@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-run"
+version = "0.1.0"
+description = "本地 Codex 自动交付控制器"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+agent-run = "agent_run.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["agent_run"]
