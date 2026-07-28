@@ -91,5 +91,10 @@ class Publisher:
     def __init__(self, git: GitRepository) -> None:
         self.git = git
 
+    def resolve_base(
+        self, default_branch: str, expected_sha: str | None
+    ) -> str:
+        return self.git.resolve_base(default_branch, expected_sha)
+
     def ensure_run_branch(self, branch: str, base_sha: str) -> None:
         self.git.ensure_run_branch(branch, base_sha)

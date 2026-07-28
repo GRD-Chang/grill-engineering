@@ -37,6 +37,7 @@ def test_initial_state_failure_happens_before_branch_creation(
         GitRepository(git_repo),
         store,
     )
+    assert not hasattr(controller, "git")
 
     def fail_save(_run_id: str, _state: dict[str, Any]) -> None:
         raise OSError("simulated first-write interruption")

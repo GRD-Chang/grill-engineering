@@ -25,7 +25,6 @@ class Controller:
         states: StateStore,
     ) -> None:
         self.github = github
-        self.git = git
         self.states = states
         self.publisher = Publisher(git)
 
@@ -35,7 +34,7 @@ class Controller:
             existing = self.states.find_run(repository.name_with_owner, parent_number)
             resumed = existing is not None
             if existing is None:
-                base_sha = self.git.resolve_base(
+                base_sha = self.publisher.resolve_base(
                     repository.default_branch, repository.default_head_sha
                 )
                 run_id = _run_id(
