@@ -26,9 +26,17 @@ def git_repo(tmp_path: Path) -> Path:
 
 
 def write_fixture(path: Path, *, issues: dict[str, Any], **overrides: Any) -> Path:
+    default_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path.parent,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
     fixture: dict[str, Any] = {
         "repository": "example/project",
         "default_branch": "main",
+        "default_head_sha": default_head,
         "parent": {
             "number": 1,
             "title": "Parent spec",

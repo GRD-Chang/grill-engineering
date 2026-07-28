@@ -47,9 +47,12 @@ class GitRepository:
     def ensure_run_branch(self, branch: str, base_sha: str) -> None:
         existing = self._resolve(f"refs/heads/{branch}")
         if existing is not None:
-            if existing != base_sha:
+            ancestry = self._run(
+                "merge-base", "--is-ancestor", base_sha, existing
+            )
+            if ancestry.returncode != 0:
                 raise GitError(
-                    f"run branch {branch!r} points to {existing}, expected {base_sha}"
+                    f"run branch {branch!r} no longer descends from base {base_sha}"
                 )
             return
         result = self._run("branch", branch, base_sha)
@@ -83,7 +86,7 @@ class GitRepository:
 
 
 class Publisher:
-    """Issue #2 中唯一允许修改 Git 引用和本地运行状态的边界。"""
+    """Issue #2 中唯一允许修改 Git 引用的边界。"""
 
     def __init__(self, git: GitRepository) -> None:
         self.git = git

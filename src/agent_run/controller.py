@@ -44,6 +44,8 @@ class Controller:
                 state = self._initial_state(
                     repository, parent_number, run_id, base_sha
                 )
+                # 先持久化稳定身份；即使此处中断，也不会遗留无状态的分支。
+                self.states.save_run(run_id, state)
             else:
                 state = existing
                 run_id = str(state["run_id"])

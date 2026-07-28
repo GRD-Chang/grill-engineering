@@ -172,6 +172,129 @@ def test_resume_command_reuses_exact_run(git_repo: Path) -> None:
     assert stdout_json(resumed)["run_id"] == run_id
 
 
+def test_resume_accepts_run_branch_that_advanced_from_original_base(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    started = run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    tree = subprocess.run(
+        ["git", "rev-parse", f"{state['run_branch']}^{{tree}}"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    advanced = subprocess.run(
+        [
+            "git",
+            "commit-tree",
+            tree,
+            "-p",
+            state["run_branch"],
+            "-m",
+            "integrate accepted ticket",
+        ],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{state['run_branch']}", advanced],
+        cwd=git_repo,
+        check=True,
+    )
+
+    resumed = run_cli(
+        git_repo, fixture, "resume", stdout_json(started)["run_id"]
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["result"] == "resumed"
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", state["run_branch"]],
+            cwd=git_repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        == advanced
+    )
+
+
+def test_live_default_head_is_fetched_before_run_branch_creation(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(git_repo), str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=git_repo,
+        check=True,
+    )
+    updater = tmp_path / "updater"
+    subprocess.run(
+        ["git", "clone", str(remote), str(updater)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Updater"], cwd=updater, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "updater@example.invalid"],
+        cwd=updater,
+        check=True,
+    )
+    (updater / "remote.txt").write_text("new live head\n", encoding="utf-8")
+    subprocess.run(["git", "add", "remote.txt"], cwd=updater, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "advance remote"],
+        cwd=updater,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "origin", "main"],
+        cwd=updater,
+        check=True,
+        capture_output=True,
+    )
+    live_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=updater,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": issue(2)},
+        default_head_sha=live_head,
+    )
+
+    result = run_cli(git_repo, fixture, "start", "1")
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    assert state["base"]["sha"] == live_head
+    branch_head = subprocess.run(
+        ["git", "rev-parse", state["run_branch"]],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    assert branch_head == live_head
+
+
 def test_no_executable_ticket_is_progress_exhaustion_not_completion(
     git_repo: Path,
 ) -> None:
