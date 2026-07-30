@@ -118,6 +118,7 @@ class Controller:
             },
             "frontier": [],
             "active_ticket_job": None,
+            "ticket_jobs": {},
             "status": "starting",
             "diagnostics": [],
             "created_at": now,

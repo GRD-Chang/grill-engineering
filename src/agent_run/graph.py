@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.models import DeliveryGraph, Issue
+from agent_run.revisions import fingerprint
+from agent_run.ticket_phase import BLOCKED_MESSAGES, TicketPhase
 
 
 DISQUALIFYING_LABELS = frozenset(
@@ -58,24 +58,64 @@ def state_from_graph(
             frontier.append(number)
         tickets[str(number)] = _ticket_state(issue, eligible, reason)
 
+    ticket_jobs = _retained_ticket_jobs(previous, order)
+    active: dict[str, Any] | None
     if frontier:
-        status = "active"
-        active: dict[str, Any] | None = {
-            "ticket_number": frontier[0],
-            "selection_reason": (
-                "first eligible ticket by parent sub-issue order, then issue number"
-            ),
-        }
-        diagnostics: list[dict[str, Any]] = []
+        selected = frontier[0]
+        active = ticket_jobs.get(str(selected), {"ticket_number": selected})
+        active["selection_reason"] = (
+            "first eligible ticket by parent sub-issue order, then issue number"
+        )
+        previous_graph = previous.get("ticket_graph")
+        if str(selected) in ticket_jobs and isinstance(previous_graph, dict):
+            previous_tickets = previous_graph.get("tickets")
+            previous_ticket = (
+                previous_tickets.get(str(selected))
+                if isinstance(previous_tickets, dict)
+                else None
+            )
+            if isinstance(previous_ticket, dict):
+                active["source_revision_changed"] = (
+                    previous_ticket.get("content_revision")
+                    != tickets[str(selected)]["content_revision"]
+                )
+        ticket_jobs[str(selected)] = active
+        if active.get("phase") == TicketPhase.ESCALATING.value:
+            status = "escalating"
+            diagnostics = [_job_diagnostic(active)]
+        elif (
+            active.get("phase") == TicketPhase.BLOCKED.value
+            and active.get("blocked_reason") != "no_code_changes"
+        ):
+            status = "blocked"
+            diagnostics = [_job_diagnostic(active)]
+        else:
+            status = "active"
+            diagnostics = []
     else:
-        status = "progress_exhausted"
-        active = None
-        diagnostics = [
-            {
-                "code": "no_executable_ticket",
-                "message": "No open, ready and unblocked Ticket is executable",
-            }
-        ]
+        active = _first_job_in_phase(
+            ticket_jobs, order, TicketPhase.ESCALATING
+        )
+        unresolved = active or _first_unresolved_blocked_job(
+            ticket_jobs, order
+        )
+        if unresolved is not None:
+            status = (
+                "escalating"
+                if active is not None
+                else "blocked"
+            )
+            diagnostics = [_job_diagnostic(unresolved)]
+        else:
+            status = "progress_exhausted"
+            diagnostics = [
+                {
+                    "code": "no_executable_ticket",
+                    "message": (
+                        "No open, ready and unblocked Ticket is executable"
+                    ),
+                }
+            ]
 
     state = dict(previous)
     state.update(
@@ -83,13 +123,15 @@ def state_from_graph(
             "parent": {
                 "number": graph.parent.number,
                 "title": graph.parent.title,
-                "revision": _fingerprint(
+                "body": graph.parent.body,
+                "revision": fingerprint(
                     {"title": graph.parent.title, "body": graph.parent.body}
                 ),
             },
             "ticket_graph": _ticket_graph_state(graph, order, tickets),
             "frontier": frontier,
             "active_ticket_job": active,
+            "ticket_jobs": ticket_jobs,
             "status": status,
             "diagnostics": diagnostics,
             "updated_at": _now(),
@@ -110,12 +152,14 @@ def _blocked_graph_state(
         for number, issue in graph.issues.items()
     }
     state = dict(previous)
+    ticket_jobs = _retained_ticket_jobs(previous, ordered_numbers)
     state.update(
         {
             "parent": {
                 "number": graph.parent.number,
                 "title": graph.parent.title,
-                "revision": _fingerprint(
+                "body": graph.parent.body,
+                "revision": fingerprint(
                     {"title": graph.parent.title, "body": graph.parent.body}
                 ),
             },
@@ -124,12 +168,69 @@ def _blocked_graph_state(
             ),
             "frontier": [],
             "active_ticket_job": None,
+            "ticket_jobs": ticket_jobs,
             "status": "blocked",
             "diagnostics": [diagnostic],
             "updated_at": _now(),
         }
     )
     return state
+
+
+def _retained_ticket_jobs(
+    previous: dict[str, Any], order: list[int]
+) -> dict[str, dict[str, Any]]:
+    allowed = {str(number) for number in order}
+    retained: dict[str, dict[str, Any]] = {}
+    previous_jobs = previous.get("ticket_jobs")
+    if isinstance(previous_jobs, dict):
+        for key, value in previous_jobs.items():
+            if key in allowed and isinstance(value, dict):
+                retained[key] = dict(value)
+    previous_active = previous.get("active_ticket_job")
+    if isinstance(previous_active, dict):
+        number = previous_active.get("ticket_number")
+        key = str(number)
+        if isinstance(number, int) and key in allowed:
+            retained[key] = dict(previous_active)
+    return retained
+
+
+def _first_job_in_phase(
+    ticket_jobs: dict[str, dict[str, Any]],
+    order: list[int],
+    phase: TicketPhase,
+) -> dict[str, Any] | None:
+    for number in order:
+        job = ticket_jobs.get(str(number))
+        if isinstance(job, dict) and job.get("phase") == phase.value:
+            return job
+    return None
+
+
+def _first_unresolved_blocked_job(
+    ticket_jobs: dict[str, dict[str, Any]], order: list[int]
+) -> dict[str, Any] | None:
+    for number in order:
+        job = ticket_jobs.get(str(number))
+        if (
+            isinstance(job, dict)
+            and job.get("phase") == TicketPhase.BLOCKED.value
+            and job.get("blocked_reason") != "no_code_changes"
+        ):
+            return job
+    return None
+
+
+def _job_diagnostic(job: dict[str, Any]) -> dict[str, Any]:
+    reason = job.get("blocked_reason") or job.get("escalation_code")
+    if not isinstance(reason, str) or reason not in BLOCKED_MESSAGES:
+        raise ValueError("unresolved Ticket Job has unknown blocker")
+    return {
+        "code": reason,
+        "message": BLOCKED_MESSAGES[reason],
+        "ticket_number": job["ticket_number"],
+    }
 
 
 def _ticket_graph_state(
@@ -148,7 +249,7 @@ def _ticket_graph_state(
         },
     }
     return {
-        "revision": _fingerprint(revision_input),
+        "revision": fingerprint(revision_input),
         "ordered_ticket_numbers": order,
         "order_source": (
             "github_sub_issues"
@@ -163,13 +264,14 @@ def _ticket_state(issue: Issue, eligible: bool, reason: str) -> dict[str, Any]:
     return {
         "number": issue.number,
         "title": issue.title,
+        "body": issue.body,
         "state": issue.state,
         "labels": sorted(issue.labels),
         "blocked_by": [
             {"number": blocker.number, "state": blocker.state}
             for blocker in sorted(issue.blocked_by, key=lambda value: value.number)
         ],
-        "content_revision": _fingerprint(
+        "content_revision": fingerprint(
             {"title": issue.title, "body": issue.body}
         ),
         "eligibility": {"eligible": eligible, "reason": reason},
@@ -224,13 +326,6 @@ def _cycle_members(graph: DeliveryGraph) -> list[int]:
     for number in sorted(dependencies):
         visit(number, [])
     return sorted(cycle_nodes)
-
-
-def _fingerprint(value: object) -> str:
-    encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _now() -> str:

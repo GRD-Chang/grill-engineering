@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
+from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
+from agent_run.revisions import effective_revision_from_graph
 
 
 class FixtureGitHubReader:
@@ -69,6 +74,314 @@ class FixtureGitHubReader:
         return DeliveryGraph(parent=parent, issues=issues)
 
 
+class FixtureGitHubPublisher:
+    """Mutable GitHub substitute for black-box delivery scenarios."""
+
+    def __init__(self, path: Path, git: GitRepository) -> None:
+        self.path = path
+        self.git = git
+        loaded: object = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("fixture root must be an object")
+        self.data = loaded
+        delivery = self.data.setdefault("delivery", {})
+        if not isinstance(delivery, dict):
+            raise ValueError("fixture delivery must be an object")
+        delivery.setdefault("linked_branches", {})
+        delivery.setdefault("published_branches", {})
+        delivery.setdefault("pull_requests", [])
+        delivery.setdefault("closed_issues", [])
+        delivery.setdefault("acceptance_records", [])
+        delivery.setdefault("mutations", [])
+        delivery.setdefault("check_position", 0)
+
+    def ensure_ticket_branch(
+        self,
+        *,
+        ticket_number: int,
+        branch: str,
+        base_branch: str,
+    ) -> None:
+        linked = _mutable_mapping(self._delivery(), "linked_branches")
+        existing = linked.get(str(ticket_number))
+        if existing not in {None, branch}:
+            raise ValueError("fixture ticket already has a different branch")
+        linked[str(ticket_number)] = branch
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        published.setdefault(branch, self.git.resolve(base_branch))
+        self._save()
+
+    def publish_branch(
+        self,
+        branch: str,
+        head_sha: str,
+        *,
+        expected_remote_sha: str,
+    ) -> None:
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        if published.get(branch) == head_sha:
+            return
+        if published.get(branch) != expected_remote_sha:
+            raise ValueError("fixture remote ticket branch drifted")
+        published[branch] = head_sha
+        self._save()
+
+    def ensure_ticket_pr(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        primary_ticket: int,
+    ) -> int:
+        pulls = _mutable_list(self._delivery(), "pull_requests")
+        matching = [
+            pr
+            for pr in pulls
+            if isinstance(pr, dict)
+            and pr.get("branch") == branch
+            and pr.get("base_branch") == base_branch
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate Ticket PRs")
+        if matching:
+            pull = matching[0]
+        else:
+            pull = {
+                "number": len(pulls) + 1,
+                "branch": branch,
+                "base_branch": base_branch,
+                "primary_ticket": primary_ticket,
+                "state": "OPEN",
+            }
+            pulls.append(pull)
+        pull.update({"title": title, "body": body})
+        self._save()
+        return int(pull["number"])
+
+    def required_checks(self, pr_number: int) -> str:
+        delivery = self._delivery()
+        sequence = delivery.get("required_checks", ["none"])
+        if not isinstance(sequence, list) or not all(
+            value in {"none", "pass", "pending", "fail"} for value in sequence
+        ):
+            raise ValueError("fixture required_checks is invalid")
+        position = int(delivery.get("check_position", 0))
+        value = str(sequence[min(position, len(sequence) - 1)])
+        delivery["check_position"] = position + 1
+        self._save()
+        return value
+
+    def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
+        configured = self._delivery().get("required_check_evidence")
+        if isinstance(configured, dict):
+            return dict(configured)
+        return {
+            "pr_number": pr_number,
+            "checks": [
+                {
+                    "name": "fixture-required-check",
+                    "workflow": "fixture-ci",
+                    "bucket": "fail",
+                    "description": "The fixture required check failed.",
+                    "link": "https://example.invalid/checks/fixture",
+                }
+            ],
+        }
+
+    def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+        pull = self._pull(pr_number)
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        live_head = published.get(str(pull["branch"]))
+        override = self._delivery().get("live_head_override")
+        result = {
+            "head_sha": override if isinstance(override, str) else live_head,
+            "base_branch": pull["base_branch"],
+            "base_sha": self.git.resolve(str(pull["base_branch"])),
+            "mergeable": bool(self._delivery().get("mergeable", True)),
+            "state": pull.get("state"),
+            "integrated_sha": pull.get("integrated_sha"),
+        }
+        integrated = pull.get("integrated_sha")
+        if isinstance(integrated, str) and isinstance(live_head, str):
+            result.update(
+                {
+                    "head_tree": self.git.resolve(f"{live_head}^{{tree}}"),
+                    "integrated_tree": self.git.resolve(
+                        f"{integrated}^{{tree}}"
+                    ),
+                    "integrated_message": _commit_subject(
+                        self.git.root, integrated
+                    ),
+                    "integrated_parents": self.git.commit_parents(integrated),
+                }
+            )
+        return result
+
+    def record_acceptance(
+        self, pr_number: int, record: dict[str, Any]
+    ) -> None:
+        records = _mutable_list(self._delivery(), "acceptance_records")
+        replacement = {"pr_number": pr_number, **record}
+        for position, existing in enumerate(records):
+            if isinstance(existing, dict) and existing.get("pr_number") == pr_number:
+                records[position] = replacement
+                break
+        else:
+            records.append(replacement)
+        self._save()
+
+    def squash_merge(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        run_branch: str,
+        commit_message: str,
+    ) -> str:
+        pull = self._pull(pr_number)
+        if pull.get("state") == "MERGED":
+            return str(pull["integrated_sha"])
+        live = self.live_pull_request(pr_number)
+        if live["head_sha"] != expected_head_sha:
+            raise ValueError("fixture merge head does not match expected head")
+        tree = self.git.resolve(f"{expected_head_sha}^{{tree}}")
+        parent = self.git.resolve(run_branch)
+        result = subprocess.run(
+            [
+                "git",
+                "commit-tree",
+                tree,
+                "-p",
+                parent,
+                "-m",
+                commit_message,
+            ],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(
+                result.stderr.strip() or "fixture merge failed"
+            )
+        integrated = result.stdout.strip()
+        subprocess.run(
+            [
+                "git",
+                "update-ref",
+                f"refs/heads/{run_branch}",
+                integrated,
+                parent,
+            ],
+            cwd=self.git.root,
+            check=True,
+        )
+        pull.update(
+            {"state": "MERGED", "integrated_sha": integrated}
+        )
+        self._save()
+        return integrated
+
+    def sync_run_branch(
+        self, *, run_branch: str, integrated_sha: str
+    ) -> None:
+        if self.git.resolve(run_branch) == integrated_sha:
+            return
+        subprocess.run(
+            ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha],
+            cwd=self.git.root,
+            check=True,
+        )
+
+    def close_primary_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        mutations = _mutable_list(self._delivery(), "mutations")
+        marker = {
+            "ticket_number": ticket_number,
+            "run_id": run_id,
+            "pr_number": pr_number,
+            "integrated_sha": integrated_sha,
+        }
+        if not any(
+            isinstance(item, dict)
+            and item.get("action") == "completion_comment"
+            and item.get("ticket_number") == ticket_number
+            for item in mutations
+        ):
+            mutations.append({"action": "completion_comment", **marker})
+        closed = _mutable_list(self._delivery(), "closed_issues")
+        if ticket_number not in closed:
+            closed.append(ticket_number)
+            mutations.append({"action": "close_issue", **marker})
+        raw_issues = _mutable_mapping(self.data, "issues")
+        issue = raw_issues.get(str(ticket_number))
+        if isinstance(issue, dict):
+            issue["state"] = "CLOSED"
+        self._save()
+
+    def mark_ready_for_human(self, ticket_number: int) -> None:
+        raw_issues = _mutable_mapping(self.data, "issues")
+        issue = raw_issues.get(str(ticket_number))
+        if not isinstance(issue, dict):
+            raise ValueError("fixture ticket is missing")
+        labels = issue.get("labels")
+        if not isinstance(labels, list):
+            raise ValueError("fixture labels must be a list")
+        issue["labels"] = [
+            label for label in labels if label != "ready-for-agent"
+        ]
+        if "ready-for-human" not in issue["labels"]:
+            issue["labels"].append("ready-for-human")
+        self._save()
+
+    def current_effective_revision(
+        self,
+        *,
+        parent_number: int,
+        ticket_number: int,
+        expected_revision: str,
+    ) -> str:
+        graph = FixtureGitHubReader(self.path).delivery_graph(parent_number)
+        return effective_revision_from_graph(graph, ticket_number)
+
+    def _delivery(self) -> dict[str, Any]:
+        return _mutable_mapping(self.data, "delivery")
+
+    def _pull(self, pr_number: int) -> dict[str, Any]:
+        for pull in _mutable_list(self._delivery(), "pull_requests"):
+            if isinstance(pull, dict) and pull.get("number") == pr_number:
+                return pull
+        raise ValueError(f"fixture PR #{pr_number} is missing")
+
+    def _save(self) -> None:
+        descriptor, name = tempfile.mkstemp(
+            dir=self.path.parent,
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                json.dump(self.data, file, ensure_ascii=False, indent=2, sort_keys=True)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
 def _parse_issue(data: dict[str, Any]) -> Issue:
     raw_labels = data.get("labels")
     raw_blockers = data.get("blocked_by")
@@ -119,3 +432,32 @@ def _integer(data: dict[str, Any], key: str) -> int:
     if not isinstance(value, int):
         raise GitHubReadError("invalid_fixture", f"{key} must be an integer")
     return value
+
+
+def _mutable_mapping(
+    data: dict[str, Any], key: str
+) -> dict[str, Any]:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be an object")
+    return value
+
+
+def _mutable_list(data: dict[str, Any], key: str) -> list[Any]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise ValueError(f"{key} must be a list")
+    return value
+
+
+def _commit_subject(repository: Path, sha: str) -> str:
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%s", sha],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or "fixture commit is missing")
+    return result.stdout.strip()
