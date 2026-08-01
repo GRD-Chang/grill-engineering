@@ -13,7 +13,8 @@
   绑定到准确的新图版本；
 - Parent Spec 变化时由一次性 Codex 生成 Scope Impact Assessment；澄清自动吸收，
   结构性变化绑定准确版本等待确认；
-- 全部 Ticket 完成后进入 `run_acceptance_pending`，不提前创建最终 Run PR。
+- 全部 Ticket 完成后进入 `run_acceptance_pending`，由独立 Reviewer 整体验收；通过后
+  才进入 `run_publication_pending`，不提前创建最终 Run PR。
 
 各智能角色的目标 Prompt 与证据合同见
 [`docs/agents/agent-prompts.md`](agents/agent-prompts.md)。
@@ -24,6 +25,7 @@
 agent-run start <parent-issue> --repo OWNER/REPO
 agent-run resume <run-id> --repo OWNER/REPO
 agent-run confirm-structure <run-id> --repo OWNER/REPO
+agent-run accept-run <run-id> --repo OWNER/REPO
 AGENT_RUN_GITHUB_APP_ID=<app-id> \
 AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
 AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
@@ -37,6 +39,15 @@ Required Checks 仍为 pending 时，命令保存 `waiting_checks` 状态并退�
 执行同一个 `deliver` 命令即可继续，不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
 原始 CI Evidence 交回同一 Development Thread。
+
+当 `deliver` 返回 `run_acceptance_pending` 后，执行 `accept-run`。它在一次性、可写的
+Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得复用任意 Ticket 的
+Development/Reviewer Thread，必须读取 Parent Spec、最终 Ticket 图、Ticket completion
+evidence、基线到 Run Head 的累计 diff 与预期 merge 结果，并进行实际 E2E、Standards、
+Spec 三条验证 lane。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
+代码修改形成新的 Run Branch commit、废弃旧验收，再由全新 Reviewer 重新检查完整累计结果。
+无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
+通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。
 
 Ticket title/body 在运行中变化时，旧开发结果、Publication 和 Acceptance 会失效；
 Controller 沿用同一个 Ticket Job、Ticket Branch 和 Development Thread，从最新 revision

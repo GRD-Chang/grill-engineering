@@ -58,6 +58,49 @@ class GhGitHubPublisher:
                 created.stderr.strip() or "could not create linked ticket branch",
             )
 
+    def ensure_run_repair_branch(self, *, branch: str, base_branch: str) -> None:
+        self._ensure_remote_run_branch(base_branch)
+        remote = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if remote.returncode != 0:
+            raise GitError(remote.stderr.strip() or "could not read Run Repair branch")
+        if remote.stdout.strip():
+            return
+        base_sha = self.git.resolve(base_branch)
+        pushed = subprocess.run(
+            ["git", "push", "origin", f"{base_sha}:refs/heads/{branch}"],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if pushed.returncode != 0:
+            raise GitError(pushed.stderr.strip() or "could not create Run Repair branch")
+
+    def ensure_run_repair_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        pulls = self._json(
+            "pr", "list", "--repo", self.repository, "--state", "open",
+            "--head", branch, "--base", base_branch, "--json", "number"
+        )
+        if not isinstance(pulls, list):
+            raise GitHubReadError("github_invalid_response", "PR list must be an array")
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_run_repair_pr", "more than one open Run Repair PR exists")
+        if pulls:
+            number = _integer(_mapping(pulls[0]), "number")
+            self._require("pr", "edit", str(number), "--repo", self.repository, "--title", title, "--body", body)
+            return number
+        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
+        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        return _integer(_mapping(created), "number")
+
     def _ensure_remote_run_branch(self, branch: str) -> None:
         remote = subprocess.run(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],

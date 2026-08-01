@@ -122,6 +122,33 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("ensure_ticket_branch")
 
+    def ensure_run_repair_branch(self, *, branch: str, base_branch: str) -> None:
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        published.setdefault(branch, self.git.resolve(base_branch))
+        self._save()
+
+    def ensure_run_repair_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        pulls = _mutable_list(self._delivery(), "pull_requests")
+        matching = [
+            pr for pr in pulls if isinstance(pr, dict)
+            and pr.get("branch") == branch and pr.get("base_branch") == base_branch
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate Run Repair PRs")
+        if matching:
+            pull = matching[0]
+        else:
+            pull = {
+                "number": len(pulls) + 1, "branch": branch,
+                "base_branch": base_branch, "state": "OPEN", "scope": "run_repair",
+            }
+            pulls.append(pull)
+        pull.update({"title": title, "body": body})
+        self._save()
+        return int(pull["number"])
+
     def publish_branch(
         self,
         branch: str,

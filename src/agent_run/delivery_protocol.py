@@ -4,6 +4,14 @@ from typing import Any, Protocol
 
 
 class GitHubPublisher(Protocol):
+    def ensure_run_repair_branch(
+        self, *, branch: str, base_branch: str
+    ) -> None: ...
+
+    def ensure_run_repair_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int: ...
+
     def ensure_ticket_branch(
         self,
         *,

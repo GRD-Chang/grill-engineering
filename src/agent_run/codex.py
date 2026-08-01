@@ -73,6 +73,7 @@ class CodexCliBackend:
 
     @staticmethod
     def _development_prompt(request: dict[str, Any]) -> str:
+        is_run_repair = request.get("acceptance_scope") == "run"
         repair_source = request.get("repair_source")
         if repair_source is None:
             mode = (
@@ -87,8 +88,9 @@ class CodexCliBackend:
                 raise ValueError(
                     "Acceptance Repair requires acceptance_artifact"
                 )
+            subject = "当前 Delivery Run" if is_run_repair else "当前 Ticket"
             mode = (
-                "Acceptance Repair：当前 Ticket、代码状态和下方未经改写的 "
+                f"Acceptance Repair：{subject}、代码状态和下方未经改写的 "
                 "Acceptance Artifact 是事实依据。逐项处理 finding，保留原意，"
                 "只修改 finding 及其直接影响范围，不改动已通过且不受影响的行为。"
             )
@@ -118,8 +120,9 @@ class CodexCliBackend:
         else:
             raise ValueError(f"unknown repair_source: {repair_source}")
 
+        role = "本次 Delivery Run 的修复工程师" if is_run_repair else "当前 Ticket 的开发工程师"
         return (
-            "你是负责当前 Ticket 的开发工程师。使用 skill:implement 完成开发或修复。"
+            f"你是负责{role}。使用 skill:implement 完成开发或修复。"
             f"{mode}\n\n"
             "阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置尽量"
             "采用 TDD。运行相关单测、typecheck、lint 和完整测试套件，并从真实用户"
@@ -133,7 +136,8 @@ class CodexCliBackend:
             "scope creep。你不得自行宣布必要审查通过。发现 blocking finding 后必须"
             "修复、重跑受影响测试和真实路径，并重新取得受影响 subagent 的有效复查。"
             "\n\nPublisher 是唯一 Mutation Authority；不要 commit、push、merge、"
-            "close 或修改 PR/Issue。开发侧验证不是正式 Acceptance。最后只用普通文本"
+            "close 或修改 PR/Issue。Run Repair 不得关闭 Ticket、创建 Ticket PR 或使用"
+            "Ticket 的修改预算。开发侧验证不是正式 Acceptance。最后只用普通文本"
             "总结改动、实际验证、两个审查结果和剩余 blocker。\n\n"
             f"{heading}:\n{prompt_input}"
         )
@@ -172,10 +176,14 @@ class CodexCliBackend:
 
     @staticmethod
     def _publication_prompt(request: dict[str, Any]) -> str:
+        identity = (
+            f"`Delivery Run: {request['run_id']}`"
+            if request.get("acceptance_scope") == "run"
+            else "唯一的 `Primary Ticket: #N`"
+        )
         return (
             "根据当前累计 diff 与实际验证，输出小型 Publication Artifact。不要修改文件，"
-            "不要执行任何 Git/GitHub 写操作。PR 正文必须以唯一的 "
-            "`Primary Ticket: #N` 开头，且包含四个非空二级标题："
+            f"不要执行任何 Git/GitHub 写操作。PR 正文必须以{identity}开头，且包含四个非空二级标题："
             "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
             "禁止 closing keywords。\n\n"
             f"Publication Brief:\n{_pretty(request)}"
@@ -183,6 +191,13 @@ class CodexCliBackend:
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         checkout = Path(_string(request, "checkout"))
+        scope_instruction = (
+            "这是 Run Acceptance：必须检查 Parent Spec、最终 Ticket Set 与依赖图、"
+            "每张 Ticket Completion Record、基线到 Run Branch Head 的累计 diff，以及"
+            "Expected Merge Result；不要把单 Ticket 通过当成整体验收通过。"
+            if request.get("acceptance_scope") == "run"
+            else "这是 Ticket Fresh Acceptance：以当前 Ticket 的完整验收标准为范围。"
+        )
         prompt = (
             "你是全新且独立的 Fresh Validation Codex。不要依赖开发者总结、自测或"
             "开发审查；使用真实 Git/gh、Ticket、Parent Spec 和准确 SHA 自行建立"
@@ -194,6 +209,7 @@ class CodexCliBackend:
             "只输出符合 schema 的 Acceptance Artifact。可修复问题写入自包含 "
             "findings。human 必须克制，仅限确实需要产品决策、外部权限、敏感凭证"
             "或不可替代外部操作的阻塞。\n\n"
+            f"{scope_instruction}\n\n"
             f"Acceptance Brief:\n{_pretty(request)}"
         )
         output, thread_id = self._invoke(

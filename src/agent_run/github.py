@@ -23,8 +23,6 @@ class GhGitHubReader:
         return self.repository_override
 
     def repository(self) -> Repository:
-        if self._repository is not None:
-            return self._repository
         arguments = ["repo", "view"]
         if self.repository_override:
             arguments.append(self.repository_override)

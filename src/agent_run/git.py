@@ -91,6 +91,24 @@ class GitRepository:
         if added.returncode != 0:
             raise GitError(added.stderr.strip() or "could not create ticket checkout")
 
+    def prepare_run_repair_checkout(
+        self, *, branch: str, checkout: Path
+    ) -> None:
+        """Check out the existing Run Branch for a bounded repair attempt."""
+        if checkout.exists():
+            if self.ticket_checkout_matches(checkout, branch):
+                return
+            raise GitError("existing Run Repair checkout does not match Run Branch")
+        self.remove_worktree(checkout)
+        if self._resolve(f"refs/heads/{branch}") is None:
+            raise GitError(f"Run Branch {branch!r} does not exist")
+        checkout.parent.mkdir(parents=True, exist_ok=True)
+        added = self._run("worktree", "add", "--force", str(checkout), branch)
+        if added.returncode != 0:
+            raise GitError(
+                added.stderr.strip() or "could not create Run Repair checkout"
+            )
+
     def ticket_checkout_matches(self, checkout: Path, branch: str) -> bool:
         if not checkout.exists():
             return False
@@ -141,6 +159,26 @@ class GitRepository:
                 added.stderr.strip() or "could not create validation checkout"
             )
 
+    def prepare_expected_merge_checkout(
+        self,
+        *,
+        default_head_sha: str,
+        run_head_sha: str,
+        checkout: Path,
+    ) -> None:
+        """Create a disposable checkout containing the actual merge preview."""
+        self.prepare_validation_checkout(head_sha=default_head_sha, checkout=checkout)
+        merged = self._run_in(
+            checkout, "merge", "--no-commit", "--no-ff", run_head_sha
+        )
+        if merged.returncode == 0:
+            return
+        self._run_in(checkout, "merge", "--abort")
+        raise GitError(
+            merged.stderr.strip()
+            or "Run Branch cannot be merged into the current default branch"
+        )
+
     def commit_candidate(
         self, checkout: Path, *, ticket_number: int, attempt: int
     ) -> str | None:
@@ -167,6 +205,37 @@ class GitRepository:
         )
         if committed.returncode != 0:
             raise GitError(committed.stderr.strip() or "could not commit candidate")
+        return self._resolve_in(checkout, "HEAD")
+
+    def commit_run_repair_candidate(
+        self, checkout: Path, *, attempt: int
+    ) -> str | None:
+        status = self._run_in(checkout, "status", "--porcelain=v1")
+        if status.returncode != 0:
+            raise GitError(
+                status.stderr.strip() or "could not inspect Run Repair checkout"
+            )
+        expected_message = f"chore(run-repair): candidate {attempt}"
+        if not status.stdout.strip():
+            subject = self._run_in(checkout, "log", "-1", "--format=%s")
+            if (
+                subject.returncode == 0
+                and subject.stdout.strip() == expected_message
+            ):
+                return self._resolve_in(checkout, "HEAD")
+            return None
+        added = self._run_in(checkout, "add", "--all")
+        if added.returncode != 0:
+            raise GitError(
+                added.stderr.strip() or "could not stage Run Repair candidate"
+            )
+        committed = self._run_in(
+            checkout, "commit", "-m", expected_message
+        )
+        if committed.returncode != 0:
+            raise GitError(
+                committed.stderr.strip() or "could not commit Run Repair candidate"
+            )
         return self._resolve_in(checkout, "HEAD")
 
     def create_publication_commit(

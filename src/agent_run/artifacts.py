@@ -28,7 +28,11 @@ class PublicationArtifact:
 
     @classmethod
     def parse(
-        cls, value: object, *, primary_ticket: int
+        cls,
+        value: object,
+        *,
+        primary_ticket: int | None = None,
+        delivery_run: str | None = None,
     ) -> PublicationArtifact:
         data = _mapping(value, "publication artifact")
         commit_message = _nonempty_string(data, "commit_message")
@@ -42,14 +46,21 @@ class PublicationArtifact:
         if not _SEMANTIC_TITLE.fullmatch(pr_title):
             raise ValueError("pr_title does not match the semantic title contract")
         _require_meaningful_outcome(pr_title, "pr_title")
-        identity = f"Primary Ticket: #{primary_ticket}"
-        identity_lines = [
-            line.strip()
-            for line in body.splitlines()
-            if line.strip().startswith("Primary Ticket:")
-        ]
-        if identity_lines != [identity]:
-            raise ValueError("PR body must identify exactly one Primary Ticket")
+        if (primary_ticket is None) == (delivery_run is None):
+            raise ValueError("publication artifact requires exactly one identity")
+        if primary_ticket is not None:
+            identity = f"Primary Ticket: #{primary_ticket}"
+            identity_lines = [
+                line.strip()
+                for line in body.splitlines()
+                if line.strip().startswith("Primary Ticket:")
+            ]
+            if identity_lines != [identity]:
+                raise ValueError("PR body must identify exactly one Primary Ticket")
+        else:
+            identity = f"Delivery Run: {delivery_run}"
+            if body.splitlines()[0].strip() != identity:
+                raise ValueError("Run Repair PR body must start with Delivery Run")
         if _CLOSING_KEYWORD.search(body):
             raise ValueError("PR body must not contain automatic closing keywords")
         for section in _REQUIRED_SECTIONS:

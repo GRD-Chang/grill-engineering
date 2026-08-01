@@ -18,6 +18,7 @@ from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_orchestration import DeliveryRunEngine
+from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 
@@ -49,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent-fixture",
         help=argparse.SUPPRESS,
     )
+    accept_run = subcommands.add_parser(
+        "accept-run", help="对完成的 Delivery Run 执行独立整体验收"
+    )
+    accept_run.add_argument("run_id", help="Delivery Run 标识")
+    _add_common_options(accept_run)
+    accept_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     return parser
 
 
@@ -93,7 +100,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state, resumed = controller.resume(parsed.run_id)
         elif parsed.command == "confirm-structure":
             state, resumed = controller.confirm_structure(parsed.run_id)
-        else:
+        elif parsed.command == "deliver":
             agent_fixture = getattr(parsed, "agent_fixture", None)
             agents = (
                 FixtureAgentBackend(Path(agent_fixture))
@@ -118,6 +125,37 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             ).deliver(parsed.run_id)
             resumed = True
+        else:
+            agent_fixture = getattr(parsed, "agent_fixture", None)
+            agents = (
+                FixtureAgentBackend(Path(agent_fixture))
+                if agent_fixture
+                else CodexCliBackend()
+            )
+            refreshed, _ = controller.resume(parsed.run_id)
+            if refreshed.get("status") not in {
+                "run_acceptance_pending",
+                "run_publication_pending",
+            }:
+                state = refreshed
+            else:
+                repository = github.repository()
+                default_head = git.resolve_base(
+                    repository.default_branch, repository.default_head_sha
+                )
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(repository.name_with_owner, git)
+                )
+                state = RunAcceptanceEngine(
+                    git=git,
+                    states=states,
+                    agents=agents,
+                    default_head_sha=default_head,
+                    github=publisher,
+                ).accept(parsed.run_id)
+            resumed = True
         output = {
             "result": "resumed" if resumed else "started",
             "run_id": state["run_id"],
@@ -139,6 +177,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "ticket_completed",
                 "waiting_checks",
                 "run_acceptance_pending",
+                "run_publication_pending",
             }
             else 2
         )
