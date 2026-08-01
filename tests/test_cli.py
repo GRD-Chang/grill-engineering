@@ -328,6 +328,7 @@ def test_cycle_is_persisted_as_blocked_with_diagnostic(git_repo: Path) -> None:
     assert result.returncode == 2
     state = load_only_run_state(git_repo)
     assert state["status"] == "blocked"
+    assert state["terminal_kind"] == "permanent_blocked"
     assert state["diagnostics"][0]["code"] == "dependency_cycle"
     assert state["diagnostics"][0]["ticket_numbers"] == [2, 3]
 
@@ -350,6 +351,7 @@ def test_missing_ticket_is_persisted_as_blocked(git_repo: Path) -> None:
     assert result.returncode == 2
     state = load_only_run_state(git_repo)
     assert state["status"] == "blocked"
+    assert state["terminal_kind"] == "permanent_blocked"
     assert state["diagnostics"][0] == {
         "code": "missing_ticket",
         "message": "GitHub did not return sub-issue #404",
@@ -367,8 +369,10 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
     failed = run_cli(git_repo, fixture, "start", "1")
 
     assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
     state = load_only_run_state(git_repo)
-    assert state["status"] == "blocked"
+    assert state["status"] == "execution_failed"
+    assert state["terminal_kind"] == "execution_failed"
     assert state["diagnostics"][0]["code"] == "github_read_failed"
 
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
@@ -377,3 +381,25 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
     assert retried.returncode == 0, retried.stderr
     assert stdout_json(retried)["result"] == "resumed"
     assert load_only_run_state(git_repo)["status"] == "active"
+
+
+def test_existing_run_records_repository_read_failure_without_network_retry(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": issue(2)}
+    )
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1")
+    )["run_id"]
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["repository"] = 42
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    state = load_only_run_state(git_repo)
+    assert state["status"] == "execution_failed"
+    assert state["terminal_kind"] == "execution_failed"

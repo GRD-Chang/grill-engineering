@@ -65,12 +65,26 @@ class TicketDeliveryLoop:
                 return self._complete_escalation(state, job)
             if phase in {TicketPhase.DEVELOPING, TicketPhase.REPAIRING}:
                 self._develop(state, job, checkout)
+                if self._live_revision_changed(state, job):
+                    return self._block(
+                        state,
+                        job,
+                        "effective_revision_mismatch",
+                        "Development result was discarded after requirements changed",
+                    )
             if job["phase"] == TicketPhase.COMMITTING_CANDIDATE.value:
                 blocked = self._commit_candidate(state, job, checkout)
                 if blocked is not None:
                     return blocked
             if job["phase"] == TicketPhase.CANDIDATE.value:
                 self._create_publication(state, job, checkout)
+                if self._live_revision_changed(state, job):
+                    return self._block(
+                        state,
+                        job,
+                        "effective_revision_mismatch",
+                        "Publication was discarded after requirements changed",
+                    )
             if job["phase"] == TicketPhase.REVIEWING.value:
                 terminal = self._review(state, job, checkout)
                 if terminal is not None:
@@ -235,6 +249,13 @@ class TicketDeliveryLoop:
         reviewer_ids.append(review.thread_id)
         job["reviewer_thread_ids"] = reviewer_ids
         self._save(state)
+        if self._live_revision_changed(state, job):
+            return self._block(
+                state,
+                job,
+                "effective_revision_mismatch",
+                "Fresh Acceptance was discarded after requirements changed",
+            )
         artifact = AcceptanceArtifact.parse(review.artifact)
         job["acceptance_artifact"] = artifact.raw
         job["acceptance_record"] = {
@@ -264,6 +285,14 @@ class TicketDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> dict[str, Any] | None:
         phase = parse_ticket_phase(job["phase"])
+        if phase in {TicketPhase.ACCEPTED, TicketPhase.WAITING_CHECKS}:
+            stale = self._block_if_live_revision_changed(
+                state,
+                job,
+                "Published-Head Gate rejected stale requirements before publish",
+            )
+            if stale is not None:
+                return stale
         if isinstance(job.get("pr_number"), int):
             live = self.github.live_pull_request(int(job["pr_number"]))
             if live.get("state") == "MERGED":
@@ -298,6 +327,13 @@ class TicketDeliveryLoop:
         )
         job["published_sha"] = str(job["publication_sha"])
         self._save(state)
+        stale = self._block_if_live_revision_changed(
+            state,
+            job,
+            "Published-Head Gate rejected requirements changed during publish",
+        )
+        if stale is not None:
+            return stale
         pr_number = self.github.ensure_ticket_pr(
             branch=str(job["ticket_branch"]),
             base_branch=str(state["run_branch"]),
@@ -307,6 +343,13 @@ class TicketDeliveryLoop:
         )
         job["pr_number"] = pr_number
         self._save(state)
+        stale = self._block_if_live_revision_changed(
+            state,
+            job,
+            "Published-Head Gate rejected requirements changed while creating PR",
+        )
+        if stale is not None:
+            return stale
         live = self.github.live_pull_request(pr_number)
         if live.get("state") == "MERGED":
             if parse_ticket_phase(job["phase"]) is not TicketPhase.MERGING:
@@ -325,6 +368,13 @@ class TicketDeliveryLoop:
                 "Current Ticket PR was closed without merging",
             )
         checks = self.github.required_checks(pr_number)
+        stale = self._block_if_live_revision_changed(
+            state,
+            job,
+            "Published-Head Gate rejected requirements changed while reading checks",
+        )
+        if stale is not None:
+            return stale
         if checks == "pending":
             job["phase"] = TicketPhase.WAITING_CHECKS.value
             state["status"] = "waiting_checks"
@@ -337,15 +387,23 @@ class TicketDeliveryLoop:
             )
         if checks not in {"none", "pass"}:
             raise ValueError(f"unknown Required Checks state: {checks}")
-        if self._live_revision_changed(state, job):
-            return self._block(
-                state,
-                job,
-                "effective_revision_mismatch",
-                "Published-Head Gate rejected stale requirements",
-            )
         live = self.github.live_pull_request(pr_number)
         return self._pass_published_head_gate(state, job, publication, live)
+
+    def _block_if_live_revision_changed(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        message: str,
+    ) -> dict[str, Any] | None:
+        if not self._live_revision_changed(state, job):
+            return None
+        return self._block(
+            state,
+            job,
+            "effective_revision_mismatch",
+            message,
+        )
 
     def _handle_failed_checks(
         self,
@@ -380,6 +438,13 @@ class TicketDeliveryLoop:
         publication: dict[str, Any],
         live: dict[str, Any],
     ) -> dict[str, Any]:
+        stale = self._block_if_live_revision_changed(
+            state,
+            job,
+            "Published-Head Gate rejected requirements changed before merge",
+        )
+        if stale is not None:
+            return stale
         acceptance = _mapping(job, "acceptance_record")
         if (
             live.get("head_sha") != job["publication_sha"]

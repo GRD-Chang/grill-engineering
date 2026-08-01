@@ -8,6 +8,7 @@ import pytest
 
 from agent_run.controller import Controller
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
 from conftest import write_fixture
@@ -56,3 +57,89 @@ def test_initial_state_failure_happens_before_branch_creation(
     ).stdout.splitlines()
     assert branches == []
     assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+
+
+def test_wrong_repository_cannot_mutate_existing_run_state(
+    git_repo: Path,
+) -> None:
+    store = StateStore(git_repo / ".agent-run")
+    correct_fixture = write_fixture(
+        git_repo / "correct.json", issues={"2": _issue(2)}
+    )
+    state, _ = Controller(
+        FixtureGitHubReader(correct_fixture),
+        GitRepository(git_repo),
+        store,
+    ).start(1)
+    wrong_fixture = write_fixture(
+        git_repo / "wrong.json",
+        issues={"2": _issue(2)},
+        repository="other/project",
+    )
+    wrong = Controller(
+        FixtureGitHubReader(wrong_fixture),
+        GitRepository(git_repo),
+        store,
+    )
+
+    wrong.record_execution_failure(str(state["run_id"]), "wrong repo")
+
+    persisted = store.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["status"] == "active"
+    with pytest.raises(ValueError, match="does not match"):
+        wrong.confirm_structure(str(state["run_id"]))
+
+
+class UnavailableRepositoryReader:
+    def __init__(self, repository_hint: str) -> None:
+        self._repository_hint = repository_hint
+
+    def repository_hint(self) -> str:
+        return self._repository_hint
+
+    def repository(self) -> Any:
+        raise GitHubReadError(
+            "github_read_failed", "simulated repository outage"
+        )
+
+    def delivery_graph(self, _parent_number: int) -> Any:
+        raise GitHubReadError(
+            "github_read_failed", "simulated repository outage"
+        )
+
+
+def test_repository_hint_guards_failure_record_when_remote_is_unavailable(
+    git_repo: Path,
+) -> None:
+    store = StateStore(git_repo / ".agent-run")
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _issue(2)}
+    )
+    state, _ = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        store,
+    ).start(1)
+    run_id = str(state["run_id"])
+    before = store.load_run(run_id)
+    assert before is not None
+
+    wrong = Controller(
+        UnavailableRepositoryReader("other/project"),
+        GitRepository(git_repo),
+        store,
+    )
+    assert not wrong.record_execution_failure(run_id, "wrong repo")
+    assert store.load_run(run_id) == before
+
+    correct = Controller(
+        UnavailableRepositoryReader("example/project"),
+        GitRepository(git_repo),
+        store,
+    )
+    assert correct.record_execution_failure(run_id, "correct repo outage")
+    recorded = store.load_run(run_id)
+    assert recorded is not None
+    assert recorded["status"] == "execution_failed"
+    assert recorded["terminal_kind"] == "execution_failed"

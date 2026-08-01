@@ -47,6 +47,10 @@ class TicketDeliveryEngine:
                 / f"ticket-{ticket_number}"
             )
             preserve_checkout = False
+            checkout_prepared = False
+            checkout_recoverable = self.git.ticket_checkout_matches(
+                checkout, str(job["ticket_branch"])
+            )
             try:
                 self.github.ensure_ticket_branch(
                     ticket_number=ticket_number,
@@ -58,6 +62,7 @@ class TicketDeliveryEngine:
                     base_sha=str(job["base_sha"]),
                     checkout=checkout,
                 )
+                checkout_prepared = True
                 result = TicketDeliveryLoop(
                     git=self.git,
                     states=self.states,
@@ -66,6 +71,19 @@ class TicketDeliveryEngine:
                 ).run(state, job, checkout)
                 preserve_checkout = result.get("status") == "waiting_checks"
                 return result
+            except KeyboardInterrupt:
+                # An explicit operator cancellation is a terminal cleanup
+                # request, unlike a recoverable Worker/process failure.
+                raise
+            except BaseException:
+                # Once the stable checkout is ready, any interrupted Worker or
+                # Publisher phase may have recoverable uncommitted state.
+                # Abrupt process exits leave it behind too, so surfaced errors
+                # must preserve the same resume semantics.
+                preserve_checkout = (
+                    checkout_recoverable or checkout_prepared
+                )
+                raise
             finally:
                 if not preserve_checkout:
                     self.git.remove_worktree(checkout)
@@ -117,6 +135,16 @@ class TicketDeliveryEngine:
         ):
             active["phase"] = TicketPhase.DEVELOPING.value
             active.pop("blocked_reason", None)
+            self._save(state)
+        elif (
+            active.get("phase") == TicketPhase.BLOCKED.value
+            and active.get("blocked_reason")
+            == "effective_revision_mismatch"
+        ):
+            # The live content may have changed and then returned to the same
+            # fingerprint. The persisted mismatch still invalidates every
+            # prior artifact, so rebuild instead of treating the Job as idle.
+            self._reset_for_revision(state, active, expected_revision)
             self._save(state)
         elif active.get("phase") == TicketPhase.BLOCKED.value:
             self._restore_blocked_projection(state, active)
@@ -206,10 +234,27 @@ class TicketDeliveryEngine:
         ticket_number: int,
         expected_revision: str,
     ) -> dict[str, Any]:
+        retired_generations = state.get("retired_ticket_generations", {})
+        retired_generation = (
+            retired_generations.get(str(ticket_number), 0)
+            if isinstance(retired_generations, dict)
+            else 0
+        )
+        generation = (
+            retired_generation + 1
+            if isinstance(retired_generation, int)
+            else 1
+        )
+        branch_suffix = (
+            f"ticket-{ticket_number}"
+            if generation == 1
+            else f"ticket-{ticket_number}-generation-{generation}"
+        )
         return {
             "ticket_branch": (
-                f"agent-run-ticket/{state['run_id']}/ticket-{ticket_number}"
+                f"agent-run-ticket/{state['run_id']}/{branch_suffix}"
             ),
+            "ticket_branch_generation": generation,
             "base_sha": self.git.resolve(str(state["run_branch"])),
             "effective_revision": expected_revision,
             "phase": TicketPhase.DEVELOPING.value,

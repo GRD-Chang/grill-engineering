@@ -3,11 +3,17 @@
 `agent-run` 是显式启动的本地 Delivery Run 控制器。当前实现支持：
 
 - 从 Parent Spec 启动或恢复 Delivery Run；
-- 选择一个 Active Ticket Job；
+- 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
 - 让持久 Development Thread 实现、修复和生成发布语义；
 - 为每轮候选创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
-  到 Run Branch，并显式关闭唯一 Primary Ticket。
+  到 Run Branch，并显式关闭唯一 Primary Ticket；
+- 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
+- 在 Ticket 集合或依赖边变化时暂停，给出 Ticket Graph Change Summary，并把人工确认
+  绑定到准确的新图版本；
+- Parent Spec 变化时由一次性 Codex 生成 Scope Impact Assessment；澄清自动吸收，
+  结构性变化绑定准确版本等待确认；
+- 全部 Ticket 完成后进入 `run_acceptance_pending`，不提前创建最终 Run PR。
 
 各智能角色的目标 Prompt 与证据合同见
 [`docs/agents/agent-prompts.md`](agents/agent-prompts.md)。
@@ -17,17 +23,42 @@
 ```bash
 agent-run start <parent-issue> --repo OWNER/REPO
 agent-run resume <run-id> --repo OWNER/REPO
+agent-run confirm-structure <run-id> --repo OWNER/REPO
 AGENT_RUN_GITHUB_APP_ID=<app-id> \
 AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
 AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
   agent-run deliver <run-id> --repo OWNER/REPO
 ```
 
-`start` 只创建 Run、Run Branch 和工作前沿；`deliver` 交付当前 Active Ticket。
+`start` 只创建 Run、Run Branch 和工作前沿；`deliver` 从当前 Active Ticket 开始，
+在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
+重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
 Required Checks 仍为 pending 时，命令保存 `waiting_checks` 状态并退出；稍后再次
 执行同一个 `deliver` 命令即可继续，不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
 原始 CI Evidence 交回同一 Development Thread。
+
+Ticket title/body 在运行中变化时，旧开发结果、Publication 和 Acceptance 会失效；
+Controller 沿用同一个 Ticket Job、Ticket Branch 和 Development Thread，从最新 revision
+自动重启。Issue 评论不参与 revision，Controller 自身产生的本地修改也不会改变 revision。
+Parent title/body 澄清会自动吸收并更新 Effective Revision。
+
+原生 Sub-issue 集合或 `blockedBy` 边发生变化时，Run 进入
+`structure_change_pending`。耐久状态中的 `graph_change_summary` 会列出新增/移除
+Ticket 与依赖边；纯执行顺序调整不会改变 Ticket Graph Revision。维护者确认当前提议
+版本后执行 `confirm-structure`；如果确认期间 GitHub 图再次变化，旧确认不会放行新图，
+Run 会继续暂停并生成新的变化摘要。
+
+Parent title/body 变化时，Controller 派发一次性 Codex，把新旧 Parent Spec、
+当前 Ticket Graph 与已完成工作交给它生成 Scope Impact Assessment。非结构性澄清自动
+吸收；改变 Ticket 集合、依赖、整体交付边界或使已完成工作需要返工的变化会进入同一个
+`structure_change_pending`，人工确认同样只绑定当前准确的 Parent Spec Revision。
+
+没有任何可执行 Ticket 时，Run 进入 `progress_exhausted`，并在
+`diagnostics[].remaining_tickets` 中列出每张剩余 Ticket 的原因。`terminal_kind` 进一步
+区分 `waiting_human`、`temporarily_no_work`、`permanent_blocked`、
+`structure_change_pending`、`execution_failed` 和 `all_tickets_completed`。最后一种对应
+`run_acceptance_pending`，它只是 Issue #5 Run Acceptance 的交接边界。
 
 ## 权限边界
 
@@ -74,18 +105,27 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 - 显式关闭 Primary Ticket并记录 Run、PR 与 integrated commit。
 
 每个 Ticket revision 最多允许十次产生真实 tree 变化的 Development Attempt。没有
-代码变化的 Attempt 不消耗预算；预算耗尽后 Ticket 会移除 `ready-for-agent` 并增加
-`ready-for-human`。
+代码变化的 Attempt 不消耗预算，但该 Ticket 会停止自动重试，Controller 先完成其他
+可执行分支；预算耗尽后 Ticket 会移除 `ready-for-agent` 并增加 `ready-for-human`。
 
 ## 本地状态与清理
 
 耐久状态位于 `.agent-run/runs/`。稳定 Development Checkout 位于
-`.agent-run/worktrees/`：Required Checks pending 时保留以供恢复，Ticket 完成、阻塞、
-异常或取消后清理。每轮独立 Validation Checkout 在验收结束后完整删除，允许验收期间
-创建构建、测试和诊断中间产物。Codex 的临时 schema、输出文件和空 GitHub 配置目录也会
-随子进程调用清理。
+`.agent-run/worktrees/`：Required Checks pending 或 Worker/Publisher 普通失败、超时、
+进程异常时保留，以恢复未提交成果；Ticket 完成、明确阻塞终止或操作者显式取消后清理。
+Checkout 尚未准备完成时产生的部分目录也会清理。每轮独立 Validation Checkout 在验收
+结束后完整删除，允许验收期间创建构建、测试和诊断中间产物。Codex 的临时 schema、输出
+文件和空 GitHub 配置目录也会随子进程调用清理。
+
+结构确认从 Ticket Set 移除已启动 Ticket 时，Controller 通过 Publisher 删除其稳定
+checkout 与本地 Ticket Branch，并记录已退役的 branch generation。同号 Ticket 后续
+重新加入会使用新的 branch generation，从当前 Run Branch 创建干净 Job，不继承旧
+revision 的未提交文件或提交。确认期间图再次变化时，待清理 Ticket 会作为耐久义务
+保留：最新图重新包含它则取消清理，最终确认的图仍不包含它才执行幂等清理。
 
 Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer、PR、merge 与
 blocker 历史；`active_ticket_job` 继续作为当前执行指针。刷新 Ticket Graph 可以把 active
 切到新的可执行 Ticket，但不会删除同一 Parent Ticket Set 内已经 blocked 或 completed 的
-Job；没有可执行 Ticket 时，顶层 diagnostics 从未解决的 Job-local blocker 重建。
+Job。进程在两张 Ticket 之间退出或失败时，下一次 `deliver` 会从耐久状态与 GitHub live
+事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭动作不会重复。没有可执行 Ticket
+时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。

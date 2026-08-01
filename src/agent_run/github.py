@@ -19,6 +19,9 @@ class GhGitHubReader:
         self.repository_override = repository_override
         self._repository: Repository | None = None
 
+    def repository_hint(self) -> str | None:
+        return self.repository_override
+
     def repository(self) -> Repository:
         if self._repository is not None:
             return self._repository

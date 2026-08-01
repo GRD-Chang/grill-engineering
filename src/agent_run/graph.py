@@ -4,7 +4,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.models import DeliveryGraph, Issue
-from agent_run.revisions import fingerprint
+from agent_run.revisions import (
+    effective_revision,
+    fingerprint,
+    ticket_graph_revision,
+)
 from agent_run.ticket_phase import BLOCKED_MESSAGES, TicketPhase
 
 
@@ -50,15 +54,27 @@ def state_from_graph(
         )
 
     tickets: dict[str, Any] = {}
-    frontier: list[int] = []
     for number in order:
         issue = graph.issues[number]
         eligible, reason = _eligibility(issue)
-        if eligible:
-            frontier.append(number)
         tickets[str(number)] = _ticket_state(issue, eligible, reason)
 
     ticket_jobs = _retained_ticket_jobs(previous, order)
+    parent_revision = fingerprint(
+        {"title": graph.parent.title, "body": graph.parent.body}
+    )
+    ticket_graph = _ticket_graph_state(graph, order, tickets)
+    frontier = [
+        number
+        for number in order
+        if tickets[str(number)]["eligibility"]["eligible"]
+        and _job_is_executable(
+            ticket_jobs.get(str(number)),
+            ticket=tickets[str(number)],
+            parent_revision=parent_revision,
+            graph_revision=str(ticket_graph["revision"]),
+        )
+    ]
     active: dict[str, Any] | None
     if frontier:
         selected = frontier[0]
@@ -96,24 +112,32 @@ def state_from_graph(
         active = _first_job_in_phase(
             ticket_jobs, order, TicketPhase.ESCALATING
         )
-        unresolved = active or _first_unresolved_blocked_job(
-            ticket_jobs, order
-        )
-        if unresolved is not None:
-            status = (
-                "escalating"
-                if active is not None
-                else "blocked"
+        if active is None:
+            active = _first_job_in_phase(
+                ticket_jobs, order, TicketPhase.MERGED
             )
-            diagnostics = [_job_diagnostic(unresolved)]
+        if _all_ticket_jobs_completed(ticket_jobs, order):
+            status = "run_acceptance_pending"
+            diagnostics = []
+        elif active is not None:
+            if active.get("phase") == TicketPhase.ESCALATING.value:
+                status = "escalating"
+                diagnostics = [_job_diagnostic(active)]
+            else:
+                status = "active"
+                diagnostics = []
         else:
             status = "progress_exhausted"
+            remaining = _remaining_ticket_reasons(
+                tickets, ticket_jobs, order
+            )
             diagnostics = [
                 {
                     "code": "no_executable_ticket",
                     "message": (
                         "No open, ready and unblocked Ticket is executable"
                     ),
+                    "remaining_tickets": remaining,
                 }
             ]
 
@@ -124,16 +148,23 @@ def state_from_graph(
                 "number": graph.parent.number,
                 "title": graph.parent.title,
                 "body": graph.parent.body,
-                "revision": fingerprint(
-                    {"title": graph.parent.title, "body": graph.parent.body}
-                ),
+                "revision": parent_revision,
             },
-            "ticket_graph": _ticket_graph_state(graph, order, tickets),
+            "ticket_graph": ticket_graph,
             "frontier": frontier,
             "active_ticket_job": active,
             "ticket_jobs": ticket_jobs,
             "status": status,
             "diagnostics": diagnostics,
+            "terminal_kind": (
+                "all_tickets_completed"
+                if status == "run_acceptance_pending"
+                else (
+                    _exhaustion_kind(diagnostics[0]["remaining_tickets"])
+                    if status == "progress_exhausted"
+                    else None
+                )
+            ),
             "updated_at": _now(),
         }
     )
@@ -170,6 +201,7 @@ def _blocked_graph_state(
             "active_ticket_job": None,
             "ticket_jobs": ticket_jobs,
             "status": "blocked",
+            "terminal_kind": "permanent_blocked",
             "diagnostics": [diagnostic],
             "updated_at": _now(),
         }
@@ -208,18 +240,80 @@ def _first_job_in_phase(
     return None
 
 
-def _first_unresolved_blocked_job(
-    ticket_jobs: dict[str, dict[str, Any]], order: list[int]
-) -> dict[str, Any] | None:
+def _remaining_ticket_reasons(
+    tickets: dict[str, Any],
+    ticket_jobs: dict[str, dict[str, Any]],
+    order: list[int],
+) -> list[dict[str, Any]]:
+    remaining: list[dict[str, Any]] = []
     for number in order:
         job = ticket_jobs.get(str(number))
-        if (
-            isinstance(job, dict)
-            and job.get("phase") == TicketPhase.BLOCKED.value
-            and job.get("blocked_reason") != "no_code_changes"
-        ):
-            return job
-    return None
+        if isinstance(job, dict) and job.get("phase") == TicketPhase.COMPLETED:
+            continue
+        reason = job.get("blocked_reason") if isinstance(job, dict) else None
+        if not isinstance(reason, str):
+            eligibility = tickets[str(number)]["eligibility"]
+            reason = str(eligibility["reason"])
+        remaining.append({"ticket_number": number, "reason": reason})
+    return remaining
+
+
+def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
+    human_reasons = {
+        "reviewer_requires_human",
+        "modification_budget_exhausted",
+        "ticket_pr_closed_unmerged",
+        "unexpected_external_merge",
+        "published_head_mismatch",
+        "acceptance_record_mismatch",
+        "merged_result_mismatch",
+        "no_code_changes",
+    }
+    if any(
+        item.get("reason") in human_reasons
+        or str(item.get("reason", "")).startswith("disqualifying_label:")
+        for item in remaining
+    ):
+        return "waiting_human"
+    return "temporarily_no_work"
+
+
+def _all_ticket_jobs_completed(
+    ticket_jobs: dict[str, dict[str, Any]], order: list[int]
+) -> bool:
+    return bool(order) and all(
+        ticket_jobs.get(str(number), {}).get("phase")
+        == TicketPhase.COMPLETED.value
+        for number in order
+    )
+
+
+def _job_is_executable(
+    job: dict[str, Any] | None,
+    *,
+    ticket: dict[str, Any],
+    parent_revision: str,
+    graph_revision: str,
+) -> bool:
+    if job is None:
+        return True
+    phase = job.get("phase")
+    if phase == TicketPhase.COMPLETED.value:
+        return False
+    if phase != TicketPhase.BLOCKED.value:
+        return True
+    if job.get("blocked_reason") == "effective_revision_mismatch":
+        # The blocker itself is durable evidence that prior artifacts were
+        # invalidated. A later ABA edit can restore the same fingerprint, but
+        # it must not resurrect the discarded Candidate or Acceptance.
+        return True
+    expected = effective_revision(
+        ticket_revision=str(ticket["content_revision"]),
+        parent_revision=parent_revision,
+        graph_revision=graph_revision,
+    )
+    current = job.get("effective_revision")
+    return isinstance(current, str) and current != expected
 
 
 def _job_diagnostic(job: dict[str, Any]) -> dict[str, Any]:
@@ -238,18 +332,8 @@ def _ticket_graph_state(
     order: list[int],
     tickets: dict[str, Any],
 ) -> dict[str, Any]:
-    revision_input = {
-        "tickets": order,
-        "dependencies": {
-            str(number): sorted(
-                blocker.number for blocker in graph.issues[number].blocked_by
-            )
-            for number in order
-            if number in graph.issues
-        },
-    }
     return {
-        "revision": fingerprint(revision_input),
+        "revision": ticket_graph_revision(graph),
         "ordered_ticket_numbers": order,
         "order_source": (
             "github_sub_issues"
@@ -281,11 +365,11 @@ def _ticket_state(issue: Issue, eligible: bool, reason: str) -> dict[str, Any]:
 def _eligibility(issue: Issue) -> tuple[bool, str]:
     if issue.state.upper() != "OPEN":
         return False, "ticket_closed"
-    if "ready-for-agent" not in issue.labels:
-        return False, "missing_ready_for_agent"
     disqualifying = sorted(issue.labels & DISQUALIFYING_LABELS)
     if disqualifying:
         return False, f"disqualifying_label:{disqualifying[0]}"
+    if "ready-for-agent" not in issue.labels:
+        return False, "missing_ready_for_agent"
     if any(
         blocker.state.upper() != "CLOSED" for blocker in issue.blocked_by
     ):

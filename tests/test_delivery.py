@@ -1151,35 +1151,25 @@ def test_no_change_attempt_does_not_consume_modification_budget(
     resumed, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
-    assert resumed["status"] == "active"
-    assert resumed["diagnostics"] == []
-    assert resumed["active_ticket_job"]["blocked_reason"] == "no_code_changes"
-
-    second_agents = NoChangeAgents(checkout)
-    retried = TicketDeliveryEngine(
-        git=GitRepository(git_repo),
-        states=states,
-        github=github,
-        agents=second_agents,
-    ).deliver(state["run_id"])
-    assert retried["active_ticket_job"]["modification_attempts"] == 0
-    assert retried["active_ticket_job"]["phase"] == "blocked"
-    assert first_agents.calls == second_agents.calls == 1
-
-    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
-    fixture_data["issues"]["3"]["labels"].append("ready-for-human")
-    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    exhausted, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).resume(state["run_id"])
-    assert exhausted["status"] == "progress_exhausted"
-    assert exhausted["active_ticket_job"] is None
-    assert exhausted["ticket_jobs"]["3"]["blocked_reason"] == (
+    assert resumed["status"] == "progress_exhausted"
+    assert resumed["active_ticket_job"] is None
+    assert resumed["ticket_jobs"]["3"]["modification_attempts"] == 0
+    assert resumed["ticket_jobs"]["3"]["blocked_reason"] == (
         "no_code_changes"
     )
+    assert first_agents.calls == 1
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["issues"]["3"]["body"] += "\nNew authoritative detail."
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    revised, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).resume(state["run_id"])
+    assert revised["status"] == "active"
+    assert revised["active_ticket_job"]["ticket_number"] == 3
 
 
-def test_cancelled_worker_still_cleans_ticket_checkout(
+def test_cancelled_worker_cleans_stable_ticket_checkout(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -1511,18 +1501,6 @@ def test_pr_closed_between_ensure_and_first_live_read_is_recoverable(
     )
     assert blocked["active_ticket_job"]["pr_number"] == 11
     assert publisher.created_prs == 1
-    resumed, _ = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).resume(state["run_id"])
-    assert resumed["status"] == "blocked"
-    assert resumed["diagnostics"] == [
-        {
-            "code": "ticket_pr_closed_unmerged",
-            "message": "Current Ticket PR was closed without merging",
-            "ticket_number": 3,
-        }
-    ]
-
     projected = engine.deliver(state["run_id"])
 
     assert projected["status"] == "blocked"
@@ -1535,18 +1513,23 @@ def test_pr_closed_between_ensure_and_first_live_read_is_recoverable(
     ]
     assert projected["active_ticket_job"]["pr_number"] == 11
     assert publisher.created_prs == 1
-    refreshed = states.load_run(state["run_id"])
-    assert refreshed is not None
-    refreshed["ticket_graph"]["tickets"]["3"][
-        "content_revision"
-    ] = "sha256:create-close-new-content"
-    states.save_run(state["run_id"], refreshed)
-
-    repeated = engine.deliver(state["run_id"])
-
-    assert repeated["status"] == "blocked"
-    assert repeated["active_ticket_job"]["pr_number"] == 11
-    assert publisher.created_prs == 1
+    resumed, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).resume(state["run_id"])
+    assert resumed["status"] == "progress_exhausted"
+    assert resumed["active_ticket_job"] is None
+    assert resumed["diagnostics"] == [
+        {
+            "code": "no_executable_ticket",
+            "message": "No open, ready and unblocked Ticket is executable",
+            "remaining_tickets": [
+                {
+                    "ticket_number": 3,
+                    "reason": "ticket_pr_closed_unmerged",
+                }
+            ],
+        }
+    ]
     assert publisher.closed_issues == []
 
 
@@ -2166,12 +2149,17 @@ def test_lost_escalation_response_cannot_return_to_acceptance(
     ).resume(state["run_id"])
     assert projected["active_ticket_job"] is None
     assert projected["ticket_jobs"]["3"]["phase"] == "blocked"
-    assert projected["status"] == "blocked"
+    assert projected["status"] == "progress_exhausted"
     assert projected["diagnostics"] == [
         {
-            "code": "modification_budget_exhausted",
-            "message": "Ticket requires explicit human intervention",
-            "ticket_number": 3,
+            "code": "no_executable_ticket",
+            "message": "No open, ready and unblocked Ticket is executable",
+            "remaining_tickets": [
+                {
+                    "ticket_number": 3,
+                    "reason": "modification_budget_exhausted",
+                }
+            ],
         }
     ]
 

@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from agent_run.agent_fixture import FixtureAgentBackend
+from agent_run.agent_fixture import (
+    FixtureAgentBackend,
+    FixtureScopeImpactAssessor,
+)
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
@@ -14,7 +17,9 @@ from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
-from agent_run.state import StateStore
+from agent_run.run_orchestration import DeliveryRunEngine
+from agent_run.state import FaultInjectingStateStore, StateStore
+from agent_run.worker_sandbox import WorkerSandboxError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subcommands.add_parser("resume", help="按稳定 Run ID 恢复 Delivery Run")
     resume.add_argument("run_id", help="Delivery Run 标识")
     _add_common_options(resume)
+    confirm_structure = subcommands.add_parser(
+        "confirm-structure",
+        help="确认当前待处理的 Ticket 图结构变化",
+    )
+    confirm_structure.add_argument("run_id", help="Delivery Run 标识")
+    _add_common_options(confirm_structure)
     deliver = subcommands.add_parser(
         "deliver", help="交付当前 Active Ticket Job"
     )
@@ -44,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     parsed = parser.parse_args(arguments)
+    controller: Controller | None = None
     try:
         git = GitRepository.discover(Path.cwd())
         state_root = (
@@ -51,47 +63,61 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if parsed.state_dir
             else git.root / ".agent-run"
         )
+        fixture_path = (
+            Path(parsed.github_fixture) if parsed.github_fixture else None
+        )
         github = (
-            FixtureGitHubReader(Path(parsed.github_fixture))
-            if parsed.github_fixture
+            FixtureGitHubReader(fixture_path)
+            if fixture_path is not None
             else GhGitHubReader(parsed.repo)
         )
-        states = StateStore(state_root)
-        controller = Controller(github, git, states)
+        scope_assessor = (
+            FixtureScopeImpactAssessor(fixture_path)
+            if fixture_path is not None
+            else CodexCliBackend()
+        )
+        crash_after_save = getattr(parsed, "crash_after_save", None)
+        states = (
+            FaultInjectingStateStore(
+                state_root, crash_after_save=crash_after_save
+            )
+            if isinstance(crash_after_save, int)
+            else StateStore(state_root)
+        )
+        controller = Controller(
+            github, git, states, scope_assessor=scope_assessor
+        )
         if parsed.command == "start":
             state, resumed = controller.start(parsed.parent)
         elif parsed.command == "resume":
             state, resumed = controller.resume(parsed.run_id)
+        elif parsed.command == "confirm-structure":
+            state, resumed = controller.confirm_structure(parsed.run_id)
         else:
-            existing = states.load_run(parsed.run_id)
-            if existing is not None and existing.get("status") == "ticket_completed":
-                state = existing
-                resumed = True
-            else:
-                refreshed, _ = controller.resume(parsed.run_id)
-                if refreshed.get("active_ticket_job") is None:
-                    raise ValueError("Delivery Run has no Active Ticket Job")
-                agent_fixture = getattr(parsed, "agent_fixture", None)
-                agents = (
-                    FixtureAgentBackend(Path(agent_fixture))
-                    if agent_fixture
-                    else CodexCliBackend()
+            agent_fixture = getattr(parsed, "agent_fixture", None)
+            agents = (
+                FixtureAgentBackend(Path(agent_fixture))
+                if agent_fixture
+                else CodexCliBackend()
+            )
+            publisher = (
+                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                if parsed.github_fixture
+                else GhGitHubPublisher(
+                    github.repository().name_with_owner,
+                    git,
                 )
-                publisher = (
-                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                    if parsed.github_fixture
-                    else GhGitHubPublisher(
-                        github.repository().name_with_owner,
-                        git,
-                    )
-                )
-                state = TicketDeliveryEngine(
+            )
+            state = DeliveryRunEngine(
+                controller=controller,
+                tickets=TicketDeliveryEngine(
                     git=git,
                     states=states,
                     github=publisher,
                     agents=agents,
-                ).deliver(parsed.run_id)
-                resumed = True
+                ),
+            ).deliver(parsed.run_id)
+            resumed = True
         output = {
             "result": "resumed" if resumed else "started",
             "run_id": state["run_id"],
@@ -107,7 +133,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return (
             0
-            if state["status"] in {"active", "ticket_completed", "waiting_checks"}
+            if state["status"]
+            in {
+                "active",
+                "ticket_completed",
+                "waiting_checks",
+                "run_acceptance_pending",
+            }
             else 2
         )
     except (
@@ -116,12 +148,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
         GitHubReadError,
         OSError,
         ValueError,
+        WorkerSandboxError,
     ) as error:
+        run_id = getattr(parsed, "run_id", None)
+        failure_recorded = False
+        if controller is not None and isinstance(run_id, str):
+            failure_recorded = controller.record_execution_failure(
+                run_id, str(error)
+            )
         print(
             json.dumps(
                 {
                     "result": "error",
-                    "status": "blocked",
+                    "status": (
+                        "execution_failed" if failure_recorded else "blocked"
+                    ),
                     "diagnostics": [
                         {
                             "code": "command_failed",
@@ -147,6 +188,11 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--github-fixture",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--crash-after-save",
+        type=_positive_integer,
         help=argparse.SUPPRESS,
     )
 

@@ -143,9 +143,9 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     )
 
     assert delivered.returncode == 0, delivered.stderr
-    assert stdout_json(delivered)["status"] == "ticket_completed"
+    assert stdout_json(delivered)["status"] == "run_acceptance_pending"
     state = load_only_run_state(git_repo)
-    job = state["active_ticket_job"]
+    job = state["ticket_jobs"]["3"]
     assert job["development_thread_id"] == "developer-1"
     assert job["reviewer_thread_ids"] == ["reviewer-1", "reviewer-2"]
     assert job["modification_attempts"] == 2
@@ -181,8 +181,11 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
         str(agent_fixture),
     )
     assert replayed.returncode == 0, replayed.stderr
-    assert stdout_json(replayed)["status"] == "ticket_completed"
-    assert load_only_run_state(git_repo)["status"] == "ticket_completed"
+    assert stdout_json(replayed)["status"] == "run_acceptance_pending"
+    assert (
+        load_only_run_state(git_repo)["status"]
+        == "run_acceptance_pending"
+    )
     replay_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(replay_fixture["delivery"]["pull_requests"]) == 1
     assert replay_fixture["delivery"]["closed_issues"] == [3]
@@ -246,8 +249,8 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
 
     assert completed.returncode == 0, completed.stderr
     state = load_only_run_state(git_repo)
-    assert state["status"] == "ticket_completed"
-    assert state["active_ticket_job"]["modification_attempts"] == 1
+    assert state["status"] == "run_acceptance_pending"
+    assert state["ticket_jobs"]["3"]["modification_attempts"] == 1
     assert git_link
     assert not checkout.exists()
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
@@ -297,7 +300,11 @@ def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:
 
     assert result.returncode == 2
     state = load_only_run_state(git_repo)
-    assert state["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert state["status"] == "progress_exhausted"
+    assert state["terminal_kind"] == "waiting_human"
+    assert state["diagnostics"][0]["remaining_tickets"] == [
+        {"ticket_number": 3, "reason": "published_head_mismatch"}
+    ]
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert mutable_fixture["delivery"]["closed_issues"] == []
     assert mutable_fixture["delivery"]["pull_requests"][0]["state"] == "OPEN"
@@ -409,7 +416,7 @@ def test_ticket_revision_change_invalidates_old_acceptance_and_reuses_job(
 
     assert completed.returncode == 0, completed.stderr
     state = load_only_run_state(git_repo)
-    job = state["active_ticket_job"]
+    job = state["ticket_jobs"]["3"]
     assert job["effective_revision"] != old_revision
     assert job["development_thread_id"] == "developer-1"
     assert job["reviewer_thread_ids"] == ["reviewer-1", "reviewer-2"]

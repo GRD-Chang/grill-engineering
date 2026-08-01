@@ -17,12 +17,11 @@ class FixtureGitHubReader:
     """供黑盒测试使用的确定性 GitHub 只读适配器。"""
 
     def __init__(self, path: Path) -> None:
-        loaded: object = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            raise GitHubReadError("invalid_fixture", "fixture root must be an object")
-        self.data = loaded
+        self.path = path
+        self.data = self._load()
 
     def repository(self) -> Repository:
+        self.data = self._load()
         default_head = self.data.get("default_head_sha")
         return Repository(
             name_with_owner=_string(self.data, "repository"),
@@ -30,7 +29,13 @@ class FixtureGitHubReader:
             default_head_sha=default_head if isinstance(default_head, str) else None,
         )
 
+    def repository_hint(self) -> str | None:
+        self.data = self._load()
+        repository = self.data.get("repository")
+        return repository if isinstance(repository, str) else None
+
     def delivery_graph(self, parent_number: int) -> DeliveryGraph:
+        self.data = self._load()
         configured_error = self.data.get("error")
         if isinstance(configured_error, dict):
             raise GitHubReadError(
@@ -73,6 +78,14 @@ class FixtureGitHubReader:
             issues[number] = _parse_issue(raw_issue)
         return DeliveryGraph(parent=parent, issues=issues)
 
+    def _load(self) -> dict[str, Any]:
+        loaded: object = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise GitHubReadError(
+                "invalid_fixture", "fixture root must be an object"
+            )
+        return loaded
+
 
 class FixtureGitHubPublisher:
     """Mutable GitHub substitute for black-box delivery scenarios."""
@@ -103,13 +116,11 @@ class FixtureGitHubPublisher:
         base_branch: str,
     ) -> None:
         linked = _mutable_mapping(self._delivery(), "linked_branches")
-        existing = linked.get(str(ticket_number))
-        if existing not in {None, branch}:
-            raise ValueError("fixture ticket already has a different branch")
         linked[str(ticket_number)] = branch
         published = _mutable_mapping(self._delivery(), "published_branches")
         published.setdefault(branch, self.git.resolve(base_branch))
         self._save()
+        self._crash_once("ensure_ticket_branch")
 
     def publish_branch(
         self,
@@ -125,6 +136,8 @@ class FixtureGitHubPublisher:
             raise ValueError("fixture remote ticket branch drifted")
         published[branch] = head_sha
         self._save()
+        self._inject_revision_drift("publish_branch")
+        self._crash_once("publish_branch")
 
     def ensure_ticket_pr(
         self,
@@ -158,6 +171,8 @@ class FixtureGitHubPublisher:
             pulls.append(pull)
         pull.update({"title": title, "body": body})
         self._save()
+        self._inject_revision_drift("ensure_ticket_pr")
+        self._crash_once("ensure_ticket_pr")
         return int(pull["number"])
 
     def required_checks(self, pr_number: int) -> str:
@@ -171,6 +186,7 @@ class FixtureGitHubPublisher:
         value = str(sequence[min(position, len(sequence) - 1)])
         delivery["check_position"] = position + 1
         self._save()
+        self._inject_revision_drift("required_checks")
         return value
 
     def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
@@ -231,6 +247,7 @@ class FixtureGitHubPublisher:
         else:
             records.append(replacement)
         self._save()
+        self._crash_once("record_acceptance")
 
     def squash_merge(
         self,
@@ -283,18 +300,21 @@ class FixtureGitHubPublisher:
             {"state": "MERGED", "integrated_sha": integrated}
         )
         self._save()
+        self._crash_once("squash_merge")
         return integrated
 
     def sync_run_branch(
         self, *, run_branch: str, integrated_sha: str
     ) -> None:
         if self.git.resolve(run_branch) == integrated_sha:
+            self._crash_once("sync_run_branch")
             return
         subprocess.run(
             ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha],
             cwd=self.git.root,
             check=True,
         )
+        self._crash_once("sync_run_branch")
 
     def close_primary_ticket(
         self,
@@ -326,7 +346,28 @@ class FixtureGitHubPublisher:
         issue = raw_issues.get(str(ticket_number))
         if isinstance(issue, dict):
             issue["state"] = "CLOSED"
+        for raw_issue in raw_issues.values():
+            if not isinstance(raw_issue, dict):
+                continue
+            blockers = raw_issue.get("blocked_by")
+            if not isinstance(blockers, list):
+                continue
+            for blocker in blockers:
+                if (
+                    isinstance(blocker, dict)
+                    and blocker.get("number") == ticket_number
+                ):
+                    blocker["state"] = "CLOSED"
+        crash_after_close = bool(
+            self._delivery().get("crash_after_close_once")
+        )
+        if crash_after_close:
+            self._delivery()["crash_after_close_once"] = False
         self._save()
+        if crash_after_close:
+            raise OSError(
+                "simulated lost response after Primary Ticket close"
+            )
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         raw_issues = _mutable_mapping(self.data, "issues")
@@ -350,7 +391,9 @@ class FixtureGitHubPublisher:
         ticket_number: int,
         expected_revision: str,
     ) -> str:
-        graph = FixtureGitHubReader(self.path).delivery_graph(parent_number)
+        reader = FixtureGitHubReader(self.path)
+        graph = reader.delivery_graph(parent_number)
+        self.data = reader.data
         return effective_revision_from_graph(graph, ticket_number)
 
     def _delivery(self) -> dict[str, Any]:
@@ -380,6 +423,44 @@ class FixtureGitHubPublisher:
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+
+    def _crash_once(self, action: str) -> None:
+        key = f"crash_after_{action}_once"
+        if not bool(self._delivery().get(key)):
+            return
+        self._delivery()[key] = False
+        self._save()
+        raise OSError(f"simulated lost response after {action}")
+
+    def _inject_revision_drift(self, action: str) -> None:
+        configured = self._delivery().get("drift_after")
+        if (
+            not isinstance(configured, dict)
+            or configured.get("action") != action
+            or configured.get("injected") is True
+        ):
+            return
+        parent = _mutable_mapping(self.data, "parent")
+        sub_issues = parent.get("sub_issues")
+        if not isinstance(sub_issues, list) or not sub_issues:
+            raise ValueError("fixture parent.sub_issues must be a non-empty list")
+        raw_number = configured.get("ticket_number", sub_issues[0])
+        if not isinstance(raw_number, int):
+            raise ValueError("fixture drift ticket_number must be an integer")
+        kind = configured.get("kind")
+        if kind == "ticket_content":
+            issue = _mutable_mapping(
+                _mutable_mapping(self.data, "issues"), str(raw_number)
+            )
+            issue["body"] = f"{_string(issue, 'body')}\nChanged during publish."
+        elif kind == "ticket_removal":
+            parent["sub_issues"] = [
+                number for number in sub_issues if number != raw_number
+            ]
+        else:
+            raise ValueError("fixture drift kind is invalid")
+        configured["injected"] = True
+        self._save()
 
 
 def _parse_issue(data: dict[str, Any]) -> Issue:

@@ -252,6 +252,10 @@ _Avoid_: Issue 评论、Git commit、Ticket Job ID
 一个 Delivery Run 当前 Ticket Set 和 `blockedBy` 依赖边的稳定版本指纹。指纹变化表示交付范围或推进关系发生变化，继续运行前必须重新确认。
 _Avoid_: Ticket Content Revision、执行顺序、运行状态
 
+**Ticket Graph Change Summary（Ticket 图变化摘要）**:
+Controller 在 Ticket Graph Revision 变化时确定性生成的集合与依赖边差异，列出新增或移除的 Ticket 和 `blockedBy` 边，帮助维护者理解待确认的新图。它是客观结构差异，不替代由 Codex Worker 对 Parent Spec 变化作出的 Scope Impact Assessment。
+_Avoid_: 语义范围判断、执行顺序变化、Parent Spec 影响评估
+
 **Ticket Set（Ticket 集合）**:
 Parent Spec 的 GitHub 原生 `subIssues` 所定义的 Delivery Run 工作范围。Issue 正文、标签或普通编号列表不能增加或移除其中的 Ticket。
 _Avoid_: 搜索结果、ready-for-agent 标签集合、依赖邻接节点

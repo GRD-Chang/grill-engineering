@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 
+class SimulatedProcessCrash(OSError):
+    """Fault-injection signal whose cleanup matches an abrupt process exit."""
+
+
 class StateStore:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -89,3 +93,24 @@ class StateStore:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+class FaultInjectingStateStore(StateStore):
+    """Black-box test seam that crashes after one durable state write."""
+
+    def __init__(self, root: Path, *, crash_after_save: int) -> None:
+        if crash_after_save < 1:
+            raise ValueError("crash_after_save must be positive")
+        super().__init__(root)
+        self.crash_after_save = crash_after_save
+        self.save_count = 0
+        self.injected = False
+
+    def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        super().save_run(run_id, state)
+        self.save_count += 1
+        if not self.injected and self.save_count == self.crash_after_save:
+            self.injected = True
+            raise SimulatedProcessCrash(
+                f"simulated crash after durable save #{self.save_count}"
+            )

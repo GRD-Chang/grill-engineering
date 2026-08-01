@@ -6,6 +6,10 @@ import json
 from agent_run.models import DeliveryGraph
 
 
+class TicketGraphDriftError(RuntimeError):
+    pass
+
+
 def fingerprint(value: object) -> str:
     encoded = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -28,25 +32,35 @@ def effective_revision(
     )
 
 
-def effective_revision_from_graph(
-    graph: DeliveryGraph, ticket_number: int
-) -> str:
-    order = list(graph.parent.sub_issue_numbers)
-    if not graph.parent.sub_issue_order_reliable:
-        order.sort()
-    graph_revision = fingerprint(
+def ticket_graph_revision(graph: DeliveryGraph) -> str:
+    """Fingerprint delivery scope and dependencies, never scheduling order."""
+    ticket_numbers = sorted(set(graph.parent.sub_issue_numbers))
+    return fingerprint(
         {
-            "tickets": order,
+            "tickets": ticket_numbers,
             "dependencies": {
                 str(number): sorted(
                     blocker.number
                     for blocker in graph.issues[number].blocked_by
                 )
-                for number in order
+                for number in ticket_numbers
                 if number in graph.issues
             },
         }
     )
+
+
+def effective_revision_from_graph(
+    graph: DeliveryGraph, ticket_number: int
+) -> str:
+    graph_revision = ticket_graph_revision(graph)
+    if (
+        ticket_number not in graph.parent.sub_issue_numbers
+        or ticket_number not in graph.issues
+    ):
+        raise TicketGraphDriftError(
+            f"Ticket #{ticket_number} is no longer present in the live graph"
+        )
     ticket = graph.issues[ticket_number]
     return effective_revision(
         ticket_revision=fingerprint(

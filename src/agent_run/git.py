@@ -77,16 +77,7 @@ class GitRepository:
         checkout: Path,
     ) -> None:
         if checkout.exists():
-            branch_result = self._run_in(
-                checkout, "rev-parse", "--abbrev-ref", "HEAD"
-            )
-            branch_head = self._resolve(f"refs/heads/{branch}")
-            checkout_head = self._resolve_in(checkout, "HEAD")
-            if (
-                branch_result.returncode == 0
-                and branch_result.stdout.strip() == branch
-                and branch_head == checkout_head
-            ):
+            if self.ticket_checkout_matches(checkout, branch):
                 return
             raise GitError("existing ticket checkout does not match its branch")
         self.remove_worktree(checkout)
@@ -99,6 +90,38 @@ class GitRepository:
         added = self._run("worktree", "add", "--force", str(checkout), branch)
         if added.returncode != 0:
             raise GitError(added.stderr.strip() or "could not create ticket checkout")
+
+    def ticket_checkout_matches(self, checkout: Path, branch: str) -> bool:
+        if not checkout.exists():
+            return False
+        branch_result = self._run_in(
+            checkout, "rev-parse", "--abbrev-ref", "HEAD"
+        )
+        branch_head = self._resolve(f"refs/heads/{branch}")
+        checkout_result = self._run_in(
+            checkout, "rev-parse", "--verify", "HEAD"
+        )
+        checkout_head = (
+            checkout_result.stdout.strip()
+            if checkout_result.returncode == 0
+            else None
+        )
+        return (
+            branch_result.returncode == 0
+            and branch_result.stdout.strip() == branch
+            and branch_head is not None
+            and branch_head == checkout_head
+        )
+
+    def delete_branch(self, branch: str) -> None:
+        if self._resolve(f"refs/heads/{branch}") is None:
+            return
+        deleted = self._run("branch", "-D", branch)
+        if deleted.returncode != 0:
+            raise GitError(
+                deleted.stderr.strip()
+                or f"could not delete branch {branch}"
+            )
 
     def prepare_validation_checkout(
         self, *, head_sha: str, checkout: Path
@@ -271,3 +294,7 @@ class Publisher:
 
     def ensure_run_branch(self, branch: str, base_sha: str) -> None:
         self.git.ensure_run_branch(branch, base_sha)
+
+    def retire_ticket_branch(self, branch: str, checkout: Path) -> None:
+        self.git.remove_worktree(checkout)
+        self.git.delete_branch(branch)
