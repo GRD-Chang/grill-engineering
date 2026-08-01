@@ -21,6 +21,7 @@ class FixtureAgentBackend:
             "developments": 0,
             "publications": 0,
             "reviews": 0,
+            "run_publications": 0,
             "scope_assessments": 0,
         }
 
@@ -107,6 +108,10 @@ class FixtureAgentBackend:
             thread_id=_string(step, "thread_id"),
             artifact=artifact,
         )
+
+    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        del request
+        return self._next("run_publications")
 
     def assess_scope(self, request: dict[str, Any]) -> dict[str, Any]:
         del request

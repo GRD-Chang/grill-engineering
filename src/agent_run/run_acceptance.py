@@ -210,6 +210,17 @@ class RunAcceptanceEngine:
         # with every prior Ticket and Run identity so a repair reviewer cannot
         # accidentally reuse any of them.
         prior_threads = sorted(self._all_prior_threads(state, run))
+        repair_request = run.pop("repair_request", {})
+        if not isinstance(repair_request, dict):
+            raise ValueError("repair_request must be an object")
+        repair_source = str(repair_request.get("repair_source", "acceptance"))
+        if repair_source not in {
+            "acceptance",
+            "human_revision",
+            "required_checks",
+            "merge_conflict",
+        }:
+            raise ValueError("invalid Run Repair source")
         job = {
             "run_id": state["run_id"],
             "phase": "developing",
@@ -219,7 +230,7 @@ class RunAcceptanceEngine:
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
             "ticket_completion_records": self._ticket_completion_records(state),
-            "repair_source": "acceptance",
+            "repair_source": repair_source,
             "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
             "modification_attempts": int(run["modification_attempts"]),
             "validation_attempts": 0,
@@ -228,6 +239,21 @@ class RunAcceptanceEngine:
             "reviewer_thread_ids": prior_threads,
             "prior_reviewer_thread_ids": prior_threads,
         }
+        if repair_source == "human_revision":
+            feedback = repair_request.get("human_feedback")
+            if not isinstance(feedback, str) or not feedback.strip():
+                raise ValueError("human revision feedback must be non-empty")
+            job["human_feedback"] = feedback.strip()
+        if repair_source == "required_checks":
+            evidence = repair_request.get("ci_evidence")
+            if not isinstance(evidence, dict):
+                raise ValueError("required-check repair evidence must be an object")
+            job["ci_evidence"] = evidence
+        if repair_source == "merge_conflict":
+            evidence = repair_request.get("merge_conflict_evidence")
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise ValueError("merge-conflict repair evidence must be non-empty")
+            job["merge_conflict_evidence"] = evidence.strip()
         run["repair_job"] = job
         self._save(state)
         return job
@@ -305,7 +331,7 @@ class RunAcceptanceEngine:
         parent["url"] = self._issue_url(state, int(parent["number"]))
         return {
             "acceptance_scope": "run",
-            "repair_source": "acceptance",
+            "repair_source": job.get("repair_source", "acceptance"),
             "run_id": state["run_id"],
             "parent": parent,
             "ticket_graph": self._mapping(state, "ticket_graph"),
@@ -316,6 +342,9 @@ class RunAcceptanceEngine:
             "thread_id": job.get("development_thread_id"),
             "development_summary": job.get("development_summary"),
             "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
+            "human_feedback": job.get("human_feedback"),
+            "ci_evidence": job.get("ci_evidence"),
+            "merge_conflict_evidence": job.get("merge_conflict_evidence"),
         }
 
     def _publication_request(

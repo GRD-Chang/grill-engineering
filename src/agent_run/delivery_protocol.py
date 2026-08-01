@@ -4,6 +4,20 @@ from typing import Any, Protocol
 
 
 class GitHubPublisher(Protocol):
+    def ensure_run_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int: ...
+
+    def record_run_publication(
+        self, pr_number: int, record: dict[str, Any]
+    ) -> None: ...
+
+    def normal_merge(
+        self, *, pr_number: int, expected_head_sha: str
+    ) -> str: ...
+
+    def abandon_run_pr(self, pr_number: int) -> None: ...
+
     def ensure_run_repair_branch(
         self, *, branch: str, base_branch: str
     ) -> None: ...

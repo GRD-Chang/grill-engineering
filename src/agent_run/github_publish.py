@@ -14,6 +14,7 @@ class MergeOutcomeUnknownError(RuntimeError):
 
 
 _ACCEPTANCE_MARKER = "<!-- agent-run:acceptance-record -->"
+_RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
 
 
 class GhGitHubPublisher:
@@ -100,6 +101,83 @@ class GhGitHubPublisher:
         self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
         created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
         return _integer(_mapping(created), "number")
+
+    def ensure_run_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        self._ensure_remote_run_branch(branch)
+        pulls = self._json(
+            "pr", "list", "--repo", self.repository, "--state", "all",
+            "--head", branch, "--base", base_branch, "--json", "number,state"
+        )
+        if not isinstance(pulls, list):
+            raise GitHubReadError("github_invalid_response", "PR list must be an array")
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_run_pr", "more than one open final Run PR exists")
+        if pulls:
+            existing = _mapping(pulls[0])
+            number = _integer(existing, "number")
+            if existing.get("state") != "OPEN":
+                raise GitHubReadError(
+                    "final_run_pr_not_open",
+                    "the existing final Run PR is not open",
+                )
+            self._require("pr", "edit", str(number), "--repo", self.repository, "--title", title, "--body", body)
+            return number
+        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
+        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        return _integer(_mapping(created), "number")
+
+    def record_run_publication(
+        self, pr_number: int, record: dict[str, Any]
+    ) -> None:
+        body = (
+            f"{_RUN_PUBLICATION_MARKER}\n"
+            "## Run Publication Record\n\n```json\n"
+            f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n```"
+        )
+        comments = self._json(
+            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate"
+        )
+        if not isinstance(comments, list):
+            raise GitHubReadError("github_invalid_response", "comments must be an array")
+        existing = next(
+            (
+                _mapping(comment)
+                for comment in comments
+                if _RUN_PUBLICATION_MARKER in str(_mapping(comment).get("body", ""))
+            ),
+            None,
+        )
+        if existing is None:
+            self._json("api", f"repos/{self.repository}/issues/{pr_number}/comments", "-f", f"body={body}")
+        else:
+            self._json(
+                "api", "--method", "PATCH",
+                f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
+                "-f", f"body={body}",
+            )
+
+    def normal_merge(self, *, pr_number: int, expected_head_sha: str) -> str:
+        merged = self._run(
+            "pr", "merge", str(pr_number), "--repo", self.repository,
+            "--merge", "--match-head-commit", expected_head_sha,
+        )
+        try:
+            live = self.live_pull_request(pr_number)
+        except GitHubReadError as error:
+            raise MergeOutcomeUnknownError("could not determine final merge outcome") from error
+        integrated = live.get("integrated_sha")
+        if live.get("state") == "MERGED" and isinstance(integrated, str):
+            return integrated
+        raise MergeOutcomeUnknownError(
+            merged.stderr.strip() or "could not determine final merge outcome"
+        )
+
+    def abandon_run_pr(self, pr_number: int) -> None:
+        live = self.live_pull_request(pr_number)
+        if live.get("state") == "OPEN":
+            self._require("pr", "close", str(pr_number), "--repo", self.repository)
 
     def _ensure_remote_run_branch(self, branch: str) -> None:
         remote = subprocess.run(

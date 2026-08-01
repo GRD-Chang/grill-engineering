@@ -14,7 +14,7 @@
 - Parent Spec 变化时由一次性 Codex 生成 Scope Impact Assessment；澄清自动吸收，
   结构性变化绑定准确版本等待确认；
 - 全部 Ticket 完成后进入 `run_acceptance_pending`，由独立 Reviewer 整体验收；通过后
-  才进入 `run_publication_pending`，不提前创建最终 Run PR。
+  才进入 `run_publication_pending`，随后由一次性只读 Codex 生成最终 Run PR 语义。
 
 各智能角色的目标 Prompt 与证据合同见
 [`docs/agents/agent-prompts.md`](agents/agent-prompts.md)。
@@ -26,6 +26,10 @@ agent-run start <parent-issue> --repo OWNER/REPO
 agent-run resume <run-id> --repo OWNER/REPO
 agent-run confirm-structure <run-id> --repo OWNER/REPO
 agent-run accept-run <run-id> --repo OWNER/REPO
+agent-run publish-run <run-id> --repo OWNER/REPO
+agent-run approve <run-id> --repo OWNER/REPO
+agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
+agent-run abandon <run-id> --repo OWNER/REPO
 AGENT_RUN_GITHUB_APP_ID=<app-id> \
 AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
 AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
@@ -47,7 +51,20 @@ evidence、基线到 Run Head 的累计 diff 与预期 merge 结果，并进行�
 Spec 三条验证 lane。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
 代码修改形成新的 Run Branch commit、废弃旧验收，再由全新 Reviewer 重新检查完整累计结果。
 无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
-通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。
+通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。随后执行
+`publish-run`：一次性、只读的 Run Publication Codex 根据 Parent Spec、Ticket completion
+records、累计 diff 与 Fresh Run Acceptance 生成最终 PR 正文。Publisher 维护同一个
+Run Branch → 默认分支的最终 PR，并将 Parent/Graph revision、Run/default/PR head 写入独立
+Publication Record。Required Checks 全部通过（或没有配置）后状态才变为
+`run_approval_pending`；即使此时所有自动检查通过，也只有 `approve` 会执行普通 merge
+commit。
+
+`approve` 每次都会重新读取 Parent/Graph revision、Run Branch、默认分支、PR head、Fresh
+Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并的默认分支漂移回到 fresh
+Run Acceptance；真实 merge conflict 与最终 PR Required Checks 失败会排入同一个有界 Run
+Repair 引擎。`revise` 原样保存维护者反馈、重置一个新的十次实际变更预算，并同样回到
+Run Repair → fresh Run Acceptance → 新 PR 语义。`abandon` 保留 Run state、已发布 PR 与其他
+远端审计事实，只停止后续 mutation 并删除该 Run 的本地临时 worktrees。
 
 Ticket title/body 在运行中变化时，旧开发结果、Publication 和 Acceptance 会失效；
 Controller 沿用同一个 Ticket Job、Ticket Branch 和 Development Thread，从最新 revision

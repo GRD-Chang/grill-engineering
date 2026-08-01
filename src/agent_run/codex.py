@@ -117,6 +117,36 @@ class CodexCliBackend:
                 f"CI Evidence (verbatim JSON):\n{_pretty(evidence)}"
                 f"\n\nDevelopment Brief:\n{_pretty(context)}"
             )
+        elif repair_source == "human_revision":
+            feedback = request.get("human_feedback")
+            if not isinstance(feedback, str) or not feedback.strip():
+                raise ValueError("Human Revision requires human_feedback")
+            mode = (
+                "Human Revision：维护者的下列反馈未经改写，是当前修复目标。"
+                "先以当前代码和事实核验其影响，再完成必要的最小修复。"
+            )
+            heading = "Human Revision Input"
+            context = dict(request)
+            context.pop("human_feedback")
+            prompt_input = (
+                f"Maintainer Feedback (verbatim):\n{feedback.strip()}"
+                f"\n\nDevelopment Brief:\n{_pretty(context)}"
+            )
+        elif repair_source == "merge_conflict":
+            evidence = request.get("merge_conflict_evidence")
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise ValueError("Merge Conflict Repair requires merge_conflict_evidence")
+            mode = (
+                "Merge Conflict Repair：默认分支与 Run Branch 的真实合并预览失败。"
+                "在不绕过既有验收的前提下修复冲突及其直接影响。"
+            )
+            heading = "Merge Conflict Repair Input"
+            context = dict(request)
+            context.pop("merge_conflict_evidence")
+            prompt_input = (
+                f"Merge Conflict Evidence (verbatim):\n{evidence.strip()}"
+                f"\n\nDevelopment Brief:\n{_pretty(context)}"
+            )
         else:
             raise ValueError(f"unknown repair_source: {repair_source}")
 
@@ -173,6 +203,27 @@ class CodexCliBackend:
             artifact=_json_object(output, "Publication Artifact"),
             replaced_thread_id=replaced_thread,
         )
+
+    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create final-PR prose in a new, read-only, one-shot worker."""
+        checkout = Path(_string(request, "checkout"))
+        prompt = (
+            "你是一次性的 Run Publication Codex。只读取当前事实，生成最终 Run PR "
+            "的语义标题和正文；不要编辑文件、不要执行 Git/GitHub 写操作，也不要做 "
+            "验收或替代人工批准。正文第一行必须是 Delivery Run identity，并包含非空 "
+            "What Problem This Solves、Why This Change Was Made、User Impact、Evidence、"
+            "Completed Tickets、Known Limitations、Validation Results 七个二级标题；"
+            "不得包含 closing keywords。\n\n"
+            f"Run Publication Brief:\n{_pretty(request)}"
+        )
+        output, _thread_id = self._invoke(
+            prompt=prompt,
+            checkout=checkout,
+            thread_id=None,
+            schema=publication_schema(),
+            writable_checkout=False,
+        )
+        return _json_object(output, "Run Publication Artifact")
 
     @staticmethod
     def _publication_prompt(request: dict[str, Any]) -> str:

@@ -33,6 +33,7 @@ class PublicationArtifact:
         *,
         primary_ticket: int | None = None,
         delivery_run: str | None = None,
+        final_run: bool = False,
     ) -> PublicationArtifact:
         data = _mapping(value, "publication artifact")
         commit_message = _nonempty_string(data, "commit_message")
@@ -60,11 +61,18 @@ class PublicationArtifact:
         else:
             identity = f"Delivery Run: {delivery_run}"
             if body.splitlines()[0].strip() != identity:
-                raise ValueError("Run Repair PR body must start with Delivery Run")
+                raise ValueError("Run PR body must start with Delivery Run")
         if _CLOSING_KEYWORD.search(body):
             raise ValueError("PR body must not contain automatic closing keywords")
         for section in _REQUIRED_SECTIONS:
             _require_nonempty_section(body, section)
+        if final_run:
+            for section in (
+                "Completed Tickets",
+                "Known Limitations",
+                "Validation Results",
+            ):
+                _require_nonempty_section(body, section)
         return cls(
             commit_message=commit_message,
             pr_title=pr_title,

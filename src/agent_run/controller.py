@@ -54,6 +54,8 @@ class Controller:
             else:
                 state = existing
                 run_id = str(state["run_id"])
+                if state.get("status") == "abandoned":
+                    return state, True
                 base = _state_mapping(state, "base")
                 base_sha = str(base["sha"])
             branch = str(state["run_branch"])
@@ -65,6 +67,8 @@ class Controller:
     def resume(self, run_id: str) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
+            if existing.get("status") == "abandoned":
+                return existing, True
             parent = _state_mapping(existing, "parent")
             parent_number = int(parent["number"])
             base = _state_mapping(existing, "base")
@@ -79,6 +83,8 @@ class Controller:
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
+            if existing.get("status") == "abandoned":
+                return existing, True
             before_confirmation = deepcopy(existing)
             pending = _state_mapping(existing, "pending_structure_change")
             proposed = pending.get("proposed_revision")
@@ -122,6 +128,8 @@ class Controller:
         with self.states.locked():
             state = self.states.load_run(run_id)
             if state is None:
+                return False
+            if state.get("status") == "abandoned":
                 return False
             hint_reader = getattr(self.github, "repository_hint", None)
             repository_hint = (

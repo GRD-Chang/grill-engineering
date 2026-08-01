@@ -19,6 +19,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 
@@ -56,6 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
     accept_run.add_argument("run_id", help="Delivery Run 标识")
     _add_common_options(accept_run)
     accept_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
+    publish_run = subcommands.add_parser(
+        "publish-run", help="发布已通过整体验收的最终 Run PR"
+    )
+    publish_run.add_argument("run_id", help="Delivery Run 标识")
+    _add_common_options(publish_run)
+    publish_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
+    approve = subcommands.add_parser("approve", help="显式合并最终 Run PR")
+    approve.add_argument("run_id", help="Delivery Run 标识")
+    _add_common_options(approve)
+    revise = subcommands.add_parser("revise", help="以人工反馈开启新的 Run 修复窗口")
+    revise.add_argument("run_id", help="Delivery Run 标识")
+    revise.add_argument("--message", required=True, help="未经改写的修订反馈")
+    _add_common_options(revise)
+    abandon = subcommands.add_parser("abandon", help="放弃 Delivery Run 并清理本地临时资源")
+    abandon.add_argument("run_id", help="Delivery Run 标识")
+    _add_common_options(abandon)
     return parser
 
 
@@ -125,7 +142,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             ).deliver(parsed.run_id)
             resumed = True
-        else:
+        elif parsed.command == "accept-run":
             agent_fixture = getattr(parsed, "agent_fixture", None)
             agents = (
                 FixtureAgentBackend(Path(agent_fixture))
@@ -156,6 +173,45 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     github=publisher,
                 ).accept(parsed.run_id)
             resumed = True
+        else:
+            refreshed, _ = controller.resume(parsed.run_id)
+            repository = github.repository()
+            default_head = git.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
+            publisher = (
+                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                if parsed.github_fixture
+                else GhGitHubPublisher(repository.name_with_owner, git)
+            )
+            if parsed.command in {"publish-run", "revise"}:
+                agent_fixture = getattr(parsed, "agent_fixture", None)
+                agents = (
+                    FixtureAgentBackend(Path(agent_fixture))
+                    if agent_fixture
+                    else CodexCliBackend()
+                )
+            else:
+                agents = CodexCliBackend()
+            publication = RunPublicationEngine(
+                git=git,
+                states=states,
+                agents=agents,
+                github=publisher,
+                default_branch=repository.default_branch,
+                default_head_sha=default_head,
+            )
+            if refreshed.get("status") == "abandoned":
+                state = refreshed
+            elif parsed.command == "publish-run":
+                state = publication.publish(parsed.run_id)
+            elif parsed.command == "approve":
+                state = publication.approve(parsed.run_id)
+            elif parsed.command == "revise":
+                state = publication.revise(parsed.run_id, parsed.message)
+            else:
+                state = publication.abandon(parsed.run_id)
+            resumed = True
         output = {
             "result": "resumed" if resumed else "started",
             "run_id": state["run_id"],
@@ -178,6 +234,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "waiting_checks",
                 "run_acceptance_pending",
                 "run_publication_pending",
+                "run_approval_pending",
+                "completed",
+                "abandoned",
             }
             else 2
         )

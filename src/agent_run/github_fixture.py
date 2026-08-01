@@ -105,6 +105,7 @@ class FixtureGitHubPublisher:
         delivery.setdefault("pull_requests", [])
         delivery.setdefault("closed_issues", [])
         delivery.setdefault("acceptance_records", [])
+        delivery.setdefault("run_publication_records", [])
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
 
@@ -148,6 +149,102 @@ class FixtureGitHubPublisher:
         pull.update({"title": title, "body": body})
         self._save()
         return int(pull["number"])
+
+    def ensure_run_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        _mutable_mapping(self._delivery(), "published_branches").setdefault(
+            branch, self.git.resolve(branch)
+        )
+        pulls = _mutable_list(self._delivery(), "pull_requests")
+        matching = [
+            pr for pr in pulls if isinstance(pr, dict)
+            and pr.get("branch") == branch and pr.get("base_branch") == base_branch
+            and pr.get("scope") == "final_run"
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate final Run PRs")
+        if matching:
+            pull = matching[0]
+            if pull.get("state") != "OPEN":
+                raise ValueError("fixture final Run PR is not open")
+        else:
+            pull = {
+                "number": len(pulls) + 1,
+                "branch": branch,
+                "base_branch": base_branch,
+                "state": "OPEN",
+                "scope": "final_run",
+            }
+            pulls.append(pull)
+        pull.update({"title": title, "body": body})
+        self._save()
+        self._crash_once("ensure_run_pr")
+        return int(pull["number"])
+
+    def record_run_publication(
+        self, pr_number: int, record: dict[str, Any]
+    ) -> None:
+        records = _mutable_list(self._delivery(), "run_publication_records")
+        replacement = {"pr_number": pr_number, **record}
+        for position, existing in enumerate(records):
+            if isinstance(existing, dict) and existing.get("pr_number") == pr_number:
+                records[position] = replacement
+                break
+        else:
+            records.append(replacement)
+        self._save()
+        self._crash_once("record_run_publication")
+
+    def normal_merge(self, *, pr_number: int, expected_head_sha: str) -> str:
+        pull = self._pull(pr_number)
+        if pull.get("state") == "MERGED":
+            return str(pull["integrated_sha"])
+        live = self.live_pull_request(pr_number)
+        if live["head_sha"] != expected_head_sha or not live["mergeable"]:
+            raise ValueError("fixture final merge does not match expected open head")
+        base = self.git.resolve(str(pull["base_branch"]))
+        result = subprocess.run(
+            ["git", "merge-tree", "--write-tree", base, expected_head_sha],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(result.stderr.strip() or "fixture final merge conflicts")
+        tree = result.stdout.splitlines()[0].strip()
+        merged = subprocess.run(
+            [
+                "git", "commit-tree", tree, "-p", base, "-p", expected_head_sha,
+                "-m", f"merge: Delivery Run {pull['branch']}",
+            ],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if merged.returncode != 0:
+            raise ValueError(merged.stderr.strip() or "fixture final merge failed")
+        integrated = merged.stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", f"refs/heads/{pull['base_branch']}", integrated, base],
+            cwd=self.git.root,
+            check=True,
+        )
+        pull.update({"state": "MERGED", "integrated_sha": integrated})
+        self._save()
+        self._crash_once("normal_merge")
+        return integrated
+
+    def abandon_run_pr(self, pr_number: int) -> None:
+        pull = self._pull(pr_number)
+        if pull.get("state") == "OPEN":
+            pull["state"] = "CLOSED"
+            _mutable_list(self._delivery(), "mutations").append(
+                {"action": "close_final_run_pr", "pr_number": pr_number}
+            )
+            self._save()
 
     def publish_branch(
         self,
