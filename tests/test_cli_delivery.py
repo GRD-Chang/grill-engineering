@@ -152,7 +152,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     run_id = stdout_json(started)["run_id"]
     state = load_only_run_state(git_repo)
     assert state["delivery_type"] == "parent_only"
-    assert state["parent_branch"] == f"agent-run-parent/{run_id}"
+    assert state["parent_branch"] == f"agent-run/{run_id}/parent"
     assert "run_branch" not in state
 
     delivered = run_cli(
@@ -194,7 +194,24 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     assert [mutation["action"] for mutation in mutable_fixture["delivery"]["mutations"]] == [
         "parent_completion_comment",
         "close_parent_issue",
+        "delete_managed_branch",
     ]
+    assert state["parent_branch"] not in mutable_fixture["delivery"]["published_branches"]
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", f"refs/heads/{state['parent_branch']}"],
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+    ).returncode != 0
+    replayed = run_cli(git_repo, fixture, "resume", run_id)
+    assert replayed.returncode == 0, replayed.stderr
+    assert stdout_json(replayed)["status"] == "completed"
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", f"refs/heads/{state['parent_branch']}"],
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+    ).returncode != 0
 
 
 def test_parent_only_publication_pending_resumes_without_revalidation(
@@ -313,6 +330,7 @@ def test_parent_only_approve_recovers_after_closeout_response_loss(
     assert [mutation["action"] for mutation in delivery["mutations"]] == [
         "parent_completion_comment",
         "close_parent_issue",
+        "delete_managed_branch",
     ]
 
 
@@ -552,7 +570,14 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert delivery["closed_issues"] == [3]
     assert [
         mutation["action"] for mutation in delivery["mutations"]
-    ] == ["completion_comment", "close_issue"]
+    ] == ["completion_comment", "close_issue", "delete_managed_branch"]
+    assert job["ticket_branch"] not in delivery["published_branches"]
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", f"refs/heads/{job['ticket_branch']}"],
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+    ).returncode != 0
     assert mutable_fixture["issues"]["3"]["state"] == "CLOSED"
     count = subprocess.run(
         [
@@ -664,6 +689,18 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
     assert "## Completed Tickets\n\n- [#3: Complete one ticket autonomously]" in final["body"]
     assert data["delivery"]["closed_issues"] == [3, 1]
     assert data["parent"]["state"] == "CLOSED"
+    assert load_only_run_state(git_repo)["run_branch"] not in data["delivery"]["published_branches"]
+    assert subprocess.run(
+        [
+            "git",
+            "show-ref",
+            "--verify",
+            f"refs/heads/{load_only_run_state(git_repo)['run_branch']}",
+        ],
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+    ).returncode != 0
 
 
 def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(

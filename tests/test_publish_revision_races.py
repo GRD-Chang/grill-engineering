@@ -320,4 +320,4 @@ def test_aba_revision_after_crash_still_forces_fresh_rebuild(
     assert delivery["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in delivery["mutations"]
-    ] == ["completion_comment", "close_issue"]
+    ] == ["completion_comment", "close_issue", "delete_managed_branch"]

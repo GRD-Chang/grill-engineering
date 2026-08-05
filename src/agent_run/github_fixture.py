@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from agent_run.git import GitRepository
+from agent_run.git import GitRepository, is_managed_delivery_branch
 from agent_run.github import GitHubReadError
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 from agent_run.revisions import effective_revision_from_graph
@@ -120,6 +120,21 @@ class FixtureGitHubPublisher:
         linked["parent"] = branch
         published = _mutable_mapping(self._delivery(), "published_branches")
         published.setdefault(branch, self.git.resolve(base_branch))
+        self._save()
+
+    def delete_managed_branch(self, branch: str) -> None:
+        if not is_managed_delivery_branch(branch):
+            raise ValueError(f"refusing to delete unmanaged branch {branch!r}")
+        delivery = self._delivery()
+        published = _mutable_mapping(delivery, "published_branches")
+        head = published.pop(branch, None)
+        if isinstance(head, str):
+            for pull in _mutable_list(delivery, "pull_requests"):
+                if isinstance(pull, dict) and pull.get("branch") == branch:
+                    pull.setdefault("head_sha", head)
+        _mutable_list(delivery, "mutations").append(
+            {"action": "delete_managed_branch", "branch": branch}
+        )
         self._save()
 
     def ensure_ticket_branch(
@@ -447,7 +462,7 @@ class FixtureGitHubPublisher:
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         pull = self._pull(pr_number)
         published = _mutable_mapping(self._delivery(), "published_branches")
-        live_head = published.get(str(pull["branch"]))
+        live_head = published.get(str(pull["branch"])) or pull.get("head_sha")
         override = self._delivery().get("live_head_override")
         result = {
             "head_sha": override if isinstance(override, str) else live_head,

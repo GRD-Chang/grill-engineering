@@ -4,7 +4,7 @@ import json
 import subprocess
 from typing import Any
 
-from agent_run.git import GitError, GitRepository
+from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.revisions import effective_revision_from_graph
 
@@ -49,6 +49,30 @@ class GhGitHubPublisher:
                 "github_write_failed",
                 created.stderr.strip() or "could not create linked Parent branch",
             )
+
+    def delete_managed_branch(self, branch: str) -> None:
+        if not is_managed_delivery_branch(branch):
+            raise GitError(f"refusing to delete unmanaged branch {branch!r}")
+        remote = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if remote.returncode != 0:
+            raise GitError(remote.stderr.strip() or "could not inspect remote branch")
+        if not remote.stdout.strip():
+            return
+        deleted = subprocess.run(
+            ["git", "push", "origin", "--delete", branch],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if deleted.returncode != 0:
+            raise GitError(deleted.stderr.strip() or "could not delete remote branch")
 
     def ensure_ticket_branch(
         self,

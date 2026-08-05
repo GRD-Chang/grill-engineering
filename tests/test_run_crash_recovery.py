@@ -96,7 +96,7 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     assert delivery["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in delivery["mutations"]
-    ] == ["completion_comment", "close_issue"]
+    ] == ["completion_comment", "close_issue", "delete_managed_branch"]
 
 
 @pytest.mark.parametrize("save_number", range(1, 16))

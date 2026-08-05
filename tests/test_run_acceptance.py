@@ -9,7 +9,7 @@ import pytest
 
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
-from agent_run.git import GitRepository
+from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.state import StateStore
@@ -187,6 +187,10 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert not (
         states.root / "worktrees" / str(state["run_id"]) / "run-repair"
     ).exists()
+    repair_branch = run["completed_repair_jobs"][0]["repair_branch"]
+    assert repair_branch not in fixture_data["delivery"]["published_branches"]
+    with pytest.raises(GitError):
+        git.resolve(repair_branch)
 
 
 def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(

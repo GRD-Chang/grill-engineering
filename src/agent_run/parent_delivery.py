@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.change_delivery import (
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryEngine,
@@ -300,7 +301,9 @@ class ParentDeliveryEngine:
         state["terminal_kind"] = "completed"
         state["diagnostics"] = []
         self._save(state)
-        return state
+        return DeliveryCleanupEngine(
+            git=self.git, states=self.states, github=self.github
+        ).complete_parent(state)
 
     def _acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any]

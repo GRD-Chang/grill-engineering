@@ -4,6 +4,8 @@ from typing import Any, Protocol
 
 
 class GitHubPublisher(Protocol):
+    def delete_managed_branch(self, branch: str) -> None: ...
+
     def ensure_parent_branch(
         self, *, parent_number: int, branch: str, base_branch: str
     ) -> None: ...

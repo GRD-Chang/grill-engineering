@@ -692,7 +692,7 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     assert data["delivery"]["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in data["delivery"]["mutations"]
-    ] == ["completion_comment", "close_issue"]
+    ] == ["completion_comment", "close_issue", "delete_managed_branch"]
 
 
 def test_active_ticket_removal_pauses_structure_in_the_same_command(
@@ -732,7 +732,7 @@ def test_active_ticket_removal_pauses_structure_in_the_same_command(
         / str(state["run_id"])
         / "ticket-2"
     )
-    old_branch = f"agent-run-ticket/{state['run_id']}/ticket-2"
+    old_branch = f"agent-run/{state['run_id']}/ticket-2"
     assert (checkout / "removed.txt").is_file()
 
     removed, _ = controller.confirm_structure(str(state["run_id"]))
@@ -819,7 +819,7 @@ def test_stale_removal_confirmation_does_not_retire_readded_ticket(
     ).deliver(run_id)
     assert paused["status"] == "structure_change_pending"
     checkout = states.root / "worktrees" / run_id / "ticket-2"
-    branch = f"agent-run-ticket/{run_id}/ticket-2"
+    branch = f"agent-run/{run_id}/ticket-2"
     assert (checkout / "removed.txt").is_file()
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -868,7 +868,7 @@ def test_confirmed_removal_is_retired_after_another_graph_change(
     ).deliver(run_id)
     assert paused["status"] == "structure_change_pending"
     checkout = states.root / "worktrees" / run_id / "ticket-2"
-    branch = f"agent-run-ticket/{run_id}/ticket-2"
+    branch = f"agent-run/{run_id}/ticket-2"
     assert (checkout / "removed.txt").is_file()
 
     data = json.loads(fixture.read_text(encoding="utf-8"))

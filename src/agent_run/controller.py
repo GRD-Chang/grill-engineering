@@ -339,18 +339,18 @@ class Controller:
     def _ensure_delivery_branch(
         self, state: dict[str, Any], base_sha: str
     ) -> None:
-        if state.get("status") == "execution_failed":
+        if state.get("status") in {"execution_failed", "abandoned", "completed"}:
             return
         graph = _state_mapping(state, "ticket_graph")
         ordered = _integer_list(graph, "ordered_ticket_numbers")
         if not ordered:
             state["delivery_type"] = "parent_only"
             branch = state.setdefault(
-                "parent_branch", f"agent-run-parent/{state['run_id']}"
+                "parent_branch", f"agent-run/{state['run_id']}/parent"
             )
         else:
             state["delivery_type"] = "ticket_run"
-            branch = state.setdefault("run_branch", f"agent-run/{state['run_id']}")
+            branch = state.setdefault("run_branch", f"agent-run/{state['run_id']}/run")
         if not isinstance(branch, str) or not branch:
             raise ValueError("Delivery Run branch is invalid")
         self.publisher.ensure_run_branch(branch, base_sha)
