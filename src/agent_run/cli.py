@@ -27,11 +27,11 @@ from agent_run.worker_sandbox import WorkerSandboxError
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-run",
-        description="从 GitHub Parent Spec 启动或恢复本地 Delivery Run",
+        description="从 GitHub Parent Issue 启动或恢复本地 Delivery Run",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
     start = subcommands.add_parser("start", help="启动或幂等恢复 Delivery Run")
-    start.add_argument("parent", type=_positive_integer, help="Parent Spec Issue 编号")
+    start.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(start)
     resume = subcommands.add_parser("resume", help="按稳定 Run ID 恢复 Delivery Run")
     resume.add_argument("run_id", help="Delivery Run 标识")
@@ -202,6 +202,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 default_head_sha=default_head,
             )
             if refreshed.get("status") == "abandoned":
+                state = refreshed
+            elif (
+                refreshed.get("status") == "structure_change_pending"
+                and parsed.command != "abandon"
+            ):
+                # A proposed Parent/Ticket graph is not an accepted delivery
+                # boundary. Do not let publication or approval bypass the
+                # explicit confirm-structure command.
                 state = refreshed
             elif parsed.command == "publish-run":
                 state = publication.publish(parsed.run_id)

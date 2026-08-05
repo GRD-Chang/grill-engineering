@@ -110,6 +110,18 @@ class FixtureGitHubPublisher:
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
 
+    def ensure_parent_branch(
+        self, *, parent_number: int, branch: str, base_branch: str
+    ) -> None:
+        parent = _mutable_mapping(self.data, "parent")
+        if _integer(parent, "number") != parent_number:
+            raise ValueError("fixture parent is missing")
+        linked = _mutable_mapping(self._delivery(), "linked_branches")
+        linked["parent"] = branch
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        published.setdefault(branch, self.git.resolve(base_branch))
+        self._save()
+
     def ensure_ticket_branch(
         self,
         *,
@@ -237,6 +249,45 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("normal_merge")
         return integrated
+
+    def close_parent_issue(
+        self,
+        *,
+        parent_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        parent = _mutable_mapping(self.data, "parent")
+        if _integer(parent, "number") != parent_number:
+            raise ValueError("fixture parent is missing")
+        mutations = _mutable_list(self._delivery(), "mutations")
+        marker = {
+            "parent_number": parent_number,
+            "run_id": run_id,
+            "pr_number": pr_number,
+            "integrated_sha": integrated_sha,
+        }
+        if not any(
+            isinstance(item, dict)
+            and item.get("action") == "parent_completion_comment"
+            and item.get("parent_number") == parent_number
+            for item in mutations
+        ):
+            mutations.append({"action": "parent_completion_comment", **marker})
+        closed = _mutable_list(self._delivery(), "closed_issues")
+        if parent_number not in closed:
+            closed.append(parent_number)
+            mutations.append({"action": "close_parent_issue", **marker})
+        parent["state"] = "CLOSED"
+        crash_after_close = bool(
+            self._delivery().get("crash_after_parent_close_once")
+        )
+        if crash_after_close:
+            self._delivery()["crash_after_parent_close_once"] = False
+        self._save()
+        if crash_after_close:
+            raise OSError("simulated lost response after Parent Issue close")
 
     def abandon_run_pr(self, pr_number: int) -> None:
         pull = self._pull(pr_number)
@@ -445,7 +496,10 @@ class FixtureGitHubPublisher:
     def sync_run_branch(
         self, *, run_branch: str, integrated_sha: str
     ) -> None:
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        published[run_branch] = integrated_sha
         if self.git.resolve(run_branch) == integrated_sha:
+            self._save()
             self._crash_once("sync_run_branch")
             return
         subprocess.run(
@@ -453,6 +507,7 @@ class FixtureGitHubPublisher:
             cwd=self.git.root,
             check=True,
         )
+        self._save()
         self._crash_once("sync_run_branch")
 
     def close_primary_ticket(

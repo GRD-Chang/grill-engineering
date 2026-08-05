@@ -12,6 +12,7 @@ from agent_run.change_delivery import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
 
@@ -101,6 +102,10 @@ class RunAcceptanceEngine:
                 run_head_sha=run_head,
                 checkout=checkout,
             )
+            expected_merge_tree = self.git.expected_merge_tree(
+                default_head_sha=default_head,
+                run_head_sha=run_head,
+            )
             review = self.agents.review(
                 self._review_request(state, run, checkout, run_head, default_head)
             )
@@ -108,7 +113,14 @@ class RunAcceptanceEngine:
             self.git.remove_worktree(checkout)
         self._record_reviewer(state, run, review.thread_id)
         artifact = AcceptanceArtifact.parse(review.artifact)
-        record = self._acceptance_record(state, run_head, review.thread_id, artifact.raw)
+        record = self._acceptance_record(
+            state,
+            run_head,
+            expected_merge_tree,
+            review.thread_id,
+            artifact.raw,
+        )
+        self._record_final_pr_status(state, artifact.raw, run_head)
         run.update(
             {
                 "reviewed_head_sha": run_head,
@@ -128,6 +140,39 @@ class RunAcceptanceEngine:
         else:
             run["phase"] = "repairing"
         self._save(state)
+
+    def _record_final_pr_status(
+        self, state: dict[str, Any], artifact: dict[str, Any], run_head: str
+    ) -> None:
+        if self.github is None:
+            return
+        publication = state.get("run_publication")
+        if not isinstance(publication, dict):
+            return
+        pr_number = publication.get("pr_number")
+        if not isinstance(pr_number, int):
+            return
+        checks = self._mapping(artifact, "checks")
+        verdict = str(artifact["verdict"])
+        self.github.record_agent_run_status(
+            pr_number,
+            {
+                "scope": "final-run",
+                "base_sha": self._default_head(state),
+                "candidate_sha": run_head,
+                "validation_verdict": verdict,
+                "lane_statuses": {
+                    lane: str(self._mapping(checks, lane)["status"])
+                    for lane in ("e2e", "standards", "spec")
+                },
+                "required_checks": "not_checked",
+                "next_action": {
+                    "pass": "generate refreshed final Run publication",
+                    "request_changes": "repair Fresh Validation findings",
+                    "human": "await human decision",
+                }[verdict],
+            },
+        )
 
     def _repair(self, state: dict[str, Any], run: dict[str, Any]) -> str:
         """Deliver a Run Repair through the same Change Job lifecycle as Tickets.
@@ -558,6 +603,7 @@ class RunAcceptanceEngine:
         self,
         state: dict[str, Any],
         run_head: str,
+        expected_merge_tree: str,
         reviewer_thread_id: str,
         artifact: dict[str, Any],
     ) -> dict[str, Any]:
@@ -566,6 +612,7 @@ class RunAcceptanceEngine:
             "reviewed_base_sha": self._default_head(state),
             "reviewed_default_base_sha": self._default_head(state),
             "reviewed_head_sha": run_head,
+            "expected_merge_tree": expected_merge_tree,
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
             "ticket_completion_records": self._ticket_completion_records(state),
@@ -607,13 +654,22 @@ class RunAcceptanceEngine:
 
     def _ticket_completion_records(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
+        tickets = self._mapping(self._mapping(state, "ticket_graph"), "tickets")
+        parent_revision = str(self._mapping(state, "parent")["revision"])
+        graph_revision = str(self._mapping(state, "ticket_graph")["revision"])
         for key, job in sorted(self._mapping(state, "ticket_jobs").items()):
             if not isinstance(job, dict) or job.get("phase") != "completed":
                 continue
+            ticket = self._mapping(tickets, key)
             records.append(
                 {
                     "ticket_number": int(key),
                     "integrated_sha": job.get("integrated_sha"),
+                    "effective_revision": effective_revision(
+                        ticket_revision=str(ticket["content_revision"]),
+                        parent_revision=parent_revision,
+                        graph_revision=graph_revision,
+                    ),
                     "acceptance_record": job.get("acceptance_record"),
                 }
             )

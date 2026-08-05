@@ -2,7 +2,7 @@
 
 `agent-run` 是显式启动的本地 Delivery Run 控制器。当前实现支持：
 
-- 从 Parent Spec 启动或恢复 Delivery Run；
+- 从 Parent Issue 启动或恢复 Delivery Run；
 - 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
 - 让持久 Development Thread 实现、修复和生成发布语义；
 - 为每轮候选创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；
@@ -52,12 +52,14 @@ Spec 三条验证 lane。失败 findings 原样交给持久 Run Repair Developme
 代码修改形成新的 Run Branch commit、废弃旧验收，再由全新 Reviewer 重新检查完整累计结果。
 无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
 通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。随后执行
-`publish-run`：一次性、只读的 Run Publication Codex 根据 Parent Spec、Ticket completion
-records、累计 diff 与 Fresh Run Acceptance 生成最终 PR 正文。Publisher 维护同一个
-Run Branch → 默认分支的最终 PR，并将 Parent/Graph revision、Run/default/PR head 写入独立
-Publication Record。Required Checks 全部通过（或没有配置）后状态才变为
+`publish-run`：每次尝试都由新的、只读的 Run Publication Codex 根据 Parent Issue、累计
+diff 与 Fresh Run Acceptance 生成最终 PR 叙事。Publisher 维护同一个 Run Branch → 默认
+分支的最终 PR，并渲染 Parent Issue、Delivery Type 及每张已完成 Ticket 的链接；它将
+Parent/Graph revision、Run/default/PR head 与预期 merge tree 写入独立 Publication Record。
+Required Checks 全部通过（或没有配置）后状态才变为
 `run_approval_pending`；即使此时所有自动检查通过，也只有 `approve` 会执行普通 merge
-commit。
+commit。合并结果与已验收的预期 merge tree 一致后，Publisher 记录可重试的 Parent
+closeout 审计评论并显式关闭 Parent Issue。
 
 `approve` 每次都会重新读取 Parent/Graph revision、Run Branch、默认分支、PR head、Fresh
 Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并的默认分支漂移回到 fresh

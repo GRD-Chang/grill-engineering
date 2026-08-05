@@ -195,6 +195,11 @@ class ScriptedPublisher:
         self.merged_sha: str | None = None
         self.merged_head: str | None = None
 
+    def ensure_parent_branch(
+        self, *, parent_number: int, branch: str, base_branch: str
+    ) -> None:
+        del parent_number, branch, base_branch
+
     def ensure_ticket_branch(
         self,
         *,

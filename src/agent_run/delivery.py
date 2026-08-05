@@ -52,6 +52,11 @@ class TicketDeliveryEngine:
                 checkout, str(job["ticket_branch"])
             )
             try:
+                self.github.ensure_parent_branch(
+                    parent_number=int(_mapping(state, "parent")["number"]),
+                    branch=str(state["run_branch"]),
+                    base_branch=str(_mapping(state, "base")["branch"]),
+                )
                 self.github.ensure_ticket_branch(
                     ticket_number=ticket_number,
                     branch=str(job["ticket_branch"]),

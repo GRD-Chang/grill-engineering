@@ -179,6 +179,23 @@ class GitRepository:
             or "Run Branch cannot be merged into the current default branch"
         )
 
+    def expected_merge_tree(
+        self, *, default_head_sha: str, run_head_sha: str
+    ) -> str:
+        """Return the tree Git would create by normally merging a Run."""
+        preview = self._run(
+            "merge-tree", "--write-tree", default_head_sha, run_head_sha
+        )
+        if preview.returncode != 0:
+            raise GitError(
+                preview.stderr.strip()
+                or "Run Branch cannot be merged into the current default branch"
+            )
+        tree = preview.stdout.splitlines()[0].strip()
+        if not tree:
+            raise GitError("Run merge preview did not produce a tree")
+        return tree
+
     def commit_candidate(
         self, checkout: Path, *, ticket_number: int, attempt: int
     ) -> str | None:

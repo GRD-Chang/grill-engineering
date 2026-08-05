@@ -31,10 +31,7 @@ class RunPublicationAgents:
                 "## What Problem This Solves\n\nThe accepted Run needs a human merge boundary.\n\n"
                 "## Why This Change Was Made\n\nIt makes the completed delivery reviewable.\n\n"
                 "## User Impact\n\nMaintainers can inspect and approve one final PR.\n\n"
-                "## Evidence\n\nFresh Run Acceptance passed.\n\n"
-                "## Completed Tickets\n\n#2 was accepted and integrated.\n\n"
-                "## Known Limitations\n\nNone known.\n\n"
-                "## Validation Results\n\nThe fixture acceptance lanes all passed."
+                "## Evidence\n\nFresh Run Acceptance passed."
             ),
         }
 
@@ -125,6 +122,64 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
         final["record"]["default_head_sha"],
         final["record"]["run_head_sha"],
     ]
+    assert merged["integrated_tree"] == final["record"]["expected_merge_tree"]
+    assert 1 in publisher.data["delivery"]["closed_issues"]
+    assert publisher.data["parent"]["state"] == "CLOSED"
+
+
+def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    state["ticket_jobs"]["2"]["pr_number"] = 42
+    states.save_run(str(state["run_id"]), state)
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    engine.publish(str(state["run_id"]))
+
+    body = publisher.data["delivery"]["pull_requests"][0]["body"]
+    assert "## Completed Tickets\n\n- [#2: Ticket 2](https://github.com/example/project/pull/42)" in body
+    assert body.index("## Completed Tickets") < body.index("## What Problem This Solves")
+
+
+def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+    published = engine.publish(str(state["run_id"]))
+    publisher.data["delivery"]["crash_after_parent_close_once"] = True
+
+    with pytest.raises(OSError, match="Parent Issue close"):
+        engine.approve(str(state["run_id"]))
+
+    pending = states.load_run(str(state["run_id"]))
+    assert pending is not None
+    assert pending["run_publication"]["phase"] == "merged"
+    assert pending["status"] == "parent_closeout_pending"
+    assert publisher.live_pull_request(int(published["run_publication"]["pr_number"]))["state"] == "MERGED"
+    assert not Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).record_execution_failure(str(state["run_id"]), "lost Parent closeout response")
+    preserved = states.load_run(str(state["run_id"]))
+    assert preserved is not None
+    assert preserved["status"] == "parent_closeout_pending"
+
+    completed = engine.approve(str(state["run_id"]))
+
+    assert completed["status"] == "completed"
+    assert publisher.data["delivery"]["closed_issues"].count(1) == 1
+    assert publisher.data["parent"]["state"] == "CLOSED"
 
 
 def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) -> None:
@@ -333,6 +388,28 @@ def test_retries_a_worker_interrupted_before_publication_artifact(
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
     assert retried["status"] == "run_approval_pending"
+
+
+def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    agents = RunPublicationAgents()
+    publisher.data["delivery"]["crash_after_ensure_run_pr_once"] = True
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    with pytest.raises(OSError, match="ensure_run_pr"):
+        engine.publish(str(state["run_id"]))
+
+    retried = engine.publish(str(state["run_id"]))
+
+    assert retried["status"] == "run_approval_pending"
+    assert len(agents.requests) == 2
 
 
 def test_closed_final_pr_is_not_replaced_with_a_second_pr(git_repo: Path) -> None:

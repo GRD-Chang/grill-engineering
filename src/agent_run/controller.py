@@ -129,7 +129,7 @@ class Controller:
             state = self.states.load_run(run_id)
             if state is None:
                 return False
-            if state.get("status") == "abandoned":
+            if state.get("status") in {"abandoned", "parent_closeout_pending"}:
                 return False
             hint_reader = getattr(self.github, "repository_hint", None)
             repository_hint = (
