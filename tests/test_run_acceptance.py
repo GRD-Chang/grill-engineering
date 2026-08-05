@@ -208,6 +208,47 @@ def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(
         ).accept(str(state["run_id"]))
 
 
+def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=ScriptedRunAgents(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    )
+    run = state["run_acceptance"] = {
+        "phase": "repairing",
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+        "repair_generation": 1,
+        "acceptance_artifact": _repair_artifact(),
+        "acceptance_record": {"reviewed_head_sha": git.resolve(state["run_branch"])},
+    }
+    job: dict[str, Any] = {
+        "phase": "publication_pending",
+        "repair_source": "acceptance",
+        "acceptance_artifact": _repair_artifact(),
+    }
+    run["repair_job"] = job
+
+    engine._invalidate_stale_repair_publication(
+        state, job, git_repo / "unused-checkout"
+    )
+
+    assert job["phase"] == "stale"
+    assert "repair_job" not in run
+    assert state["status"] == "run_acceptance_pending"
+    assert run["phase"] == "repairing"
+    replacement = engine._repair_job(state, run)
+    assert replacement["repair_generation"] == 2
+    assert replacement["repair_branch"].endswith("/1-generation-2")
+
+
 def test_run_acceptance_rejects_run_repair_developer_as_a_reviewer(
     git_repo: Path,
 ) -> None:

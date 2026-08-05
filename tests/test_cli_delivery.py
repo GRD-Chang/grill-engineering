@@ -197,6 +197,74 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     ]
 
 
+def test_parent_only_publication_pending_resumes_without_revalidation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agent_fixture = git_repo / "parent-only-agents.json"
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [{"invalid": "publication"} for _ in range(5)],
+                "reviews": [passing_acceptance("parent-reviewer-1", "candidate passed")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+
+    pending = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert pending.returncode == 0, pending.stderr
+    assert stdout_json(pending)["status"] == "publication_pending"
+    pending_job = load_only_run_state(git_repo)["parent_job"]
+    assert pending_job["phase"] == "publication_pending"
+    assert pending_job["modification_attempts"] == 1
+    assert pending_job["validation_attempts"] == 1
+    assert pending_job["publication_attempts"] == 5
+
+    resumed_pending = run_cli(git_repo, fixture, "resume", run_id)
+    assert resumed_pending.returncode == 0, resumed_pending.stderr
+    assert stdout_json(resumed_pending)["status"] == "publication_pending"
+
+    agent_fixture.write_text(
+        json.dumps(
+            {"developments": [], "publications": [parent_publication()], "reviews": []}
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "parent_approval_pending"
+    resumed_job = load_only_run_state(git_repo)["parent_job"]
+    assert resumed_job["modification_attempts"] == 1
+    assert resumed_job["validation_attempts"] == 1
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
+
+
 def test_parent_only_approve_recovers_after_closeout_response_loss(
     git_repo: Path,
 ) -> None:
@@ -678,6 +746,80 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     assert len(mutable_fixture["delivery"]["agent_run_status"]) == 1
     assert mutable_fixture["delivery"]["agent_run_status"][0]["required_checks"] == "pass"
     assert mutable_fixture["delivery"]["closed_issues"] == [3]
+
+
+def test_publication_pending_resumes_without_redevelopment_or_fresh_validation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agent_fixture = git_repo / "agents.json"
+    invalid_publications = [{"invalid": "publication"} for _ in range(5)]
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-1",
+                        "summary": "Implemented and tested.",
+                        "write_files": {"feature.txt": "done\n"},
+                    }
+                ],
+                "publications": invalid_publications,
+                "reviews": [
+                    passing_acceptance("reviewer-1", "The exact candidate passed.")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+
+    pending = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert pending.returncode == 0, pending.stderr
+    assert stdout_json(pending)["status"] == "publication_pending"
+    pending_state = load_only_run_state(git_repo)
+    pending_job = pending_state["ticket_jobs"]["3"]
+    assert pending_job["phase"] == "publication_pending"
+    assert pending_job["modification_attempts"] == 1
+    assert pending_job["validation_attempts"] == 1
+    assert pending_job["publication_attempts"] == 5
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"] == []
+
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [],
+                "publications": [publication()],
+                "reviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "run_acceptance_pending"
+    completed_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert completed_job["modification_attempts"] == 1
+    assert completed_job["validation_attempts"] == 1
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
 
 
 def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:

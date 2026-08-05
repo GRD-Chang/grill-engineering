@@ -39,7 +39,7 @@ class DeliveryRunEngine:
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)
                 return state
-            if result.get("status") == "waiting_checks":
+            if result.get("status") in {"waiting_checks", "publication_pending"}:
                 return result
             state, _ = self.controller.resume(run_id)
             active = state.get("active_ticket_job")

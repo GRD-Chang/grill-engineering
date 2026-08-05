@@ -7,6 +7,7 @@ from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
     MAX_MODIFICATION_ATTEMPTS,
+    MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryEngine,
     ChangeJobContract,
 )
@@ -66,6 +67,12 @@ class RunAcceptanceEngine:
                     repair = self._repair(state, run)
                     if repair == "waiting":
                         return self._save(state)
+                    if repair == "stale":
+                        run["phase"] = "pending"
+                        run.pop("acceptance_record", None)
+                        run.pop("acceptance_artifact", None)
+                        self._save(state)
+                        continue
                     if repair == "no_code_changes":
                         run["phase"] = "ready_for_human"
                         run["blocked_reason"] = "no_code_changes"
@@ -207,6 +214,8 @@ class RunAcceptanceEngine:
                 if job.get("blocked_reason") == "no_code_changes"
                 else "blocked"
             )
+        if job["phase"] == "stale":
+            return "stale"
         return "waiting"
 
     def _repair_engine(self) -> ChangeDeliveryEngine:
@@ -238,6 +247,7 @@ class RunAcceptanceEngine:
                 ),
                 acceptance_record=self._repair_acceptance_record,
                 acceptance_is_current=self._repair_acceptance_is_current,
+                invalidate_stale_publication=self._invalidate_stale_repair_publication,
                 revision_changed=self._repair_revision_changed,
                 requires_explicit_approval=lambda _state, _job: False,
                 after_merge=self._after_repair_merge,
@@ -252,6 +262,8 @@ class RunAcceptanceEngine:
             return existing
         base_sha = self.git.resolve(str(state["run_branch"]))
         attempt = int(run["modification_attempts"]) + 1
+        generation = int(run.get("repair_generation", 0)) + 1
+        run["repair_generation"] = generation
         # The generic engine only knows a job's own thread history.  Seed it
         # with every prior Ticket and Run identity so a repair reviewer cannot
         # accidentally reuse any of them.
@@ -271,7 +283,12 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "phase": "developing",
             "repair_attempt": attempt,
-            "repair_branch": f"agent-run-repair/{state['run_id']}/{attempt}",
+            "repair_generation": generation,
+            "repair_branch": (
+                f"agent-run-repair/{state['run_id']}/{attempt}"
+                if generation == 1
+                else f"agent-run-repair/{state['run_id']}/{attempt}-generation-{generation}"
+            ),
             "base_sha": base_sha,
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
@@ -399,7 +416,7 @@ class RunAcceptanceEngine:
         job: dict[str, Any],
         checkout: Path,
     ) -> dict[str, Any]:
-        return {
+        request = {
             "acceptance_scope": "run",
             "run_id": state["run_id"],
             "parent": self._mapping(state, "parent"),
@@ -408,10 +425,31 @@ class RunAcceptanceEngine:
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
-            "thread_id": job["development_thread_id"],
+            "thread_id": (
+                job["development_thread_id"]
+                if int(job.get("publication_attempts", 0))
+                < MAX_PUBLICATION_CONTEXT_ATTEMPTS
+                else None
+            ),
             "development_summary": job.get("development_summary"),
             "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
         }
+        existing_pr = job.get("pr_number")
+        if isinstance(existing_pr, int):
+            if self.github is None:
+                raise ValueError("Run Repair Publication requires the Publisher")
+            request["existing_pr"] = self.github.publication_context(existing_pr)
+        return request
+
+    def _invalidate_stale_repair_publication(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        del checkout
+        run = self._run_state(state)
+        run.pop("repair_job", None)
+        job["phase"] = "stale"
+        state["status"] = "run_acceptance_pending"
+        state["diagnostics"] = []
 
     def _render_run_repair_pr_body(
         self, state: dict[str, Any], publication: dict[str, Any]

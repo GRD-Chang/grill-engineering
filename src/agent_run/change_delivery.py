@@ -16,8 +16,11 @@ from agent_run.agents import AgentBackend, PublicationResult
 from agent_run.artifacts import AcceptanceArtifact, PublicationArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 
 MAX_MODIFICATION_ATTEMPTS = 10
+MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
+MAX_PUBLICATION_ATTEMPTS = MAX_PUBLICATION_CONTEXT_ATTEMPTS + 1
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,9 @@ class ChangeJobContract:
     ]
     acceptance_is_current: Callable[
         [dict[str, Any], dict[str, Any], dict[str, Any]], bool
+    ]
+    invalidate_stale_publication: Callable[
+        [dict[str, Any], dict[str, Any], Path], None
     ]
     revision_changed: Callable[[dict[str, Any], dict[str, Any]], bool]
     requires_explicit_approval: Callable[[dict[str, Any], dict[str, Any]], bool]
@@ -86,6 +92,17 @@ class ChangeDeliveryEngine:
                 phase = str(job["phase"])
                 if phase in {"completed", "blocked"}:
                     return state
+                if phase == "publication_pending":
+                    # A new explicit delivery attempt is allowed to retry
+                    # publication only; the accepted Candidate and Fresh
+                    # Acceptance remain the durable boundary.
+                    job["phase"] = "accepted"
+                    job["publication_attempts"] = 0
+                    job.pop("last_publication_error", None)
+                    state["status"] = "active"
+                    state["diagnostics"] = []
+                    self.contract.save(state)
+                    continue
                 if phase == "merged":
                     live = self.github.live_pull_request(int(job["pr_number"]))
                     if not self.contract.after_merge(state, job, live):
@@ -114,7 +131,11 @@ class ChangeDeliveryEngine:
                     if terminal:
                         return state
                     continue
-                if job["phase"] == "repairing":
+                if job["phase"] == "publication_pending":
+                    return state
+                if job["phase"] == "stale":
+                    return state
+                if job["phase"] in {"developing", "repairing"}:
                     continue
                 if job["phase"] in {"completed", "blocked"}:
                     return state
@@ -168,26 +189,65 @@ class ChangeDeliveryEngine:
     def _publication(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
-        raw = self.agents.publication(
-            self.contract.publication_request(state, job, checkout)
-        )
-        if isinstance(raw, PublicationResult):
-            if not self.contract.development_thread_is_allowed(
-                state, raw.thread_id
-            ):
-                raise ValueError("Change Job Development Thread is not independent")
-            _record_development_thread(job, raw.thread_id, raw.replaced_thread_id)
-            artifact_data = raw.artifact
-        else:
-            artifact_data = raw
-        if isinstance(job.get("ticket_number"), int):
-            publication = PublicationArtifact.parse(
-                artifact_data, primary_ticket=int(job["ticket_number"])
-            )
-        else:
-            publication = PublicationArtifact.parse(
-                artifact_data, delivery_run=str(job["run_id"])
-            )
+        while True:
+            if not self._publication_is_current(state, job):
+                self.contract.invalidate_stale_publication(state, job, checkout)
+                self.contract.save(state)
+                return
+            try:
+                raw = self.agents.publication(
+                    self.contract.publication_request(state, job, checkout)
+                )
+                if isinstance(raw, PublicationResult):
+                    if raw.replaced_thread_id is not None:
+                        if not self.contract.development_thread_is_allowed(
+                            state, raw.thread_id
+                        ):
+                            raise ValueError(
+                                "Change Job Development Thread is not independent"
+                            )
+                        _record_development_thread(
+                            job, raw.thread_id, raw.replaced_thread_id
+                        )
+                    elif raw.thread_id != job.get("development_thread_id"):
+                        job["publication_thread_id"] = raw.thread_id
+                    artifact_data = raw.artifact
+                else:
+                    artifact_data = raw
+                if isinstance(job.get("ticket_number"), int):
+                    publication = PublicationArtifact.parse(
+                        artifact_data, primary_ticket=int(job["ticket_number"])
+                    )
+                else:
+                    publication = PublicationArtifact.parse(
+                        artifact_data, delivery_run=str(job["run_id"])
+                    )
+            except Exception as error:
+                attempts = int(job.get("publication_attempts", 0)) + 1
+                job["publication_attempts"] = attempts
+                job["last_publication_error"] = str(error)
+                if attempts >= MAX_PUBLICATION_ATTEMPTS:
+                    job["phase"] = "publication_pending"
+                    state["status"] = "publication_pending"
+                    state["diagnostics"] = [
+                        {
+                            "code": "publication_pending",
+                            "message": (
+                                "Publication retries were exhausted; resume retries "
+                                "publication without rerunning Development or Fresh Validation"
+                            ),
+                            "change_job": self.contract.label(job),
+                        }
+                    ]
+                    self.contract.save(state)
+                    return
+                self.contract.save(state)
+                continue
+            break
+        if not self._publication_is_current(state, job):
+            self.contract.invalidate_stale_publication(state, job, checkout)
+            self.contract.save(state)
+            return
         sha = self.git.create_publication_commit(
             checkout,
             candidate_sha=str(job["candidate_sha"]),
@@ -201,10 +261,13 @@ class ChangeDeliveryEngine:
                     "pr_title": publication.pr_title,
                     "pr_body_markdown": publication.pr_body_markdown,
                 },
+                "publication_attempts": int(job.get("publication_attempts", 0))
+                + 1,
                 "publication_sha": sha,
                 "phase": "publishing",
             }
         )
+        job.pop("last_publication_error", None)
         self.contract.save(state)
         self._reject_stale(
             state, job, "Publication was discarded after requirements changed"
@@ -355,7 +418,19 @@ class ChangeDeliveryEngine:
                 "ticket_pr_closed_unmerged",
                 "Current Change Job PR was closed without merging",
             )
-        checks = self.github.required_checks(pr_number)
+        try:
+            checks = self.github.required_checks(pr_number)
+        except (GitHubReadError, OSError, TimeoutError):
+            self._record_agent_run_status(
+                pr_number,
+                job,
+                "unavailable",
+                next_action="retry Required Checks observation",
+            )
+            job["phase"] = "waiting_checks"
+            state["status"] = "waiting_checks"
+            self.contract.save(state)
+            return True
         self._reject_stale(
             state,
             job,
@@ -496,6 +571,18 @@ class ChangeDeliveryEngine:
                 "required_checks": checks,
                 "next_action": next_action,
             },
+        )
+
+    def _publication_is_current(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool:
+        acceptance = job.get("acceptance_record")
+        return (
+            isinstance(acceptance, dict)
+            and self.git.resolve(self.contract.base_branch(state))
+            == job.get("base_sha")
+            and self.contract.acceptance_is_current(state, job, acceptance)
+            and not self.contract.revision_changed(state, job)
         )
 
     def _reject_stale(

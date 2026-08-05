@@ -411,6 +411,23 @@ class GhGitHubPublisher:
         )
         return _integer(_mapping(created), "number")
 
+    def publication_context(self, pr_number: int) -> dict[str, object]:
+        value = self._json(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            self.repository,
+            "--json",
+            "number,url,title",
+        )
+        data = _mapping(value)
+        return {
+            "number": _integer(data, "number"),
+            "url": _string(data, "url"),
+            "title": _string(data, "title"),
+        }
+
     def required_checks(self, pr_number: int) -> str:
         checks = self._json(
             "pr",

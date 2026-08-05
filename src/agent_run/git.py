@@ -286,6 +286,16 @@ class GitRepository:
             raise GitError("publication commit changed the accepted candidate tree")
         return publication_sha
 
+    def reset_checkout_to_base(self, checkout: Path, base_branch: str) -> None:
+        """Discard an invalidated Candidate from its managed checkout."""
+        base_sha = self.resolve(base_branch)
+        reset = self._run_in(checkout, "reset", "--hard", base_sha)
+        if reset.returncode != 0:
+            raise GitError(
+                reset.stderr.strip()
+                or "could not reset managed checkout to the current base"
+            )
+
     def diff_between(self, base_sha: str, head_sha: str) -> str:
         result = self._run(
             "diff",
