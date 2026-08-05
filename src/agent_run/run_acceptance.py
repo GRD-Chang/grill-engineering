@@ -239,6 +239,7 @@ class RunAcceptanceEngine:
                 acceptance_record=self._repair_acceptance_record,
                 acceptance_is_current=self._repair_acceptance_is_current,
                 revision_changed=self._repair_revision_changed,
+                requires_explicit_approval=lambda _state, _job: False,
                 after_merge=self._after_repair_merge,
                 escalate=self._escalate_repair,
                 save=self._save,

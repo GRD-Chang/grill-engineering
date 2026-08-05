@@ -54,11 +54,16 @@ class CodexCliBackend:
             if resumed_thread is None:
                 raise
             replaced_thread = resumed_thread
+            job_name = (
+                "Parent-only Delivery"
+                if request.get("acceptance_scope") == "parent_only"
+                else "Ticket Job"
+            )
             output, actual_thread = self._invoke(
                 prompt=(
                     "旧 Development Thread 恢复失败。你是接替该工作的 Development "
                     "Codex；下面的 Development Brief 是完整恢复上下文，请在同一 "
-                    "Ticket Job、branch 和 PR 上继续，不要重新规划或丢失未解决证据。"
+                    f"{job_name}、branch 和 PR 上继续，不要重新规划或丢失未解决证据。"
                     "\n\n"
                     + prompt
                 ),
@@ -74,10 +79,14 @@ class CodexCliBackend:
     @staticmethod
     def _development_prompt(request: dict[str, Any]) -> str:
         is_run_repair = request.get("acceptance_scope") == "run"
+        is_parent_only = request.get("acceptance_scope") == "parent_only"
         repair_source = request.get("repair_source")
         if repair_source is None:
             mode = (
-                "Development Brief：以当前 Ticket 和代码事实为依据，以最小、完整、"
+                "Development Brief：以当前 Parent Issue 和代码事实为依据，以最小、完整、"
+                "可维护的改动满足全部 Acceptance Criteria。"
+                if is_parent_only
+                else "Development Brief：以当前 Ticket 和代码事实为依据，以最小、完整、"
                 "可维护的改动满足全部 Acceptance Criteria。"
             )
             heading = "Development Brief"
@@ -88,7 +97,13 @@ class CodexCliBackend:
                 raise ValueError(
                     "Acceptance Repair requires acceptance_artifact"
                 )
-            subject = "当前 Delivery Run" if is_run_repair else "当前 Ticket"
+            subject = (
+                "当前 Delivery Run"
+                if is_run_repair
+                else "当前 Parent Issue"
+                if is_parent_only
+                else "当前 Ticket"
+            )
             mode = (
                 f"Acceptance Repair：{subject}、代码状态和下方未经改写的 "
                 "Acceptance Artifact 是事实依据。逐项处理 finding，保留原意，"
@@ -105,8 +120,9 @@ class CodexCliBackend:
             evidence = request.get("ci_evidence")
             if not isinstance(evidence, dict):
                 raise ValueError("Required-Checks Repair requires ci_evidence")
+            subject = "当前 Parent Issue" if is_parent_only else "当前 Ticket"
             mode = (
-                "Required-Checks Repair：当前 Ticket、代码状态和下方未经改写的 "
+                f"Required-Checks Repair：{subject}、代码状态和下方未经改写的 "
                 "CI Evidence 是事实依据。修复失败的 Required Checks 及其直接影响，"
                 "不要绕过检查、删除测试或放宽断言。"
             )
@@ -150,7 +166,13 @@ class CodexCliBackend:
         else:
             raise ValueError(f"unknown repair_source: {repair_source}")
 
-        role = "本次 Delivery Run 的修复工程师" if is_run_repair else "当前 Ticket 的开发工程师"
+        role = (
+            "本次 Delivery Run 的修复工程师"
+            if is_run_repair
+            else "当前 Parent Issue 的开发工程师"
+            if is_parent_only
+            else "当前 Ticket 的开发工程师"
+        )
         return (
             f"你是负责{role}。使用 skill:implement 完成开发或修复。"
             f"{mode}\n\n"
@@ -266,6 +288,8 @@ class CodexCliBackend:
             "每张 Ticket Completion Record、基线到 Run Branch Head 的累计 diff，以及"
             "Expected Merge Result；不要把单 Ticket 通过当成整体验收通过。"
             if request.get("acceptance_scope") == "run"
+            else "这是 Parent-only Fresh Acceptance：以当前 Parent Issue 的完整验收标准为范围。"
+            if request.get("acceptance_scope") == "parent_only"
             else "这是 Ticket Fresh Acceptance：以当前 Ticket 的完整验收标准为范围。"
         )
         prompt = (

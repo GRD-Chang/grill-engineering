@@ -72,6 +72,10 @@ _Avoid_: 启动授权、依赖已解除、完成状态
 一个 Delivery Run 独有的临时集成分支。已通过自动验收的 Ticket 变更先进入该分支，整个 Delivery Run 最终通过它接受人工整体验收后才进入默认分支。
 _Avoid_: 默认分支、Ticket Branch、永久集成分支
 
+**Parent-only Delivery（仅 Parent 交付）**:
+当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循 Candidate-first、Fresh Validation、Required Checks 和 Published-Head Gate；只有 `agent-run approve <run-id>` 重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head 后，Publisher 才以普通 merge 合并。已合并但 closeout 响应丢失时，`resume`/`deliver` 只重试幂等审计评论和关闭，不得再次合并。
+_Avoid_: Run Branch、Final Run PR、跳过独立验收、自动合并
+
 **Ticket PR（Ticket 拉取请求）**:
 承载一张 Ticket 候选变更并以所属 Run Branch 为 base 的拉取请求。Publisher 从 Primary Ticket 创建 GitHub 原生关联的 Ticket Branch，并在 PR 正文保留可读引用；该 PR 只在自动门禁通过后使用 squash merge 进入 Run Branch，不直接进入默认分支。普通 repair 始终更新同一张 active PR；current PR 被关闭但未合并时 Job 阻塞，不自动创建替代 PR。若 PR 已合并但 Ticket 在显式完成前发生 Revision 漂移，该 PR 记为 superseded integration，同一 Ticket Job 与 Ticket Branch 针对最新 Revision 创建新的 active PR，已合并 PR 不再编辑或复用。
 _Avoid_: 最终集成 PR、多 Ticket PR、默认分支 PR

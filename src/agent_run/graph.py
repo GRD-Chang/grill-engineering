@@ -116,7 +116,28 @@ def state_from_graph(
             active = _first_job_in_phase(
                 ticket_jobs, order, TicketPhase.MERGED
             )
-        if _all_ticket_jobs_completed(ticket_jobs, order):
+        if not order:
+            parent_job = previous.get("parent_job")
+            phase = parent_job.get("phase") if isinstance(parent_job, dict) else None
+            if phase == "completed":
+                status = "completed"
+                diagnostics = []
+            elif phase == "ready_for_approval":
+                status = "parent_approval_pending"
+                diagnostics = []
+            elif phase == "waiting_checks":
+                status = "waiting_checks"
+                diagnostics = []
+            elif phase == "merging":
+                status = "parent_closeout_pending"
+                diagnostics = []
+            elif phase in {"blocked", "escalating"}:
+                status = "blocked"
+                diagnostics = list(previous.get("diagnostics", []))
+            else:
+                status = "parent_delivery_pending"
+                diagnostics = []
+        elif _all_ticket_jobs_completed(ticket_jobs, order):
             status = "run_acceptance_pending"
             diagnostics = []
         elif active is not None:
@@ -159,6 +180,7 @@ def state_from_graph(
             "terminal_kind": (
                 "all_tickets_completed"
                 if status == "run_acceptance_pending"
+                else "completed" if status == "completed"
                 else (
                     _exhaustion_kind(diagnostics[0]["remaining_tickets"])
                     if status == "progress_exhausted"

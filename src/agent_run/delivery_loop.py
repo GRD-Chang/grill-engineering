@@ -77,6 +77,7 @@ class TicketDeliveryLoop:
                 acceptance_record=self._acceptance_record,
                 acceptance_is_current=self._acceptance_is_current,
                 revision_changed=self._live_revision_changed,
+                requires_explicit_approval=lambda _state, _job: False,
                 after_merge=self._after_merge,
                 escalate=self._escalate,
                 save=self._save,

@@ -20,6 +20,7 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 
@@ -115,8 +116,56 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state, resumed = controller.start(parsed.parent)
         elif parsed.command == "resume":
             state, resumed = controller.resume(parsed.run_id)
+            if (
+                state.get("delivery_type") == "parent_only"
+                and isinstance(state.get("parent_job"), dict)
+                and state["parent_job"].get("phase") == "merging"
+            ):
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(github.repository().name_with_owner, git)
+                )
+                state = ParentDeliveryEngine(
+                    git=git,
+                    states=states,
+                    github=publisher,
+                    agents=CodexCliBackend(),
+                ).recover_closeout(parsed.run_id)
+            elif (
+                state.get("delivery_type") == "ticket_run"
+                and isinstance(state.get("parent_job"), dict)
+            ):
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(github.repository().name_with_owner, git)
+                )
+                state = ParentDeliveryEngine(
+                    git=git,
+                    states=states,
+                    github=publisher,
+                    agents=CodexCliBackend(),
+                ).retire_for_child_flow(parsed.run_id)
         elif parsed.command == "confirm-structure":
+            before_confirmation = states.load_run(parsed.run_id)
             state, resumed = controller.confirm_structure(parsed.run_id)
+            if (
+                isinstance(before_confirmation, dict)
+                and before_confirmation.get("delivery_type") == "parent_only"
+                and state.get("delivery_type") == "ticket_run"
+            ):
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(github.repository().name_with_owner, git)
+                )
+                state = ParentDeliveryEngine(
+                    git=git,
+                    states=states,
+                    github=publisher,
+                    agents=CodexCliBackend(),
+                ).retire_for_child_flow(parsed.run_id)
         elif parsed.command == "deliver":
             agent_fixture = getattr(parsed, "agent_fixture", None)
             agents = (
@@ -132,15 +181,31 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     git,
                 )
             )
-            state = DeliveryRunEngine(
-                controller=controller,
-                tickets=TicketDeliveryEngine(
+            refreshed, _ = controller.resume(parsed.run_id)
+            if (
+                refreshed.get("delivery_type") == "ticket_run"
+                and isinstance(refreshed.get("parent_job"), dict)
+            ):
+                refreshed = ParentDeliveryEngine(
                     git=git,
                     states=states,
                     github=publisher,
                     agents=agents,
-                ),
-            ).deliver(parsed.run_id)
+                ).retire_for_child_flow(parsed.run_id)
+            if refreshed.get("delivery_type") == "parent_only":
+                state = ParentDeliveryEngine(
+                    git=git, states=states, github=publisher, agents=agents
+                ).deliver(parsed.run_id)
+            else:
+                state = DeliveryRunEngine(
+                    controller=controller,
+                    tickets=TicketDeliveryEngine(
+                        git=git,
+                        states=states,
+                        github=publisher,
+                        agents=agents,
+                    ),
+                ).deliver_from_state(parsed.run_id, refreshed)
             resumed = True
         elif parsed.command == "accept-run":
             agent_fixture = getattr(parsed, "agent_fixture", None)
@@ -211,6 +276,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 # boundary. Do not let publication or approval bypass the
                 # explicit confirm-structure command.
                 state = refreshed
+            elif (
+                parsed.command == "approve"
+                and refreshed.get("delivery_type") == "parent_only"
+            ):
+                state = ParentDeliveryEngine(
+                    git=git, states=states, github=publisher, agents=agents
+                ).approve(parsed.run_id)
             elif parsed.command == "publish-run":
                 state = publication.publish(parsed.run_id)
             elif parsed.command == "approve":
@@ -224,7 +296,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             "result": "resumed" if resumed else "started",
             "run_id": state["run_id"],
             "status": state["status"],
-            "run_branch": state["run_branch"],
+            "run_branch": state.get("run_branch", state.get("parent_branch")),
             "active_ticket": (
                 state["active_ticket_job"]["ticket_number"]
                 if state["active_ticket_job"]
@@ -240,6 +312,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "active",
                 "ticket_completed",
                 "waiting_checks",
+                "parent_delivery_pending",
+                "parent_approval_pending",
+                "parent_closeout_pending",
                 "run_acceptance_pending",
                 "run_publication_pending",
                 "run_approval_pending",

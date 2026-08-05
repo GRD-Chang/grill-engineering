@@ -51,6 +51,7 @@ class ChangeJobContract:
         [dict[str, Any], dict[str, Any], dict[str, Any]], bool
     ]
     revision_changed: Callable[[dict[str, Any], dict[str, Any]], bool]
+    requires_explicit_approval: Callable[[dict[str, Any], dict[str, Any]], bool]
     after_merge: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], bool]
     escalate: Callable[[dict[str, Any], dict[str, Any], str], None]
     save: Callable[[dict[str, Any]], dict[str, Any]]
@@ -418,6 +419,19 @@ class ChangeDeliveryEngine:
         }
         if "effective_revision" in job:
             job["merge_intent"]["effective_revision"] = str(job["effective_revision"])
+        if self.contract.requires_explicit_approval(state, job):
+            job["phase"] = "ready_for_approval"
+            state["status"] = "parent_approval_pending"
+            state["terminal_kind"] = "waiting_human"
+            state["diagnostics"] = []
+            self.contract.save(state)
+            self._record_agent_run_status(
+                pr_number,
+                job,
+                checks,
+                next_action="await explicit maintainer approval",
+            )
+            return True
         job["phase"] = "merging"
         self.contract.save(state)
         self._record_agent_run_status(

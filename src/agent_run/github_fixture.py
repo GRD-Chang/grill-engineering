@@ -195,6 +195,47 @@ class FixtureGitHubPublisher:
         self._crash_once("ensure_run_pr")
         return int(pull["number"])
 
+    def ensure_parent_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        _mutable_mapping(self._delivery(), "published_branches").setdefault(
+            branch, self.git.resolve(branch)
+        )
+        pulls = _mutable_list(self._delivery(), "pull_requests")
+        matching = [
+            pr for pr in pulls if isinstance(pr, dict)
+            and pr.get("branch") == branch and pr.get("base_branch") == base_branch
+            and pr.get("scope") == "parent_only"
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate Parent PRs")
+        if matching:
+            pull = matching[0]
+            if pull.get("state") != "OPEN":
+                raise ValueError("fixture Parent PR is not open")
+        else:
+            pull = {
+                "number": len(pulls) + 1,
+                "branch": branch,
+                "base_branch": base_branch,
+                "state": "OPEN",
+                "scope": "parent_only",
+            }
+            pulls.append(pull)
+        pull.update({"title": title, "body": body})
+        self._save()
+        self._crash_once("ensure_parent_pr")
+        return int(pull["number"])
+
+    def abandon_parent_pr(self, pr_number: int) -> None:
+        pull = self._pull(pr_number)
+        if pull.get("state") == "OPEN":
+            pull["state"] = "CLOSED"
+            _mutable_list(self._delivery(), "mutations").append(
+                {"action": "close_parent_pr", "pr_number": pr_number}
+            )
+            self._save()
+
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
     ) -> None:
@@ -280,11 +321,21 @@ class FixtureGitHubPublisher:
             closed.append(parent_number)
             mutations.append({"action": "close_parent_issue", **marker})
         parent["state"] = "CLOSED"
-        crash_after_close = bool(
-            self._delivery().get("crash_after_parent_close_once")
+        delivery = self._delivery()
+        crash_flag = next(
+            (
+                key
+                for key in (
+                    "crash_after_parent_close_once",
+                    "crash_after_close_parent_issue_once",
+                )
+                if delivery.get(key)
+            ),
+            None,
         )
-        if crash_after_close:
-            self._delivery()["crash_after_parent_close_once"] = False
+        crash_after_close = crash_flag is not None
+        if crash_flag is not None:
+            delivery[crash_flag] = False
         self._save()
         if crash_after_close:
             raise OSError("simulated lost response after Parent Issue close")
