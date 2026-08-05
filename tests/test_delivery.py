@@ -39,9 +39,11 @@ class ScriptedAgents:
         self.reviewer_thread_ids: list[str] = []
         self.publication_diffs: list[str] = []
         self.validation_checkouts: list[Path] = []
+        self.events: list[str] = []
         self.review_count = 0
 
     def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+        self.events.append("develop")
         self.development_requests.append(request)
         actual_head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -64,6 +66,7 @@ class ScriptedAgents:
         )
 
     def publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.events.append("publication")
         self.publication_requests.append(request)
         diff = subprocess.run(
             [
@@ -82,8 +85,6 @@ class ScriptedAgents:
             "commit_message": "feat(delivery): complete one ticket autonomously",
             "pr_title": "feat(delivery): complete one ticket autonomously",
             "pr_body_markdown": """
-Primary Ticket: #3
-
 ## What Problem This Solves
 
 The ticket stopped before publication.
@@ -103,6 +104,7 @@ The scripted end-to-end scenario passed.
         }
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
+        self.events.append("review")
         self.review_requests.append(request)
         validation_checkout = Path(str(request["checkout"]))
         self.validation_checkouts.append(validation_checkout)
@@ -114,7 +116,9 @@ The scripted end-to-end scenario passed.
             capture_output=True,
             check=True,
         ).stdout.strip()
-        assert reviewed_head == request["publication_sha"]
+        assert reviewed_head == request["candidate_sha"]
+        assert "publication_sha" not in request
+        assert "publication" not in request
         (validation_checkout / "validation.tmp").write_text(
             "temporary validation evidence\n", encoding="utf-8"
         )
@@ -166,8 +170,10 @@ class ScriptedPublisher:
         self.repo = repo
         self.pr_number = 11
         self.created_prs = 0
+        self.pr_bodies: list[str] = []
         self.closed_issues: list[int] = []
         self.acceptance_records: list[dict[str, Any]] = []
+        self.agent_run_statuses: list[dict[str, Any]] = []
         self.live_head: str | None = None
         self.base_branch: str | None = None
         self.escalated: list[int] = []
@@ -222,6 +228,7 @@ class ScriptedPublisher:
     ) -> int:
         self.created_prs += 1
         self.base_branch = base_branch
+        self.pr_bodies.append(body)
         return self.pr_number
 
     def required_checks(self, pr_number: int) -> str:
@@ -276,6 +283,16 @@ class ScriptedPublisher:
         self, pr_number: int, record: dict[str, Any]
     ) -> None:
         self.acceptance_records.append(record)
+
+    def record_agent_run_status(
+        self, pr_number: int, status: dict[str, Any]
+    ) -> None:
+        self.agent_run_statuses[:] = [
+            existing
+            for existing in self.agent_run_statuses
+            if existing["pr_number"] != pr_number
+        ]
+        self.agent_run_statuses.append({"pr_number": pr_number, **status})
 
     def squash_merge(
         self,
@@ -1027,8 +1044,9 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
     assert job["modification_attempts"] == 2
     assert job["development_thread_id"] == "development-thread-1"
     assert agents.development_thread_ids == [None, "development-thread-1"]
-    assert "repair applied" not in agents.publication_diffs[0]
-    assert "repair applied" in agents.publication_diffs[1]
+    assert agents.events == ["develop", "review", "develop", "review", "publication"]
+    assert len(agents.publication_diffs) == 1
+    assert "repair applied" in agents.publication_diffs[0]
     assert all(
         "change_diff" not in request
         for request in (
@@ -1057,17 +1075,34 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
     ]
     assert (
         agents.development_requests[1]["head_sha"]
-        == agents.review_requests[0]["publication_sha"]
+        == agents.review_requests[0]["candidate_sha"]
     )
     assert len(set(agents.reviewer_thread_ids)) == 2
     assert len(set(agents.validation_checkouts)) == 2
     assert all(not path.exists() for path in agents.validation_checkouts)
     assert github.created_prs == 1
+    assert github.pr_bodies == [
+        "Parent Issue: #1\nPrimary Ticket: #3\nDelivery Type: Ticket\n\n"
+        "## What Problem This Solves\n\nThe ticket stopped before publication.\n\n"
+        "## Why This Change Was Made\n\nThe delivery loop now owns the bounded workflow.\n\n"
+        "## User Impact\n\nThe active ticket reaches the Run Branch automatically.\n\n"
+        "## Evidence\n\nThe scripted end-to-end scenario passed."
+    ]
     assert github.closed_issues == [3]
     assert github.escalated == []
-    assert github.acceptance_records[-1]["reviewed_head_sha"] == job["publication_sha"]
-    assert github.acceptance_records[-1]["artifact"]["verdict"] == "pass"
-    assert github.acceptance_records[-1]["reviewer_thread_id"] == "reviewer-2"
+    assert github.acceptance_records == []
+    assert github.agent_run_statuses == [
+        {
+            "pr_number": 11,
+            "scope": "ticket-3",
+            "base_sha": job["base_sha"],
+            "candidate_sha": job["candidate_sha"],
+            "validation_verdict": "pass",
+            "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
+            "required_checks": "pass",
+            "next_action": "squash merge into the Run Branch",
+        }
+    ]
     run_count = subprocess.run(
         ["git", "rev-list", "--count", f"{state['base']['sha']}..{state['run_branch']}"],
         cwd=git_repo,
@@ -1431,6 +1466,9 @@ def test_published_head_gate_rejects_live_base_sha_drift(
 
     assert result["status"] == "blocked"
     assert result["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert publisher.agent_run_statuses[-1]["next_action"] == (
+        "blocked: Published-Head Gate rejected live PR state"
+    )
     assert publisher.closed_issues == []
 
 
@@ -1937,7 +1975,7 @@ def test_publication_failure_resumes_from_persisted_candidate(
         engine.deliver(state["run_id"])
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
-    assert interrupted["active_ticket_job"]["phase"] == "candidate"
+    assert interrupted["active_ticket_job"]["phase"] == "accepted"
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"

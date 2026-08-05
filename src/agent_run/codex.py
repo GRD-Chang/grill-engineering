@@ -183,20 +183,21 @@ class CodexCliBackend:
                 checkout=checkout,
                 thread_id=thread_id,
                 schema=publication_schema(),
+                writable_checkout=False,
             )
         except _CodexThreadResumeError:
             replaced_thread = thread_id
             output, resumed_thread = self._invoke(
                 prompt=(
-                    "旧 Development Thread 在 Publication 阶段恢复失败。你是接替"
-                    "该工作的 Development Codex；下面的 Publication Brief 是完整"
-                    "恢复上下文。保留同一 Ticket Job、branch、PR 和 Candidate，"
-                    "不要重新开发或改动文件。\n\n"
+                    "旧发布叙事 Agent 恢复失败。你是接替该工作的发布叙事工程师；"
+                    "下面的 Publication Brief 是完整恢复上下文。保留同一 Candidate，"
+                    "不要重新开发、改动文件或改变发布范围。\n\n"
                     + prompt
                 ),
                 checkout=checkout,
                 thread_id=None,
                 schema=publication_schema(),
+                writable_checkout=False,
             )
         return PublicationResult(
             thread_id=resumed_thread,
@@ -207,13 +208,18 @@ class CodexCliBackend:
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
         """Create final-PR prose in a new, read-only, one-shot worker."""
         checkout = Path(_string(request, "checkout"))
+        run_id = _string(request, "run_id")
         prompt = (
             "你是一次性的 Run Publication Codex。只读取当前事实，生成最终 Run PR "
             "的语义标题和正文；不要编辑文件、不要执行 Git/GitHub 写操作，也不要做 "
-            "验收或替代人工批准。正文第一行必须是 Delivery Run identity，并包含非空 "
+            "验收或替代人工批准。Parent Issue、Delivery Type、Delivery Run、SHA、CI 与"
+            "生命周期事实由 Publisher 注入，叙事中不得输出这些字段；并包含非空 "
             "What Problem This Solves、Why This Change Was Made、User Impact、Evidence、"
             "Completed Tickets、Known Limitations、Validation Results 七个二级标题；"
-            "不得包含 closing keywords。\n\n"
+            "不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 "
+            "Conventional Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，"
+            "其中 type 只能是 feat、fix、improve、refactor、docs、test、chore；"
+            "不要使用自然语言标题。\n\n"
             f"Run Publication Brief:\n{_pretty(request)}"
         )
         output, _thread_id = self._invoke(
@@ -227,31 +233,44 @@ class CodexCliBackend:
 
     @staticmethod
     def _publication_prompt(request: dict[str, Any]) -> str:
-        identity = (
-            f"`Delivery Run: {request['run_id']}`"
-            if request.get("acceptance_scope") == "run"
-            else "唯一的 `Primary Ticket: #N`"
-        )
+        if request.get("acceptance_scope") == "run":
+            return (
+                "你是本次 Run Repair 的发布叙事工程师。当前 Candidate 已通过独立验收；"
+                "根据当前累计 diff、开发摘要和独立验收证据，输出小型 Publication Artifact。"
+                "不要修改文件，也不要执行任何 Git/GitHub 写操作。Parent Issue、"
+                "Delivery Type、Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入，"
+                "叙事中不得输出这些字段；并包含四个非空二级标题："
+                "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
+                "禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
+                "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
+                "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
+                f"Publication Brief:\n{_pretty(request)}"
+            )
         return (
-            "根据当前累计 diff 与实际验证，输出小型 Publication Artifact。不要修改文件，"
-            f"不要执行任何 Git/GitHub 写操作。PR 正文必须以{identity}开头，且包含四个非空二级标题："
+            "你是本次交付的发布叙事工程师。当前 Candidate 已通过独立验收；"
+            "根据当前累计 diff、开发摘要和独立验收证据，输出小型 Publication Artifact。"
+            "不要修改文件，也不要执行任何 Git/GitHub 写操作。PR 叙事包含四个非空二级标题："
             "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
-            "禁止 closing keywords。\n\n"
+            "只描述已经发生的真实验证；不要把开发者自述当作验证事实。Parent Issue、"
+            "Primary Ticket、Delivery Type、Delivery Run、SHA、CI 与生命周期事实由 Publisher"
+            "注入，叙事中不得输出这些字段。禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
+            "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
+            "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
             f"Publication Brief:\n{_pretty(request)}"
         )
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         checkout = Path(_string(request, "checkout"))
         scope_instruction = (
-            "这是 Run Acceptance：必须检查 Parent Spec、最终 Ticket Set 与依赖图、"
+            "这是 Run Acceptance：必须检查 Parent Issue、最终 Ticket Set 与依赖图、"
             "每张 Ticket Completion Record、基线到 Run Branch Head 的累计 diff，以及"
             "Expected Merge Result；不要把单 Ticket 通过当成整体验收通过。"
             if request.get("acceptance_scope") == "run"
             else "这是 Ticket Fresh Acceptance：以当前 Ticket 的完整验收标准为范围。"
         )
         prompt = (
-            "你是全新且独立的 Fresh Validation Codex。不要依赖开发者总结、自测或"
-            "开发审查；使用真实 Git/gh、Ticket、Parent Spec 和准确 SHA 自行建立"
+            "你是全新且独立的 Fresh Validation 工程师。不要依赖开发者总结、自测、"
+            "开发审查、PR 文案或 Publication Artifact；使用真实 Git/gh、Ticket、Parent Issue 和准确 SHA 自行建立"
             "事实。必须派发三个不同 subagent：一个真实执行 E2E 使用；一个使用 "
             "skill:code-review 执行 Standards Review；另一个使用 "
             "skill:code-review 执行 Spec Review。你不得替代任何缺失 lane 或自行"
@@ -259,7 +278,9 @@ class CodexCliBackend:
             "Checkout 可写，允许构建和测试中间产物。汇总三条 lane 的实际证据后，"
             "只输出符合 schema 的 Acceptance Artifact。可修复问题写入自包含 "
             "findings。human 必须克制，仅限确实需要产品决策、外部权限、敏感凭证"
-            "或不可替代外部操作的阻塞。\n\n"
+            "或不可替代外部操作的阻塞。若 verdict 为 pass，三个 check 都必须是 pass，"
+            "findings 与 human_blockers 必须都是空数组 `[]`；不要输出提示、风格建议、"
+            "未来改进或其他非阻塞观察。\n\n"
             f"{scope_instruction}\n\n"
             f"Acceptance Brief:\n{_pretty(request)}"
         )

@@ -10,8 +10,6 @@ def publication_data() -> dict[str, str]:
         "commit_message": "feat(delivery): complete one ticket autonomously",
         "pr_title": "feat(delivery): complete one ticket autonomously",
         "pr_body_markdown": """
-Primary Ticket: #3
-
 ## What Problem This Solves
 
 The active ticket previously stopped before delivery.
@@ -39,19 +37,35 @@ def test_publication_artifact_enforces_ticket_narrative_contract() -> None:
 
 
 @pytest.mark.parametrize(
-    "replacement",
+    "machine_fact",
     [
-        "Primary Ticket: #4",
-        "Primary Ticket: #3\nPrimary Ticket: #3",
-        "Closes #3",
+        "Parent Issue: #1",
+        "Primary Ticket: #3",
+        "Delivery Type: Ticket",
+        "Delivery Run: run-1",
     ],
 )
-def test_publication_artifact_rejects_ambiguous_issue_authority(
-    replacement: str,
+def test_publication_artifact_rejects_publisher_owned_facts(
+    machine_fact: str,
 ) -> None:
     data = publication_data()
-    body = data["pr_body_markdown"]
-    data["pr_body_markdown"] = body.replace("Primary Ticket: #3", replacement)
+    data["pr_body_markdown"] = f"{machine_fact}\n\n{data['pr_body_markdown']}"
+
+    with pytest.raises(ValueError):
+        PublicationArtifact.parse(data, primary_ticket=3)
+
+
+def test_run_publication_artifact_rejects_publisher_owned_facts() -> None:
+    data = publication_data()
+    data["pr_body_markdown"] = f"Delivery Run: run-1\n\n{data['pr_body_markdown']}"
+
+    with pytest.raises(ValueError):
+        PublicationArtifact.parse(data, delivery_run="run-1")
+
+
+def test_ticket_publication_artifact_rejects_closing_keyword() -> None:
+    data = publication_data()
+    data["pr_body_markdown"] += "\n\nCloses #3"
 
     with pytest.raises(ValueError):
         PublicationArtifact.parse(data, primary_ticket=3)
@@ -159,6 +173,40 @@ def test_human_verdict_requires_a_blocked_lane_and_human_blocker() -> None:
     data["human_blockers"] = ["A maintainer must grant an external permission."]
 
     with pytest.raises(ValueError, match="blocked check"):
+        AcceptanceArtifact.parse(data)
+
+
+def test_human_verdict_rejects_a_repairable_failed_lane() -> None:
+    data = passing_acceptance()
+    data["verdict"] = "human"
+    checks = data["checks"]
+    assert isinstance(checks, dict)
+    checks["e2e"] = {"status": "fail", "evidence": "The user path is broken."}
+    checks["spec"] = {"status": "blocked", "evidence": "Needs maintainer permission."}
+    data["human_blockers"] = ["A maintainer must grant external permission."]
+
+    with pytest.raises(ValueError, match="no failed check"):
+        AcceptanceArtifact.parse(data)
+
+
+def test_human_verdict_rejects_repair_findings() -> None:
+    data = passing_acceptance()
+    data["verdict"] = "human"
+    checks = data["checks"]
+    assert isinstance(checks, dict)
+    checks["e2e"] = {"status": "blocked", "evidence": "Needs approval."}
+    data["human_blockers"] = ["A maintainer must approve external access."]
+    data["findings"] = [
+        {
+            "id": "F1",
+            "problem": "A repairable problem.",
+            "evidence": "Observed in the candidate.",
+            "required_outcome": "Repair it.",
+            "verification": "Run the flow.",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="human.*findings"):
         AcceptanceArtifact.parse(data)
 
 

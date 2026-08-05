@@ -189,7 +189,7 @@ class RunAcceptanceEngine:
                     branch=str(job["repair_branch"]),
                     base_branch=str(state["run_branch"]),
                     title=str(publication["pr_title"]),
-                    body=str(publication["pr_body_markdown"]),
+                    body=self._render_run_repair_pr_body(state, publication),
                 ),
                 acceptance_record=self._repair_acceptance_record,
                 acceptance_is_current=self._repair_acceptance_is_current,
@@ -367,6 +367,17 @@ class RunAcceptanceEngine:
             "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
         }
 
+    def _render_run_repair_pr_body(
+        self, state: dict[str, Any], publication: dict[str, Any]
+    ) -> str:
+        parent = self._mapping(state, "parent")
+        narrative = str(publication["pr_body_markdown"]).strip()
+        return (
+            f"Parent Issue: #{int(parent['number'])}\n"
+            "Delivery Type: Run Repair\n\n"
+            f"{narrative}"
+        )
+
     def _prepare_repair_validation(
         self, _checkout: Path, job: dict[str, Any], validation: Path
     ) -> None:
@@ -374,7 +385,7 @@ class RunAcceptanceEngine:
         # publication merged into it, not merely the repair branch by itself.
         self.git.prepare_expected_merge_checkout(
             default_head_sha=str(job["base_sha"]),
-            run_head_sha=str(job["publication_sha"]),
+            run_head_sha=str(job["candidate_sha"]),
             checkout=validation,
         )
 
@@ -392,13 +403,12 @@ class RunAcceptanceEngine:
             "ticket_completion_records": self._ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "run_head_sha": job["base_sha"],
-            "publication_sha": job["publication_sha"],
-            "publication": self._mapping(job, "publication"),
+            "candidate_sha": job["candidate_sha"],
             "expected_merge_result": {
                 "run_branch_head_sha": job["base_sha"],
-                "repair_publication_sha": job["publication_sha"],
+                "repair_candidate_sha": job["candidate_sha"],
                 "inspection_command": (
-                    f"git diff {job['base_sha']} {job['publication_sha']}"
+                    f"git diff {job['base_sha']} {job['candidate_sha']}"
                 ),
                 "checkout_state": (
                     "Run Branch plus repair publication merge preview; "
@@ -419,7 +429,10 @@ class RunAcceptanceEngine:
         return {
             "acceptance_scope": "run_repair",
             "reviewed_base_sha": job["base_sha"],
-            "reviewed_head_sha": job["publication_sha"],
+            "reviewed_candidate_sha": job["candidate_sha"],
+            "reviewed_candidate_tree": self.git.resolve(
+                f"{job['candidate_sha']}^{{tree}}"
+            ),
             "parent_revision": job["parent_revision"],
             "ticket_graph_revision": job["ticket_graph_revision"],
             "ticket_completion_records": job["ticket_completion_records"],
@@ -433,7 +446,9 @@ class RunAcceptanceEngine:
     ) -> bool:
         return (
             acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_head_sha") == job.get("publication_sha")
+            and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")
+            and acceptance.get("reviewed_candidate_tree")
+            == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
             and not self._repair_revision_changed(state, job)
         )
 

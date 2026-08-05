@@ -97,7 +97,6 @@ class ScriptedRunAgents:
             "commit_message": "fix(run): repair accumulated delivery behavior",
             "pr_title": "fix(run): repair accumulated delivery behavior",
             "pr_body_markdown": (
-                f"Delivery Run: {request['run_id']}\n\n"
                 "## What Problem This Solves\n\nThe combined Run failed.\n\n"
                 "## Why This Change Was Made\n\nThe repair restores the combined behavior.\n\n"
                 "## User Impact\n\nThe complete delivery works together.\n\n"
@@ -177,9 +176,13 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert len(repair_prs) == 1
     assert repair_prs[0]["scope"] == "run_repair"
     assert repair_prs[0]["base_branch"] == state["run_branch"]
-    repair_records = fixture_data["delivery"]["acceptance_records"]
-    assert repair_records[0]["acceptance_scope"] == "run_repair"
-    assert repair_records[0]["reviewed_head_sha"] == run["publication_sha"]
+    assert repair_prs[0]["body"].startswith(
+        "Parent Issue: #1\nDelivery Type: Run Repair\n\n"
+    )
+    assert fixture_data["delivery"]["acceptance_records"] == []
+    repair_statuses = fixture_data["delivery"]["agent_run_status"]
+    assert repair_statuses[0]["scope"] == "run-repair-1"
+    assert repair_statuses[0]["candidate_sha"] == run["candidate_sha"]
     assert fixture_data["delivery"]["closed_issues"] == []
     assert not (
         states.root / "worktrees" / str(state["run_id"]) / "run-repair"
@@ -284,8 +287,7 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
                         "commit_message": "feat(run): deliver the ticket outcome",
                         "pr_title": "feat(run): deliver the ticket outcome",
                         "pr_body_markdown": (
-                            "Primary Ticket: #2\n\n"
-                            "## What Problem This Solves\n\nThe Ticket was pending.\n\n"
+                                "## What Problem This Solves\n\nThe Ticket was pending.\n\n"
                             "## Why This Change Was Made\n\nIt completes the requested path.\n\n"
                             "## User Impact\n\nThe path is available.\n\n"
                             "## Evidence\n\nThe fixture flow passed."

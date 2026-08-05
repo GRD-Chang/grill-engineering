@@ -25,8 +25,6 @@ def publication() -> dict[str, str]:
         "commit_message": "feat(delivery): complete one ticket autonomously",
         "pr_title": "feat(delivery): complete one ticket autonomously",
         "pr_body_markdown": """
-Primary Ticket: #3
-
 ## What Problem This Solves
 
 Active tickets previously stopped before publication.
@@ -234,6 +232,19 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     )
     assert waiting.returncode == 0, waiting.stderr
     assert stdout_json(waiting)["status"] == "waiting_checks"
+    waiting_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert waiting_fixture["delivery"]["agent_run_status"] == [
+        {
+            "pr_number": 1,
+            "scope": "ticket-3",
+            "base_sha": load_only_run_state(git_repo)["ticket_jobs"]["3"]["base_sha"],
+            "candidate_sha": load_only_run_state(git_repo)["ticket_jobs"]["3"]["candidate_sha"],
+            "validation_verdict": "pass",
+            "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
+            "required_checks": "pending",
+            "next_action": "wait for Required Checks",
+        }
+    ]
     checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
     assert checkout.is_dir()
     git_link = (checkout / ".git").read_text(encoding="utf-8")
@@ -255,6 +266,8 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     assert not checkout.exists()
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(mutable_fixture["delivery"]["pull_requests"]) == 1
+    assert len(mutable_fixture["delivery"]["agent_run_status"]) == 1
+    assert mutable_fixture["delivery"]["agent_run_status"][0]["required_checks"] == "pass"
     assert mutable_fixture["delivery"]["closed_issues"] == [3]
 
 
@@ -393,9 +406,9 @@ def test_ticket_revision_change_invalidates_old_acceptance_and_reuses_job(
     final_agents = git_repo / "agents-final.json"
     final_agents.write_text(
         json.dumps(
-            {
-                "developments": [],
-                "publications": [],
+                {
+                    "developments": [],
+                    "publications": [publication()],
                 "reviews": [
                     passing_acceptance(
                         "reviewer-2", "Revision two passed."

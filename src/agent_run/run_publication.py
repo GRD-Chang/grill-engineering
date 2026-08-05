@@ -87,7 +87,7 @@ class RunPublicationEngine:
                 branch=str(state["run_branch"]),
                 base_branch=self.default_branch,
                 title=artifact.pr_title,
-                body=artifact.pr_body_markdown,
+                body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
             )
             live = self.github.live_pull_request(pr_number)
             if (
@@ -101,6 +101,7 @@ class RunPublicationEngine:
             self.github.record_run_publication(pr_number, record)
             publication.update({"pr_number": pr_number, "record": record})
             checks = self.github.required_checks(pr_number)
+            self._record_agent_run_status(pr_number, run, run_head, checks)
             if checks == "fail":
                 self._queue_repair(
                     state,
@@ -321,6 +322,40 @@ class RunPublicationEngine:
             "acceptance_record": self._mapping(run, "acceptance_record"),
             "checkout": str(checkout),
         }
+
+    def _render_final_run_pr_body(self, state: dict[str, Any], narrative: str) -> str:
+        parent = self._mapping(state, "parent")
+        return (
+            f"Parent Issue: #{int(parent['number'])}\n"
+            "Delivery Type: Final Run\n\n"
+            f"{narrative.strip()}"
+        )
+
+    def _record_agent_run_status(
+        self, pr_number: int, run: dict[str, Any], run_head: str, checks: str
+    ) -> None:
+        artifact = self._mapping(run, "acceptance_artifact")
+        raw_checks = self._mapping(artifact, "checks")
+        lane_statuses = {
+            lane: str(self._mapping(raw_checks, lane)["status"])
+            for lane in ("e2e", "standards", "spec")
+        }
+        next_action = {
+            "fail": "repair failed Required Checks",
+            "pending": "wait for Required Checks",
+        }.get(checks, "await explicit maintainer approval")
+        self.github.record_agent_run_status(
+            pr_number,
+            {
+                "scope": "final-run",
+                "base_sha": self.default_head_sha,
+                "candidate_sha": run_head,
+                "validation_verdict": str(artifact["verdict"]),
+                "lane_statuses": lane_statuses,
+                "required_checks": checks,
+                "next_action": next_action,
+            },
+        )
 
     def _record(self, state: dict[str, Any], run_head: str, pr_head: str) -> dict[str, Any]:
         return {

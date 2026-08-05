@@ -37,6 +37,7 @@ class TicketPhase(StrEnum):
     CANDIDATE = "candidate"
     REVIEWING = "reviewing"
     ACCEPTED = "accepted"
+    PUBLISHING = "publishing"
     WAITING_CHECKS = "waiting_checks"
     ESCALATING = "escalating"
     MERGING = "merging"

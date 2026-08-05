@@ -29,8 +29,6 @@ def _publication() -> dict[str, str]:
         "commit_message": "feat(delivery): complete crash-safe ticket",
         "pr_title": "feat(delivery): complete crash-safe ticket",
         "pr_body_markdown": """
-Primary Ticket: #2
-
 ## What Problem This Solves
 
 The Ticket needs a crash-safe delivery path.
@@ -87,20 +85,21 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     assert job["phase"] == "completed"
     assert job["validation_attempts"] >= 1
     record = job["acceptance_record"]
-    assert record["reviewed_head_sha"] == job["publication_sha"]
+    assert record["reviewed_candidate_sha"] == job["candidate_sha"]
     assert record["effective_revision"] == job["effective_revision"]
 
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
     assert len(delivery["pull_requests"]) == 1
-    assert len(delivery["acceptance_records"]) == 1
+    assert delivery["acceptance_records"] == []
+    assert len(delivery["agent_run_status"]) == 1
     assert delivery["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in delivery["mutations"]
     ] == ["completion_comment", "close_issue"]
 
 
-@pytest.mark.parametrize("save_number", range(1, 17))
+@pytest.mark.parametrize("save_number", range(1, 16))
 def test_public_cli_recovers_after_every_durable_save_boundary(
     git_repo: Path, save_number: int
 ) -> None:
@@ -159,7 +158,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         "ensure_ticket_branch",
         "publish_branch",
         "ensure_ticket_pr",
-        "record_acceptance",
+        "record_agent_run_status",
         "squash_merge",
         "sync_run_branch",
         "close",

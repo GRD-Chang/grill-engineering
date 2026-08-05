@@ -27,8 +27,6 @@ def _publication(label: str) -> dict[str, str]:
         "commit_message": f"fix(run): publish {label} revision",
         "pr_title": f"fix(run): publish {label} revision",
         "pr_body_markdown": f"""
-Primary Ticket: #2
-
 ## What Problem This Solves
 
 Stale publication evidence must not advance.
@@ -175,7 +173,8 @@ def test_content_change_at_publish_boundary_restarts_before_merge(
     )
     live = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(live["delivery"]["pull_requests"]) == 1
-    assert len(live["delivery"]["acceptance_records"]) == 1
+    assert live["delivery"]["acceptance_records"] == []
+    assert len(live["delivery"]["agent_run_status"]) == 1
     assert live["delivery"]["closed_issues"] == [2]
 
 
@@ -316,7 +315,8 @@ def test_aba_revision_after_crash_still_forces_fresh_rebuild(
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
     assert len(delivery["pull_requests"]) == 1
-    assert len(delivery["acceptance_records"]) == 1
+    assert delivery["acceptance_records"] == []
+    assert len(delivery["agent_run_status"]) == 1
     assert delivery["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in delivery["mutations"]

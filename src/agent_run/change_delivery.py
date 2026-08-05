@@ -57,7 +57,7 @@ class ChangeJobContract:
 
 
 class ChangeDeliveryEngine:
-    """One Development -> Candidate -> Publication -> Review -> Merge loop.
+    """One Development -> Candidate -> Review -> Publication -> Merge loop.
 
     ``job`` uses the existing durable phase values so Ticket records remain
     backward compatible.  Run Repair records use the same fields but have no
@@ -101,12 +101,14 @@ class ChangeDeliveryEngine:
                     if not self._commit_candidate(state, job, checkout):
                         return state
                 if job["phase"] == "candidate":
-                    self._publication(state, job, checkout)
-                if job["phase"] == "reviewing":
                     self._review(state, job, checkout)
+                if job["phase"] == "reviewing":
+                    raise ValueError("reviewing Change Job must be completed atomically")
+                if job["phase"] == "accepted":
+                    self._publication(state, job, checkout)
                 if job["phase"] == "escalating":
                     continue
-                if job["phase"] in {"accepted", "waiting_checks", "merging"}:
+                if job["phase"] in {"publishing", "waiting_checks", "merging"}:
                     terminal = self._publish_and_merge(state, job)
                     if terminal:
                         return state
@@ -199,7 +201,7 @@ class ChangeDeliveryEngine:
                     "pr_body_markdown": publication.pr_body_markdown,
                 },
                 "publication_sha": sha,
-                "phase": "reviewing",
+                "phase": "publishing",
             }
         )
         self.contract.save(state)
@@ -236,6 +238,23 @@ class ChangeDeliveryEngine:
         job["acceptance_record"] = self.contract.acceptance_record(
             state, job, review.thread_id, artifact.raw
         )
+        # A first rejection has no PR to expose.  For a repair after a PR
+        # already exists, update that PR's one status comment immediately so
+        # it cannot keep advertising an obsolete passing Candidate.
+        existing_pr = job.get("pr_number")
+        if isinstance(existing_pr, int):
+            self._record_agent_run_status(
+                existing_pr,
+                job,
+                "not_checked",
+                next_action=(
+                    "repair Fresh Validation findings"
+                    if artifact.verdict == "request_changes"
+                    else "await human decision"
+                    if artifact.verdict == "human"
+                    else "generate publication narrative"
+                ),
+            )
         if artifact.verdict == "pass":
             job["phase"] = "accepted"
         elif (
@@ -341,6 +360,7 @@ class ChangeDeliveryEngine:
             job,
             "Published-Head Gate rejected requirements changed while reading checks",
         )
+        self._record_agent_run_status(pr_number, job, checks)
         if checks == "pending":
             job["phase"] = "waiting_checks"
             state["status"] = "waiting_checks"
@@ -373,9 +393,17 @@ class ChangeDeliveryEngine:
             or live.get("base_branch") != self.contract.base_branch(state)
             or live.get("base_sha") != acceptance.get("reviewed_base_sha")
             or live.get("mergeable") is not True
-            or acceptance.get("reviewed_head_sha") != job["publication_sha"]
+            or acceptance.get("reviewed_candidate_sha") != job["candidate_sha"]
+            or acceptance.get("reviewed_candidate_tree")
+            != self.git.resolve(f"{job['publication_sha']}^{{tree}}")
             or not self.contract.acceptance_is_current(state, job, acceptance)
         ):
+            self._record_agent_run_status(
+                pr_number,
+                job,
+                checks,
+                next_action="blocked: Published-Head Gate rejected live PR state",
+            )
             return self._block(
                 state,
                 job,
@@ -392,11 +420,12 @@ class ChangeDeliveryEngine:
             job["merge_intent"]["effective_revision"] = str(job["effective_revision"])
         job["phase"] = "merging"
         self.contract.save(state)
-        self.github.record_acceptance(pr_number, acceptance)
-        # The remote Acceptance Record is an external durable side effect.  A
-        # checkpoint here makes a response-loss recovery replay the merge
-        # intent instead of conflating record creation with the merge call.
-        self.contract.save(state)
+        self._record_agent_run_status(
+            pr_number,
+            job,
+            checks,
+            next_action="squash merge into the Run Branch",
+        )
         integrated = self.github.squash_merge(
             pr_number=pr_number,
             expected_head_sha=str(job["publication_sha"]),
@@ -418,6 +447,42 @@ class ChangeDeliveryEngine:
         job["phase"] = "completed"
         self.contract.save(state)
         return True
+
+    def _record_agent_run_status(
+        self,
+        pr_number: int,
+        job: dict[str, Any],
+        checks: str,
+        *,
+        next_action: str | None = None,
+    ) -> None:
+        artifact = _mapping(job, "acceptance_artifact")
+        raw_checks = _mapping(artifact, "checks")
+        lane_statuses = {
+            lane: str(_mapping(raw_checks, lane)["status"])
+            for lane in ("e2e", "standards", "spec")
+        }
+        if next_action is None:
+            if checks == "pending":
+                next_action = "wait for Required Checks"
+            elif checks == "fail":
+                next_action = "repair failed Required Checks"
+            elif checks == "not_checked":
+                next_action = "verify Published-Head Gate"
+            else:
+                next_action = "verify Published-Head Gate"
+        self.github.record_agent_run_status(
+            pr_number,
+            {
+                "scope": self.contract.label(job),
+                "base_sha": str(job["base_sha"]),
+                "candidate_sha": str(job["candidate_sha"]),
+                "validation_verdict": str(artifact["verdict"]),
+                "lane_statuses": lane_statuses,
+                "required_checks": checks,
+                "next_action": next_action,
+            },
+        )
 
     def _reject_stale(
         self, state: dict[str, Any], job: dict[str, Any], message: str
