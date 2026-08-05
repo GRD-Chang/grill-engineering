@@ -176,6 +176,19 @@ def test_human_verdict_requires_a_blocked_lane_and_human_blocker() -> None:
         AcceptanceArtifact.parse(data)
 
 
+def test_human_verdict_rejects_a_repairable_failed_lane() -> None:
+    data = passing_acceptance()
+    data["verdict"] = "human"
+    checks = data["checks"]
+    assert isinstance(checks, dict)
+    checks["e2e"] = {"status": "fail", "evidence": "The user path is broken."}
+    checks["spec"] = {"status": "blocked", "evidence": "Needs maintainer permission."}
+    data["human_blockers"] = ["A maintainer must grant external permission."]
+
+    with pytest.raises(ValueError, match="no failed check"):
+        AcceptanceArtifact.parse(data)
+
+
 def test_human_verdict_rejects_repair_findings() -> None:
     data = passing_acceptance()
     data["verdict"] = "human"

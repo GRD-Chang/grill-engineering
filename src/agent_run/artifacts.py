@@ -139,9 +139,11 @@ class AcceptanceArtifact:
             raise ValueError("request_changes must not contain human blockers")
         if verdict == "human" and findings:
             raise ValueError("human acceptance must not contain repair findings")
-        if verdict == "human" and (not blockers or "blocked" not in statuses):
+        if verdict == "human" and (
+            not blockers or "blocked" not in statuses or "fail" in statuses
+        ):
             raise ValueError(
-                "human verdict requires human_blockers and a blocked check"
+                "human verdict requires human_blockers, a blocked check, and no failed check"
             )
         return cls(
             verdict=verdict,

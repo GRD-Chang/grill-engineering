@@ -448,6 +448,41 @@ def test_publication_resume_failure_starts_and_reports_replacement(
     assert "The candidate is ready." in invocations[1][1]
 
 
+def test_publication_uses_a_read_only_checkout(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    calls: list[dict[str, Any]] = []
+
+    def fake_invoke(self: CodexCliBackend, **options: Any) -> tuple[str, str]:
+        del self
+        calls.append(options)
+        return (
+            json.dumps(
+                {
+                    "commit_message": "fix(delivery): publish accepted candidate",
+                    "pr_title": "fix(delivery): publish accepted candidate",
+                    "pr_body_markdown": (
+                        "## What Problem This Solves\n\nPublication needs an immutable candidate.\n\n"
+                        "## Why This Change Was Made\n\nThe Publisher owns release writes.\n\n"
+                        "## User Impact\n\nThe accepted change stays stable.\n\n"
+                        "## Evidence\n\nFresh validation passed."
+                    ),
+                }
+            ),
+            "publication-thread",
+        )
+
+    monkeypatch.setattr(CodexCliBackend, "_invoke", fake_invoke)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").publication(
+        {"checkout": str(checkout), "thread_id": "development-thread"}
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["writable_checkout"] is False
+
+
 def test_live_codex_backend_rejects_empty_minted_token(
     tmp_path: Path,
 ) -> None:

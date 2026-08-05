@@ -183,6 +183,7 @@ class CodexCliBackend:
                 checkout=checkout,
                 thread_id=thread_id,
                 schema=publication_schema(),
+                writable_checkout=False,
             )
         except _CodexThreadResumeError:
             replaced_thread = thread_id
@@ -196,6 +197,7 @@ class CodexCliBackend:
                 checkout=checkout,
                 thread_id=None,
                 schema=publication_schema(),
+                writable_checkout=False,
             )
         return PublicationResult(
             thread_id=resumed_thread,
