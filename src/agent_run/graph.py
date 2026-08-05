@@ -140,6 +140,18 @@ def state_from_graph(
             elif phase == "waiting_checks":
                 status = "waiting_checks"
                 diagnostics = []
+            elif phase == TicketPhase.PUBLICATION_PENDING.value:
+                status = "publication_pending"
+                diagnostics = [
+                    {
+                        "code": "publication_pending",
+                        "message": (
+                            "Publication retries were exhausted; resume retries "
+                            "publication without rerunning Development or Fresh Validation"
+                        ),
+                        "change_job": "parent-only",
+                    }
+                ]
             elif phase == "merging":
                 status = "parent_closeout_pending"
                 diagnostics = []
