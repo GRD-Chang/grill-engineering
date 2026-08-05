@@ -97,7 +97,6 @@ class ScriptedRunAgents:
             "commit_message": "fix(run): repair accumulated delivery behavior",
             "pr_title": "fix(run): repair accumulated delivery behavior",
             "pr_body_markdown": (
-                f"Delivery Run: {request['run_id']}\n\n"
                 "## What Problem This Solves\n\nThe combined Run failed.\n\n"
                 "## Why This Change Was Made\n\nThe repair restores the combined behavior.\n\n"
                 "## User Impact\n\nThe complete delivery works together.\n\n"
@@ -177,6 +176,9 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert len(repair_prs) == 1
     assert repair_prs[0]["scope"] == "run_repair"
     assert repair_prs[0]["base_branch"] == state["run_branch"]
+    assert repair_prs[0]["body"].startswith(
+        "Parent Issue: #1\nDelivery Type: Run Repair\n\n"
+    )
     assert fixture_data["delivery"]["acceptance_records"] == []
     repair_statuses = fixture_data["delivery"]["agent_run_status"]
     assert repair_statuses[0]["scope"] == "run-repair-1"

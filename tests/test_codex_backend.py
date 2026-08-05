@@ -192,10 +192,10 @@ def test_publication_prompts_require_semantic_titles() -> None:
     assert "Conventional Commit 语义标题格式" in ticket_prompt
     assert "Conventional Commit 语义标题格式" in run_prompt
     assert "`Primary Ticket: #" not in ticket_prompt
-    assert "`Delivery Run: run-1` 开头" in run_prompt
+    assert "Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入" in run_prompt
 
 
-def test_run_publication_prompt_requires_exact_run_identity(
+def test_run_publication_prompt_reserves_identity_for_publisher(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -212,7 +212,7 @@ def test_run_publication_prompt_requires_exact_run_identity(
                 {
                     "commit_message": "feat: publish validated run",
                     "pr_title": "feat: publish validated run",
-                    "pr_body_markdown": "Delivery Run: run-1",
+                    "pr_body_markdown": "## What Problem This Solves\n\nA complete Run needs a review boundary.",
                 }
             ),
             encoding="utf-8",
@@ -229,8 +229,7 @@ def test_run_publication_prompt_requires_exact_run_identity(
         {"checkout": str(tmp_path), "run_id": "run-1"}
     )
 
-    assert "`Delivery Run: run-1`" in prompts[0]
-    assert "前面不得有任何标题、空行或其他文字" in prompts[0]
+    assert "Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入" in prompts[0]
 
 
 @pytest.mark.parametrize(

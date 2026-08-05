@@ -189,7 +189,7 @@ class RunAcceptanceEngine:
                     branch=str(job["repair_branch"]),
                     base_branch=str(state["run_branch"]),
                     title=str(publication["pr_title"]),
-                    body=str(publication["pr_body_markdown"]),
+                    body=self._render_run_repair_pr_body(state, publication),
                 ),
                 acceptance_record=self._repair_acceptance_record,
                 acceptance_is_current=self._repair_acceptance_is_current,
@@ -366,6 +366,17 @@ class RunAcceptanceEngine:
             "development_summary": job.get("development_summary"),
             "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
         }
+
+    def _render_run_repair_pr_body(
+        self, state: dict[str, Any], publication: dict[str, Any]
+    ) -> str:
+        parent = self._mapping(state, "parent")
+        narrative = str(publication["pr_body_markdown"]).strip()
+        return (
+            f"Parent Issue: #{int(parent['number'])}\n"
+            "Delivery Type: Run Repair\n\n"
+            f"{narrative}"
+        )
 
     def _prepare_repair_validation(
         self, _checkout: Path, job: dict[str, Any], validation: Path

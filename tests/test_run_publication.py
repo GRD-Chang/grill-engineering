@@ -28,7 +28,6 @@ class RunPublicationAgents:
             "commit_message": "feat(run): publish the completed delivery",
             "pr_title": "feat(run): publish the completed delivery",
             "pr_body_markdown": (
-                f"Delivery Run: {request['run_id']}\n\n"
                 "## What Problem This Solves\n\nThe accepted Run needs a human merge boundary.\n\n"
                 "## Why This Change Was Made\n\nIt makes the completed delivery reviewable.\n\n"
                 "## User Impact\n\nMaintainers can inspect and approve one final PR.\n\n"
@@ -100,6 +99,22 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert final["record"]["run_head_sha"] == git.resolve(str(state["run_branch"]))
     assert final["record"]["default_head_sha"] == git.resolve("main")
     assert publisher.live_pull_request(int(final["pr_number"]))["state"] == "OPEN"
+    pull = publisher.data["delivery"]["pull_requests"][0]
+    assert pull["body"].startswith(
+        "Parent Issue: #1\nDelivery Type: Final Run\n\n"
+    )
+    assert publisher.data["delivery"]["agent_run_status"] == [
+        {
+            "pr_number": final["pr_number"],
+            "scope": "final-run",
+            "base_sha": git.resolve("main"),
+            "candidate_sha": git.resolve(str(state["run_branch"])),
+            "validation_verdict": "pass",
+            "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
+            "required_checks": "none",
+            "next_action": "await explicit maintainer approval",
+        }
+    ]
 
     completed = engine.approve(str(state["run_id"]))
 

@@ -210,8 +210,8 @@ class CodexCliBackend:
         prompt = (
             "你是一次性的 Run Publication Codex。只读取当前事实，生成最终 Run PR "
             "的语义标题和正文；不要编辑文件、不要执行 Git/GitHub 写操作，也不要做 "
-            "验收或替代人工批准。PR 正文第一行必须精确为 "
-            f"`Delivery Run: {run_id}`，前面不得有任何标题、空行或其他文字；并包含非空 "
+            "验收或替代人工批准。Parent Issue、Delivery Type、Delivery Run、SHA、CI 与"
+            "生命周期事实由 Publisher 注入，叙事中不得输出这些字段；并包含非空 "
             "What Problem This Solves、Why This Change Was Made、User Impact、Evidence、"
             "Completed Tickets、Known Limitations、Validation Results 七个二级标题；"
             "不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 "
@@ -235,8 +235,9 @@ class CodexCliBackend:
             return (
                 "你是本次 Run Repair 的发布叙事工程师。当前 Candidate 已通过独立验收；"
                 "根据当前累计 diff、开发摘要和独立验收证据，输出小型 Publication Artifact。"
-                "不要修改文件，也不要执行任何 Git/GitHub 写操作。PR 正文必须以"
-                f"`Delivery Run: {request['run_id']}` 开头，并包含四个非空二级标题："
+                "不要修改文件，也不要执行任何 Git/GitHub 写操作。Parent Issue、"
+                "Delivery Type、Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入，"
+                "叙事中不得输出这些字段；并包含四个非空二级标题："
                 "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
                 "禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
                 "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "

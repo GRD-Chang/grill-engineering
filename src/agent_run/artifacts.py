@@ -13,7 +13,7 @@ _CLOSING_KEYWORD = re.compile(
     r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+\b"
 )
 _PUBLISHER_OWNED_CONTEXT = re.compile(
-    r"(?im)^\s*(?:Parent Issue|Primary Ticket|Delivery Type):"
+    r"(?im)^\s*(?:Parent Issue|Primary Ticket|Delivery Type|Delivery Run):"
 )
 _REQUIRED_SECTIONS = (
     "What Problem This Solves",
@@ -52,13 +52,8 @@ class PublicationArtifact:
         _require_meaningful_outcome(pr_title, "pr_title")
         if (primary_ticket is None) == (delivery_run is None):
             raise ValueError("publication artifact requires exactly one identity")
-        if primary_ticket is not None:
-            if _PUBLISHER_OWNED_CONTEXT.search(body):
-                raise ValueError("Ticket narrative must not contain Publisher-owned facts")
-        else:
-            identity = f"Delivery Run: {delivery_run}"
-            if body.splitlines()[0].strip() != identity:
-                raise ValueError("Run PR body must start with Delivery Run")
+        if _PUBLISHER_OWNED_CONTEXT.search(body):
+            raise ValueError("PR narrative must not contain Publisher-owned facts")
         if _CLOSING_KEYWORD.search(body):
             raise ValueError("PR body must not contain automatic closing keywords")
         for section in _REQUIRED_SECTIONS:

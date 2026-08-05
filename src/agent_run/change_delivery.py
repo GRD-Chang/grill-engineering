@@ -238,6 +238,23 @@ class ChangeDeliveryEngine:
         job["acceptance_record"] = self.contract.acceptance_record(
             state, job, review.thread_id, artifact.raw
         )
+        # A first rejection has no PR to expose.  For a repair after a PR
+        # already exists, update that PR's one status comment immediately so
+        # it cannot keep advertising an obsolete passing Candidate.
+        existing_pr = job.get("pr_number")
+        if isinstance(existing_pr, int):
+            self._record_agent_run_status(
+                existing_pr,
+                job,
+                "not_checked",
+                next_action=(
+                    "repair Fresh Validation findings"
+                    if artifact.verdict == "request_changes"
+                    else "await human decision"
+                    if artifact.verdict == "human"
+                    else "generate publication narrative"
+                ),
+            )
         if artifact.verdict == "pass":
             job["phase"] = "accepted"
         elif (
@@ -381,6 +398,12 @@ class ChangeDeliveryEngine:
             != self.git.resolve(f"{job['publication_sha']}^{{tree}}")
             or not self.contract.acceptance_is_current(state, job, acceptance)
         ):
+            self._record_agent_run_status(
+                pr_number,
+                job,
+                checks,
+                next_action="blocked: Published-Head Gate rejected live PR state",
+            )
             return self._block(
                 state,
                 job,
@@ -397,6 +420,12 @@ class ChangeDeliveryEngine:
             job["merge_intent"]["effective_revision"] = str(job["effective_revision"])
         job["phase"] = "merging"
         self.contract.save(state)
+        self._record_agent_run_status(
+            pr_number,
+            job,
+            checks,
+            next_action="squash merge into the Run Branch",
+        )
         integrated = self.github.squash_merge(
             pr_number=pr_number,
             expected_head_sha=str(job["publication_sha"]),
@@ -420,7 +449,12 @@ class ChangeDeliveryEngine:
         return True
 
     def _record_agent_run_status(
-        self, pr_number: int, job: dict[str, Any], checks: str
+        self,
+        pr_number: int,
+        job: dict[str, Any],
+        checks: str,
+        *,
+        next_action: str | None = None,
     ) -> None:
         artifact = _mapping(job, "acceptance_artifact")
         raw_checks = _mapping(artifact, "checks")
@@ -428,12 +462,15 @@ class ChangeDeliveryEngine:
             lane: str(_mapping(raw_checks, lane)["status"])
             for lane in ("e2e", "standards", "spec")
         }
-        if checks == "pending":
-            next_action = "wait for Required Checks"
-        elif checks == "fail":
-            next_action = "repair failed Required Checks"
-        else:
-            next_action = "squash merge into the Run Branch"
+        if next_action is None:
+            if checks == "pending":
+                next_action = "wait for Required Checks"
+            elif checks == "fail":
+                next_action = "repair failed Required Checks"
+            elif checks == "not_checked":
+                next_action = "verify Published-Head Gate"
+            else:
+                next_action = "verify Published-Head Gate"
         self.github.record_agent_run_status(
             pr_number,
             {

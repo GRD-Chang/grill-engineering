@@ -1466,6 +1466,9 @@ def test_published_head_gate_rejects_live_base_sha_drift(
 
     assert result["status"] == "blocked"
     assert result["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert publisher.agent_run_statuses[-1]["next_action"] == (
+        "blocked: Published-Head Gate rejected live PR state"
+    )
     assert publisher.closed_issues == []
 
 

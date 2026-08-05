@@ -38,9 +38,14 @@ def test_publication_artifact_enforces_ticket_narrative_contract() -> None:
 
 @pytest.mark.parametrize(
     "machine_fact",
-    ["Parent Issue: #1", "Primary Ticket: #3", "Delivery Type: Ticket"],
+    [
+        "Parent Issue: #1",
+        "Primary Ticket: #3",
+        "Delivery Type: Ticket",
+        "Delivery Run: run-1",
+    ],
 )
-def test_ticket_publication_artifact_rejects_publisher_owned_facts(
+def test_publication_artifact_rejects_publisher_owned_facts(
     machine_fact: str,
 ) -> None:
     data = publication_data()
@@ -48,6 +53,14 @@ def test_ticket_publication_artifact_rejects_publisher_owned_facts(
 
     with pytest.raises(ValueError):
         PublicationArtifact.parse(data, primary_ticket=3)
+
+
+def test_run_publication_artifact_rejects_publisher_owned_facts() -> None:
+    data = publication_data()
+    data["pr_body_markdown"] = f"Delivery Run: run-1\n\n{data['pr_body_markdown']}"
+
+    with pytest.raises(ValueError):
+        PublicationArtifact.parse(data, delivery_run="run-1")
 
 
 def test_ticket_publication_artifact_rejects_closing_keyword() -> None:
