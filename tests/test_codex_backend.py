@@ -113,6 +113,7 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     prompts: list[str] = []
+    schemas: list[dict[str, Any]] = []
 
     def fake_run(
         arguments: list[str],
@@ -122,6 +123,10 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
         output_index = arguments.index("--output-last-message") + 1
         output = "Implemented and tested."
         if "--output-schema" in arguments:
+            schema_index = arguments.index("--output-schema") + 1
+            schemas.append(
+                json.loads(Path(arguments[schema_index]).read_text(encoding="utf-8"))
+            )
             output = json.dumps(
                 {
                     "verdict": "pass",
@@ -159,7 +164,7 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
             "checkout": str(checkout),
             "ticket": {"number": 3},
             "base_sha": "a" * 40,
-            "publication_sha": "b" * 40,
+            "candidate_sha": "b" * 40,
         }
     )
 
@@ -171,6 +176,61 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert "E2E" in acceptance
     assert acceptance.count("skill:code-review") >= 2
     assert "不得替代" in acceptance
+    assert "findings 与 human_blockers 必须都是空数组" in acceptance
+    assert len(schemas) == 1
+    assert "allOf" not in schemas[0]
+
+
+def test_publication_prompts_require_semantic_titles() -> None:
+    ticket_prompt = CodexCliBackend._publication_prompt(
+        {"acceptance_scope": "ticket"}
+    )
+    run_prompt = CodexCliBackend._publication_prompt(
+        {"acceptance_scope": "run", "run_id": "run-1"}
+    )
+
+    assert "Conventional Commit 语义标题格式" in ticket_prompt
+    assert "Conventional Commit 语义标题格式" in run_prompt
+    assert "`Primary Ticket: #" not in ticket_prompt
+    assert "`Delivery Run: run-1` 开头" in run_prompt
+
+
+def test_run_publication_prompt_requires_exact_run_identity(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    prompts: list[str] = []
+
+    def fake_run(
+        arguments: list[str],
+        **options: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(
+                {
+                    "commit_message": "feat: publish validated run",
+                    "pr_title": "feat: publish validated run",
+                    "pr_body_markdown": "Delivery Run: run-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"run-publication"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").run_publication(
+        {"checkout": str(tmp_path), "run_id": "run-1"}
+    )
+
+    assert "`Delivery Run: run-1`" in prompts[0]
+    assert "前面不得有任何标题、空行或其他文字" in prompts[0]
 
 
 @pytest.mark.parametrize(
@@ -348,7 +408,6 @@ def test_publication_resume_failure_starts_and_reports_replacement(
                     "commit_message": "fix(delivery): repair publication",
                     "pr_title": "fix(delivery): repair publication",
                     "pr_body_markdown": (
-                        "Primary Ticket: #3\n\n"
                         "## What Problem This Solves\n\nLost publication.\n\n"
                         "## Why This Change Was Made\n\nRecover the thread.\n\n"
                         "## User Impact\n\nDelivery continues.\n\n"

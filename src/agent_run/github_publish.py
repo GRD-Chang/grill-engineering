@@ -15,6 +15,7 @@ class MergeOutcomeUnknownError(RuntimeError):
 
 _ACCEPTANCE_MARKER = "<!-- agent-run:acceptance-record -->"
 _RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
+_AGENT_RUN_STATUS_MARKER = "<!-- agent-run:agent-run-status -->"
 
 
 class GhGitHubPublisher:
@@ -443,6 +444,34 @@ class GhGitHubPublisher:
                 f"body={body}",
             )
 
+    def record_agent_run_status(
+        self, pr_number: int, status: dict[str, Any]
+    ) -> None:
+        body = _render_agent_run_status(status)
+        comments = self._json(
+            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate"
+        )
+        if not isinstance(comments, list):
+            raise GitHubReadError("github_invalid_response", "comments must be an array")
+        existing = next(
+            (
+                _mapping(comment)
+                for comment in comments
+                if _AGENT_RUN_STATUS_MARKER in str(_mapping(comment).get("body", ""))
+            ),
+            None,
+        )
+        if existing is None:
+            self._json(
+                "api", f"repos/{self.repository}/issues/{pr_number}/comments", "-f", f"body={body}"
+            )
+        else:
+            self._json(
+                "api", "--method", "PATCH",
+                f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
+                "-f", f"body={body}",
+            )
+
     def squash_merge(
         self,
         *,
@@ -651,4 +680,30 @@ def _integer(data: dict[str, Any], key: str) -> int:
     value = data.get(key)
     if not isinstance(value, int):
         raise GitHubReadError("github_invalid_response", f"{key} must be an integer")
+    return value
+
+
+def _render_agent_run_status(status: dict[str, Any]) -> str:
+    lanes = _mapping(status.get("lane_statuses"))
+    lane_summary = ", ".join(
+        f"{lane}={lanes.get(lane)}" for lane in ("e2e", "standards", "spec")
+    )
+    required = _string(status, "required_checks")
+    return (
+        f"{_AGENT_RUN_STATUS_MARKER}\n"
+        "## Agent Run Status\n\n"
+        f"- Scope: `{_string(status, 'scope')}`\n"
+        f"- Candidate/Base: `{_string(status, 'candidate_sha')}` / "
+        f"`{_string(status, 'base_sha')}`\n"
+        f"- Fresh Validation: `{_string(status, 'validation_verdict')}` "
+        f"({lane_summary})\n"
+        f"- Required Checks: `{required}`\n"
+        f"- Next action: {_string(status, 'next_action')}"
+    )
+
+
+def _string(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise GitHubReadError("github_invalid_response", f"{key} must be a string")
     return value

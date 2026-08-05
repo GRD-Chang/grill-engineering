@@ -62,6 +62,10 @@ class GitHubPublisher(Protocol):
         self, pr_number: int, record: dict[str, Any]
     ) -> None: ...
 
+    def record_agent_run_status(
+        self, pr_number: int, status: dict[str, Any]
+    ) -> None: ...
+
     def squash_merge(
         self,
         *,

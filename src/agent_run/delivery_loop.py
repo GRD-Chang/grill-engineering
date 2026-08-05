@@ -65,13 +65,13 @@ class TicketDeliveryLoop:
                 publication_request=self._publication_request,
                 review_request=self._review_request,
                 prepare_validation=lambda _checkout, job, validation: self.git.prepare_validation_checkout(
-                    head_sha=str(job["publication_sha"]), checkout=validation
+                    head_sha=str(job["candidate_sha"]), checkout=validation
                 ),
                 ensure_pr=lambda state, job, publication: self.github.ensure_ticket_pr(
                     branch=str(job["ticket_branch"]),
                     base_branch=str(state["run_branch"]),
                     title=str(publication["pr_title"]),
-                    body=str(publication["pr_body_markdown"]),
+                    body=self._render_ticket_pr_body(state, job, publication),
                     primary_ticket=int(job["ticket_number"]),
                 ),
                 acceptance_record=self._acceptance_record,
@@ -98,19 +98,23 @@ class TicketDeliveryLoop:
         return {
             "acceptance_scope": "change_job",
             "reviewed_base_sha": str(job["base_sha"]),
-            "reviewed_head_sha": str(job["publication_sha"]),
+            "reviewed_candidate_sha": str(job["candidate_sha"]),
+            "reviewed_candidate_tree": self.git.resolve(
+                f"{job['candidate_sha']}^{{tree}}"
+            ),
             "effective_revision": str(job["effective_revision"]),
             "reviewer_thread_id": reviewer_thread_id,
             "artifact": artifact,
         }
 
-    @staticmethod
     def _acceptance_is_current(
-        _state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
+        self, _state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
     ) -> bool:
         return (
             acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_head_sha") == job.get("publication_sha")
+            and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")
+            and acceptance.get("reviewed_candidate_tree")
+            == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
             and acceptance.get("effective_revision") == job.get("effective_revision")
         )
 
@@ -229,6 +233,7 @@ class TicketDeliveryLoop:
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
             "thread_id": job["development_thread_id"],
+            "acceptance_artifact": _mapping(job, "acceptance_artifact"),
         }
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
@@ -246,11 +251,23 @@ class TicketDeliveryLoop:
             "parent": self._parent(state),
             "ticket": self._ticket(state, job),
             "base_sha": job["base_sha"],
-            "publication_sha": job["publication_sha"],
+            "candidate_sha": job["candidate_sha"],
             "effective_revision": job["effective_revision"],
-            "publication": _mapping(job, "publication"),
             "checkout": str(checkout),
         }
+
+    @staticmethod
+    def _render_ticket_pr_body(
+        state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
+    ) -> str:
+        parent = _mapping(state, "parent")
+        narrative = str(publication["pr_body_markdown"]).strip()
+        return (
+            f"Parent Issue: #{int(parent['number'])}\n"
+            f"Primary Ticket: #{int(job['ticket_number'])}\n"
+            "Delivery Type: Ticket\n\n"
+            f"{narrative}"
+        )
 
     @staticmethod
     def _parent(state: dict[str, Any]) -> dict[str, Any]:

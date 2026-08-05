@@ -105,6 +105,7 @@ class FixtureGitHubPublisher:
         delivery.setdefault("pull_requests", [])
         delivery.setdefault("closed_issues", [])
         delivery.setdefault("acceptance_records", [])
+        delivery.setdefault("agent_run_status", [])
         delivery.setdefault("run_publication_records", [])
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
@@ -372,6 +373,20 @@ class FixtureGitHubPublisher:
             records.append(replacement)
         self._save()
         self._crash_once("record_acceptance")
+
+    def record_agent_run_status(
+        self, pr_number: int, status: dict[str, Any]
+    ) -> None:
+        statuses = _mutable_list(self._delivery(), "agent_run_status")
+        replacement = {"pr_number": pr_number, **status}
+        for position, existing in enumerate(statuses):
+            if isinstance(existing, dict) and existing.get("pr_number") == pr_number:
+                statuses[position] = replacement
+                break
+        else:
+            statuses.append(replacement)
+        self._save()
+        self._crash_once("record_agent_run_status")
 
     def squash_merge(
         self,

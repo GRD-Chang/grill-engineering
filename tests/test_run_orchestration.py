@@ -36,8 +36,6 @@ def _publication(number: int) -> dict[str, str]:
         "commit_message": f"feat(delivery): complete ticket {number}",
         "pr_title": f"feat(delivery): complete ticket {number}",
         "pr_body_markdown": f"""
-Primary Ticket: #{number}
-
 ## What Problem This Solves
 
 Ticket {number} was not integrated into the Delivery Run.

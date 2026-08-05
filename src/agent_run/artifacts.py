@@ -12,6 +12,9 @@ _SEMANTIC_TITLE = re.compile(
 _CLOSING_KEYWORD = re.compile(
     r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+\b"
 )
+_PUBLISHER_OWNED_CONTEXT = re.compile(
+    r"(?im)^\s*(?:Parent Issue|Primary Ticket|Delivery Type):"
+)
 _REQUIRED_SECTIONS = (
     "What Problem This Solves",
     "Why This Change Was Made",
@@ -50,14 +53,8 @@ class PublicationArtifact:
         if (primary_ticket is None) == (delivery_run is None):
             raise ValueError("publication artifact requires exactly one identity")
         if primary_ticket is not None:
-            identity = f"Primary Ticket: #{primary_ticket}"
-            identity_lines = [
-                line.strip()
-                for line in body.splitlines()
-                if line.strip().startswith("Primary Ticket:")
-            ]
-            if identity_lines != [identity]:
-                raise ValueError("PR body must identify exactly one Primary Ticket")
+            if _PUBLISHER_OWNED_CONTEXT.search(body):
+                raise ValueError("Ticket narrative must not contain Publisher-owned facts")
         else:
             identity = f"Delivery Run: {delivery_run}"
             if body.splitlines()[0].strip() != identity:
@@ -145,6 +142,8 @@ class AcceptanceArtifact:
             raise ValueError("request_changes requires a failed check")
         if verdict == "request_changes" and blockers:
             raise ValueError("request_changes must not contain human blockers")
+        if verdict == "human" and findings:
+            raise ValueError("human acceptance must not contain repair findings")
         if verdict == "human" and (not blockers or "blocked" not in statuses):
             raise ValueError(
                 "human verdict requires human_blockers and a blocked check"

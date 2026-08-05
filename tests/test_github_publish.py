@@ -201,6 +201,47 @@ def test_ticket_pr_recovery_only_reuses_open_prs(
     assert number == 12
 
 
+def test_agent_run_status_comment_is_updated_in_place(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    comments: list[dict[str, object]] = []
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:1] != ("api",):
+            raise AssertionError(arguments)
+        if "--paginate" in arguments:
+            return comments
+        body = next(argument[5:] for argument in arguments if argument.startswith("body="))
+        if "PATCH" in arguments:
+            comments[0]["body"] = body
+        else:
+            comments.append({"id": 9, "body": body})
+        return {"id": 9}
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    pending = {
+        "scope": "ticket-3",
+        "base_sha": "a" * 40,
+        "candidate_sha": "b" * 40,
+        "validation_verdict": "pass",
+        "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
+        "required_checks": "pending",
+        "next_action": "wait for Required Checks",
+    }
+    publisher.record_agent_run_status(12, pending)
+    publisher.record_agent_run_status(
+        12, {**pending, "required_checks": "pass", "next_action": "merge"}
+    )
+
+    assert len(comments) == 1
+    body = str(comments[0]["body"])
+    assert "<!-- agent-run:agent-run-status -->" in body
+    assert "Required Checks: `pass`" in body
+    assert "```json" not in body
+
+
 def test_squash_merge_uses_supported_pr_merge_and_live_result(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
