@@ -114,6 +114,13 @@ Publication 根据 `base_sha` 和 `candidate_sha` 使用真实 Git CLI 读取准
 因为它负责描述最终交付语义。它不需要 Acceptance Artifact，也不需要 Controller 的
 内部状态。
 
+Parent-only 时，Brief 只提供 Parent Issue（它同时是需求源和当前任务）、准确
+`base_sha`/`candidate_sha` 与 checkout；不得伪造 Primary Ticket。Publication 与 Fresh
+Validation 继续使用相同的独立性约束和 schema。通过 Fresh Validation 与 Required Checks
+后，Parent PR 必须等待维护者的显式 `approve`；批准时程序重新核对 Parent Revision、
+验收记录、默认分支、PR head 和检查。若已普通 merge 但 closeout 写入响应丢失，恢复只重试
+幂等审计评论和 Parent Issue close，不得重新 merge。
+
 ### Fresh Validation Brief
 
 最小输入：

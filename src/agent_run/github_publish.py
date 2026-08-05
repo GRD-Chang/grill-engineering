@@ -154,6 +154,34 @@ class GhGitHubPublisher:
         created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
         return _integer(_mapping(created), "number")
 
+    def ensure_parent_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        self._ensure_remote_run_branch(branch)
+        pulls = self._json(
+            "pr", "list", "--repo", self.repository, "--state", "all",
+            "--head", branch, "--base", base_branch, "--json", "number,state"
+        )
+        if not isinstance(pulls, list):
+            raise GitHubReadError("github_invalid_response", "PR list must be an array")
+        if len(pulls) > 1:
+            raise GitHubReadError("ambiguous_parent_pr", "more than one Parent PR exists")
+        if pulls:
+            existing = _mapping(pulls[0])
+            number = _integer(existing, "number")
+            if existing.get("state") != "OPEN":
+                raise GitHubReadError("parent_pr_not_open", "the existing Parent PR is not open")
+            self._require("pr", "edit", str(number), "--repo", self.repository, "--title", title, "--body", body)
+            return number
+        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
+        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        return _integer(_mapping(created), "number")
+
+    def abandon_parent_pr(self, pr_number: int) -> None:
+        live = self.live_pull_request(pr_number)
+        if live.get("state") == "OPEN":
+            self._require("pr", "close", str(pr_number), "--repo", self.repository)
+
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
     ) -> None:

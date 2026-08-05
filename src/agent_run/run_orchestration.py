@@ -28,6 +28,11 @@ class DeliveryRunEngine:
 
     def deliver(self, run_id: str) -> dict[str, Any]:
         state, _ = self.controller.resume(run_id)
+        return self.deliver_from_state(run_id, state)
+
+    def deliver_from_state(
+        self, run_id: str, state: dict[str, Any]
+    ) -> dict[str, Any]:
         while state.get("active_ticket_job") is not None:
             try:
                 result = self.tickets.deliver(run_id)

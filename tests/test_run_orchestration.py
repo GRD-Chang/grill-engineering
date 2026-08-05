@@ -737,7 +737,7 @@ def test_active_ticket_removal_pauses_structure_in_the_same_command(
 
     removed, _ = controller.confirm_structure(str(state["run_id"]))
 
-    assert removed["status"] == "progress_exhausted"
+    assert removed["status"] == "parent_delivery_pending"
     assert not checkout.exists()
     assert (
         subprocess.run(

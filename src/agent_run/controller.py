@@ -58,9 +58,8 @@ class Controller:
                     return state, True
                 base = _state_mapping(state, "base")
                 base_sha = str(base["sha"])
-            branch = str(state["run_branch"])
-            self.publisher.ensure_run_branch(branch, base_sha)
             state = self._refresh(state, parent_number)
+            self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, resumed
 
@@ -73,8 +72,8 @@ class Controller:
             parent_number = int(parent["number"])
             base = _state_mapping(existing, "base")
             base_sha = str(base["sha"])
-            self.publisher.ensure_run_branch(str(existing["run_branch"]), base_sha)
             state = self._refresh(existing, parent_number)
+            self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
 
@@ -113,6 +112,7 @@ class Controller:
                 raise ValueError("pending structure kind is invalid")
             parent = _state_mapping(existing, "parent")
             state = self._refresh(existing, int(parent["number"]))
+            self._ensure_delivery_branch(state, str(_state_mapping(state, "base")["sha"]))
             if kind == "ticket_graph":
                 self._reconcile_ticket_retirements(
                     before_confirmation,
@@ -320,7 +320,6 @@ class Controller:
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
             "base": {"branch": repository.default_branch, "sha": base_sha},
-            "run_branch": f"agent-run/{run_id}",
             "ticket_graph": {
                 "revision": None,
                 "ordered_ticket_numbers": [],
@@ -336,6 +335,25 @@ class Controller:
             "created_at": now,
             "updated_at": now,
         }
+
+    def _ensure_delivery_branch(
+        self, state: dict[str, Any], base_sha: str
+    ) -> None:
+        if state.get("status") == "execution_failed":
+            return
+        graph = _state_mapping(state, "ticket_graph")
+        ordered = _integer_list(graph, "ordered_ticket_numbers")
+        if not ordered:
+            state["delivery_type"] = "parent_only"
+            branch = state.setdefault(
+                "parent_branch", f"agent-run-parent/{state['run_id']}"
+            )
+        else:
+            state["delivery_type"] = "ticket_run"
+            branch = state.setdefault("run_branch", f"agent-run/{state['run_id']}")
+        if not isinstance(branch, str) or not branch:
+            raise ValueError("Delivery Run branch is invalid")
+        self.publisher.ensure_run_branch(branch, base_sha)
 
 def _run_id(repository: str, parent_number: int, base_sha: str) -> str:
     identity = f"{repository}\0{parent_number}\0{base_sha}".encode()
