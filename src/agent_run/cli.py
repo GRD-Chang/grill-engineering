@@ -315,6 +315,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "parent_delivery_pending",
                 "parent_approval_pending",
                 "parent_closeout_pending",
+                "publication_pending",
                 "run_acceptance_pending",
                 "run_publication_pending",
                 "run_approval_pending",

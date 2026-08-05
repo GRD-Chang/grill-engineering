@@ -99,6 +99,18 @@ def state_from_graph(
         if active.get("phase") == TicketPhase.ESCALATING.value:
             status = "escalating"
             diagnostics = [_job_diagnostic(active)]
+        elif active.get("phase") == TicketPhase.PUBLICATION_PENDING.value:
+            status = "publication_pending"
+            diagnostics = [
+                {
+                    "code": "publication_pending",
+                    "message": (
+                        "Publication retries were exhausted; resume retries "
+                        "publication without rerunning Development or Fresh Validation"
+                    ),
+                    "ticket_number": active["ticket_number"],
+                }
+            ]
         elif (
             active.get("phase") == TicketPhase.BLOCKED.value
             and active.get("blocked_reason") != "no_code_changes"

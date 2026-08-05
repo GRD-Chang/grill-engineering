@@ -402,6 +402,17 @@ class FixtureGitHubPublisher:
         self._crash_once("ensure_ticket_pr")
         return int(pull["number"])
 
+    def publication_context(self, pr_number: int) -> dict[str, object]:
+        pull = self._pull(pr_number)
+        title = pull.get("title")
+        if not isinstance(title, str) or not title:
+            raise ValueError("fixture Ticket PR title is missing")
+        return {
+            "number": pr_number,
+            "url": f"https://github.com/{_string(self.data, 'repository')}/pull/{pr_number}",
+            "title": title,
+        }
+
     def required_checks(self, pr_number: int) -> str:
         delivery = self._delivery()
         sequence = delivery.get("required_checks", ["none"])

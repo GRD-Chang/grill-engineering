@@ -10,6 +10,7 @@ from agent_run.change_delivery import (
     MAX_MODIFICATION_ATTEMPTS,
     ChangeDeliveryEngine,
     ChangeJobContract,
+    MAX_PUBLICATION_CONTEXT_ATTEMPTS,
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -76,6 +77,7 @@ class TicketDeliveryLoop:
                 ),
                 acceptance_record=self._acceptance_record,
                 acceptance_is_current=self._acceptance_is_current,
+                invalidate_stale_publication=self._invalidate_stale_publication,
                 revision_changed=self._live_revision_changed,
                 requires_explicit_approval=lambda _state, _job: False,
                 after_merge=self._after_merge,
@@ -118,6 +120,33 @@ class TicketDeliveryLoop:
             == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
             and acceptance.get("effective_revision") == job.get("effective_revision")
         )
+
+    def _invalidate_stale_publication(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        self.git.reset_checkout_to_base(checkout, str(state["run_branch"]))
+        for key in (
+            "candidate_sha",
+            "publication",
+            "publication_sha",
+            "acceptance_artifact",
+            "acceptance_record",
+            "publication_attempts",
+            "publication_thread_id",
+            "last_publication_error",
+            "repair_source",
+            "ci_evidence",
+        ):
+            job.pop(key, None)
+        job.update(
+            {
+                "base_sha": self.git.resolve(str(state["run_branch"])),
+                "phase": TicketPhase.DEVELOPING.value,
+                "validation_attempts": 0,
+            }
+        )
+        state["status"] = "active"
+        state["diagnostics"] = []
 
     def _after_merge(
         self,
@@ -233,11 +262,19 @@ class TicketDeliveryLoop:
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
-            "thread_id": job["development_thread_id"],
+            "thread_id": (
+                job["development_thread_id"]
+                if int(job.get("publication_attempts", 0))
+                < MAX_PUBLICATION_CONTEXT_ATTEMPTS
+                else None
+            ),
             "acceptance_artifact": _mapping(job, "acceptance_artifact"),
         }
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
+        existing_pr = job.get("pr_number")
+        if isinstance(existing_pr, int):
+            request["existing_pr"] = self.github.publication_context(existing_pr)
         if job.get("repair_source") == "acceptance":
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         elif job.get("repair_source") == "required_checks":

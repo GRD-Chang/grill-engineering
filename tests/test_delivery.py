@@ -171,6 +171,7 @@ class ScriptedPublisher:
         self.pr_number = 11
         self.created_prs = 0
         self.pr_bodies: list[str] = []
+        self.pr_titles: list[str] = []
         self.closed_issues: list[int] = []
         self.acceptance_records: list[dict[str, Any]] = []
         self.agent_run_statuses: list[dict[str, Any]] = []
@@ -234,7 +235,16 @@ class ScriptedPublisher:
         self.created_prs += 1
         self.base_branch = base_branch
         self.pr_bodies.append(body)
+        self.pr_titles.append(title)
         return self.pr_number
+
+    def publication_context(self, pr_number: int) -> dict[str, object]:
+        assert pr_number == self.pr_number
+        return {
+            "number": pr_number,
+            "url": f"https://example.invalid/pull/{pr_number}",
+            "title": self.pr_titles[-1],
+        }
 
     def required_checks(self, pr_number: int) -> str:
         value = self.checks[min(self.check_position, len(self.checks) - 1)]
@@ -785,6 +795,64 @@ class PublicationFailsOnceAgents(PassAgents):
         return super().publication(request)
 
 
+class PublicationFailsUntilPendingAgents(PassAgents):
+    def __init__(self, checkout: Path) -> None:
+        super().__init__(checkout)
+        self.fail = True
+        self.publication_calls = 0
+
+    def publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.publication_calls += 1
+        if self.fail:
+            self.events.append("publication")
+            self.publication_requests.append(request)
+            raise ValueError("simulated Publication timeout")
+        return super().publication(request)
+
+
+class PublicationDriftsBaseThenSucceedsAgents(PassAgents):
+    def __init__(self, checkout: Path, repository: Path, run_branch: str) -> None:
+        super().__init__(checkout)
+        self.repository = repository
+        self.run_branch = run_branch
+        self.publication_calls = 0
+
+    def publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.publication_calls += 1
+        if self.publication_calls == 1:
+            self.events.append("publication")
+            self.publication_requests.append(request)
+            _advance_branch_with_same_tree(self.repository, self.run_branch)
+            raise ValueError("simulated Publication timeout")
+        return super().publication(request)
+
+
+class PublicationSucceedsDuringBaseDriftAgents(PassAgents):
+    def __init__(self, checkout: Path, repository: Path, run_branch: str) -> None:
+        super().__init__(checkout)
+        self.repository = repository
+        self.run_branch = run_branch
+        self.publication_calls = 0
+
+    def publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.publication_calls += 1
+        if self.publication_calls == 1:
+            _advance_branch_with_same_tree(self.repository, self.run_branch)
+        return super().publication(request)
+
+
+class CheckReadFailsOncePublisher(ScriptedPublisher):
+    def __init__(self, repo: Path) -> None:
+        super().__init__(repo)
+        self.check_read_failures = 1
+
+    def required_checks(self, pr_number: int) -> str:
+        if self.check_read_failures:
+            self.check_read_failures -= 1
+            raise TimeoutError("simulated Required Checks timeout")
+        return super().required_checks(pr_number)
+
+
 class PublicationReplacementAgents(PassAgents):
     def publication(
         self, request: dict[str, Any]
@@ -807,6 +875,39 @@ class CheckRepairAgents(PassAgents):
                 encoding="utf-8",
             )
         return result
+
+
+class RepairPublicationFailsUntilResumedAgents(CheckRepairAgents):
+    def __init__(self, checkout: Path) -> None:
+        super().__init__(checkout)
+        self.publication_calls = 0
+        self.fail_repair_publication = True
+
+    def publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.publication_calls += 1
+        if self.publication_calls > 1 and self.fail_repair_publication:
+            self.events.append("publication")
+            self.publication_requests.append(request)
+            raise ValueError("simulated repair Publication timeout")
+        return super().publication(request)
+
+
+class AcceptanceRepairPublicationFailsUntilResumedAgents(ScriptedAgents):
+    def __init__(self, checkout: Path) -> None:
+        super().__init__(checkout)
+        self.fail_publication = True
+
+    def publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.fail_publication:
+            self.events.append("publication")
+            self.publication_requests.append(request)
+            raise ValueError("simulated acceptance repair Publication timeout")
+        return super().publication(request)
+
+    def review(self, request: dict[str, Any]) -> ReviewResult:
+        if self.review_count >= 2:
+            return PassAgents.review(self, request)
+        return super().review(request)
 
 
 class CrashAfterCandidateGit(GitRepository):
@@ -1319,6 +1420,16 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert agents.development_requests[1]["repair_source"] == (
         "required_checks"
     )
+    assert len(agents.publication_requests) == 2
+    assert agents.publication_requests[1]["existing_pr"] == {
+        "number": 11,
+        "url": "https://example.invalid/pull/11",
+        "title": "feat(delivery): complete one ticket autonomously",
+    }
+    assert publisher.created_prs == 2
+    assert len(publisher.pr_bodies) == 2
+    assert len(publisher.agent_run_statuses) == 1
+    assert publisher.agent_run_statuses[0]["validation_verdict"] == "pass"
 
 
 def test_fresh_validation_rejects_development_thread_identity(
@@ -1976,16 +2087,255 @@ def test_publication_failure_resumes_from_persisted_candidate(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="Publication timeout"):
-        engine.deliver(state["run_id"])
-    interrupted = states.load_run(state["run_id"])
-    assert interrupted is not None
-    assert interrupted["active_ticket_job"]["phase"] == "accepted"
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
     assert completed["active_ticket_job"]["modification_attempts"] == 1
     assert agents.development_thread_ids == [None]
+    assert len(agents.publication_requests) == 1
+
+
+def test_publication_exhaustion_persists_then_resumes_without_redevelopment(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PublicationFailsUntilPendingAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    )
+
+    pending = engine.deliver(state["run_id"])
+
+    job = pending["active_ticket_job"]
+    assert pending["status"] == "publication_pending"
+    assert job["phase"] == "publication_pending"
+    assert job["publication_attempts"] == 5
+    assert job["modification_attempts"] == 1
+    assert job["acceptance_artifact"]["verdict"] == "pass"
+    assert agents.development_thread_ids == [None]
+    assert agents.review_count == 1
+    assert agents.publication_calls == 5
+    assert [request.get("thread_id") for request in agents.publication_requests] == [
+        "development-thread-1",
+        "development-thread-1",
+        "development-thread-1",
+        "development-thread-1",
+        None,
+    ]
+
+    agents.fail = False
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert completed["active_ticket_job"]["modification_attempts"] == 1
+    assert agents.development_thread_ids == [None]
+    assert agents.review_count == 1
+    assert agents.publication_calls == 6
+
+
+def test_required_checks_timeout_waits_without_starting_a_repair(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PassAgents(checkout)
+    publisher = CheckReadFailsOncePublisher(git_repo)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher,
+        agents=agents,
+    )
+
+    waiting = engine.deliver(state["run_id"])
+
+    job = waiting["active_ticket_job"]
+    assert waiting["status"] == "waiting_checks"
+    assert job["phase"] == "waiting_checks"
+    assert "repair_source" not in job
+    assert job["modification_attempts"] == 1
+    assert agents.development_thread_ids == [None]
+    assert agents.review_count == 1
+    assert len(agents.publication_requests) == 1
+
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert completed["active_ticket_job"]["modification_attempts"] == 1
+    assert agents.development_thread_ids == [None]
+    assert agents.review_count == 1
+
+
+def test_publication_pending_base_drift_rebuilds_before_republishing(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PublicationFailsUntilPendingAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    )
+
+    pending = engine.deliver(state["run_id"])
+    old_candidate = str(pending["active_ticket_job"]["candidate_sha"])
+    new_base = _advance_branch_with_same_tree(
+        git_repo, str(state["run_branch"])
+    )
+    agents.fail = False
+
+    completed = engine.deliver(state["run_id"])
+
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "ticket_completed"
+    assert job["base_sha"] == new_base
+    assert job["candidate_sha"] != old_candidate
+    assert job["acceptance_record"]["reviewed_base_sha"] == new_base
+    assert job["modification_attempts"] == 2
+    assert agents.development_thread_ids == [None, "development-thread-1"]
+    assert agents.review_count == 2
+
+
+def test_publication_retry_rechecks_base_before_each_attempt(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PublicationDriftsBaseThenSucceedsAgents(
+        checkout, git_repo, str(state["run_branch"])
+    )
+    result = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    ).deliver(state["run_id"])
+
+    job = result["active_ticket_job"]
+    assert result["status"] == "ticket_completed"
+    assert job["modification_attempts"] == 2
+    assert job["validation_attempts"] == 1
+    assert job["reviewer_thread_ids"] == ["reviewer-1", "reviewer-2"]
+    assert agents.publication_calls == 2
+    assert agents.publication_requests[0]["candidate_sha"] != job["candidate_sha"]
+    assert agents.publication_requests[1]["candidate_sha"] == job["candidate_sha"]
+
+
+def test_publication_success_rechecks_base_before_creating_a_commit(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PublicationSucceedsDuringBaseDriftAgents(
+        checkout, git_repo, str(state["run_branch"])
+    )
+    result = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    ).deliver(state["run_id"])
+
+    job = result["active_ticket_job"]
+    assert result["status"] == "ticket_completed"
+    assert job["modification_attempts"] == 2
+    assert job["reviewer_thread_ids"] == ["reviewer-1", "reviewer-2"]
+    assert agents.publication_calls == 2
+    assert agents.publication_requests[0]["candidate_sha"] != job["candidate_sha"]
+    assert agents.publication_requests[1]["candidate_sha"] == job["candidate_sha"]
+
+
+def test_existing_pr_recovers_after_publication_pending_base_drift(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = RepairPublicationFailsUntilResumedAgents(checkout)
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail", "pass"]
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher,
+        agents=agents,
+    )
+
+    pending = engine.deliver(state["run_id"])
+
+    pending_job = pending["active_ticket_job"]
+    old_published_sha = str(pending_job["published_sha"])
+    assert pending["status"] == "publication_pending"
+    assert pending_job["pr_number"] == publisher.pr_number
+    assert publisher.live_head == old_published_sha
+    _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
+    agents.fail_repair_publication = False
+
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert completed["active_ticket_job"]["pr_number"] == publisher.pr_number
+    assert publisher.live_head == completed["active_ticket_job"]["publication_sha"]
+
+
+def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = AcceptanceRepairPublicationFailsUntilResumedAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    )
+
+    pending = engine.deliver(state["run_id"])
+
+    assert pending["status"] == "publication_pending"
+    assert pending["active_ticket_job"]["repair_source"] == "acceptance"
+    _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
+    agents.fail_publication = False
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert completed["active_ticket_job"]["modification_attempts"] == 3
+    assert "repair_source" not in agents.development_requests[-1]
+    assert "acceptance_artifact" not in agents.development_requests[-1]
 
 
 def _tree(repository: Path, sha: str) -> str:

@@ -196,31 +196,45 @@ class CodexCliBackend:
 
     def publication(self, request: dict[str, Any]) -> PublicationResult:
         checkout = Path(_string(request, "checkout"))
-        thread_id = _string(request, "thread_id")
+        supplied_thread = request.get("thread_id")
+        thread_id = (
+            _string(request, "thread_id")
+            if isinstance(supplied_thread, str)
+            else None
+        )
         prompt = self._publication_prompt(request)
         replaced_thread: str | None = None
-        try:
+        if thread_id is None:
             output, resumed_thread = self._invoke(
                 prompt=prompt,
-                checkout=checkout,
-                thread_id=thread_id,
-                schema=publication_schema(),
-                writable_checkout=False,
-            )
-        except _CodexThreadResumeError:
-            replaced_thread = thread_id
-            output, resumed_thread = self._invoke(
-                prompt=(
-                    "旧发布叙事 Agent 恢复失败。你是接替该工作的发布叙事工程师；"
-                    "下面的 Publication Brief 是完整恢复上下文。保留同一 Candidate，"
-                    "不要重新开发、改动文件或改变发布范围。\n\n"
-                    + prompt
-                ),
                 checkout=checkout,
                 thread_id=None,
                 schema=publication_schema(),
                 writable_checkout=False,
             )
+        else:
+            try:
+                output, resumed_thread = self._invoke(
+                    prompt=prompt,
+                    checkout=checkout,
+                    thread_id=thread_id,
+                    schema=publication_schema(),
+                    writable_checkout=False,
+                )
+            except _CodexThreadResumeError:
+                replaced_thread = thread_id
+                output, resumed_thread = self._invoke(
+                    prompt=(
+                        "旧发布叙事 Agent 恢复失败。你是接替该工作的发布叙事工程师；"
+                        "下面的 Publication Brief 是完整恢复上下文。保留同一 Candidate，"
+                        "不要重新开发、改动文件或改变发布范围。\n\n"
+                        + prompt
+                    ),
+                    checkout=checkout,
+                    thread_id=None,
+                    schema=publication_schema(),
+                    writable_checkout=False,
+                )
         return PublicationResult(
             thread_id=resumed_thread,
             artifact=_json_object(output, "Publication Artifact"),
