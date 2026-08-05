@@ -25,6 +25,31 @@ class GhGitHubPublisher:
         self.repository = repository
         self.git = git
 
+    def ensure_parent_branch(
+        self, *, parent_number: int, branch: str, base_branch: str
+    ) -> None:
+        listed = self._run(
+            "issue", "develop", "--list", str(parent_number), "--repo", self.repository
+        )
+        if listed.returncode == 0 and branch in listed.stdout:
+            return
+        created = self._run(
+            "issue",
+            "develop",
+            str(parent_number),
+            "--repo",
+            self.repository,
+            "--name",
+            branch,
+            "--base",
+            base_branch,
+        )
+        if created.returncode != 0:
+            raise GitHubReadError(
+                "github_write_failed",
+                created.stderr.strip() or "could not create linked Parent branch",
+            )
+
     def ensure_ticket_branch(
         self,
         *,
@@ -174,6 +199,53 @@ class GhGitHubPublisher:
         raise MergeOutcomeUnknownError(
             merged.stderr.strip() or "could not determine final merge outcome"
         )
+
+    def close_parent_issue(
+        self,
+        *,
+        parent_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        issue = _mapping(
+            self._json(
+                "issue",
+                "view",
+                str(parent_number),
+                "--repo",
+                self.repository,
+                "--json",
+                "state,comments",
+            )
+        )
+        marker = f"<!-- agent-run:{run_id}:parent-completed -->"
+        comments = issue.get("comments")
+        already_recorded = isinstance(comments, list) and any(
+            marker in str(_mapping(comment).get("body", "")) for comment in comments
+        )
+        if not already_recorded:
+            body = (
+                f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
+                f"in Final Run PR #{pr_number}; merge commit `{integrated_sha}` "
+                "is verified on the default branch."
+            )
+            self._require(
+                "issue",
+                "comment",
+                str(parent_number),
+                "--repo",
+                self.repository,
+                "--body",
+                body,
+            )
+        if issue.get("state") != "CLOSED":
+            self._require(
+                "issue",
+                "close",
+                str(parent_number),
+                "--repo",
+            )
 
     def abandon_run_pr(self, pr_number: int) -> None:
         live = self.live_pull_request(pr_number)

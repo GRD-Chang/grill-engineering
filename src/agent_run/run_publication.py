@@ -8,6 +8,7 @@ from agent_run.agents import AgentBackend
 from agent_run.artifacts import PublicationArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
+from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
 
@@ -41,13 +42,11 @@ class RunPublicationEngine:
             if publication["phase"] == "stale":
                 publication.clear()
                 publication["phase"] = "pending"
-            if publication["phase"] == "publishing" and not isinstance(
-                publication.get("artifact"), dict
-            ):
-                # A worker can die after its durable in-flight marker but
-                # before it has produced an artifact. Retrying starts a fresh
-                # one-shot publisher rather than treating a missing artifact
-                # as a state corruption.
+            if publication["phase"] == "publishing":
+                # A failed publication attempt never reuses a previous
+                # narrative. Every retry gets a fresh, read-only publisher so
+                # it can describe the same accepted tree from current facts.
+                publication.pop("artifact", None)
                 publication["phase"] = "pending"
             if not self._acceptance_is_current(state, run):
                 return self._invalidate_for_fresh_acceptance(state)
@@ -66,7 +65,6 @@ class RunPublicationEngine:
                             self._publication_request(state, run, checkout)
                         ),
                         delivery_run=str(state["run_id"]),
-                        final_run=True,
                     )
                 finally:
                     self.git.remove_worktree(checkout)
@@ -78,10 +76,9 @@ class RunPublicationEngine:
                 }
 
             artifact = PublicationArtifact.parse(
-                self._mapping(publication, "artifact"),
-                delivery_run=str(state["run_id"]),
-                final_run=True,
-            )
+            self._mapping(publication, "artifact"),
+            delivery_run=str(state["run_id"]),
+        )
             run_head = self.git.resolve(str(state["run_branch"]))
             pr_number = self.github.ensure_run_pr(
                 branch=str(state["run_branch"]),
@@ -124,7 +121,7 @@ class RunPublicationEngine:
             state = self._load(run_id)
             publication = self._publication_state(state)
             if publication["phase"] == "merged":
-                return state
+                return self._complete_parent_closeout(state)
             if publication["phase"] != "ready_for_approval":
                 raise ValueError("Run Publication is not ready for explicit approval")
             run = self._mapping(state, "run_acceptance")
@@ -142,11 +139,14 @@ class RunPublicationEngine:
                         record.get("default_head_sha"),
                         record.get("run_head_sha"),
                     ]
+                    and live.get("integrated_tree")
+                    == record.get("expected_merge_tree")
                 ):
-                    publication.update({"phase": "merged", "integrated_sha": integrated})
-                    state.update({"status": "completed", "terminal_kind": "merged", "diagnostics": []})
-                    return self._save(state)
-                raise ValueError("merged final Run PR does not match its publication record")
+                    return self._mark_merged_and_close_parent(state, integrated)
+                return self._block_merged_boundary(
+                    state,
+                    "merged final Run PR does not match its reviewed publication boundary",
+                )
             if (
                 record.get("pr_head_sha") != live.get("head_sha")
                 or record.get("run_head_sha") != self.git.resolve(str(state["run_branch"]))
@@ -189,11 +189,13 @@ class RunPublicationEngine:
                     self.default_head_sha,
                     live.get("head_sha"),
                 ]
+                or merged.get("integrated_tree") != record.get("expected_merge_tree")
             ):
-                raise ValueError("final Run merge result does not preserve the expected boundary")
-            publication.update({"phase": "merged", "integrated_sha": integrated})
-            state.update({"status": "completed", "terminal_kind": "merged", "diagnostics": []})
-            return self._save(state)
+                return self._block_merged_boundary(
+                    state,
+                    "final Run merge result does not preserve the reviewed boundary",
+                )
+            return self._mark_merged_and_close_parent(state, integrated)
 
     def revise(self, run_id: str, feedback: str) -> dict[str, Any]:
         if not feedback.strip():
@@ -243,6 +245,11 @@ class RunPublicationEngine:
         return (
             record.get("reviewed_head_sha") == self.git.resolve(str(state["run_branch"]))
             and record.get("reviewed_default_base_sha") == self.default_head_sha
+            and record.get("expected_merge_tree")
+            == self.git.expected_merge_tree(
+                default_head_sha=self.default_head_sha,
+                run_head_sha=self.git.resolve(str(state["run_branch"])),
+            )
             and record.get("parent_revision") == self._mapping(state, "parent").get("revision")
             and record.get("ticket_graph_revision") == self._mapping(state, "ticket_graph").get("revision")
             and record.get("ticket_completion_records") == self._ticket_completion_records(state)
@@ -325,11 +332,35 @@ class RunPublicationEngine:
 
     def _render_final_run_pr_body(self, state: dict[str, Any], narrative: str) -> str:
         parent = self._mapping(state, "parent")
+        completed_tickets = "\n".join(self._completed_ticket_lines(state))
         return (
             f"Parent Issue: #{int(parent['number'])}\n"
             "Delivery Type: Final Run\n\n"
+            f"## Completed Tickets\n\n{completed_tickets}\n\n"
             f"{narrative.strip()}"
         )
+
+    def _completed_ticket_lines(self, state: dict[str, Any]) -> list[str]:
+        tickets = self._mapping(self._mapping(state, "ticket_graph"), "tickets")
+        lines: list[str] = []
+        for key, job in sorted(self._mapping(state, "ticket_jobs").items()):
+            if not isinstance(job, dict) or job.get("phase") != "completed":
+                continue
+            ticket = self._mapping(tickets, key)
+            title = str(ticket.get("title", "")).strip()
+            if not title:
+                raise ValueError("completed Ticket is missing its title")
+            number = int(key)
+            pr_number = job.get("pr_number")
+            if isinstance(pr_number, int):
+                lines.append(
+                    f"- [#{number}: {title}](https://github.com/{state['repository']}/pull/{pr_number})"
+                )
+            else:
+                lines.append(f"- #{number}: {title}")
+        if not lines:
+            raise ValueError("Final Run requires completed Tickets")
+        return lines
 
     def _record_agent_run_status(
         self, pr_number: int, run: dict[str, Any], run_head: str, checks: str
@@ -358,13 +389,66 @@ class RunPublicationEngine:
         )
 
     def _record(self, state: dict[str, Any], run_head: str, pr_head: str) -> dict[str, Any]:
+        run = self._mapping(state, "run_acceptance")
         return {
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
             "default_head_sha": self.default_head_sha,
             "run_head_sha": run_head,
             "pr_head_sha": pr_head,
+            "expected_merge_tree": self._mapping(run, "acceptance_record")[
+                "expected_merge_tree"
+            ],
         }
+
+    def _mark_merged_and_close_parent(
+        self, state: dict[str, Any], integrated_sha: str
+    ) -> dict[str, Any]:
+        publication = self._publication_state(state)
+        publication.update({"phase": "merged", "integrated_sha": integrated_sha})
+        state.update(
+            {
+                "status": "parent_closeout_pending",
+                "terminal_kind": "parent_closeout_pending",
+                "diagnostics": [],
+            }
+        )
+        self._save(state)
+        return self._complete_parent_closeout(state)
+
+    def _complete_parent_closeout(self, state: dict[str, Any]) -> dict[str, Any]:
+        publication = self._publication_state(state)
+        integrated_sha = publication.get("integrated_sha")
+        if not isinstance(integrated_sha, str) or not integrated_sha:
+            raise ValueError("merged final Run is missing its integrated SHA")
+        self.github.close_parent_issue(
+            parent_number=int(self._mapping(state, "parent")["number"]),
+            run_id=str(state["run_id"]),
+            pr_number=self._integer(publication, "pr_number"),
+            integrated_sha=integrated_sha,
+        )
+        publication["parent_closed"] = True
+        state.update({"status": "completed", "terminal_kind": "merged", "diagnostics": []})
+        return self._save(state)
+
+    def _block_merged_boundary(
+        self, state: dict[str, Any], message: str
+    ) -> dict[str, Any]:
+        publication = self._publication_state(state)
+        publication["phase"] = "merged_boundary_mismatch"
+        state.update(
+            {
+                "status": "blocked",
+                "terminal_kind": "merged_boundary_mismatch",
+                "diagnostics": [
+                    {
+                        "code": "merged_boundary_mismatch",
+                        "message": message,
+                    }
+                ],
+            }
+        )
+        return self._save(state)
 
     def _publication_state(self, state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("run_publication")
@@ -376,11 +460,19 @@ class RunPublicationEngine:
 
     def _ticket_completion_records(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
+        tickets = self._mapping(self._mapping(state, "ticket_graph"), "tickets")
+        parent_revision = str(self._mapping(state, "parent")["revision"])
+        graph_revision = str(self._mapping(state, "ticket_graph")["revision"])
         for key, job in sorted(self._mapping(state, "ticket_jobs").items()):
             if isinstance(job, dict) and job.get("phase") == "completed":
                 records.append({
                     "ticket_number": int(key),
                     "integrated_sha": job.get("integrated_sha"),
+                    "effective_revision": effective_revision(
+                        ticket_revision=str(self._mapping(tickets, key)["content_revision"]),
+                        parent_revision=parent_revision,
+                        graph_revision=graph_revision,
+                    ),
                     "acceptance_record": job.get("acceptance_record"),
                 })
         return records

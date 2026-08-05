@@ -149,6 +149,7 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert job["modification_attempts"] == 2
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = mutable_fixture["delivery"]
+    assert delivery["linked_branches"]["parent"] == state["run_branch"]
     assert len(delivery["pull_requests"]) == 1
     assert delivery["closed_issues"] == [3]
     assert [
@@ -187,6 +188,84 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     replay_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(replay_fixture["delivery"]["pull_requests"]) == 1
     assert replay_fixture["delivery"]["closed_issues"] == [3]
+
+
+def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    ticket_agents = git_repo / "ticket-agents.json"
+    ticket_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "ticket-developer",
+                        "summary": "Delivered the one Ticket.",
+                        "write_files": {"feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("ticket-reviewer", "The Ticket flow passed.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+    delivered = run_cli(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
+    )
+    assert stdout_json(delivered)["status"] == "run_acceptance_pending"
+
+    run_agents = git_repo / "run-agents.json"
+    run_agents.write_text(
+        json.dumps(
+            {"reviews": [passing_acceptance("run-reviewer", "The expected merge passed.")]},
+        ),
+        encoding="utf-8",
+    )
+    accepted = run_cli(
+        git_repo, fixture, "accept-run", run_id, "--agent-fixture", str(run_agents)
+    )
+    assert stdout_json(accepted)["status"] == "run_publication_pending"
+
+    final_agents = git_repo / "final-agents.json"
+    final_agents.write_text(
+        json.dumps(
+            {
+                "run_publications": [
+                    {
+                        "commit_message": "feat(run): publish the completed delivery",
+                        "pr_title": "feat(run): publish the completed delivery",
+                        "pr_body_markdown": (
+                            "## What Problem This Solves\n\nThe completed Ticket needs one review boundary.\n\n"
+                            "## Why This Change Was Made\n\nThe Run branch keeps the standard delivery route.\n\n"
+                            "## User Impact\n\nMaintainers can approve the complete Parent delivery.\n\n"
+                            "## Evidence\n\nThe independent expected-merge review passed."
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    published = run_cli(
+        git_repo, fixture, "publish-run", run_id, "--agent-fixture", str(final_agents)
+    )
+    assert stdout_json(published)["status"] == "run_approval_pending"
+    approved = run_cli(git_repo, fixture, "approve", run_id)
+    assert approved.returncode == 0, approved.stderr
+    assert stdout_json(approved)["status"] == "completed"
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    pulls = data["delivery"]["pull_requests"]
+    assert len(pulls) == 2
+    final = next(pull for pull in pulls if pull.get("scope") == "final_run")
+    assert final["branch"] == load_only_run_state(git_repo)["run_branch"]
+    assert final["body"].startswith("Parent Issue: #1\nDelivery Type: Final Run\n\n")
+    assert "## Completed Tickets\n\n- [#3: Complete one ticket autonomously]" in final["body"]
+    assert data["delivery"]["closed_issues"] == [3, 1]
+    assert data["parent"]["state"] == "CLOSED"
 
 
 def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(

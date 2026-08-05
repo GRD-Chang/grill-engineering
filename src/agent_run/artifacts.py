@@ -15,6 +15,7 @@ _CLOSING_KEYWORD = re.compile(
 _PUBLISHER_OWNED_CONTEXT = re.compile(
     r"(?im)^\s*(?:Parent Issue|Primary Ticket|Delivery Type|Delivery Run):"
 )
+_PUBLISHER_OWNED_SECTION = re.compile(r"(?im)^## Completed Tickets\s*$")
 _REQUIRED_SECTIONS = (
     "What Problem This Solves",
     "Why This Change Was Made",
@@ -36,7 +37,6 @@ class PublicationArtifact:
         *,
         primary_ticket: int | None = None,
         delivery_run: str | None = None,
-        final_run: bool = False,
     ) -> PublicationArtifact:
         data = _mapping(value, "publication artifact")
         commit_message = _nonempty_string(data, "commit_message")
@@ -54,17 +54,12 @@ class PublicationArtifact:
             raise ValueError("publication artifact requires exactly one identity")
         if _PUBLISHER_OWNED_CONTEXT.search(body):
             raise ValueError("PR narrative must not contain Publisher-owned facts")
+        if _PUBLISHER_OWNED_SECTION.search(body):
+            raise ValueError("PR narrative must not contain Publisher-owned sections")
         if _CLOSING_KEYWORD.search(body):
             raise ValueError("PR body must not contain automatic closing keywords")
         for section in _REQUIRED_SECTIONS:
             _require_nonempty_section(body, section)
-        if final_run:
-            for section in (
-                "Completed Tickets",
-                "Known Limitations",
-                "Validation Results",
-            ):
-                _require_nonempty_section(body, section)
         return cls(
             commit_message=commit_message,
             pr_title=pr_title,

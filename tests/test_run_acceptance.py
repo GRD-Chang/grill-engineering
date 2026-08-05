@@ -411,3 +411,23 @@ def test_default_branch_drift_invalidates_run_acceptance_and_rechecks_merge_prev
     assert result["status"] == "run_publication_pending"
     assert result["run_acceptance"]["validation_attempts"] == 2
     assert result["run_acceptance"]["acceptance_record"]["reviewed_default_base_sha"] == git.resolve("main")
+
+
+def test_run_acceptance_binds_the_previewed_merge_tree(git_repo: Path) -> None:
+    state, states, git = _completed_run(git_repo)
+    agents = ScriptedRunAgents()
+    agents._reviews = [_passing_artifact()]
+
+    accepted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        default_head_sha=git.resolve("main"),
+    ).accept(str(state["run_id"]))
+
+    record = accepted["run_acceptance"]["acceptance_record"]
+    assert record["expected_merge_tree"] == git.expected_merge_tree(
+        default_head_sha=git.resolve("main"),
+        run_head_sha=git.resolve(str(state["run_branch"])),
+    )

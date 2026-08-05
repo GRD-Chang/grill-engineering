@@ -4,6 +4,10 @@ from typing import Any, Protocol
 
 
 class GitHubPublisher(Protocol):
+    def ensure_parent_branch(
+        self, *, parent_number: int, branch: str, base_branch: str
+    ) -> None: ...
+
     def ensure_run_pr(
         self, *, branch: str, base_branch: str, title: str, body: str
     ) -> int: ...
@@ -15,6 +19,15 @@ class GitHubPublisher(Protocol):
     def normal_merge(
         self, *, pr_number: int, expected_head_sha: str
     ) -> str: ...
+
+    def close_parent_issue(
+        self,
+        *,
+        parent_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None: ...
 
     def abandon_run_pr(self, pr_number: int) -> None: ...
 
