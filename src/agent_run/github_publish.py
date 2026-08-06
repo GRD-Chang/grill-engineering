@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from typing import Any
 
@@ -454,19 +455,7 @@ class GhGitHubPublisher:
         }
 
     def required_checks(self, pr_number: int) -> str:
-        checks = self._json(
-            "pr",
-            "checks",
-            str(pr_number),
-            "--repo",
-            self.repository,
-            "--required",
-            "--json",
-            "bucket",
-            allowed_exit_codes={0, 1, 8},
-        )
-        if not isinstance(checks, list):
-            raise GitHubReadError("github_invalid_response", "checks must be an array")
+        checks = self._checks(pr_number, "bucket")
         buckets = {
             str(_mapping(check).get("bucket", "")).lower() for check in checks
         }
@@ -479,21 +468,7 @@ class GhGitHubPublisher:
         return "pass"
 
     def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
-        checks = self._json(
-            "pr",
-            "checks",
-            str(pr_number),
-            "--repo",
-            self.repository,
-            "--required",
-            "--json",
-            "bucket,name,link,workflow,description",
-            allowed_exit_codes={0, 1, 8},
-        )
-        if not isinstance(checks, list):
-            raise GitHubReadError(
-                "github_invalid_response", "checks must be an array"
-            )
+        checks = self._checks(pr_number, "bucket,name,link,workflow,description")
         failed = [
             dict(_mapping(check))
             for check in checks
@@ -501,6 +476,156 @@ class GhGitHubPublisher:
             in {"fail", "cancel"}
         ]
         return {"pr_number": pr_number, "checks": failed}
+
+    def _checks(self, pr_number: int, fields: str) -> list[object]:
+        arguments = (
+            "pr",
+            "checks",
+            str(pr_number),
+            "--repo",
+            self.repository,
+            "--required",
+            "--json",
+            fields,
+        )
+        result = self._run(*arguments)
+        if (
+            result.returncode == 1
+            and "no required checks reported" in result.stderr.lower()
+        ):
+            return self._ruleset_checks(pr_number, fields)
+        if result.returncode not in {0, 1, 8}:
+            raise GitHubReadError(
+                "github_write_failed", result.stderr.strip() or "gh command failed"
+            )
+        try:
+            checks = json.loads(result.stdout or "null")
+        except json.JSONDecodeError as error:
+            raise GitHubReadError(
+                "github_invalid_response", f"gh returned invalid JSON: {error}"
+            ) from error
+        if not isinstance(checks, list):
+            raise GitHubReadError("github_invalid_response", "checks must be an array")
+        return checks
+
+    def _ruleset_checks(self, pr_number: int, fields: str) -> list[object]:
+        live = self.live_pull_request(pr_number)
+        base_branch = _string(live, "base_branch")
+        required_contexts = self._ruleset_required_contexts(base_branch)
+        if not required_contexts:
+            return []
+        integration_bound = [
+            context
+            for context, integration_id in required_contexts.items()
+            if integration_id is not None
+        ]
+        if integration_bound:
+            raise GitHubReadError(
+                "github_unsupported_ruleset",
+                "Ruleset required checks with integration_id are not safely observable",
+            )
+        requested_fields = tuple(field for field in fields.split(",") if field)
+        check_fields = ",".join(dict.fromkeys((*requested_fields, "name")))
+        checks = self._json(
+            "pr",
+            "checks",
+            str(pr_number),
+            "--repo",
+            self.repository,
+            "--json",
+            check_fields,
+            allowed_exit_codes={0, 1, 8},
+        )
+        if not isinstance(checks, list):
+            raise GitHubReadError("github_invalid_response", "checks must be an array")
+        matching = [
+            check
+            for check in checks
+            if _string(_mapping(check), "name") in required_contexts
+        ]
+        observed = {_string(_mapping(check), "name") for check in matching}
+        return matching + [
+            {"name": context, "bucket": "pending"}
+            for context in required_contexts
+            if context not in observed
+        ]
+
+    def _ruleset_required_contexts(self, branch: str) -> dict[str, int | None]:
+        pages = self._json(
+            "api", f"repos/{self.repository}/rulesets", "--paginate", "--slurp"
+        )
+        if not isinstance(pages, list) or not all(
+            isinstance(page, list) for page in pages
+        ):
+            raise GitHubReadError("github_invalid_response", "ruleset pages must be arrays")
+        contexts: dict[str, int | None] = {}
+        rulesets = [summary for page in pages for summary in page]
+        for summary in rulesets:
+            summary_data = _mapping(summary)
+            if (
+                summary_data.get("target") != "branch"
+                or summary_data.get("enforcement") != "active"
+            ):
+                continue
+            ruleset_id = _integer(summary_data, "id")
+            ruleset = _mapping(
+                self._json("api", f"repos/{self.repository}/rulesets/{ruleset_id}")
+            )
+            if not self._ruleset_applies_to_branch(ruleset, branch):
+                continue
+            rules = ruleset.get("rules")
+            if not isinstance(rules, list):
+                raise GitHubReadError("github_invalid_response", "ruleset rules must be an array")
+            for rule in rules:
+                rule_data = _mapping(rule)
+                if rule_data.get("type") != "required_status_checks":
+                    continue
+                parameters = _mapping(rule_data.get("parameters"))
+                checks = parameters.get("required_status_checks")
+                if not isinstance(checks, list):
+                    raise GitHubReadError(
+                        "github_invalid_response",
+                        "required_status_checks must be an array",
+                    )
+                for check in checks:
+                    check_data = _mapping(check)
+                    context = _string(check_data, "context")
+                    integration_id = check_data.get("integration_id")
+                    if integration_id is not None and not isinstance(integration_id, int):
+                        raise GitHubReadError(
+                            "github_invalid_response",
+                            "Ruleset integration_id must be an integer",
+                        )
+                    existing = contexts.get(context)
+                    if existing is not None and integration_id not in {None, existing}:
+                        raise GitHubReadError(
+                            "github_invalid_response",
+                            "Ruleset context has conflicting integration_id values",
+                        )
+                    contexts[context] = (
+                        integration_id if integration_id is not None else existing
+                    )
+        return contexts
+
+    def _ruleset_applies_to_branch(self, ruleset: dict[str, Any], branch: str) -> bool:
+        conditions = ruleset.get("conditions")
+        if conditions is None:
+            return True
+        ref_name_value = _mapping(conditions).get("ref_name")
+        if ref_name_value is None:
+            return True
+        ref_name = _mapping(ref_name_value)
+        reference = f"refs/heads/{branch}"
+        includes = ref_name.get("include", [])
+        excludes = ref_name.get("exclude", [])
+        if not isinstance(includes, list) or not isinstance(excludes, list):
+            raise GitHubReadError(
+                "github_invalid_response", "ruleset ref conditions must be arrays"
+            )
+        return (
+            (not includes or any(_matches_ref(reference, pattern) for pattern in includes))
+            and not any(_matches_ref(reference, pattern) for pattern in excludes)
+        )
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         value = self._json(
@@ -823,6 +948,37 @@ def _integer(data: dict[str, Any], key: str) -> int:
     if not isinstance(value, int):
         raise GitHubReadError("github_invalid_response", f"{key} must be an integer")
     return value
+
+
+def _matches_ref(reference: str, pattern: object) -> bool:
+    if not isinstance(pattern, str):
+        raise GitHubReadError("github_invalid_response", "ruleset ref pattern must be a string")
+    if pattern == "~ALL":
+        return True
+    if pattern.startswith("~"):
+        raise GitHubReadError(
+            "github_unsupported_ruleset", f"unsupported ruleset ref pattern: {pattern}"
+        )
+    expression = ""
+    position = 0
+    while position < len(pattern):
+        character = pattern[position]
+        if character == "*":
+            if position + 1 < len(pattern) and pattern[position + 1] == "*":
+                expression += ".*"
+                position += 2
+                continue
+            expression += "[^/]*"
+        elif character == "?":
+            expression += "[^/]"
+        elif character == "[":
+            raise GitHubReadError(
+                "github_unsupported_ruleset", "unsupported ruleset ref character class"
+            )
+        else:
+            expression += re.escape(character)
+        position += 1
+    return re.fullmatch(expression, reference) is not None
 
 
 def _render_agent_run_status(status: dict[str, Any]) -> str:
