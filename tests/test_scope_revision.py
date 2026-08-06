@@ -223,7 +223,9 @@ def test_codex_scope_assessment_is_one_shot_and_uses_yolo_checkout(
     assert "exec" in captured["command"]
     assert "resume" not in captured["command"]
     assert "--output-schema" in captured["command"]
-    assert "新旧 Parent Spec" in captured["prompt"]
+    assert "新旧 Parent Issue" in captured["prompt"]
+    assert "范围影响分析师" in captured["prompt"]
+    assert "Codex Worker" not in captured["prompt"]
     assert "既有已完成工作" in captured["prompt"]
 
 

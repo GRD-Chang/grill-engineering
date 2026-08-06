@@ -162,8 +162,7 @@ def state_from_graph(
                 status = "parent_delivery_pending"
                 diagnostics = []
         elif _all_ticket_jobs_completed(ticket_jobs, order):
-            status = "run_acceptance_pending"
-            diagnostics = []
+            status, diagnostics = _run_completion_status(previous)
         elif active is not None:
             if active.get("phase") == TicketPhase.ESCALATING.value:
                 status = "escalating"
@@ -215,6 +214,39 @@ def state_from_graph(
         }
     )
     return state
+
+
+def _run_completion_status(previous: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    acceptance = previous.get("run_acceptance")
+    publication = previous.get("run_publication")
+    if (
+        not isinstance(acceptance, dict)
+        or acceptance.get("phase") != "accepted"
+        or not isinstance(publication, dict)
+    ):
+        return "run_acceptance_pending", []
+    phase = publication.get("phase")
+    if phase == "publication_pending":
+        return (
+            "publication_pending",
+            [
+                {
+                    "code": "publication_pending",
+                    "message": (
+                        "Publication retries were exhausted; resume retries "
+                        "publication without rerunning Development or Fresh Validation"
+                    ),
+                    "delivery_run": previous["run_id"],
+                }
+            ],
+        )
+    if phase == "waiting_checks":
+        return "waiting_checks", []
+    if phase == "ready_for_approval":
+        return "run_approval_pending", []
+    if phase == "merged":
+        return "parent_closeout_pending", []
+    return "run_publication_pending", []
 
 
 def _blocked_graph_state(

@@ -182,6 +182,29 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert publisher.data["parent"]["state"] == "CLOSED"
 
 
+def test_final_run_closeout_records_its_actual_delivery_type(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    engine.publish(str(state["run_id"]))
+    engine.approve(str(state["run_id"]))
+
+    comment = next(
+        mutation
+        for mutation in publisher.data["delivery"]["mutations"]
+        if mutation["action"] == "parent_completion_comment"
+    )
+    assert comment["action"] == "parent_completion_comment"
+    assert comment["delivery_type"] == "Final Run"
+
+
 def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     engine = RunPublicationEngine(
@@ -364,20 +387,31 @@ def test_retries_a_worker_interrupted_before_publication_artifact(
     state, states, git, publisher = _accepted_run(git_repo)
 
     class InterruptedPublication(RunPublicationAgents):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
         def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
             del request
+            self.attempts += 1
             raise OSError("simulated publication interruption")
 
+    agents = InterruptedPublication()
     engine = RunPublicationEngine(
         git=git,
         states=states,
-        agents=InterruptedPublication(),
+        agents=agents,
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
     )
-    with pytest.raises(OSError, match="interruption"):
-        engine.publish(str(state["run_id"]))
+    pending = engine.publish(str(state["run_id"]))
+
+    assert pending["status"] == "publication_pending"
+    assert pending["run_publication"]["phase"] == "publication_pending"
+    assert pending["run_publication"]["publication_attempts"] == 5
+    assert agents.attempts == 5
+    assert pending["run_acceptance"]["phase"] == "accepted"
 
     retried = RunPublicationEngine(
         git=git,
@@ -388,6 +422,100 @@ def test_retries_a_worker_interrupted_before_publication_artifact(
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
     assert retried["status"] == "run_approval_pending"
+    assert retried["run_publication"]["publication_attempts"] == 1
+    assert retried["run_acceptance"]["phase"] == "accepted"
+
+
+def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+
+    class InterruptedPublication(RunPublicationAgents):
+        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
+            del request
+            raise OSError("simulated publication interruption")
+
+    pending = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=InterruptedPublication(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+    acceptance = pending["run_acceptance"]["acceptance_record"]
+    agents = git_repo / "resume-publication-agents.json"
+    agents.write_text(
+        json.dumps(
+            {"run_publications": [RunPublicationAgents().run_publication({})]}
+        ),
+        encoding="utf-8",
+    )
+
+    resumed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "resume",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    recovered = states.load_run(str(state["run_id"]))
+    assert recovered is not None
+    assert recovered["run_acceptance"]["acceptance_record"] == acceptance
+    assert recovered["run_publication"]["publication_attempts"] == 1
+
+
+def test_recovered_publication_replaces_the_pending_terminal_kind(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+
+    class InterruptedPublication(RunPublicationAgents):
+        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
+            del request
+            raise OSError("simulated publication interruption")
+
+    pending = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=InterruptedPublication(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+    publisher.data["delivery"]["required_checks"] = ["pending"]
+
+    waiting = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    assert pending["terminal_kind"] == "publication_pending"
+    assert waiting["status"] == "waiting_checks"
+    assert waiting["terminal_kind"] == "waiting_checks"
+
+
+def test_final_run_publication_receives_only_role_required_facts(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    agents = RunPublicationAgents()
+
+    RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    request = agents.requests[0]
+    assert set(request) == {"base_sha", "checkout", "parent_issue_url", "run_head_sha"}
+    assert request["parent_issue_url"].endswith("/issues/1")
 
 
 def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> None:
@@ -402,9 +530,6 @@ def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> Non
         default_branch="main",
         default_head_sha=git.resolve("main"),
     )
-
-    with pytest.raises(OSError, match="ensure_run_pr"):
-        engine.publish(str(state["run_id"]))
 
     retried = engine.publish(str(state["run_id"]))
 

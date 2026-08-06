@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subcommands.add_parser("resume", help="按稳定 Run ID 恢复 Delivery Run")
     resume.add_argument("run_id", help="Delivery Run 标识")
     _add_common_options(resume)
+    resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     confirm_structure = subcommands.add_parser(
         "confirm-structure",
         help="确认当前待处理的 Ticket 图结构变化",
@@ -117,6 +118,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state, resumed = controller.start(parsed.parent)
         elif parsed.command == "resume":
             state, resumed = controller.resume(parsed.run_id)
+            publication_retried = False
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
@@ -135,6 +137,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ).recover_closeout(parsed.run_id)
             elif (
                 state.get("delivery_type") == "ticket_run"
+                and isinstance(state.get("run_publication"), dict)
+                and state["run_publication"].get("phase") == "publication_pending"
+            ):
+                repository = github.repository()
+                agents = (
+                    FixtureAgentBackend(Path(parsed.agent_fixture))
+                    if parsed.agent_fixture
+                    else CodexCliBackend()
+                )
+                state = RunPublicationEngine(
+                    git=git,
+                    states=states,
+                    agents=agents,
+                    github=publisher,
+                    default_branch=repository.default_branch,
+                    default_head_sha=git.resolve_base(
+                        repository.default_branch, repository.default_head_sha
+                    ),
+                ).publish(parsed.run_id)
+                publication_retried = True
+            elif (
+                state.get("delivery_type") == "ticket_run"
                 and isinstance(state.get("parent_job"), dict)
             ):
                 state = ParentDeliveryEngine(
@@ -143,9 +167,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     github=publisher,
                     agents=CodexCliBackend(),
                 ).retire_for_child_flow(parsed.run_id)
-            state = DeliveryCleanupEngine(
-                git=git, states=states, github=publisher
-            ).resume(parsed.run_id)
+            if not publication_retried:
+                state = DeliveryCleanupEngine(
+                    git=git, states=states, github=publisher
+                ).resume(parsed.run_id)
         elif parsed.command == "confirm-structure":
             before_confirmation = states.load_run(parsed.run_id)
             state, resumed = controller.confirm_structure(parsed.run_id)

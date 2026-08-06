@@ -6,9 +6,11 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import PublicationArtifact
+from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
@@ -43,6 +45,15 @@ class RunPublicationEngine:
             if publication["phase"] == "stale":
                 publication.clear()
                 publication["phase"] = "pending"
+            if publication["phase"] == "publication_pending":
+                # An explicit publish/resume retries only publication.  The
+                # accepted Run boundary remains valid unless current facts say
+                # otherwise below.
+                publication.pop("artifact", None)
+                publication.pop("last_publication_error", None)
+                publication["publication_attempts"] = 0
+                publication["phase"] = "pending"
+                state["terminal_kind"] = "run_publication_pending"
             if publication["phase"] == "publishing":
                 # A failed publication attempt never reuses a previous
                 # narrative. Every retry gets a fresh, read-only publisher so
@@ -52,70 +63,135 @@ class RunPublicationEngine:
             if not self._acceptance_is_current(state, run):
                 return self._invalidate_for_fresh_acceptance(state)
 
-            if publication["phase"] == "pending":
+            if publication["phase"] in {"waiting_checks", "ready_for_approval"}:
+                return self._publish_accepted_run(state, run, publication)
+            if publication["phase"] != "pending":
+                raise ValueError("unknown Final Run Publication phase")
+
+            while True:
+                publication["publication_attempts"] = (
+                    int(publication.get("publication_attempts", 0)) + 1
+                )
                 publication["phase"] = "publishing"
+                publication.pop("artifact", None)
                 self._save(state)
-                checkout = self._publication_checkout(state)
                 try:
-                    self.git.prepare_validation_checkout(
-                        head_sha=self.git.resolve(str(state["run_branch"])),
-                        checkout=checkout,
-                    )
-                    artifact = PublicationArtifact.parse(
-                        self.agents.run_publication(
-                            self._publication_request(state, run, checkout)
-                        ),
-                        delivery_run=str(state["run_id"]),
-                    )
-                finally:
-                    self.git.remove_worktree(checkout)
-                    self._remove_empty_directories(checkout)
+                    artifact = self._create_publication_artifact(state, run)
+                except Exception as error:
+                    if self._publication_failed(state, publication, error):
+                        return state
+                    continue
                 publication["artifact"] = {
                     "commit_message": artifact.commit_message,
                     "pr_title": artifact.pr_title,
                     "pr_body_markdown": artifact.pr_body_markdown,
                 }
+                try:
+                    return self._publish_accepted_run(state, run, publication)
+                except (GitError, GitHubReadError, OSError) as error:
+                    if self._publication_failed(state, publication, error):
+                        return state
 
-            artifact = PublicationArtifact.parse(
+    def _publication_failed(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        error: Exception,
+    ) -> bool:
+        if int(publication["publication_attempts"]) >= MAX_PUBLICATION_ATTEMPTS:
+            publication["phase"] = "publication_pending"
+            publication["last_publication_error"] = str(error)
+            state.update(
+                {
+                    "status": "publication_pending",
+                    "terminal_kind": "publication_pending",
+                    "diagnostics": [
+                        {
+                            "code": "publication_pending",
+                            "message": (
+                                "Publication retries were exhausted; resume retries "
+                                "publication without rerunning Development or Fresh Validation"
+                            ),
+                            "delivery_run": state["run_id"],
+                        }
+                    ],
+                }
+            )
+            self._save(state)
+            return True
+        publication.pop("artifact", None)
+        publication["last_publication_error"] = str(error)
+        publication["phase"] = "pending"
+        self._save(state)
+        return False
+
+    def _create_publication_artifact(
+        self, state: dict[str, Any], run: dict[str, Any]
+    ) -> PublicationArtifact:
+        checkout = self._publication_checkout(state)
+        try:
+            self.git.prepare_validation_checkout(
+                head_sha=self.git.resolve(str(state["run_branch"])),
+                checkout=checkout,
+            )
+            return PublicationArtifact.parse(
+                self.agents.run_publication(
+                    self._publication_request(state, run, checkout)
+                ),
+                delivery_run=str(state["run_id"]),
+            )
+        finally:
+            self.git.remove_worktree(checkout)
+            self._remove_empty_directories(checkout)
+
+    def _publish_accepted_run(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        publication: dict[str, Any],
+    ) -> dict[str, Any]:
+        artifact = PublicationArtifact.parse(
             self._mapping(publication, "artifact"),
             delivery_run=str(state["run_id"]),
         )
-            run_head = self.git.resolve(str(state["run_branch"]))
-            pr_number = self.github.ensure_run_pr(
-                branch=str(state["run_branch"]),
-                base_branch=self.default_branch,
-                title=artifact.pr_title,
-                body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+        run_head = self.git.resolve(str(state["run_branch"]))
+        pr_number = self.github.ensure_run_pr(
+            branch=str(state["run_branch"]),
+            base_branch=self.default_branch,
+            title=artifact.pr_title,
+            body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+        )
+        live = self.github.live_pull_request(pr_number)
+        if (
+            live.get("state") != "OPEN"
+            or live.get("head_sha") != run_head
+            or live.get("base_branch") != self.default_branch
+            or live.get("base_sha") != self.default_head_sha
+        ):
+            raise ValueError("final Run PR does not match the accepted publication")
+        record = self._record(state, run_head, str(live["head_sha"]))
+        self.github.record_run_publication(pr_number, record)
+        publication.update({"pr_number": pr_number, "record": record})
+        publication.pop("last_publication_error", None)
+        checks = self.github.required_checks(pr_number)
+        self._record_agent_run_status(pr_number, run, run_head, checks)
+        if checks == "fail":
+            self._queue_repair(
+                state,
+                repair_source="required_checks",
+                ci_evidence=self.github.required_check_evidence(pr_number),
             )
-            live = self.github.live_pull_request(pr_number)
-            if (
-                live.get("state") != "OPEN"
-                or live.get("head_sha") != run_head
-                or live.get("base_branch") != self.default_branch
-                or live.get("base_sha") != self.default_head_sha
-            ):
-                raise ValueError("final Run PR does not match the accepted publication")
-            record = self._record(state, run_head, str(live["head_sha"]))
-            self.github.record_run_publication(pr_number, record)
-            publication.update({"pr_number": pr_number, "record": record})
-            checks = self.github.required_checks(pr_number)
-            self._record_agent_run_status(pr_number, run, run_head, checks)
-            if checks == "fail":
-                self._queue_repair(
-                    state,
-                    repair_source="required_checks",
-                    ci_evidence=self.github.required_check_evidence(pr_number),
-                )
-            elif checks == "pending":
-                publication["phase"] = "waiting_checks"
-                state["status"] = "waiting_checks"
-                state["diagnostics"] = []
-            else:
-                publication["phase"] = "ready_for_approval"
-                state["status"] = "run_approval_pending"
-                state["terminal_kind"] = "waiting_human"
-                state["diagnostics"] = []
-            return self._save(state)
+        elif checks == "pending":
+            publication["phase"] = "waiting_checks"
+            state["status"] = "waiting_checks"
+            state["terminal_kind"] = "waiting_checks"
+            state["diagnostics"] = []
+        else:
+            publication["phase"] = "ready_for_approval"
+            state["status"] = "run_approval_pending"
+            state["terminal_kind"] = "waiting_human"
+            state["diagnostics"] = []
+        return self._save(state)
 
     def approve(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
@@ -320,14 +396,14 @@ class RunPublicationEngine:
     def _publication_request(
         self, state: dict[str, Any], run: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
+        del run
+        parent = self._mapping(state, "parent")
         return {
-            "run_id": state["run_id"],
-            "parent": self._mapping(state, "parent"),
-            "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "parent_issue_url": (
+                f"https://github.com/{state['repository']}/issues/{int(parent['number'])}"
+            ),
             "run_head_sha": self.git.resolve(str(state["run_branch"])),
-            "default_head_sha": self.default_head_sha,
-            "acceptance_record": self._mapping(run, "acceptance_record"),
+            "base_sha": self.default_head_sha,
             "checkout": str(checkout),
         }
 
@@ -427,6 +503,7 @@ class RunPublicationEngine:
             run_id=str(state["run_id"]),
             pr_number=self._integer(publication, "pr_number"),
             integrated_sha=integrated_sha,
+            delivery_type="Final Run",
         )
         publication["parent_closed"] = True
         state.update({"status": "completed", "terminal_kind": "merged", "diagnostics": []})
