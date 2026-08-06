@@ -6,6 +6,7 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import PublicationArtifact
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
 from agent_run.revisions import effective_revision
@@ -429,7 +430,10 @@ class RunPublicationEngine:
         )
         publication["parent_closed"] = True
         state.update({"status": "completed", "terminal_kind": "merged", "diagnostics": []})
-        return self._save(state)
+        self._save(state)
+        return DeliveryCleanupEngine(
+            git=self.git, states=self.states, github=self.github
+        ).complete_final_run(state)
 
     def _block_merged_boundary(
         self, state: dict[str, Any], message: str

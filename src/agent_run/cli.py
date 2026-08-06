@@ -12,6 +12,7 @@ from agent_run.agent_fixture import (
 )
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
@@ -116,16 +117,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state, resumed = controller.start(parsed.parent)
         elif parsed.command == "resume":
             state, resumed = controller.resume(parsed.run_id)
+            publisher = (
+                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                if parsed.github_fixture
+                else GhGitHubPublisher(github.repository().name_with_owner, git)
+            )
             if (
                 state.get("delivery_type") == "parent_only"
                 and isinstance(state.get("parent_job"), dict)
                 and state["parent_job"].get("phase") == "merging"
             ):
-                publisher = (
-                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                    if parsed.github_fixture
-                    else GhGitHubPublisher(github.repository().name_with_owner, git)
-                )
                 state = ParentDeliveryEngine(
                     git=git,
                     states=states,
@@ -136,17 +137,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 state.get("delivery_type") == "ticket_run"
                 and isinstance(state.get("parent_job"), dict)
             ):
-                publisher = (
-                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                    if parsed.github_fixture
-                    else GhGitHubPublisher(github.repository().name_with_owner, git)
-                )
                 state = ParentDeliveryEngine(
                     git=git,
                     states=states,
                     github=publisher,
                     agents=CodexCliBackend(),
                 ).retire_for_child_flow(parsed.run_id)
+            state = DeliveryCleanupEngine(
+                git=git, states=states, github=publisher
+            ).resume(parsed.run_id)
         elif parsed.command == "confirm-structure":
             before_confirmation = states.load_run(parsed.run_id)
             state, resumed = controller.confirm_structure(parsed.run_id)
@@ -182,6 +181,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 )
             )
             refreshed, _ = controller.resume(parsed.run_id)
+            refreshed = DeliveryCleanupEngine(
+                git=git, states=states, github=publisher
+            ).resume(parsed.run_id)
             if (
                 refreshed.get("delivery_type") == "ticket_run"
                 and isinstance(refreshed.get("parent_job"), dict)

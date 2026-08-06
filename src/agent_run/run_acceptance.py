@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
     MAX_MODIFICATION_ATTEMPTS,
@@ -207,6 +208,9 @@ class RunAcceptanceEngine:
             self.git.remove_worktree(checkout)
             self._remove_empty_directories(checkout)
         if job["phase"] == "completed":
+            DeliveryCleanupEngine(
+                git=self.git, states=self.states, github=self.github
+            ).complete_run_repair(state, job)
             return "merged"
         if job["phase"] == "blocked":
             return (
@@ -600,6 +604,16 @@ class RunAcceptanceEngine:
                 "candidate_sha": job["candidate_sha"],
                 "publication_sha": job["publication_sha"],
                 "repair_pr_number": job["pr_number"],
+                "integrated_sha": integrated,
+            }
+        )
+        completed_repairs = run.setdefault("completed_repair_jobs", [])
+        if not isinstance(completed_repairs, list):
+            raise ValueError("completed_repair_jobs must be a list")
+        completed_repairs.append(
+            {
+                "phase": "completed",
+                "repair_branch": job["repair_branch"],
                 "integrated_sha": integrated,
             }
         )

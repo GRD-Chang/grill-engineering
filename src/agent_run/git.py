@@ -5,6 +5,16 @@ import subprocess
 from pathlib import Path
 
 
+MANAGED_DELIVERY_BRANCH_PREFIXES = (
+    "agent-run/",
+    "agent-run-repair/",
+)
+
+
+def is_managed_delivery_branch(branch: str) -> bool:
+    return branch.startswith(MANAGED_DELIVERY_BRANCH_PREFIXES)
+
+
 class GitError(RuntimeError):
     pass
 
@@ -140,6 +150,12 @@ class GitRepository:
                 deleted.stderr.strip()
                 or f"could not delete branch {branch}"
             )
+
+    def delete_managed_delivery_branch(self, branch: str) -> None:
+        """Delete only a branch shape owned by the Delivery Run controller."""
+        if not is_managed_delivery_branch(branch):
+            raise GitError(f"refusing to delete unmanaged branch {branch!r}")
+        self.delete_branch(branch)
 
     def prepare_validation_checkout(
         self, *, head_sha: str, checkout: Path

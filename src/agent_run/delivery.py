@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_loop import (
     TicketDeliveryLoop,
     _record_superseded_integration,
@@ -74,6 +75,10 @@ class TicketDeliveryEngine:
                     github=self.github,
                     agents=self.agents,
                 ).run(state, job, checkout)
+                if job.get("phase") == TicketPhase.COMPLETED.value:
+                    result = DeliveryCleanupEngine(
+                        git=self.git, states=self.states, github=self.github
+                    ).complete_ticket(result, job)
                 preserve_checkout = result.get("status") == "waiting_checks"
                 return result
             except KeyboardInterrupt:
@@ -257,7 +262,7 @@ class TicketDeliveryEngine:
         )
         return {
             "ticket_branch": (
-                f"agent-run-ticket/{state['run_id']}/{branch_suffix}"
+                f"agent-run/{state['run_id']}/{branch_suffix}"
             ),
             "ticket_branch_generation": generation,
             "base_sha": self.git.resolve(str(state["run_branch"])),
