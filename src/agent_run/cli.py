@@ -136,7 +136,26 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     agents=CodexCliBackend(),
                 ).recover_closeout(parsed.run_id)
             elif (
+                state.get("delivery_type") == "parent_only"
+                and state.get("status") == "publication_pending"
+                and isinstance(state.get("parent_job"), dict)
+                and state["parent_job"].get("phase") == "publication_pending"
+            ):
+                agents = (
+                    FixtureAgentBackend(Path(parsed.agent_fixture))
+                    if parsed.agent_fixture
+                    else CodexCliBackend()
+                )
+                state = ParentDeliveryEngine(
+                    git=git,
+                    states=states,
+                    github=publisher,
+                    agents=agents,
+                ).deliver(parsed.run_id)
+                publication_retried = True
+            elif (
                 state.get("delivery_type") == "ticket_run"
+                and state.get("status") == "publication_pending"
                 and isinstance(state.get("run_publication"), dict)
                 and state["run_publication"].get("phase") == "publication_pending"
             ):

@@ -249,15 +249,54 @@ def test_parent_only_publication_pending_resumes_without_revalidation(
 
     assert pending.returncode == 0, pending.stderr
     assert stdout_json(pending)["status"] == "publication_pending"
-    pending_job = load_only_run_state(git_repo)["parent_job"]
+    pending_state = load_only_run_state(git_repo)
+    assert pending_state["terminal_kind"] == "publication_pending"
+    assert pending_state["diagnostics"] == [
+        {
+            "code": "publication_pending",
+            "message": (
+                "Publication retries were exhausted; resume retries publication "
+                "without rerunning Development or Fresh Validation"
+            ),
+            "change_job": "parent-only",
+        }
+    ]
+    pending_job = pending_state["parent_job"]
     assert pending_job["phase"] == "publication_pending"
     assert pending_job["modification_attempts"] == 1
     assert pending_job["validation_attempts"] == 1
     assert pending_job["publication_attempts"] == 5
+    accepted_boundary = {
+        "candidate_sha": pending_job["candidate_sha"],
+        "acceptance_record": pending_job["acceptance_record"],
+    }
 
-    resumed_pending = run_cli(git_repo, fixture, "resume", run_id)
-    assert resumed_pending.returncode == 0, resumed_pending.stderr
-    assert stdout_json(resumed_pending)["status"] == "publication_pending"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["error"] = {"code": "github_read_failed", "message": "offline"}
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    unreadable = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert unreadable.returncode == 2
+    assert stdout_json(unreadable)["status"] == "execution_failed"
+    assert load_only_run_state(git_repo)["parent_job"] == pending_job
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"] == []
+
+    data.pop("error")
+    data["parent"]["sub_issues"] = [3]
+    data["issues"] = {"3": ticket()}
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    changed_structure = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert changed_structure.returncode == 2
+    assert stdout_json(changed_structure)["status"] == "structure_change_pending"
+    assert load_only_run_state(git_repo)["parent_job"] == pending_job
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"] == []
+
+    data["parent"]["sub_issues"] = []
+    data["issues"] = {}
+    fixture.write_text(json.dumps(data), encoding="utf-8")
 
     agent_fixture.write_text(
         json.dumps(
@@ -268,7 +307,7 @@ def test_parent_only_publication_pending_resumes_without_revalidation(
     resumed = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(agent_fixture),
@@ -279,6 +318,11 @@ def test_parent_only_publication_pending_resumes_without_revalidation(
     resumed_job = load_only_run_state(git_repo)["parent_job"]
     assert resumed_job["modification_attempts"] == 1
     assert resumed_job["validation_attempts"] == 1
+    assert resumed_job["publication_attempts"] == 1
+    assert {
+        "candidate_sha": resumed_job["candidate_sha"],
+        "acceptance_record": resumed_job["acceptance_record"],
+    } == accepted_boundary
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
 
 

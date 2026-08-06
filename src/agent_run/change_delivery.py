@@ -17,6 +17,7 @@ from agent_run.artifacts import AcceptanceArtifact, PublicationArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
+from agent_run.publication_pending import publication_pending_diagnostic
 
 MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
@@ -229,15 +230,11 @@ class ChangeDeliveryEngine:
                 if attempts >= MAX_PUBLICATION_ATTEMPTS:
                     job["phase"] = "publication_pending"
                     state["status"] = "publication_pending"
+                    state["terminal_kind"] = "publication_pending"
                     state["diagnostics"] = [
-                        {
-                            "code": "publication_pending",
-                            "message": (
-                                "Publication retries were exhausted; resume retries "
-                                "publication without rerunning Development or Fresh Validation"
-                            ),
-                            "change_job": self.contract.label(job),
-                        }
+                        publication_pending_diagnostic(
+                            subject_key="change_job", subject=self.contract.label(job)
+                        )
                     ]
                     self.contract.save(state)
                     return
