@@ -29,6 +29,7 @@ class GitHubPublisher(Protocol):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
+        delivery_type: str,
     ) -> None: ...
 
     def abandon_run_pr(self, pr_number: int) -> None: ...

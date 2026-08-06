@@ -28,7 +28,7 @@ class _CodexThreadResumeError(CodexProcessError):
 
 
 class CodexCliBackend:
-    """Runs untrusted Codex workers without Publisher GitHub credentials."""
+    """Runs untrusted role-scoped agents without Publisher GitHub credentials."""
 
     def __init__(
         self,
@@ -61,8 +61,8 @@ class CodexCliBackend:
             )
             output, actual_thread = self._invoke(
                 prompt=(
-                    "旧 Development Thread 恢复失败。你是接替该工作的 Development "
-                    "Codex；下面的 Development Brief 是完整恢复上下文，请在同一 "
+                    "之前的开发会话恢复失败。你是接替该工作的开发工程师；下面的 Development "
+                    "Brief 是完整恢复上下文，请在同一 "
                     f"{job_name}、branch 和 PR 上继续，不要重新规划或丢失未解决证据。"
                     "\n\n"
                     + prompt
@@ -242,14 +242,15 @@ class CodexCliBackend:
         )
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Create final-PR prose in a new, read-only, one-shot worker."""
+        """Create final-PR prose with a fresh, read-only release-narrative writer."""
         checkout = Path(_string(request, "checkout"))
-        run_id = _string(request, "run_id")
         prompt = (
-            "你是一次性的 Run Publication Codex。只读取当前事实，生成最终 Run PR "
+            "你是本次 Final Run 的发布叙事工程师。只读取当前事实，生成最终 Run PR "
             "的语义标题和正文；不要编辑文件、不要执行 Git/GitHub 写操作，也不要做 "
             "验收或替代人工批准。Parent Issue、Delivery Type、Delivery Run、SHA、CI 与"
             "生命周期事实由 Publisher 注入；Completed Tickets 也由 Publisher 渲染，叙事中不得输出这些字段；"
+            "先读取 Publication Brief 提供的 Parent Issue URL，再在 checkout 中读取 "
+            "base_sha..run_head_sha 的完整 Git diff；不要读取或要求其他 Controller 状态。"
             "并包含非空 What Problem This Solves、Why This Change Was Made、User Impact、Evidence"
             "四个二级标题；"
             "不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 "
@@ -336,8 +337,8 @@ class CodexCliBackend:
     def assess_scope(self, request: dict[str, Any]) -> dict[str, Any]:
         checkout = Path(_string(request, "checkout"))
         prompt = (
-            "你是一次性的 Scope Impact Assessment Codex Worker。比较新旧 "
-            "Parent Spec、当前 Ticket Graph 和既有已完成工作，只判断 Parent 变化"
+            "你是范围影响分析师。比较新旧 Parent Issue、当前 Ticket Graph 和既有已完成工作，"
+            "只判断 Parent 变化"
             "是否改变 Ticket 集合、依赖关系、整体交付边界，或使已完成 Ticket 需要"
             "返工。文案澄清或不影响这些结构的补充不是结构性变化。使用所需工具核验，"
             "但不要 commit、push、merge、close 或修改 Issue/PR；只输出符合 schema "

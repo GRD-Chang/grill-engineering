@@ -313,6 +313,7 @@ class FixtureGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
+        delivery_type: str,
     ) -> None:
         parent = _mutable_mapping(self.data, "parent")
         if _integer(parent, "number") != parent_number:
@@ -323,6 +324,7 @@ class FixtureGitHubPublisher:
             "run_id": run_id,
             "pr_number": pr_number,
             "integrated_sha": integrated_sha,
+            "delivery_type": delivery_type,
         }
         if not any(
             isinstance(item, dict)

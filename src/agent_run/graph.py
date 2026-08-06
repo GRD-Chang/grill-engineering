@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.models import DeliveryGraph, Issue
+from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.revisions import (
     effective_revision,
     fingerprint,
@@ -102,14 +103,9 @@ def state_from_graph(
         elif active.get("phase") == TicketPhase.PUBLICATION_PENDING.value:
             status = "publication_pending"
             diagnostics = [
-                {
-                    "code": "publication_pending",
-                    "message": (
-                        "Publication retries were exhausted; resume retries "
-                        "publication without rerunning Development or Fresh Validation"
-                    ),
-                    "ticket_number": active["ticket_number"],
-                }
+                publication_pending_diagnostic(
+                    subject_key="ticket_number", subject=active["ticket_number"]
+                )
             ]
         elif (
             active.get("phase") == TicketPhase.BLOCKED.value
@@ -143,14 +139,9 @@ def state_from_graph(
             elif phase == TicketPhase.PUBLICATION_PENDING.value:
                 status = "publication_pending"
                 diagnostics = [
-                    {
-                        "code": "publication_pending",
-                        "message": (
-                            "Publication retries were exhausted; resume retries "
-                            "publication without rerunning Development or Fresh Validation"
-                        ),
-                        "change_job": "parent-only",
-                    }
+                    publication_pending_diagnostic(
+                        subject_key="change_job", subject="parent-only"
+                    )
                 ]
             elif phase == "merging":
                 status = "parent_closeout_pending"
@@ -162,8 +153,7 @@ def state_from_graph(
                 status = "parent_delivery_pending"
                 diagnostics = []
         elif _all_ticket_jobs_completed(ticket_jobs, order):
-            status = "run_acceptance_pending"
-            diagnostics = []
+            status, diagnostics = _run_completion_status(previous)
         elif active is not None:
             if active.get("phase") == TicketPhase.ESCALATING.value:
                 status = "escalating"
@@ -205,6 +195,7 @@ def state_from_graph(
                 "all_tickets_completed"
                 if status == "run_acceptance_pending"
                 else "completed" if status == "completed"
+                else "publication_pending" if status == "publication_pending"
                 else (
                     _exhaustion_kind(diagnostics[0]["remaining_tickets"])
                     if status == "progress_exhausted"
@@ -215,6 +206,34 @@ def state_from_graph(
         }
     )
     return state
+
+
+def _run_completion_status(previous: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    acceptance = previous.get("run_acceptance")
+    publication = previous.get("run_publication")
+    if (
+        not isinstance(acceptance, dict)
+        or acceptance.get("phase") != "accepted"
+        or not isinstance(publication, dict)
+    ):
+        return "run_acceptance_pending", []
+    phase = publication.get("phase")
+    if phase == "publication_pending":
+        return (
+            "publication_pending",
+            [
+                publication_pending_diagnostic(
+                    subject_key="delivery_run", subject=str(previous["run_id"])
+                )
+            ],
+        )
+    if phase == "waiting_checks":
+        return "waiting_checks", []
+    if phase == "ready_for_approval":
+        return "run_approval_pending", []
+    if phase == "merged":
+        return "parent_closeout_pending", []
+    return "run_publication_pending", []
 
 
 def _blocked_graph_state(

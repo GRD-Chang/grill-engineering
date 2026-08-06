@@ -259,6 +259,7 @@ class GhGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
+        delivery_type: str,
     ) -> None:
         issue = _mapping(
             self._json(
@@ -279,7 +280,7 @@ class GhGitHubPublisher:
         if not already_recorded:
             body = (
                 f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
-                f"in Final Run PR #{pr_number}; merge commit `{integrated_sha}` "
+                f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
                 "is verified on the default branch."
             )
             self._require(

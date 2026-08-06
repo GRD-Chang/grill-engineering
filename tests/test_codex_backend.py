@@ -226,10 +226,20 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
     CodexCliBackend(credential_provider=lambda: "reader-secret").run_publication(
-        {"checkout": str(tmp_path), "run_id": "run-1"}
+        {
+            "checkout": str(tmp_path),
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "base_sha": "base-sha",
+            "run_head_sha": "run-head-sha",
+        }
     )
 
     assert "Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入" in prompts[0]
+    assert "https://github.com/example/project/issues/1" in prompts[0]
+    assert "base_sha..run_head_sha" in prompts[0]
+    assert "一次性的" not in prompts[0]
+    assert "Codex" not in prompts[0]
+    assert "Worker" not in prompts[0]
 
 
 @pytest.mark.parametrize(
