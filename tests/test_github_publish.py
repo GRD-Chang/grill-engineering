@@ -85,6 +85,31 @@ def test_publish_branch_refuses_remote_drift(
     assert _remote_head(git_repo, "ticket") == drift
 
 
+def test_close_parent_issue_passes_repository_to_gh(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *_arguments: {"state": "OPEN", "comments": []},
+    )
+    monkeypatch.setattr(
+        publisher, "_require", lambda *arguments: calls.append(arguments)
+    )
+
+    publisher.close_parent_issue(
+        parent_number=1,
+        run_id="run-1",
+        pr_number=2,
+        integrated_sha="abc123",
+        delivery_type="Final Run",
+    )
+
+    assert calls[-1] == ("issue", "close", "1", "--repo", "example/project")
+
+
 def test_publish_branch_accepts_retry_after_successful_push(
     git_repo: Path,
     tmp_path: Path,

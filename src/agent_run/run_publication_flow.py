@@ -46,11 +46,12 @@ class RunPublicationFlow(RunPublicationShared):
                 publication.pop("artifact", None)
                 self._save(state)
                 try:
-                    artifact = self._create_publication_artifact(state)
+                    artifact = self._create_publication_artifact(state, publication)
                 except Exception as error:
                     if self._publication_failed(state, publication, error):
                         return state
                     continue
+                self._save(state)
                 publication["artifact"] = {
                     "commit_message": artifact.commit_message,
                     "pr_title": artifact.pr_title,
@@ -91,15 +92,19 @@ class RunPublicationFlow(RunPublicationShared):
         return False
 
     def _create_publication_artifact(
-        self, state: dict[str, Any]
+        self, state: dict[str, Any], publication: dict[str, Any]
     ) -> PublicationArtifact:
         checkout = self._publication_checkout(state)
         try:
             self.git.prepare_validation_checkout(
                 head_sha=self.git.resolve(str(state["run_branch"])), checkout=checkout
             )
+            raw = self.agents.run_publication(self._publication_request(state, checkout))
+            thread_id = raw.pop("_thread_id", None)
+            if isinstance(thread_id, str):
+                publication["thread_id"] = thread_id
             return PublicationArtifact.parse(
-                self.agents.run_publication(self._publication_request(state, checkout)),
+                raw,
                 delivery_run=str(state["run_id"]),
             )
         finally:

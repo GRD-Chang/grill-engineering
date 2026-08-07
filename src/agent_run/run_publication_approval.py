@@ -90,6 +90,14 @@ class RunPublicationApproval(RunPublicationShared):
                 )
             return self._mark_merged_and_close_parent(state, integrated)
 
+    def recover_closeout(self, run_id: str) -> dict[str, Any]:
+        with self.states.locked():
+            state = self._load(run_id)
+            publication = self._publication_state(state)
+            if publication.get("phase") != "merged":
+                raise ValueError("Run Publication is not awaiting Parent closeout")
+            return self._complete_parent_closeout(state)
+
     def revise(self, run_id: str, feedback: str) -> dict[str, Any]:
         if not feedback.strip():
             raise ValueError("revision feedback must be non-empty")

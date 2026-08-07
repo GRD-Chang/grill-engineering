@@ -7,6 +7,7 @@ from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
 from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
 
 
@@ -30,9 +31,14 @@ class GhGitHubPublisher:
         self, *, parent_number: int, branch: str, base_branch: str
     ) -> None:
         listed = self._run(
-            "issue", "develop", "--list", str(parent_number), "--repo", self.repository
+            "issue", "develop", "--list", str(parent_number), "--repo", self.repository,
         )
-        if listed.returncode == 0 and branch in listed.stdout:
+        if listed.returncode != 0:
+            raise GitHubReadError(
+                "github_read_failed",
+                listed.stderr.strip() or "could not inspect linked Parent branch",
+            )
+        if branch in listed.stdout:
             return
         created = self._run(
             "issue",
@@ -54,23 +60,17 @@ class GhGitHubPublisher:
     def delete_managed_branch(self, branch: str) -> None:
         if not is_managed_delivery_branch(branch):
             raise GitError(f"refusing to delete unmanaged branch {branch!r}")
-        remote = subprocess.run(
+        remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if remote.returncode != 0:
             raise GitError(remote.stderr.strip() or "could not inspect remote branch")
         if not remote.stdout.strip():
             return
-        deleted = subprocess.run(
+        deleted = run_write_command(
             ["git", "push", "origin", "--delete", branch],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if deleted.returncode != 0:
             raise GitError(deleted.stderr.strip() or "could not delete remote branch")
@@ -91,7 +91,12 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
         )
-        if listed.returncode == 0 and branch in listed.stdout:
+        if listed.returncode != 0:
+            raise GitHubReadError(
+                "github_read_failed",
+                listed.stderr.strip() or "could not inspect linked ticket branch",
+            )
+        if branch in listed.stdout:
             return
         created = self._run(
             "issue",
@@ -112,24 +117,18 @@ class GhGitHubPublisher:
 
     def ensure_run_repair_branch(self, *, branch: str, base_branch: str) -> None:
         self._ensure_remote_run_branch(base_branch)
-        remote = subprocess.run(
+        remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if remote.returncode != 0:
             raise GitError(remote.stderr.strip() or "could not read Run Repair branch")
         if remote.stdout.strip():
             return
         base_sha = self.git.resolve(base_branch)
-        pushed = subprocess.run(
+        pushed = run_write_command(
             ["git", "push", "origin", f"{base_sha}:refs/heads/{branch}"],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if pushed.returncode != 0:
             raise GitError(pushed.stderr.strip() or "could not create Run Repair branch")
@@ -299,6 +298,7 @@ class GhGitHubPublisher:
                 "close",
                 str(parent_number),
                 "--repo",
+                self.repository,
             )
 
     def abandon_run_pr(self, pr_number: int) -> None:
@@ -307,24 +307,18 @@ class GhGitHubPublisher:
             self._require("pr", "close", str(pr_number), "--repo", self.repository)
 
     def _ensure_remote_run_branch(self, branch: str) -> None:
-        remote = subprocess.run(
+        remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if remote.returncode != 0:
             raise GitError(remote.stderr.strip() or "could not read remote Run Branch")
         if remote.stdout.strip():
             return
         head = self.git.resolve(branch)
-        pushed = subprocess.run(
+        pushed = run_write_command(
             ["git", "push", "origin", f"{head}:refs/heads/{branch}"],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if pushed.returncode != 0:
             raise GitError(pushed.stderr.strip() or "could not publish Run Branch")
@@ -336,12 +330,9 @@ class GhGitHubPublisher:
         *,
         expected_remote_sha: str,
     ) -> None:
-        remote = subprocess.run(
+        remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if remote.returncode != 0:
             raise GitError(remote.stderr.strip() or "could not read ticket branch")
@@ -359,13 +350,7 @@ class GhGitHubPublisher:
             f"{head_sha}:refs/heads/{branch}",
             f"--force-with-lease=refs/heads/{branch}:{expected_remote_sha}",
         ]
-        pushed = subprocess.run(
-            arguments,
-            cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        pushed = run_write_command(arguments, cwd=self.git.root)
         if pushed.returncode != 0:
             raise GitError(pushed.stderr.strip() or "could not publish ticket branch")
 
@@ -776,12 +761,9 @@ class GhGitHubPublisher:
     def sync_run_branch(
         self, *, run_branch: str, integrated_sha: str
     ) -> None:
-        fetched = subprocess.run(
+        fetched = run_read_command(
             ["git", "fetch", "--no-tags", "origin", run_branch],
             cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
         if fetched.returncode != 0:
             raise GitError(fetched.stderr.strip() or "could not fetch merged Run Branch")
@@ -927,14 +909,13 @@ class GhGitHubPublisher:
                 "github_invalid_response", f"gh returned invalid JSON: {error}"
             ) from error
 
-    def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["gh", *arguments],
-            cwd=self.git.root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+    def _run(
+        self, *arguments: str, retry: bool | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        command = ["gh", *arguments]
+        if retry if retry is not None else _is_read_command(arguments):
+            return run_read_command(command, cwd=self.git.root)
+        return run_write_command(command, cwd=self.git.root)
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -948,6 +929,26 @@ def _integer(data: dict[str, Any], key: str) -> int:
     if not isinstance(value, int):
         raise GitHubReadError("github_invalid_response", f"{key} must be an integer")
     return value
+
+
+def _is_read_command(arguments: tuple[str, ...]) -> bool:
+    if not arguments:
+        return False
+    command = arguments[0]
+    if command == "api":
+        return (
+            "--method" not in arguments
+            and not any(argument.startswith("body=") for argument in arguments)
+        )
+    if command == "repo":
+        return arguments[1:2] == ("view",)
+    if command == "pr":
+        return arguments[1:2] in {("list",), ("view",), ("checks",)}
+    if command == "issue":
+        return arguments[1:2] == ("view",) or (
+            arguments[1:2] == ("develop",) and "--list" in arguments
+        )
+    return False
 
 
 def _matches_ref(reference: str, pattern: object) -> bool:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +31,12 @@ def issue(
     }
 
 
-def run_cli(repo: Path, fixture: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    repo: Path,
+    fixture: Path,
+    *arguments: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     source_path = str(PROJECT_ROOT / "src")
     environment["PYTHONPATH"] = (
@@ -38,6 +44,8 @@ def run_cli(repo: Path, fixture: Path, *arguments: str) -> subprocess.CompletedP
         if not environment.get("PYTHONPATH")
         else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
     )
+    if extra_env:
+        environment.update(extra_env)
     return subprocess.run(
         [
             sys.executable,
@@ -53,6 +61,33 @@ def run_cli(repo: Path, fixture: Path, *arguments: str) -> subprocess.CompletedP
         capture_output=True,
         check=False,
     )
+
+
+def git_fetch_failure_wrapper(
+    directory: Path, *, failures: int
+) -> tuple[Path, dict[str, str]]:
+    real_git = shutil.which("git")
+    assert real_git is not None
+    counter = directory / "git-fetch-failures"
+    counter.write_text(str(failures), encoding="utf-8")
+    wrapper = directory / "git"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"fetch\" ] && [ \"$(cat \"$AGENT_RUN_FETCH_COUNTER\")\" -gt 0 ]; then\n"
+        "  remaining=$(cat \"$AGENT_RUN_FETCH_COUNTER\")\n"
+        "  echo $((remaining - 1)) > \"$AGENT_RUN_FETCH_COUNTER\"\n"
+        "  echo 'dial tcp: i/o timeout' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "exec \"$AGENT_RUN_REAL_GIT\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return counter, {
+        "AGENT_RUN_FETCH_COUNTER": str(counter),
+        "AGENT_RUN_REAL_GIT": real_git,
+        "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}",
+    }
 
 
 def stdout_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:

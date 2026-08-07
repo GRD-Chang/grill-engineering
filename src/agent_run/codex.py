@@ -259,14 +259,16 @@ class CodexCliBackend:
             "不要使用自然语言标题。\n\n"
             f"Run Publication Brief:\n{_pretty(request)}"
         )
-        output, _thread_id = self._invoke(
+        output, thread_id = self._invoke(
             prompt=prompt,
             checkout=checkout,
             thread_id=None,
             schema=publication_schema(),
             writable_checkout=False,
         )
-        return _json_object(output, "Run Publication Artifact")
+        artifact = _json_object(output, "Run Publication Artifact")
+        artifact["_thread_id"] = thread_id
+        return artifact
 
     @staticmethod
     def _publication_prompt(request: dict[str, Any]) -> str:

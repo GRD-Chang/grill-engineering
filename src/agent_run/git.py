@@ -4,6 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from agent_run.github_retry import run_read_command
+
 
 MANAGED_DELIVERY_BRANCH_PREFIXES = (
     "agent-run/",
@@ -350,7 +352,10 @@ class GitRepository:
         self._run("worktree", "prune")
 
     def _fetch_default_branch(self, default_branch: str) -> None:
-        result = self._run("fetch", "--no-tags", "origin", default_branch)
+        result = run_read_command(
+            ["git", "fetch", "--no-tags", "origin", default_branch],
+            cwd=self.root,
+        )
         if result.returncode != 0:
             raise GitError(
                 result.stderr.strip() or f"could not fetch origin/{default_branch}"

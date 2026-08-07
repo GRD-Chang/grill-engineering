@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from agent_run import cli_presentation, cli_surface
 from agent_run.agent_fixture import (
     FixtureAgentBackend,
     FixtureScopeImpactAssessor,
@@ -29,53 +30,68 @@ from agent_run.worker_sandbox import WorkerSandboxError
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-run",
-        description="从 GitHub Parent Issue 启动或恢复本地 Delivery Run",
+        description="从 GitHub 父 Issue 启动或恢复本地交付运行",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
-    start = subcommands.add_parser("start", help="启动或幂等恢复 Delivery Run")
+    start = subcommands.add_parser("start", help="启动或幂等恢复交付运行")
     start.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(start)
-    resume = subcommands.add_parser("resume", help="按稳定 Run ID 恢复 Delivery Run")
-    resume.add_argument("run_id", help="Delivery Run 标识")
+    start.add_argument("--new-run", action="store_true", help=argparse.SUPPRESS)
+    run = subcommands.add_parser(
+        "run", help="自动推进交付运行至需要人工处理的阶段"
+    )
+    run.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
+    _add_common_options(run)
+    run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
+    resume = subcommands.add_parser("resume", help="按稳定运行 ID 恢复交付运行")
+    resume.add_argument("run_id", help="交付运行标识")
     _add_common_options(resume)
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     confirm_structure = subcommands.add_parser(
         "confirm-structure",
         help="确认当前待处理的 Ticket 图结构变化",
     )
-    confirm_structure.add_argument("run_id", help="Delivery Run 标识")
+    confirm_structure.add_argument("run_id", help="交付运行标识")
     _add_common_options(confirm_structure)
     deliver = subcommands.add_parser(
         "deliver", help="交付当前 Active Ticket Job"
     )
-    deliver.add_argument("run_id", help="Delivery Run 标识")
+    deliver.add_argument("run_id", help="交付运行标识")
     _add_common_options(deliver)
     deliver.add_argument(
         "--agent-fixture",
         help=argparse.SUPPRESS,
     )
     accept_run = subcommands.add_parser(
-        "accept-run", help="对完成的 Delivery Run 执行独立整体验收"
+        "accept-run", help="对完成的交付运行执行独立整体验收"
     )
-    accept_run.add_argument("run_id", help="Delivery Run 标识")
+    accept_run.add_argument("run_id", help="交付运行标识")
     _add_common_options(accept_run)
     accept_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     publish_run = subcommands.add_parser(
         "publish-run", help="发布已通过整体验收的最终 Run PR"
     )
-    publish_run.add_argument("run_id", help="Delivery Run 标识")
+    publish_run.add_argument("run_id", help="交付运行标识")
     _add_common_options(publish_run)
     publish_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     approve = subcommands.add_parser("approve", help="显式合并最终 Run PR")
-    approve.add_argument("run_id", help="Delivery Run 标识")
+    approve.add_argument("run_id", help="交付运行标识")
     _add_common_options(approve)
     revise = subcommands.add_parser("revise", help="以人工反馈开启新的 Run 修复窗口")
-    revise.add_argument("run_id", help="Delivery Run 标识")
+    revise.add_argument("run_id", help="交付运行标识")
     revise.add_argument("--message", required=True, help="未经改写的修订反馈")
     _add_common_options(revise)
-    abandon = subcommands.add_parser("abandon", help="放弃 Delivery Run 并清理本地临时资源")
-    abandon.add_argument("run_id", help="Delivery Run 标识")
+    abandon = subcommands.add_parser("abandon", help="放弃交付运行并清理本地临时资源")
+    abandon.add_argument("run_id", help="交付运行标识")
     _add_common_options(abandon)
+    status = subcommands.add_parser("status", help="显示当前交付运行状态")
+    status.add_argument("run_id", help="交付运行标识")
+    _add_common_options(status)
+    status.add_argument("--json", action="store_true", dest="as_json")
+    history = subcommands.add_parser("history", help="显示交付运行时间线")
+    history.add_argument("run_id", help="交付运行标识")
+    _add_common_options(history)
+    history.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -83,6 +99,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     parsed = parser.parse_args(arguments)
     controller: Controller | None = None
+    precondition_failed = False
     try:
         git = GitRepository.discover(Path.cwd())
         state_root = (
@@ -114,8 +131,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
         controller = Controller(
             github, git, states, scope_assessor=scope_assessor
         )
-        if parsed.command == "start":
-            state, resumed = controller.start(parsed.parent)
+        if parsed.command == "status":
+            state = cli_surface._load_local_run(states, parsed.run_id)
+            cli_presentation._print_status(state, as_json=parsed.as_json)
+            return 0
+        if parsed.command == "history":
+            state = cli_surface._load_local_run(states, parsed.run_id)
+            cli_presentation._print_history(state, as_json=parsed.as_json)
+            return 0
+        if cli_surface._is_lifecycle_action(parsed.command):
+            local_state = cli_surface._load_local_run(states, parsed.run_id)
+            if not cli_surface._command_is_ready(local_state, parsed.command):
+                cli_presentation._print_precondition_failure(local_state)
+                return 2
+        if parsed.command == "run":
+            state, resumed = cli_surface._run_to_human_gate(parsed, states, controller)
+        elif parsed.command == "start":
+            state, resumed = controller.start(
+                parsed.parent, reuse_existing=not parsed.new_run
+            )
         elif parsed.command == "resume":
             state, resumed = controller.resume(parsed.run_id)
             publication_retried = False
@@ -124,10 +158,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 if parsed.github_fixture
                 else GhGitHubPublisher(github.repository().name_with_owner, git)
             )
+            parent_job = state.get("parent_job")
+            run_publication = state.get("run_publication")
             if (
                 state.get("delivery_type") == "parent_only"
-                and isinstance(state.get("parent_job"), dict)
-                and state["parent_job"].get("phase") == "merging"
+                and isinstance(parent_job, dict)
+                and parent_job.get("phase") == "merging"
             ):
                 state = ParentDeliveryEngine(
                     git=git,
@@ -138,8 +174,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             elif (
                 state.get("delivery_type") == "parent_only"
                 and state.get("status") == "publication_pending"
-                and isinstance(state.get("parent_job"), dict)
-                and state["parent_job"].get("phase") == "publication_pending"
+                and isinstance(parent_job, dict)
+                and parent_job.get("phase") == "publication_pending"
             ):
                 agents = (
                     FixtureAgentBackend(Path(parsed.agent_fixture))
@@ -156,8 +192,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             elif (
                 state.get("delivery_type") == "ticket_run"
                 and state.get("status") == "publication_pending"
-                and isinstance(state.get("run_publication"), dict)
-                and state["run_publication"].get("phase") == "publication_pending"
+                and isinstance(run_publication, dict)
+                and run_publication.get("phase") == "publication_pending"
             ):
                 repository = github.repository()
                 agents = (
@@ -175,6 +211,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         repository.default_branch, repository.default_head_sha
                     ),
                 ).publish(parsed.run_id)
+                publication_retried = True
+            elif (
+                state.get("delivery_type") == "ticket_run"
+                and state.get("status") == "parent_closeout_pending"
+                and isinstance(run_publication, dict)
+                and run_publication.get("phase") == "merged"
+            ):
+                repository = github.repository()
+                state = RunPublicationEngine(
+                    git=git,
+                    states=states,
+                    agents=CodexCliBackend(),
+                    github=publisher,
+                    default_branch=repository.default_branch,
+                    default_head_sha=git.resolve_base(
+                        repository.default_branch, repository.default_head_sha
+                    ),
+                ).recover_closeout(parsed.run_id)
                 publication_retried = True
             elif (
                 state.get("delivery_type") == "ticket_run"
@@ -322,35 +376,66 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 # boundary. Do not let publication or approval bypass the
                 # explicit confirm-structure command.
                 state = refreshed
+                precondition_failed = True
             elif (
                 parsed.command == "approve"
                 and refreshed.get("delivery_type") == "parent_only"
+                and refreshed.get("status") == "parent_approval_pending"
             ):
                 state = ParentDeliveryEngine(
                     git=git, states=states, github=publisher, agents=agents
                 ).approve(parsed.run_id)
-            elif parsed.command == "publish-run":
+            elif (
+                parsed.command == "publish-run"
+                and (
+                    refreshed.get("status") == "run_publication_pending"
+                    or (
+                        isinstance(refreshed.get("run_publication"), dict)
+                        and refreshed.get("status")
+                        in {"waiting_checks", "run_approval_pending"}
+                    )
+                )
+            ):
                 state = publication.publish(parsed.run_id)
-            elif parsed.command == "approve":
+            elif parsed.command == "approve" and refreshed.get("status") == "run_approval_pending":
                 state = publication.approve(parsed.run_id)
-            elif parsed.command == "revise":
+            elif parsed.command == "revise" and refreshed.get("status") in {
+                "ready_for_human",
+                "run_approval_pending",
+            }:
                 state = publication.revise(parsed.run_id, parsed.message)
             else:
-                state = publication.abandon(parsed.run_id)
+                state = refreshed if parsed.command != "abandon" else publication.abandon(parsed.run_id)
+                precondition_failed = parsed.command != "abandon"
             resumed = True
+        active_ticket_job = state.get("active_ticket_job")
+        diagnostics = state.get("diagnostics")
+        current_diagnostics = diagnostics if isinstance(diagnostics, list) else []
         output = {
             "result": "resumed" if resumed else "started",
             "run_id": state["run_id"],
             "status": state["status"],
             "run_branch": state.get("run_branch", state.get("parent_branch")),
             "active_ticket": (
-                state["active_ticket_job"]["ticket_number"]
-                if state["active_ticket_job"]
+                active_ticket_job["ticket_number"]
+                if isinstance(active_ticket_job, dict)
                 else None
             ),
-            "diagnostics": state["diagnostics"],
+            "diagnostics": (
+                [
+                    *current_diagnostics,
+                    {
+                        "code": "command_precondition",
+                        "message": "当前交付运行尚未满足此命令的执行条件",
+                    },
+                ]
+                if precondition_failed
+                else current_diagnostics
+            ),
         }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        if precondition_failed:
+            return 2
         return (
             0
             if state["status"]
@@ -367,6 +452,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "run_approval_pending",
                 "completed",
                 "abandoned",
+                "waiting_merge",
             }
             else 2
         )
@@ -384,6 +470,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             failure_recorded = controller.record_execution_failure(
                 run_id, str(error)
             )
+        diagnostic_code = (
+            "multiple_unfinished_runs"
+            if str(error).startswith("multiple unfinished Delivery Runs")
+            else "command_failed"
+        )
+        diagnostic_message = (
+            "同一父 Issue 存在多个未终止交付运行；候选运行："
+            f"{str(error).partition(': ')[2]}。请先人工确定要保留的运行"
+            if diagnostic_code == "multiple_unfinished_runs"
+            else "命令执行失败；请通过 status 或 history 查看可恢复状态"
+        )
         print(
             json.dumps(
                 {
@@ -393,8 +490,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ),
                     "diagnostics": [
                         {
-                            "code": "command_failed",
-                            "message": str(error),
+                            "code": diagnostic_code,
+                            "message": diagnostic_message,
                         }
                     ],
                 },
@@ -402,7 +499,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
-        return 2
+    return 2
+
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:

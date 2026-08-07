@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from typing import Any
 
+from agent_run.github_retry import run_read_command
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 
 
@@ -189,12 +189,7 @@ class GhGitHubReader:
 
     @staticmethod
     def _gh_json(*arguments: str) -> dict[str, Any]:
-        result = subprocess.run(
-            ["gh", *arguments],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        result = run_read_command(["gh", *arguments])
         if result.returncode != 0:
             raise GitHubReadError(
                 "github_read_failed",

@@ -21,6 +21,7 @@ class FixtureAgentBackend:
             "developments": 0,
             "publications": 0,
             "reviews": 0,
+            "run_reviews": 0,
             "run_publications": 0,
             "scope_assessments": 0,
         }
@@ -99,7 +100,13 @@ class FixtureAgentBackend:
         return self._next("publications")
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
-        step = self._next("reviews")
+        name = (
+            "run_reviews"
+            if request.get("acceptance_scope") == "run"
+            and isinstance(self.data.get("run_reviews"), list)
+            else "reviews"
+        )
+        step = self._next(name)
         artifact = step.get("artifact")
         if not isinstance(artifact, dict):
             artifact = dict(step)

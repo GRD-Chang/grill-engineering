@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from agent_run.controller import Controller
+from agent_run.state import StateStore
+from agent_run.cli_presentation import _print_precondition_failure
+
+def _run_to_human_gate(
+    parsed: argparse.Namespace, states: StateStore, controller: Controller
+) -> tuple[dict[str, Any], bool]:
+    arguments = _nested_arguments(parsed)
+    state, resumed = controller.start_or_resume_unfinished(parsed.parent)
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str):
+        raise ValueError("Delivery Run is missing its Run ID")
+    # A read budget exhausted while selecting the Run is itself the durable
+    # recovery boundary.  Do not immediately spend another budget through the
+    # nested resume in the same foreground invocation.
+    if resumed and state.get("status") != "execution_failed":
+        _invoke_nested("resume", run_id, *arguments, *_agent_fixture_arguments(parsed, "resume"))
+    state = _load_local_run(states, run_id)
+    previous_marker: tuple[object, ...] | None = None
+    while True:
+        command = _next_automatic_command(state)
+        if command is None:
+            return state, resumed
+        marker = _progress_marker(state, command)
+        if marker == previous_marker:
+            return state, resumed
+        previous_marker = marker
+        print(f"推进: {state['status']} → {command}", file=sys.stderr)
+        agent_arguments = _agent_fixture_arguments(parsed, command)
+        _invoke_nested(command, run_id, *arguments, *agent_arguments)
+        state = _load_local_run(states, run_id)
+def _nested_arguments(parsed: argparse.Namespace) -> list[str]:
+    arguments: list[str] = []
+    if parsed.repo:
+        arguments.extend(["--repo", parsed.repo])
+    if parsed.state_dir:
+        arguments.extend(["--state-dir", parsed.state_dir])
+    if parsed.github_fixture:
+        arguments.extend(["--github-fixture", parsed.github_fixture])
+    crash_after_save = getattr(parsed, "crash_after_save", None)
+    if isinstance(crash_after_save, int):
+        arguments.extend(["--crash-after-save", str(crash_after_save)])
+    return arguments
+
+
+def _agent_fixture_arguments(
+    parsed: argparse.Namespace, command: str
+) -> list[str]:
+    agent_fixture = getattr(parsed, "agent_fixture", None)
+    if agent_fixture and command in {
+        "resume",
+        "deliver",
+        "accept-run",
+        "publish-run",
+    }:
+        return ["--agent-fixture", agent_fixture]
+    return []
+
+
+def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, object]:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        from agent_run.cli import main
+
+        exit_code = main([command, identifier, *arguments])
+    lines = [line for line in output.getvalue().splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"{command} did not return a Delivery Run result")
+    try:
+        result: object = json.loads(lines[-1])
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{command} returned invalid Delivery Run JSON") from error
+    if not isinstance(result, dict):
+        raise ValueError(f"{command} returned invalid Delivery Run result")
+    if exit_code != 0 and result.get("status") not in {
+        "waiting_checks",
+        "ready_for_human",
+        "structure_change_pending",
+        "progress_exhausted",
+        "execution_failed",
+        "blocked",
+        "waiting_merge",
+    }:
+        raise ValueError(f"{command} failed without a recoverable Run state")
+    return result
+
+
+def _next_automatic_command(state: dict[str, Any]) -> str | None:
+    status = str(state.get("status"))
+    if status in {
+        "active",
+        "ticket_completed",
+        "parent_delivery_pending",
+        "waiting_merge",
+    }:
+        return "deliver"
+    if status == "run_acceptance_pending":
+        return "accept-run"
+    publication = state.get("run_publication")
+    if status == "run_publication_pending" or (
+        status in {"publication_pending", "waiting_checks"}
+        and isinstance(publication, dict)
+        and publication.get("phase") in {
+            "publication_pending",
+            "waiting_checks",
+            "ready_for_approval",
+        }
+    ):
+        return "publish-run"
+    if status in {"publication_pending", "waiting_checks"}:
+        return "deliver"
+    return None
+
+
+def _is_lifecycle_action(command: str) -> bool:
+    return command in {
+        "confirm-structure",
+        "deliver",
+        "accept-run",
+        "publish-run",
+        "approve",
+        "revise",
+    }
+
+
+def _command_is_ready(state: dict[str, object], command: str) -> bool:
+    status = state.get("status")
+    # Existing commands are also recovery entry points. A previous process
+    # failure (or an abandoned Run queried idempotently) must reach their
+    # established reconciliation path instead of being rejected locally.
+    if status in {"execution_failed", "abandoned"}:
+        return True
+    if command == "confirm-structure":
+        return status == "structure_change_pending"
+    if command == "deliver":
+        return True
+    if command == "accept-run":
+        return status in {"run_acceptance_pending", "run_publication_pending"}
+    if command == "publish-run":
+        publication = state.get("run_publication")
+        return status == "run_publication_pending" or (
+            isinstance(publication, dict)
+            and status in {"waiting_checks", "run_approval_pending"}
+        )
+    if command == "approve":
+        return (
+            state.get("delivery_type") == "parent_only"
+            and status == "parent_approval_pending"
+        ) or status == "run_approval_pending"
+    if command == "revise":
+        return status in {"ready_for_human", "run_approval_pending"}
+    return False
+
+
+def _progress_marker(state: dict[str, Any], command: str) -> tuple[object, ...]:
+    active = state.get("active_ticket_job")
+    active_phase = active.get("phase") if isinstance(active, dict) else None
+    acceptance = state.get("run_acceptance")
+    acceptance_phase = acceptance.get("phase") if isinstance(acceptance, dict) else None
+    publication = state.get("run_publication")
+    publication_phase = publication.get("phase") if isinstance(publication, dict) else None
+    return (
+        command,
+        state.get("status"),
+        active_phase,
+        active.get("modification_attempts") if isinstance(active, dict) else None,
+        active.get("validation_attempts") if isinstance(active, dict) else None,
+        active.get("publication_attempts") if isinstance(active, dict) else None,
+        active.get("pull_number") if isinstance(active, dict) else None,
+        acceptance_phase,
+        acceptance.get("validation_attempts") if isinstance(acceptance, dict) else None,
+        publication_phase,
+        publication.get("publication_attempts") if isinstance(publication, dict) else None,
+        publication.get("pr_number") if isinstance(publication, dict) else None,
+    )
+
+
+def _load_local_run(states: StateStore, run_id: str) -> dict[str, object]:
+    state = states.load_run(run_id)
+    if state is None:
+        raise ValueError(f"unknown Delivery Run: {run_id}")
+    return state

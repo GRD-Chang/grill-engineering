@@ -214,9 +214,10 @@ def _run_completion_status(previous: dict[str, Any]) -> tuple[str, list[dict[str
     if (
         not isinstance(acceptance, dict)
         or acceptance.get("phase") != "accepted"
-        or not isinstance(publication, dict)
     ):
         return "run_acceptance_pending", []
+    if not isinstance(publication, dict):
+        return "run_publication_pending", []
     phase = publication.get("phase")
     if phase == "publication_pending":
         return (

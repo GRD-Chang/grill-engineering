@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from agent_run.controller import Controller
-from agent_run.git import GitRepository
+from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
@@ -57,6 +57,40 @@ def test_initial_state_failure_happens_before_branch_creation(
     ).stdout.splitlines()
     assert branches == []
     assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+
+
+def test_base_fetch_failure_preserves_a_recoverable_run(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_path = write_fixture(
+        git_repo / "github.json", issues={"2": _issue(2)}
+    )
+    store = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture_path), GitRepository(git_repo), store
+    )
+
+    def fail_resolve(_branch: str, _expected_sha: str | None) -> str:
+        raise GitError("simulated exhausted fetch retry budget")
+
+    monkeypatch.setattr(controller.publisher, "resolve_base", fail_resolve)
+    failed, resumed = controller.start_or_resume_unfinished(1)
+
+    assert not resumed
+    assert failed["status"] == "execution_failed"
+    assert failed["base_resolution_pending"] is True
+    run_id = str(failed["run_id"])
+    persisted = store.load_run(run_id)
+    assert persisted is not None
+    assert persisted["diagnostics"][0]["code"] == "base_resolution_failed"
+
+    monkeypatch.undo()
+    recovered, resumed = controller.resume(run_id)
+
+    assert resumed
+    assert recovered["run_id"] == run_id
+    assert recovered["status"] == "active"
+    assert recovered.get("base_resolution_pending") is None
 
 
 def test_wrong_repository_cannot_mutate_existing_run_state(

@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_run.git import GitRepository, is_managed_delivery_branch
 from agent_run.github import GitHubReadError
+from agent_run.github_retry import is_transient_message, retry_read_operation
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 from agent_run.revisions import effective_revision_from_graph
 
@@ -35,7 +36,26 @@ class FixtureGitHubReader:
         return repository if isinstance(repository, str) else None
 
     def delivery_graph(self, parent_number: int) -> DeliveryGraph:
+        return retry_read_operation(
+            lambda: self._delivery_graph_once(parent_number),
+            should_retry=_is_transient_read_error,
+        )
+
+    def _delivery_graph_once(self, parent_number: int) -> DeliveryGraph:
         self.data = self._load()
+        configured_failures = self.data.get("delivery_graph_read_failures")
+        if isinstance(configured_failures, list) and configured_failures:
+            configured_error = configured_failures.pop(0)
+            self._save_reader_data()
+            if not isinstance(configured_error, dict):
+                raise GitHubReadError(
+                    "invalid_fixture",
+                    "delivery_graph_read_failures must contain objects",
+                )
+            raise GitHubReadError(
+                str(configured_error.get("code", "github_read_failed")),
+                str(configured_error.get("message", "GitHub read failed")),
+            )
         configured_error = self.data.get("error")
         if isinstance(configured_error, dict):
             raise GitHubReadError(
@@ -85,6 +105,16 @@ class FixtureGitHubReader:
                 "invalid_fixture", "fixture root must be an object"
             )
         return loaded
+
+    def _save_reader_data(self) -> None:
+        self.path.write_text(json.dumps(self.data), encoding="utf-8")
+
+
+def _is_transient_read_error(error: Exception) -> bool:
+    return isinstance(error, GitHubReadError) and (
+        error.code in {"github_timeout", "github_transient"}
+        or is_transient_message(error.message)
+    )
 
 
 class FixtureGitHubPublisher:

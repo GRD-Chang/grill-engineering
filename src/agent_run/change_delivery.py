@@ -122,7 +122,13 @@ class ChangeDeliveryEngine:
                 if job["phase"] == "candidate":
                     self._review(state, job, checkout)
                 if job["phase"] == "reviewing":
-                    raise ValueError("reviewing Change Job must be completed atomically")
+                    # The reviewer may have been interrupted after its attempt
+                    # was durably announced but before its result was saved.
+                    # Keep that attempt in the timeline, then request a fresh
+                    # independent reviewer on resume.
+                    job["phase"] = "candidate"
+                    self.contract.save(state)
+                    continue
                 if job["phase"] == "accepted":
                     self._publication(state, job, checkout)
                 if job["phase"] == "escalating":
@@ -147,6 +153,18 @@ class ChangeDeliveryEngine:
     def _develop(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
+        pending = job.get("pending_attempt")
+        attempt = (
+            pending
+            if isinstance(pending, int)
+            and pending > int(job.get("modification_attempts", 0))
+            else int(job.get("modification_attempts", 0)) + 1
+        )
+        # Persist the actual Worker attempt before invoking Codex.  This
+        # makes a foreground status query truthful even while Codex is still
+        # running, and leaves an observable recovery boundary on interruption.
+        job["pending_attempt"] = attempt
+        self.contract.save(state)
         result = self.agents.develop(
             self.contract.development_request(state, job, checkout)
         )
@@ -156,7 +174,6 @@ class ChangeDeliveryEngine:
             raise ValueError("Change Job Development Thread is not independent")
         _record_development_thread(job, result.thread_id, result.replaced_thread_id)
         job["development_summary"] = result.summary
-        job["pending_attempt"] = int(job["modification_attempts"]) + 1
         job["phase"] = "committing_candidate"
         self.contract.save(state)
         self._reject_stale(
@@ -275,6 +292,7 @@ class ChangeDeliveryEngine:
     ) -> None:
         attempt = int(job.get("validation_attempts", 0)) + 1
         job["validation_attempts"] = attempt
+        job["phase"] = "reviewing"
         self.contract.save(state)
         validation = (
             checkout.parent / f"validation-{self.contract.label(job)}-{attempt}"

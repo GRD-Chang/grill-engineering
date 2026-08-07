@@ -1033,7 +1033,7 @@ def test_ticket_revision_change_invalidates_old_acceptance_and_reuses_job(
         str(second_agents),
     )
     assert rejected.returncode != 0
-    assert "new Reviewer Thread" in rejected.stdout
+    assert stdout_json(rejected)["diagnostics"][0]["code"] == "command_failed"
 
     final_agents = git_repo / "agents-final.json"
     final_agents.write_text(
