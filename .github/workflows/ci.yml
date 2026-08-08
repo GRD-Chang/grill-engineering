@@ -16,7 +16,8 @@ permissions:
 jobs:
   quality:
     name: quality
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 AppArmor blocks bwrap user namespaces on hosted runners.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
