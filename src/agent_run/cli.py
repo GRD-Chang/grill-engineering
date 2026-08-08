@@ -151,13 +151,59 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed.parent, reuse_existing=not parsed.new_run
             )
         elif parsed.command == "resume":
-            state, resumed = controller.resume(parsed.run_id)
-            publication_retried = False
+            state, resumed = controller.resume(
+                parsed.run_id, resume_human_blocker=True
+            )
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
                 else GhGitHubPublisher(github.repository().name_with_owner, git)
             )
+            agent_fixture = getattr(parsed, "agent_fixture", None)
+            agents = (
+                FixtureAgentBackend(Path(agent_fixture))
+                if agent_fixture
+                else CodexCliBackend()
+            )
+            publication_retried = _has_resumed_agent_phase(state)
+            if publication_retried:
+                if state.get("delivery_type") == "parent_only":
+                    state = ParentDeliveryEngine(
+                        git=git, states=states, github=publisher, agents=agents
+                    ).deliver(parsed.run_id)
+                elif state.get("status") == "active":
+                    state = DeliveryRunEngine(
+                        controller=controller,
+                        tickets=TicketDeliveryEngine(
+                            git=git,
+                            states=states,
+                            github=publisher,
+                            agents=agents,
+                        ),
+                    ).deliver_from_state(parsed.run_id, state)
+                elif state.get("status") == "run_acceptance_pending":
+                    repository = github.repository()
+                    state = RunAcceptanceEngine(
+                        git=git,
+                        states=states,
+                        agents=agents,
+                        default_head_sha=git.resolve_base(
+                            repository.default_branch, repository.default_head_sha
+                        ),
+                        github=publisher,
+                    ).accept(parsed.run_id)
+                elif state.get("status") == "run_publication_pending":
+                    repository = github.repository()
+                    state = RunPublicationEngine(
+                        git=git,
+                        states=states,
+                        agents=agents,
+                        github=publisher,
+                        default_branch=repository.default_branch,
+                        default_head_sha=git.resolve_base(
+                            repository.default_branch, repository.default_head_sha
+                        ),
+                    ).publish(parsed.run_id)
             parent_job = state.get("parent_job")
             run_publication = state.get("run_publication")
             if (
@@ -528,6 +574,25 @@ def _positive_integer(value: str) -> int:
     if number <= 0:
         raise argparse.ArgumentTypeError("Issue 编号必须是正整数")
     return number
+
+
+def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
+    """Whether the explicit resume just re-entered a Human Blocker phase."""
+    for key in ("active_ticket_job", "parent_job"):
+        job = state.get(key)
+        if isinstance(job, dict) and job.get("prior_human_blockers"):
+            return True
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        if acceptance.get("prior_human_blockers"):
+            return True
+        repair = acceptance.get("repair_job")
+        if isinstance(repair, dict) and repair.get("prior_human_blockers"):
+            return True
+    publication = state.get("run_publication")
+    return isinstance(publication, dict) and bool(
+        publication.get("prior_human_blockers")
+    )
 
 
 if __name__ == "__main__":

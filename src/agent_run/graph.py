@@ -306,6 +306,14 @@ def _first_job_in_phase(
     return None
 
 
+def _valid_human_blockers(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(blocker, str) and blocker.strip() for blocker in value)
+    )
+
+
 def _remaining_ticket_reasons(
     tickets: dict[str, Any],
     ticket_jobs: dict[str, dict[str, Any]],
@@ -320,12 +328,18 @@ def _remaining_ticket_reasons(
         if not isinstance(reason, str):
             eligibility = tickets[str(number)]["eligibility"]
             reason = str(eligibility["reason"])
-        remaining.append({"ticket_number": number, "reason": reason})
+        record: dict[str, Any] = {"ticket_number": number, "reason": reason}
+        blockers = job.get("human_blockers") if isinstance(job, dict) else None
+        if _valid_human_blockers(blockers):
+            assert isinstance(blockers, list)
+            record["human_blockers"] = list(blockers)
+        remaining.append(record)
     return remaining
 
 
 def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
     human_reasons = {
+        "agent_requires_human",
         "reviewer_requires_human",
         "modification_budget_exhausted",
         "ticket_pr_closed_unmerged",

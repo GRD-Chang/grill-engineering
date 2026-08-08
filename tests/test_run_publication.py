@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import ReviewResult
+from agent_run.codex import CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
@@ -40,6 +41,44 @@ class PassingRunReviewer:
     def review(self, request: dict[str, Any]) -> ReviewResult:
         del request
         return ReviewResult("run-reviewer", _passing_artifact())
+
+
+class InterruptedRunPublisher(FixtureGitHubPublisher):
+    def ensure_run_pr(
+        self, *, branch: str, base_branch: str, title: str, body: str
+    ) -> int:
+        del branch, base_branch, title, body
+        raise OSError("simulated Publisher interruption")
+
+
+class HumanThenRunPublicationAgents:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return {
+                "human_blockers": [
+                    "GitHub denied access; tried gh issue view; grant Issue read access."
+                ],
+                "_thread_id": "blocked-publication-thread",
+            }
+        assert request["thread_id"] == "blocked-publication-thread"
+        assert request["prior_human_blockers"] == [
+            "GitHub denied access; tried gh issue view; grant Issue read access."
+        ]
+        return {
+            "commit_message": "feat(run): publish the completed delivery",
+            "pr_title": "feat(run): publish the completed delivery",
+            "pr_body_markdown": (
+                "## What Problem This Solves\n\nThe accepted Run needs publication.\n\n"
+                "## Why This Change Was Made\n\nAccess has been restored.\n\n"
+                "## User Impact\n\nMaintainers can approve the Run.\n\n"
+                "## Evidence\n\nThe original thread rechecked GitHub."
+            ),
+            "_thread_id": "blocked-publication-thread",
+        }
 
 
 def _accepted_run(git_repo: Path) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
@@ -125,6 +164,63 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert merged["integrated_tree"] == final["record"]["expected_merge_tree"]
     assert 1 in publisher.data["delivery"]["closed_issues"]
     assert publisher.data["parent"]["state"] == "CLOSED"
+
+
+def test_final_publication_human_resume_clears_current_blocker(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    agents = HumanThenRunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    blocked = engine.publish(str(state["run_id"]))
+    assert blocked["status"] == "ready_for_human"
+    assert publisher.data["delivery"]["pull_requests"] == []
+    history = stdout_json(
+        run_cli(
+            git_repo,
+            git_repo / "github.json",
+            "history",
+            str(state["run_id"]),
+            "--json",
+        )
+    )
+    assert any(
+        event.get("worker") == "运行发布工作代理"
+        and event.get("thread_id") == "blocked-publication-thread"
+        and event.get("human_blockers")
+        for event in history["timeline"]
+    )
+
+    resumed, _ = Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).resume(str(state["run_id"]), resume_human_blocker=True)
+    assert resumed["run_publication"]["prior_human_blockers"] == [
+        "GitHub denied access; tried gh issue view; grant Issue read access."
+    ]
+
+    published = engine.publish(str(state["run_id"]))
+
+    assert published["status"] == "run_approval_pending"
+    publication = published["run_publication"]
+    assert publication["thread_id"] == "blocked-publication-thread"
+    assert publication["human_blocker_history"] == [
+        {
+            "phase": "pending",
+            "human_blockers": [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ],
+        }
+    ]
+    for key in ("human_blockers", "human_blocker_phase", "prior_human_blockers"):
+        assert key not in publication
 
 
 def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
@@ -381,7 +477,7 @@ def test_pending_check_that_later_fails_enters_shared_run_repair(
     assert repaired["run_acceptance"]["repair_request"]["repair_source"] == "required_checks"
 
 
-def test_retries_a_worker_interrupted_before_publication_artifact(
+def test_worker_failure_before_publication_artifact_is_not_retried(
     git_repo: Path,
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -394,7 +490,7 @@ def test_retries_a_worker_interrupted_before_publication_artifact(
         def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
             del request
             self.attempts += 1
-            raise OSError("simulated publication interruption")
+            raise CodexProcessError("simulated publication worker crash")
 
     agents = InterruptedPublication()
     engine = RunPublicationEngine(
@@ -405,13 +501,15 @@ def test_retries_a_worker_interrupted_before_publication_artifact(
         default_branch="main",
         default_head_sha=git.resolve("main"),
     )
-    pending = engine.publish(str(state["run_id"]))
+    with pytest.raises(CodexProcessError, match="publication worker crash"):
+        engine.publish(str(state["run_id"]))
 
-    assert pending["status"] == "publication_pending"
-    assert pending["run_publication"]["phase"] == "publication_pending"
-    assert pending["run_publication"]["publication_attempts"] == 5
-    assert agents.attempts == 5
-    assert pending["run_acceptance"]["phase"] == "accepted"
+    interrupted = states.load_run(str(state["run_id"]))
+    assert interrupted is not None
+    assert interrupted["run_publication"]["phase"] == "publishing"
+    assert interrupted["run_publication"]["publication_attempts"] == 1
+    assert agents.attempts == 1
+    assert interrupted["run_acceptance"]["phase"] == "accepted"
 
     retried = RunPublicationEngine(
         git=git,
@@ -422,23 +520,81 @@ def test_retries_a_worker_interrupted_before_publication_artifact(
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
     assert retried["status"] == "run_approval_pending"
-    assert retried["run_publication"]["publication_attempts"] == 1
+    assert retried["run_publication"]["publication_attempts"] == 2
     assert retried["run_acceptance"]["phase"] == "accepted"
+
+
+def test_malformed_final_run_publication_is_not_retried(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+
+    class MalformedRunPublication:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
+            del request
+            self.attempts += 1
+            return {"invalid": "publication"}
+
+    agents = MalformedRunPublication()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    with pytest.raises(ValueError, match="commit_message"):
+        engine.publish(str(state["run_id"]))
+
+    assert agents.attempts == 1
+    interrupted = states.load_run(str(state["run_id"]))
+    assert interrupted is not None
+    assert interrupted["run_publication"]["phase"] == "publishing"
+    assert interrupted["run_publication"]["publication_attempts"] == 1
+
+
+def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
+    git_repo: Path,
+) -> None:
+    state, states, _git, _publisher = _accepted_run(git_repo)
+    agents = git_repo / "malformed-run-publication.json"
+    agents.write_text(
+        json.dumps({"run_publications": [{"invalid": "publication"}]}),
+        encoding="utf-8",
+    )
+
+    failed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "publish-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["status"] == "execution_failed"
+    assert persisted["terminal_kind"] == "execution_failed"
+    assert persisted["run_publication"]["phase"] == "publishing"
+    assert persisted["run_publication"]["publication_attempts"] == 1
 
 
 def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
-    class InterruptedPublication(RunPublicationAgents):
-        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
-            del request
-            raise OSError("simulated publication interruption")
-
     pending = RunPublicationEngine(
         git=git,
         states=states,
-        agents=InterruptedPublication(),
-        github=publisher,
+        agents=RunPublicationAgents(),
+        github=InterruptedRunPublisher(git_repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
@@ -471,16 +627,11 @@ def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> 
 def test_recovered_publication_replaces_the_pending_terminal_kind(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
-    class InterruptedPublication(RunPublicationAgents):
-        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
-            del request
-            raise OSError("simulated publication interruption")
-
     pending = RunPublicationEngine(
         git=git,
         states=states,
-        agents=InterruptedPublication(),
-        github=publisher,
+        agents=RunPublicationAgents(),
+        github=InterruptedRunPublisher(git_repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
@@ -514,7 +665,7 @@ def test_final_run_publication_receives_only_role_required_facts(git_repo: Path)
     ).publish(str(state["run_id"]))
 
     request = agents.requests[0]
-    assert set(request) == {"base_sha", "checkout", "parent_issue_url", "run_head_sha"}
+    assert set(request) == {"acceptance_artifact", "checkout", "parent_issue_url"}
     assert request["parent_issue_url"].endswith("/issues/1")
 
 

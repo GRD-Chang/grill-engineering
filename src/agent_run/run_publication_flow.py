@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.artifacts import PublicationArtifact
+from agent_run.artifacts import (
+    PublicationArtifact,
+    append_human_blocker_history,
+    clear_current_human_blocker,
+    parse_human_blockers,
+)
 from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError
@@ -45,12 +50,9 @@ class RunPublicationFlow(RunPublicationShared):
                 publication["phase"] = "publishing"
                 publication.pop("artifact", None)
                 self._save(state)
-                try:
-                    artifact = self._create_publication_artifact(state, publication)
-                except Exception as error:
-                    if self._publication_failed(state, publication, error):
-                        return state
-                    continue
+                artifact = self._create_publication_artifact(state, publication)
+                if artifact is None:
+                    return self._save(state)
                 self._save(state)
                 publication["artifact"] = {
                     "commit_message": artifact.commit_message,
@@ -93,7 +95,7 @@ class RunPublicationFlow(RunPublicationShared):
 
     def _create_publication_artifact(
         self, state: dict[str, Any], publication: dict[str, Any]
-    ) -> PublicationArtifact:
+    ) -> PublicationArtifact | None:
         checkout = self._publication_checkout(state)
         try:
             self.git.prepare_validation_checkout(
@@ -103,10 +105,35 @@ class RunPublicationFlow(RunPublicationShared):
             thread_id = raw.pop("_thread_id", None)
             if isinstance(thread_id, str):
                 publication["thread_id"] = thread_id
-            return PublicationArtifact.parse(
+            blockers = parse_human_blockers(raw)
+            if blockers is not None:
+                append_human_blocker_history(
+                    publication, phase="pending", blockers=blockers
+                )
+                publication.update(
+                    {
+                        "phase": "ready_for_human",
+                        "human_blockers": list(blockers),
+                        "human_blocker_phase": "pending",
+                    }
+                )
+                state.update(
+                    {
+                        "status": "ready_for_human",
+                        "terminal_kind": "waiting_human",
+                        "diagnostics": [
+                            {"code": "agent_requires_human", "message": blocker}
+                            for blocker in blockers
+                        ],
+                    }
+                )
+                return None
+            artifact = PublicationArtifact.parse(
                 raw,
                 delivery_run=str(state["run_id"]),
             )
+            clear_current_human_blocker(publication)
+            return artifact
         finally:
             self.git.remove_worktree(checkout)
             self._remove_empty_directories(checkout)

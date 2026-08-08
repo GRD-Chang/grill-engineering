@@ -5,7 +5,7 @@
 - 从 Parent Issue 启动或恢复 Delivery Run；
 - 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
 - 让持久 Development Thread 实现、修复和生成发布语义；
-- 为每轮候选创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；
+- 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -44,17 +44,22 @@ Required Checks 仍为 pending 时，命令保存 `waiting_checks` 状态并退�
 Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
 原始 CI Evidence 交回同一 Development Thread。
 
-当 `deliver` 返回 `run_acceptance_pending` 后，执行 `accept-run`。它在一次性、可写的
-Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得复用任意 Ticket 的
-Development/Reviewer Thread，必须读取 Parent Spec、最终 Ticket 图、Ticket completion
-evidence、基线到 Run Head 的累计 diff 与预期 merge 结果，并进行实际 E2E、Standards、
-Spec 三条验证 lane。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
+当 `deliver` 返回 `run_acceptance_pending` 后，执行 `accept-run`。正常 Run Acceptance
+Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
+复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
+最终 Ticket 集合和依赖，
+检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条验证 lane；Completion Record、
+Expected Merge Result 与 SHA/Revision 绑定只由 Controller 在验收外层校验，不进入 Codex
+Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
 代码修改形成新的 Run Branch commit、废弃旧验收，再由全新 Reviewer 重新检查完整累计结果。
+仅当 Run Reviewer 报告 Human Blocker 后执行 `resume` 时，Controller 复用刚刚被阻塞的
+Reviewer Thread，但仍创建新的 Validation Checkout，并要求它重新读取权威状态和重新验收。
 无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
 通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。随后执行
-`publish-run`：每次尝试都由新的、只读的 Run Publication Codex 根据 Parent Issue、累计
-diff 与 Fresh Run Acceptance 生成最终 PR 叙事。Publisher 维护同一个 Run Branch → 默认
-分支的最终 PR，并渲染 Parent Issue、Delivery Type 及每张已完成 Ticket 的链接；它将
+`publish-run`：正常 Run Publication Attempt 由新的、只读的 Run Publication Codex 根据
+Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；仅 Human Blocker resume
+复用刚刚被阻塞的 Run Publication Thread，并要求它重新读取权威状态。Publisher 维护同一个
+Run Branch → 默认分支的最终 PR，并渲染 Parent Issue、Delivery Type 及每张已完成 Ticket 的链接；它将
 Parent/Graph revision、Run/default/PR head 与预期 merge tree 写入独立 Publication Record。
 Required Checks 全部通过（或没有配置）后状态才变为
 `run_approval_pending`；即使此时所有自动检查通过，也只有 `approve` 会执行普通 merge
@@ -79,6 +84,12 @@ Ticket 与依赖边；纯执行顺序调整不会改变 Ticket Graph Revision。
 版本后执行 `confirm-structure`；如果确认期间 GitHub 图再次变化，旧确认不会放行新图，
 Run 会继续暂停并生成新的变化摘要。
 
+当前 MVP 已知限制：若 `structure_change_pending` 与先前保存的 Agent Human Blocker 同时
+存在，通用 `resume` 尚未把“恢复外部阻塞”与“确认结构变化”拆成两个独立动作。操作者在该
+状态下只能先使用 `confirm-structure` 明确接受当前提议版本，或使用 `abandon` 停止 Run；
+不要用 `resume` 代替结构确认。该限制留待后续 Scope Change 设计统一处理，本版本不修改其
+状态机。
+
 Parent title/body 变化时，Controller 派发一次性 Codex，把新旧 Parent Spec、
 当前 Ticket Graph 与已完成工作交给它生成 Scope Impact Assessment。非结构性澄清自动
 吸收；改变 Ticket 集合、依赖、整体交付边界或使已完成工作需要返工的变化会进入同一个
@@ -98,7 +109,8 @@ Controller 使用专属 GitHub App 的 ID、installation ID 与私钥，按 work
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
 Publisher GitHub token、SSH agent 和交互式凭据入口，只向 worker 注入该短期只读 token，
 并要求系统安装 `bubblewrap`。Codex 使用 YOLO 模式，可以读写宿主文件系统、联网以及
-使用完整真实的 Git/`gh` CLI。Controller 只向 Brief 提供准确的任务身份和 SHA；
+使用完整真实的 Git/`gh` CLI。Controller 只向 Brief 提供适用的 Parent/Ticket URL 和
+不可重建的原始失败证据；Revision、SHA、Run/Thread/Attempt 等身份只留在确定性账本中。
 Development、Publication 与 Fresh Validation Codex 使用 Git/`gh` 自行读取 diff、
 历史、Issue 和 PR 事实。
 
@@ -142,7 +154,7 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 
 耐久状态位于 `.agent-run/runs/`。稳定 Development Checkout 位于
 `.agent-run/worktrees/`：Required Checks pending 或 Worker/Publisher 普通失败、超时、
-进程异常时保留，以恢复未提交成果；Ticket 完成、明确阻塞终止或操作者显式取消后清理。
+进程异常时保留，以恢复未提交成果；Development/Repair Codex 报告 Human Blocker 时也保留，供同一 Thread 在 `resume` 后重新核验并继续。Ticket 完成、非恢复性的明确终止或操作者显式取消后清理。
 Checkout 尚未准备完成时产生的部分目录也会清理。每轮独立 Validation Checkout 在验收
 结束后完整删除，允许验收期间创建构建、测试和诊断中间产物。Codex 的临时 schema、输出
 文件和空 GitHub 配置目录也会随子进程调用清理。
@@ -154,7 +166,9 @@ revision 的未提交文件或提交。确认期间图再次变化时，待清�
 保留：最新图重新包含它则取消清理，最终确认的图仍不包含它才执行幂等清理。
 
 Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer、PR、merge 与
-blocker 历史；`active_ticket_job` 继续作为当前执行指针。刷新 Ticket Graph 可以把 active
+最近 16 次 blocker 历史；每次 Human Blocker 最多 8 条、每条最多 2000 个字符。成功恢复后
+当前 `human_blockers`、phase 与 resume 输入会清除，timeline 只保留已经发生的历史事件且
+继续受全局容量限制。`active_ticket_job` 继续作为当前执行指针。刷新 Ticket Graph 可以把 active
 切到新的可执行 Ticket，但不会删除同一 Parent Ticket Set 内已经 blocked 或 completed 的
 Job。进程在两张 Ticket 之间退出或失败时，下一次 `deliver` 会从耐久状态与 GitHub live
 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭动作不会重复。没有可执行 Ticket

@@ -233,9 +233,9 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
 @pytest.mark.parametrize(
         ("action", "mismatch_save"),
         [
-            ("publish_branch", 11),
-            ("ensure_ticket_pr", 12),
-            ("required_checks", 12),
+            ("publish_branch", 12),
+            ("ensure_ticket_pr", 13),
+            ("required_checks", 13),
         ],
 )
 def test_aba_revision_after_crash_still_forces_fresh_rebuild(

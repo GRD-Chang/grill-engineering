@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -47,6 +47,21 @@ def _repair_artifact() -> dict[str, object]:
             "required_outcome": "Restore the complete combined flow.",
             "verification": "Run the full accumulated scenario.",
         }
+    ]
+    return artifact
+
+
+def _human_artifact() -> dict[str, object]:
+    artifact = _passing_artifact()
+    checks = artifact["checks"]
+    assert isinstance(checks, dict)
+    checks["e2e"] = {
+        "status": "blocked",
+        "evidence": "GitHub denied access to the Parent Issue.",
+    }
+    artifact["verdict"] = "human"
+    artifact["human_blockers"] = [
+        "GitHub denied access; tried gh issue view; grant Issue read access."
     ]
     return artifact
 
@@ -193,6 +208,136 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
         git.resolve(repair_branch)
 
 
+def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class BlockedRunRepairDevelopment(ScriptedRunAgents):
+        def develop(
+            self, request: dict[str, Any]
+        ) -> DevelopmentResult | HumanBlockerResult:
+            self.development_requests.append(request)
+            return HumanBlockerResult(
+                thread_id="run-repair-development-blocked",
+                human_blockers=(
+                    "GitHub denied access; tried gh issue view; grant Issue read access.",
+                ),
+            )
+
+    blocked = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=BlockedRunRepairDevelopment(),
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+
+    assert blocked["status"] == "ready_for_human"
+    repair = blocked["run_acceptance"]["repair_job"]
+    assert repair["phase"] == "blocked"
+    assert repair["human_blocker_phase"] == "developing"
+    assert repair["development_thread_id"] == "run-repair-development-blocked"
+    assert "candidate_sha" not in repair
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert delivery["pull_requests"] == []
+    status = stdout_json(
+        run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
+    )
+    assert status["status"] == "ready_for_human"
+    assert status["diagnostics"][0]["message"].startswith("GitHub denied access")
+    history = stdout_json(
+        run_cli(git_repo, fixture, "history", str(state["run_id"]), "--json")
+    )
+    assert any(
+        event.get("thread_id") == "run-repair-development-blocked"
+        and event.get("worker") == "开发工作代理"
+        and event.get("human_blockers")
+        for event in history["timeline"]
+    )
+
+
+def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class BlockedRunRepairReviewer(ScriptedRunAgents):
+        def __init__(self) -> None:
+            super().__init__()
+            self._reviews = [_repair_artifact(), _human_artifact()]
+
+    blocked = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=BlockedRunRepairReviewer(),
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+
+    assert blocked["status"] == "ready_for_human"
+    repair = blocked["run_acceptance"]["repair_job"]
+    assert repair["phase"] == "blocked"
+    assert repair["blocked_reason"] == "reviewer_requires_human"
+    assert repair["reviewer_thread_ids"][-1] == "run-reviewer-2"
+    history = stdout_json(
+        run_cli(git_repo, fixture, "history", str(state["run_id"]), "--json")
+    )
+    assert any(
+        event.get("worker") == "独立验收工作代理"
+        and event.get("thread_id") == "run-reviewer-2"
+        and event.get("human_blockers")
+        for event in history["timeline"]
+    )
+
+
+def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class BlockedRunRepairPublication(ScriptedRunAgents):
+        def publication(
+            self, request: dict[str, Any]
+        ) -> HumanBlockerResult:
+            del request
+            return HumanBlockerResult(
+                thread_id="run-repair-publication-blocked",
+                human_blockers=(
+                    "GitHub denied access; tried gh issue view; grant Issue read access.",
+                ),
+            )
+
+    blocked = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=BlockedRunRepairPublication(),
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+
+    assert blocked["status"] == "ready_for_human"
+    repair = blocked["run_acceptance"]["repair_job"]
+    assert repair["phase"] == "blocked"
+    assert repair["human_blocker_phase"] == "accepted"
+    assert repair["publication_thread_id"] == "run-repair-publication-blocked"
+    assert repair["publication_attempts"] == 1
+    assert "publication_sha" not in repair
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ] == []
+    history = stdout_json(
+        run_cli(git_repo, fixture, "history", str(state["run_id"]), "--json")
+    )
+    assert any(
+        event.get("worker") == "发布工作代理"
+        and event.get("attempt") == 1
+        and event.get("thread_id") == "run-repair-publication-blocked"
+        and event.get("human_blockers")
+        for event in history["timeline"]
+    )
+
+
 def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(
     git_repo: Path,
 ) -> None:
@@ -210,6 +355,102 @@ def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(
             agents=ReusedReviewer(),
             github=FixtureGitHubPublisher(git_repo / "github.json", git),
         ).accept(str(state["run_id"]))
+
+
+def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+
+    class HumanThenPassingReviewer:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+            self.checkouts: list[Path] = []
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.requests.append(request)
+            self.checkouts.append(Path(str(request["checkout"])))
+            if len(self.requests) == 1:
+                return ReviewResult("blocked-run-reviewer", _human_artifact())
+            assert request["thread_id"] == "blocked-run-reviewer"
+            assert request["prior_human_blockers"] == [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ]
+            return ReviewResult("blocked-run-reviewer", _passing_artifact())
+
+    agents = HumanThenPassingReviewer()
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    )
+
+    blocked = engine.accept(str(state["run_id"]))
+    assert blocked["status"] == "ready_for_human"
+    assert all(not checkout.exists() for checkout in agents.checkouts)
+
+    resumed, _ = Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).resume(str(state["run_id"]), resume_human_blocker=True)
+    assert resumed["run_acceptance"]["prior_human_blockers"] == [
+        "GitHub denied access; tried gh issue view; grant Issue read access."
+    ]
+
+    accepted = engine.accept(str(state["run_id"]))
+
+    assert accepted["status"] == "run_publication_pending"
+    run = accepted["run_acceptance"]
+    assert run["reviewer_thread_ids"] == ["blocked-run-reviewer"]
+    assert len(set(agents.checkouts)) == 2
+    assert all(not checkout.exists() for checkout in agents.checkouts)
+    assert run["human_blocker_history"] == [
+        {
+            "phase": "pending",
+            "human_blockers": [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ],
+        }
+    ]
+    for key in ("human_blockers", "human_blocker_phase", "prior_human_blockers"):
+        assert key not in run
+
+
+def test_run_acceptance_human_resume_rejects_an_older_reviewer_thread(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+
+    class HumanThenHistoricalReviewer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                return ReviewResult("blocked-latest-reviewer", _human_artifact())
+            return ReviewResult("older-reviewer", _passing_artifact())
+
+    agents = HumanThenHistoricalReviewer()
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    )
+    blocked = engine.accept(str(state["run_id"]))
+    run = blocked["run_acceptance"]
+    run["reviewer_thread_ids"].insert(0, "older-reviewer")
+    states.save_run(str(state["run_id"]), blocked)
+    Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).resume(str(state["run_id"]), resume_human_blocker=True)
+
+    with pytest.raises(
+        ValueError, match="Human Blocker resume requires the latest Reviewer Thread"
+    ):
+        engine.accept(str(state["run_id"]))
 
 
 def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(

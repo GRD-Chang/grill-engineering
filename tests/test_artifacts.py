@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from agent_run.artifacts import AcceptanceArtifact, PublicationArtifact
+from agent_run.agent_schemas import acceptance_schema, human_blocker_schema
+from agent_run.artifacts import (
+    MAX_HUMAN_BLOCKER_HISTORY,
+    MAX_HUMAN_BLOCKER_LENGTH,
+    MAX_HUMAN_BLOCKERS,
+    AcceptanceArtifact,
+    PublicationArtifact,
+    append_human_blocker_history,
+    clear_current_human_blocker,
+    parse_human_blockers,
+)
 
 
 def publication_data() -> dict[str, str]:
@@ -231,3 +241,73 @@ def test_request_changes_rejects_blocked_only_checks() -> None:
 
     with pytest.raises(ValueError, match="failed check"):
         AcceptanceArtifact.parse(data)
+
+
+def test_human_blockers_have_bounded_count_length_and_history() -> None:
+    blockers = ["x" * MAX_HUMAN_BLOCKER_LENGTH] * MAX_HUMAN_BLOCKERS
+    assert parse_human_blockers({"human_blockers": blockers}) == tuple(blockers)
+
+    with pytest.raises(ValueError, match="at most"):
+        parse_human_blockers({"human_blockers": blockers + ["one too many"]})
+    with pytest.raises(ValueError, match="at most"):
+        parse_human_blockers(
+            {"human_blockers": ["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)]}
+        )
+
+    subject: dict[str, object] = {
+        "human_blockers": ["current blocker"],
+        "human_blocker_phase": "developing",
+        "prior_human_blockers": ["current blocker"],
+        "blocked_reason": "agent_requires_human",
+        "human_blocker_history": [
+            {
+                "phase": "legacy",
+                "human_blockers": ["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)],
+            }
+        ],
+    }
+    for attempt in range(MAX_HUMAN_BLOCKER_HISTORY + 3):
+        append_human_blocker_history(
+            subject, phase=f"attempt-{attempt}", blockers=(f"blocker-{attempt}",)
+        )
+
+    history = subject["human_blocker_history"]
+    assert isinstance(history, list)
+    assert len(history) == MAX_HUMAN_BLOCKER_HISTORY
+    assert history[0]["phase"] == "attempt-3"
+    assert history[-1]["phase"] == (
+        f"attempt-{MAX_HUMAN_BLOCKER_HISTORY + 2}"
+    )
+
+    clear_current_human_blocker(subject)
+    assert "human_blocker_history" in subject
+    for key in (
+        "human_blockers",
+        "human_blocker_phase",
+        "prior_human_blockers",
+        "blocked_reason",
+    ):
+        assert key not in subject
+
+
+def test_human_blocker_schemas_reject_whitespace_only_strings() -> None:
+    blocker_item = human_blocker_schema()["properties"]["human_blockers"]["items"]
+    acceptance_item = acceptance_schema()["properties"]["human_blockers"]["items"]
+
+    assert blocker_item["minLength"] == 1
+    assert blocker_item["pattern"] == r"\S"
+    assert acceptance_item["minLength"] == 1
+    assert acceptance_item["pattern"] == r"\S"
+
+
+def test_human_acceptance_preserves_raw_blocker_text_within_limits() -> None:
+    data = passing_acceptance()
+    data["verdict"] = "human"
+    checks = data["checks"]
+    assert isinstance(checks, dict)
+    checks["e2e"] = {"status": "blocked", "evidence": "Permission is missing."}
+    data["human_blockers"] = ["  preserve surrounding spaces  "]
+
+    artifact = AcceptanceArtifact.parse(data)
+
+    assert artifact.human_blockers == ("  preserve surrounding spaces  ",)

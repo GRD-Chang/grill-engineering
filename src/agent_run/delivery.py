@@ -79,7 +79,11 @@ class TicketDeliveryEngine:
                     result = DeliveryCleanupEngine(
                         git=self.git, states=self.states, github=self.github
                     ).complete_ticket(result, job)
-                preserve_checkout = result.get("status") == "waiting_checks"
+                preserve_checkout = result.get("status") == "waiting_checks" or (
+                    job.get("blocked_reason") == "agent_requires_human"
+                    and job.get("human_blocker_phase")
+                    in {"developing", "repairing"}
+                )
                 return result
             except KeyboardInterrupt:
                 # An explicit operator cancellation is a terminal cleanup

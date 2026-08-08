@@ -7,11 +7,18 @@ from typing import Any
 
 import pytest
 
-from agent_run.agents import DevelopmentResult, PublicationResult, ReviewResult
+from agent_run.agents import (
+    DevelopmentResult,
+    HumanBlockerResult,
+    PublicationResult,
+    ReviewResult,
+)
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.parent_delivery_loop import ParentDeliveryLoop
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
@@ -165,6 +172,40 @@ The scripted end-to-end scenario passed.
         return ReviewResult(thread_id=reviewer_id, artifact=artifact)
 
 
+class HumanBlockedDevelopmentAgents(ScriptedAgents):
+    def __init__(self, checkout: Path) -> None:
+        super().__init__(checkout)
+        self.blocked = False
+        self.resumed = False
+
+    def develop(
+        self, request: dict[str, Any]
+    ) -> DevelopmentResult | HumanBlockerResult:
+        self.development_requests.append(request)
+        if not self.blocked:
+            self.blocked = True
+            return HumanBlockerResult(
+                thread_id="blocked-development-thread",
+                human_blockers=(
+                    "GitHub denied access; tried gh issue view; grant Issue read access.",
+                ),
+            )
+        if not self.resumed:
+            assert request["thread_id"] == "blocked-development-thread"
+            assert request["prior_human_blockers"] == [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ]
+            self.resumed = True
+        text = "resumed\n"
+        if request.get("acceptance_artifact"):
+            text += "repair applied\n"
+        (self.checkout / "delivered.txt").write_text(text, encoding="utf-8")
+        return DevelopmentResult(
+            thread_id="blocked-development-thread",
+            summary="Resumed after the human fixed access.",
+        )
+
+
 class ScriptedPublisher:
     def __init__(self, repo: Path) -> None:
         self.repo = repo
@@ -195,6 +236,7 @@ class ScriptedPublisher:
         self.check_position = 0
         self.merged_sha: str | None = None
         self.merged_head: str | None = None
+        self.publication_context_calls: list[int] = []
 
     def ensure_parent_branch(
         self, *, parent_number: int, branch: str, base_branch: str
@@ -240,6 +282,7 @@ class ScriptedPublisher:
 
     def publication_context(self, pr_number: int) -> dict[str, object]:
         assert pr_number == self.pr_number
+        self.publication_context_calls.append(pr_number)
         return {
             "number": pr_number,
             "url": f"https://example.invalid/pull/{pr_number}",
@@ -726,6 +769,23 @@ class PassAgents(ScriptedAgents):
         )
 
 
+class HumanThenHistoricalReviewerAgents(PassAgents):
+    def review(self, request: dict[str, Any]) -> ReviewResult:
+        result = super().review(request)
+        if self.review_count == 1:
+            artifact = result.artifact
+            artifact["verdict"] = "human"
+            artifact["checks"]["e2e"] = {
+                "status": "blocked",
+                "evidence": "GitHub access requires a maintainer.",
+            }
+            artifact["human_blockers"] = [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ]
+            return ReviewResult("blocked-latest-reviewer", artifact)
+        return ReviewResult("older-reviewer", result.artifact)
+
+
 class RevisionAgents(PassAgents):
     def develop(self, request: dict[str, Any]) -> DevelopmentResult:
         result = super().develop(request)
@@ -851,6 +911,25 @@ class CheckReadFailsOncePublisher(ScriptedPublisher):
             self.check_read_failures -= 1
             raise TimeoutError("simulated Required Checks timeout")
         return super().required_checks(pr_number)
+
+
+class PublicationContextFailsUntilResumedPublisher(ScriptedPublisher):
+    def __init__(self, repo: Path) -> None:
+        super().__init__(repo)
+        self.fail_publication_context = True
+
+    def publication_context(self, pr_number: int) -> dict[str, object]:
+        self.publication_context_calls.append(pr_number)
+        if self.fail_publication_context:
+            raise GitHubReadError(
+                "github_timeout", "timed out reading the existing PR context"
+            )
+        return {
+            "number": pr_number,
+            "state": "OPEN",
+            "title": "Existing PR",
+            "body": "Existing body",
+        }
 
 
 class PublicationReplacementAgents(PassAgents):
@@ -1209,6 +1288,44 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
             "next_action": "squash merge into the Run Branch",
         }
     ]
+
+
+def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
+    state, _ = controller.start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = HumanBlockedDevelopmentAgents(checkout)
+    publisher = ScriptedPublisher(git_repo)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    )
+
+    blocked = engine.deliver(str(state["run_id"]))
+
+    assert blocked["status"] == "ready_for_human"
+    job = blocked["active_ticket_job"]
+    assert job["human_blockers"] == [
+        "GitHub denied access; tried gh issue view; grant Issue read access."
+    ]
+    assert job["human_blocker_phase"] == "developing"
+    assert checkout.exists()
+    assert publisher.created_prs == 0
+    assert blocked["diagnostics"][0]["message"] == job["human_blockers"][0]
+
+    resumed, _ = controller.resume(
+        str(state["run_id"]), resume_human_blocker=True
+    )
+    assert resumed["active_ticket_job"]["phase"] == "developing"
+    assert resumed["active_ticket_job"]["prior_human_blockers"] == job["human_blockers"]
+
+    engine.deliver(str(state["run_id"]))
+
+    assert len(agents.development_requests) >= 2
+    assert agents.development_requests[1]["thread_id"] == "blocked-development-thread"
     run_count = subprocess.run(
         ["git", "rev-list", "--count", f"{state['base']['sha']}..{state['run_branch']}"],
         cwd=git_repo,
@@ -1235,6 +1352,53 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         ).read_text(encoding="utf-8")
     )
     assert persisted["status"] == "ticket_completed"
+    completed_job = persisted["ticket_jobs"]["3"]
+    assert completed_job["human_blocker_history"] == [
+        {
+            "phase": "developing",
+            "human_blockers": [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ],
+        }
+    ]
+    for key in ("human_blockers", "human_blocker_phase", "prior_human_blockers"):
+        assert key not in completed_job
+    assert "human_blockers" not in persisted["timeline"][-1]
+
+
+def test_fresh_validation_human_resume_rejects_an_older_reviewer_thread(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = HumanThenHistoricalReviewerAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    )
+
+    blocked = engine.deliver(str(state["run_id"]))
+    assert blocked["status"] == "ready_for_human"
+    job = blocked["active_ticket_job"]
+    assert job["reviewer_thread_ids"] == ["blocked-latest-reviewer"]
+    job["reviewer_thread_ids"].insert(0, "older-reviewer")
+    blocked["ticket_jobs"]["3"] = dict(job)
+    states.save_run(str(state["run_id"]), blocked)
+
+    Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).resume(str(state["run_id"]), resume_human_blocker=True)
+
+    with pytest.raises(
+        ValueError, match="Human Blocker resume requires the latest Reviewer Thread"
+    ):
+        engine.deliver(str(state["run_id"]))
 
 
 def test_tenth_changed_attempt_escalates_without_merge_or_close(
@@ -1426,10 +1590,44 @@ def test_failed_required_check_evidence_reaches_development_thread(
         "url": "https://example.invalid/pull/11",
         "title": "feat(delivery): complete one ticket autonomously",
     }
+    assert publisher.publication_context_calls == [11]
     assert publisher.created_prs == 2
     assert len(publisher.pr_bodies) == 2
     assert len(publisher.agent_run_statuses) == 1
     assert publisher.agent_run_statuses[0]["validation_verdict"] == "pass"
+
+
+def test_parent_publication_reads_existing_pr_context_once(git_repo: Path) -> None:
+    publisher = ScriptedPublisher(git_repo)
+    publisher.pr_titles.append("feat(parent): deliver parent scope")
+    loop = ParentDeliveryLoop(
+        git=GitRepository(git_repo),
+        states=StateStore(git_repo / ".agent-run"),
+        github=publisher,
+        agents=ScriptedAgents(git_repo),
+    )
+
+    request = loop._publication_request(
+        {
+            "repository": "example/project",
+            "run_id": "run-1",
+            "parent": {"number": 1},
+            "base": {"branch": "main"},
+        },
+        {
+            "effective_revision": "revision-1",
+            "base_sha": "base-sha",
+            "candidate_sha": "candidate-sha",
+            "development_thread_id": "development-thread",
+            "publication_attempts": 0,
+            "acceptance_artifact": {},
+            "pr_number": 11,
+        },
+        git_repo,
+    )
+
+    assert request["existing_pr"]["number"] == 11
+    assert publisher.publication_context_calls == [11]
 
 
 def test_fresh_validation_rejects_development_thread_identity(
@@ -2070,7 +2268,7 @@ def test_transient_sync_git_error_remains_recoverable(
     assert publisher.closed_issues == [3]
 
 
-def test_publication_failure_resumes_from_persisted_candidate(
+def test_publication_worker_failure_resumes_from_persisted_candidate(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2087,6 +2285,13 @@ def test_publication_failure_resumes_from_persisted_candidate(
         agents=agents,
     )
 
+    with pytest.raises(ValueError, match="simulated Publication timeout"):
+        engine.deliver(state["run_id"])
+
+    failed = states.load_run(str(state["run_id"]))
+    assert failed is not None
+    assert failed["active_ticket_job"]["phase"] == "accepted"
+
     completed = engine.deliver(state["run_id"])
 
     assert completed["status"] == "ticket_completed"
@@ -2095,7 +2300,7 @@ def test_publication_failure_resumes_from_persisted_candidate(
     assert len(agents.publication_requests) == 1
 
 
-def test_publication_exhaustion_persists_then_resumes_without_redevelopment(
+def test_publication_worker_failure_is_not_retried_or_marked_pending(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2112,33 +2317,22 @@ def test_publication_exhaustion_persists_then_resumes_without_redevelopment(
         agents=agents,
     )
 
-    pending = engine.deliver(state["run_id"])
+    with pytest.raises(ValueError, match="simulated Publication timeout"):
+        engine.deliver(state["run_id"])
 
-    job = pending["active_ticket_job"]
-    assert pending["status"] == "publication_pending"
-    assert job["phase"] == "publication_pending"
-    assert job["publication_attempts"] == 5
+    failed = states.load_run(str(state["run_id"]))
+    assert failed is not None
+    job = failed["active_ticket_job"]
+    assert job["phase"] == "accepted"
+    assert job["publication_attempts"] == 1
     assert job["modification_attempts"] == 1
     assert job["acceptance_artifact"]["verdict"] == "pass"
     assert agents.development_thread_ids == [None]
     assert agents.review_count == 1
-    assert agents.publication_calls == 5
+    assert agents.publication_calls == 1
     assert [request.get("thread_id") for request in agents.publication_requests] == [
-        "development-thread-1",
-        "development-thread-1",
-        "development-thread-1",
-        "development-thread-1",
-        None,
+        "development-thread-1"
     ]
-
-    agents.fail = False
-    completed = engine.deliver(state["run_id"])
-
-    assert completed["status"] == "ticket_completed"
-    assert completed["active_ticket_job"]["modification_attempts"] == 1
-    assert agents.development_thread_ids == [None]
-    assert agents.review_count == 1
-    assert agents.publication_calls == 6
 
 
 def test_required_checks_timeout_waits_without_starting_a_repair(
@@ -2178,7 +2372,7 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
     assert agents.review_count == 1
 
 
-def test_publication_pending_base_drift_rebuilds_before_republishing(
+def test_publication_worker_failure_rechecks_base_before_resume(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2195,8 +2389,11 @@ def test_publication_pending_base_drift_rebuilds_before_republishing(
         agents=agents,
     )
 
-    pending = engine.deliver(state["run_id"])
-    old_candidate = str(pending["active_ticket_job"]["candidate_sha"])
+    with pytest.raises(ValueError, match="simulated Publication timeout"):
+        engine.deliver(state["run_id"])
+    failed = states.load_run(str(state["run_id"]))
+    assert failed is not None
+    old_candidate = str(failed["active_ticket_job"]["candidate_sha"])
     new_base = _advance_branch_with_same_tree(
         git_repo, str(state["run_branch"])
     )
@@ -2214,7 +2411,7 @@ def test_publication_pending_base_drift_rebuilds_before_republishing(
     assert agents.review_count == 2
 
 
-def test_publication_retry_rechecks_base_before_each_attempt(
+def test_publication_resume_rechecks_base_before_next_attempt(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2226,12 +2423,16 @@ def test_publication_retry_rechecks_base_before_each_attempt(
     agents = PublicationDriftsBaseThenSucceedsAgents(
         checkout, git_repo, str(state["run_branch"])
     )
-    result = TicketDeliveryEngine(
+    engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
         states=states,
         github=ScriptedPublisher(git_repo),
         agents=agents,
-    ).deliver(state["run_id"])
+    )
+
+    with pytest.raises(ValueError, match="simulated Publication timeout"):
+        engine.deliver(state["run_id"])
+    result = engine.deliver(state["run_id"])
 
     job = result["active_ticket_job"]
     assert result["status"] == "ticket_completed"
@@ -2280,8 +2481,8 @@ def test_existing_pr_recovers_after_publication_pending_base_drift(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    agents = RepairPublicationFailsUntilResumedAgents(checkout)
-    publisher = ScriptedPublisher(git_repo)
+    agents = CheckRepairAgents(checkout)
+    publisher = PublicationContextFailsUntilResumedPublisher(git_repo)
     publisher.checks = ["fail", "pass"]
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
@@ -2298,7 +2499,7 @@ def test_existing_pr_recovers_after_publication_pending_base_drift(
     assert pending_job["pr_number"] == publisher.pr_number
     assert publisher.live_head == old_published_sha
     _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
-    agents.fail_repair_publication = False
+    publisher.fail_publication_context = False
 
     completed = engine.deliver(state["run_id"])
 
@@ -2324,10 +2525,13 @@ def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(
         agents=agents,
     )
 
-    pending = engine.deliver(state["run_id"])
-
-    assert pending["status"] == "publication_pending"
-    assert pending["active_ticket_job"]["repair_source"] == "acceptance"
+    with pytest.raises(
+        ValueError, match="simulated acceptance repair Publication timeout"
+    ):
+        engine.deliver(state["run_id"])
+    failed = states.load_run(str(state["run_id"]))
+    assert failed is not None
+    assert failed["active_ticket_job"]["repair_source"] == "acceptance"
     _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
     agents.fail_publication = False
     completed = engine.deliver(state["run_id"])

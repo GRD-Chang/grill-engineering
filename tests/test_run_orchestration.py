@@ -474,7 +474,13 @@ def test_human_blocked_branch_does_not_stop_independent_work(
     assert "4" not in state["ticket_jobs"]
     remaining = state["diagnostics"][0]["remaining_tickets"]
     assert remaining == [
-        {"ticket_number": 2, "reason": "reviewer_requires_human"},
+        {
+            "ticket_number": 2,
+            "reason": "reviewer_requires_human",
+            "human_blockers": [
+                "A product decision is absent from authoritative inputs."
+            ],
+        },
         {"ticket_number": 4, "reason": "blocked_by_open_issues"},
     ]
 

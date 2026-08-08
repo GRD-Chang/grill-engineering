@@ -161,6 +161,7 @@ def _append_timeline_event(
         "phase",
         "pr_number",
         "commit_sha",
+        "human_blockers",
         "result",
     ):
         value = marker.get(key)
@@ -174,38 +175,50 @@ def _append_timeline_event(
 def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
     status = str(state.get("status", "unknown"))
     publication = state.get("run_publication")
-    if status in {
+    if (
+        status in {
         "run_publication_pending",
         "waiting_checks",
         "run_approval_pending",
         "parent_closeout_pending",
         "completed",
         "abandoned",
-    } and isinstance(publication, dict):
+        }
+        or (
+            status == "ready_for_human"
+            and isinstance(publication, dict)
+            and publication.get("phase") == "ready_for_human"
+        )
+    ) and isinstance(publication, dict):
         phase = str(publication.get("phase", "pending"))
-        return {
+        role = _worker_role(publication, phase)
+        return _with_human_blockers({
             "kind": "run_publication",
             "status": status,
-            "worker": "运行发布工作代理" if phase == "publishing" else None,
-            "attempt": publication.get("publication_attempts"),
-            "thread_id": publication.get("thread_id"),
+            "worker": _worker_name(role, run=True),
+            "attempt": _worker_attempt(publication, role),
+            "thread_id": _thread_id_for_role(publication, role),
             "phase": phase,
             "pr_number": publication.get("pr_number"),
             "commit_sha": publication.get("integrated_sha"),
-        }
+        }, publication)
     run_acceptance = state.get("run_acceptance")
     if status in {"run_acceptance_pending", "ready_for_human"} and isinstance(
         run_acceptance, dict
     ):
         phase = str(run_acceptance.get("phase", "pending"))
-        return {
+        repair = run_acceptance.get("repair_job")
+        subject = repair if isinstance(repair, dict) else run_acceptance
+        subject_phase = str(subject.get("phase", phase))
+        role = _worker_role(subject, subject_phase)
+        return _with_human_blockers({
             "kind": "run_acceptance",
             "status": status,
-            "worker": "运行验收工作代理" if phase == "reviewing" else None,
-            "attempt": run_acceptance.get("validation_attempts"),
-            "thread_id": _latest_thread_id(run_acceptance, reviewing=phase == "reviewing"),
-            "phase": phase,
-        }
+            "worker": _worker_name(role, run=not isinstance(repair, dict)),
+            "attempt": _worker_attempt(subject, role),
+            "thread_id": _thread_id_for_role(subject, role),
+            "phase": subject_phase,
+        }, subject)
     active = state.get("active_ticket_job")
     if isinstance(active, dict):
         return _job_timeline_marker(active, status)
@@ -217,59 +230,110 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
 
 def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
     phase = str(job.get("phase", "pending"))
-    if phase in {"developing", "repairing", "committing_candidate"}:
-        worker = "开发工作代理"
-        attempt = job.get("pending_attempt", job.get("modification_attempts"))
-    elif phase in {"reviewing", "validating"}:
-        worker = "独立验收工作代理"
-        attempt = job.get("validation_attempts")
-    elif phase in {"publishing", "publication_pending"}:
-        worker = "发布工作代理"
-        attempt = job.get("publication_attempts")
-    else:
-        worker = None
-        attempt = None
+    role = _worker_role(job, phase)
     ticket = job.get("ticket_number")
-    return {
+    return _with_human_blockers({
         "kind": "ticket_phase" if isinstance(ticket, int) else "parent_phase",
         "status": status,
         "ticket": ticket if isinstance(ticket, int) else None,
-        "worker": worker,
-        "attempt": attempt if isinstance(attempt, int) else None,
-        "thread_id": _latest_thread_id(
+        "worker": _worker_name(role),
+        "attempt": _worker_attempt(job, role),
+        "thread_id": _thread_id_for_role(
             job,
-            reviewing=phase in {"reviewing", "validating"},
-            developing=phase in {"developing", "repairing"},
+            role,
+            hide_pending_development=phase in {"developing", "repairing"},
         ),
         "phase": phase,
         "pr_number": job.get("pr_number"),
         "commit_sha": job.get("integrated_sha")
         or job.get("publication_sha")
         or job.get("candidate_sha"),
-    }
+    }, job)
 
 
-def _latest_thread_id(
-    job: dict[str, Any], *, reviewing: bool = False, developing: bool = False
-) -> object:
-    if developing and isinstance(job.get("pending_attempt"), int):
+def _with_human_blockers(
+    marker: dict[str, object], subject: dict[str, Any]
+) -> dict[str, object]:
+    blockers = subject.get("human_blockers")
+    if isinstance(blockers, list) and all(isinstance(item, str) for item in blockers):
+        marker["human_blockers"] = list(blockers)
+    return marker
+
+
+def _worker_role(subject: dict[str, Any], phase: str) -> str | None:
+    blocked_reason = subject.get("blocked_reason")
+    if blocked_reason == "reviewer_requires_human":
+        return "reviewer"
+    if phase in {"reviewing", "validating"}:
+        return "reviewer"
+    if phase in {"developing", "repairing", "committing_candidate"}:
+        return "development"
+    if phase in {"publishing", "publication_pending"}:
+        return "publication"
+    if phase not in {"blocked", "ready_for_human"}:
         return None
-    if not reviewing:
-        publication_thread_id = job.get("publication_thread_id")
-        if isinstance(publication_thread_id, str):
-            return publication_thread_id
-    reviewer_ids = job.get("reviewer_thread_ids")
-    if reviewing and isinstance(reviewer_ids, list) and reviewer_ids:
-        latest = reviewer_ids[-1]
-        if isinstance(latest, str):
-            return latest
-    thread_id = job.get("development_thread_id")
-    if isinstance(thread_id, str):
-        return thread_id
+    blocked_phase = str(subject.get("human_blocker_phase", ""))
+    if blocked_phase in {"developing", "repairing"}:
+        return "development"
+    if blocked_phase in {"candidate", "reviewing", "validating"}:
+        return "reviewer"
+    if blocked_phase in {"accepted", "publishing", "pending"}:
+        return "publication"
+    return None
+
+
+def _worker_name(role: str | None, *, run: bool = False) -> str | None:
+    if role == "development":
+        return "开发工作代理"
+    if role == "reviewer":
+        return "运行验收工作代理" if run else "独立验收工作代理"
+    if role == "publication":
+        return "运行发布工作代理" if run else "发布工作代理"
+    return None
+
+
+def _worker_attempt(subject: dict[str, Any], role: str | None) -> int | None:
+    if role == "development":
+        value = subject.get("pending_attempt", subject.get("modification_attempts"))
+    elif role == "reviewer":
+        value = subject.get("validation_attempts")
+    elif role == "publication":
+        value = subject.get("publication_attempts")
+    else:
+        return None
+    return value if isinstance(value, int) else None
+
+
+def _thread_id_for_role(
+    subject: dict[str, Any],
+    role: str | None,
+    *,
+    hide_pending_development: bool = False,
+) -> object:
+    reviewer_ids = subject.get("reviewer_thread_ids")
+    if role == "reviewer":
+        if isinstance(reviewer_ids, list) and reviewer_ids:
+            latest = reviewer_ids[-1]
+            return latest if isinstance(latest, str) else None
+        return None
+    if role == "development":
+        if hide_pending_development and isinstance(subject.get("pending_attempt"), int):
+            return None
+        thread_id = subject.get("development_thread_id")
+        return thread_id if isinstance(thread_id, str) else None
+    if role == "publication":
+        for key in ("publication_thread_id", "thread_id"):
+            thread_id = subject.get(key)
+            if isinstance(thread_id, str):
+                return thread_id
+        return None
+    for key in ("publication_thread_id", "thread_id", "development_thread_id"):
+        thread_id = subject.get(key)
+        if isinstance(thread_id, str):
+            return thread_id
     if isinstance(reviewer_ids, list) and reviewer_ids:
         latest = reviewer_ids[-1]
-        if isinstance(latest, str):
-            return latest
+        return latest if isinstance(latest, str) else None
     return None
 
 

@@ -23,6 +23,10 @@ _REQUIRED_SECTIONS = (
     "Evidence",
 )
 
+MAX_HUMAN_BLOCKERS = 8
+MAX_HUMAN_BLOCKER_LENGTH = 2_000
+MAX_HUMAN_BLOCKER_HISTORY = 16
+
 
 @dataclass(frozen=True)
 class PublicationArtifact:
@@ -149,6 +153,47 @@ class AcceptanceArtifact:
         )
 
 
+def parse_human_blockers(value: object) -> tuple[str, ...] | None:
+    """Return the exact minimal Human Blocker alternative, if supplied."""
+    if not isinstance(value, dict):
+        return None
+    if "human_blockers" not in value:
+        return None
+    if set(value) != {"human_blockers"}:
+        raise ValueError("human blocker output contains unexpected fields")
+    blockers = _bounded_blocker_list(value.get("human_blockers"))
+    if not blockers:
+        raise ValueError("human_blockers must contain non-empty strings")
+    return tuple(blockers)
+
+
+def append_human_blocker_history(
+    subject: dict[str, Any], *, phase: str, blockers: tuple[str, ...]
+) -> None:
+    """Keep only the recent raw blocker attempts needed for operator history."""
+    history = subject.setdefault("human_blocker_history", [])
+    if not isinstance(history, list):
+        raise ValueError("human_blocker_history must be a list")
+    history[:] = _valid_human_blocker_history(history)
+    current = _bounded_blocker_list(list(blockers))
+    if not current:
+        raise ValueError("human_blockers must contain non-empty strings")
+    history.append({"phase": phase, "human_blockers": current})
+    if len(history) > MAX_HUMAN_BLOCKER_HISTORY:
+        del history[:-MAX_HUMAN_BLOCKER_HISTORY]
+
+
+def clear_current_human_blocker(subject: dict[str, Any]) -> None:
+    """Clear the resolved alert while retaining bounded historical attempts."""
+    for key in ("human_blockers", "human_blocker_phase", "prior_human_blockers"):
+        subject.pop(key, None)
+    if subject.get("blocked_reason") in {
+        "agent_requires_human",
+        "reviewer_requires_human",
+    }:
+        subject.pop("blocked_reason", None)
+
+
 def _require_nonempty_section(body: str, title: str) -> None:
     pattern = re.compile(
         rf"(?ms)^## {re.escape(title)}\s*\n+(.+?)(?=^## |\Z)"
@@ -205,8 +250,42 @@ def _mapping_list(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
 
 def _string_list(data: dict[str, Any], key: str) -> list[str]:
     value = data.get(key)
+    if key == "human_blockers":
+        return _bounded_blocker_list(value)
     if not isinstance(value, list) or not all(
         isinstance(item, str) and item.strip() for item in value
     ):
         raise ValueError(f"{key} must contain non-empty strings")
     return [item.strip() for item in value]
+
+
+def _bounded_blocker_list(value: object) -> list[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError("human_blockers must contain non-empty strings")
+    if len(value) > MAX_HUMAN_BLOCKERS:
+        raise ValueError(f"human_blockers must contain at most {MAX_HUMAN_BLOCKERS} items")
+    if any(len(item) > MAX_HUMAN_BLOCKER_LENGTH for item in value):
+        raise ValueError(
+            "each human blocker must contain at most "
+            f"{MAX_HUMAN_BLOCKER_LENGTH} characters"
+        )
+    return list(value)
+
+
+def _valid_human_blocker_history(value: list[object]) -> list[dict[str, object]]:
+    valid: list[dict[str, object]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        phase = entry.get("phase")
+        if not isinstance(phase, str) or not phase:
+            continue
+        try:
+            blockers = _bounded_blocker_list(entry.get("human_blockers"))
+        except ValueError:
+            continue
+        if blockers:
+            valid.append({"phase": phase, "human_blockers": blockers})
+    return valid[-(MAX_HUMAN_BLOCKER_HISTORY - 1) :]

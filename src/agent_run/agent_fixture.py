@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.worker_sandbox import WorkerSandboxError
 
 
@@ -26,7 +26,9 @@ class FixtureAgentBackend:
             "scope_assessments": 0,
         }
 
-    def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+    def develop(
+        self, request: dict[str, Any]
+    ) -> DevelopmentResult | HumanBlockerResult:
         step = self._next("developments")
         expected = step.get("expected_thread_id")
         if expected != request.get("thread_id"):
@@ -91,13 +93,29 @@ class FixtureAgentBackend:
         sandbox_error = step.get("sandbox_error_after_writes")
         if isinstance(sandbox_error, str):
             raise WorkerSandboxError(sandbox_error)
+        blockers = _human_blockers(step)
+        if blockers is not None:
+            return HumanBlockerResult(
+                thread_id=_string(step, "thread_id"),
+                human_blockers=blockers,
+            )
         return DevelopmentResult(
             thread_id=_string(step, "thread_id"),
             summary=_string(step, "summary"),
         )
 
-    def publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._next("publications")
+    def publication(
+        self, request: dict[str, Any]
+    ) -> dict[str, Any] | HumanBlockerResult:
+        del request
+        step = self._next("publications")
+        blockers = _human_blockers(step)
+        if blockers is not None:
+            return HumanBlockerResult(
+                thread_id=_string(step, "thread_id"),
+                human_blockers=blockers,
+            )
+        return step
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         name = (
@@ -172,3 +190,14 @@ def _string(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
     return value
+
+
+def _human_blockers(data: dict[str, Any]) -> tuple[str, ...] | None:
+    value = data.get("human_blockers")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError("human_blockers must contain non-empty strings")
+    return tuple(value)

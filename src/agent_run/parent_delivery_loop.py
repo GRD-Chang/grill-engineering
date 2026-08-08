@@ -8,6 +8,7 @@ from agent_run.change_delivery import (
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryEngine,
     ChangeJobContract,
+    latest_reviewer_thread,
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -110,6 +111,7 @@ class ParentDeliveryLoop:
     def _development_request(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> dict[str, Any]:
         request = {
             "acceptance_scope": "parent_only",
+            "parent_issue_url": self._parent(state)["url"],
             "run_id": state["run_id"],
             "parent": self._parent(state),
             "effective_revision": job["effective_revision"],
@@ -118,6 +120,8 @@ class ParentDeliveryLoop:
             "checkout": str(checkout),
             "thread_id": job.get("development_thread_id"),
         }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
         if job.get("repair_source") == "acceptance":
             request["repair_source"] = "acceptance"
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
@@ -129,6 +133,7 @@ class ParentDeliveryLoop:
     def _publication_request(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> dict[str, Any]:
         request = {
             "acceptance_scope": "parent_only",
+            "parent_issue_url": self._parent(state)["url"],
             "run_id": state["run_id"],
             "parent": self._parent(state),
             "effective_revision": job["effective_revision"],
@@ -136,13 +141,17 @@ class ParentDeliveryLoop:
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
             "thread_id": (
-                job["development_thread_id"]
+                job.get("publication_thread_id")
+                if job.get("prior_human_blockers")
+                else job["development_thread_id"]
                 if int(job.get("publication_attempts", 0))
                 < MAX_PUBLICATION_CONTEXT_ATTEMPTS
                 else None
             ),
             "acceptance_artifact": _mapping(job, "acceptance_artifact"),
         }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
         existing_pr = job.get("pr_number")
         if isinstance(existing_pr, int):
             request["existing_pr"] = self.github.publication_context(existing_pr)
@@ -182,12 +191,21 @@ class ParentDeliveryLoop:
     def _review_request(self, state: dict[str, Any], job: dict[str, Any], checkout: Path) -> dict[str, Any]:
         return {
             "acceptance_scope": "parent_only",
+            "parent_issue_url": self._parent(state)["url"],
             "run_id": state["run_id"],
             "parent": self._parent(state),
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
+            "thread_id": latest_reviewer_thread(job)
+            if job.get("prior_human_blockers")
+            else None,
+            **(
+                {"prior_human_blockers": job["prior_human_blockers"]}
+                if job.get("prior_human_blockers")
+                else {}
+            ),
         }
 
     @staticmethod

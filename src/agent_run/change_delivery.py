@@ -12,8 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_run.agents import AgentBackend, PublicationResult
-from agent_run.artifacts import AcceptanceArtifact, PublicationArtifact
+from agent_run.agents import AgentBackend, HumanBlockerResult, PublicationResult
+from agent_run.artifacts import (
+    AcceptanceArtifact,
+    PublicationArtifact,
+    append_human_blocker_history,
+    clear_current_human_blocker,
+)
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
@@ -168,12 +173,21 @@ class ChangeDeliveryEngine:
         result = self.agents.develop(
             self.contract.development_request(state, job, checkout)
         )
+        if isinstance(result, HumanBlockerResult):
+            if not self.contract.development_thread_is_allowed(state, result.thread_id):
+                raise ValueError("Change Job Development Thread is not independent")
+            _record_development_thread(job, result.thread_id, result.replaced_thread_id)
+            self._wait_for_human(
+                state, job, phase=str(job["phase"]), blockers=result.human_blockers
+            )
+            return
         if not result.thread_id.strip() or not result.summary.strip():
             raise ValueError("Development result is incomplete")
         if not self.contract.development_thread_is_allowed(state, result.thread_id):
             raise ValueError("Change Job Development Thread is not independent")
         _record_development_thread(job, result.thread_id, result.replaced_thread_id)
         job["development_summary"] = result.summary
+        clear_current_human_blocker(job)
         job["phase"] = "committing_candidate"
         self.contract.save(state)
         self._reject_stale(
@@ -213,34 +227,8 @@ class ChangeDeliveryEngine:
                 self.contract.save(state)
                 return
             try:
-                raw = self.agents.publication(
-                    self.contract.publication_request(state, job, checkout)
-                )
-                if isinstance(raw, PublicationResult):
-                    if raw.replaced_thread_id is not None:
-                        if not self.contract.development_thread_is_allowed(
-                            state, raw.thread_id
-                        ):
-                            raise ValueError(
-                                "Change Job Development Thread is not independent"
-                            )
-                        _record_development_thread(
-                            job, raw.thread_id, raw.replaced_thread_id
-                        )
-                    elif raw.thread_id != job.get("development_thread_id"):
-                        job["publication_thread_id"] = raw.thread_id
-                    artifact_data = raw.artifact
-                else:
-                    artifact_data = raw
-                if isinstance(job.get("ticket_number"), int):
-                    publication = PublicationArtifact.parse(
-                        artifact_data, primary_ticket=int(job["ticket_number"])
-                    )
-                else:
-                    publication = PublicationArtifact.parse(
-                        artifact_data, delivery_run=str(job["run_id"])
-                    )
-            except Exception as error:
+                request = self.contract.publication_request(state, job, checkout)
+            except GitHubReadError as error:
                 attempts = int(job.get("publication_attempts", 0)) + 1
                 job["publication_attempts"] = attempts
                 job["last_publication_error"] = str(error)
@@ -257,7 +245,44 @@ class ChangeDeliveryEngine:
                     return
                 self.contract.save(state)
                 continue
+            job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
+            self.contract.save(state)
+            raw = self.agents.publication(request)
+            if isinstance(raw, HumanBlockerResult):
+                job["publication_thread_id"] = raw.thread_id
+                self._wait_for_human(
+                    state,
+                    job,
+                    phase="accepted",
+                    blockers=raw.human_blockers,
+                )
+                return
+            if isinstance(raw, PublicationResult):
+                if raw.replaced_thread_id is not None:
+                    if not self.contract.development_thread_is_allowed(
+                        state, raw.thread_id
+                    ):
+                        raise ValueError(
+                            "Change Job Development Thread is not independent"
+                        )
+                    _record_development_thread(
+                        job, raw.thread_id, raw.replaced_thread_id
+                    )
+                elif raw.thread_id != job.get("development_thread_id"):
+                    job["publication_thread_id"] = raw.thread_id
+                artifact_data = raw.artifact
+            else:
+                artifact_data = raw
+            if isinstance(job.get("ticket_number"), int):
+                publication = PublicationArtifact.parse(
+                    artifact_data, primary_ticket=int(job["ticket_number"])
+                )
+            else:
+                publication = PublicationArtifact.parse(
+                    artifact_data, delivery_run=str(job["run_id"])
+                )
             break
+        clear_current_human_blocker(job)
         if not self._publication_is_current(state, job):
             self.contract.invalidate_stale_publication(state, job, checkout)
             self.contract.save(state)
@@ -275,8 +300,6 @@ class ChangeDeliveryEngine:
                     "pr_title": publication.pr_title,
                     "pr_body_markdown": publication.pr_body_markdown,
                 },
-                "publication_attempts": int(job.get("publication_attempts", 0))
-                + 1,
                 "publication_sha": sha,
                 "phase": "publishing",
             }
@@ -321,6 +344,16 @@ class ChangeDeliveryEngine:
         # already exists, update that PR's one status comment immediately so
         # it cannot keep advertising an obsolete passing Candidate.
         existing_pr = job.get("pr_number")
+        if artifact.verdict == "human":
+            self._wait_for_human(
+                state,
+                job,
+                phase="candidate",
+                blockers=artifact.human_blockers,
+                code="reviewer_requires_human",
+            )
+            return
+        clear_current_human_blocker(job)
         if isinstance(existing_pr, int):
             self._record_agent_run_status(
                 existing_pr,
@@ -336,10 +369,7 @@ class ChangeDeliveryEngine:
             )
         if artifact.verdict == "pass":
             job["phase"] = "accepted"
-        elif (
-            artifact.verdict == "human"
-            or int(job["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS
-        ):
+        elif int(job["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS:
             job["phase"] = "escalating"
             job["escalation_code"] = (
                 "reviewer_requires_human"
@@ -349,6 +379,39 @@ class ChangeDeliveryEngine:
         else:
             job["repair_source"] = "acceptance"
             job["phase"] = "repairing"
+        self.contract.save(state)
+
+    def _wait_for_human(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        *,
+        phase: str,
+        blockers: tuple[str, ...],
+        code: str = "agent_requires_human",
+    ) -> None:
+        append_human_blocker_history(job, phase=phase, blockers=blockers)
+        job.update(
+            {
+                "human_blockers": list(blockers),
+                "human_blocker_phase": phase,
+                "phase": "blocked",
+                "blocked_reason": code,
+            }
+        )
+        state.update(
+            {
+                "status": "ready_for_human",
+                "terminal_kind": "waiting_human",
+                "diagnostics": [
+                    {
+                        "code": code,
+                        "message": blocker,
+                    }
+                    for blocker in blockers
+                ],
+            }
+        )
         self.contract.save(state)
 
     def _publish_and_merge(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
@@ -646,10 +709,24 @@ def _record_reviewer(job: dict[str, Any], thread_id: str) -> None:
     reviewers = _string_list(job, "reviewer_thread_ids")
     if thread_id in development_ids:
         raise ValueError("Fresh Acceptance cannot reuse the Development Thread")
-    if not thread_id.strip() or thread_id in reviewers:
+    resumed = bool(job.get("prior_human_blockers"))
+    if resumed and thread_id != latest_reviewer_thread(job):
+        raise ValueError(
+            "Human Blocker resume requires the latest Reviewer Thread"
+        )
+    if not thread_id.strip() or (thread_id in reviewers and not resumed):
         raise ValueError("Fresh Acceptance requires a new Reviewer Thread")
-    reviewers.append(thread_id)
+    if thread_id not in reviewers:
+        reviewers.append(thread_id)
     job["reviewer_thread_ids"] = reviewers
+
+
+def latest_reviewer_thread(subject: dict[str, Any]) -> str | None:
+    """Return the only Reviewer Thread eligible for Human Blocker resume."""
+    threads = subject.get("reviewer_thread_ids")
+    if isinstance(threads, list) and threads and isinstance(threads[-1], str):
+        return threads[-1]
+    return None
 
 
 def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:

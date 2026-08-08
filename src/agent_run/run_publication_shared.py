@@ -105,14 +105,19 @@ class RunPublicationShared:
 
     def _publication_request(self, state: dict[str, Any], checkout: Path) -> dict[str, Any]:
         parent = self._mapping(state, "parent")
-        return {
+        publication = self._publication_state(state)
+        run = self._mapping(state, "run_acceptance")
+        request: dict[str, Any] = {
             "parent_issue_url": (
                 f"https://github.com/{state['repository']}/issues/{int(parent['number'])}"
             ),
-            "run_head_sha": self.git.resolve(str(state["run_branch"])),
-            "base_sha": self.default_head_sha,
             "checkout": str(checkout),
+            "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
         }
+        if publication.get("prior_human_blockers"):
+            request["prior_human_blockers"] = publication["prior_human_blockers"]
+            request["thread_id"] = publication.get("thread_id")
+        return request
 
     def _render_final_run_pr_body(self, state: dict[str, Any], narrative: str) -> str:
         parent = self._mapping(state, "parent")

@@ -183,10 +183,10 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
 
 def test_publication_prompts_require_semantic_titles() -> None:
     ticket_prompt = CodexCliBackend._publication_prompt(
-        {"acceptance_scope": "ticket"}
+        {"acceptance_scope": "ticket", "acceptance_artifact": {}}
     )
     run_prompt = CodexCliBackend._publication_prompt(
-        {"acceptance_scope": "run", "run_id": "run-1"}
+        {"acceptance_scope": "run", "acceptance_artifact": {}}
     )
 
     assert "Conventional Commit 语义标题格式" in ticket_prompt
@@ -231,12 +231,14 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "base_sha": "base-sha",
             "run_head_sha": "run-head-sha",
+            "acceptance_artifact": {"verdict": "pass"},
         }
     )
 
-    assert "Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入" in prompts[0]
+    assert "parent_issue_url" in prompts[0]
     assert "https://github.com/example/project/issues/1" in prompts[0]
-    assert "base_sha..run_head_sha" in prompts[0]
+    assert "base-sha" not in prompts[0]
+    assert "run-head-sha" not in prompts[0]
     assert "一次性的" not in prompts[0]
     assert "Codex" not in prompts[0]
     assert "Worker" not in prompts[0]
@@ -332,6 +334,134 @@ def test_development_prompt_matches_normal_and_repair_contracts(
         )
 
 
+def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None:
+    artifact = {
+        "verdict": "request_changes",
+        "checks": {"e2e": {"status": "fail", "evidence": "original"}},
+    }
+    internal = {
+        "checkout": "/private/checkout",
+        "thread_id": "private-thread",
+        "run_id": "private-run",
+        "base_sha": "private-base-sha",
+        "candidate_sha": "private-candidate-sha",
+        "ticket_graph": {"private": "graph"},
+        "parent": {"body": "private parent body"},
+        "ticket": {"body": "private ticket body"},
+    }
+    request = {
+        **internal,
+        "acceptance_scope": "ticket",
+        "repair_source": "acceptance",
+        "parent_issue_url": "https://github.com/example/project/issues/1",
+        "task_issue_url": "https://github.com/example/project/issues/2",
+        "acceptance_artifact": artifact,
+    }
+
+    development = CodexCliBackend._development_prompt(request)
+    publication = CodexCliBackend._publication_prompt(
+        {
+            **request,
+            "acceptance_artifact": artifact,
+        }
+    )
+    review = CodexCliBackend._review_prompt(request)
+
+    for prompt in (development, publication, review):
+        assert "https://github.com/example/project/issues/1" in prompt
+        assert "private parent body" not in prompt
+        assert "private ticket body" not in prompt
+        assert "private-base-sha" not in prompt
+        assert "private-candidate-sha" not in prompt
+        assert "private-run" not in prompt
+        assert "private-thread" not in prompt
+    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in development
+    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in publication
+
+
+def test_development_human_blocker_is_an_exact_result(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(
+                {
+                    "human_blockers": [
+                        "GitHub denied Issue read; tried gh issue view; grant read access."
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"blocked-thread"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {
+            "checkout": str(tmp_path),
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/2",
+        }
+    )
+
+    from agent_run.agents import HumanBlockerResult
+
+    assert isinstance(result, HumanBlockerResult)
+    assert result.thread_id == "blocked-thread"
+    assert result.human_blockers == (
+        "GitHub denied Issue read; tried gh issue view; grant read access.",
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {
+            "human_blockers": ["Grant Issue read access."],
+            "reason": "GitHub rejected the request.",
+        },
+        {"status": "blocked"},
+        ["Grant Issue read access."],
+    ],
+)
+def test_development_rejects_non_exact_structured_results(
+    tmp_path: Path, monkeypatch: Any, malformed: object
+) -> None:
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(malformed),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"blocked-thread"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+
+    with pytest.raises(CodexProcessError, match="structured result|Human Blocker"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+            {
+                "checkout": str(tmp_path),
+                "parent_issue_url": "https://github.com/example/project/issues/1",
+                "task_issue_url": "https://github.com/example/project/issues/2",
+            }
+        )
+
+
 def test_development_resume_failure_starts_replacement_with_full_context(
     tmp_path: Path,
     monkeypatch: Any,
@@ -370,12 +500,13 @@ def test_development_resume_failure_starts_replacement_with_full_context(
         {
             "checkout": str(checkout),
             "thread_id": "developer-1",
-            "development_summary": "Developer one implemented the first attempt.",
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/3",
             "acceptance_artifact": {
                 "verdict": "request_changes",
                 "findings": [{"id": "F1", "problem": "Repair this."}],
             },
-            "ticket": {"number": 3, "body": "Authoritative requirement."},
+            "repair_source": "acceptance",
         }
     )
 
@@ -385,9 +516,8 @@ def test_development_resume_failure_starts_replacement_with_full_context(
     assert "resume" not in invocations[1][0]
     replacement_prompt = invocations[1][1]
     assert "恢复失败" in replacement_prompt
-    assert "Developer one implemented the first attempt." in replacement_prompt
     assert "Repair this." in replacement_prompt
-    assert "Authoritative requirement." in replacement_prompt
+    assert "https://github.com/example/project/issues/3" in replacement_prompt
 
 
 def test_publication_resume_failure_starts_and_reports_replacement(
@@ -440,9 +570,9 @@ def test_publication_resume_failure_starts_and_reports_replacement(
         {
             "checkout": str(checkout),
             "thread_id": "developer-1",
-            "development_summary": "The candidate is ready.",
-            "candidate_sha": "a" * 40,
-            "ticket": {"number": 3, "body": "Authoritative requirement."},
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/3",
+            "acceptance_artifact": {"verdict": "pass"},
         }
     )
 
@@ -455,7 +585,7 @@ def test_publication_resume_failure_starts_and_reports_replacement(
     assert "resume" in invocations[0][0]
     assert "resume" not in invocations[1][0]
     assert "恢复失败" in invocations[1][1]
-    assert "The candidate is ready." in invocations[1][1]
+    assert "https://github.com/example/project/issues/3" in invocations[1][1]
 
 
 def test_publication_uses_a_read_only_checkout(
@@ -486,7 +616,11 @@ def test_publication_uses_a_read_only_checkout(
 
     monkeypatch.setattr(CodexCliBackend, "_invoke", fake_invoke)
     CodexCliBackend(credential_provider=lambda: "reader-secret").publication(
-        {"checkout": str(checkout), "thread_id": "development-thread"}
+        {
+            "checkout": str(checkout),
+            "thread_id": "development-thread",
+            "acceptance_artifact": {},
+        }
     )
 
     assert len(calls) == 1

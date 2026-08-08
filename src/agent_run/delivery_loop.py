@@ -11,6 +11,7 @@ from agent_run.change_delivery import (
     ChangeDeliveryEngine,
     ChangeJobContract,
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
+    latest_reviewer_thread,
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -232,6 +233,9 @@ class TicketDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
         request = {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": self._parent(state)["url"],
+            "task_issue_url": self._ticket(state, job)["url"],
             "run_id": state["run_id"],
             "parent": self._parent(state),
             "ticket": self._ticket(state, job),
@@ -241,6 +245,8 @@ class TicketDeliveryLoop:
             "checkout": str(checkout),
             "thread_id": job.get("development_thread_id"),
         }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
         if job.get("repair_source") == "acceptance":
@@ -255,6 +261,9 @@ class TicketDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
         request = {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": self._parent(state)["url"],
+            "task_issue_url": self._ticket(state, job)["url"],
             "run_id": state["run_id"],
             "parent": self._parent(state),
             "ticket": self._ticket(state, job),
@@ -263,13 +272,17 @@ class TicketDeliveryLoop:
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
             "thread_id": (
-                job["development_thread_id"]
+                job.get("publication_thread_id")
+                if job.get("prior_human_blockers")
+                else job["development_thread_id"]
                 if int(job.get("publication_attempts", 0))
                 < MAX_PUBLICATION_CONTEXT_ATTEMPTS
                 else None
             ),
             "acceptance_artifact": _mapping(job, "acceptance_artifact"),
         }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
         existing_pr = job.get("pr_number")
@@ -285,6 +298,9 @@ class TicketDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
         return {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": self._parent(state)["url"],
+            "task_issue_url": self._ticket(state, job)["url"],
             "run_id": state["run_id"],
             "parent": self._parent(state),
             "ticket": self._ticket(state, job),
@@ -292,6 +308,14 @@ class TicketDeliveryLoop:
             "candidate_sha": job["candidate_sha"],
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
+            "thread_id": latest_reviewer_thread(job)
+            if job.get("prior_human_blockers")
+            else None,
+            **(
+                {"prior_human_blockers": job["prior_human_blockers"]}
+                if job.get("prior_human_blockers")
+                else {}
+            ),
         }
 
     @staticmethod

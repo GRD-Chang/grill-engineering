@@ -5,8 +5,17 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_run.agents import DevelopmentResult, PublicationResult, ReviewResult
-from agent_run.agent_schemas import acceptance_schema, publication_schema
+from agent_run.agents import (
+    DevelopmentResult,
+    HumanBlockerResult,
+    PublicationResult,
+    ReviewResult,
+)
+from agent_run.agent_schemas import (
+    acceptance_schema,
+    publication_or_human_blocker_schema,
+)
+from agent_run.artifacts import parse_human_blockers
 from agent_run.github_auth import (
     GitHubCredentialError,
     mint_read_only_installation_token,
@@ -38,7 +47,9 @@ class CodexCliBackend:
         self.executable = executable
         self.credential_provider = credential_provider
 
-    def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+    def develop(
+        self, request: dict[str, Any]
+    ) -> DevelopmentResult | HumanBlockerResult:
         checkout = Path(_string(request, "checkout"))
         thread_id = request.get("thread_id")
         prompt = self._development_prompt(request)
@@ -51,7 +62,7 @@ class CodexCliBackend:
                 thread_id=resumed_thread,
             )
         except _CodexThreadResumeError:
-            if resumed_thread is None:
+            if resumed_thread is None or request.get("prior_human_blockers"):
                 raise
             replaced_thread = resumed_thread
             job_name = (
@@ -69,6 +80,13 @@ class CodexCliBackend:
                 ),
                 checkout=checkout,
                 thread_id=None,
+            )
+        blockers = _human_blocker_output(output, "Development result")
+        if blockers is not None:
+            return HumanBlockerResult(
+                thread_id=actual_thread,
+                human_blockers=blockers,
+                replaced_thread_id=replaced_thread,
             )
         return DevelopmentResult(
             thread_id=actual_thread,
@@ -90,7 +108,7 @@ class CodexCliBackend:
                 "可维护的改动满足全部 Acceptance Criteria。"
             )
             heading = "Development Brief"
-            prompt_input = _pretty(request)
+            prompt_input = _pretty(_development_context(request))
         elif repair_source == "acceptance":
             artifact = request.get("acceptance_artifact")
             if not isinstance(artifact, dict):
@@ -110,8 +128,7 @@ class CodexCliBackend:
                 "只修改 finding 及其直接影响范围，不改动已通过且不受影响的行为。"
             )
             heading = "Acceptance Repair Input"
-            context = dict(request)
-            context.pop("acceptance_artifact")
+            context = _development_context(request)
             prompt_input = (
                 f"Acceptance Artifact (verbatim JSON):\n{_pretty(artifact)}"
                 f"\n\nDevelopment Brief:\n{_pretty(context)}"
@@ -120,15 +137,20 @@ class CodexCliBackend:
             evidence = request.get("ci_evidence")
             if not isinstance(evidence, dict):
                 raise ValueError("Required-Checks Repair requires ci_evidence")
-            subject = "当前 Parent Issue" if is_parent_only else "当前 Ticket"
+            subject = (
+                "当前 Delivery Run"
+                if is_run_repair
+                else "当前 Parent Issue"
+                if is_parent_only
+                else "当前 Ticket"
+            )
             mode = (
                 f"Required-Checks Repair：{subject}、代码状态和下方未经改写的 "
                 "CI Evidence 是事实依据。修复失败的 Required Checks 及其直接影响，"
                 "不要绕过检查、删除测试或放宽断言。"
             )
             heading = "Required-Checks Repair Input"
-            context = dict(request)
-            context.pop("ci_evidence")
+            context = _development_context(request)
             prompt_input = (
                 f"CI Evidence (verbatim JSON):\n{_pretty(evidence)}"
                 f"\n\nDevelopment Brief:\n{_pretty(context)}"
@@ -142,10 +164,9 @@ class CodexCliBackend:
                 "先以当前代码和事实核验其影响，再完成必要的最小修复。"
             )
             heading = "Human Revision Input"
-            context = dict(request)
-            context.pop("human_feedback")
+            context = _development_context(request)
             prompt_input = (
-                f"Maintainer Feedback (verbatim):\n{feedback.strip()}"
+                f"Maintainer Feedback (verbatim):\n{feedback}"
                 f"\n\nDevelopment Brief:\n{_pretty(context)}"
             )
         elif repair_source == "merge_conflict":
@@ -157,10 +178,9 @@ class CodexCliBackend:
                 "在不绕过既有验收的前提下修复冲突及其直接影响。"
             )
             heading = "Merge Conflict Repair Input"
-            context = dict(request)
-            context.pop("merge_conflict_evidence")
+            context = _development_context(request)
             prompt_input = (
-                f"Merge Conflict Evidence (verbatim):\n{evidence.strip()}"
+                f"Merge Conflict Evidence (verbatim):\n{evidence}"
                 f"\n\nDevelopment Brief:\n{_pretty(context)}"
             )
         else:
@@ -176,6 +196,9 @@ class CodexCliBackend:
         return (
             f"你是负责{role}。使用 skill:implement 完成开发或修复。"
             f"{mode}\n\n"
+            + _issue_context_instruction(_development_context(request))
+            + _human_blocker_instruction()
+            + "\n\n"
             "阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置尽量"
             "采用 TDD。运行相关单测、typecheck、lint 和完整测试套件，并从真实用户"
             "入口复验受影响的成功路径、失败路径和边界情况。记录实际命令、exit code、"
@@ -194,7 +217,9 @@ class CodexCliBackend:
             f"{heading}:\n{prompt_input}"
         )
 
-    def publication(self, request: dict[str, Any]) -> PublicationResult:
+    def publication(
+        self, request: dict[str, Any]
+    ) -> PublicationResult | HumanBlockerResult:
         checkout = Path(_string(request, "checkout"))
         supplied_thread = request.get("thread_id")
         thread_id = (
@@ -209,7 +234,7 @@ class CodexCliBackend:
                 prompt=prompt,
                 checkout=checkout,
                 thread_id=None,
-                schema=publication_schema(),
+                schema=publication_or_human_blocker_schema(),
                 writable_checkout=False,
             )
         else:
@@ -218,10 +243,12 @@ class CodexCliBackend:
                     prompt=prompt,
                     checkout=checkout,
                     thread_id=thread_id,
-                    schema=publication_schema(),
+                    schema=publication_or_human_blocker_schema(),
                     writable_checkout=False,
                 )
             except _CodexThreadResumeError:
+                if request.get("prior_human_blockers"):
+                    raise
                 replaced_thread = thread_id
                 output, resumed_thread = self._invoke(
                     prompt=(
@@ -232,38 +259,32 @@ class CodexCliBackend:
                     ),
                     checkout=checkout,
                     thread_id=None,
-                    schema=publication_schema(),
+                    schema=publication_or_human_blocker_schema(),
                     writable_checkout=False,
                 )
+        artifact = _json_object(output, "Publication Artifact")
+        blockers = parse_human_blockers(artifact)
+        if blockers is not None:
+            return HumanBlockerResult(
+                thread_id=resumed_thread,
+                human_blockers=blockers,
+                replaced_thread_id=replaced_thread,
+            )
         return PublicationResult(
             thread_id=resumed_thread,
-            artifact=_json_object(output, "Publication Artifact"),
+            artifact=artifact,
             replaced_thread_id=replaced_thread,
         )
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Create final-PR prose with a fresh, read-only release-narrative writer."""
+        """Create final-PR prose with a read-only release-narrative writer."""
         checkout = Path(_string(request, "checkout"))
-        prompt = (
-            "你是本次 Final Run 的发布叙事工程师。只读取当前事实，生成最终 Run PR "
-            "的语义标题和正文；不要编辑文件、不要执行 Git/GitHub 写操作，也不要做 "
-            "验收或替代人工批准。Parent Issue、Delivery Type、Delivery Run、SHA、CI 与"
-            "生命周期事实由 Publisher 注入；Completed Tickets 也由 Publisher 渲染，叙事中不得输出这些字段；"
-            "先读取 Publication Brief 提供的 Parent Issue URL，再在 checkout 中读取 "
-            "base_sha..run_head_sha 的完整 Git diff；不要读取或要求其他 Controller 状态。"
-            "并包含非空 What Problem This Solves、Why This Change Was Made、User Impact、Evidence"
-            "四个二级标题；"
-            "不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 "
-            "Conventional Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，"
-            "其中 type 只能是 feat、fix、improve、refactor、docs、test、chore；"
-            "不要使用自然语言标题。\n\n"
-            f"Run Publication Brief:\n{_pretty(request)}"
-        )
+        prompt = self._run_publication_prompt(request)
         output, thread_id = self._invoke(
             prompt=prompt,
             checkout=checkout,
-            thread_id=None,
-            schema=publication_schema(),
+            thread_id=_optional_string(request, "thread_id"),
+            schema=publication_or_human_blocker_schema(),
             writable_checkout=False,
         )
         artifact = _json_object(output, "Run Publication Artifact")
@@ -271,11 +292,49 @@ class CodexCliBackend:
         return artifact
 
     @staticmethod
+    def _run_publication_prompt(request: dict[str, Any]) -> str:
+        context = _prompt_context(
+            request,
+            "parent_issue_url",
+            "prior_human_blockers",
+        )
+        artifact = request.get("acceptance_artifact")
+        if not isinstance(artifact, dict):
+            raise ValueError("Final Run Publication requires acceptance_artifact")
+        return (
+            "你是本次 Final Run 的发布叙事工程师。先用 `gh issue view` 读取 "
+            "parent_issue_url 指向的 Parent Issue；它定义整体交付目标。然后在当前 "
+            "checkout 中阅读实际累计 diff。只读取事实，生成最终 Run PR 的语义标题和正文；"
+            "不要编辑文件、不要执行 Git/GitHub 写操作，也不要做验收或替代人工批准。"
+            "必须包含非空 What Problem This Solves、Why This Change Was Made、User Impact、"
+            "Evidence 四个二级标题；不得包含 closing keywords。commit_message 与 pr_title "
+            "必须采用 Conventional Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，"
+            "type 只能是 feat、fix、improve、refactor、docs、test、chore。"
+            + _human_blocker_instruction()
+            + _resume_recheck_instruction(context)
+            + "\n\nRun Acceptance Artifact (verbatim JSON):\n"
+            + _pretty(artifact)
+            + "\n\nFinal Run Publication Context:\n"
+            + _pretty(context)
+        )
+
+    @staticmethod
     def _publication_prompt(request: dict[str, Any]) -> str:
+        context = _prompt_context(
+            request,
+            "parent_issue_url",
+            "task_issue_url",
+            "prior_human_blockers",
+        )
+        artifact = request.get("acceptance_artifact")
+        if not isinstance(artifact, dict):
+            raise ValueError("Publication requires acceptance_artifact")
+        artifact_input = "Acceptance Artifact (verbatim JSON):\n" + _pretty(artifact)
         if request.get("acceptance_scope") == "run":
             return (
-                "你是本次 Run Repair 的发布叙事工程师。当前 Candidate 已通过独立验收；"
-                "根据当前累计 diff、开发摘要和独立验收证据，输出小型 Publication Artifact。"
+                "你是本次 Run Repair 的发布叙事工程师。先用 `gh issue view` 读取 "
+                "parent_issue_url 指向的 Parent Issue，再依据当前 checkout 的实际 diff 和"
+                "下方完整独立验收证据，输出小型 Publication Artifact。"
                 "不要修改文件，也不要执行任何 Git/GitHub 写操作。Parent Issue、"
                 "Delivery Type、Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入，"
                 "叙事中不得输出这些字段；并包含四个非空二级标题："
@@ -283,11 +342,17 @@ class CodexCliBackend:
                 "禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
                 "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
                 "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
-                f"Publication Brief:\n{_pretty(request)}"
+                + _human_blocker_instruction()
+                + _resume_recheck_instruction(context)
+                + "\n\n"
+                + artifact_input
+                + "\n\nPublication Context:\n"
+                + _pretty(context)
             )
         return (
-            "你是本次交付的发布叙事工程师。当前 Candidate 已通过独立验收；"
-            "根据当前累计 diff、开发摘要和独立验收证据，输出小型 Publication Artifact。"
+            "你是本次交付的发布叙事工程师。先用 `gh issue view` 读取 parent_issue_url；"
+            "若给出 task_issue_url，也必须读取该当前 Ticket。然后依据 checkout 的实际 diff 和"
+            "下方完整独立验收证据，输出小型 Publication Artifact。"
             "不要修改文件，也不要执行任何 Git/GitHub 写操作。PR 叙事包含四个非空二级标题："
             "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
             "只描述已经发生的真实验证；不要把开发者自述当作验证事实。Parent Issue、"
@@ -295,15 +360,40 @@ class CodexCliBackend:
             "注入，叙事中不得输出这些字段。禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
             "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
             "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
-            f"Publication Brief:\n{_pretty(request)}"
+            + _human_blocker_instruction()
+            + _resume_recheck_instruction(context)
+            + "\n\n"
+            + artifact_input
+            + "\n\nPublication Context:\n"
+            + _pretty(context)
         )
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         checkout = Path(_string(request, "checkout"))
+        prompt = self._review_prompt(request)
+        output, thread_id = self._invoke(
+            prompt=prompt,
+            checkout=checkout,
+            thread_id=_optional_string(request, "thread_id"),
+            schema=acceptance_schema(),
+        )
+        return ReviewResult(
+            thread_id=thread_id,
+            artifact=_json_object(output, "Acceptance Artifact"),
+        )
+
+    @staticmethod
+    def _review_prompt(request: dict[str, Any]) -> str:
+        context = _prompt_context(
+            request,
+            "parent_issue_url",
+            "task_issue_url",
+            "prior_human_blockers",
+        )
         scope_instruction = (
-            "这是 Run Acceptance：必须检查 Parent Issue、最终 Ticket Set 与依赖图、"
-            "每张 Ticket Completion Record、基线到 Run Branch Head 的累计 diff，以及"
-            "Expected Merge Result；不要把单 Ticket 通过当成整体验收通过。"
+            "这是 Run Acceptance：从 Parent Issue 和 GitHub 独立读取最终 Ticket Set 与"
+            "依赖关系，并检查准备好的累计 diff 及整体验收标准；不要寻找或猜测 Controller "
+            "私有账本，也不要把单 Ticket 通过当成整体验收通过。"
             if request.get("acceptance_scope") == "run"
             else "这是 Parent-only Fresh Acceptance：以当前 Parent Issue 的完整验收标准为范围。"
             if request.get("acceptance_scope") == "parent_only"
@@ -311,7 +401,8 @@ class CodexCliBackend:
         )
         prompt = (
             "你是全新且独立的 Fresh Validation 工程师。不要依赖开发者总结、自测、"
-            "开发审查、PR 文案或 Publication Artifact；使用真实 Git/gh、Ticket、Parent Issue 和准确 SHA 自行建立"
+            "开发审查、PR 文案或 Publication Artifact；先用 `gh issue view` 读取 "
+            "parent_issue_url，若给出 task_issue_url 也读取它，并使用真实 Git/gh 自行建立"
             "事实。必须派发三个不同 subagent：一个真实执行 E2E 使用；一个使用 "
             "skill:code-review 执行 Standards Review；另一个使用 "
             "skill:code-review 执行 Spec Review。你不得替代任何缺失 lane 或自行"
@@ -322,19 +413,12 @@ class CodexCliBackend:
             "或不可替代外部操作的阻塞。若 verdict 为 pass，三个 check 都必须是 pass，"
             "findings 与 human_blockers 必须都是空数组 `[]`；不要输出提示、风格建议、"
             "未来改进或其他非阻塞观察。\n\n"
+            + _resume_recheck_instruction(context)
+            + "\n\n"
             f"{scope_instruction}\n\n"
-            f"Acceptance Brief:\n{_pretty(request)}"
+            f"Acceptance Context:\n{_pretty(context)}"
         )
-        output, thread_id = self._invoke(
-            prompt=prompt,
-            checkout=checkout,
-            thread_id=None,
-            schema=acceptance_schema(),
-        )
-        return ReviewResult(
-            thread_id=thread_id,
-            artifact=_json_object(output, "Acceptance Artifact"),
-        )
+        return prompt
 
     def assess_scope(self, request: dict[str, Any]) -> dict[str, Any]:
         checkout = Path(_string(request, "checkout"))
@@ -430,7 +514,16 @@ class CodexCliBackend:
                 raise CodexProcessError(message)
             if not output_path.exists():
                 raise CodexProcessError("Codex worker did not produce a final response")
-            actual_thread = _thread_id(result.stdout) or thread_id
+            reported_thread = _thread_id(result.stdout)
+            if (
+                thread_id is not None
+                and reported_thread is not None
+                and reported_thread != thread_id
+            ):
+                raise _CodexThreadResumeError(
+                    "Codex resume reported a different Thread ID"
+                )
+            actual_thread = reported_thread or thread_id
             if actual_thread is None:
                 raise CodexProcessError("Codex worker did not report a Thread ID")
             return output_path.read_text(encoding="utf-8"), actual_thread
@@ -473,6 +566,76 @@ def _json_object(value: str, name: str) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise CodexProcessError(f"{name} must be an object")
     return loaded
+
+
+def _human_blocker_output(value: str, name: str) -> tuple[str, ...] | None:
+    try:
+        loaded: object = json.loads(value)
+    except json.JSONDecodeError as error:
+        if value.lstrip().startswith(("{", "[")):
+            raise CodexProcessError(
+                f"{name} looks like invalid structured JSON: {error}"
+            ) from error
+        return None
+    try:
+        blockers = parse_human_blockers(loaded)
+    except ValueError as error:
+        raise CodexProcessError(f"{name} Human Blocker is invalid: {error}") from error
+    if blockers is None and isinstance(loaded, (dict, list)):
+        raise CodexProcessError(
+            f"{name} structured result does not match the Human Blocker contract"
+        )
+    return blockers
+
+
+def _prompt_context(request: dict[str, Any], *fields: str) -> dict[str, Any]:
+    return {field: request[field] for field in fields if field in request and request[field] is not None}
+
+
+def _development_context(request: dict[str, Any]) -> dict[str, Any]:
+    return _prompt_context(
+        request,
+        "parent_issue_url",
+        "task_issue_url",
+        "prior_human_blockers",
+    )
+
+
+def _issue_context_instruction(context: dict[str, Any]) -> str:
+    task_instruction = (
+        " task_issue_url 是当前立即工作 Ticket，开始前也必须通过 `gh issue view` 读取它。"
+        if "task_issue_url" in context
+        else ""
+    )
+    return (
+        "动态 Context 中的 parent_issue_url 是定义整体交付目标的 Parent Issue，开始前"
+        "必须通过只读 `gh issue view` 读取它；URL 不是需求摘要。"
+        + task_instruction
+        + _resume_recheck_instruction(context)
+    )
+
+
+def _resume_recheck_instruction(context: dict[str, Any]) -> str:
+    if "prior_human_blockers" not in context:
+        return ""
+    return (
+        "这是一次 Human Blocker 恢复。prior_human_blockers 是上一轮未经改写的求助内容，"
+        "不表示问题已经解决；必须重新读取权威来源、重新检查受影响工作，然后继续或报告"
+        "更新后的 Human Blocker。"
+    )
+
+
+def _human_blocker_instruction() -> str:
+    return (
+        "若出现确实必须由人处理的外部权限、GitHub 访问、产品决定、敏感凭证或不可替代"
+        '外部操作，停止当前阶段且只输出 JSON `{"human_blockers":["发生了什么；尝试了什么；'
+        '人必须做什么"]}`。不要把可自行修复的问题作为 Human Blocker。'
+    )
+
+
+def _optional_string(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _string(data: dict[str, Any], key: str) -> str:

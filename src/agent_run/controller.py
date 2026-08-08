@@ -70,7 +70,9 @@ class Controller:
             repository.name_with_owner, parent_number
         )
 
-    def resume(self, run_id: str) -> tuple[dict[str, Any], bool]:
+    def resume(
+        self, run_id: str, *, resume_human_blocker: bool = False
+    ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
             if existing.get("status") == "abandoned":
@@ -84,6 +86,8 @@ class Controller:
             base = _state_mapping(existing, "base")
             base_sha = str(base["sha"])
             state = self._refresh(existing, parent_number)
+            if resume_human_blocker:
+                _resume_agent_human_blocker(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
@@ -469,3 +473,114 @@ def _current_ticket_graph(state: dict[str, Any]) -> dict[str, Any]:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
+    """Re-enter exactly one top-level Agent phase after an explicit resume.
+
+    This is deliberately mechanical: Codex supplied the raw blocker text and
+    the maintainer chose to resume.  The controller neither interprets the
+    condition nor declares it fixed.
+    """
+    ticket_jobs = state.get("ticket_jobs")
+    if isinstance(ticket_jobs, dict):
+        for job in ticket_jobs.values():
+            if _resume_change_job(state, job, ticket=True):
+                return
+    parent = state.get("parent_job")
+    if _resume_change_job(state, parent, ticket=False):
+        return
+    acceptance = state.get("run_acceptance")
+    if not isinstance(acceptance, dict):
+        return
+    repair = acceptance.get("repair_job")
+    if _resume_change_job(state, repair, ticket=False):
+        acceptance["phase"] = "repairing"
+        state.update(
+            {
+                "status": "run_acceptance_pending",
+                "terminal_kind": "run_repair_pending",
+                "diagnostics": [],
+            }
+        )
+        return
+    if (
+        acceptance.get("phase") == "ready_for_human"
+        and acceptance.get("blocked_reason") in {
+            "agent_requires_human",
+            "reviewer_requires_human",
+        }
+    ):
+        blockers = _human_blockers(acceptance)
+        acceptance.update(
+            {
+                "phase": str(acceptance.get("human_blocker_phase", "pending")),
+                "prior_human_blockers": blockers,
+            }
+        )
+        acceptance.pop("blocked_reason", None)
+        state.update(
+            {
+                "status": "run_acceptance_pending",
+                "terminal_kind": "run_acceptance_pending",
+                "diagnostics": [],
+            }
+        )
+        return
+    publication = state.get("run_publication")
+    if (
+        isinstance(publication, dict)
+        and publication.get("phase") == "ready_for_human"
+        and publication.get("human_blockers") is not None
+    ):
+        publication.update(
+            {
+                "phase": str(publication.get("human_blocker_phase", "pending")),
+                "prior_human_blockers": _human_blockers(publication),
+            }
+        )
+        state.update(
+            {
+                "status": "run_publication_pending",
+                "terminal_kind": "run_publication_pending",
+                "diagnostics": [],
+            }
+        )
+
+
+def _resume_change_job(
+    state: dict[str, Any], value: object, *, ticket: bool
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if (
+        value.get("phase") != "blocked"
+        or value.get("blocked_reason")
+        not in {"agent_requires_human", "reviewer_requires_human"}
+    ):
+        return False
+    value.update(
+        {
+            "phase": str(value.get("human_blocker_phase", "developing")),
+            "prior_human_blockers": _human_blockers(value),
+        }
+    )
+    value.pop("blocked_reason", None)
+    if ticket:
+        state["active_ticket_job"] = value
+        status = "active"
+    elif "ticket_number" in value:
+        status = "active"
+    else:
+        status = "parent_delivery_pending"
+    state.update({"status": status, "terminal_kind": "waiting_human", "diagnostics": []})
+    return True
+
+
+def _human_blockers(subject: dict[str, Any]) -> list[str]:
+    value = subject.get("human_blockers")
+    if not isinstance(value, list) or not value or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError("Agent Human Blocker is missing raw blocker strings")
+    return list(value)

@@ -5,12 +5,17 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
-from agent_run.artifacts import AcceptanceArtifact
+from agent_run.artifacts import (
+    AcceptanceArtifact,
+    append_human_blocker_history,
+    clear_current_human_blocker,
+)
 from agent_run.change_delivery import (
     MAX_MODIFICATION_ATTEMPTS,
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryEngine,
     ChangeJobContract,
+    latest_reviewer_thread,
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -128,7 +133,6 @@ class RunAcceptanceEngine:
             review.thread_id,
             artifact.raw,
         )
-        self._record_final_pr_status(state, artifact.raw, run_head)
         run.update(
             {
                 "reviewed_head_sha": run_head,
@@ -137,16 +141,39 @@ class RunAcceptanceEngine:
             }
         )
         if artifact.verdict == "pass":
-            run.pop("blocked_reason", None)
+            clear_current_human_blocker(run)
             run["phase"] = "accepted"
         elif artifact.verdict == "human":
-            run["phase"] = "ready_for_human"
-            run["blocked_reason"] = "reviewer_requires_human"
+            append_human_blocker_history(
+                run, phase="pending", blockers=artifact.human_blockers
+            )
+            run.update(
+                {
+                    "phase": "ready_for_human",
+                    "blocked_reason": "reviewer_requires_human",
+                    "human_blockers": list(artifact.human_blockers),
+                    "human_blocker_phase": "pending",
+                }
+            )
+            state.update(
+                {
+                    "status": "ready_for_human",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [
+                        {"code": "reviewer_requires_human", "message": blocker}
+                        for blocker in artifact.human_blockers
+                    ],
+                }
+            )
         elif int(run["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS:
+            clear_current_human_blocker(run)
             run["phase"] = "ready_for_human"
             run["blocked_reason"] = "modification_budget_exhausted"
         else:
+            clear_current_human_blocker(run)
             run["phase"] = "repairing"
+        if artifact.verdict != "human":
+            self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
 
     def _record_final_pr_status(
@@ -199,14 +226,20 @@ class RunAcceptanceEngine:
             branch=branch, base_branch=str(state["run_branch"])
         )
         checkout = self._repair_checkout(state)
+        preserve_checkout = False
         try:
             self.git.prepare_ticket_checkout(
                 branch=branch, base_sha=str(job["base_sha"]), checkout=checkout
             )
             self._repair_engine().run(state, job, checkout)
+            preserve_checkout = (
+                job.get("blocked_reason") == "agent_requires_human"
+                and job.get("human_blocker_phase") in {"developing", "repairing"}
+            )
         finally:
-            self.git.remove_worktree(checkout)
-            self._remove_empty_directories(checkout)
+            if not preserve_checkout:
+                self.git.remove_worktree(checkout)
+                self._remove_empty_directories(checkout)
         if job["phase"] == "completed":
             DeliveryCleanupEngine(
                 git=self.git, states=self.states, github=self.github
@@ -310,7 +343,7 @@ class RunAcceptanceEngine:
             feedback = repair_request.get("human_feedback")
             if not isinstance(feedback, str) or not feedback.strip():
                 raise ValueError("human revision feedback must be non-empty")
-            job["human_feedback"] = feedback.strip()
+            job["human_feedback"] = feedback
         if repair_source == "required_checks":
             evidence = repair_request.get("ci_evidence")
             if not isinstance(evidence, dict):
@@ -320,7 +353,7 @@ class RunAcceptanceEngine:
             evidence = repair_request.get("merge_conflict_evidence")
             if not isinstance(evidence, str) or not evidence.strip():
                 raise ValueError("merge-conflict repair evidence must be non-empty")
-            job["merge_conflict_evidence"] = evidence.strip()
+            job["merge_conflict_evidence"] = evidence
         run["repair_job"] = job
         self._save(state)
         return job
@@ -370,13 +403,13 @@ class RunAcceptanceEngine:
         run_head: str,
         default_head: str,
     ) -> dict[str, Any]:
-        parent = dict(self._mapping(state, "parent"))
-        parent["url"] = self._issue_url(state, int(parent["number"]))
-        base = self._mapping(state, "base")
         return {
             "acceptance_scope": "run",
+            "parent_issue_url": self._issue_url(
+                state, int(self._mapping(state, "parent")["number"])
+            ),
             "run_id": state["run_id"],
-            "parent": parent,
+            "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
             "ticket_completion_records": self._ticket_completion_records(state),
             "base_sha": default_head,
@@ -388,19 +421,27 @@ class RunAcceptanceEngine:
                 "checkout_state": "merged working tree; HEAD remains default base",
             },
             "checkout": str(checkout),
-            "prior_run_acceptance": run.get("acceptance_artifact"),
+            "thread_id": latest_reviewer_thread(run)
+            if run.get("prior_human_blockers")
+            else None,
+            **(
+                {"prior_human_blockers": run["prior_human_blockers"]}
+                if run.get("prior_human_blockers")
+                else {}
+            ),
         }
 
     def _development_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
-        parent = dict(self._mapping(state, "parent"))
-        parent["url"] = self._issue_url(state, int(parent["number"]))
-        return {
+        request = {
             "acceptance_scope": "run",
             "repair_source": job.get("repair_source", "acceptance"),
+            "parent_issue_url": self._issue_url(
+                state, int(self._mapping(state, "parent")["number"])
+            ),
             "run_id": state["run_id"],
-            "parent": parent,
+            "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
             "ticket_completion_records": self._ticket_completion_records(state),
             "base_sha": job["base_sha"],
@@ -408,11 +449,19 @@ class RunAcceptanceEngine:
             "checkout": str(checkout),
             "thread_id": job.get("development_thread_id"),
             "development_summary": job.get("development_summary"),
-            "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
-            "human_feedback": job.get("human_feedback"),
-            "ci_evidence": job.get("ci_evidence"),
-            "merge_conflict_evidence": job.get("merge_conflict_evidence"),
         }
+        source = str(request["repair_source"])
+        if source == "acceptance":
+            request["acceptance_artifact"] = self._mapping(job, "acceptance_artifact")
+        elif source == "required_checks":
+            request["ci_evidence"] = self._mapping(job, "ci_evidence")
+        elif source == "human_revision":
+            request["human_feedback"] = str(job["human_feedback"])
+        elif source == "merge_conflict":
+            request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
+        return request
 
     def _publication_request(
         self,
@@ -422,6 +471,9 @@ class RunAcceptanceEngine:
     ) -> dict[str, Any]:
         request = {
             "acceptance_scope": "run",
+            "parent_issue_url": self._issue_url(
+                state, int(self._mapping(state, "parent")["number"])
+            ),
             "run_id": state["run_id"],
             "parent": self._mapping(state, "parent"),
             "ticket_graph": self._mapping(state, "ticket_graph"),
@@ -430,19 +482,17 @@ class RunAcceptanceEngine:
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
             "thread_id": (
-                job["development_thread_id"]
+                job.get("publication_thread_id")
+                if job.get("prior_human_blockers")
+                else job["development_thread_id"]
                 if int(job.get("publication_attempts", 0))
                 < MAX_PUBLICATION_CONTEXT_ATTEMPTS
                 else None
             ),
-            "development_summary": job.get("development_summary"),
             "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
         }
-        existing_pr = job.get("pr_number")
-        if isinstance(existing_pr, int):
-            if self.github is None:
-                raise ValueError("Run Repair Publication requires the Publisher")
-            request["existing_pr"] = self.github.publication_context(existing_pr)
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
         return request
 
     def _invalidate_stale_repair_publication(
@@ -480,13 +530,14 @@ class RunAcceptanceEngine:
     def _repair_review_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
-        parent = dict(self._mapping(state, "parent"))
-        parent["url"] = self._issue_url(state, int(parent["number"]))
         return {
             "acceptance_scope": "run",
+            "parent_issue_url": self._issue_url(
+                state, int(self._mapping(state, "parent")["number"])
+            ),
             "repair_scope": "run_repair",
             "run_id": state["run_id"],
-            "parent": parent,
+            "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
             "ticket_completion_records": self._ticket_completion_records(state),
             "base_sha": job["base_sha"],
@@ -498,13 +549,17 @@ class RunAcceptanceEngine:
                 "inspection_command": (
                     f"git diff {job['base_sha']} {job['candidate_sha']}"
                 ),
-                "checkout_state": (
-                    "Run Branch plus repair publication merge preview; "
-                    "HEAD remains Run Branch base"
-                ),
+                "checkout_state": "Run Branch plus repair publication merge preview; HEAD remains Run Branch base",
             },
             "checkout": str(checkout),
-            "prior_run_acceptance": self._mapping(job, "acceptance_artifact"),
+            "thread_id": latest_reviewer_thread(job)
+            if job.get("prior_human_blockers")
+            else None,
+            **(
+                {"prior_human_blockers": job["prior_human_blockers"]}
+                if job.get("prior_human_blockers")
+                else {}
+            ),
         }
 
     def _repair_acceptance_record(
@@ -676,10 +731,18 @@ class RunAcceptanceEngine:
     def _record_reviewer(
         self, state: dict[str, Any], run: dict[str, Any], thread_id: str
     ) -> None:
-        if not thread_id.strip() or thread_id in self._all_prior_threads(state, run):
+        resumed = bool(run.get("prior_human_blockers"))
+        if resumed and thread_id != latest_reviewer_thread(run):
+            raise ValueError(
+                "Human Blocker resume requires the latest Reviewer Thread"
+            )
+        if not thread_id.strip() or (
+            thread_id in self._all_prior_threads(state, run) and not resumed
+        ):
             raise ValueError("Run Acceptance requires a new Reviewer Thread")
         reviewers = self._string_list(run, "reviewer_thread_ids")
-        reviewers.append(thread_id)
+        if thread_id not in reviewers:
+            reviewers.append(thread_id)
         run["reviewer_thread_ids"] = reviewers
         self._save(state)
 

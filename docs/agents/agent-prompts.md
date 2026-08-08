@@ -5,6 +5,45 @@
 
 相关领域边界见根目录的 `CONTEXT.md`；命令与权限现状见 `docs/agent-run.md`。
 
+## Runtime Dynamic Context（运行时动态上下文，唯一合同）
+
+本节优先于本文后续历史示例。Controller 的 Revision、SHA、Candidate、Ticket Graph、Completion Record、开发总结、既有 PR、Run/Thread/Attempt 身份只用于确定性门禁，绝不进入 Codex stdin Prompt。Worker 已有正确 checkout 与只读 GitHub token；开始工作前必须用 `gh issue view` 读取每个 URL。URL 不是需求摘要。
+
+| 顶层角色 | 正常动态字段 | Human Blocker 恢复额外字段 |
+| --- | --- | --- |
+| Ticket Development | `parent_issue_url`, `task_issue_url` | `prior_human_blockers` |
+| Parent-only Development | `parent_issue_url` | `prior_human_blockers` |
+| Ticket Repair | 两个 URL，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers` |
+| Parent-only Repair | `parent_issue_url`，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers` |
+| Run Repair | `parent_issue_url`，加一个 `acceptance_artifact`、`ci_evidence`、`human_feedback` 或 `merge_conflict_evidence` | `prior_human_blockers` |
+| Ticket / Parent-only Fresh Validation | 相应 Parent URL，Ticket 时再有 task URL | `prior_human_blockers` |
+| Run Acceptance | `parent_issue_url` | `prior_human_blockers` |
+| Ticket Publication | 两个 URL，加完整 `acceptance_artifact` | `prior_human_blockers` |
+| Parent-only / Run Repair Publication | `parent_issue_url`，加完整 `acceptance_artifact` | `prior_human_blockers` |
+| Final Run Publication | `parent_issue_url`，加完整 Run `acceptance_artifact` | `prior_human_blockers` |
+
+原始 Artifact 与修复证据逐字序列化，不能由 Controller 总结或裁剪。恢复时 `prior_human_blockers` 是上一轮未改写的求助内容，不代表问题已解决；同一顶层 Codex Thread 必须重新读取权威来源、重新检查受影响工作后继续或返回更新后的 blocker。
+
+除 Fresh/Run Acceptance 现有的 `verdict: "human"` 外，Development、Repair、Publication 和 Final Publication 需要人处理时只输出：
+
+```json
+{"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}
+```
+
+Controller 只验证这个精确最小形状、保存/展示原字符串并暂停；多字段、空字符串、超出数量或长度上限的输出属于 malformed output，按普通执行失败处理，绝不能当作 Development Summary。Controller 不分类、不自动重试、不会以保存的 Issue body 兜底，也不读取或管理 Codex 内部 subagent 对话。恢复成功后清除当前告警字段，只保留最近的有界原始历史。
+
+### 固定 Prompt 行为
+
+- Development/Repair：先读 Parent Issue；有 task URL 时也读当前 Ticket。执行 `skill:implement`、真实使用验证和两个独立 review subagent；不得 commit、push、merge、关闭或修改 GitHub。
+- Fresh Validation：首次使用新 Reviewer Thread；先读适用 Issue，派发 E2E、Standards 与 Spec 三条独立 lane，只输出现有 Acceptance Artifact。Human 恢复才复用该 Reviewer Thread，并重新准备验证 checkout。
+- Publication：只读 Issue、checkout diff 与完整 Acceptance Artifact；不得修改文件或 Git/GitHub，输出既有 Publication Artifact，PR 叙事必须有四个必需章节。
+- Final Run Publication：只读 Parent Issue、累计 diff 与完整 Run Acceptance Artifact；输出既有 Publication Artifact，不替代验收或人工批准。
+- Scope Impact Assessment 不在本次动态上下文合同内，保持其现有 Prompt 与行为不变。
+
+## 历史设计记录（不作为运行时 Prompt 合同）
+
+下文从此处到文件结尾均为已废弃的需求演进背景，不能用于实现、测试或推断任何顶层 Codex stdin 字段；其中的 title/body、Revision、SHA、checkout、开发总结与网络失败回退示例均不再有效。运行时唯一合同是上方矩阵与固定行为。
+
 ## 设计原则
 
 Prompt 采用以下固定结构：

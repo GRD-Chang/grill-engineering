@@ -69,7 +69,11 @@ class ParentDeliveryEngine:
                     github=self.github,
                     agents=self.agents,
                 ).run(state, job, checkout)
-                preserve_checkout = result.get("status") == "waiting_checks"
+                preserve_checkout = result.get("status") == "waiting_checks" or (
+                    job.get("blocked_reason") == "agent_requires_human"
+                    and job.get("human_blocker_phase")
+                    in {"developing", "repairing"}
+                )
                 return result
             except KeyboardInterrupt:
                 raise

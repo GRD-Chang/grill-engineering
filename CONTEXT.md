@@ -13,7 +13,7 @@ Codex Worker 返回的结构化意图、判断与证据。它可以包含代码�
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **Development Brief（开发简报）**:
-提供给 Development Codex 的最小语义输入，包括目标 Ticket、Parent Spec、Delivery Run 身份、当前验收反馈、GitHub 上下文约定和输出要求。Codex 直接从本地 worktree 与只读 GitHub 访问获取代码、Issue 与历史 PR 事实，并自主判断需要读取哪些相关对象；Controller 不提供 PR 读取白名单，也不把内部运行账本作为任务输入。
+提供给 Development Codex 的最小语义输入，包括 Parent Issue URL、适用时的当前 Ticket URL、不可重建的原始失败证据、GitHub 上下文约定和输出要求。Codex 直接从本地 worktree 与只读 GitHub 访问获取代码、Issue 与历史 PR 事实，并自主判断需要读取哪些相关对象；Controller 不把 Delivery Run、Revision、SHA 或其他内部运行账本作为任务输入。
 _Avoid_: Change Job Record、完整环境快照、实现计划
 
 **Development Attempt（开发尝试）**:
@@ -29,7 +29,7 @@ Development–Acceptance Engine 的确定性参数集合，包括需求源、有
 _Avoid_: Development Brief、Agent Artifact、Controller 全局配置
 
 **Development Thread（开发线程）**:
-一个 Change Job 独有并跨 Development Attempt 复用的持久 Codex Thread。它保存该任务的开发与修复上下文，但每个 Turn 都必须重新提供当前 Effective Revision、checkout 状态和最新验收反馈；其身份由 Change Job Record 保存，不与任何 Reviewer Thread 共享。Thread 无法恢复时，Controller 自动创建替代 Thread，并以最新版需求源、当前 checkout、Development Summary 和未解决 Acceptance Artifact 重建上下文，无需人工确认。
+一个 Change Job 独有并跨 Development Attempt 复用的持久 Codex Thread。它保存该任务的开发与修复上下文，但每个 Turn 都必须重新提供当前权威 Issue 引用、准备好的 checkout 和适用的原始反馈证据；其身份由 Change Job Record 保存，不与任何 Reviewer Thread 共享。因 Human Blocker 暂停后，`resume` 必须复用原 Thread 与保留的工作区，并让 Codex 重新核验；Thread 无法恢复时，Controller 才自动创建替代 Thread。
 _Avoid_: Development Attempt、Reviewer Thread、Delivery Run 全局会话
 
 **Change Job Record（变更任务记录）**:
@@ -41,7 +41,7 @@ Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用�
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:
-Development 与 Fresh Validation Codex 必须按 Prompt 派发不同 subagent、处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 状态/证据与外层 SHA/Revision 绑定。
+Development 与 Fresh Validation Codex 必须按 Prompt 派发不同 subagent、处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 状态/证据与外层 SHA/Revision 绑定。内部 subagent 发现的 Human Blocker 先交给本阶段顶层 Codex；只有顶层 Codex 的最终结构化输出可传给 Controller。
 _Avoid_: Controller 内部 Agent 编排器、subagent provenance ledger、父 Agent 自签
 
 **Controller（控制器）**:
@@ -85,7 +85,7 @@ _Avoid_: 最终集成 PR、多 Ticket PR、默认分支 PR
 _Avoid_: Ticket PR、squash 整个 Delivery Run、自动合入默认分支
 
 **Run Acceptance（运行整体验收）**:
-全部 Ticket Completion 后、首次创建 Run PR 前以及任何 Run Branch 或默认分支更新后，由全新 YOLO Reviewer Thread 在独立 Validation Checkout 中，针对 Parent Spec、Run Feedback Revisions、完整 Ticket Set、默认分支 reviewed base SHA、准确 Run Branch head SHA、预期合并结果、累计 diff 和各 Ticket Acceptance Records 执行的独立整体验收。它不复用任何 Development Thread 或 Ticket Reviewer Thread，重点检查跨 Ticket 交互、整体需求遗漏、局部实现累计偏离和集成回归；默认分支 base、Run Branch head 或有效需求 Revision 漂移都会使结论失效，只有通过后才允许生成或刷新 Run PR Narrative。
+全部 Ticket Completion 后、首次创建 Run PR 前以及任何 Run Branch 或默认分支更新后执行的独立整体验收。正常 Run Acceptance Attempt 使用全新 YOLO Reviewer Thread 和独立 Validation Checkout，针对 Parent Spec、Run Feedback Revisions、完整 Ticket Set、默认分支 reviewed base SHA、准确 Run Branch head SHA、预期合并结果、累计 diff 和各 Ticket Acceptance Records 进行检查；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Run Reviewer Thread，但仍重新创建一次性 Validation Checkout 并重新核验。Run Reviewer 不复用任何 Development Thread 或 Ticket Reviewer Thread，重点检查跨 Ticket 交互、整体需求遗漏、局部实现累计偏离和集成回归；默认分支 base、Run Branch head 或有效需求 Revision 漂移都会使结论失效，只有通过后才允许生成或刷新 Run PR Narrative。
 _Avoid_: Ticket Fresh Acceptance、简单汇总各票 pass、最终人工验收
 
 **Default Branch Drift（默认分支漂移）**:
@@ -93,7 +93,7 @@ _Avoid_: Ticket Fresh Acceptance、简单汇总各票 pass、最终人工验收
 _Avoid_: Ticket Content Revision、人工逐次确认、复用旧验收
 
 **Run Publication Codex（运行发布 Codex）**:
-Run Acceptance 通过后由 Controller 启动的一次性 YOLO Codex，读取 Parent Spec、完整 Ticket Set、各 Ticket PR、准确累计 diff 与真实验证证据，生成符合统一 PR Narrative 的 Run PR title/body。它的职责只包含发布语义，不复用 Reviewer Thread、不执行验收；Run Branch、默认分支 base、有效需求或证据变化后必须基于新状态重新生成。
+Run Acceptance 通过后由 Controller 启动的只读 YOLO Codex，读取 Parent Spec、完整 Ticket Set、各 Ticket PR、准确累计 diff 与真实验证证据，生成符合统一 PR Narrative 的 Run PR title/body。正常 Run Publication Attempt 使用新的 Codex Thread；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Run Publication Thread，并重新读取权威状态后继续或再次报告 blocker。它的职责只包含发布语义，不复用 Reviewer Thread、不执行验收；Run Branch、默认分支 base、有效需求或证据变化后必须基于新状态重新生成。
 _Avoid_: Run Acceptance Reviewer、Controller 拼接正文、Run Repair Thread
 
 **Run Repair Thread（运行修复线程）**:
@@ -197,7 +197,7 @@ Publisher 在独立 PR 评论或 Check 中维护的机器可核验运行事实�
 _Avoid_: PR Narrative、Agent 自述、重复验证说明
 
 **Fresh Acceptance（独立验收）**:
-Publisher 创建最终 Publication Commit 后、首次推送或修复推送前，由 Controller 按 Change Job Contract 启动全新 YOLO Reviewer Thread，在独立 Validation Checkout 中针对准确的 base SHA、Publication Commit SHA、有效 Revision、需求源和验收标准执行实际使用与代码审查。每轮验收都使用新的 Thread 和 checkout，不继承 Development Thread、旧 Reviewer Thread 或任何开发者自我判断；只有其通过结果与随后 Published-Head Gate 同时有效，目标 PR 才可进入 Run Branch。
+Publisher 创建最终 Publication Commit 后、首次推送或修复推送前，由 Controller 按 Change Job Contract 启动全新 YOLO Reviewer Thread，在独立 Validation Checkout 中针对准确的 base SHA、Publication Commit SHA、有效 Revision、需求源和验收标准执行实际使用与代码审查。正常新一轮验收使用新的 Thread 和 checkout，不继承 Development Thread、旧 Reviewer Thread 或任何开发者自我判断；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Reviewer Thread，但仍重新创建一次性 Validation Checkout 并重新核验。只有其通过结果与随后 Published-Head Gate 同时有效，目标 PR 才可进入 Run Branch。
 _Avoid_: 开发者自测、第二次 GitHub Codex Review、仅测试通过
 
 **Validation Checkout（验收工作区）**:
@@ -211,6 +211,10 @@ _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方�
 **Run Acceptance Artifact（运行验收产物）**:
 由 Controller 以 `acceptance_scope=run` 保存的 Acceptance Artifact。外层 Acceptance Record 将它绑定到 Parent Spec Revision、Run Feedback Revisions、Ticket Graph Revision、默认分支 reviewed base SHA、Run Branch reviewed head SHA、预期合并结果指纹与完整 Ticket Set；其 findings 原样驱动 Run Repair Job。
 _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
+
+**Human Blocker（人工阻塞）**:
+顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在现有 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；其他顶层阶段以唯一替代输出 `{"human_blockers":["…"]}` 表达。Controller 只保存、展示与在 resume 时原样传回它，不解释或裁决其语义。恢复成功后当前 blocker 告警会清除，最近的原始 blocker 尝试仍作为有界历史保留。
+_Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
 **Review Finding（审查发现）**:
 Acceptance Artifact 中一个可由 Development Codex 独立修复和验证的问题单元。它说明具体问题、代码或行为证据、必须达到的结果以及验证方式；人工产品决策、外部权限或不可替代操作进入 `human_blockers`，不伪装成 finding。

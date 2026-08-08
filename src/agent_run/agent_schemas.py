@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_run.artifacts import MAX_HUMAN_BLOCKER_LENGTH, MAX_HUMAN_BLOCKERS
+
 
 def publication_schema() -> dict[str, Any]:
     return {
@@ -13,6 +15,31 @@ def publication_schema() -> dict[str, Any]:
             for key in ("commit_message", "pr_title", "pr_body_markdown")
         },
     }
+
+
+def human_blocker_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["human_blockers"],
+        "properties": {
+            "human_blockers": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_HUMAN_BLOCKERS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_HUMAN_BLOCKER_LENGTH,
+                    "pattern": r"\S",
+                },
+            }
+        },
+    }
+
+
+def publication_or_human_blocker_schema() -> dict[str, Any]:
+    return {"oneOf": [publication_schema(), human_blocker_schema()]}
 
 
 def acceptance_schema() -> dict[str, Any]:
@@ -74,7 +101,13 @@ def acceptance_schema() -> dict[str, Any]:
             "findings": {"type": "array", "items": finding},
             "human_blockers": {
                 "type": "array",
-                "items": {"type": "string"},
+                "maxItems": MAX_HUMAN_BLOCKERS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_HUMAN_BLOCKER_LENGTH,
+                    "pattern": r"\S",
+                },
             },
         },
     }
