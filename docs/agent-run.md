@@ -21,8 +21,20 @@
 
 ## 命令
 
+日常操作优先使用 `run`。它会创建或幂等恢复同一 Parent Issue 的未完成 Run，并自动推进
+到下一处需要人工处理的门禁：
+
+```bash
+agent-run run <parent-issue> --repo OWNER/REPO
+agent-run status <run-id> --repo OWNER/REPO
+agent-run history <run-id> --repo OWNER/REPO
+```
+
+需要逐阶段排障或控制时，使用底层生命周期命令：
+
 ```bash
 agent-run start <parent-issue> --repo OWNER/REPO
+agent-run deliver <run-id> --repo OWNER/REPO
 agent-run resume <run-id> --repo OWNER/REPO
 agent-run confirm-structure <run-id> --repo OWNER/REPO
 agent-run accept-run <run-id> --repo OWNER/REPO
@@ -33,8 +45,12 @@ agent-run abandon <run-id> --repo OWNER/REPO
 AGENT_RUN_GITHUB_APP_ID=<app-id> \
 AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
 AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
-  agent-run deliver <run-id> --repo OWNER/REPO
+  agent-run run <parent-issue> --repo OWNER/REPO
 ```
+
+`status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。
+`run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
+维护者检查最终 PR，再显式执行 `approve`。
 
 `start` 只创建 Run、Run Branch 和工作前沿；`deliver` 从当前 Active Ticket 开始，
 在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
@@ -149,6 +165,33 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 每个 Ticket revision 最多允许十次产生真实 tree 变化的 Development Attempt。没有
 代码变化的 Attempt 不消耗预算，但该 Ticket 会停止自动重试，Controller 先完成其他
 可执行分支；预算耗尽后 Ticket 会移除 `ready-for-agent` 并增加 `ready-for-human`。
+
+## 自托管开发
+
+使用 `agent-run` 开发本仓库时，运行中的 Controller 必须来自已验证且固定的 commit，
+不得从正在被 Worker 修改的 editable checkout 导入代码。推荐把 Runner 安装到按 commit
+SHA 命名的独立 Python 环境，并从专用干净 clone 启动；同一 Delivery Run 从开始到完成始终
+使用同一个 Runner。最终 PR 合入默认分支并完成全量验证后，才创建下一版 Runner。
+
+仓库 CI 的 Required Check 名称是 `quality`。GitHub Ruleset 应覆盖默认分支以及 Ticket PR、
+Run Repair PR 所针对的 Run Branch。没有 Required Checks 时 Controller 会按无托管 CI 继续，
+因此正式自托管前必须核验目标分支确实应用了该 Ruleset，而不是只确认 workflow 文件存在。
+
+当前版本建议拆分两个 Active branch Ruleset：
+
+- 默认分支规则显式包含 `refs/heads/main`，要求 PR 和 `quality`，禁止 force push 与删除；
+- Run Branch 规则显式包含 `refs/heads/agent-run/**/run`，要求 `quality`，但允许分支创建时
+  暂无 status check，并允许交付完成后的受控删除。
+
+不要使用 `~DEFAULT_BRANCH` 代替显式 `main`；当前 Controller 只特殊支持 `~ALL`。Required
+Check 暂时选择 Any source，不绑定 GitHub Actions App：当前版本遇到非空 `integration_id`
+会以 `github_unsupported_ruleset` 安全拒绝继续。Any source 允许具备写权限的其他主体提交同名
+status，因此仍应限制仓库写权限，并保持 Worker 只持有短期只读 App token。Ruleset 启用前先
+让 `quality` 在仓库中成功运行一次，启用后再通过 API 读回实际条件和 Required Check。
+
+GitHub App 的创建、安装和私钥保管不属于 Controller 自动化范围。App 必须只授予
+`metadata: read`、`issues: read`、`pull_requests: read`，私钥保存在仓库和 Runner checkout
+之外；Publisher 继续使用独立的宿主 `gh` 写凭据。
 
 ## 本地状态与清理
 
