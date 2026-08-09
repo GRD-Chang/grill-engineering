@@ -21,7 +21,7 @@ Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内
 _Avoid_: Change Job、Plan Artifact、Acceptance Attempt
 
 **Development–Acceptance Engine（开发验收引擎）**:
-Controller 复用的单一自动变更循环：持久 Development Thread 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，pass 后由 Publisher 推送 PR、等待 Required Checks、执行 Published-Head Gate 并 squash merge。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文和完成规则使用该引擎，不复制控制流。
+Controller 复用的单一自动变更循环：持久 Development Thread 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，pass 后由 Publisher 推送 PR、等待 Required Checks、执行 Published-Head Gate，并按 Job 的合并策略完成合并。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文、批准策略和完成规则使用该引擎，不复制控制流；Parent-only 的人工批准只授予一次合并权限，批准后的重新核验、合并与恢复仍由该引擎执行。
 _Avoid_: Ticket 专用流水线、Run Repair 专用流水线、动态 Agent 编排
 
 **Change Job Contract（变更任务契约）**:
@@ -33,7 +33,7 @@ _Avoid_: Development Brief、Agent Artifact、Controller 全局配置
 _Avoid_: Development Attempt、Reviewer Thread、Delivery Run 全局会话
 
 **Change Job Record（变更任务记录）**:
-Controller 私有保存的 Change Job 身份、Development Thread 身份、Effective Revision、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job Record 按 Ticket 身份持久保存，并与兼容的当前 `active_ticket_job` 指针分离；Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入；Ticket Job 与 Run Repair Job 使用同一记录结构。
+Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 使用同一规范记录骨架和生命周期语义，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
 _Avoid_: Development Brief、Agent Artifact、PR 正文
 
 **Execution Guard（执行约束）**:
@@ -73,7 +73,7 @@ _Avoid_: 启动授权、依赖已解除、完成状态
 _Avoid_: 默认分支、Ticket Branch、永久集成分支
 
 **Parent-only Delivery（仅 Parent 交付）**:
-当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循 Candidate-first、Fresh Validation、Required Checks 和 Published-Head Gate；只有 `agent-run approve <run-id>` 重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head 后，Publisher 才以普通 merge 合并。已合并但 closeout 响应丢失时，`resume`/`deliver` 只重试幂等审计评论和关闭，不得再次合并。
+当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Validation、Required Checks 和 Published-Head Gate；`agent-run approve <run-id>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
 _Avoid_: Run Branch、Final Run PR、跳过独立验收、自动合并
 
 **Ticket PR（Ticket 拉取请求）**:
@@ -148,6 +148,10 @@ _Avoid_: Related Issue、Agent 猜测、一个 PR 关闭多张 Ticket
 Ticket PR 通过 Fresh Acceptance、Required Checks 和 Published-Head Gate，并合入所属 Run Branch 后形成的完成状态。Publisher 随即显式关闭 Primary Ticket，并评论记录 Delivery Run、Ticket PR 和进入 Run Branch 的 commit SHA，同时说明该变更尚未进入默认分支；该关闭动作使 GitHub `blockedBy` 依赖自然解除。
 _Avoid_: 合入默认分支、最终人工整体验收、closing keyword
 
+**Ticket Completion Revision（Ticket 完成版本）**:
+Run Acceptance 与 Run Repair Revision Snapshot 使用的确定性 Ticket 完成身份，只包含 Ticket number、integrated SHA、Effective Revision 以及已验收 base/tree，并按 Ticket number 数值排序。完整 Acceptance Record 继续保存在对应 Ticket Job 中，不嵌套复制到该版本身份。
+_Avoid_: Ticket Completion、完整 Acceptance Record、Reviewer 文案
+
 **Run Abandonment Recovery（运行放弃恢复）**:
 Delivery Run 在进入默认分支前被人工取消或永久放弃时，由 Publisher 只重新打开该 Run 曾记录为由 Publisher 从 open 变为 closed、且尚未进入默认分支的 Tickets，并留下恢复原因和 Run 证据；运行开始前已关闭或由外部主体独立关闭的 Issue 不得被重开。普通返工或暂时阻塞不触发整批重开。
 _Avoid_: Ticket 自动修复、Run 暂停、默认分支回滚
@@ -173,7 +177,7 @@ Publisher 在每轮 Development Codex 编辑返回后，于 Change Job working b
 _Avoid_: Publication Commit、远端 PR head、Agent 自行提交
 
 **Publication Commit（发布提交）**:
-Candidate 完成 Development Codex 自测、通过 Git 完整性检查并生成 Publication Artifact 后，Publisher 保持最终候选 tree 不变，以 Run Branch 的有效 base 为父提交并使用 Agent 编写的语义 commit message 创建的待发布提交。Publisher 必须验证压缩前后 tree 相同；Fresh Acceptance 绑定其准确 SHA，通过后才可推送 Ticket Branch。
+Candidate Commit 通过 Fresh Acceptance 后，Publisher 根据 Publication Artifact 保持已验收候选 tree 不变，以 Run Branch 的有效 base 为父提交并使用 Agent 编写的语义 commit message 创建待发布提交。Publisher 必须验证 Publication Commit 与已验收 Candidate Commit 的 tree 相同；随后 Published-Head Gate 将远端 PR head 绑定其准确 SHA。
 _Avoid_: Candidate Commit、机械 checkpoint、远端 PR head
 
 **Development Summary（开发摘要）**:
@@ -181,7 +185,7 @@ Development Codex 在 Development Attempt 结束时返回的普通、可读最�
 _Avoid_: Publication Artifact、Controller Evidence、完成证明
 
 **Publication Artifact（发布产物）**:
-Development Codex 完成代码编辑和自测后，根据最终 diff 与实际验证生成的小型结构化语义产物，提供语义 commit message、`type(scope): user-facing outcome` 格式的 PR title 和符合统一 PR Narrative 的完整正文。需求、最终方案、用户影响、验证证据或 Cross-Ticket Note 变化时，原 Development Thread 必须按累计 diff 更新对应语义；Publisher 只校验结构并执行写入，不改写 Agent 内容。
+Candidate Commit 通过 Fresh Acceptance 后，Development Codex 根据已验收的最终 diff 与实际验证生成的小型结构化语义产物，提供语义 commit message、`type(scope): user-facing outcome` 格式的 PR title 和符合统一 PR Narrative 的完整正文。需求、最终方案、用户影响、验证证据或 Cross-Ticket Note 变化时，原 Development Thread 必须按累计 diff 更新对应语义；Publisher 只校验结构并执行写入，不改写 Agent 内容。
 _Avoid_: Development Summary、独立发现工作流、验证记录
 
 **PR Narrative（PR 语义正文）**:
@@ -193,11 +197,11 @@ Development Codex 在 Ticket PR body 的可选 `## Cross-ticket notes` 段落中
 _Avoid_: 正式需求增量、Issue 修改、验收门禁
 
 **Publication Metadata（发布元数据）**:
-Publisher 在独立 PR 评论或 Check 中维护的机器可核验运行事实，包括 Delivery Run、目标 Run Branch、发布 commit 和 Fresh Acceptance 状态。它不进入 Agent 编写的 PR 语义正文，不重复其语义或 Evidence，并可与 Acceptance Record 使用同一耐久载体。
+Publisher 为每张已创建的开放自动化 PR 维护的一条 `Agent Run Status` 评论，原地更新 scope、Candidate/base、Fresh Acceptance、三条验收 lane、Required Checks 和 next action。它只是本地权威状态的简洁远端投影，不进入 Agent 编写的 PR 语义正文，也不发布完整 Acceptance Artifact、Acceptance Record、repair input 或其他嵌套 JSON。
 _Avoid_: PR Narrative、Agent 自述、重复验证说明
 
 **Fresh Acceptance（独立验收）**:
-Publisher 创建最终 Publication Commit 后、首次推送或修复推送前，由 Controller 按 Change Job Contract 启动全新 YOLO Reviewer Thread，在独立 Validation Checkout 中针对准确的 base SHA、Publication Commit SHA、有效 Revision、需求源和验收标准执行实际使用与代码审查。正常新一轮验收使用新的 Thread 和 checkout，不继承 Development Thread、旧 Reviewer Thread 或任何开发者自我判断；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Reviewer Thread，但仍重新创建一次性 Validation Checkout 并重新核验。只有其通过结果与随后 Published-Head Gate 同时有效，目标 PR 才可进入 Run Branch。
+Candidate Commit 创建后、生成 Publication Artifact 与 Publication Commit 前，由 Controller 按 Change Job Contract 启动全新 YOLO Reviewer Thread，在独立 Validation Checkout 中针对准确的 base SHA、Candidate Commit SHA、有效 Revision、需求源和验收标准执行实际使用与代码审查。正常新一轮验收使用新的 Thread 和 checkout，不继承 Development Thread、旧 Reviewer Thread 或任何开发者自我判断；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Reviewer Thread，但仍重新创建一次性 Validation Checkout 并重新核验。只有其通过结果、Publication Commit 与已验收 Candidate 的 tree equality 以及随后 Published-Head Gate 同时有效，目标 PR 才可进入 Run Branch。
 _Avoid_: 开发者自测、第二次 GitHub Codex Review、仅测试通过
 
 **Validation Checkout（验收工作区）**:
@@ -237,7 +241,7 @@ _Avoid_: Hosted CI Gate、Fresh Acceptance、本地 changed-surface validation
 _Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acceptance
 
 **Acceptance Record（验收记录）**:
-Publisher 确认 Published PR live head 等于已验收 commit 后，幂等维护的 GitHub 状态，适用于 Ticket PR、Run Repair PR 与 Run PR。它绑定 acceptance scope、reviewed base/head、有效 Revision、Acceptance Criteria、代码审查和验证结论；head、base 或 Revision 改变后记录失效。
+Development–Acceptance Engine 在独立验收后本地持久化的权威记录，将唯一一份 Acceptance Artifact 绑定到 acceptance scope、reviewed base、已验收 Candidate 或 Run head、对应 tree 或预期合并结果、有效 Revision 和 Reviewer 身份。每个合法的 `pass`、`request_changes` 或 `human` 结果都形成当前 Record；只有仍然 current 的 `pass` 可以授权 Publication，后续 Attempt 替换当前 Record，历史只按恢复需要有界保留，GitHub 只接收简洁的 Agent Run Status 投影。
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Ticket Repair Budget（Ticket 修复预算）**:
