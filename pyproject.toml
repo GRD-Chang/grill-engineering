@@ -9,6 +9,12 @@ description = "本地 Codex 自动交付控制器"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+dev = [
+    "mypy==1.19.1",
+    "pytest==9.0.2",
+]
+
 [project.scripts]
 agent-run = "agent_run.cli:main"
 
