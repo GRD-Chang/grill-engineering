@@ -21,11 +21,11 @@ Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内
 _Avoid_: Change Job、Plan Artifact、Acceptance Attempt
 
 **Development–Acceptance Engine（开发验收引擎）**:
-Controller 复用的单一自动变更循环：持久 Development Thread 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，pass 后由 Publisher 推送 PR、等待 Required Checks、执行 Published-Head Gate 并 squash merge。Ticket Job 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文和完成 hook 使用该引擎，不复制控制流。
+Controller 复用的单一自动变更循环：持久 Development Thread 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，pass 后由 Publisher 推送 PR、等待 Required Checks、执行 Published-Head Gate 并 squash merge。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文和完成规则使用该引擎，不复制控制流。
 _Avoid_: Ticket 专用流水线、Run Repair 专用流水线、动态 Agent 编排
 
 **Change Job Contract（变更任务契约）**:
-Development–Acceptance Engine 的确定性参数集合，包括需求源、有效 Revision、base/head branch、目标 PR 类型、开发与 Reviewer Prompt、修复预算以及完成 hook。智能 Agent 不选择或修改这些生命周期参数。
+Development–Acceptance Engine 处理 Ticket Job、Parent-only Delivery 或 Run Repair Job 时遵守的确定性事实与任务特有规则，包括需求源、有效 Revision、base/head branch、目标 PR 类型、开发与 Reviewer Prompt、修复预算以及完成规则。Controller 固定这些内容，智能 Agent 不选择或修改。
 _Avoid_: Development Brief、Agent Artifact、Controller 全局配置
 
 **Development Thread（开发线程）**:
@@ -157,7 +157,7 @@ _Avoid_: Ticket 自动修复、Run 暂停、默认分支回滚
 _Avoid_: Ticket、Attempt、Codex Thread
 
 **Active Ticket Job（活跃 Ticket 任务）**:
-Delivery Run 当前唯一获准进入开发、发布或验收循环的 Ticket Job。第一版任意时刻最多存在一个，其他 Ticket 即使依赖已解除也仍保持等待。
+Delivery Run 当前唯一获准进入开发、发布或验收循环的 Ticket Job。Controller 任意时刻最多激活一个，其他 Ticket 即使依赖已解除也仍保持等待。
 _Avoid_: 所有 ready Ticket、并行 frontier、后台 worker 池
 
 **Ticket Selection Order（Ticket 选择顺序）**:
@@ -237,7 +237,7 @@ _Avoid_: Hosted CI Gate、Fresh Acceptance、本地 changed-surface validation
 _Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acceptance
 
 **Acceptance Record（验收记录）**:
-Publisher 确认 Published PR live head 等于已验收 commit 后，幂等维护的 GitHub 状态，适用于 Ticket PR、Run Repair PR 与 Run PR。V1 使用固定 PR 评论记录 acceptance scope、reviewed base/head、有效 Revision、Acceptance Criteria、代码审查和验证结论；head、base 或 Revision 改变后旧记录失效。后续可升级为 GitHub App 提供的 required Check，而不反复改写 PR 正文。
+Publisher 确认 Published PR live head 等于已验收 commit 后，幂等维护的 GitHub 状态，适用于 Ticket PR、Run Repair PR 与 Run PR。它绑定 acceptance scope、reviewed base/head、有效 Revision、Acceptance Criteria、代码审查和验证结论；head、base 或 Revision 改变后记录失效。
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Ticket Repair Budget（Ticket 修复预算）**:
