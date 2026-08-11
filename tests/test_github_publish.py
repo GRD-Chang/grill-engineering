@@ -1143,6 +1143,50 @@ def test_explicit_reopen_resolves_older_missing_close_actor(
     ) is None
 
 
+def test_latest_close_with_missing_actor_remains_pending(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "CLOSED",
+                "comments": [],
+                "updatedAt": "2026-08-11T10:00:02Z",
+            }
+        return [
+            {
+                "id": 101,
+                "event": "reopened",
+                "created_at": "2026-08-11T10:00:01Z",
+                "actor": {"login": "maintainer"},
+            },
+            {
+                "id": 102,
+                "event": "closed",
+                "created_at": "2026-08-11T10:00:02Z",
+                "actor": None,
+            },
+        ]
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    with pytest.raises(GitHubReadError, match="transition actor"):
+        publisher.ticket_close_ownership(
+            ticket_number=2,
+            run_id="run-1",
+            recorded_ownership={
+                "actor": "agent-run-bot",
+                "event_id": None,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 100,
+                "intent_binding": "pr-3:sha-abc123",
+                "dispatch_attempted": True,
+            },
+        )
+
+
 def test_close_retry_does_not_overwrite_external_reopen(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1158,8 +1158,6 @@ class GhGitHubPublisher:
                     "Ticket state and close timeline have not converged",
                 )
             return None
-        if len(after_baseline) != 1:
-            return None
         actor = latest_after_baseline.get("actor")
         if (
             not isinstance(actor, dict)
@@ -1170,6 +1168,8 @@ class GhGitHubPublisher:
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed the Ticket transition actor yet",
             )
+        if len(after_baseline) != 1:
+            return None
         owned = (
             latest_after_baseline
             if latest_after_baseline.get("event") == "closed"
