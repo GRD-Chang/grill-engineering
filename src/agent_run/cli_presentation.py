@@ -23,6 +23,7 @@ def _print_precondition_failure(state: dict[str, object]) -> None:
                         "message": "当前交付运行尚未满足此命令的执行条件",
                     },
                 ],
+                "scope_change": state.get("unsupported_scope_change"),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -46,6 +47,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
         "next_action": _next_action(state),
         "diagnostics": state.get("diagnostics", []),
+        "scope_change": state.get("unsupported_scope_change"),
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -64,6 +66,16 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     print(f"已运行: {output['elapsed_seconds']} 秒")
     if output["gate"]:
         print("当前门禁: 必需检查")
+    scope_change = output["scope_change"]
+    if isinstance(scope_change, dict):
+        print(
+            "Ticket Graph: "
+            f"accepted={scope_change.get('accepted_graph_revision')} "
+            f"observed={scope_change.get('observed_graph_revision')}"
+        )
+        summary = scope_change.get("graph_change_summary")
+        if isinstance(summary, dict):
+            print(f"变化摘要: {summary.get('summary')}")
     print(f"下一步: {output['next_action']}")
 
 
@@ -71,7 +83,11 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     timeline = state.get("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
-    output = {"run_id": state.get("run_id"), "timeline": timeline}
+    output = {
+        "run_id": state.get("run_id"),
+        "timeline": timeline,
+        "next_action": _next_action(state),
+    }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
@@ -97,6 +113,22 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
             f"{event.get('at')} {_display_term(event.get('kind'))} "
             f"{_display_term(event.get('status'))} {detail}".rstrip()
         )
+        if event.get("kind") == "unsupported_scope_change":
+            print(
+                "  Ticket Graph: "
+                f"accepted={event.get('accepted_graph_revision')} "
+                f"observed={event.get('observed_graph_revision')}"
+            )
+            summary = event.get("graph_change_summary")
+            if isinstance(summary, dict):
+                print(
+                    "  变化明细: "
+                    f"新增 Ticket {summary.get('added_tickets', [])}；"
+                    f"移除 Ticket {summary.get('removed_tickets', [])}；"
+                    f"新增依赖 {summary.get('added_dependencies', [])}；"
+                    f"移除依赖 {summary.get('removed_dependencies', [])}"
+                )
+    print(f"下一步: {output['next_action']}")
 
 
 def _next_action(state: dict[str, Any]) -> str:
@@ -108,8 +140,8 @@ def _next_action(state: dict[str, Any]) -> str:
         run_id, str
     ):
         return f"agent-run approve {run_id}"
-    if status == "structure_change_pending" and isinstance(run_id, str):
-        return f"agent-run confirm-structure {run_id}"
+    if status == "unsupported_scope_change":
+        return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
     if status in {"ready_for_human", "progress_exhausted", "blocked"}:
         return "处理诊断中的人工事项"
     if status in {
@@ -245,7 +277,7 @@ def _display_term(value: object) -> object:
         "run_publication_pending": "等待运行发布",
         "run_approval_pending": "等待人工批准",
         "ready_for_human": "等待人工处理",
-        "structure_change_pending": "等待结构确认",
+        "unsupported_scope_change": "不支持的范围变化",
         "progress_exhausted": "无可推进任务",
         "execution_failed": "执行失败，可恢复",
         "blocked": "已阻塞",

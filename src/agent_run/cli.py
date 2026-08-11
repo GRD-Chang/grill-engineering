@@ -7,10 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 from agent_run import cli_presentation, cli_surface
-from agent_run.agent_fixture import (
-    FixtureAgentBackend,
-    FixtureScopeImpactAssessor,
-)
+from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
@@ -47,12 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("run_id", help="交付运行标识")
     _add_common_options(resume)
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    confirm_structure = subcommands.add_parser(
-        "confirm-structure",
-        help="确认当前待处理的 Ticket 图结构变化",
-    )
-    confirm_structure.add_argument("run_id", help="交付运行标识")
-    _add_common_options(confirm_structure)
     deliver = subcommands.add_parser(
         "deliver", help="交付当前 Active Ticket Job"
     )
@@ -115,11 +106,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if fixture_path is not None
             else GhGitHubReader(parsed.repo)
         )
-        scope_assessor = (
-            FixtureScopeImpactAssessor(fixture_path)
-            if fixture_path is not None
-            else CodexCliBackend()
-        )
         crash_after_save = getattr(parsed, "crash_after_save", None)
         states = (
             FaultInjectingStateStore(
@@ -128,9 +114,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if isinstance(crash_after_save, int)
             else StateStore(state_root)
         )
-        controller = Controller(
-            github, git, states, scope_assessor=scope_assessor
-        )
+        controller = Controller(github, git, states)
         if parsed.command == "status":
             state = cli_surface._load_local_run(states, parsed.run_id)
             cli_presentation._print_status(state, as_json=parsed.as_json)
@@ -290,25 +274,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 state = DeliveryCleanupEngine(
                     git=git, states=states, github=publisher
                 ).resume(parsed.run_id)
-        elif parsed.command == "confirm-structure":
-            before_confirmation = states.load_run(parsed.run_id)
-            state, resumed = controller.confirm_structure(parsed.run_id)
-            if (
-                isinstance(before_confirmation, dict)
-                and before_confirmation.get("delivery_type") == "parent_only"
-                and state.get("delivery_type") == "ticket_run"
-            ):
-                publisher = (
-                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                    if parsed.github_fixture
-                    else GhGitHubPublisher(github.repository().name_with_owner, git)
-                )
-                state = ParentDeliveryEngine(
-                    git=git,
-                    states=states,
-                    github=publisher,
-                    agents=CodexCliBackend(),
-                ).retire_for_child_flow(parsed.run_id)
         elif parsed.command == "deliver":
             agent_fixture = getattr(parsed, "agent_fixture", None)
             agents = (
@@ -325,10 +290,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 )
             )
             refreshed, _ = controller.resume(parsed.run_id)
-            refreshed = DeliveryCleanupEngine(
-                git=git, states=states, github=publisher
-            ).resume(parsed.run_id)
-            if (
+            unsupported_scope = (
+                refreshed.get("status") == "unsupported_scope_change"
+            )
+            if unsupported_scope:
+                state = refreshed
+                precondition_failed = True
+            else:
+                refreshed = DeliveryCleanupEngine(
+                    git=git, states=states, github=publisher
+                ).resume(parsed.run_id)
+            if unsupported_scope:
+                pass
+            elif (
                 refreshed.get("delivery_type") == "ticket_run"
                 and isinstance(refreshed.get("parent_job"), dict)
             ):
@@ -338,7 +312,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     github=publisher,
                     agents=agents,
                 ).retire_for_child_flow(parsed.run_id)
-            if refreshed.get("delivery_type") == "parent_only":
+            if unsupported_scope:
+                pass
+            elif refreshed.get("delivery_type") == "parent_only":
                 state = ParentDeliveryEngine(
                     git=git, states=states, github=publisher, agents=agents
                 ).deliver(parsed.run_id)
@@ -415,12 +391,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if refreshed.get("status") == "abandoned":
                 state = refreshed
             elif (
-                refreshed.get("status") == "structure_change_pending"
+                refreshed.get("status") == "unsupported_scope_change"
                 and parsed.command != "abandon"
             ):
-                # A proposed Parent/Ticket graph is not an accepted delivery
-                # boundary. Do not let publication or approval bypass the
-                # explicit confirm-structure command.
+                # Graph drift is fail-closed and cannot be absorbed by a
+                # lifecycle command.
                 state = refreshed
                 precondition_failed = True
             elif (
@@ -478,6 +453,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 if precondition_failed
                 else current_diagnostics
             ),
+            "scope_change": state.get("unsupported_scope_change"),
         }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if precondition_failed:

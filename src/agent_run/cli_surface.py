@@ -85,7 +85,7 @@ def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, 
     if exit_code != 0 and result.get("status") not in {
         "waiting_checks",
         "ready_for_human",
-        "structure_change_pending",
+        "unsupported_scope_change",
         "progress_exhausted",
         "execution_failed",
         "blocked",
@@ -124,7 +124,6 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
 
 def _is_lifecycle_action(command: str) -> bool:
     return command in {
-        "confirm-structure",
         "deliver",
         "accept-run",
         "publish-run",
@@ -140,8 +139,8 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
     # established reconciliation path instead of being rejected locally.
     if status in {"execution_failed", "abandoned"}:
         return True
-    if command == "confirm-structure":
-        return status == "structure_change_pending"
+    if status == "unsupported_scope_change":
+        return False
     if command == "deliver":
         return True
     if command == "accept-run":

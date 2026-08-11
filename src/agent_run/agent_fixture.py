@@ -23,7 +23,6 @@ class FixtureAgentBackend:
             "reviews": 0,
             "run_reviews": 0,
             "run_publications": 0,
-            "scope_assessments": 0,
         }
 
     def develop(
@@ -138,10 +137,6 @@ class FixtureAgentBackend:
         del request
         return self._next("run_publications")
 
-    def assess_scope(self, request: dict[str, Any]) -> dict[str, Any]:
-        del request
-        return self._next("scope_assessments")
-
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)
         if not isinstance(values, list):
@@ -154,35 +149,6 @@ class FixtureAgentBackend:
         if not isinstance(value, dict):
             raise ValueError(f"agent fixture {name} item must be an object")
         return dict(value)
-
-
-class FixtureScopeImpactAssessor:
-    """Deterministic Scope Impact substitute for GitHub fixture tests."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def assess_scope(self, request: dict[str, Any]) -> dict[str, Any]:
-        del request
-        value: object = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("fixture root must be an object")
-        assessment = value.get(
-            "scope_impact_assessment",
-            {
-                "structural_change": False,
-                "summary": "Fixture Parent change is non-structural.",
-                "ticket_set_impact": "none",
-                "dependency_impact": "none",
-                "delivery_boundary_impact": "none",
-                "completed_work_impact": "none",
-            },
-        )
-        if not isinstance(assessment, dict):
-            raise ValueError(
-                "fixture scope_impact_assessment must be an object"
-            )
-        return dict(assessment)
 
 
 def _string(data: dict[str, Any], key: str) -> str:

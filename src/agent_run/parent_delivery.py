@@ -32,7 +32,7 @@ class ParentDeliveryEngine:
     def deliver(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
-            if state.get("status") == "structure_change_pending":
+            if state.get("status") == "unsupported_scope_change":
                 return state
             job = self._job(state)
             if job["phase"] == "merging":
@@ -93,7 +93,7 @@ class ParentDeliveryEngine:
                 return state
             if job.get("phase") not in {"ready_for_approval", "merging"}:
                 raise ValueError("Parent-only delivery is not awaiting approval")
-            if state.get("status") == "structure_change_pending":
+            if state.get("status") == "unsupported_scope_change":
                 return state
             base = _mapping(state, "base")
             pr_number = int(job["pr_number"])

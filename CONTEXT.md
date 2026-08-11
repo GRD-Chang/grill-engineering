@@ -118,14 +118,14 @@ _Avoid_: PR 普通评论、Parent Spec Revision、Controller 摘要
 
 **Final Human Acceptance（最终人工验收）**:
 Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向维护者请求的 Delivery Run 整体确认。维护者通过本地 `agent-run approve <run-id>` 显式批准；Controller 随后重新核对默认分支 live base、Run PR live head、Run Acceptance、Required Checks、Parent Spec Revision 与 Ticket Graph Revision，完全一致时 Publisher 才可使用普通 merge commit 和 `--match-head-commit` 合入默认分支。此前各 Ticket 的自动完成不触发逐票人工验收。
-_Avoid_: Ticket 级确认、自动 merge 默认分支、Scope Impact Assessment
+_Avoid_: Ticket 级确认、自动 merge 默认分支、Agent 语义范围判断
 
 **Final Approval Command（最终批准命令）**:
 维护者对一个已通过全部自动门禁的 Delivery Run 授予默认分支合并权限的本地显式命令 `agent-run approve <run-id>`。该授权只对命令执行时重新验证的 Run PR head 和有效 Revision 生效；状态漂移时命令拒绝合并并恢复自动处理或重新请求验收。
 _Avoid_: GitHub Approve、标签触发、永久授权
 
 **Final Revision Command（最终修改命令）**:
-维护者通过 `agent-run revise <run-id> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启新的十次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，仍按结构性范围变化规则确认。
+维护者通过 `agent-run revise <run-id> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启新的十次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，Run 必须 fail closed 为 Unsupported Scope Change。
 _Avoid_: Parent Spec 静默改写、直接修改 Run Branch、无限自动重试
 
 **Final Abandon Command（最终放弃命令）**:
@@ -261,12 +261,12 @@ _Avoid_: 单 Ticket 失败、正常依赖等待、最终整体验收
 _Avoid_: Issue 评论、Git commit、Ticket Job ID
 
 **Ticket Graph Revision（Ticket 图版本）**:
-一个 Delivery Run 当前 Ticket Set 和 `blockedBy` 依赖边的稳定版本指纹。指纹变化表示交付范围或推进关系发生变化，继续运行前必须重新确认。
+一个 Delivery Run 启动时接受的 Ticket Set 和 `blockedBy` 依赖边的稳定版本指纹。指纹变化表示固定边界失效，当前 MVP 必须 fail closed，不允许自动 Requeue、继续工作或人工吸收。
 _Avoid_: Ticket Content Revision、执行顺序、运行状态
 
 **Ticket Graph Change Summary（Ticket 图变化摘要）**:
-Controller 在 Ticket Graph Revision 变化时确定性生成的集合与依赖边差异，列出新增或移除的 Ticket 和 `blockedBy` 边，帮助维护者理解待确认的新图。它是客观结构差异，不替代由 Codex Worker 对 Parent Spec 变化作出的 Scope Impact Assessment。
-_Avoid_: 语义范围判断、执行顺序变化、Parent Spec 影响评估
+Controller 在 Ticket Graph Revision 变化时确定性生成的集合与依赖边差异，列出新增或移除的 Ticket 和 `blockedBy` 边，帮助维护者审计 accepted/observed Graph。它只记录客观结构差异，不授权接受新图。
+_Avoid_: 语义范围判断、执行顺序变化、结构确认授权
 
 **Ticket Set（Ticket 集合）**:
 Parent Spec 的 GitHub 原生 `subIssues` 所定义的 Delivery Run 工作范围。Issue 正文、标签或普通编号列表不能增加或移除其中的 Ticket。
@@ -277,13 +277,9 @@ _Avoid_: 搜索结果、ready-for-agent 标签集合、依赖邻接节点
 _Avoid_: 隐式新增 Ticket、正文中的阻塞描述、普通相关 Issue
 
 **Parent Spec Revision（父规格版本）**:
-一个 Delivery Run 所依据的 Parent Spec 当前需求内容版本指纹。其变化会使相关范围判断失效，但只有被范围影响评估判定为结构性变化时才要求人工确认。
+一个 Delivery Run 所依据的 Parent Spec title/body 内容版本指纹。Controller 同时保留 accepted 与 observed revision 作为机械 currentness 输入；评论、assignee 与时间戳不进入 revision，具体 stale 路由由 Job Generation 规则决定。
 _Avoid_: Ticket Content Revision、Ticket Graph Revision、Git commit
 
-**Scope Impact Assessment（范围影响评估）**:
-Parent Spec 变化后，由一次性 YOLO Codex Worker 对新旧规格、Ticket Graph 和既有交付结果进行的结构化影响判断。它只输出变化是否影响 Ticket 集合、依赖、整体边界或已完成工作的判断，不持有 GitHub Mutation Authority。
-_Avoid_: 自动改写 Ticket、开发 Attempt、人工验收
-
-**Structural Scope Change（结构性范围变化）**:
-改变 Ticket 集合、依赖关系、整体交付边界，或使已完成 Ticket 需要返工的 Parent Spec 变化。该变化必须经人工确认；非结构性澄清可以自动吸收。
-_Avoid_: 文案澄清、局部实现调整、普通 Ticket 内容变化
+**Unsupported Scope Change（不支持的范围变化）**:
+运行中 observed Ticket Set 或 `blockedBy` Graph Revision 与 accepted revision 不一致时的 fail-closed 状态。Controller 保留 accepted/observed revision、变化摘要和 observed graph；该状态不运行 Codex、不新建 Thread、不 Requeue、不继续交付，也不执行 Publisher mutation。操作者只能查看状态/历史、恢复 GitHub 原图或放弃当前 Run。
+_Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue

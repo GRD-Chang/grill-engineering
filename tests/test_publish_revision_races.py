@@ -213,9 +213,9 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
 
     assert delivered.returncode == 2
     state = load_only_run_state(git_repo)
-    assert state["status"] == "structure_change_pending"
+    assert state["status"] == "unsupported_scope_change"
     assert state["active_ticket_job"] is None
-    assert state["pending_structure_change"]["graph_change_summary"][
+    assert state["unsupported_scope_change"]["graph_change_summary"][
         "removed_tickets"
     ] == [2]
     live = json.loads(fixture.read_text(encoding="utf-8"))

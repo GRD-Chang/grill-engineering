@@ -122,7 +122,7 @@ def test_wrong_repository_cannot_mutate_existing_run_state(
     assert persisted is not None
     assert persisted["status"] == "active"
     with pytest.raises(ValueError, match="does not match"):
-        wrong.confirm_structure(str(state["run_id"]))
+        wrong.resume(str(state["run_id"]))
 
 
 class UnavailableRepositoryReader:

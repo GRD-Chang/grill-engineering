@@ -374,14 +374,14 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
     )
     assert resumed.returncode == 0, resumed.stderr
     assert stdout_json(resumed)["status"] == "abandoned"
-    confirmed = run_cli(
+    removed_command = run_cli(
         git_repo,
         git_repo / "github.json",
         "confirm-structure",
         str(state["run_id"]),
     )
-    assert confirmed.returncode == 0, confirmed.stderr
-    assert stdout_json(confirmed)["status"] == "abandoned"
+    assert removed_command.returncode == 2
+    assert "invalid choice" in removed_command.stderr
     assert not Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
     ).record_execution_failure(str(state["run_id"]), "must not overwrite abandonment")
