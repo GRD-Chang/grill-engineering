@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryEngine,
@@ -140,15 +141,8 @@ class ParentDeliveryLoop:
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
-            "thread_id": (
-                None
-                if job.get("publication_new_thread") is True
-                else job.get("publication_thread_id")
-                if job.get("publication_thread_id")
-                else job["development_thread_id"]
-                if int(job.get("publication_attempts", 0))
-                < MAX_PUBLICATION_CONTEXT_ATTEMPTS
-                else None
+            "thread_id": select_publication_thread(
+                job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
             ),
             "acceptance_artifact": _mapping(job, "acceptance_artifact"),
         }

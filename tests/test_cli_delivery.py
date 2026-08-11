@@ -1502,6 +1502,17 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     )
     assert successor["requested_thread_id"] == expected_thread
     assert successor["reported_thread_id"] == successor_thread
+    assert successor["work_subject"] == "ticket:3"
+    assert successor["generation"] == completed_job["ticket_branch_generation"]
+    assert successor["input_fingerprint"].startswith("sha256:")
+    assert len(successor["input_fingerprint"]) == 71
+    acceptance = completed_job["acceptance_record"]
+    assert successor["currentness_boundary"] == {
+        "base_sha": completed_job["base_sha"],
+        "candidate_sha": completed_job["candidate_sha"],
+        "candidate_tree": acceptance["reviewed_candidate_tree"],
+        "effective_revision": completed_job["effective_revision"],
+    }
     assert completed_state["agent_invocation_history"][-1] == successor
 
 

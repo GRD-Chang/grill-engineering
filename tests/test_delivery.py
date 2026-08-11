@@ -4,6 +4,7 @@ import json
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,11 @@ from agent_run.agents import (
     PublicationResult,
     ReviewResult,
 )
+from agent_run.agent_invocation import (
+    canonical_fingerprint,
+    select_publication_thread,
+)
+from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
@@ -35,6 +41,118 @@ def issue(number: int) -> dict[str, Any]:
         "labels": ["ready-for-agent"],
         "blocked_by": [],
     }
+
+
+def test_publication_input_fingerprint_is_canonical_and_ignores_callbacks() -> None:
+    first = {"z": [2, 1], "a": {"value": "kept"}, "_callback": object()}
+    second = {"a": {"value": "kept"}, "z": [2, 1], "_other": object()}
+
+    assert canonical_fingerprint(first) == canonical_fingerprint(second)
+    assert canonical_fingerprint(first).startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    ("job", "expected"),
+    [
+        (
+            {
+                "publication_new_thread": True,
+                "publication_thread_id": "publication",
+                "development_thread_id": "development",
+                "publication_attempts": 0,
+            },
+            None,
+        ),
+        (
+            {
+                "publication_thread_id": "publication",
+                "development_thread_id": "development",
+                "publication_attempts": 0,
+            },
+            "publication",
+        ),
+        (
+            {"development_thread_id": "development", "publication_attempts": 1},
+            "development",
+        ),
+        (
+            {"development_thread_id": "development", "publication_attempts": 2},
+            None,
+        ),
+    ],
+)
+def test_publication_thread_selection_has_one_shared_priority_chain(
+    job: dict[str, Any], expected: str | None
+) -> None:
+    assert select_publication_thread(job, max_context_attempts=2) == expected
+
+
+@pytest.mark.parametrize(
+    ("job", "work_subject", "generation", "expected_boundary"),
+    [
+        (
+            {
+                "base_sha": "parent-base",
+                "candidate_sha": "parent-candidate",
+                "effective_revision": "parent-revision",
+                "acceptance_record": {"reviewed_candidate_tree": "parent-tree"},
+            },
+            "parent-only:run-1",
+            1,
+            {
+                "base_sha": "parent-base",
+                "candidate_sha": "parent-candidate",
+                "candidate_tree": "parent-tree",
+                "effective_revision": "parent-revision",
+            },
+        ),
+        (
+            {
+                "base_sha": "repair-base",
+                "candidate_sha": "repair-candidate",
+                "repair_generation": 3,
+                "parent_revision": "parent-revision",
+                "ticket_graph_revision": "graph-revision",
+                "ticket_completion_records": [{"ticket": 3, "revision": "done"}],
+                "acceptance_record": {"reviewed_candidate_tree": "repair-tree"},
+            },
+            "run-repair:run-1",
+            3,
+            {
+                "base_sha": "repair-base",
+                "candidate_sha": "repair-candidate",
+                "candidate_tree": "repair-tree",
+                "parent_revision": "parent-revision",
+                "ticket_graph_revision": "graph-revision",
+                "ticket_completion_records_fingerprint": canonical_fingerprint(
+                    [{"ticket": 3, "revision": "done"}]
+                ),
+            },
+        ),
+    ],
+)
+def test_change_publication_invocation_binds_subject_generation_and_currentness(
+    job: dict[str, Any],
+    work_subject: str,
+    generation: int,
+    expected_boundary: dict[str, Any],
+) -> None:
+    state: dict[str, Any] = {"run_id": "run-1"}
+    engine = object.__new__(ChangeDeliveryEngine)
+    engine.contract = SimpleNamespace(save=lambda value: value)
+    request = {"acceptance_scope": "test", "_callback": object()}
+
+    event = engine._invocation_events(state, job, request, phase="publication")
+    event("started", requested_thread_id=None, attempt_count=0)
+    event("thread_started", reported_thread_id="publication-thread", attempt_count=1)
+    event("completed", reported_thread_id="publication-thread", attempt_count=1)
+
+    invocation = state["active_agent_invocation"]
+    assert invocation["work_subject"] == work_subject
+    assert invocation["generation"] == generation
+    assert invocation["input_fingerprint"] == canonical_fingerprint(request)
+    assert invocation["currentness_boundary"] == expected_boundary
+    assert state["agent_invocation_history"][-1] == invocation
 
 
 class ScriptedAgents:

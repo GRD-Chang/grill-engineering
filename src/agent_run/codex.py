@@ -367,7 +367,7 @@ class CodexCliBackend:
             "Evidence 四个二级标题；不得包含 closing keywords。commit_message 与 pr_title "
             "必须采用 Conventional Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，"
             "type 只能是 feat、fix、improve、refactor、docs、test、chore。"
-            + _human_blocker_instruction()
+            + _publication_human_blocker_instruction()
             + _resume_recheck_instruction(context)
             + "\n\nRun Acceptance Artifact (verbatim JSON):\n"
             + _pretty(artifact)
@@ -399,7 +399,7 @@ class CodexCliBackend:
                 "禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
                 "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
                 "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
-                + _human_blocker_instruction()
+                + _publication_human_blocker_instruction()
                 + _resume_recheck_instruction(context)
                 + "\n\n"
                 + artifact_input
@@ -417,7 +417,7 @@ class CodexCliBackend:
             "注入，叙事中不得输出这些字段。禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
             "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
             "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
-            + _human_blocker_instruction()
+            + _publication_human_blocker_instruction()
             + _resume_recheck_instruction(context)
             + "\n\n"
             + artifact_input
@@ -613,11 +613,12 @@ def _terminal_error(stdout: str, stderr: str) -> str:
                 candidates["turn.failed"] = nested["message"]
             elif isinstance(nested, str):
                 candidates["turn.failed"] = nested
-        nested = value.get("error")
-        if isinstance(nested, dict) and isinstance(nested.get("message"), str):
-            candidates.setdefault("error", nested["message"])
-        elif isinstance(nested, str):
-            candidates.setdefault("error", nested)
+        if event_type not in {"task_complete", "turn.failed"}:
+            nested = value.get("error")
+            if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+                candidates.setdefault("error", nested["message"])
+            elif isinstance(nested, str):
+                candidates.setdefault("error", nested)
     raw = (
         candidates.get("task_complete")
         or candidates.get("error")
@@ -755,6 +756,17 @@ def _human_blocker_instruction() -> str:
         "若出现确实必须由人处理的外部权限、GitHub 访问、产品决定、敏感凭证或不可替代"
         '外部操作，停止当前阶段且只输出 JSON `{"human_blockers":["发生了什么；尝试了什么；'
         '人必须做什么"]}`。不要把可自行修复的问题作为 Human Blocker。'
+    )
+
+
+def _publication_human_blocker_instruction() -> str:
+    return (
+        "若出现确实必须由人处理的外部权限、GitHub 访问、产品决定、敏感凭证或不可替代"
+        "外部操作，停止当前阶段且只输出完整 Publication wire JSON "
+        '`{"result_kind":"human_blocker","commit_message":null,'
+        '"pr_title":null,"pr_body_markdown":null,'
+        '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`。'
+        "不要把可自行修复的问题作为 Human Blocker。"
     )
 
 

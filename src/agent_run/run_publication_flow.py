@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from agent_run.agent_invocation import (
+    canonical_fingerprint,
+    invocation_event_recorder,
+)
 from agent_run.artifacts import (
     PublicationArtifact,
     append_human_blocker_history,
     clear_current_human_blocker,
     parse_publication_wire_result,
 )
-from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError
@@ -103,7 +106,7 @@ class RunPublicationFlow(RunPublicationShared):
                 head_sha=self.git.resolve(str(state["run_branch"])), checkout=checkout
             )
             request = self._publication_request(state, checkout)
-            request["_invocation_event"] = self._invocation_events(state)
+            request["_invocation_event"] = self._invocation_events(state, request)
             request["_currentness_check"] = lambda: self._acceptance_is_current(
                 state, self._mapping(state, "run_acceptance")
             )
@@ -153,12 +156,29 @@ class RunPublicationFlow(RunPublicationShared):
             self._remove_empty_directories(checkout)
 
     def _invocation_events(
-        self, state: dict[str, Any]
+        self, state: dict[str, Any], request: dict[str, Any]
     ) -> Callable[..., None]:
+        run = self._mapping(state, "run_acceptance")
+        acceptance = self._mapping(run, "acceptance_record")
         return invocation_event_recorder(
             state,
             role="final_publication",
             phase="run_publication",
+            work_subject=f"run-publication:{state['run_id']}",
+            generation=int(run.get("validation_attempts", 1)),
+            invocation_input=request,
+            currentness_boundary={
+                "reviewed_head_sha": acceptance["reviewed_head_sha"],
+                "reviewed_default_base_sha": acceptance[
+                    "reviewed_default_base_sha"
+                ],
+                "expected_merge_tree": acceptance["expected_merge_tree"],
+                "parent_revision": acceptance["parent_revision"],
+                "ticket_graph_revision": acceptance["ticket_graph_revision"],
+                "ticket_completion_records_fingerprint": canonical_fingerprint(
+                    acceptance["ticket_completion_records"]
+                ),
+            },
             save=self._save,
         )
 

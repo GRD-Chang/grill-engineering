@@ -85,14 +85,58 @@ def test_publication_repairs_invalid_output_in_same_thread(
     )
 
 
-def test_terminal_error_prefers_structured_message_and_bounds_secrets() -> None:
-    error = _terminal_error(
-        '{"type":"task_complete","error":{"message":"token=secret-value\\u0000 failed"}}\n',
-        "less useful stderr",
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected"),
+    [
+        (
+            '{"type":"error","error":{"message":"api_key=key-value\\u0000 failed"}}\n',
+            "less useful stderr",
+            "api_key=[REDACTED] failed",
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"password=bad-value denied"}}\n',
+            "less useful stderr",
+            "password=[REDACTED] denied",
+        ),
+        (
+            '{"type":"turn.failed","error":"authorization=bad-value denied"}\n',
+            "less useful stderr",
+            "authorization=[REDACTED] denied",
+        ),
+        (
+            '{malformed jsonl}\nnot-json\n',
+            "secret=stderr-value failed",
+            "secret=[REDACTED] failed",
+        ),
+    ],
+)
+def test_terminal_error_extracts_real_jsonl_failure_shapes(
+    stdout: str, stderr: str, expected: str
+) -> None:
+    assert _terminal_error(stdout, stderr) == expected
+
+
+def test_terminal_error_prefers_task_complete_then_top_level_error_then_turn_failed() -> None:
+    stdout = "\n".join(
+        (
+            '{"type":"turn.failed","error":{"message":"turn failed"}}',
+            '{"type":"error","error":{"message":"top-level error"}}',
+            '{"type":"task_complete","error":{"message":"task complete error"}}',
+        )
     )
 
-    assert error == "token=[REDACTED] failed"
-    assert len(_terminal_error("", "x" * 9000).encode()) <= 8192
+    assert _terminal_error(stdout, "stderr error") == "task complete error"
+    assert _terminal_error(
+        "\n".join(stdout.splitlines()[:2]), "stderr error"
+    ) == "top-level error"
+
+
+def test_terminal_error_strips_controls_redacts_and_bounds_utf8() -> None:
+    assert _terminal_error(
+        '{"type":"task_complete","error":{"message":"token=secret-value\\u0000 failed"}}\n',
+        "less useful stderr",
+    ) == "token=[REDACTED] failed"
+    assert len(_terminal_error("", "密" * 9000).encode()) <= 8192
 
 
 def test_codex_worker_environment_excludes_publisher_credentials(

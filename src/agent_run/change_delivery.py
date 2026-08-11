@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_run.agents import AgentBackend, HumanBlockerResult, PublicationResult
-from agent_run.agent_invocation import invocation_event_recorder
+from agent_run.agent_invocation import (
+    canonical_fingerprint,
+    invocation_event_recorder,
+)
 from agent_run.artifacts import (
     AcceptanceArtifact,
     PublicationArtifact,
@@ -249,7 +252,7 @@ class ChangeDeliveryEngine:
             job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
             self.contract.save(state)
             request["_invocation_event"] = self._invocation_events(
-                state, phase="publication"
+                state, job, request, phase="publication"
             )
             request["_currentness_check"] = lambda: self._publication_is_current(
                 state, job
@@ -323,12 +326,45 @@ class ChangeDeliveryEngine:
         )
 
     def _invocation_events(
-        self, state: dict[str, Any], *, phase: str
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        request: dict[str, Any],
+        *,
+        phase: str,
     ) -> Callable[..., None]:
+        acceptance = job.get("acceptance_record")
+        if not isinstance(acceptance, dict):
+            raise ValueError("Publication requires a current Acceptance Record")
+        if isinstance(job.get("ticket_number"), int):
+            work_subject = f"ticket:{int(job['ticket_number'])}"
+            generation = int(job.get("ticket_branch_generation", 1))
+        elif isinstance(job.get("repair_generation"), int):
+            work_subject = f"run-repair:{state['run_id']}"
+            generation = int(job["repair_generation"])
+        else:
+            work_subject = f"parent-only:{state['run_id']}"
+            generation = 1
+        boundary: dict[str, Any] = {
+            "base_sha": str(job["base_sha"]),
+            "candidate_sha": str(job["candidate_sha"]),
+            "candidate_tree": str(acceptance["reviewed_candidate_tree"]),
+        }
+        for key in ("effective_revision", "parent_revision", "ticket_graph_revision"):
+            if key in job:
+                boundary[key] = job[key]
+        if "ticket_completion_records" in job:
+            boundary["ticket_completion_records_fingerprint"] = canonical_fingerprint(
+                job["ticket_completion_records"]
+            )
         return invocation_event_recorder(
             state,
             role="publication",
             phase=phase,
+            work_subject=work_subject,
+            generation=generation,
+            invocation_input=request,
+            currentness_boundary=boundary,
             save=self.contract.save,
         )
 

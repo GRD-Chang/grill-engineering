@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import ReviewResult
+from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.codex import CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
@@ -37,6 +38,25 @@ class RunPublicationAgents:
             ),
             "human_blockers": None,
         }
+
+
+class InvocationRunPublicationAgents(RunPublicationAgents):
+    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        result = super().run_publication(request)
+        event = request["_invocation_event"]
+        event("started", requested_thread_id=None, attempt_count=0)
+        event(
+            "thread_started",
+            reported_thread_id="final-publication-thread",
+            attempt_count=1,
+        )
+        event(
+            "completed",
+            reported_thread_id="final-publication-thread",
+            attempt_count=1,
+        )
+        result["_thread_id"] = "final-publication-thread"
+        return result
 
 
 class PassingRunReviewer:
@@ -723,6 +743,42 @@ def test_final_run_publication_receives_only_role_required_facts(git_repo: Path)
     assert callable(request.pop("_currentness_check"))
     assert set(request) == {"acceptance_artifact", "checkout", "parent_issue_url"}
     assert request["parent_issue_url"].endswith("/issues/1")
+
+
+def test_final_run_publication_invocation_binds_accepted_run_identity(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    agents = InvocationRunPublicationAgents()
+
+    completed = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    invocation = completed["active_agent_invocation"]
+    run = completed["run_acceptance"]
+    acceptance = run["acceptance_record"]
+    request = agents.requests[0]
+    assert invocation["status"] == "completed"
+    assert invocation["work_subject"] == f"run-publication:{state['run_id']}"
+    assert invocation["generation"] == run["validation_attempts"]
+    assert invocation["input_fingerprint"] == canonical_fingerprint(request)
+    assert invocation["currentness_boundary"] == {
+        "reviewed_head_sha": acceptance["reviewed_head_sha"],
+        "reviewed_default_base_sha": acceptance["reviewed_default_base_sha"],
+        "expected_merge_tree": acceptance["expected_merge_tree"],
+        "parent_revision": acceptance["parent_revision"],
+        "ticket_graph_revision": acceptance["ticket_graph_revision"],
+        "ticket_completion_records_fingerprint": canonical_fingerprint(
+            acceptance["ticket_completion_records"]
+        ),
+    }
+    assert completed["agent_invocation_history"][-1] == invocation
 
 
 def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> None:
