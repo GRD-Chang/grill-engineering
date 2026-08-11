@@ -895,6 +895,22 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
         "mutations"
     ]
     assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+    frozen_mutations = after["delivery"]["mutations"]
+
+    replayed = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert replayed.returncode == 0, replayed.stderr
+    assert stdout_json(replayed)["status"] == "abandoned"
+    replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert replayed_fixture["delivery"]["mutations"] == frozen_mutations
+    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
 
 
 def test_scripted_cli_delivers_active_ticket_end_to_end(
