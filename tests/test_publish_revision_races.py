@@ -315,6 +315,27 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     ]
     assert after_fixture["delivery"]["mutations"] == frozen["mutations"]
 
+    after_fixture["delivery"]["crash_after_recover_abandoned_ticket_once"] = True
+    fixture.write_text(json.dumps(after_fixture), encoding="utf-8")
+    interrupted_abandon = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert interrupted_abandon.returncode == 2
+    assert stdout_json(interrupted_abandon)["status"] == "abandonment_pending"
+    interrupted_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    frozen_pending_mutations = interrupted_fixture["delivery"]["mutations"]
+    for command in ("resume", "deliver", "approve"):
+        blocked = run_cli(
+            git_repo,
+            fixture,
+            command,
+            run_id,
+            *("--agent-fixture", str(agents)) if command == "deliver" else (),
+        )
+        assert blocked.returncode == 2
+        assert stdout_json(blocked)["status"] == "abandonment_pending"
+        blocked_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+        assert blocked_fixture["delivery"]["mutations"] == frozen_pending_mutations
+
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
     assert abandoned.returncode == 0, abandoned.stderr
@@ -382,6 +403,58 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
     assert {"action": "close_change_pr", "pr_number": 1} in after["delivery"][
         "mutations"
     ]
+    assert str(git_repo / ".agent-run" / "worktrees" / run_id) not in subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
+def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket()},
+        delivery={
+            "required_checks": ["none"],
+            "external_close_before_primary_ticket": True,
+        },
+    )
+    agents = _write_agents(git_repo / "agents.json", two_revisions=False)
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    recovered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert load_only_run_state(git_repo)["ticket_jobs"]["2"][
+        "ticket_closed_by_run"
+    ] is False
+
+    drifted = json.loads(fixture.read_text(encoding="utf-8"))
+    added = _ticket()
+    added.update({"number": 4, "title": "Unexpected added ticket"})
+    drifted["parent"]["sub_issues"] = [2, 4]
+    drifted["issues"]["4"] = added
+    fixture.write_text(json.dumps(drifted), encoding="utf-8")
+    assert run_cli(git_repo, fixture, "resume", run_id).returncode == 2
+
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert abandoned.returncode == 0, abandoned.stderr
+    after = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after["issues"]["2"]["state"] == "CLOSED"
+    assert not any(
+        mutation["action"].startswith("abandonment_")
+        for mutation in after["delivery"]["mutations"]
+    )
 
 
 @pytest.mark.parametrize(

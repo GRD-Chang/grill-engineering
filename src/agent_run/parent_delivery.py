@@ -2,12 +2,11 @@ from __future__ import annotations
 
 """Parent-only delivery using the shared candidate-first change lifecycle."""
 
-import shutil
 from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
-from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.parent_delivery_loop import ParentDeliveryLoop
@@ -188,13 +187,37 @@ class ParentDeliveryEngine:
                 return state
             if job.get("phase") == "abandoned":
                 return state
-            pr_number = job.get("pr_number")
-            if isinstance(pr_number, int):
-                self.github.abandon_parent_pr(pr_number)
-            shutil.rmtree(
-                self.states.root / "worktrees" / str(state["run_id"]),
-                ignore_errors=True,
-            )
+            abandonment = state.get("run_abandonment")
+            if not isinstance(abandonment, dict):
+                pr_number = job.get("pr_number")
+                abandonment = {
+                    "phase": "pending",
+                    "kind": "parent_only",
+                    "parent_pr": (
+                        {"pr_number": pr_number, "status": "pending"}
+                        if isinstance(pr_number, int)
+                        else None
+                    ),
+                }
+                state.update(
+                    {
+                        "run_abandonment": abandonment,
+                        "status": "abandonment_pending",
+                        "terminal_kind": "abandonment_pending",
+                        "diagnostics": [],
+                    }
+                )
+                self._save(state)
+            parent_pr = abandonment.get("parent_pr")
+            if (
+                isinstance(parent_pr, dict)
+                and parent_pr.get("status") != "completed"
+            ):
+                self.github.abandon_parent_pr(int(parent_pr["pr_number"]))
+                parent_pr["status"] = "completed"
+                self._save(state)
+            remove_run_worktrees(self.git, self.states, run_id)
+            abandonment["phase"] = "completed"
             job["phase"] = "abandoned"
             state.update(
                 {

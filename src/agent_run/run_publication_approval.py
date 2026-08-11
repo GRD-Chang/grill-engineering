@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import shutil
 from typing import Any
 
-from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.git import GitError
 from agent_run.run_publication_shared import RunPublicationShared
 
@@ -127,31 +126,63 @@ class RunPublicationApproval(RunPublicationShared):
                 raise ValueError("a merged Run cannot be abandoned")
             if publication["phase"] == "abandoned":
                 return state
-            for change_pr_number in _change_pr_numbers(state):
-                self.github.abandon_change_pr(change_pr_number)
-            for job in self._mapping(state, "ticket_jobs").values():
-                if not isinstance(job, dict) or job.get("phase") != "completed":
-                    continue
-                ticket_number = job.get("ticket_number")
-                ticket_pr_number = job.get("pr_number")
-                integrated_sha = job.get("integrated_sha")
-                if (
-                    isinstance(ticket_number, int)
-                    and isinstance(ticket_pr_number, int)
-                    and isinstance(integrated_sha, str)
-                ):
-                    self.github.recover_abandoned_ticket(
-                        ticket_number=ticket_number,
+            abandonment = state.get("run_abandonment")
+            if not isinstance(abandonment, dict):
+                final_pr_number = publication.get("pr_number")
+                abandonment = {
+                    "phase": "pending",
+                    "kind": "ticket_run",
+                    "change_prs": [
+                        {"pr_number": number, "status": "pending"}
+                        for number in _change_pr_numbers(state)
+                    ],
+                    "tickets": _ticket_recovery_obligations(state),
+                    "final_pr": (
+                        {"pr_number": final_pr_number, "status": "pending"}
+                        if isinstance(final_pr_number, int)
+                        else None
+                    ),
+                }
+                state.update(
+                    {
+                        "run_abandonment": abandonment,
+                        "status": "abandonment_pending",
+                        "terminal_kind": "abandonment_pending",
+                        "diagnostics": [],
+                    }
+                )
+                self._save(state)
+            for ticket in _obligation_list(abandonment, "tickets"):
+                if ticket.get("eligible") is None:
+                    ticket["eligible"] = self.github.ticket_closed_by_run(
+                        ticket_number=int(ticket["ticket_number"]),
                         run_id=run_id,
-                        pr_number=ticket_pr_number,
-                        integrated_sha=integrated_sha,
                     )
-            final_pr_number = publication.get("pr_number")
-            if isinstance(final_pr_number, int):
-                self.github.abandon_run_pr(final_pr_number)
-            shutil.rmtree(
-                self.states.root / "worktrees" / str(state["run_id"]), ignore_errors=True
-            )
+                    self._save(state)
+            for change_pr in _obligation_list(abandonment, "change_prs"):
+                if change_pr.get("status") != "completed":
+                    self.github.abandon_change_pr(int(change_pr["pr_number"]))
+                    change_pr["status"] = "completed"
+                    self._save(state)
+            for ticket in _obligation_list(abandonment, "tickets"):
+                if ticket.get("eligible") is True and ticket.get("status") != "completed":
+                    self.github.recover_abandoned_ticket(
+                        ticket_number=int(ticket["ticket_number"]),
+                        run_id=run_id,
+                        pr_number=int(ticket["pr_number"]),
+                        integrated_sha=str(ticket["integrated_sha"]),
+                    )
+                    ticket["status"] = "completed"
+                    self._save(state)
+                elif ticket.get("eligible") is False:
+                    ticket["status"] = "not_owned"
+            final_pr = abandonment.get("final_pr")
+            if isinstance(final_pr, dict) and final_pr.get("status") != "completed":
+                self.github.abandon_run_pr(int(final_pr["pr_number"]))
+                final_pr["status"] = "completed"
+                self._save(state)
+            remove_run_worktrees(self.git, self.states, run_id)
+            abandonment["phase"] = "completed"
             publication["phase"] = "abandoned"
             state.update(
                 {"status": "abandoned", "terminal_kind": "abandoned", "diagnostics": []}
@@ -243,3 +274,42 @@ def _change_pr_numbers(state: dict[str, Any]) -> list[int]:
         if isinstance(repair, dict) and isinstance(repair.get("pr_number"), int):
             numbers.add(int(repair["pr_number"]))
     return sorted(numbers)
+
+
+def _ticket_recovery_obligations(
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    obligations: list[dict[str, Any]] = []
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return obligations
+    for job in jobs.values():
+        if not isinstance(job, dict) or job.get("phase") not in {"merged", "completed"}:
+            continue
+        ticket_number = job.get("ticket_number")
+        pr_number = job.get("pr_number")
+        integrated_sha = job.get("integrated_sha")
+        if (
+            isinstance(ticket_number, int)
+            and isinstance(pr_number, int)
+            and isinstance(integrated_sha, str)
+        ):
+            obligations.append(
+                {
+                    "ticket_number": ticket_number,
+                    "pr_number": pr_number,
+                    "integrated_sha": integrated_sha,
+                    "eligible": None,
+                    "status": "pending",
+                }
+            )
+    return sorted(obligations, key=lambda item: int(item["ticket_number"]))
+
+
+def _obligation_list(
+    abandonment: dict[str, Any], key: str
+) -> list[dict[str, Any]]:
+    value = abandonment.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"run_abandonment.{key} must contain objects")
+    return value

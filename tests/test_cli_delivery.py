@@ -250,6 +250,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
         capture_output=True,
         check=False,
     ).returncode != 0
+
     replayed = run_cli(git_repo, fixture, "resume", run_id)
     assert replayed.returncode == 0, replayed.stderr
     assert stdout_json(replayed)["status"] == "completed"
@@ -263,7 +264,6 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
         capture_output=True,
         check=False,
     ).returncode != 0
-
 
 def test_parent_only_development_human_blocker_stops_before_candidate(
     git_repo: Path,
@@ -883,6 +883,29 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     assert blocked.returncode == 2
     assert stdout_json(blocked)["status"] == "unsupported_scope_change"
 
+    pending = json.loads(fixture.read_text(encoding="utf-8"))
+    pending["delivery"]["crash_after_abandon_parent_pr_once"] = True
+    fixture.write_text(json.dumps(pending), encoding="utf-8")
+    interrupted = run_cli(git_repo, fixture, "abandon", run_id)
+    assert interrupted.returncode == 2
+    assert stdout_json(interrupted)["status"] == "abandonment_pending"
+    frozen_pending = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "mutations"
+    ]
+    blocked_replay = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert blocked_replay.returncode == 2
+    assert stdout_json(blocked_replay)["status"] == "abandonment_pending"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "mutations"
+    ] == frozen_pending
+
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
     assert abandoned.returncode == 0, abandoned.stderr
@@ -895,6 +918,13 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
         "mutations"
     ]
     assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+    assert str(git_repo / ".agent-run" / "worktrees" / run_id) not in subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
     frozen_mutations = after["delivery"]["mutations"]
 
     replayed = run_cli(
@@ -1103,6 +1133,31 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
         capture_output=True,
         check=False,
     ).returncode != 0
+
+    completed_state = load_only_run_state(git_repo)
+    completed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    added = ticket()
+    added.update({"number": 4, "title": "Added after completion"})
+    completed_fixture["parent"]["sub_issues"] = [3, 4]
+    completed_fixture["issues"]["4"] = added
+    fixture.write_text(json.dumps(completed_fixture), encoding="utf-8")
+    frozen_mutations = completed_fixture["delivery"]["mutations"]
+
+    for command in ("resume", "deliver", "abandon"):
+        replayed = run_cli(
+            git_repo,
+            fixture,
+            command,
+            run_id,
+            *("--agent-fixture", str(ticket_agents))
+            if command == "deliver"
+            else (),
+        )
+        assert replayed.returncode == 0, replayed.stderr
+        assert stdout_json(replayed)["status"] == "completed"
+        assert load_only_run_state(git_repo) == completed_state
+        replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+        assert replayed_fixture["delivery"]["mutations"] == frozen_mutations
 
 
 def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(

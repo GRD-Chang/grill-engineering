@@ -139,7 +139,7 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
     # established reconciliation path instead of being rejected locally.
     if status in {"execution_failed", "abandoned"}:
         return True
-    if status == "unsupported_scope_change":
+    if status in {"unsupported_scope_change", "abandonment_pending"}:
         return False
     if command == "deliver":
         return True

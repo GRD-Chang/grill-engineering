@@ -141,6 +141,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if state.get("status") == "unsupported_scope_change":
                 cli_presentation._print_precondition_failure(state)
                 return 2
+            if state.get("status") == "abandonment_pending":
+                cli_presentation._print_precondition_failure(state)
+                return 2
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
@@ -279,7 +282,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ).resume(parsed.run_id)
         elif parsed.command == "deliver":
             refreshed, _ = controller.resume(parsed.run_id)
-            if refreshed.get("status") == "unsupported_scope_change":
+            if refreshed.get("status") in {"completed", "abandoned"}:
+                state = refreshed
+            elif refreshed.get("status") == "unsupported_scope_change":
                 state = refreshed
                 precondition_failed = True
             else:
@@ -387,7 +392,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 default_branch=repository.default_branch,
                 default_head_sha=default_head,
             )
-            if refreshed.get("status") == "abandoned":
+            if refreshed.get("status") in {"abandoned", "completed"}:
                 state = refreshed
             elif (
                 refreshed.get("status") == "unsupported_scope_change"
@@ -505,6 +510,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             failure_recorded = controller.record_execution_failure(
                 run_id, str(error)
             )
+        durable_status = None
+        if states is not None and isinstance(run_id, str):
+            durable = states.load_run(run_id)
+            if isinstance(durable, dict):
+                durable_status = durable.get("status")
         diagnostic_code = (
             "multiple_unfinished_runs"
             if str(error).startswith("multiple unfinished Delivery Runs")
@@ -521,7 +531,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 {
                     "result": "error",
                     "status": (
-                        "execution_failed" if failure_recorded else "blocked"
+                        "execution_failed"
+                        if failure_recorded
+                        else (
+                            durable_status
+                            if durable_status
+                            in {"abandonment_pending", "completed", "abandoned"}
+                            else "blocked"
+                        )
                     ),
                     "diagnostics": [
                         {

@@ -24,6 +24,7 @@ def _print_precondition_failure(state: dict[str, object]) -> None:
                     },
                 ],
                 "scope_change": state.get("unsupported_scope_change"),
+                "abandonment": state.get("run_abandonment"),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -48,6 +49,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "next_action": _next_action(state),
         "diagnostics": state.get("diagnostics", []),
         "scope_change": state.get("unsupported_scope_change"),
+        "abandonment": state.get("run_abandonment"),
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -76,6 +78,9 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         summary = scope_change.get("graph_change_summary")
         if isinstance(summary, dict):
             print(f"变化摘要: {summary.get('summary')}")
+    abandonment = output["abandonment"]
+    if isinstance(abandonment, dict):
+        print(f"放弃恢复: {abandonment.get('phase')}")
     print(f"下一步: {output['next_action']}")
 
 
@@ -87,6 +92,7 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         "run_id": state.get("run_id"),
         "timeline": timeline,
         "next_action": _next_action(state),
+        "abandonment": state.get("run_abandonment"),
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -142,6 +148,8 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run approve {run_id}"
     if status == "unsupported_scope_change":
         return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
+    if status == "abandonment_pending" and isinstance(run_id, str):
+        return f"agent-run abandon {run_id}"
     if status in {"ready_for_human", "progress_exhausted", "blocked"}:
         return "处理诊断中的人工事项"
     if status in {
@@ -278,6 +286,7 @@ def _display_term(value: object) -> object:
         "run_approval_pending": "等待人工批准",
         "ready_for_human": "等待人工处理",
         "unsupported_scope_change": "不支持的范围变化",
+        "abandonment_pending": "等待放弃恢复",
         "progress_exhausted": "无可推进任务",
         "execution_failed": "执行失败，可恢复",
         "blocked": "已阻塞",

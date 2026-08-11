@@ -788,7 +788,7 @@ class GhGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+    ) -> bool:
         issue = _mapping(
             self._json(
                 "issue",
@@ -801,13 +801,24 @@ class GhGitHubPublisher:
             )
         )
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:completed -->"
+        close_marker = (
+            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-closed -->"
+        )
         comments = issue.get("comments")
         already_recorded = isinstance(comments, list) and any(
             marker in str(_mapping(comment).get("body", "")) for comment in comments
         )
-        if not already_recorded:
+        publisher_closed = isinstance(comments, list) and any(
+            close_marker in str(_mapping(comment).get("body", ""))
+            for comment in comments
+        )
+        if not already_recorded or (
+            issue.get("state") != "CLOSED" and not publisher_closed
+        ):
             body = (
-                f"{marker}\nDelivery Run `{run_id}` completed this ticket in "
+                f"{marker}\n"
+                f"{close_marker if issue.get('state') != 'CLOSED' else ''}\n"
+                f"Delivery Run `{run_id}` completed this ticket in "
                 f"PR #{pr_number}; Run Branch commit `{integrated_sha}`. "
                 "This change has not yet entered the default branch."
             )
@@ -821,6 +832,7 @@ class GhGitHubPublisher:
                 body,
             )
         if issue.get("state") != "CLOSED":
+            publisher_closed = True
             self._require(
                 "issue",
                 "close",
@@ -828,6 +840,30 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
             )
+        return publisher_closed
+
+    def ticket_closed_by_run(
+        self, *, ticket_number: int, run_id: str
+    ) -> bool:
+        issue = _mapping(
+            self._json(
+                "issue",
+                "view",
+                str(ticket_number),
+                "--repo",
+                self.repository,
+                "--json",
+                "comments",
+            )
+        )
+        marker = (
+            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-closed -->"
+        )
+        comments = issue.get("comments")
+        return isinstance(comments, list) and any(
+            marker in str(_mapping(comment).get("body", ""))
+            for comment in comments
+        )
 
     def recover_abandoned_ticket(
         self,

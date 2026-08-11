@@ -71,7 +71,11 @@ class Controller:
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
-            if existing.get("status") == "abandoned":
+            if existing.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+            }:
                 return existing, True
             parent = _state_mapping(existing, "parent")
             parent_number = int(parent["number"])
@@ -100,6 +104,7 @@ class Controller:
                 return False
             if state.get("status") in {
                 "abandoned",
+                "abandonment_pending",
                 "completed",
                 "parent_closeout_pending",
             }:
@@ -250,7 +255,7 @@ class Controller:
         else:
             state = existing
             run_id = str(state["run_id"])
-            if state.get("status") == "abandoned":
+            if state.get("status") in {"abandoned", "abandonment_pending"}:
                 return state, True
         base = _state_mapping(state, "base")
         base_sha = str(base["sha"])

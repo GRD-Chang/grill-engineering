@@ -280,6 +280,7 @@ class FixtureGitHubPublisher:
                 {"action": "close_parent_pr", "pr_number": pr_number}
             )
             self._save()
+            self._crash_once("abandon_parent_pr")
 
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
@@ -395,6 +396,7 @@ class FixtureGitHubPublisher:
                 {"action": "close_final_run_pr", "pr_number": pr_number}
             )
             self._save()
+            self._crash_once("abandon_run_pr")
 
     def abandon_change_pr(self, pr_number: int) -> None:
         pull = self._pull(pr_number)
@@ -404,6 +406,7 @@ class FixtureGitHubPublisher:
                 {"action": "close_change_pr", "pr_number": pr_number}
             )
             self._save()
+            self._crash_once("abandon_change_pr")
 
     def publish_branch(
         self,
@@ -635,7 +638,7 @@ class FixtureGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+    ) -> bool:
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,
@@ -651,13 +654,21 @@ class FixtureGitHubPublisher:
         ):
             mutations.append({"action": "completion_comment", **marker})
         closed = _mutable_list(self._delivery(), "closed_issues")
-        if ticket_number not in closed:
-            closed.append(ticket_number)
-            mutations.append({"action": "close_issue", **marker})
+        publisher_closed = ticket_number in closed
         raw_issues = _mutable_mapping(self.data, "issues")
         issue = raw_issues.get(str(ticket_number))
-        if isinstance(issue, dict):
+        if self._delivery().pop("external_close_before_primary_ticket", False):
+            if isinstance(issue, dict):
+                issue["state"] = "CLOSED"
+        if (
+            not publisher_closed
+            and isinstance(issue, dict)
+            and issue.get("state") != "CLOSED"
+        ):
+            closed.append(ticket_number)
+            mutations.append({"action": "close_issue", **marker})
             issue["state"] = "CLOSED"
+            publisher_closed = True
         for raw_issue in raw_issues.values():
             if not isinstance(raw_issue, dict):
                 continue
@@ -680,6 +691,15 @@ class FixtureGitHubPublisher:
             raise OSError(
                 "simulated lost response after Primary Ticket close"
             )
+        return publisher_closed
+
+    def ticket_closed_by_run(
+        self, *, ticket_number: int, run_id: str
+    ) -> bool:
+        del run_id
+        return ticket_number in _mutable_list(
+            self._delivery(), "closed_issues"
+        )
 
     def recover_abandoned_ticket(
         self,
@@ -729,6 +749,7 @@ class FixtureGitHubPublisher:
                     ):
                         blocker["state"] = "OPEN"
         self._save()
+        self._crash_once("recover_abandoned_ticket")
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         raw_issues = _mutable_mapping(self.data, "issues")

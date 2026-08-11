@@ -255,3 +255,16 @@ class DeliveryCleanupEngine:
         if not isinstance(value, int):
             raise ValueError(f"{key} must be an integer")
         return value
+
+
+def remove_run_worktrees(
+    git: GitRepository, states: StateStore, run_id: str
+) -> None:
+    root = states.root / "worktrees" / run_id
+    if root.exists():
+        for checkout in root.iterdir():
+            git.remove_worktree(checkout)
+        try:
+            root.rmdir()
+        except OSError:
+            pass
