@@ -215,6 +215,41 @@ def test_public_cli_recovers_after_external_response_loss(
     _assert_exactly_once_delivery(git_repo, fixture)
 
 
+def test_abandon_recovers_ticket_after_close_response_loss(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket()},
+        delivery={"crash_after_close_once": True},
+    )
+    agents = _write_agents(
+        git_repo / "agents.json", reviewer="reviewer-first"
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    interrupted = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert interrupted.returncode == 2
+    interrupted_state = load_only_run_state(git_repo)
+    assert interrupted_state["ticket_jobs"]["2"]["phase"] == "merged"
+    interrupted_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert interrupted_fixture["issues"]["2"]["state"] == "CLOSED"
+
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    recovered_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert recovered_fixture["issues"]["2"]["state"] == "OPEN"
+    assert recovered_fixture["delivery"]["closed_issues"] == []
+
+
 def test_ready_for_human_remainder_is_reported_after_independent_work(
     git_repo: Path,
 ) -> None:

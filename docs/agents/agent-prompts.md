@@ -38,7 +38,8 @@ Controller 只验证这个精确最小形状、保存/展示原字符串并暂�
 - Fresh Validation：首次使用新 Reviewer Thread；先读适用 Issue，派发 E2E、Standards 与 Spec 三条独立 lane，只输出现有 Acceptance Artifact。Human 恢复才复用该 Reviewer Thread，并重新准备验证 checkout。
 - Publication：只读 Issue、checkout diff 与完整 Acceptance Artifact；不得修改文件或 Git/GitHub，输出既有 Publication Artifact，PR 叙事必须有四个必需章节。
 - Final Run Publication：只读 Parent Issue、累计 diff 与完整 Run Acceptance Artifact；输出既有 Publication Artifact，不替代验收或人工批准。
-- Scope Impact Assessment 不在本次动态上下文合同内，保持其现有 Prompt 与行为不变。
+- Scope Impact Assessment 已删除。Ticket Graph drift 由 Controller 机械比较并 fail closed，
+  不构造语义分类 Prompt，也不创建 Codex Thread。
 
 ## 历史设计记录（不作为运行时 Prompt 合同）
 

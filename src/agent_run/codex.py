@@ -420,25 +420,6 @@ class CodexCliBackend:
         )
         return prompt
 
-    def assess_scope(self, request: dict[str, Any]) -> dict[str, Any]:
-        checkout = Path(_string(request, "checkout"))
-        prompt = (
-            "你是范围影响分析师。比较新旧 Parent Issue、当前 Ticket Graph 和既有已完成工作，"
-            "只判断 Parent 变化"
-            "是否改变 Ticket 集合、依赖关系、整体交付边界，或使已完成 Ticket 需要"
-            "返工。文案澄清或不影响这些结构的补充不是结构性变化。使用所需工具核验，"
-            "但不要 commit、push、merge、close 或修改 Issue/PR；只输出符合 schema "
-            "的结构化判断。\n\n"
-            f"Scope Assessment Brief:\n{_pretty(request)}"
-        )
-        output, _thread_id = self._invoke(
-            prompt=prompt,
-            checkout=checkout,
-            thread_id=None,
-            schema=_scope_impact_schema(),
-        )
-        return _json_object(output, "Scope Impact Assessment")
-
     def _invoke(
         self,
         *,
@@ -647,25 +628,3 @@ def _string(data: dict[str, Any], key: str) -> str:
 
 def _pretty(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def _scope_impact_schema() -> dict[str, Any]:
-    text_fields = (
-        "summary",
-        "ticket_set_impact",
-        "dependency_impact",
-        "delivery_boundary_impact",
-        "completed_work_impact",
-    )
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["structural_change", *text_fields],
-        "properties": {
-            "structural_change": {"type": "boolean"},
-            **{
-                field: {"type": "string", "minLength": 1}
-                for field in text_fields
-            },
-        },
-    }

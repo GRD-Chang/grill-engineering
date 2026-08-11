@@ -250,16 +250,20 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
         capture_output=True,
         check=False,
     ).returncode != 0
+
     replayed = run_cli(git_repo, fixture, "resume", run_id)
     assert replayed.returncode == 0, replayed.stderr
     assert stdout_json(replayed)["status"] == "completed"
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "completed"
+    assert load_only_run_state(git_repo)["status"] == "completed"
     assert subprocess.run(
         ["git", "show-ref", "--verify", f"refs/heads/{state['parent_branch']}"],
         cwd=git_repo,
         capture_output=True,
         check=False,
     ).returncode != 0
-
 
 def test_parent_only_development_human_blocker_stops_before_candidate(
     git_repo: Path,
@@ -583,6 +587,106 @@ def test_parent_only_approve_recovers_after_closeout_response_loss(
     ]
 
 
+def test_resume_freezes_parent_closeout_assets_after_graph_drift(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={},
+        delivery={"crash_after_close_parent_issue_once": True},
+    )
+    agent_fixture = git_repo / "parent-only-agents.json"
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-reviewer-1", "candidate passed"
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    interrupted = run_cli(git_repo, fixture, "approve", run_id)
+    assert interrupted.returncode == 2
+
+    before_state = load_only_run_state(git_repo)
+    before_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    parent_job = before_state["parent_job"]
+    branch = parent_job["parent_branch"]
+    frozen_local = {
+        "candidate_sha": parent_job["candidate_sha"],
+        "acceptance_record": parent_job["acceptance_record"],
+        "branch_sha": subprocess.run(
+            ["git", "rev-parse", branch],
+            cwd=git_repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip(),
+    }
+    frozen_remote = {
+        "published_branch": before_fixture["delivery"]["published_branches"][
+            branch
+        ],
+        "pull_requests": before_fixture["delivery"]["pull_requests"],
+        "mutations": before_fixture["delivery"]["mutations"],
+    }
+
+    before_fixture["parent"]["sub_issues"] = [3]
+    before_fixture["issues"] = {"3": ticket()}
+    fixture.write_text(json.dumps(before_fixture), encoding="utf-8")
+
+    resumed = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert resumed.returncode == 2
+    assert stdout_json(resumed)["status"] == "unsupported_scope_change"
+    after_state = load_only_run_state(git_repo)
+    after_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after_state["parent_job"]["candidate_sha"] == frozen_local[
+        "candidate_sha"
+    ]
+    assert after_state["parent_job"]["acceptance_record"] == frozen_local[
+        "acceptance_record"
+    ]
+    assert subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip() == frozen_local["branch_sha"]
+    assert after_fixture["delivery"]["published_branches"][branch] == (
+        frozen_remote["published_branch"]
+    )
+    assert after_fixture["delivery"]["pull_requests"] == frozen_remote[
+        "pull_requests"
+    ]
+    assert after_fixture["delivery"]["mutations"] == frozen_remote[
+        "mutations"
+    ]
+
+
 def test_parent_only_approve_rechecks_required_checks_before_merge(
     git_repo: Path,
 ) -> None:
@@ -663,51 +767,7 @@ def test_parent_only_approve_rejects_stale_parent_revision(
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
 
-def test_confirmed_child_addition_switches_from_parent_only_to_ticket_flow(
-    git_repo: Path,
-) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "ticket-agents.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "ticket-developer-1",
-                        "summary": "Implemented the child ticket.",
-                        "write_files": {"ticket-feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [publication()],
-                "reviews": [passing_acceptance("ticket-reviewer-1", "candidate passed")],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["parent"]["sub_issues"] = [3]
-    data["issues"] = {"3": ticket()}
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-
-    pending = run_cli(git_repo, fixture, "resume", run_id)
-    assert pending.returncode == 2
-    assert stdout_json(pending)["status"] == "structure_change_pending"
-    confirmed = run_cli(git_repo, fixture, "confirm-structure", run_id)
-    assert confirmed.returncode == 0, confirmed.stderr
-    delivered = run_cli(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
-    )
-
-    assert delivered.returncode == 0, delivered.stderr
-    assert stdout_json(delivered)["status"] == "run_acceptance_pending"
-    state = load_only_run_state(git_repo)
-    assert state["delivery_type"] == "ticket_run"
-    assert state["ticket_jobs"]["3"]["phase"] == "completed"
-
-
-def test_unconfirmed_child_addition_cannot_continue_parent_only_delivery(
+def test_child_addition_cannot_continue_parent_only_delivery(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -724,40 +784,163 @@ def test_unconfirmed_child_addition_cannot_continue_parent_only_delivery(
     )
 
     assert delivered.returncode == 2
-    assert stdout_json(delivered)["status"] == "structure_change_pending"
+    delivered_json = stdout_json(delivered)
+    assert delivered_json["status"] == "unsupported_scope_change"
+    assert delivered_json["scope_change"]["graph_change_summary"][
+        "added_tickets"
+    ] == [3]
     assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get("pull_requests", []) == []
 
+    blocked = load_only_run_state(git_repo)
+    accepted = blocked["unsupported_scope_change"]["accepted_graph_revision"]
+    observed = blocked["unsupported_scope_change"]["observed_graph_revision"]
+    for command, identifier, extra in (
+        ("run", "1", ()),
+        ("resume", run_id, ()),
+        ("accept-run", run_id, ()),
+        ("publish-run", run_id, ()),
+        ("approve", run_id, ()),
+        ("revise", run_id, ("--message", "do not absorb drift")),
+    ):
+        result = run_cli(git_repo, fixture, command, identifier, *extra)
+        assert result.returncode == 2, (command, result.stdout, result.stderr)
+        assert stdout_json(result)["status"] == "unsupported_scope_change"
 
-def test_confirmed_child_addition_closes_existing_parent_pr(
-    git_repo: Path,
-) -> None:
+    status = stdout_json(
+        run_cli(git_repo, fixture, "status", run_id, "--json")
+    )
+    assert status["scope_change"]["accepted_graph_revision"] == accepted
+    assert status["scope_change"]["observed_graph_revision"] == observed
+    assert "abandon" in status["next_action"]
+    status_text = run_cli(git_repo, fixture, "status", run_id).stdout
+    assert f"accepted={accepted}" in status_text
+    assert f"observed={observed}" in status_text
+    assert "Ticket 图变化：新增 1" in status_text
+    history = stdout_json(
+        run_cli(git_repo, fixture, "history", run_id, "--json")
+    )
+    scope_events = [
+        event
+        for event in history["timeline"]
+        if event.get("kind") == "unsupported_scope_change"
+    ]
+    assert len(scope_events) == 1
+    assert scope_events[0]["accepted_graph_revision"] == accepted
+    assert scope_events[0]["observed_graph_revision"] == observed
+    assert scope_events[0]["graph_change_summary"]["added_tickets"] == [3]
+    assert "abandon" in history["next_action"]
+    history_text = run_cli(git_repo, fixture, "history", run_id).stdout
+    assert f"accepted={accepted}" in history_text
+    assert f"observed={observed}" in history_text
+    assert "新增 Ticket [3]" in history_text
+    final = json.loads(fixture.read_text(encoding="utf-8"))
+    assert final.get("delivery", {}).get("mutations", []) == []
+
+
+def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     agents = git_repo / "parent-only-agents.json"
     agents.write_text(
         json.dumps(
             {
-                "developments": [{"expected_thread_id": None, "thread_id": "parent-dev", "summary": "Implemented Parent.", "write_files": {"parent-feature.txt": "done\n"}}],
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
                 "publications": [parent_publication()],
-                "reviews": [passing_acceptance("parent-review", "candidate passed")],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-reviewer-1",
+                        "parent-feature.txt is present in the candidate.",
+                    )
+                ],
             }
         ),
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents))
+    delivered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
     assert delivered.returncode == 0, delivered.stderr
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["parent"]["sub_issues"] = [3]
-    data["issues"] = {"3": ticket()}
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    assert stdout_json(run_cli(git_repo, fixture, "resume", run_id))["status"] == "structure_change_pending"
+    assert stdout_json(delivered)["status"] == "parent_approval_pending"
+    before_drift = json.loads(fixture.read_text(encoding="utf-8"))
+    assert before_drift["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
-    confirmed = run_cli(git_repo, fixture, "confirm-structure", run_id)
+    before_drift["parent"]["sub_issues"] = [3]
+    before_drift["issues"] = {"3": ticket()}
+    fixture.write_text(json.dumps(before_drift), encoding="utf-8")
+    blocked = run_cli(git_repo, fixture, "resume", run_id)
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "unsupported_scope_change"
 
-    assert confirmed.returncode == 0, confirmed.stderr
-    data = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
-    assert data["pull_requests"][0]["state"] == "CLOSED"
-    assert data["mutations"][-1] == {"action": "close_parent_pr", "pr_number": 1}
+    pending = json.loads(fixture.read_text(encoding="utf-8"))
+    pending["delivery"]["crash_after_abandon_parent_pr_once"] = True
+    fixture.write_text(json.dumps(pending), encoding="utf-8")
+    interrupted = run_cli(git_repo, fixture, "abandon", run_id)
+    assert interrupted.returncode == 2
+    assert stdout_json(interrupted)["status"] == "abandonment_pending"
+    frozen_pending = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "mutations"
+    ]
+    blocked_replay = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert blocked_replay.returncode == 2
+    assert stdout_json(blocked_replay)["status"] == "abandonment_pending"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "mutations"
+    ] == frozen_pending
+
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    abandoned_state = load_only_run_state(git_repo)
+    assert abandoned_state["parent_job"]["phase"] == "abandoned"
+    after = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after["delivery"]["pull_requests"][0]["state"] == "CLOSED"
+    assert {"action": "close_parent_pr", "pr_number": 1} in after["delivery"][
+        "mutations"
+    ]
+    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+    assert str(git_repo / ".agent-run" / "worktrees" / run_id) not in subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    frozen_mutations = after["delivery"]["mutations"]
+
+    replayed = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert replayed.returncode == 0, replayed.stderr
+    assert stdout_json(replayed)["status"] == "abandoned"
+    replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert replayed_fixture["delivery"]["mutations"] == frozen_mutations
+    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
 
 
 def test_scripted_cli_delivers_active_ticket_end_to_end(
@@ -950,6 +1133,31 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
         capture_output=True,
         check=False,
     ).returncode != 0
+
+    completed_state = load_only_run_state(git_repo)
+    completed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    added = ticket()
+    added.update({"number": 4, "title": "Added after completion"})
+    completed_fixture["parent"]["sub_issues"] = [3, 4]
+    completed_fixture["issues"]["4"] = added
+    fixture.write_text(json.dumps(completed_fixture), encoding="utf-8")
+    frozen_mutations = completed_fixture["delivery"]["mutations"]
+
+    for command in ("resume", "deliver", "abandon"):
+        replayed = run_cli(
+            git_repo,
+            fixture,
+            command,
+            run_id,
+            *("--agent-fixture", str(ticket_agents))
+            if command == "deliver"
+            else (),
+        )
+        assert replayed.returncode == 0, replayed.stderr
+        assert stdout_json(replayed)["status"] == "completed"
+        assert load_only_run_state(git_repo) == completed_state
+        replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+        assert replayed_fixture["delivery"]["mutations"] == frozen_mutations
 
 
 def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(

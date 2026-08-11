@@ -23,7 +23,10 @@ def _run_to_human_gate(
     # A read budget exhausted while selecting the Run is itself the durable
     # recovery boundary.  Do not immediately spend another budget through the
     # nested resume in the same foreground invocation.
-    if resumed and state.get("status") != "execution_failed":
+    if resumed and state.get("status") not in {
+        "execution_failed",
+        "abandonment_pending",
+    }:
         _invoke_nested("resume", run_id, *arguments, *_agent_fixture_arguments(parsed, "resume"))
     state = _load_local_run(states, run_id)
     previous_marker: tuple[object, ...] | None = None
@@ -85,7 +88,8 @@ def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, 
     if exit_code != 0 and result.get("status") not in {
         "waiting_checks",
         "ready_for_human",
-        "structure_change_pending",
+        "unsupported_scope_change",
+        "abandonment_pending",
         "progress_exhausted",
         "execution_failed",
         "blocked",
@@ -124,7 +128,6 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
 
 def _is_lifecycle_action(command: str) -> bool:
     return command in {
-        "confirm-structure",
         "deliver",
         "accept-run",
         "publish-run",
@@ -140,8 +143,8 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
     # established reconciliation path instead of being rejected locally.
     if status in {"execution_failed", "abandoned"}:
         return True
-    if command == "confirm-structure":
-        return status == "structure_change_pending"
+    if status in {"unsupported_scope_change", "abandonment_pending"}:
+        return False
     if command == "deliver":
         return True
     if command == "accept-run":

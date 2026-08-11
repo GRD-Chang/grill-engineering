@@ -15,6 +15,7 @@ from agent_run.change_delivery import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 
@@ -185,15 +186,50 @@ class TicketDeliveryLoop:
         # Persist the integrated boundary before the external Issue mutation.
         job["phase"] = TicketPhase.MERGED.value
         self._save(state)
-        self.github.close_primary_ticket(
+        close_intent = job.get("ticket_close_intent")
+        if not isinstance(close_intent, dict):
+            close_intent = self.github.prepare_primary_ticket_close(
+                ticket_number=int(job["ticket_number"]),
+                run_id=str(state["run_id"]),
+                pr_number=int(job["pr_number"]),
+                integrated_sha=integrated,
+            )
+            job["ticket_close_intent"] = close_intent
+            self._save(state)
+        if not isinstance(close_intent, dict):
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "Ticket close preparation did not establish current ownership",
+            )
+        dispatch_intent = close_intent
+
+        def record_dispatch_boundary() -> None:
+            nonlocal dispatch_intent
+            if dispatch_intent.get("dispatch_attempted") is True:
+                return
+            dispatch_intent = {**dispatch_intent, "dispatch_attempted": True}
+            job["ticket_close_intent"] = dispatch_intent
+            self._save(state)
+
+        close_ownership = self.github.close_primary_ticket(
             ticket_number=int(job["ticket_number"]),
             run_id=str(state["run_id"]),
             pr_number=int(job["pr_number"]),
             integrated_sha=integrated,
+            close_intent=dispatch_intent,
+            before_dispatch=record_dispatch_boundary,
         )
+        if close_ownership is None:
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "Ticket close dispatch did not establish exact ownership",
+            )
+        job["ticket_close_ownership"] = close_ownership
+        job["ticket_closed_by_run"] = close_ownership is not None
         job.pop("blocked_reason", None)
         state["status"] = "ticket_completed"
         state["diagnostics"] = []
+        self._save(state)
         return True
 
     def _block(

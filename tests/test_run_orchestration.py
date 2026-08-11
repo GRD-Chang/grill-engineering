@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
@@ -266,7 +268,7 @@ def test_deliver_advances_the_complete_dag_and_enters_run_acceptance(
     assert commit_count == "4"
 
 
-def test_graph_change_pauses_with_impact_until_exact_revision_is_confirmed(
+def test_graph_change_fails_closed_with_auditable_revisions(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -287,30 +289,34 @@ def test_graph_change_pauses_with_impact_until_exact_revision_is_confirmed(
 
     assert paused.returncode == 2
     state = load_only_run_state(git_repo)
-    assert state["status"] == "structure_change_pending"
-    assert state["terminal_kind"] == "structure_change_pending"
+    assert state["status"] == "unsupported_scope_change"
+    assert state["terminal_kind"] == "unsupported_scope_change"
     assert state["active_ticket_job"] is None
     assert state["ticket_graph"] == original["ticket_graph"]
-    impact = state["pending_structure_change"]["graph_change_summary"]
+    change = state["unsupported_scope_change"]
+    assert change["accepted_graph_revision"] == original["ticket_graph"]["revision"]
+    assert change["observed_graph_revision"] != change["accepted_graph_revision"]
+    impact = change["graph_change_summary"]
     assert impact["added_tickets"] == [3]
     assert impact["removed_tickets"] == []
     assert impact["added_dependencies"] == [
         {"ticket_number": 3, "blocked_by": 2}
     ]
 
-    confirmed = run_cli(
-        git_repo, fixture, "confirm-structure", run_id
-    )
+    assert change["observed_ticket_graph"]["ordered_ticket_numbers"] == [2, 3]
 
-    assert confirmed.returncode == 0, confirmed.stdout
-    confirmed_state = load_only_run_state(git_repo)
-    assert confirmed_state["status"] == "active"
-    assert confirmed_state["active_ticket_job"]["ticket_number"] == 2
-    assert confirmed_state["ticket_graph"]["ordered_ticket_numbers"] == [2, 3]
-    assert "pending_structure_change" not in confirmed_state
+    data["parent"]["sub_issues"] = [2]
+    data["issues"].pop("3")
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    restored = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert restored.returncode == 0
+    restored_state = load_only_run_state(git_repo)
+    assert restored_state["status"] == "active"
+    assert "unsupported_scope_change" not in restored_state
 
 
-def test_structure_confirmation_never_authorizes_a_later_graph(
+def test_later_graph_drift_updates_observed_revision_without_accepting_it(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -324,32 +330,23 @@ def test_structure_confirmation_never_authorizes_a_later_graph(
     data["issues"]["3"] = _ticket(3)
     fixture.write_text(json.dumps(data), encoding="utf-8")
     run_cli(git_repo, fixture, "resume", run_id)
-    first_pending = load_only_run_state(git_repo)[
-        "pending_structure_change"
-    ]["proposed_revision"]
+    first = load_only_run_state(git_repo)["unsupported_scope_change"]
+    accepted = first["accepted_graph_revision"]
+    first_observed = first["observed_graph_revision"]
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["sub_issues"].append(4)
     data["issues"]["4"] = _ticket(4)
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    confirmed = run_cli(
-        git_repo, fixture, "confirm-structure", run_id
-    )
+    resumed = run_cli(git_repo, fixture, "resume", run_id)
 
-    assert confirmed.returncode == 2
+    assert resumed.returncode == 2
     state = load_only_run_state(git_repo)
-    assert state["status"] == "structure_change_pending"
-    assert (
-        state["pending_structure_change"]["accepted_revision"]
-        == first_pending
-    )
-    assert (
-        state["pending_structure_change"]["proposed_revision"]
-        != first_pending
-    )
-    assert state["pending_structure_change"]["graph_change_summary"][
-        "added_tickets"
-    ] == [4]
+    change = state["unsupported_scope_change"]
+    assert state["status"] == "unsupported_scope_change"
+    assert change["accepted_graph_revision"] == accepted
+    assert change["observed_graph_revision"] != first_observed
+    assert change["graph_change_summary"]["added_tickets"] == [3, 4]
 
 
 def test_legacy_run_does_not_silently_accept_graph_drift(
@@ -372,9 +369,9 @@ def test_legacy_run_does_not_silently_accept_graph_drift(
 
     resumed, _ = controller.resume(str(state["run_id"]))
 
-    assert resumed["status"] == "structure_change_pending"
+    assert resumed["status"] == "unsupported_scope_change"
     assert resumed["ticket_graph"]["ordered_ticket_numbers"] == [2]
-    assert resumed["pending_structure_change"]["graph_change_summary"][
+    assert resumed["unsupported_scope_change"]["graph_change_summary"][
         "added_tickets"
     ] == [3]
 
@@ -394,6 +391,8 @@ def test_parent_clarification_and_comments_do_not_change_the_ticket_graph(
     data["issues"]["2"]["comments"] = [
         {"author": "maintainer", "body": "Useful context only."}
     ]
+    data["issues"]["2"]["assignees"] = ["maintainer"]
+    data["issues"]["2"]["updated_at"] = "2099-01-01T00:00:00Z"
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
     resumed = run_cli(git_repo, fixture, "resume", run_id)
@@ -701,7 +700,132 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     ] == ["completion_comment", "close_issue", "delete_managed_branch"]
 
 
-def test_active_ticket_removal_pauses_structure_in_the_same_command(
+@pytest.mark.parametrize(
+    "recovery_case",
+    [
+        "response_loss",
+        "response_loss_event_lag",
+        "prepared_only",
+        "dispatch_pending",
+        "external_reopen",
+    ],
+)
+def test_provisional_close_intent_can_abandon(
+    git_repo: Path, recovery_case: str
+) -> None:
+    crash_flag = {
+        "response_loss": "crash_after_close_once",
+        "response_loss_event_lag": "crash_after_close_once",
+        "prepared_only": "crash_before_close_dispatch_once",
+        "dispatch_pending": "crash_after_close_dispatch_boundary_once",
+        "external_reopen": "crash_after_close_dispatch_boundary_once",
+    }[recovery_case]
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket(2)},
+        delivery={crash_flag: True},
+    )
+    agent_fixture = git_repo / "agents.json"
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-2",
+                        "summary": "Implemented ticket 2.",
+                        "write_files": {"ticket-2.txt": "done\n"},
+                    }
+                ],
+                "publications": [_publication(2)],
+                "reviews": [
+                    passing_acceptance("reviewer-2", "Ticket 2 passed.")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+
+    interrupted = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert interrupted.returncode == 2
+    interrupted_job = load_only_run_state(git_repo)["ticket_jobs"]["2"]
+    assert interrupted_job["phase"] == "merged"
+    assert isinstance(interrupted_job["ticket_close_intent"], dict)
+    assert "ticket_close_ownership" not in interrupted_job
+    interrupted_data = json.loads(fixture.read_text(encoding="utf-8"))
+    assert interrupted_data["issues"]["2"]["state"] == (
+        "CLOSED"
+        if recovery_case in {"response_loss", "response_loss_event_lag"}
+        else "OPEN"
+    )
+    assert (
+        interrupted_job["ticket_close_intent"].get("dispatch_attempted") is True
+    ) == (recovery_case != "prepared_only")
+    if recovery_case == "external_reopen":
+        interrupted_data["delivery"]["external_ticket_transitions"] = [2]
+        fixture.write_text(json.dumps(interrupted_data), encoding="utf-8")
+    elif recovery_case == "response_loss_event_lag":
+        interrupted_data["delivery"]["ticket_close_event_lag_reads"] = 2
+        fixture.write_text(json.dumps(interrupted_data), encoding="utf-8")
+
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+    if recovery_case in {"dispatch_pending", "response_loss_event_lag"}:
+        assert abandoned.returncode == 2
+        assert stdout_json(abandoned)["status"] == "abandonment_pending"
+        pending_data = json.loads(fixture.read_text(encoding="utf-8"))
+        assert pending_data["delivery"]["mutations"] == interrupted_data[
+            "delivery"
+        ]["mutations"]
+        abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+        if recovery_case == "dispatch_pending":
+            assert abandoned.returncode == 2
+            assert stdout_json(abandoned)["status"] == "abandonment_pending"
+            repeated_data = json.loads(fixture.read_text(encoding="utf-8"))
+            assert repeated_data["delivery"]["mutations"] == interrupted_data[
+                "delivery"
+            ]["mutations"]
+            return
+        assert abandoned.returncode == 2
+        assert stdout_json(abandoned)["status"] == "abandonment_pending"
+        if recovery_case == "response_loss_event_lag":
+            abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    assert data["issues"]["2"]["state"] == "OPEN"
+    abandonment_mutations = [
+        mutation["action"]
+        for mutation in data["delivery"]["mutations"]
+        if mutation["action"].startswith("abandonment_")
+    ]
+    assert abandonment_mutations == (
+        ["abandonment_reopen_issue", "abandonment_recovery_comment"]
+        if recovery_case in {"response_loss", "response_loss_event_lag"}
+        else []
+    )
+    close_mutations = [
+        mutation["action"]
+        for mutation in data["delivery"]["mutations"]
+        if mutation["action"] == "close_issue"
+    ]
+    assert close_mutations == (
+        ["close_issue"]
+        if recovery_case in {"response_loss", "response_loss_event_lag"}
+        else []
+    )
+
+
+def test_active_ticket_removal_stops_agents_and_preserves_work(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -712,196 +836,26 @@ def test_active_ticket_removal_pauses_structure_in_the_same_command(
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     state, _ = controller.start(1)
     agents = TicketRemovingAgents(fixture)
-    tickets = TicketDeliveryEngine(
-        git=git,
-        states=states,
-        github=FixtureGitHubPublisher(fixture, git),
-        agents=agents,
-    )
 
-    paused = DeliveryRunEngine(
-        controller=controller, tickets=tickets
+    blocked = DeliveryRunEngine(
+        controller=controller,
+        tickets=TicketDeliveryEngine(
+            git=git,
+            states=states,
+            github=FixtureGitHubPublisher(fixture, git),
+            agents=agents,
+        ),
     ).deliver(str(state["run_id"]))
 
-    assert paused["status"] == "structure_change_pending"
-    assert paused["active_ticket_job"] is None
-    impact = paused["pending_structure_change"]["graph_change_summary"]
-    assert impact["removed_tickets"] == [2]
+    assert blocked["status"] == "unsupported_scope_change"
+    assert blocked["active_ticket_job"] is None
+    assert blocked["unsupported_scope_change"]["graph_change_summary"][
+        "removed_tickets"
+    ] == [2]
     assert agents.publication_calls == 0
     assert agents.review_calls == 0
     data = json.loads(fixture.read_text(encoding="utf-8"))
     assert data.get("delivery", {}).get("pull_requests", []) == []
     assert data.get("delivery", {}).get("closed_issues", []) == []
-    checkout = (
-        states.root
-        / "worktrees"
-        / str(state["run_id"])
-        / "ticket-2"
-    )
-    old_branch = f"agent-run/{state['run_id']}/ticket-2"
+    checkout = states.root / "worktrees" / str(state["run_id"]) / "ticket-2"
     assert (checkout / "removed.txt").is_file()
-
-    removed, _ = controller.confirm_structure(str(state["run_id"]))
-
-    assert removed["status"] == "parent_delivery_pending"
-    assert not checkout.exists()
-    assert (
-        subprocess.run(
-            ["git", "show-ref", "--verify", f"refs/heads/{old_branch}"],
-            cwd=git_repo,
-            capture_output=True,
-            check=False,
-        ).returncode
-        != 0
-    )
-
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["parent"]["sub_issues"] = [2]
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    paused_again, _ = controller.resume(str(state["run_id"]))
-    assert paused_again["status"] == "structure_change_pending"
-    readded, _ = controller.confirm_structure(str(state["run_id"]))
-    assert readded["status"] == "active"
-
-    recovery_fixture = git_repo / "agents-readded.json"
-    recovery_fixture.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "developer-readded",
-                        "summary": "Rebuilt the re-added Ticket cleanly.",
-                        "absent_files": ["removed.txt"],
-                        "write_files": {"readded.txt": "clean\n"},
-                    }
-                ],
-                "publications": [_publication(2)],
-                "reviews": [
-                    passing_acceptance(
-                        "reviewer-readded",
-                        "The clean re-added Ticket passed.",
-                    )
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    completed = DeliveryRunEngine(
-        controller=controller,
-        tickets=TicketDeliveryEngine(
-            git=git,
-            states=states,
-            github=FixtureGitHubPublisher(fixture, git),
-            agents=FixtureAgentBackend(recovery_fixture),
-        ),
-    ).deliver(str(state["run_id"]))
-
-    assert completed["status"] == "run_acceptance_pending"
-    assert completed["ticket_jobs"]["2"]["ticket_branch"].endswith(
-        "/ticket-2-generation-2"
-    )
-
-
-def test_stale_removal_confirmation_does_not_retire_readded_ticket(
-    git_repo: Path,
-) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json", issues={"2": _ticket(2)}
-    )
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
-    started, _ = controller.start(1)
-    run_id = str(started["run_id"])
-    paused = DeliveryRunEngine(
-        controller=controller,
-        tickets=TicketDeliveryEngine(
-            git=git,
-            states=states,
-            github=FixtureGitHubPublisher(fixture, git),
-            agents=TicketRemovingAgents(fixture),
-        ),
-    ).deliver(run_id)
-    assert paused["status"] == "structure_change_pending"
-    checkout = states.root / "worktrees" / run_id / "ticket-2"
-    branch = f"agent-run/{run_id}/ticket-2"
-    assert (checkout / "removed.txt").is_file()
-
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["parent"]["sub_issues"] = [2]
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    stale_confirmation, _ = controller.confirm_structure(run_id)
-
-    assert stale_confirmation["status"] == "structure_change_pending"
-    assert (checkout / "removed.txt").is_file()
-    assert git.resolve(branch)
-    assert stale_confirmation.get("retired_ticket_generations", {}) == {}
-    assert (
-        stale_confirmation["pending_structure_change"]["graph_change_summary"][
-            "added_tickets"
-        ]
-        == [2]
-    )
-
-    confirmed, _ = controller.confirm_structure(run_id)
-
-    assert confirmed["status"] == "active"
-    assert confirmed["active_ticket_job"]["ticket_number"] == 2
-    assert confirmed["ticket_jobs"]["2"]["ticket_branch"] == branch
-    assert (checkout / "removed.txt").is_file()
-
-
-def test_confirmed_removal_is_retired_after_another_graph_change(
-    git_repo: Path,
-) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json", issues={"2": _ticket(2)}
-    )
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
-    started, _ = controller.start(1)
-    run_id = str(started["run_id"])
-    paused = DeliveryRunEngine(
-        controller=controller,
-        tickets=TicketDeliveryEngine(
-            git=git,
-            states=states,
-            github=FixtureGitHubPublisher(fixture, git),
-            agents=TicketRemovingAgents(fixture),
-        ),
-    ).deliver(run_id)
-    assert paused["status"] == "structure_change_pending"
-    checkout = states.root / "worktrees" / run_id / "ticket-2"
-    branch = f"agent-run/{run_id}/ticket-2"
-    assert (checkout / "removed.txt").is_file()
-
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["parent"]["sub_issues"] = [3]
-    data["issues"]["3"] = _ticket(3)
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    later_graph, _ = controller.confirm_structure(run_id)
-
-    assert later_graph["status"] == "structure_change_pending"
-    assert later_graph["pending_ticket_retirements"]["2"] == {
-        "branch": branch,
-        "generation": 1,
-    }
-    assert (checkout / "removed.txt").is_file()
-
-    confirmed, _ = controller.confirm_structure(run_id)
-
-    assert confirmed["status"] == "active"
-    assert not checkout.exists()
-    assert confirmed["retired_ticket_generations"]["2"] == 1
-    assert "pending_ticket_retirements" not in confirmed
-    assert (
-        subprocess.run(
-            ["git", "show-ref", "--verify", f"refs/heads/{branch}"],
-            cwd=git_repo,
-            capture_output=True,
-            check=False,
-        ).returncode
-        != 0
-    )

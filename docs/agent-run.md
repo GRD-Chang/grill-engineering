@@ -9,10 +9,9 @@
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
-- 在 Ticket 集合或依赖边变化时暂停，给出 Ticket Graph Change Summary，并把人工确认
-  绑定到准确的新图版本；
-- Parent Spec 变化时由一次性 Codex 生成 Scope Impact Assessment；澄清自动吸收，
-  结构性变化绑定准确版本等待确认；
+- 在 Ticket 集合或依赖边变化时 fail closed，给出 Ticket Graph Change Summary，并禁止
+  Agent、Thread、Requeue 与 Publisher mutation；
+- Parent title/body revision 作为机械 currentness 输入保留，不再运行语义范围分类器；
 - 全部 Ticket 完成后进入 `run_acceptance_pending`，由独立 Reviewer 整体验收；通过后
   才进入 `run_publication_pending`，随后由一次性只读 Codex 生成最终 Run PR 语义。
 
@@ -36,7 +35,6 @@ agent-run history <run-id> --repo OWNER/REPO
 agent-run start <parent-issue> --repo OWNER/REPO
 agent-run deliver <run-id> --repo OWNER/REPO
 agent-run resume <run-id> --repo OWNER/REPO
-agent-run confirm-structure <run-id> --repo OWNER/REPO
 agent-run accept-run <run-id> --repo OWNER/REPO
 agent-run publish-run <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
@@ -86,35 +84,34 @@ closeout 审计评论并显式关闭 Parent Issue。
 Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并的默认分支漂移回到 fresh
 Run Acceptance；真实 merge conflict 与最终 PR Required Checks 失败会排入同一个有界 Run
 Repair 引擎。`revise` 原样保存维护者反馈、重置一个新的十次实际变更预算，并同样回到
-Run Repair → fresh Run Acceptance → 新 PR 语义。`abandon` 保留 Run state、已发布 PR 与其他
-远端审计事实，只停止后续 mutation 并删除该 Run 的本地临时 worktrees。
+Run Repair → fresh Run Acceptance → 新 PR 语义。`abandon` 先把
+`abandonment_pending` 与逐项恢复义务写入耐久状态，再幂等关闭未合并的自动化 PR、只重开
+带有本 Run Publisher close 证据且尚未进入默认分支的 Ticket。任一步响应丢失后，其他生命周期
+命令都不会恢复正常发布；重复 `abandon` 会在 GitHub 暴露精确 close 或外部 transition 后继续
+收敛。若进程恰在耐久 dispatch boundary 与远端 close 之间退出、GitHub 又尚无可判定 event，
+Run 保持 `abandonment_pending`，不会猜测 ownership 或制造新的 close。完成后保留 Run state、
+已发布 PR 与其他远端审计事实，并通过 Git worktree 操作删除该 Run 的本地临时 worktrees。
 
 Ticket title/body 在运行中变化时，旧开发结果、Publication 和 Acceptance 会失效；
 Controller 沿用同一个 Ticket Job、Ticket Branch 和 Development Thread，从最新 revision
 自动重启。Issue 评论不参与 revision，Controller 自身产生的本地修改也不会改变 revision。
-Parent title/body 澄清会自动吸收并更新 Effective Revision。
+Parent title/body 变化会更新 observed Parent revision，同时保留 accepted revision，供后续
+Job Generation currentness 路由使用；Controller 不再派发 Scope Impact Assessment Codex。
 
 原生 Sub-issue 集合或 `blockedBy` 边发生变化时，Run 进入
-`structure_change_pending`。耐久状态中的 `graph_change_summary` 会列出新增/移除
-Ticket 与依赖边；纯执行顺序调整不会改变 Ticket Graph Revision。维护者确认当前提议
-版本后执行 `confirm-structure`；如果确认期间 GitHub 图再次变化，旧确认不会放行新图，
-Run 会继续暂停并生成新的变化摘要。
+`unsupported_scope_change`。耐久状态中的 `unsupported_scope_change` 保存 accepted/observed
+Graph revision、`graph_change_summary` 与 observed graph；纯执行顺序调整不会改变 Ticket
+Graph Revision。`status --json` 与 `history --json` 可审计这些事实。
 
-当前 MVP 已知限制：若 `structure_change_pending` 与先前保存的 Agent Human Blocker 同时
-存在，通用 `resume` 尚未把“恢复外部阻塞”与“确认结构变化”拆成两个独立动作。操作者在该
-状态下只能先使用 `confirm-structure` 明确接受当前提议版本，或使用 `abandon` 停止 Run；
-不要用 `resume` 代替结构确认。该限制留待后续 Scope Change 设计统一处理，本版本不修改其
-状态机。
-
-Parent title/body 变化时，Controller 派发一次性 Codex，把新旧 Parent Spec、
-当前 Ticket Graph 与已完成工作交给它生成 Scope Impact Assessment。非结构性澄清自动
-吸收；改变 Ticket 集合、依赖、整体交付边界或使已完成工作需要返工的变化会进入同一个
-`structure_change_pending`，人工确认同样只绑定当前准确的 Parent Spec Revision。
+该状态不允许 `run`、`resume`、`deliver`、`accept-run`、`publish-run`、`approve` 或
+`revise` 越过边界，不自动 Requeue，不创建 Codex Thread，也不执行 Git/GitHub Publisher
+mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原图后重新核验，或执行
+`abandon` 停止 Run。
 
 没有任何可执行 Ticket 时，Run 进入 `progress_exhausted`，并在
 `diagnostics[].remaining_tickets` 中列出每张剩余 Ticket 的原因。`terminal_kind` 进一步
 区分 `waiting_human`、`temporarily_no_work`、`permanent_blocked`、
-`structure_change_pending`、`execution_failed` 和 `all_tickets_completed`。最后一种对应
+`unsupported_scope_change`、`execution_failed` 和 `all_tickets_completed`。最后一种对应
 `run_acceptance_pending`，它只是 Issue #5 Run Acceptance 的交接边界。
 
 ## 权限边界
@@ -202,17 +199,16 @@ Checkout 尚未准备完成时产生的部分目录也会清理。每轮独立 V
 结束后完整删除，允许验收期间创建构建、测试和诊断中间产物。Codex 的临时 schema、输出
 文件和空 GitHub 配置目录也会随子进程调用清理。
 
-结构确认从 Ticket Set 移除已启动 Ticket 时，Controller 通过 Publisher 删除其稳定
-checkout 与本地 Ticket Branch，并记录已退役的 branch generation。同号 Ticket 后续
-重新加入会使用新的 branch generation，从当前 Run Branch 创建干净 Job，不继承旧
-revision 的未提交文件或提交。确认期间图再次变化时，待清理 Ticket 会作为耐久义务
-保留：最新图重新包含它则取消清理，最终确认的图仍不包含它才执行幂等清理。
+Graph drift fail closed 时，Controller 保留当前 Candidate、Acceptance、checkout、branch、
+PR 与 Ticket completion，不静默清理或改写。只有正常完成或 `abandon` 路径可以按既有
+Publisher/cleanup 权限处理托管资源；观察到的新 Graph 本身不产生任何 mutation。
 
 Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer、PR、merge 与
 最近 16 次 blocker 历史；每次 Human Blocker 最多 8 条、每条最多 2000 个字符。成功恢复后
 当前 `human_blockers`、phase 与 resume 输入会清除，timeline 只保留已经发生的历史事件且
-继续受全局容量限制。`active_ticket_job` 继续作为当前执行指针。刷新 Ticket Graph 可以把 active
-切到新的可执行 Ticket，但不会删除同一 Parent Ticket Set 内已经 blocked 或 completed 的
-Job。进程在两张 Ticket 之间退出或失败时，下一次 `deliver` 会从耐久状态与 GitHub live
-事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭动作不会重复。没有可执行 Ticket
-时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。
+继续受全局容量限制。`active_ticket_job` 继续作为当前执行指针。仅当 Ticket Graph revision
+未变化时，Controller 才会在既定 Ticket Set 内把 active 切到新的可执行 Ticket；它不会删除
+已经 blocked 或 completed 的 Job。Graph revision 变化按上文进入
+`unsupported_scope_change`，不更新 active。进程在两张 Ticket 之间退出或失败时，下一次
+`deliver` 会从耐久状态与 GitHub live 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭
+动作不会重复。没有可执行 Ticket 时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。

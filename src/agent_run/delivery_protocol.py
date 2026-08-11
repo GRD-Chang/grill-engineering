@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 
@@ -33,6 +34,8 @@ class GitHubPublisher(Protocol):
     ) -> None: ...
 
     def abandon_run_pr(self, pr_number: int) -> None: ...
+
+    def abandon_change_pr(self, pr_number: int) -> None: ...
 
     def ensure_run_repair_branch(
         self, *, branch: str, base_branch: str
@@ -103,6 +106,15 @@ class GitHubPublisher(Protocol):
         self, *, run_branch: str, integrated_sha: str
     ) -> None: ...
 
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> dict[str, Any] | None: ...
+
     def close_primary_ticket(
         self,
         *,
@@ -110,7 +122,35 @@ class GitHubPublisher(Protocol):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None: ...
+        close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+    ) -> dict[str, Any] | None: ...
+
+    def ticket_closed_by_run(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> bool: ...
+
+    def ticket_close_ownership(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> dict[str, Any] | None: ...
+
+    def recover_abandoned_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+        expected_ownership: dict[str, Any],
+    ) -> bool: ...
 
     def mark_ready_for_human(self, ticket_number: int) -> None: ...
 

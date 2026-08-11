@@ -91,6 +91,8 @@ class DeliveryCleanupEngine:
             state = self.states.load_run(run_id)
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
+            if state.get("status") == "abandoned":
+                return state
             self._schedule_completed_items(state)
             if not isinstance(state.get("delivery_cleanup"), dict):
                 return state
@@ -253,3 +255,17 @@ class DeliveryCleanupEngine:
         if not isinstance(value, int):
             raise ValueError(f"{key} must be an integer")
         return value
+
+
+def remove_run_worktrees(
+    git: GitRepository, states: StateStore, run_id: str
+) -> None:
+    root = states.root / "worktrees" / run_id
+    if root.exists():
+        for checkout in root.iterdir():
+            git.remove_worktree(checkout)
+        try:
+            root.rmdir()
+        except OSError:
+            pass
+    git.prune_worktrees()

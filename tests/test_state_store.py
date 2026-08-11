@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.state import StateStore
+from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
 
 
 def test_interrupted_replace_preserves_previous_state(
@@ -161,3 +161,51 @@ def test_final_publication_blocker_history_identifies_publication_worker(
     event = state["timeline"][-1]
     assert event["worker"] == "运行发布工作代理"
     assert event["thread_id"] == "blocked-final-publication-thread"
+
+
+def test_unsupported_scope_change_uses_bounded_deduplicated_history(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path)
+    summary = {
+        "summary": "Ticket graph changed.",
+        "added_tickets": [3],
+        "removed_tickets": [],
+        "added_dependencies": [],
+        "removed_dependencies": [],
+    }
+    state = {
+        "run_id": "run-1",
+        "status": "unsupported_scope_change",
+        "unsupported_scope_change": {
+            "accepted_graph_revision": "accepted",
+            "observed_graph_revision": "observed",
+            "graph_change_summary": summary,
+        },
+    }
+
+    store.save_run("run-1", state)
+    store.save_run("run-1", state)
+
+    assert state["timeline"] == [
+        {
+            "at": state["timeline"][0]["at"],
+            "kind": "unsupported_scope_change",
+            "status": "unsupported_scope_change",
+            "accepted_graph_revision": "accepted",
+            "observed_graph_revision": "observed",
+            "graph_change_summary": summary,
+            "next_action": "restore_graph_or_abandon",
+            "result": "Ticket graph changed.",
+        }
+    ]
+
+    for number in range(MAX_TIMELINE_EVENTS + 10):
+        change = state["unsupported_scope_change"]
+        assert isinstance(change, dict)
+        change["observed_graph_revision"] = f"observed-{number}"
+        store.save_run("run-1", state)
+
+    assert len(state["timeline"]) == MAX_TIMELINE_EVENTS
+    assert state["timeline"][-1]["kind"] == "timeline_capacity"
+    assert state["timeline_at_capacity"] is True

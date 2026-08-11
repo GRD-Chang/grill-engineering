@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -280,6 +281,7 @@ class FixtureGitHubPublisher:
                 {"action": "close_parent_pr", "pr_number": pr_number}
             )
             self._save()
+            self._crash_once("abandon_parent_pr")
 
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
@@ -395,6 +397,17 @@ class FixtureGitHubPublisher:
                 {"action": "close_final_run_pr", "pr_number": pr_number}
             )
             self._save()
+            self._crash_once("abandon_run_pr")
+
+    def abandon_change_pr(self, pr_number: int) -> None:
+        pull = self._pull(pr_number)
+        if pull.get("state") == "OPEN":
+            pull["state"] = "CLOSED"
+            _mutable_list(self._delivery(), "mutations").append(
+                {"action": "close_change_pr", "pr_number": pr_number}
+            )
+            self._save()
+            self._crash_once("abandon_change_pr")
 
     def publish_branch(
         self,
@@ -619,6 +632,37 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("sync_run_branch")
 
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> dict[str, Any] | None:
+        mutations = _mutable_list(self._delivery(), "mutations")
+        marker = {
+            "ticket_number": ticket_number,
+            "run_id": run_id,
+            "pr_number": pr_number,
+            "integrated_sha": integrated_sha,
+        }
+        if not any(
+            isinstance(item, dict)
+            and item.get("action") == "completion_comment"
+            and item.get("ticket_number") == ticket_number
+            for item in mutations
+        ):
+            mutations.append({"action": "completion_comment", **marker})
+        self._save()
+        return {
+            "actor": "fixture-publisher",
+            "event_id": None,
+            "intent_created_at": f"{run_id}:ticket-{ticket_number}:intent",
+            "baseline_event_id": 0,
+            "intent_binding": f"pr-{pr_number}:sha-{integrated_sha}",
+        }
+
     def close_primary_ticket(
         self,
         *,
@@ -626,7 +670,9 @@ class FixtureGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+        close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+    ) -> dict[str, Any] | None:
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,
@@ -642,13 +688,51 @@ class FixtureGitHubPublisher:
         ):
             mutations.append({"action": "completion_comment", **marker})
         closed = _mutable_list(self._delivery(), "closed_issues")
-        if ticket_number not in closed:
-            closed.append(ticket_number)
-            mutations.append({"action": "close_issue", **marker})
+        publisher_closed = ticket_number in closed
+        raw_ownerships = self._delivery().setdefault(
+            "ticket_close_ownership", {}
+        )
+        if not isinstance(raw_ownerships, dict):
+            raise ValueError("delivery.ticket_close_ownership must be an object")
+        ownerships = raw_ownerships
         raw_issues = _mutable_mapping(self.data, "issues")
         issue = raw_issues.get(str(ticket_number))
-        if isinstance(issue, dict):
+        if self._delivery().pop("external_close_before_primary_ticket", False):
+            if isinstance(issue, dict):
+                issue["state"] = "CLOSED"
+        if (
+            not publisher_closed
+            and isinstance(issue, dict)
+            and issue.get("state") != "CLOSED"
+        ):
+            crash_before_dispatch = bool(
+                self._delivery().pop("crash_before_close_dispatch_once", False)
+            )
+            if crash_before_dispatch:
+                self._save()
+                raise OSError("simulated crash before Primary Ticket close dispatch")
+            if before_dispatch is not None:
+                before_dispatch()
+            crash_after_boundary = bool(
+                self._delivery().pop("crash_after_close_dispatch_boundary_once", False)
+            )
+            if crash_after_boundary:
+                self._save()
+                raise OSError("simulated crash after durable close dispatch boundary")
+            closed.append(ticket_number)
+            mutations.append({"action": "close_issue", **marker})
             issue["state"] = "CLOSED"
+            publisher_closed = True
+        if publisher_closed and str(ticket_number) not in ownerships:
+            ownerships[str(ticket_number)] = {
+                "event_id": f"{run_id}:ticket-{ticket_number}:closed",
+                "actor": "fixture-publisher",
+                "intent_binding": (
+                    close_intent.get("intent_binding")
+                    if isinstance(close_intent, dict)
+                    else None
+                ),
+            }
         for raw_issue in raw_issues.values():
             if not isinstance(raw_issue, dict):
                 continue
@@ -671,6 +755,155 @@ class FixtureGitHubPublisher:
             raise OSError(
                 "simulated lost response after Primary Ticket close"
             )
+        ownership = ownerships.get(str(ticket_number))
+        return dict(ownership) if isinstance(ownership, dict) else None
+
+    def ticket_closed_by_run(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> bool:
+        return self.ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=recorded_ownership,
+        ) is not None
+
+    def ticket_close_ownership(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        del run_id
+        issue = _mutable_mapping(self.data, "issues").get(str(ticket_number))
+        raw_ownerships = self._delivery().get("ticket_close_ownership", {})
+        if not isinstance(raw_ownerships, dict):
+            raise ValueError("delivery.ticket_close_ownership must be an object")
+        current = raw_ownerships.get(str(ticket_number))
+        expected = recorded_ownership if recorded_ownership is not None else current
+        lag_reads = self._delivery().get("ticket_close_event_lag_reads", 0)
+        if (
+            isinstance(lag_reads, int)
+            and not isinstance(lag_reads, bool)
+            and lag_reads > 0
+            and isinstance(issue, dict)
+            and issue.get("state") == "CLOSED"
+        ):
+            self._delivery()["ticket_close_event_lag_reads"] = lag_reads - 1
+            self._save()
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "fixture has not exposed the Ticket close event yet",
+            )
+        if (
+            isinstance(issue, dict)
+            and issue.get("state") == "OPEN"
+            and isinstance(expected, dict)
+            and expected.get("event_id") is None
+            and expected.get("dispatch_attempted") is True
+            and not isinstance(current, dict)
+        ):
+            external = self._delivery().get("external_ticket_transitions", [])
+            if isinstance(external, list) and ticket_number in external:
+                return None
+            raise GitHubReadError(
+                "ticket_close_dispatch_unobserved",
+                "fixture has not observed the attempted Ticket close",
+            )
+        owned = (
+            isinstance(issue, dict)
+            and issue.get("state") == "CLOSED"
+            and ticket_number
+            in _mutable_list(self._delivery(), "closed_issues")
+            and isinstance(current, dict)
+            and isinstance(expected, dict)
+            and (
+                current.get("event_id") == expected.get("event_id")
+                or (
+                    expected.get("event_id") is None
+                    and current.get("actor") == expected.get("actor")
+                    and current.get("intent_binding")
+                    == expected.get("intent_binding")
+                )
+            )
+        )
+        return dict(current) if owned and isinstance(current, dict) else None
+
+    def recover_abandoned_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+        expected_ownership: dict[str, Any],
+    ) -> bool:
+        expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
+        if expected_ownership.get("intent_binding") != expected_binding:
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "recorded Ticket close belongs to a different PR generation",
+            )
+        mutations = _mutable_list(self._delivery(), "mutations")
+        marker = {
+            "ticket_number": ticket_number,
+            "run_id": run_id,
+            "pr_number": pr_number,
+            "integrated_sha": integrated_sha,
+        }
+        already_recorded = any(
+            isinstance(item, dict)
+            and item.get("action") == "abandonment_recovery_comment"
+            and item.get("ticket_number") == ticket_number
+            and item.get("run_id") == run_id
+            for item in mutations
+        )
+        raw_issues = _mutable_mapping(self.data, "issues")
+        issue = raw_issues.get(str(ticket_number))
+        if not isinstance(issue, dict) or issue.get("state") != "CLOSED":
+            return (
+                already_recorded
+                and ticket_number
+                not in _mutable_list(self._delivery(), "closed_issues")
+            )
+        current_ownership = self.ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=expected_ownership,
+        )
+        if current_ownership is None:
+            self._save()
+            return False
+        issue["state"] = "OPEN"
+        closed = _mutable_list(self._delivery(), "closed_issues")
+        if ticket_number in closed:
+            closed.remove(ticket_number)
+        mutations.append(
+            {"action": "abandonment_reopen_issue", **marker}
+        )
+        for raw_issue in raw_issues.values():
+            if not isinstance(raw_issue, dict):
+                continue
+            blockers = raw_issue.get("blocked_by")
+            if not isinstance(blockers, list):
+                continue
+            for blocker in blockers:
+                if (
+                    isinstance(blocker, dict)
+                    and blocker.get("number") == ticket_number
+                ):
+                    blocker["state"] = "OPEN"
+        if not already_recorded:
+            mutations.append(
+                {"action": "abandonment_recovery_comment", **marker}
+            )
+        self._save()
+        self._crash_once("recover_abandoned_ticket")
+        return True
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         raw_issues = _mutable_mapping(self.data, "issues")

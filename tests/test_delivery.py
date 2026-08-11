@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +238,7 @@ class ScriptedPublisher:
         self.merged_sha: str | None = None
         self.merged_head: str | None = None
         self.publication_context_calls: list[int] = []
+        self.prepared_ticket_closes: list[dict[str, Any]] = []
 
     def ensure_parent_branch(
         self, *, parent_number: int, branch: str, base_branch: str
@@ -406,6 +408,25 @@ class ScriptedPublisher:
             check=True,
         )
 
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> dict[str, Any]:
+        self.prepared_ticket_closes.append(
+            {"pr_number": pr_number, "integrated_sha": integrated_sha}
+        )
+        return {
+            "actor": "scripted-publisher",
+            "event_id": None,
+            "intent_created_at": f"{run_id}:ticket-{ticket_number}:intent",
+            "baseline_event_id": 0,
+            "intent_binding": f"pr-{pr_number}:sha-{integrated_sha}",
+        }
+
     def close_primary_ticket(
         self,
         *,
@@ -413,8 +434,14 @@ class ScriptedPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+        close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        del run_id, pr_number, integrated_sha, close_intent
+        if before_dispatch is not None:
+            before_dispatch()
         self.closed_issues.append(ticket_number)
+        return {"actor": "scripted-publisher", "event_id": ticket_number}
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         self.escalated.append(ticket_number)
@@ -488,6 +515,34 @@ class CrashAfterMergePublisher(ScriptedPublisher):
             self.crash_once = False
             raise OSError("simulated crash after remote merge")
         return integrated
+
+
+class MissingCloseIntentPublisher(ScriptedPublisher):
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        del ticket_number, run_id, pr_number, integrated_sha
+
+
+class MissingCloseOwnershipPublisher(ScriptedPublisher):
+    def close_primary_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+        close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+    ) -> None:
+        del ticket_number, run_id, pr_number, integrated_sha, close_intent
+        if before_dispatch is not None:
+            before_dispatch()
 
 
 class BaseMovesThenMergeResponseIsLostPublisher(CrashAfterMergePublisher):
@@ -1058,15 +1113,19 @@ class CrashBeforeClosePublisher(ScriptedPublisher):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+        close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         if self.crash_once:
             self.crash_once = False
             raise OSError("simulated crash before Primary Ticket close")
-        super().close_primary_ticket(
+        return super().close_primary_ticket(
             ticket_number=ticket_number,
             run_id=run_id,
             pr_number=pr_number,
             integrated_sha=integrated_sha,
+            close_intent=close_intent,
+            before_dispatch=before_dispatch,
         )
 
 
@@ -1243,6 +1302,8 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
     assert agents.development_requests[0]["ticket"]["url"].endswith(
         "/example/project/issues/3"
     )
+
+
     assert agents.review_requests[0]["parent"]["url"].endswith(
         "/example/project/issues/1"
     )
@@ -1288,6 +1349,37 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
             "next_action": "squash merge into the Run Branch",
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "publisher_type",
+    [MissingCloseIntentPublisher, MissingCloseOwnershipPublisher],
+)
+def test_ticket_delivery_requires_exact_close_evidence(
+    git_repo: Path,
+    publisher_type: type[ScriptedPublisher],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher_type(git_repo),
+        agents=ScriptedAgents(checkout),
+    )
+
+    with pytest.raises(GitHubReadError, match="exact ownership|current ownership"):
+        engine.deliver(state["run_id"])
+
+    persisted = states.load_run(state["run_id"])
+    assert persisted is not None
+    assert persisted["active_ticket_job"]["phase"] == "merged"
+    assert persisted["status"] != "ticket_completed"
+    assert "ticket_close_ownership" not in persisted["active_ticket_job"]
 
 
 def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
@@ -2193,6 +2285,8 @@ def test_revision_drift_after_merged_save_archives_before_reset(
     assert interrupted is not None
     old_job = interrupted["active_ticket_job"]
     assert old_job["phase"] == "merged"
+    assert old_job["ticket_close_intent"]["actor"] == "scripted-publisher"
+    assert len(publisher.prepared_ticket_closes) == 1
     old_pr_number = int(old_job["pr_number"])
     old_integrated_sha = str(old_job["integrated_sha"])
     old_effective_revision = str(old_job["effective_revision"])
@@ -2227,6 +2321,13 @@ def test_revision_drift_after_merged_save_archives_before_reset(
     )
     assert publisher.created_prs == 2
     assert publisher.closed_issues == [3]
+    assert publisher.prepared_ticket_closes == [
+        {"pr_number": old_pr_number, "integrated_sha": old_integrated_sha},
+        {
+            "pr_number": 12,
+            "integrated_sha": completed["active_ticket_job"]["integrated_sha"],
+        },
+    ]
 
     repeated = engine.deliver(state["run_id"])
 
