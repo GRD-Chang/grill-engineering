@@ -15,6 +15,7 @@ from agent_run.change_delivery import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 
@@ -195,6 +196,11 @@ class TicketDeliveryLoop:
             )
             job["ticket_close_intent"] = close_intent
             self._save(state)
+        if close_intent is None:
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "Ticket close preparation did not establish current ownership",
+            )
         close_ownership = self.github.close_primary_ticket(
             ticket_number=int(job["ticket_number"]),
             run_id=str(state["run_id"]),
@@ -202,6 +208,11 @@ class TicketDeliveryLoop:
             integrated_sha=integrated,
             close_intent=close_intent,
         )
+        if close_ownership is None:
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "Ticket close dispatch did not establish exact ownership",
+            )
         job["ticket_close_ownership"] = close_ownership
         job["ticket_closed_by_run"] = close_ownership is not None
         job.pop("blocked_reason", None)

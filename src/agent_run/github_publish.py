@@ -807,14 +807,25 @@ class GhGitHubPublisher:
             f"publisher-close-intent:{intent_binding} -->"
         )
         comments = issue.get("comments")
-        already_recorded = isinstance(comments, list) and any(
-            marker in str(_mapping(comment).get("body", "")) for comment in comments
-        )
-        has_close_intent = isinstance(comments, list) and any(
-            close_intent in str(_mapping(comment).get("body", ""))
-            for comment in comments
-        )
         publisher_login = self._publisher_login()
+        trusted_comments = (
+            [
+                _mapping(comment)
+                for comment in comments
+                if isinstance(_mapping(comment).get("author"), dict)
+                and _mapping(comment)["author"].get("login") == publisher_login
+            ]
+            if isinstance(comments, list)
+            else []
+        )
+        already_recorded = any(
+            marker in str(_mapping(comment).get("body", ""))
+            for comment in trusted_comments
+        )
+        has_close_intent = any(
+            close_intent in str(_mapping(comment).get("body", ""))
+            for comment in trusted_comments
+        )
         baseline_event_id: int | None = None
         if issue.get("state") != "CLOSED" and not has_close_intent:
             baseline_event_id = self._ticket_transition_watermark(ticket_number)
@@ -913,6 +924,12 @@ class GhGitHubPublisher:
         )
         if prepared is None or prepared.get("event_id") is not None:
             return prepared
+        expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
+        if prepared.get("intent_binding") != expected_binding:
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "prepared Ticket close belongs to a different PR generation",
+            )
         issue = _mapping(
             self._json(
                 "issue",

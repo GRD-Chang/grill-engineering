@@ -513,6 +513,31 @@ class CrashAfterMergePublisher(ScriptedPublisher):
         return integrated
 
 
+class MissingCloseIntentPublisher(ScriptedPublisher):
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        del ticket_number, run_id, pr_number, integrated_sha
+
+
+class MissingCloseOwnershipPublisher(ScriptedPublisher):
+    def close_primary_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+        close_intent: dict[str, Any] | None = None,
+    ) -> None:
+        del ticket_number, run_id, pr_number, integrated_sha, close_intent
+
+
 class BaseMovesThenMergeResponseIsLostPublisher(CrashAfterMergePublisher):
     def squash_merge(
         self,
@@ -1086,7 +1111,7 @@ class CrashBeforeClosePublisher(ScriptedPublisher):
         if self.crash_once:
             self.crash_once = False
             raise OSError("simulated crash before Primary Ticket close")
-        super().close_primary_ticket(
+        return super().close_primary_ticket(
             ticket_number=ticket_number,
             run_id=run_id,
             pr_number=pr_number,
@@ -1268,6 +1293,8 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
     assert agents.development_requests[0]["ticket"]["url"].endswith(
         "/example/project/issues/3"
     )
+
+
     assert agents.review_requests[0]["parent"]["url"].endswith(
         "/example/project/issues/1"
     )
@@ -1313,6 +1340,37 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
             "next_action": "squash merge into the Run Branch",
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "publisher_type",
+    [MissingCloseIntentPublisher, MissingCloseOwnershipPublisher],
+)
+def test_ticket_delivery_requires_exact_close_evidence(
+    git_repo: Path,
+    publisher_type: type[ScriptedPublisher],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher_type(git_repo),
+        agents=ScriptedAgents(checkout),
+    )
+
+    with pytest.raises(GitHubReadError, match="exact ownership|current ownership"):
+        engine.deliver(state["run_id"])
+
+    persisted = states.load_run(state["run_id"])
+    assert persisted is not None
+    assert persisted["active_ticket_job"]["phase"] == "merged"
+    assert persisted["status"] != "ticket_completed"
+    assert "ticket_close_ownership" not in persisted["active_ticket_job"]
 
 
 def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
