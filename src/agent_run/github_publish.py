@@ -1162,6 +1162,13 @@ class GhGitHubPublisher:
         )
         if issue.get("state") != "CLOSED":
             return already_recorded
+        ownership = self._ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=expected_ownership,
+        )
+        if ownership is None:
+            return False
         if not already_recorded:
             body = (
                 f"{marker}\nDelivery Run `{run_id}` was abandoned before entering "

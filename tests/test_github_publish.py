@@ -605,6 +605,7 @@ def test_abandonment_rechecks_exact_close_before_reopen(
         integrated_sha="abc123",
         expected_ownership={"actor": "agent-run-bot", "event_id": 99},
     )
+    assert not any(call[:2] == ("issue", "comment") for call in calls)
     assert not any(call[:2] == ("issue", "reopen") for call in calls)
 
 
