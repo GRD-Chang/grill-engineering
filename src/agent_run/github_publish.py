@@ -801,8 +801,10 @@ class GhGitHubPublisher:
             )
         )
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:completed -->"
+        intent_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         close_intent = (
-            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-close-intent -->"
+            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:"
+            f"publisher-close-intent:{intent_binding} -->"
         )
         comments = issue.get("comments")
         already_recorded = isinstance(comments, list) and any(
@@ -812,9 +814,7 @@ class GhGitHubPublisher:
             close_intent in str(_mapping(comment).get("body", ""))
             for comment in comments
         )
-        publisher_login = (
-            self._publisher_login() if issue.get("state") != "CLOSED" else None
-        )
+        publisher_login = self._publisher_login()
         baseline_event_id: int | None = None
         if issue.get("state") != "CLOSED" and not has_close_intent:
             baseline_event_id = self._ticket_transition_watermark(ticket_number)
@@ -823,7 +823,8 @@ class GhGitHubPublisher:
         ):
             baseline_marker = (
                 f"<!-- agent-run:{run_id}:ticket-{ticket_number}:"
-                f"publisher-close-baseline:{baseline_event_id} -->"
+                f"publisher-close-baseline:{intent_binding}:"
+                f"{baseline_event_id} -->"
                 if baseline_event_id is not None
                 else ""
             )
@@ -845,10 +846,6 @@ class GhGitHubPublisher:
                 body,
             )
         if issue.get("state") != "CLOSED":
-            if not isinstance(publisher_login, str):
-                raise GitHubReadError(
-                    "github_invalid_response", "authenticated GitHub login is missing"
-                )
             intent_issue = _mapping(
                 self._json(
                     "issue",
@@ -866,6 +863,7 @@ class GhGitHubPublisher:
                 publisher_login,
                 run_id=run_id,
                 ticket_number=ticket_number,
+                intent_binding=intent_binding,
             )
             if intent is None:
                 raise GitHubReadError(
@@ -881,10 +879,20 @@ class GhGitHubPublisher:
                 **intent,
                 "event_id": None,
             }
+        intent = self._publisher_close_intent(
+            issue,
+            close_intent,
+            publisher_login,
+            run_id=run_id,
+            ticket_number=ticket_number,
+            intent_binding=intent_binding,
+        )
+        if intent is None:
+            return None
         ownership = self._ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
-            recorded_ownership=None,
+            recorded_ownership=intent,
         )
         return ownership
 
@@ -917,11 +925,17 @@ class GhGitHubPublisher:
             )
         )
         if issue.get("state") == "CLOSED":
-            return self._ticket_close_ownership(
+            ownership = self._ticket_close_ownership(
                 ticket_number=ticket_number,
                 run_id=run_id,
                 recorded_ownership=prepared,
             )
+            if ownership is None:
+                raise GitHubReadError(
+                    "ticket_close_reconciliation_pending",
+                    "Ticket close ownership conflicts with the prepared dispatch",
+                )
+            return ownership
         if issue.get("state") != "OPEN":
             raise GitHubReadError(
                 "ticket_close_reconciliation_pending", "Ticket state is unavailable"
@@ -948,11 +962,17 @@ class GhGitHubPublisher:
         self._require(
             "issue", "close", str(ticket_number), "--repo", self.repository
         )
-        return self._ticket_close_ownership(
+        ownership = self._ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
             recorded_ownership=prepared,
         )
+        if ownership is None:
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "Ticket close ownership conflicts with the dispatched close",
+            )
+        return ownership
 
     def ticket_closed_by_run(
         self,
@@ -1040,30 +1060,17 @@ class GhGitHubPublisher:
             publisher_login = recorded_ownership.get("actor")
             intent_time = recorded_ownership.get("intent_created_at")
             baseline_event_id = recorded_ownership.get("baseline_event_id")
+            intent_binding = recorded_ownership.get("intent_binding")
             if (
                 not isinstance(publisher_login, str)
                 or not isinstance(intent_time, str)
                 or not isinstance(baseline_event_id, int)
                 or isinstance(baseline_event_id, bool)
+                or not isinstance(intent_binding, str)
             ):
                 raise ValueError("provisional Ticket close ownership is incomplete")
         else:
-            publisher_login = self._publisher_login()
-            marker = (
-                f"<!-- agent-run:{run_id}:ticket-{ticket_number}:"
-                "publisher-close-intent -->"
-            )
-            intent = self._publisher_close_intent(
-                issue,
-                marker,
-                publisher_login,
-                run_id=run_id,
-                ticket_number=ticket_number,
-            )
-            if intent is None:
-                return None
-            intent_time = str(intent["intent_created_at"])
-            baseline_event_id = int(intent["baseline_event_id"])
+            return None
         after_baseline = [
             event for event in transitions if int(event["id"]) > baseline_event_id
         ]
@@ -1121,6 +1128,7 @@ class GhGitHubPublisher:
             "created_at": owned["created_at"],
             "intent_created_at": intent_time,
             "baseline_event_id": baseline_event_id,
+            "intent_binding": intent_binding,
         }
 
     @staticmethod
@@ -1196,6 +1204,7 @@ class GhGitHubPublisher:
         *,
         run_id: str,
         ticket_number: int,
+        intent_binding: str,
     ) -> dict[str, Any] | None:
         comments = issue.get("comments")
         if not isinstance(comments, list):
@@ -1217,7 +1226,7 @@ class GhGitHubPublisher:
         intent = max(trusted, key=lambda item: str(item["createdAt"]))
         baseline_marker = (
             f"<!-- agent-run:{run_id}:ticket-{ticket_number}:"
-            "publisher-close-baseline:"
+            f"publisher-close-baseline:{intent_binding}:"
         )
         body = str(intent.get("body", ""))
         start = body.find(baseline_marker)
@@ -1235,6 +1244,7 @@ class GhGitHubPublisher:
             "actor": publisher_login,
             "intent_created_at": str(intent["createdAt"]),
             "baseline_event_id": baseline_event_id,
+            "intent_binding": intent_binding,
         }
 
     def _publisher_login(self) -> str:

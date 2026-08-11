@@ -659,6 +659,7 @@ class FixtureGitHubPublisher:
             "event_id": None,
             "intent_created_at": f"{run_id}:ticket-{ticket_number}:intent",
             "baseline_event_id": 0,
+            "intent_binding": f"pr-{pr_number}:sha-{integrated_sha}",
         }
 
     def close_primary_ticket(

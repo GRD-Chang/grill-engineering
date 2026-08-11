@@ -138,10 +138,11 @@ def test_ticket_close_ownership_requires_publisher_close_event(
                 "comments": [
                     {
                         "body": (
+                            "<!-- agent-run:run-1:ticket-2:completed -->\n"
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-intent -->\n"
+                            "publisher-close-intent:pr-3:sha-abc123 -->\n"
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-baseline:0 -->"
+                            "publisher-close-baseline:pr-3:sha-abc123:0 -->"
                         ),
                         "createdAt": "2026-08-11T10:00:00Z",
                         "author": {"login": intent_author},
@@ -164,8 +165,14 @@ def test_ticket_close_ownership_requires_publisher_close_event(
 
     monkeypatch.setattr(publisher, "_json", fake_json)
 
-    assert publisher.ticket_closed_by_run(
-        ticket_number=2, run_id="run-1", recorded_ownership=None
+    assert (
+        publisher.prepare_primary_ticket_close(
+            ticket_number=2,
+            run_id="run-1",
+            pr_number=3,
+            integrated_sha="abc123",
+        )
+        is not None
     ) is expected
 
 
@@ -226,6 +233,7 @@ def test_successful_close_waits_for_exact_event_before_completion(
         "event_id": None,
         "intent_created_at": "2026-08-11T10:00:00Z",
         "baseline_event_id": 0,
+        "intent_binding": "pr-3:sha-abc123",
     }
     with pytest.raises(GitHubReadError, match="close event"):
         publisher.close_primary_ticket(
@@ -256,6 +264,7 @@ def test_successful_close_waits_for_exact_event_before_completion(
         "created_at": "2026-08-11T10:00:01Z",
         "intent_created_at": "2026-08-11T10:00:00Z",
         "baseline_event_id": 0,
+        "intent_binding": "pr-3:sha-abc123",
     }
 
 
@@ -286,9 +295,9 @@ def test_close_stops_when_ticket_changes_after_intent(
                         {
                             "body": (
                                 "<!-- agent-run:run-1:ticket-2:"
-                                "publisher-close-intent -->\n"
+                                "publisher-close-intent:pr-3:sha-abc123 -->\n"
                                 "<!-- agent-run:run-1:ticket-2:"
-                                "publisher-close-baseline:0 -->"
+                                "publisher-close-baseline:pr-3:sha-abc123:0 -->"
                             ),
                             "createdAt": "2026-08-11T10:00:00Z",
                             "author": {"login": "agent-run-bot"},
@@ -372,7 +381,69 @@ def test_prepare_close_recovers_lost_comment_response(
         "event_id": None,
         "intent_created_at": "2026-08-11T10:00:00Z",
         "baseline_event_id": 0,
+        "intent_binding": "pr-3:sha-abc123",
     }
+
+
+def test_prepare_close_binds_intent_to_current_pr_and_commit(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    comments: list[dict[str, object]] = [
+        {
+            "body": (
+                "<!-- agent-run:run-1:ticket-2:completed -->\n"
+                "<!-- agent-run:run-1:ticket-2:"
+                "publisher-close-intent:pr-3:sha-old -->\n"
+                "<!-- agent-run:run-1:ticket-2:"
+                "publisher-close-baseline:pr-3:sha-old:0 -->"
+            ),
+            "createdAt": "2026-08-11T10:00:00Z",
+            "author": {"login": "agent-run-bot"},
+        }
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("api", "user"):
+            return {"login": "agent-run-bot"}
+        if arguments[:2] == (
+            "api",
+            "repos/example/project/issues/2/events",
+        ):
+            return []
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "OPEN",
+                "updatedAt": "2026-08-11T11:00:00Z",
+                "comments": comments,
+            }
+        raise AssertionError(arguments)
+
+    def fake_require(*arguments: str) -> None:
+        calls.append(arguments)
+        comments.append(
+            {
+                "body": arguments[-1],
+                "createdAt": "2026-08-11T11:00:00Z",
+                "author": {"login": "agent-run-bot"},
+            }
+        )
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    monkeypatch.setattr(publisher, "_require", fake_require)
+
+    intent = publisher.prepare_primary_ticket_close(
+        ticket_number=2,
+        run_id="run-1",
+        pr_number=4,
+        integrated_sha="new",
+    )
+
+    assert intent is not None
+    assert intent["intent_binding"] == "pr-4:sha-new"
+    assert len(calls) == 1
+    assert "publisher-close-intent:pr-4:sha-new" in calls[0][-1]
 
 
 def test_ticket_close_ownership_rejects_later_external_reclose(
@@ -432,9 +503,9 @@ def test_ticket_close_ownership_flattens_paginated_events(
                     {
                         "body": (
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-intent -->\n"
+                            "publisher-close-intent:pr-3:sha-abc123 -->\n"
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-baseline:0 -->"
+                            "publisher-close-baseline:pr-3:sha-abc123:0 -->"
                         ),
                         "createdAt": "2026-08-11T10:00:00Z",
                         "author": {"login": "agent-run-bot"},
@@ -484,9 +555,9 @@ def test_provisional_close_rejects_later_same_actor_reclose(
                     {
                         "body": (
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-intent -->\n"
+                            "publisher-close-intent:pr-3:sha-abc123 -->\n"
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-baseline:0 -->"
+                            "publisher-close-baseline:pr-3:sha-abc123:0 -->"
                         ),
                         "createdAt": "2026-08-11T10:00:00Z",
                         "author": {"login": "agent-run-bot"},
@@ -526,6 +597,7 @@ def test_provisional_close_rejects_later_same_actor_reclose(
             "event_id": None,
             "intent_created_at": "2026-08-11T10:00:00Z",
             "baseline_event_id": 0,
+            "intent_binding": "pr-3:sha-abc123",
         },
     )
     assert not publisher.ticket_closed_by_run(
@@ -567,6 +639,7 @@ def test_provisional_close_waits_for_post_intent_event(
                 "event_id": None,
                 "intent_created_at": "2026-08-11T10:00:00Z",
                 "baseline_event_id": 50,
+                "intent_binding": "pr-3:sha-abc123",
             },
         )
 
@@ -614,6 +687,7 @@ def test_close_watermark_excludes_same_second_history(
             "event_id": None,
             "intent_created_at": "2026-08-11T10:00:00Z",
             "baseline_event_id": 100,
+            "intent_binding": "pr-3:sha-abc123",
         },
     ) == {
         "actor": "agent-run-bot",
@@ -621,6 +695,7 @@ def test_close_watermark_excludes_same_second_history(
         "created_at": "2026-08-11T10:00:00Z",
         "intent_created_at": "2026-08-11T10:00:00Z",
         "baseline_event_id": 100,
+        "intent_binding": "pr-3:sha-abc123",
     }
 
 
@@ -662,6 +737,7 @@ def test_close_watermark_waits_while_new_close_event_is_hidden(
                 "event_id": None,
                 "intent_created_at": "2026-08-11T10:00:00Z",
                 "baseline_event_id": 100,
+                "intent_binding": "pr-3:sha-abc123",
             },
         )
 
@@ -709,6 +785,7 @@ def test_close_rejects_any_intervening_transition_after_watermark(
             "event_id": None,
             "intent_created_at": "2026-08-11T10:00:00Z",
             "baseline_event_id": 100,
+            "intent_binding": "pr-3:sha-abc123",
         },
     ) is None
 
@@ -730,9 +807,9 @@ def test_close_retry_does_not_overwrite_external_reopen(
                         "body": (
                             "<!-- agent-run:run-1:ticket-2:completed -->\n"
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-intent -->\n"
+                            "publisher-close-intent:pr-3:sha-abc123 -->\n"
                             "<!-- agent-run:run-1:ticket-2:"
-                            "publisher-close-baseline:0 -->"
+                            "publisher-close-baseline:pr-3:sha-abc123:0 -->"
                         ),
                         "createdAt": "2026-08-11T10:00:00Z",
                         "author": {"login": "agent-run-bot"},
