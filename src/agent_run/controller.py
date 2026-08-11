@@ -455,9 +455,12 @@ def _publication_job_for_invocation(
     """Resolve a Publication job from its persisted, unambiguous subject."""
 
     subject = invocation.get("work_subject")
+    generation = invocation.get("generation")
     run_id = state.get("run_id")
     if not isinstance(subject, str) or not subject.strip():
         raise ValueError("current Publication Invocation work_subject is missing")
+    if type(generation) is not int or generation < 1:
+        raise ValueError("current Publication Invocation generation is invalid")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("Delivery Run ID is missing")
 
@@ -468,6 +471,13 @@ def _publication_job_for_invocation(
         publication = state.get("run_publication")
         if not isinstance(publication, dict):
             raise ValueError("current Final Publication job is missing")
+        acceptance = state.get("run_acceptance")
+        current_generation = (
+            acceptance.get("validation_attempts")
+            if isinstance(acceptance, dict)
+            else None
+        )
+        _require_invocation_generation(generation, current_generation)
         return publication, None
     if role != "publication":
         raise ValueError("current Publication Invocation role is invalid")
@@ -481,6 +491,9 @@ def _publication_job_for_invocation(
         job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
         if not isinstance(job, dict) or job.get("ticket_number") != ticket_number:
             raise ValueError("current Ticket Publication job is missing")
+        _require_invocation_generation(
+            generation, job.get("ticket_branch_generation")
+        )
         active = state.get("active_ticket_job")
         mirror = (
             active
@@ -495,6 +508,7 @@ def _publication_job_for_invocation(
         parent = state.get("parent_job")
         if not isinstance(parent, dict):
             raise ValueError("current Parent-only Publication job is missing")
+        _require_invocation_generation(generation, 1)
         return parent, None
 
     if subject == f"run-repair:{run_id}":
@@ -506,9 +520,15 @@ def _publication_job_for_invocation(
         )
         if not isinstance(repair, dict):
             raise ValueError("current Run Repair Publication job is missing")
+        _require_invocation_generation(generation, repair.get("repair_generation"))
         return repair, None
 
     raise ValueError("Publication Invocation work_subject is invalid")
+
+
+def _require_invocation_generation(invocation: int, current: object) -> None:
+    if type(current) is not int or invocation != current:
+        raise ValueError("Publication Invocation generation is stale")
 
 
 def _resume_change_job(

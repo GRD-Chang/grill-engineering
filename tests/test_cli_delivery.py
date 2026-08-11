@@ -1441,6 +1441,7 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     failed_state["active_agent_invocation"] = {
         "work_subject": "ticket:3",
+        "generation": failed_job["ticket_branch_generation"],
         "role": "publication",
         "phase": "publication",
         "mode": "fresh",
