@@ -698,6 +698,67 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     ] == ["completion_comment", "close_issue", "delete_managed_branch"]
 
 
+def test_close_response_loss_can_abandon_from_provisional_intent(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket(2)},
+        delivery={"crash_after_close_once": True},
+    )
+    agent_fixture = git_repo / "agents.json"
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-2",
+                        "summary": "Implemented ticket 2.",
+                        "write_files": {"ticket-2.txt": "done\n"},
+                    }
+                ],
+                "publications": [_publication(2)],
+                "reviews": [
+                    passing_acceptance("reviewer-2", "Ticket 2 passed.")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+
+    interrupted = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert interrupted.returncode == 2
+    interrupted_job = load_only_run_state(git_repo)["ticket_jobs"]["2"]
+    assert interrupted_job["phase"] == "merged"
+    assert isinstance(interrupted_job["ticket_close_intent"], dict)
+    assert "ticket_close_ownership" not in interrupted_job
+    assert json.loads(fixture.read_text(encoding="utf-8"))["issues"]["2"][
+        "state"
+    ] == "CLOSED"
+
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    assert data["issues"]["2"]["state"] == "OPEN"
+    assert [
+        mutation["action"]
+        for mutation in data["delivery"]["mutations"]
+        if mutation["action"].startswith("abandonment_")
+    ] == ["abandonment_reopen_issue", "abandonment_recovery_comment"]
+
+
 def test_active_ticket_removal_stops_agents_and_preserves_work(
     git_repo: Path,
 ) -> None:

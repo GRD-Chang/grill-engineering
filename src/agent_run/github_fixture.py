@@ -671,7 +671,6 @@ class FixtureGitHubPublisher:
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        del close_intent
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,
@@ -712,6 +711,11 @@ class FixtureGitHubPublisher:
             ownerships[str(ticket_number)] = {
                 "event_id": f"{run_id}:ticket-{ticket_number}:closed",
                 "actor": "fixture-publisher",
+                "intent_binding": (
+                    close_intent.get("intent_binding")
+                    if isinstance(close_intent, dict)
+                    else None
+                ),
             }
         for raw_issue in raw_issues.values():
             if not isinstance(raw_issue, dict):
@@ -772,7 +776,15 @@ class FixtureGitHubPublisher:
             in _mutable_list(self._delivery(), "closed_issues")
             and isinstance(current, dict)
             and isinstance(expected, dict)
-            and current.get("event_id") == expected.get("event_id")
+            and (
+                current.get("event_id") == expected.get("event_id")
+                or (
+                    expected.get("event_id") is None
+                    and current.get("actor") == expected.get("actor")
+                    and current.get("intent_binding")
+                    == expected.get("intent_binding")
+                )
+            )
         )
         return dict(current) if owned and isinstance(current, dict) else None
 

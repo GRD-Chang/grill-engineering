@@ -922,7 +922,7 @@ class GhGitHubPublisher:
             pr_number=pr_number,
             integrated_sha=integrated_sha,
         )
-        if prepared is None or prepared.get("event_id") is not None:
+        if prepared is None:
             return prepared
         expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         if prepared.get("intent_binding") != expected_binding:
@@ -930,6 +930,18 @@ class GhGitHubPublisher:
                 "ticket_close_reconciliation_pending",
                 "prepared Ticket close belongs to a different PR generation",
             )
+        if prepared.get("event_id") is not None:
+            ownership = self._ticket_close_ownership(
+                ticket_number=ticket_number,
+                run_id=run_id,
+                recorded_ownership=prepared,
+            )
+            if ownership is None:
+                raise GitHubReadError(
+                    "ticket_close_reconciliation_pending",
+                    "recorded Ticket close is no longer current",
+                )
+            return ownership
         issue = _mapping(
             self._json(
                 "issue",

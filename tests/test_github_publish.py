@@ -852,8 +852,9 @@ def test_close_rejects_any_intervening_transition_after_watermark(
     ) is None
 
 
+@pytest.mark.parametrize("event_id", [None, 99])
 def test_close_rejects_intent_from_another_pr_generation(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, event_id: int | None
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     calls: list[tuple[str, ...]] = []
@@ -874,7 +875,7 @@ def test_close_rejects_intent_from_another_pr_generation(
             integrated_sha="new",
             close_intent={
                 "actor": "agent-run-bot",
-                "event_id": None,
+                "event_id": event_id,
                 "intent_created_at": "2026-08-11T10:00:00Z",
                 "baseline_event_id": 100,
                 "intent_binding": "pr-3:sha-old",
@@ -882,6 +883,52 @@ def test_close_rejects_intent_from_another_pr_generation(
         )
 
     assert calls == []
+
+
+def test_close_rechecks_exact_ownership_before_completion(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "OPEN",
+                "comments": [],
+                "updatedAt": "2026-08-11T10:00:02Z",
+            }
+        return [
+            {
+                "id": 99,
+                "event": "closed",
+                "created_at": "2026-08-11T10:00:01Z",
+                "actor": {"login": "agent-run-bot"},
+            },
+            {
+                "id": 100,
+                "event": "reopened",
+                "created_at": "2026-08-11T10:00:02Z",
+                "actor": {"login": "maintainer"},
+            },
+        ]
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    with pytest.raises(GitHubReadError, match="no longer current"):
+        publisher.close_primary_ticket(
+            ticket_number=2,
+            run_id="run-1",
+            pr_number=3,
+            integrated_sha="abc123",
+            close_intent={
+                "actor": "agent-run-bot",
+                "event_id": 99,
+                "created_at": "2026-08-11T10:00:01Z",
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 0,
+                "intent_binding": "pr-3:sha-abc123",
+            },
+        )
 
 
 def test_close_retry_does_not_overwrite_external_reopen(

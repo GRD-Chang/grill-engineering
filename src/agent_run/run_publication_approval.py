@@ -314,7 +314,11 @@ def _ticket_recovery_obligations(
                     "recorded_ownership": (
                         job.get("ticket_close_ownership")
                         if isinstance(job.get("ticket_close_ownership"), dict)
-                        else None
+                        else (
+                            job.get("ticket_close_intent")
+                            if isinstance(job.get("ticket_close_intent"), dict)
+                            else None
+                        )
                     ),
                     "status": "pending",
                 }
