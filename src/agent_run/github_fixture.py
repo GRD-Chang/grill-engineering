@@ -631,7 +631,7 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("sync_run_branch")
 
-    def close_primary_ticket(
+    def prepare_primary_ticket_close(
         self,
         *,
         ticket_number: int,
@@ -639,6 +639,38 @@ class FixtureGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
     ) -> dict[str, Any] | None:
+        mutations = _mutable_list(self._delivery(), "mutations")
+        marker = {
+            "ticket_number": ticket_number,
+            "run_id": run_id,
+            "pr_number": pr_number,
+            "integrated_sha": integrated_sha,
+        }
+        if not any(
+            isinstance(item, dict)
+            and item.get("action") == "completion_comment"
+            and item.get("ticket_number") == ticket_number
+            for item in mutations
+        ):
+            mutations.append({"action": "completion_comment", **marker})
+        self._save()
+        return {
+            "actor": "fixture-publisher",
+            "event_id": None,
+            "intent_created_at": f"{run_id}:ticket-{ticket_number}:intent",
+            "baseline_event_id": 0,
+        }
+
+    def close_primary_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+        close_intent: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        del close_intent
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,
@@ -759,27 +791,35 @@ class FixtureGitHubPublisher:
             "pr_number": pr_number,
             "integrated_sha": integrated_sha,
         }
-        if not any(
+        already_recorded = any(
             isinstance(item, dict)
             and item.get("action") == "abandonment_recovery_comment"
             and item.get("ticket_number") == ticket_number
             and item.get("run_id") == run_id
             for item in mutations
-        ):
-            mutations.append(
-                {"action": "abandonment_recovery_comment", **marker}
-            )
+        )
         raw_issues = _mutable_mapping(self.data, "issues")
         issue = raw_issues.get(str(ticket_number))
+        if not isinstance(issue, dict) or issue.get("state") != "CLOSED":
+            return already_recorded
         current_ownership = self.ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
             recorded_ownership=expected_ownership,
         )
-        if isinstance(issue, dict) and issue.get("state") == "CLOSED":
-            if current_ownership is None:
-                self._save()
-                return False
+        if current_ownership is None:
+            self._save()
+            return False
+        if not already_recorded:
+            mutations.append(
+                {"action": "abandonment_recovery_comment", **marker}
+            )
+        current_ownership = self.ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=expected_ownership,
+        )
+        if current_ownership is not None:
             issue["state"] = "OPEN"
             closed = _mutable_list(self._delivery(), "closed_issues")
             if ticket_number in closed:
@@ -799,6 +839,9 @@ class FixtureGitHubPublisher:
                         and blocker.get("number") == ticket_number
                     ):
                         blocker["state"] = "OPEN"
+        else:
+            self._save()
+            return False
         self._save()
         self._crash_once("recover_abandoned_ticket")
         return True

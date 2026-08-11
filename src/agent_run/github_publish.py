@@ -269,7 +269,7 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
                 "--json",
-                "state,comments",
+                "state,comments,updatedAt",
             )
         )
         marker = f"<!-- agent-run:{run_id}:parent-completed -->"
@@ -781,7 +781,7 @@ class GhGitHubPublisher:
             check=True,
         )
 
-    def close_primary_ticket(
+    def prepare_primary_ticket_close(
         self,
         *,
         ticket_number: int,
@@ -797,7 +797,7 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
                 "--json",
-                "state,comments",
+                "state,comments,updatedAt",
             )
         )
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:completed -->"
@@ -857,7 +857,7 @@ class GhGitHubPublisher:
                     "--repo",
                     self.repository,
                     "--json",
-                    "state,comments",
+                    "state,comments,updatedAt",
                 )
             )
             intent = self._publisher_close_intent(
@@ -872,23 +872,11 @@ class GhGitHubPublisher:
                     "ticket_close_intent_pending",
                     "GitHub has not exposed the Publisher close intent yet",
                 )
-            if has_close_intent:
-                self._ticket_close_ownership(
-                    ticket_number=ticket_number,
-                    run_id=run_id,
-                    recorded_ownership=intent,
-                )
+            if intent_issue.get("state") != "OPEN":
                 raise GitHubReadError(
                     "ticket_close_reconciliation_pending",
-                    "an open Ticket with an existing close intent cannot be closed again",
+                    "Ticket state changed after the Publisher close intent",
                 )
-            self._require(
-                "issue",
-                "close",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-            )
             return {
                 **intent,
                 "event_id": None,
@@ -899,6 +887,68 @@ class GhGitHubPublisher:
             recorded_ownership=None,
         )
         return ownership
+
+    def close_primary_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+        close_intent: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        prepared = close_intent or self.prepare_primary_ticket_close(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            pr_number=pr_number,
+            integrated_sha=integrated_sha,
+        )
+        if prepared is None or prepared.get("event_id") is not None:
+            return prepared
+        issue = _mapping(
+            self._json(
+                "issue",
+                "view",
+                str(ticket_number),
+                "--repo",
+                self.repository,
+                "--json",
+                "state,comments,updatedAt",
+            )
+        )
+        if issue.get("state") == "CLOSED":
+            return self._ticket_close_ownership(
+                ticket_number=ticket_number,
+                run_id=run_id,
+                recorded_ownership=prepared,
+            )
+        if issue.get("state") != "OPEN":
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending", "Ticket state is unavailable"
+            )
+        baseline = prepared.get("baseline_event_id")
+        if not isinstance(baseline, int) or isinstance(baseline, bool):
+            raise ValueError("prepared Ticket close is missing its event watermark")
+        transitions = self._ticket_transitions(ticket_number)
+        if any(int(event["id"]) > baseline for event in transitions):
+            self._ticket_close_ownership(
+                ticket_number=ticket_number,
+                run_id=run_id,
+                recorded_ownership=prepared,
+            )
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "Ticket changed after the Publisher close intent",
+            )
+        if issue.get("updatedAt") != prepared.get("intent_created_at"):
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "Ticket currentness changed after the Publisher close intent",
+            )
+        self._require(
+            "issue", "close", str(ticket_number), "--repo", self.repository
+        )
+        return dict(prepared)
 
     def ticket_closed_by_run(
         self,
@@ -941,7 +991,7 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
                 "--json",
-                "state,comments",
+                "state,comments,updatedAt",
             )
         )
         transitions = self._ticket_transitions(ticket_number)
@@ -970,6 +1020,17 @@ class GhGitHubPublisher:
                     raise GitHubReadError(
                         "ticket_close_ownership_pending",
                         "Ticket state and close timeline have not converged",
+                    )
+                if not self._ticket_current_at_transition(
+                    issue,
+                    latest,
+                    publisher_login=str(recorded_ownership.get("actor", "")),
+                    run_id=run_id,
+                    ticket_number=ticket_number,
+                ):
+                    raise GitHubReadError(
+                        "ticket_close_ownership_pending",
+                        "Ticket updates are newer than the recorded close event",
                     )
                 return dict(recorded_ownership)
             publisher_login = recorded_ownership.get("actor")
@@ -1035,6 +1096,17 @@ class GhGitHubPublisher:
             return None
         if owned is None or latest_after_baseline["id"] != owned["id"]:
             return None
+        if not self._ticket_current_at_transition(
+            issue,
+            latest_after_baseline,
+            publisher_login=publisher_login,
+            run_id=run_id,
+            ticket_number=ticket_number,
+        ):
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "Ticket updates are newer than the Publisher close event",
+            )
         return {
             "event_id": owned["id"],
             "actor": publisher_login,
@@ -1042,6 +1114,34 @@ class GhGitHubPublisher:
             "intent_created_at": intent_time,
             "baseline_event_id": baseline_event_id,
         }
+
+    @staticmethod
+    def _ticket_current_at_transition(
+        issue: dict[str, Any],
+        transition: dict[str, Any],
+        *,
+        publisher_login: str,
+        run_id: str,
+        ticket_number: int,
+    ) -> bool:
+        updated_at = issue.get("updatedAt")
+        transition_time = transition.get("created_at")
+        if not isinstance(updated_at, str) or not isinstance(transition_time, str):
+            return False
+        if updated_at == transition_time:
+            return True
+        marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:"
+        comments = issue.get("comments")
+        if not isinstance(comments, list):
+            return False
+        return any(
+            isinstance(_mapping(comment).get("createdAt"), str)
+            and _mapping(comment).get("createdAt") == updated_at
+            and isinstance(_mapping(comment).get("author"), dict)
+            and _mapping(comment)["author"].get("login") == publisher_login
+            and marker in str(_mapping(comment).get("body", ""))
+            for comment in comments
+        )
 
     def _ticket_transitions(self, ticket_number: int) -> list[dict[str, Any]]:
         raw_events = self._json(
@@ -1152,16 +1252,30 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
                 "--json",
-                "state,comments",
+                "state,comments,updatedAt",
             )
         )
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:abandoned -->"
         comments = issue.get("comments")
+        publisher_login = expected_ownership.get("actor")
+        if not isinstance(publisher_login, str) or not publisher_login:
+            raise ValueError("expected Ticket ownership is missing its Publisher")
         already_recorded = isinstance(comments, list) and any(
-            marker in str(_mapping(comment).get("body", "")) for comment in comments
+            marker in str(_mapping(comment).get("body", ""))
+            and isinstance(_mapping(comment).get("author"), dict)
+            and _mapping(comment)["author"].get("login") == publisher_login
+            for comment in comments
         )
         if issue.get("state") != "CLOSED":
-            return already_recorded
+            if issue.get("state") != "OPEN" or not already_recorded:
+                return False
+            return self._publisher_reopen_completed(
+                issue,
+                ticket_number=ticket_number,
+                run_id=run_id,
+                expected_ownership=expected_ownership,
+                publisher_login=publisher_login,
+            )
         ownership = self._ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
@@ -1199,6 +1313,56 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
         )
+        return True
+
+    def _publisher_reopen_completed(
+        self,
+        issue: dict[str, Any],
+        *,
+        ticket_number: int,
+        run_id: str,
+        expected_ownership: dict[str, Any],
+        publisher_login: str,
+    ) -> bool:
+        expected_event_id = expected_ownership.get("event_id")
+        if expected_event_id is None:
+            raise ValueError("expected Ticket ownership requires an exact close event")
+        transitions = self._ticket_transitions(ticket_number)
+        expected_indexes = [
+            index
+            for index, event in enumerate(transitions)
+            if str(event["id"]) == str(expected_event_id)
+        ]
+        if not expected_indexes:
+            raise GitHubReadError(
+                "ticket_reopen_reconciliation_pending",
+                "GitHub has not exposed the expected close event yet",
+            )
+        later = transitions[expected_indexes[-1] + 1 :]
+        if not later:
+            raise GitHubReadError(
+                "ticket_reopen_reconciliation_pending",
+                "GitHub has not exposed the Ticket reopen event yet",
+            )
+        latest = later[-1]
+        actor = latest.get("actor")
+        if (
+            latest.get("event") != "reopened"
+            or not isinstance(actor, dict)
+            or actor.get("login") != publisher_login
+        ):
+            return False
+        if not self._ticket_current_at_transition(
+            issue,
+            latest,
+            publisher_login=publisher_login,
+            run_id=run_id,
+            ticket_number=ticket_number,
+        ):
+            raise GitHubReadError(
+                "ticket_reopen_reconciliation_pending",
+                "Ticket updates are newer than the Publisher reopen event",
+            )
         return True
 
     def mark_ready_for_human(self, ticket_number: int) -> None:

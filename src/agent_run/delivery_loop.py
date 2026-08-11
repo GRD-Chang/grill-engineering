@@ -185,11 +185,22 @@ class TicketDeliveryLoop:
         # Persist the integrated boundary before the external Issue mutation.
         job["phase"] = TicketPhase.MERGED.value
         self._save(state)
+        close_intent = job.get("ticket_close_intent")
+        if not isinstance(close_intent, dict):
+            close_intent = self.github.prepare_primary_ticket_close(
+                ticket_number=int(job["ticket_number"]),
+                run_id=str(state["run_id"]),
+                pr_number=int(job["pr_number"]),
+                integrated_sha=integrated,
+            )
+            job["ticket_close_intent"] = close_intent
+            self._save(state)
         close_ownership = self.github.close_primary_ticket(
             ticket_number=int(job["ticket_number"]),
             run_id=str(state["run_id"]),
             pr_number=int(job["pr_number"]),
             integrated_sha=integrated,
+            close_intent=close_intent,
         )
         job["ticket_close_ownership"] = close_ownership
         job["ticket_closed_by_run"] = close_ownership is not None

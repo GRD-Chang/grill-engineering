@@ -406,6 +406,22 @@ class ScriptedPublisher:
             check=True,
         )
 
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> dict[str, Any]:
+        del pr_number, integrated_sha
+        return {
+            "actor": "scripted-publisher",
+            "event_id": None,
+            "intent_created_at": f"{run_id}:ticket-{ticket_number}:intent",
+            "baseline_event_id": 0,
+        }
+
     def close_primary_ticket(
         self,
         *,
@@ -413,8 +429,11 @@ class ScriptedPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+        close_intent: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del run_id, pr_number, integrated_sha, close_intent
         self.closed_issues.append(ticket_number)
+        return {"actor": "scripted-publisher", "event_id": ticket_number}
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         self.escalated.append(ticket_number)
@@ -1058,7 +1077,8 @@ class CrashBeforeClosePublisher(ScriptedPublisher):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+        close_intent: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.crash_once:
             self.crash_once = False
             raise OSError("simulated crash before Primary Ticket close")
@@ -1067,6 +1087,7 @@ class CrashBeforeClosePublisher(ScriptedPublisher):
             run_id=run_id,
             pr_number=pr_number,
             integrated_sha=integrated_sha,
+            close_intent=close_intent,
         )
 
 
@@ -2193,6 +2214,7 @@ def test_revision_drift_after_merged_save_archives_before_reset(
     assert interrupted is not None
     old_job = interrupted["active_ticket_job"]
     assert old_job["phase"] == "merged"
+    assert old_job["ticket_close_intent"]["actor"] == "scripted-publisher"
     old_pr_number = int(old_job["pr_number"])
     old_integrated_sha = str(old_job["integrated_sha"])
     old_effective_revision = str(old_job["effective_revision"])

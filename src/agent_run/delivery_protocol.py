@@ -105,6 +105,15 @@ class GitHubPublisher(Protocol):
         self, *, run_branch: str, integrated_sha: str
     ) -> None: ...
 
+    def prepare_primary_ticket_close(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> dict[str, Any] | None: ...
+
     def close_primary_ticket(
         self,
         *,
@@ -112,6 +121,7 @@ class GitHubPublisher(Protocol):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
+        close_intent: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None: ...
 
     def ticket_closed_by_run(
