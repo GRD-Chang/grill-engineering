@@ -1142,29 +1142,6 @@ class GhGitHubPublisher:
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed a transition after the close intent baseline yet",
             )
-        if any(
-            event.get("event") in {"closed", "reopened"}
-            and (
-                not isinstance(event.get("actor"), dict)
-                or not isinstance(event["actor"].get("login"), str)
-                or not event["actor"]["login"]
-            )
-            for event in after_baseline
-        ):
-            raise GitHubReadError(
-                "ticket_close_ownership_pending",
-                "GitHub has not exposed the Ticket transition actor yet",
-            )
-        owned = next(
-            (
-                event
-                for event in after_baseline
-                if event.get("event") == "closed"
-                and isinstance(event.get("actor"), dict)
-                and event["actor"].get("login") == publisher_login
-            ),
-            None,
-        )
         latest_after_baseline = after_baseline[-1]
         if (
             issue.get("state") == "CLOSED"
@@ -1181,9 +1158,26 @@ class GhGitHubPublisher:
                     "Ticket state and close timeline have not converged",
                 )
             return None
+        if len(after_baseline) != 1:
+            return None
+        actor = latest_after_baseline.get("actor")
         if (
-            len(after_baseline) != 1
-            or owned is None
+            not isinstance(actor, dict)
+            or not isinstance(actor.get("login"), str)
+            or not actor["login"]
+        ):
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "GitHub has not exposed the Ticket transition actor yet",
+            )
+        owned = (
+            latest_after_baseline
+            if latest_after_baseline.get("event") == "closed"
+            and actor.get("login") == publisher_login
+            else None
+        )
+        if (
+            owned is None
             or latest_after_baseline["id"] != owned["id"]
         ):
             return None
