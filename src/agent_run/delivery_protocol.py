@@ -122,6 +122,14 @@ class GitHubPublisher(Protocol):
         recorded_ownership: dict[str, Any] | None,
     ) -> bool: ...
 
+    def ticket_close_ownership(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> dict[str, Any] | None: ...
+
     def recover_abandoned_ticket(
         self,
         *,
@@ -129,7 +137,8 @@ class GitHubPublisher(Protocol):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None: ...
+        expected_ownership: dict[str, Any],
+    ) -> bool: ...
 
     def mark_ready_for_human(self, ticket_number: int) -> None: ...
 

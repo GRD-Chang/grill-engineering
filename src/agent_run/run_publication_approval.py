@@ -154,7 +154,7 @@ class RunPublicationApproval(RunPublicationShared):
                 self._save(state)
             for ticket in _obligation_list(abandonment, "tickets"):
                 if ticket.get("eligible") is None:
-                    ticket["eligible"] = self.github.ticket_closed_by_run(
+                    ownership = self.github.ticket_close_ownership(
                         ticket_number=int(ticket["ticket_number"]),
                         run_id=run_id,
                         recorded_ownership=(
@@ -163,6 +163,8 @@ class RunPublicationApproval(RunPublicationShared):
                             else None
                         ),
                     )
+                    ticket["expected_ownership"] = ownership
+                    ticket["eligible"] = ownership is not None
                     self._save(state)
             for change_pr in _obligation_list(abandonment, "change_prs"):
                 if change_pr.get("status") != "completed":
@@ -171,13 +173,17 @@ class RunPublicationApproval(RunPublicationShared):
                     self._save(state)
             for ticket in _obligation_list(abandonment, "tickets"):
                 if ticket.get("eligible") is True and ticket.get("status") != "completed":
-                    self.github.recover_abandoned_ticket(
+                    expected_ownership = ticket.get("expected_ownership")
+                    if not isinstance(expected_ownership, dict):
+                        raise ValueError("eligible Ticket recovery requires ownership")
+                    recovered = self.github.recover_abandoned_ticket(
                         ticket_number=int(ticket["ticket_number"]),
                         run_id=run_id,
                         pr_number=int(ticket["pr_number"]),
                         integrated_sha=str(ticket["integrated_sha"]),
+                        expected_ownership=expected_ownership,
                     )
-                    ticket["status"] = "completed"
+                    ticket["status"] = "completed" if recovered else "not_owned"
                     self._save(state)
                 elif ticket.get("eligible") is False:
                     ticket["status"] = "not_owned"

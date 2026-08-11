@@ -712,6 +712,19 @@ class FixtureGitHubPublisher:
         run_id: str,
         recorded_ownership: dict[str, Any] | None,
     ) -> bool:
+        return self.ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=recorded_ownership,
+        ) is not None
+
+    def ticket_close_ownership(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
         del run_id
         issue = _mutable_mapping(self.data, "issues").get(str(ticket_number))
         raw_ownerships = self._delivery().get("ticket_close_ownership", {})
@@ -719,7 +732,7 @@ class FixtureGitHubPublisher:
             raise ValueError("delivery.ticket_close_ownership must be an object")
         current = raw_ownerships.get(str(ticket_number))
         expected = recorded_ownership if recorded_ownership is not None else current
-        return (
+        owned = (
             isinstance(issue, dict)
             and issue.get("state") == "CLOSED"
             and ticket_number
@@ -728,6 +741,7 @@ class FixtureGitHubPublisher:
             and isinstance(expected, dict)
             and current.get("event_id") == expected.get("event_id")
         )
+        return dict(current) if owned and isinstance(current, dict) else None
 
     def recover_abandoned_ticket(
         self,
@@ -736,7 +750,8 @@ class FixtureGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> None:
+        expected_ownership: dict[str, Any],
+    ) -> bool:
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,
@@ -756,7 +771,15 @@ class FixtureGitHubPublisher:
             )
         raw_issues = _mutable_mapping(self.data, "issues")
         issue = raw_issues.get(str(ticket_number))
+        current_ownership = self.ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=expected_ownership,
+        )
         if isinstance(issue, dict) and issue.get("state") == "CLOSED":
+            if current_ownership is None:
+                self._save()
+                return False
             issue["state"] = "OPEN"
             closed = _mutable_list(self._delivery(), "closed_issues")
             if ticket_number in closed:
@@ -778,6 +801,7 @@ class FixtureGitHubPublisher:
                         blocker["state"] = "OPEN"
         self._save()
         self._crash_once("recover_abandoned_ticket")
+        return True
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         raw_issues = _mutable_mapping(self.data, "issues")
