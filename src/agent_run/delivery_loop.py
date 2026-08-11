@@ -201,6 +201,10 @@ class TicketDeliveryLoop:
                 "ticket_close_ownership_pending",
                 "Ticket close preparation did not establish current ownership",
             )
+        if close_intent.get("dispatch_attempted") is not True:
+            close_intent = {**close_intent, "dispatch_attempted": True}
+            job["ticket_close_intent"] = close_intent
+            self._save(state)
         close_ownership = self.github.close_primary_ticket(
             ticket_number=int(job["ticket_number"]),
             run_id=str(state["run_id"]),

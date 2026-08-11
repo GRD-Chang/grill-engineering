@@ -1052,6 +1052,7 @@ class GhGitHubPublisher:
             if (
                 isinstance(recorded_ownership, dict)
                 and recorded_ownership.get("event_id") is None
+                and recorded_ownership.get("dispatch_attempted") is not True
                 and issue.get("state") == "OPEN"
             ):
                 return None
@@ -1110,7 +1111,10 @@ class GhGitHubPublisher:
             event for event in transitions if int(event["id"]) > baseline_event_id
         ]
         if not after_baseline:
-            if issue.get("state") == "OPEN":
+            if (
+                issue.get("state") == "OPEN"
+                and recorded_ownership.get("dispatch_attempted") is not True
+            ):
                 return None
             raise GitHubReadError(
                 "ticket_close_ownership_pending",

@@ -749,6 +749,12 @@ def test_provisional_close_intent_can_abandon(
         "state"
     ] == "CLOSED"
     if not publisher_closed:
+        state_path = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+        prepared_state = json.loads(state_path.read_text(encoding="utf-8"))
+        prepared_state["ticket_jobs"]["2"]["ticket_close_intent"].pop(
+            "dispatch_attempted", None
+        )
+        state_path.write_text(json.dumps(prepared_state), encoding="utf-8")
         prepared_only = json.loads(fixture.read_text(encoding="utf-8"))
         prepared_only["issues"]["2"]["state"] = "OPEN"
         prepared_only["delivery"]["closed_issues"] = []
