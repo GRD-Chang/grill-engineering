@@ -274,6 +274,7 @@ def test_close_stops_when_ticket_changes_after_intent(
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     calls: list[tuple[str, ...]] = []
+    dispatches: list[str] = []
     issue_views = 0
 
     def fake_json(*arguments: str) -> object:
@@ -319,9 +320,11 @@ def test_close_stops_when_ticket_changes_after_intent(
             run_id="run-1",
             pr_number=3,
             integrated_sha="abc123",
+            before_dispatch=lambda: dispatches.append("dispatch"),
         )
 
     assert not any(call[:2] == ("issue", "close") for call in calls)
+    assert dispatches == []
 
 
 def test_prepare_close_recovers_lost_comment_response(

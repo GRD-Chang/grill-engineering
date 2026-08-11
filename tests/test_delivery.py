@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -434,8 +435,11 @@ class ScriptedPublisher:
         pr_number: int,
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         del run_id, pr_number, integrated_sha, close_intent
+        if before_dispatch is not None:
+            before_dispatch()
         self.closed_issues.append(ticket_number)
         return {"actor": "scripted-publisher", "event_id": ticket_number}
 
@@ -534,8 +538,11 @@ class MissingCloseOwnershipPublisher(ScriptedPublisher):
         pr_number: int,
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> None:
         del ticket_number, run_id, pr_number, integrated_sha, close_intent
+        if before_dispatch is not None:
+            before_dispatch()
 
 
 class BaseMovesThenMergeResponseIsLostPublisher(CrashAfterMergePublisher):
@@ -1107,6 +1114,7 @@ class CrashBeforeClosePublisher(ScriptedPublisher):
         pr_number: int,
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         if self.crash_once:
             self.crash_once = False
@@ -1117,6 +1125,7 @@ class CrashBeforeClosePublisher(ScriptedPublisher):
             pr_number=pr_number,
             integrated_sha=integrated_sha,
             close_intent=close_intent,
+            before_dispatch=before_dispatch,
         )
 
 

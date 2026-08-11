@@ -196,21 +196,28 @@ class TicketDeliveryLoop:
             )
             job["ticket_close_intent"] = close_intent
             self._save(state)
-        if close_intent is None:
+        if not isinstance(close_intent, dict):
             raise GitHubReadError(
                 "ticket_close_ownership_pending",
                 "Ticket close preparation did not establish current ownership",
             )
-        if close_intent.get("dispatch_attempted") is not True:
-            close_intent = {**close_intent, "dispatch_attempted": True}
-            job["ticket_close_intent"] = close_intent
+        dispatch_intent = close_intent
+
+        def record_dispatch_boundary() -> None:
+            nonlocal dispatch_intent
+            if dispatch_intent.get("dispatch_attempted") is True:
+                return
+            dispatch_intent = {**dispatch_intent, "dispatch_attempted": True}
+            job["ticket_close_intent"] = dispatch_intent
             self._save(state)
+
         close_ownership = self.github.close_primary_ticket(
             ticket_number=int(job["ticket_number"]),
             run_id=str(state["run_id"]),
             pr_number=int(job["pr_number"]),
             integrated_sha=integrated,
-            close_intent=close_intent,
+            close_intent=dispatch_intent,
+            before_dispatch=record_dispatch_boundary,
         )
         if close_ownership is None:
             raise GitHubReadError(

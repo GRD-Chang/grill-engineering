@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -670,6 +671,7 @@ class FixtureGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None:
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
@@ -703,6 +705,20 @@ class FixtureGitHubPublisher:
             and isinstance(issue, dict)
             and issue.get("state") != "CLOSED"
         ):
+            crash_before_dispatch = bool(
+                self._delivery().pop("crash_before_close_dispatch_once", False)
+            )
+            if crash_before_dispatch:
+                self._save()
+                raise OSError("simulated crash before Primary Ticket close dispatch")
+            if before_dispatch is not None:
+                before_dispatch()
+            crash_after_boundary = bool(
+                self._delivery().pop("crash_after_close_dispatch_boundary_once", False)
+            )
+            if crash_after_boundary:
+                self._save()
+                raise OSError("simulated crash after durable close dispatch boundary")
             closed.append(ticket_number)
             mutations.append({"action": "close_issue", **marker})
             issue["state"] = "CLOSED"

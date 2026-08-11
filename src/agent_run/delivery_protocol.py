@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 
@@ -122,6 +123,7 @@ class GitHubPublisher(Protocol):
         pr_number: int,
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None: ...
 
     def ticket_closed_by_run(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Callable
 from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
@@ -915,6 +916,7 @@ class GhGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
         close_intent: dict[str, Any] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None:
         prepared = close_intent or self.prepare_primary_ticket_close(
             ticket_number=ticket_number,
@@ -988,6 +990,8 @@ class GhGitHubPublisher:
                 "ticket_close_reconciliation_pending",
                 "Ticket currentness changed after the Publisher close intent",
             )
+        if before_dispatch is not None:
+            before_dispatch()
         self._require(
             "issue", "close", str(ticket_number), "--repo", self.repository
         )

@@ -154,15 +154,29 @@ class RunPublicationApproval(RunPublicationShared):
                 self._save(state)
             for ticket in _obligation_list(abandonment, "tickets"):
                 if ticket.get("eligible") is None:
-                    ownership = self.github.ticket_close_ownership(
-                        ticket_number=int(ticket["ticket_number"]),
-                        run_id=run_id,
-                        recorded_ownership=(
-                            ticket.get("recorded_ownership")
-                            if isinstance(ticket.get("recorded_ownership"), dict)
-                            else None
-                        ),
+                    recorded_ownership = (
+                        ticket.get("recorded_ownership")
+                        if isinstance(ticket.get("recorded_ownership"), dict)
+                        else None
                     )
+                    if (
+                        isinstance(recorded_ownership, dict)
+                        and recorded_ownership.get("event_id") is None
+                        and recorded_ownership.get("dispatch_attempted") is True
+                    ):
+                        ownership = self.github.close_primary_ticket(
+                            ticket_number=int(ticket["ticket_number"]),
+                            run_id=run_id,
+                            pr_number=int(ticket["pr_number"]),
+                            integrated_sha=str(ticket["integrated_sha"]),
+                            close_intent=recorded_ownership,
+                        )
+                    else:
+                        ownership = self.github.ticket_close_ownership(
+                            ticket_number=int(ticket["ticket_number"]),
+                            run_id=run_id,
+                            recorded_ownership=recorded_ownership,
+                        )
                     ticket["expected_ownership"] = ownership
                     ticket["eligible"] = ownership is not None
                     self._save(state)

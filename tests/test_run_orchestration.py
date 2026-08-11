@@ -700,14 +700,21 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     ] == ["completion_comment", "close_issue", "delete_managed_branch"]
 
 
-@pytest.mark.parametrize("publisher_closed", [True, False])
+@pytest.mark.parametrize(
+    "recovery_case", ["response_loss", "prepared_only", "dispatch_pending"]
+)
 def test_provisional_close_intent_can_abandon(
-    git_repo: Path, publisher_closed: bool
+    git_repo: Path, recovery_case: str
 ) -> None:
+    crash_flag = {
+        "response_loss": "crash_after_close_once",
+        "prepared_only": "crash_before_close_dispatch_once",
+        "dispatch_pending": "crash_after_close_dispatch_boundary_once",
+    }[recovery_case]
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"2": _ticket(2)},
-        delivery={"crash_after_close_once": True},
+        delivery={crash_flag: True},
     )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(
@@ -745,26 +752,13 @@ def test_provisional_close_intent_can_abandon(
     assert interrupted_job["phase"] == "merged"
     assert isinstance(interrupted_job["ticket_close_intent"], dict)
     assert "ticket_close_ownership" not in interrupted_job
-    assert json.loads(fixture.read_text(encoding="utf-8"))["issues"]["2"][
-        "state"
-    ] == "CLOSED"
-    if not publisher_closed:
-        state_path = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
-        prepared_state = json.loads(state_path.read_text(encoding="utf-8"))
-        prepared_state["ticket_jobs"]["2"]["ticket_close_intent"].pop(
-            "dispatch_attempted", None
-        )
-        state_path.write_text(json.dumps(prepared_state), encoding="utf-8")
-        prepared_only = json.loads(fixture.read_text(encoding="utf-8"))
-        prepared_only["issues"]["2"]["state"] = "OPEN"
-        prepared_only["delivery"]["closed_issues"] = []
-        prepared_only["delivery"]["ticket_close_ownership"] = {}
-        prepared_only["delivery"]["mutations"] = [
-            mutation
-            for mutation in prepared_only["delivery"]["mutations"]
-            if mutation["action"] != "close_issue"
-        ]
-        fixture.write_text(json.dumps(prepared_only), encoding="utf-8")
+    interrupted_data = json.loads(fixture.read_text(encoding="utf-8"))
+    assert interrupted_data["issues"]["2"]["state"] == (
+        "CLOSED" if recovery_case == "response_loss" else "OPEN"
+    )
+    assert (
+        interrupted_job["ticket_close_intent"].get("dispatch_attempted") is True
+    ) == (recovery_case != "prepared_only")
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
@@ -779,8 +773,16 @@ def test_provisional_close_intent_can_abandon(
     ]
     assert abandonment_mutations == (
         ["abandonment_reopen_issue", "abandonment_recovery_comment"]
-        if publisher_closed
+        if recovery_case != "prepared_only"
         else []
+    )
+    close_mutations = [
+        mutation["action"]
+        for mutation in data["delivery"]["mutations"]
+        if mutation["action"] == "close_issue"
+    ]
+    assert close_mutations == (
+        [] if recovery_case == "prepared_only" else ["close_issue"]
     )
 
 
