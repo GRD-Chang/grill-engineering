@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.git import GitError, GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.github_publish import GhGitHubPublisher, _matches_ref
 
 
@@ -150,9 +151,9 @@ def test_ticket_close_ownership_requires_publisher_close_event(
         ):
             return [
                 {
-                    "id": 101,
+                    "id": 99,
                     "event": "closed",
-                    "created_at": "2026-08-11T10:00:01Z",
+                    "created_at": "2026-08-11T10:00:00Z",
                     "actor": {"login": closing_actor},
                 }
             ]
@@ -170,10 +171,29 @@ def test_successful_close_persists_ownership_before_events_are_visible(
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     calls: list[tuple[str, ...]] = []
+    issue_views = 0
 
     def fake_json(*arguments: str) -> object:
+        nonlocal issue_views
         if arguments[:2] == ("issue", "view"):
-            return {"state": "OPEN", "comments": []}
+            issue_views += 1
+            return {
+                "state": "OPEN",
+                "comments": (
+                    []
+                    if issue_views == 1
+                    else [
+                        {
+                            "body": (
+                                "<!-- agent-run:run-1:ticket-2:"
+                                "publisher-close-intent -->"
+                            ),
+                            "createdAt": "2026-08-11T10:00:00Z",
+                            "author": {"login": "agent-run-bot"},
+                        }
+                    ]
+                ),
+            }
         if arguments[:2] == ("api", "user"):
             return {"login": "agent-run-bot"}
         raise AssertionError(arguments)
@@ -190,7 +210,11 @@ def test_successful_close_persists_ownership_before_events_are_visible(
         integrated_sha="abc123",
     )
 
-    assert ownership == {"actor": "agent-run-bot", "event_id": None}
+    assert ownership == {
+        "actor": "agent-run-bot",
+        "event_id": None,
+        "intent_created_at": "2026-08-11T10:00:00Z",
+    }
     assert calls[-1] == ("issue", "close", "2", "--repo", "example/project")
 
 
@@ -208,21 +232,21 @@ def test_ticket_close_ownership_rejects_later_external_reclose(
         ):
             return [
                 {
-                    "id": 101,
+                    "id": 99,
                     "event": "closed",
-                    "created_at": "2026-08-11T10:00:01Z",
+                    "created_at": "2026-08-11T10:00:00Z",
                     "actor": {"login": "agent-run-bot"},
                 },
                 {
-                    "id": 102,
+                    "id": 100,
                     "event": "reopened",
-                    "created_at": "2026-08-11T10:01:00Z",
+                    "created_at": "2026-08-11T10:00:00Z",
                     "actor": {"login": "maintainer"},
                 },
                 {
-                    "id": 103,
+                    "id": 101,
                     "event": "closed",
-                    "created_at": "2026-08-11T10:02:00Z",
+                    "created_at": "2026-08-11T10:00:00Z",
                     "actor": {"login": "maintainer"},
                 },
             ]
@@ -233,8 +257,150 @@ def test_ticket_close_ownership_rejects_later_external_reclose(
     assert not publisher.ticket_closed_by_run(
         ticket_number=2,
         run_id="run-1",
-        recorded_ownership={"event_id": 101, "actor": "agent-run-bot"},
+        recorded_ownership={"event_id": 99, "actor": "agent-run-bot"},
     )
+
+
+def test_ticket_close_ownership_flattens_paginated_events(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "CLOSED",
+                "comments": [
+                    {
+                        "body": (
+                            "<!-- agent-run:run-1:ticket-2:"
+                            "publisher-close-intent -->"
+                        ),
+                        "createdAt": "2026-08-11T10:00:00Z",
+                        "author": {"login": "agent-run-bot"},
+                    }
+                ],
+            }
+        if arguments[:2] == ("api", "user"):
+            return {"login": "agent-run-bot"}
+        return [
+            [
+                {
+                    "id": 101,
+                    "event": "closed",
+                    "created_at": "2026-08-11T10:00:00Z",
+                    "actor": {"login": "agent-run-bot"},
+                }
+            ],
+            [
+                {
+                    "id": 202,
+                    "event": "closed",
+                    "created_at": "2026-08-11T11:00:00Z",
+                    "actor": {"login": "agent-run-bot"},
+                }
+            ],
+        ]
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    assert publisher.ticket_closed_by_run(
+        ticket_number=2,
+        run_id="run-1",
+        recorded_ownership={"event_id": 202, "actor": "agent-run-bot"},
+    )
+
+
+def test_provisional_close_rejects_later_same_actor_reclose(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "CLOSED",
+                "comments": [
+                    {
+                        "body": (
+                            "<!-- agent-run:run-1:ticket-2:"
+                            "publisher-close-intent -->"
+                        ),
+                        "createdAt": "2026-08-11T10:00:00Z",
+                        "author": {"login": "agent-run-bot"},
+                    }
+                ],
+            }
+        if arguments[:2] == ("api", "user"):
+            return {"login": "agent-run-bot"}
+        return [
+            {
+                "id": 99,
+                "event": "closed",
+                "created_at": "2026-08-11T10:00:01Z",
+                "actor": {"login": "agent-run-bot"},
+            },
+            {
+                "id": 100,
+                "event": "reopened",
+                "created_at": "2026-08-11T10:00:02Z",
+                "actor": {"login": "maintainer"},
+            },
+            {
+                "id": 101,
+                "event": "closed",
+                "created_at": "2026-08-11T10:00:03Z",
+                "actor": {"login": "agent-run-bot"},
+            },
+        ]
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    assert not publisher.ticket_closed_by_run(
+        ticket_number=2,
+        run_id="run-1",
+        recorded_ownership={
+            "actor": "agent-run-bot",
+            "event_id": None,
+            "intent_created_at": "2026-08-11T10:00:00Z",
+        },
+    )
+    assert not publisher.ticket_closed_by_run(
+        ticket_number=2,
+        run_id="run-1",
+        recorded_ownership=None,
+    )
+
+
+def test_provisional_close_waits_for_post_intent_event(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {"state": "CLOSED", "comments": []}
+        return [
+            {
+                "id": 50,
+                "event": "closed",
+                "created_at": "2026-08-11T09:00:00Z",
+                "actor": {"login": "agent-run-bot"},
+            }
+        ]
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    with pytest.raises(GitHubReadError, match="transition after the close intent"):
+        publisher.ticket_closed_by_run(
+            ticket_number=2,
+            run_id="run-1",
+            recorded_ownership={
+                "actor": "agent-run-bot",
+                "event_id": None,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+            },
+        )
 
 
 def test_durable_close_event_survives_deleted_intent_comment(

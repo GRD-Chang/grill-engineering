@@ -833,6 +833,25 @@ class GhGitHubPublisher:
             )
         if issue.get("state") != "CLOSED":
             publisher_login = self._publisher_login()
+            intent_issue = _mapping(
+                self._json(
+                    "issue",
+                    "view",
+                    str(ticket_number),
+                    "--repo",
+                    self.repository,
+                    "--json",
+                    "state,comments",
+                )
+            )
+            intent_time = self._publisher_close_intent_time(
+                intent_issue, close_intent, publisher_login
+            )
+            if intent_time is None:
+                raise GitHubReadError(
+                    "ticket_close_intent_pending",
+                    "GitHub has not exposed the Publisher close intent yet",
+                )
             self._require(
                 "issue",
                 "close",
@@ -840,7 +859,11 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
             )
-            return {"actor": publisher_login, "event_id": None}
+            return {
+                "actor": publisher_login,
+                "event_id": None,
+                "intent_created_at": intent_time,
+            }
         ownership = self._ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
@@ -881,21 +904,28 @@ class GhGitHubPublisher:
         )
         if issue.get("state") != "CLOSED":
             return None
-        events = self._json(
+        raw_events = self._json(
             "api",
             f"repos/{self.repository}/issues/{ticket_number}/events",
             "--paginate",
+            "--slurp",
         )
-        if not isinstance(events, list):
+        if not isinstance(raw_events, list):
             raise GitHubReadError(
                 "github_invalid_response", "Issue events must be an array"
             )
+        events = (
+            [event for page in raw_events for event in page]
+            if all(isinstance(page, list) for page in raw_events)
+            else raw_events
+        )
         transitions = [
             event
             for event in events
             if isinstance(event, dict)
             and event.get("event") in {"closed", "reopened"}
-            and event.get("id") is not None
+            and isinstance(event.get("id"), int)
+            and not isinstance(event.get("id"), bool)
             and isinstance(event.get("created_at"), str)
         ]
         if not transitions:
@@ -905,34 +935,87 @@ class GhGitHubPublisher:
             )
         latest = max(
             transitions,
-            key=lambda event: (str(event["created_at"]), str(event["id"])),
+            key=lambda event: (str(event["created_at"]), int(event["id"])),
         )
-        if latest.get("event") != "closed":
-            return None
         if isinstance(recorded_ownership, dict):
             recorded_event_id = recorded_ownership.get("event_id")
-            actor = latest.get("actor")
-            if recorded_event_id is not None and str(latest["id"]) != str(
-                recorded_event_id
+            if recorded_event_id is not None:
+                recorded_events = [
+                    event
+                    for event in transitions
+                    if str(event["id"]) == str(recorded_event_id)
+                ]
+                if not recorded_events:
+                    raise GitHubReadError(
+                        "ticket_close_ownership_pending",
+                        "GitHub has not exposed the recorded Ticket close event yet",
+                    )
+                if str(latest["id"]) != str(recorded_event_id):
+                    return None
+                return dict(recorded_ownership)
+            publisher_login = recorded_ownership.get("actor")
+            intent_time = recorded_ownership.get("intent_created_at")
+            if not isinstance(publisher_login, str) or not isinstance(
+                intent_time, str
             ):
-                return None
-            if (
-                recorded_event_id is None
-                and (
-                    not isinstance(actor, dict)
-                    or actor.get("login") != recorded_ownership.get("actor")
-                )
-            ):
-                return None
-            return {
-                "event_id": latest["id"],
-                "actor": recorded_ownership.get("actor"),
-                "created_at": latest["created_at"],
-            }
-        publisher_login = self._publisher_login()
+                raise ValueError("provisional Ticket close ownership is incomplete")
+        else:
+            publisher_login = self._publisher_login()
+            intent_time = None
         marker = (
             f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-close-intent -->"
         )
+        if intent_time is None:
+            intent_time = self._publisher_close_intent_time(
+                issue, marker, publisher_login
+            )
+        if intent_time is None:
+            return None
+        after_intent = [
+            event
+            for event in transitions
+            if str(event["created_at"]) >= intent_time
+        ]
+        if not after_intent:
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "GitHub has not exposed a transition after the close intent yet",
+            )
+        ordered = sorted(
+            after_intent,
+            key=lambda event: (str(event["created_at"]), int(event["id"])),
+        )
+        owned = next(
+            (
+                event
+                for event in ordered
+                if event.get("event") == "closed"
+                and isinstance(event.get("actor"), dict)
+                and event["actor"].get("login") == publisher_login
+            ),
+            None,
+        )
+        latest_after_intent = ordered[-1]
+        if owned is None:
+            if latest_after_intent.get("event") == "closed":
+                return None
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "GitHub has not exposed the close following the Publisher intent yet",
+            )
+        if latest_after_intent["id"] != owned["id"]:
+            return None
+        return {
+            "event_id": owned["id"],
+            "actor": publisher_login,
+            "created_at": owned["created_at"],
+            "intent_created_at": intent_time,
+        }
+
+    @staticmethod
+    def _publisher_close_intent_time(
+        issue: dict[str, Any], marker: str, publisher_login: str
+    ) -> str | None:
         comments = issue.get("comments")
         if not isinstance(comments, list):
             return None
@@ -941,30 +1024,16 @@ class GhGitHubPublisher:
             for comment in comments
             if marker in str(_mapping(comment).get("body", ""))
         ]
-        intents = [
+        trusted = [
             intent
             for intent in intents
             if isinstance(intent.get("createdAt"), str)
             and isinstance(intent.get("author"), dict)
-            and isinstance(intent["author"].get("login"), str)
             and intent["author"].get("login") == publisher_login
         ]
-        if not intents:
+        if not trusted:
             return None
-        intent = max(intents, key=lambda item: str(item["createdAt"]))
-        intent_time = str(intent["createdAt"])
-        actor = latest.get("actor")
-        if (
-            str(latest.get("created_at", "")) < intent_time
-            or not isinstance(actor, dict)
-            or actor.get("login") != publisher_login
-        ):
-            return None
-        return {
-            "event_id": latest["id"],
-            "actor": publisher_login,
-            "created_at": latest["created_at"],
-        }
+        return str(max(trusted, key=lambda item: str(item["createdAt"]))["createdAt"])
 
     def _publisher_login(self) -> str:
         identity = _mapping(self._json("api", "user"))
