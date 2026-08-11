@@ -182,7 +182,7 @@ class ParentDeliveryEngine:
             state = self._load(run_id)
             job = _mapping(state, "parent_job")
             if job.get("phase") == "completed":
-                raise ValueError("a completed Parent-only Run cannot be abandoned")
+                return state
             if job.get("phase") == "abandoned":
                 return state
             pr_number = job.get("pr_number")

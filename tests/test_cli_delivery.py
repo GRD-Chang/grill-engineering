@@ -253,6 +253,10 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     replayed = run_cli(git_repo, fixture, "resume", run_id)
     assert replayed.returncode == 0, replayed.stderr
     assert stdout_json(replayed)["status"] == "completed"
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "completed"
+    assert load_only_run_state(git_repo)["status"] == "completed"
     assert subprocess.run(
         ["git", "show-ref", "--verify", f"refs/heads/{state['parent_branch']}"],
         cwd=git_repo,
