@@ -139,6 +139,35 @@ def test_terminal_error_strips_controls_redacts_and_bounds_utf8() -> None:
     assert len(_terminal_error("", "密" * 9000).encode()) <= 8192
 
 
+def test_terminal_error_projects_embedded_api_error_json() -> None:
+    message = (
+        "API request failed: "
+        '{"request_id":"req-sensitive","status":429,'
+        '"error":{"type":"invalid_request_error","code":"invalid_api_key",'
+        '"message":"api_key=secret-value denied","param":null,'
+        '"headers":{"authorization":"Bearer sensitive"},'
+        '"response_body":{"customer":"private"}}}'
+        "; contact upstream support"
+    )
+    stdout = json.dumps(
+        {"type": "turn.failed", "error": {"message": message}}
+    )
+
+    assert _terminal_error(stdout, "less useful stderr") == (
+        '{"type":"invalid_request_error","code":"invalid_api_key",'
+        '"status":429,"message":"api_key=[REDACTED] denied","param":null}'
+    )
+
+
+def test_terminal_error_keeps_plain_text_message() -> None:
+    message = "plain upstream failure without an API response"
+    stdout = json.dumps(
+        {"type": "task_complete", "error": {"message": message}}
+    )
+
+    assert _terminal_error(stdout, "less useful stderr") == message
+
+
 def test_codex_worker_environment_excludes_publisher_credentials(
     tmp_path: Path,
     monkeypatch: Any,

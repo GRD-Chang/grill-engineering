@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import inspect
+import json
+import math
 import re
 import tempfile
 from pathlib import Path
@@ -626,7 +627,41 @@ def _terminal_error(stdout: str, stderr: str) -> str:
         or stderr.strip()
         or "Codex worker failed"
     )
-    return _bounded_error(raw)
+    return _bounded_error(_project_api_error(raw) or raw)
+
+
+_API_ERROR_FIELDS = ("type", "code", "status", "message", "param")
+
+
+def _project_api_error(value: str) -> str | None:
+    decoder = json.JSONDecoder()
+    for offset, character in enumerate(value):
+        if character != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(value, offset)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        nested = candidate.get("error")
+        primary = nested if isinstance(nested, dict) else candidate
+        projected: dict[str, object] = {}
+        for field in _API_ERROR_FIELDS:
+            sources = (primary, candidate) if primary is not candidate else (primary,)
+            for source in sources:
+                if field in source and _is_json_scalar(source[field]):
+                    projected[field] = source[field]
+                    break
+        if projected:
+            return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    return None
+
+
+def _is_json_scalar(value: object) -> bool:
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
 
 
 def _bounded_error(value: str) -> str:

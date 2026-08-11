@@ -414,46 +414,15 @@ def _clear_current_publication_thread(state: dict[str, Any]) -> None:
         "final_publication",
     }:
         raise ValueError("--new-thread requires a current Publication Invocation")
+    job, mirror = _publication_job_for_invocation(state, invocation)
     if invocation.get("role") == "final_publication":
-        publication = state.get("run_publication")
-        if isinstance(publication, dict):
-            publication.pop("thread_id", None)
-            publication["publication_new_thread"] = True
-        return
-    active = state.get("active_ticket_job")
-    if isinstance(active, dict):
-        active.pop("publication_thread_id", None)
-        active["publication_new_thread"] = True
-        number = active.get("ticket_number")
-        jobs = state.get("ticket_jobs")
-        job = jobs.get(str(number)) if isinstance(jobs, dict) else None
-        if isinstance(job, dict):
-            job.pop("publication_thread_id", None)
-            job["publication_new_thread"] = True
-        return
-    jobs = state.get("ticket_jobs")
-    if isinstance(jobs, dict):
-        candidates = [
-            job
-            for job in jobs.values()
-            if isinstance(job, dict) and job.get("publication_thread_id")
-        ]
-        if len(candidates) == 1:
-            candidates[0].pop("publication_thread_id", None)
-            candidates[0]["publication_new_thread"] = True
-            return
-    parent = state.get("parent_job")
-    if isinstance(parent, dict):
-        parent.pop("publication_thread_id", None)
-        parent["publication_new_thread"] = True
-        return
-    acceptance = state.get("run_acceptance")
-    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-    if isinstance(repair, dict):
-        repair.pop("publication_thread_id", None)
-        repair["publication_new_thread"] = True
-        return
-    raise ValueError("current Publication job is missing")
+        job.pop("thread_id", None)
+    else:
+        job.pop("publication_thread_id", None)
+    job["publication_new_thread"] = True
+    if mirror is not None:
+        mirror.pop("publication_thread_id", None)
+        mirror["publication_new_thread"] = True
 
 
 def _restore_current_publication_thread(state: dict[str, Any]) -> None:
@@ -464,48 +433,82 @@ def _restore_current_publication_thread(state: dict[str, Any]) -> None:
         or invocation.get("role") not in {"publication", "final_publication"}
     ):
         return
+    job, mirror = _publication_job_for_invocation(state, invocation)
     thread_id = invocation.get("reported_thread_id") or invocation.get(
         "requested_thread_id"
     )
     if not isinstance(thread_id, str) or not thread_id.strip():
         return
     if invocation.get("role") == "final_publication":
+        job["thread_id"] = thread_id
+    else:
+        job["publication_thread_id"] = thread_id
+    job.pop("publication_new_thread", None)
+    if mirror is not None:
+        mirror["publication_thread_id"] = thread_id
+        mirror.pop("publication_new_thread", None)
+
+
+def _publication_job_for_invocation(
+    state: dict[str, Any], invocation: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Resolve a Publication job from its persisted, unambiguous subject."""
+
+    subject = invocation.get("work_subject")
+    run_id = state.get("run_id")
+    if not isinstance(subject, str) or not subject.strip():
+        raise ValueError("current Publication Invocation work_subject is missing")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("Delivery Run ID is missing")
+
+    role = invocation.get("role")
+    if role == "final_publication":
+        if subject != f"run-publication:{run_id}":
+            raise ValueError("Final Publication Invocation work_subject is invalid")
         publication = state.get("run_publication")
-        if isinstance(publication, dict):
-            publication["thread_id"] = thread_id
-        return
-    active = state.get("active_ticket_job")
-    if isinstance(active, dict):
-        active["publication_thread_id"] = thread_id
-        active.pop("publication_new_thread", None)
-        number = active.get("ticket_number")
+        if not isinstance(publication, dict):
+            raise ValueError("current Final Publication job is missing")
+        return publication, None
+    if role != "publication":
+        raise ValueError("current Publication Invocation role is invalid")
+
+    if subject.startswith("ticket:"):
+        ticket_text = subject.removeprefix("ticket:")
+        if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
+            raise ValueError("Ticket Publication Invocation work_subject is invalid")
+        ticket_number = int(ticket_text)
         jobs = state.get("ticket_jobs")
-        job = jobs.get(str(number)) if isinstance(jobs, dict) else None
-        if isinstance(job, dict):
-            job["publication_thread_id"] = thread_id
-            job.pop("publication_new_thread", None)
-        return
-    jobs = state.get("ticket_jobs")
-    if isinstance(jobs, dict):
-        candidates = [
-            job
-            for job in jobs.values()
-            if isinstance(job, dict) and job.get("phase") == "accepted"
-        ]
-        if len(candidates) == 1:
-            candidates[0]["publication_thread_id"] = thread_id
-            candidates[0].pop("publication_new_thread", None)
-            return
-    parent = state.get("parent_job")
-    if isinstance(parent, dict):
-        parent["publication_thread_id"] = thread_id
-        parent.pop("publication_new_thread", None)
-        return
-    acceptance = state.get("run_acceptance")
-    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-    if isinstance(repair, dict):
-        repair["publication_thread_id"] = thread_id
-        repair.pop("publication_new_thread", None)
+        job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
+        if not isinstance(job, dict) or job.get("ticket_number") != ticket_number:
+            raise ValueError("current Ticket Publication job is missing")
+        active = state.get("active_ticket_job")
+        mirror = (
+            active
+            if isinstance(active, dict)
+            and active.get("ticket_number") == ticket_number
+            and active is not job
+            else None
+        )
+        return job, mirror
+
+    if subject == f"parent-only:{run_id}":
+        parent = state.get("parent_job")
+        if not isinstance(parent, dict):
+            raise ValueError("current Parent-only Publication job is missing")
+        return parent, None
+
+    if subject == f"run-repair:{run_id}":
+        acceptance = state.get("run_acceptance")
+        repair = (
+            acceptance.get("repair_job")
+            if isinstance(acceptance, dict)
+            else None
+        )
+        if not isinstance(repair, dict):
+            raise ValueError("current Run Repair Publication job is missing")
+        return repair, None
+
+    raise ValueError("Publication Invocation work_subject is invalid")
 
 
 def _resume_change_job(
