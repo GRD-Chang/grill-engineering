@@ -931,6 +931,68 @@ def test_close_rechecks_exact_ownership_before_completion(
         )
 
 
+@pytest.mark.parametrize("event_id", [None, 99])
+def test_recovery_rejects_ownership_from_another_pr_generation(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, event_id: int | None
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *arguments: (_ for _ in ()).throw(AssertionError(arguments)),
+    )
+    monkeypatch.setattr(
+        publisher, "_require", lambda *arguments: calls.append(arguments)
+    )
+
+    with pytest.raises(GitHubReadError, match="different PR generation"):
+        publisher.recover_abandoned_ticket(
+            ticket_number=2,
+            run_id="run-1",
+            pr_number=4,
+            integrated_sha="new",
+            expected_ownership={
+                "actor": "agent-run-bot",
+                "event_id": event_id,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 0,
+                "intent_binding": "pr-3:sha-old",
+            },
+        )
+
+    assert calls == []
+
+
+def test_open_ticket_without_post_intent_transition_is_not_owned(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "OPEN",
+                "comments": [],
+                "updatedAt": "2026-08-11T10:00:00Z",
+            }
+        return []
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    assert publisher.ticket_close_ownership(
+        ticket_number=2,
+        run_id="run-1",
+        recorded_ownership={
+            "actor": "agent-run-bot",
+            "event_id": None,
+            "intent_created_at": "2026-08-11T10:00:00Z",
+            "baseline_event_id": 0,
+            "intent_binding": "pr-3:sha-abc123",
+        },
+    ) is None
+
+
 def test_close_retry_does_not_overwrite_external_reopen(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1032,7 +1094,11 @@ def test_abandonment_rechecks_exact_close_before_reopen(
         run_id="run-1",
         pr_number=3,
         integrated_sha="abc123",
-        expected_ownership={"actor": "agent-run-bot", "event_id": 99},
+        expected_ownership={
+            "actor": "agent-run-bot",
+            "event_id": 99,
+            "intent_binding": "pr-3:sha-abc123",
+        },
     )
     assert not any(call[:2] == ("issue", "comment") for call in calls)
     assert not any(call[:2] == ("issue", "reopen") for call in calls)
@@ -1071,7 +1137,11 @@ def test_abandonment_waits_when_issue_is_newer_than_visible_events(
             run_id="run-1",
             pr_number=3,
             integrated_sha="abc123",
-            expected_ownership={"actor": "agent-run-bot", "event_id": 99},
+            expected_ownership={
+                "actor": "agent-run-bot",
+                "event_id": 99,
+                "intent_binding": "pr-3:sha-abc123",
+            },
         )
     assert calls == []
 
@@ -1128,7 +1198,11 @@ def test_open_recovery_requires_publisher_marker_and_reopen(
             run_id="run-1",
             pr_number=3,
             integrated_sha="abc123",
-            expected_ownership={"actor": "agent-run-bot", "event_id": 99},
+            expected_ownership={
+                "actor": "agent-run-bot",
+                "event_id": 99,
+                "intent_binding": "pr-3:sha-abc123",
+            },
         )
         is expected
     )
@@ -1172,7 +1246,11 @@ def test_open_recovery_records_comment_after_lost_reopen_response(
         run_id="run-1",
         pr_number=3,
         integrated_sha="abc123",
-        expected_ownership={"actor": "agent-run-bot", "event_id": 99},
+        expected_ownership={
+            "actor": "agent-run-bot",
+            "event_id": 99,
+            "intent_binding": "pr-3:sha-abc123",
+        },
     )
     assert [call[:2] for call in calls] == [("issue", "comment")]
 

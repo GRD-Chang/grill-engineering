@@ -1049,6 +1049,12 @@ class GhGitHubPublisher:
         )
         transitions = self._ticket_transitions(ticket_number)
         if not transitions:
+            if (
+                isinstance(recorded_ownership, dict)
+                and recorded_ownership.get("event_id") is None
+                and issue.get("state") == "OPEN"
+            ):
+                return None
             raise GitHubReadError(
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed the Ticket close event yet",
@@ -1104,6 +1110,8 @@ class GhGitHubPublisher:
             event for event in transitions if int(event["id"]) > baseline_event_id
         ]
         if not after_baseline:
+            if issue.get("state") == "OPEN":
+                return None
             raise GitHubReadError(
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed a transition after the close intent baseline yet",
@@ -1294,6 +1302,12 @@ class GhGitHubPublisher:
         integrated_sha: str,
         expected_ownership: dict[str, Any],
     ) -> bool:
+        expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
+        if expected_ownership.get("intent_binding") != expected_binding:
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "recorded Ticket close belongs to a different PR generation",
+            )
         issue = _mapping(
             self._json(
                 "issue",

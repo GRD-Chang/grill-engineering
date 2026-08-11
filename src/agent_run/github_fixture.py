@@ -797,6 +797,12 @@ class FixtureGitHubPublisher:
         integrated_sha: str,
         expected_ownership: dict[str, Any],
     ) -> bool:
+        expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
+        if expected_ownership.get("intent_binding") != expected_binding:
+            raise GitHubReadError(
+                "ticket_close_reconciliation_pending",
+                "recorded Ticket close belongs to a different PR generation",
+            )
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,

@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
@@ -698,8 +700,9 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     ] == ["completion_comment", "close_issue", "delete_managed_branch"]
 
 
-def test_close_response_loss_can_abandon_from_provisional_intent(
-    git_repo: Path,
+@pytest.mark.parametrize("publisher_closed", [True, False])
+def test_provisional_close_intent_can_abandon(
+    git_repo: Path, publisher_closed: bool
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json",
@@ -745,6 +748,17 @@ def test_close_response_loss_can_abandon_from_provisional_intent(
     assert json.loads(fixture.read_text(encoding="utf-8"))["issues"]["2"][
         "state"
     ] == "CLOSED"
+    if not publisher_closed:
+        prepared_only = json.loads(fixture.read_text(encoding="utf-8"))
+        prepared_only["issues"]["2"]["state"] = "OPEN"
+        prepared_only["delivery"]["closed_issues"] = []
+        prepared_only["delivery"]["ticket_close_ownership"] = {}
+        prepared_only["delivery"]["mutations"] = [
+            mutation
+            for mutation in prepared_only["delivery"]["mutations"]
+            if mutation["action"] != "close_issue"
+        ]
+        fixture.write_text(json.dumps(prepared_only), encoding="utf-8")
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
@@ -752,11 +766,16 @@ def test_close_response_loss_can_abandon_from_provisional_intent(
     assert stdout_json(abandoned)["status"] == "abandoned"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     assert data["issues"]["2"]["state"] == "OPEN"
-    assert [
+    abandonment_mutations = [
         mutation["action"]
         for mutation in data["delivery"]["mutations"]
         if mutation["action"].startswith("abandonment_")
-    ] == ["abandonment_reopen_issue", "abandonment_recovery_comment"]
+    ]
+    assert abandonment_mutations == (
+        ["abandonment_reopen_issue", "abandonment_recovery_comment"]
+        if publisher_closed
+        else []
+    )
 
 
 def test_active_ticket_removal_stops_agents_and_preserves_work(
