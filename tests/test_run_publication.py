@@ -388,6 +388,52 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
     assert states.load_run(str(state["run_id"]))["status"] == "abandoned"
 
 
+def test_abandon_recovers_lost_final_run_pr_close_response(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+    published = engine.publish(str(state["run_id"]))
+    pr_number = int(published["run_publication"]["pr_number"])
+    publisher.data["delivery"]["crash_after_abandon_run_pr_once"] = True
+
+    with pytest.raises(OSError, match="simulated lost response after abandon_run_pr"):
+        engine.abandon(str(state["run_id"]))
+
+    interrupted = states.load_run(str(state["run_id"]))
+    assert interrupted["status"] == "abandonment_pending"
+    assert interrupted["run_abandonment"]["final_pr"] == {
+        "pr_number": pr_number,
+        "status": "pending",
+    }
+    assert publisher.live_pull_request(pr_number)["state"] == "CLOSED"
+    close_mutations = [
+        mutation
+        for mutation in publisher.data["delivery"]["mutations"]
+        if mutation["action"] == "close_final_run_pr"
+    ]
+    assert close_mutations == [
+        {"action": "close_final_run_pr", "pr_number": pr_number}
+    ]
+
+    recovered = engine.abandon(str(state["run_id"]))
+
+    assert recovered["status"] == "abandoned"
+    assert recovered["run_abandonment"]["final_pr"]["status"] == "completed"
+    assert [
+        mutation
+        for mutation in publisher.data["delivery"]["mutations"]
+        if mutation["action"] == "close_final_run_pr"
+    ] == close_mutations
+
+
 def test_final_check_failure_enters_shared_run_repair(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     publisher.data["delivery"]["required_checks"] = ["fail"]

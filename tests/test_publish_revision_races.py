@@ -426,6 +426,54 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
     ).stdout
 
 
+def test_abandon_recovers_lost_change_pr_close_response(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket()},
+        delivery={
+            "required_checks": ["pending"],
+            "crash_after_abandon_change_pr_once": True,
+        },
+    )
+    agents = _write_agents(git_repo / "agents.json", two_revisions=False)
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    waiting = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert stdout_json(waiting)["status"] == "waiting_checks"
+
+    interrupted = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert interrupted.returncode == 2
+    assert stdout_json(interrupted)["status"] == "abandonment_pending"
+    after_interruption = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after_interruption["delivery"]["pull_requests"][0]["state"] == "CLOSED"
+    close_mutations = [
+        mutation
+        for mutation in after_interruption["delivery"]["mutations"]
+        if mutation["action"] == "close_change_pr"
+    ]
+    assert close_mutations == [{"action": "close_change_pr", "pr_number": 1}]
+
+    recovered = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert stdout_json(recovered)["status"] == "abandoned"
+    after_recovery = json.loads(fixture.read_text(encoding="utf-8"))
+    assert [
+        mutation
+        for mutation in after_recovery["delivery"]["mutations"]
+        if mutation["action"] == "close_change_pr"
+    ] == close_mutations
+
+
 def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     git_repo: Path,
 ) -> None:
