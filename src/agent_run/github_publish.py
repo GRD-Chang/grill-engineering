@@ -948,7 +948,11 @@ class GhGitHubPublisher:
         self._require(
             "issue", "close", str(ticket_number), "--repo", self.repository
         )
-        return dict(prepared)
+        return self._ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=prepared,
+        )
 
     def ticket_closed_by_run(
         self,
@@ -1094,7 +1098,11 @@ class GhGitHubPublisher:
                     "Ticket state and close timeline have not converged",
                 )
             return None
-        if owned is None or latest_after_baseline["id"] != owned["id"]:
+        if (
+            len(after_baseline) != 1
+            or owned is None
+            or latest_after_baseline["id"] != owned["id"]
+        ):
             return None
         if not self._ticket_current_at_transition(
             issue,
@@ -1123,6 +1131,7 @@ class GhGitHubPublisher:
         publisher_login: str,
         run_id: str,
         ticket_number: int,
+        allow_recovery_marker: bool = False,
     ) -> bool:
         updated_at = issue.get("updatedAt")
         transition_time = transition.get("created_at")
@@ -1130,7 +1139,9 @@ class GhGitHubPublisher:
             return False
         if updated_at == transition_time:
             return True
-        marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:"
+        if not allow_recovery_marker:
+            return False
+        marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:abandoned -->"
         comments = issue.get("comments")
         if not isinstance(comments, list):
             return False
@@ -1266,39 +1277,33 @@ class GhGitHubPublisher:
             and _mapping(comment)["author"].get("login") == publisher_login
             for comment in comments
         )
+        body = (
+            f"{marker}\nDelivery Run `{run_id}` was abandoned before entering "
+            f"the default branch. Reopened Ticket #{ticket_number}; its prior "
+            f"completion was recorded by PR #{pr_number} at Run Branch commit "
+            f"`{integrated_sha}`."
+        )
         if issue.get("state") != "CLOSED":
-            if issue.get("state") != "OPEN" or not already_recorded:
+            if issue.get("state") != "OPEN":
                 return False
-            return self._publisher_reopen_completed(
+            completed = self._publisher_reopen_completed(
                 issue,
                 ticket_number=ticket_number,
                 run_id=run_id,
                 expected_ownership=expected_ownership,
                 publisher_login=publisher_login,
             )
-        ownership = self._ticket_close_ownership(
-            ticket_number=ticket_number,
-            run_id=run_id,
-            recorded_ownership=expected_ownership,
-        )
-        if ownership is None:
-            return False
-        if not already_recorded:
-            body = (
-                f"{marker}\nDelivery Run `{run_id}` was abandoned before entering "
-                f"the default branch. Reopening Ticket #{ticket_number}; its prior "
-                f"completion was recorded by PR #{pr_number} at Run Branch commit "
-                f"`{integrated_sha}`."
-            )
-            self._require(
-                "issue",
-                "comment",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--body",
-                body,
-            )
+            if completed and not already_recorded:
+                self._require(
+                    "issue",
+                    "comment",
+                    str(ticket_number),
+                    "--repo",
+                    self.repository,
+                    "--body",
+                    body,
+                )
+            return completed
         ownership = self._ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
@@ -1313,6 +1318,16 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
         )
+        if not already_recorded:
+            self._require(
+                "issue",
+                "comment",
+                str(ticket_number),
+                "--repo",
+                self.repository,
+                "--body",
+                body,
+            )
         return True
 
     def _publisher_reopen_completed(
@@ -1358,6 +1373,7 @@ class GhGitHubPublisher:
             publisher_login=publisher_login,
             run_id=run_id,
             ticket_number=ticket_number,
+            allow_recovery_marker=True,
         ):
             raise GitHubReadError(
                 "ticket_reopen_reconciliation_pending",

@@ -361,7 +361,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
         mutation["action"]
         for mutation in abandoned_fixture["delivery"]["mutations"]
         if mutation["action"].startswith("abandonment_")
-    ] == ["abandonment_recovery_comment", "abandonment_reopen_issue"]
+    ] == ["abandonment_reopen_issue", "abandonment_recovery_comment"]
     frozen_after_abandon = abandoned_fixture["delivery"]["mutations"]
 
     for command in ("resume", "deliver"):

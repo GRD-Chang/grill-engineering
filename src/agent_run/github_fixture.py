@@ -801,7 +801,11 @@ class FixtureGitHubPublisher:
         raw_issues = _mutable_mapping(self.data, "issues")
         issue = raw_issues.get(str(ticket_number))
         if not isinstance(issue, dict) or issue.get("state") != "CLOSED":
-            return already_recorded
+            return (
+                already_recorded
+                and ticket_number
+                not in _mutable_list(self._delivery(), "closed_issues")
+            )
         current_ownership = self.ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
@@ -810,38 +814,29 @@ class FixtureGitHubPublisher:
         if current_ownership is None:
             self._save()
             return False
+        issue["state"] = "OPEN"
+        closed = _mutable_list(self._delivery(), "closed_issues")
+        if ticket_number in closed:
+            closed.remove(ticket_number)
+        mutations.append(
+            {"action": "abandonment_reopen_issue", **marker}
+        )
+        for raw_issue in raw_issues.values():
+            if not isinstance(raw_issue, dict):
+                continue
+            blockers = raw_issue.get("blocked_by")
+            if not isinstance(blockers, list):
+                continue
+            for blocker in blockers:
+                if (
+                    isinstance(blocker, dict)
+                    and blocker.get("number") == ticket_number
+                ):
+                    blocker["state"] = "OPEN"
         if not already_recorded:
             mutations.append(
                 {"action": "abandonment_recovery_comment", **marker}
             )
-        current_ownership = self.ticket_close_ownership(
-            ticket_number=ticket_number,
-            run_id=run_id,
-            recorded_ownership=expected_ownership,
-        )
-        if current_ownership is not None:
-            issue["state"] = "OPEN"
-            closed = _mutable_list(self._delivery(), "closed_issues")
-            if ticket_number in closed:
-                closed.remove(ticket_number)
-            mutations.append(
-                {"action": "abandonment_reopen_issue", **marker}
-            )
-            for raw_issue in raw_issues.values():
-                if not isinstance(raw_issue, dict):
-                    continue
-                blockers = raw_issue.get("blocked_by")
-                if not isinstance(blockers, list):
-                    continue
-                for blocker in blockers:
-                    if (
-                        isinstance(blocker, dict)
-                        and blocker.get("number") == ticket_number
-                    ):
-                        blocker["state"] = "OPEN"
-        else:
-            self._save()
-            return False
         self._save()
         self._crash_once("recover_abandoned_ticket")
         return True
