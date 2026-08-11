@@ -785,6 +785,20 @@ class FixtureGitHubPublisher:
             raise ValueError("delivery.ticket_close_ownership must be an object")
         current = raw_ownerships.get(str(ticket_number))
         expected = recorded_ownership if recorded_ownership is not None else current
+        lag_reads = self._delivery().get("ticket_close_event_lag_reads", 0)
+        if (
+            isinstance(lag_reads, int)
+            and not isinstance(lag_reads, bool)
+            and lag_reads > 0
+            and isinstance(issue, dict)
+            and issue.get("state") == "CLOSED"
+        ):
+            self._delivery()["ticket_close_event_lag_reads"] = lag_reads - 1
+            self._save()
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "fixture has not exposed the Ticket close event yet",
+            )
         if (
             isinstance(issue, dict)
             and issue.get("state") == "OPEN"

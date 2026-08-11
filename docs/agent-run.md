@@ -87,8 +87,10 @@ Repair 引擎。`revise` 原样保存维护者反馈、重置一个新的十次�
 Run Repair → fresh Run Acceptance → 新 PR 语义。`abandon` 先把
 `abandonment_pending` 与逐项恢复义务写入耐久状态，再幂等关闭未合并的自动化 PR、只重开
 带有本 Run Publisher close 证据且尚未进入默认分支的 Ticket。任一步响应丢失后，其他生命周期
-命令都不会恢复正常发布；重复 `abandon` 会继续收敛。完成后保留 Run state、已发布 PR 与其他
-远端审计事实，并通过 Git worktree 操作删除该 Run 的本地临时 worktrees。
+命令都不会恢复正常发布；重复 `abandon` 会在 GitHub 暴露精确 close 或外部 transition 后继续
+收敛。若进程恰在耐久 dispatch boundary 与远端 close 之间退出、GitHub 又尚无可判定 event，
+Run 保持 `abandonment_pending`，不会猜测 ownership 或制造新的 close。完成后保留 Run state、
+已发布 PR 与其他远端审计事实，并通过 Git worktree 操作删除该 Run 的本地临时 worktrees。
 
 Ticket title/body 在运行中变化时，旧开发结果、Publication 和 Acceptance 会失效；
 Controller 沿用同一个 Ticket Job、Ticket Branch 和 Development Thread，从最新 revision

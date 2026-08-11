@@ -1064,6 +1064,7 @@ class GhGitHubPublisher:
                 isinstance(recorded_ownership, dict)
                 and recorded_ownership.get("event_id") is None
                 and recorded_ownership.get("dispatch_attempted") is True
+                and issue.get("state") == "OPEN"
             ):
                 raise GitHubReadError(
                     "ticket_close_dispatch_unobserved",
@@ -1129,7 +1130,10 @@ class GhGitHubPublisher:
                 and recorded_ownership.get("dispatch_attempted") is not True
             ):
                 return None
-            if recorded_ownership.get("dispatch_attempted") is True:
+            if (
+                recorded_ownership.get("dispatch_attempted") is True
+                and issue.get("state") == "OPEN"
+            ):
                 raise GitHubReadError(
                     "ticket_close_dispatch_unobserved",
                     "GitHub has not exposed the attempted Ticket close yet",

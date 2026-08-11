@@ -702,13 +702,20 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
 
 @pytest.mark.parametrize(
     "recovery_case",
-    ["response_loss", "prepared_only", "dispatch_pending", "external_reopen"],
+    [
+        "response_loss",
+        "response_loss_event_lag",
+        "prepared_only",
+        "dispatch_pending",
+        "external_reopen",
+    ],
 )
 def test_provisional_close_intent_can_abandon(
     git_repo: Path, recovery_case: str
 ) -> None:
     crash_flag = {
         "response_loss": "crash_after_close_once",
+        "response_loss_event_lag": "crash_after_close_once",
         "prepared_only": "crash_before_close_dispatch_once",
         "dispatch_pending": "crash_after_close_dispatch_boundary_once",
         "external_reopen": "crash_after_close_dispatch_boundary_once",
@@ -756,7 +763,9 @@ def test_provisional_close_intent_can_abandon(
     assert "ticket_close_ownership" not in interrupted_job
     interrupted_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert interrupted_data["issues"]["2"]["state"] == (
-        "CLOSED" if recovery_case == "response_loss" else "OPEN"
+        "CLOSED"
+        if recovery_case in {"response_loss", "response_loss_event_lag"}
+        else "OPEN"
     )
     assert (
         interrupted_job["ticket_close_intent"].get("dispatch_attempted") is True
@@ -764,17 +773,31 @@ def test_provisional_close_intent_can_abandon(
     if recovery_case == "external_reopen":
         interrupted_data["delivery"]["external_ticket_transitions"] = [2]
         fixture.write_text(json.dumps(interrupted_data), encoding="utf-8")
+    elif recovery_case == "response_loss_event_lag":
+        interrupted_data["delivery"]["ticket_close_event_lag_reads"] = 2
+        fixture.write_text(json.dumps(interrupted_data), encoding="utf-8")
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
-    if recovery_case == "dispatch_pending":
+    if recovery_case in {"dispatch_pending", "response_loss_event_lag"}:
         assert abandoned.returncode == 2
         assert stdout_json(abandoned)["status"] == "abandonment_pending"
         pending_data = json.loads(fixture.read_text(encoding="utf-8"))
-        assert not any(
-            mutation["action"] in {"close_issue", "abandonment_reopen_issue"}
-            for mutation in pending_data["delivery"]["mutations"]
-        )
+        assert pending_data["delivery"]["mutations"] == interrupted_data[
+            "delivery"
+        ]["mutations"]
         abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+        if recovery_case == "dispatch_pending":
+            assert abandoned.returncode == 2
+            assert stdout_json(abandoned)["status"] == "abandonment_pending"
+            repeated_data = json.loads(fixture.read_text(encoding="utf-8"))
+            assert repeated_data["delivery"]["mutations"] == interrupted_data[
+                "delivery"
+            ]["mutations"]
+            return
+        assert abandoned.returncode == 2
+        assert stdout_json(abandoned)["status"] == "abandonment_pending"
+        if recovery_case == "response_loss_event_lag":
+            abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
     assert abandoned.returncode == 0, abandoned.stderr
     assert stdout_json(abandoned)["status"] == "abandoned"
@@ -787,7 +810,7 @@ def test_provisional_close_intent_can_abandon(
     ]
     assert abandonment_mutations == (
         ["abandonment_reopen_issue", "abandonment_recovery_comment"]
-        if recovery_case == "response_loss"
+        if recovery_case in {"response_loss", "response_loss_event_lag"}
         else []
     )
     close_mutations = [
@@ -797,7 +820,7 @@ def test_provisional_close_intent_can_abandon(
     ]
     assert close_mutations == (
         ["close_issue"]
-        if recovery_case == "response_loss"
+        if recovery_case in {"response_loss", "response_loss_event_lag"}
         else []
     )
 
