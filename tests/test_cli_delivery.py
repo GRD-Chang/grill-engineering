@@ -833,6 +833,66 @@ def test_child_addition_cannot_continue_parent_only_delivery(
     assert final.get("delivery", {}).get("mutations", []) == []
 
 
+def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-reviewer-1",
+                        "parent-feature.txt is present in the candidate.",
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    assert stdout_json(delivered)["status"] == "parent_approval_pending"
+    before_drift = json.loads(fixture.read_text(encoding="utf-8"))
+    assert before_drift["delivery"]["pull_requests"][0]["state"] == "OPEN"
+
+    before_drift["parent"]["sub_issues"] = [3]
+    before_drift["issues"] = {"3": ticket()}
+    fixture.write_text(json.dumps(before_drift), encoding="utf-8")
+    blocked = run_cli(git_repo, fixture, "resume", run_id)
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "unsupported_scope_change"
+
+    abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "abandoned"
+    abandoned_state = load_only_run_state(git_repo)
+    assert abandoned_state["parent_job"]["phase"] == "abandoned"
+    after = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after["delivery"]["pull_requests"][0]["state"] == "CLOSED"
+    assert {"action": "close_parent_pr", "pr_number": 1} in after["delivery"][
+        "mutations"
+    ]
+    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+
+
 def test_scripted_cli_delivers_active_ticket_end_to_end(
     git_repo: Path,
 ) -> None:

@@ -424,8 +424,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "run_approval_pending",
             }:
                 state = publication.revise(parsed.run_id, parsed.message)
+            elif (
+                parsed.command == "abandon"
+                and refreshed.get("delivery_type") == "parent_only"
+            ):
+                state = ParentDeliveryEngine(
+                    git=git,
+                    states=states,
+                    github=publisher,
+                    agents=agents,
+                ).abandon(parsed.run_id)
             else:
-                state = refreshed if parsed.command != "abandon" else publication.abandon(parsed.run_id)
+                state = (
+                    refreshed
+                    if parsed.command != "abandon"
+                    else publication.abandon(parsed.run_id)
+                )
                 precondition_failed = parsed.command != "abandon"
             resumed = True
         active_ticket_job = state.get("active_ticket_job")

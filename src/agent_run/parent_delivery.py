@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Parent-only delivery using the shared candidate-first change lifecycle."""
 
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,31 @@ class ParentDeliveryEngine:
                 state["diagnostics"] = []
                 self._save(state)
             return state
+
+    def abandon(self, run_id: str) -> dict[str, Any]:
+        with self.states.locked():
+            state = self._load(run_id)
+            job = _mapping(state, "parent_job")
+            if job.get("phase") == "completed":
+                raise ValueError("a completed Parent-only Run cannot be abandoned")
+            if job.get("phase") == "abandoned":
+                return state
+            pr_number = job.get("pr_number")
+            if isinstance(pr_number, int):
+                self.github.abandon_parent_pr(pr_number)
+            shutil.rmtree(
+                self.states.root / "worktrees" / str(state["run_id"]),
+                ignore_errors=True,
+            )
+            job["phase"] = "abandoned"
+            state.update(
+                {
+                    "status": "abandoned",
+                    "terminal_kind": "abandoned",
+                    "diagnostics": [],
+                }
+            )
+            return self._save(state)
 
     def retire_for_child_flow(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
