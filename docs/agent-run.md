@@ -201,8 +201,9 @@ Publisher/cleanup 权限处理托管资源；观察到的新 Graph 本身不产�
 Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer、PR、merge 与
 最近 16 次 blocker 历史；每次 Human Blocker 最多 8 条、每条最多 2000 个字符。成功恢复后
 当前 `human_blockers`、phase 与 resume 输入会清除，timeline 只保留已经发生的历史事件且
-继续受全局容量限制。`active_ticket_job` 继续作为当前执行指针。刷新 Ticket Graph 可以把 active
-切到新的可执行 Ticket，但不会删除同一 Parent Ticket Set 内已经 blocked 或 completed 的
-Job。进程在两张 Ticket 之间退出或失败时，下一次 `deliver` 会从耐久状态与 GitHub live
-事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭动作不会重复。没有可执行 Ticket
-时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。
+继续受全局容量限制。`active_ticket_job` 继续作为当前执行指针。仅当 Ticket Graph revision
+未变化时，Controller 才会在既定 Ticket Set 内把 active 切到新的可执行 Ticket；它不会删除
+已经 blocked 或 completed 的 Job。Graph revision 变化按上文进入
+`unsupported_scope_change`，不更新 active。进程在两张 Ticket 之间退出或失败时，下一次
+`deliver` 会从耐久状态与 GitHub live 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭
+动作不会重复。没有可执行 Ticket 时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。

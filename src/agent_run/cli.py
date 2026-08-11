@@ -278,59 +278,55 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     git=git, states=states, github=publisher
                 ).resume(parsed.run_id)
         elif parsed.command == "deliver":
-            agent_fixture = getattr(parsed, "agent_fixture", None)
-            agents = (
-                FixtureAgentBackend(Path(agent_fixture))
-                if agent_fixture
-                else CodexCliBackend()
-            )
-            publisher = (
-                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                if parsed.github_fixture
-                else GhGitHubPublisher(
-                    github.repository().name_with_owner,
-                    git,
-                )
-            )
             refreshed, _ = controller.resume(parsed.run_id)
-            unsupported_scope = (
-                refreshed.get("status") == "unsupported_scope_change"
-            )
-            if unsupported_scope:
+            if refreshed.get("status") == "unsupported_scope_change":
                 state = refreshed
                 precondition_failed = True
             else:
+                agent_fixture = getattr(parsed, "agent_fixture", None)
+                agents = (
+                    FixtureAgentBackend(Path(agent_fixture))
+                    if agent_fixture
+                    else CodexCliBackend()
+                )
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(
+                        github.repository().name_with_owner,
+                        git,
+                    )
+                )
                 refreshed = DeliveryCleanupEngine(
                     git=git, states=states, github=publisher
                 ).resume(parsed.run_id)
-            if unsupported_scope:
-                pass
-            elif (
-                refreshed.get("delivery_type") == "ticket_run"
-                and isinstance(refreshed.get("parent_job"), dict)
-            ):
-                refreshed = ParentDeliveryEngine(
-                    git=git,
-                    states=states,
-                    github=publisher,
-                    agents=agents,
-                ).retire_for_child_flow(parsed.run_id)
-            if unsupported_scope:
-                pass
-            elif refreshed.get("delivery_type") == "parent_only":
-                state = ParentDeliveryEngine(
-                    git=git, states=states, github=publisher, agents=agents
-                ).deliver(parsed.run_id)
-            else:
-                state = DeliveryRunEngine(
-                    controller=controller,
-                    tickets=TicketDeliveryEngine(
+                if (
+                    refreshed.get("delivery_type") == "ticket_run"
+                    and isinstance(refreshed.get("parent_job"), dict)
+                ):
+                    refreshed = ParentDeliveryEngine(
                         git=git,
                         states=states,
                         github=publisher,
                         agents=agents,
-                    ),
-                ).deliver_from_state(parsed.run_id, refreshed)
+                    ).retire_for_child_flow(parsed.run_id)
+                if refreshed.get("delivery_type") == "parent_only":
+                    state = ParentDeliveryEngine(
+                        git=git,
+                        states=states,
+                        github=publisher,
+                        agents=agents,
+                    ).deliver(parsed.run_id)
+                else:
+                    state = DeliveryRunEngine(
+                        controller=controller,
+                        tickets=TicketDeliveryEngine(
+                            git=git,
+                            states=states,
+                            github=publisher,
+                            agents=agents,
+                        ),
+                    ).deliver_from_state(parsed.run_id, refreshed)
             resumed = True
         elif parsed.command == "accept-run":
             agent_fixture = getattr(parsed, "agent_fixture", None)
