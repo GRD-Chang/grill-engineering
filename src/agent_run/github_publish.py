@@ -306,6 +306,11 @@ class GhGitHubPublisher:
         if live.get("state") == "OPEN":
             self._require("pr", "close", str(pr_number), "--repo", self.repository)
 
+    def abandon_change_pr(self, pr_number: int) -> None:
+        live = self.live_pull_request(pr_number)
+        if live.get("state") == "OPEN":
+            self._require("pr", "close", str(pr_number), "--repo", self.repository)
+
     def _ensure_remote_run_branch(self, branch: str) -> None:
         remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
@@ -819,6 +824,55 @@ class GhGitHubPublisher:
             self._require(
                 "issue",
                 "close",
+                str(ticket_number),
+                "--repo",
+                self.repository,
+            )
+
+    def recover_abandoned_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        issue = _mapping(
+            self._json(
+                "issue",
+                "view",
+                str(ticket_number),
+                "--repo",
+                self.repository,
+                "--json",
+                "state,comments",
+            )
+        )
+        marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:abandoned -->"
+        comments = issue.get("comments")
+        already_recorded = isinstance(comments, list) and any(
+            marker in str(_mapping(comment).get("body", "")) for comment in comments
+        )
+        if not already_recorded:
+            body = (
+                f"{marker}\nDelivery Run `{run_id}` was abandoned before entering "
+                f"the default branch. Reopening Ticket #{ticket_number}; its prior "
+                f"completion was recorded by PR #{pr_number} at Run Branch commit "
+                f"`{integrated_sha}`."
+            )
+            self._require(
+                "issue",
+                "comment",
+                str(ticket_number),
+                "--repo",
+                self.repository,
+                "--body",
+                body,
+            )
+        if issue.get("state") == "CLOSED":
+            self._require(
+                "issue",
+                "reopen",
                 str(ticket_number),
                 "--repo",
                 self.repository,

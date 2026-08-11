@@ -40,6 +40,14 @@ class FailingBranchCleanupGit(GitRepository):
         raise OSError(f"cannot delete {branch}")
 
 
+class RecordingBranchPublisher:
+    def __init__(self) -> None:
+        self.deleted_branches: list[str] = []
+
+    def delete_managed_branch(self, branch: str) -> None:
+        self.deleted_branches.append(branch)
+
+
 def test_partial_checkout_is_cleaned_when_preparation_fails(
     git_repo: Path,
 ) -> None:
@@ -129,3 +137,47 @@ def test_cleanup_never_deletes_a_maintainer_branch(git_repo: Path) -> None:
     assert result["status"] == "completed"
     assert result["delivery_cleanup"]["status"] == "cleanup_pending"
     assert git.resolve(branch)
+
+
+def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> None:
+    branch = "agent-run/run-1/ticket-2"
+    state = {
+        "run_id": "run-1",
+        "status": "abandoned",
+        "ticket_jobs": {
+            "2": {
+                "phase": "completed",
+                "ticket_number": 2,
+                "ticket_branch": branch,
+                "integrated_sha": "integrated",
+            }
+        },
+        "delivery_cleanup": {
+            "status": "cleanup_pending",
+            "items": {
+                branch: {
+                    "kind": "ticket",
+                    "branch": branch,
+                    "checkout": str(
+                        git_repo
+                        / ".agent-run"
+                        / "worktrees"
+                        / "run-1"
+                        / "ticket-2"
+                    ),
+                    "attempts": 3,
+                    "status": "cleanup_pending",
+                }
+            },
+        },
+    }
+    states = StateStore(git_repo / ".agent-run")
+    states.save_run("run-1", state)
+    github = RecordingBranchPublisher()
+
+    resumed = DeliveryCleanupEngine(
+        git=GitRepository(git_repo), states=states, github=github
+    ).resume("run-1")
+
+    assert resumed == state
+    assert github.deleted_branches == []

@@ -91,6 +91,8 @@ class DeliveryCleanupEngine:
             state = self.states.load_run(run_id)
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
+            if state.get("status") == "abandoned":
+                return state
             self._schedule_completed_items(state)
             if not isinstance(state.get("delivery_cleanup"), dict):
                 return state

@@ -120,14 +120,35 @@ class RunPublicationApproval(RunPublicationShared):
     def abandon(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
+            if state.get("status") in {"completed", "abandoned"}:
+                return state
             publication = self._publication_state(state)
             if publication["phase"] == "merged":
                 raise ValueError("a merged Run cannot be abandoned")
             if publication["phase"] == "abandoned":
                 return state
-            pr_number = publication.get("pr_number")
-            if isinstance(pr_number, int):
-                self.github.abandon_run_pr(pr_number)
+            for change_pr_number in _change_pr_numbers(state):
+                self.github.abandon_change_pr(change_pr_number)
+            for job in self._mapping(state, "ticket_jobs").values():
+                if not isinstance(job, dict) or job.get("phase") != "completed":
+                    continue
+                ticket_number = job.get("ticket_number")
+                ticket_pr_number = job.get("pr_number")
+                integrated_sha = job.get("integrated_sha")
+                if (
+                    isinstance(ticket_number, int)
+                    and isinstance(ticket_pr_number, int)
+                    and isinstance(integrated_sha, str)
+                ):
+                    self.github.recover_abandoned_ticket(
+                        ticket_number=ticket_number,
+                        run_id=run_id,
+                        pr_number=ticket_pr_number,
+                        integrated_sha=integrated_sha,
+                    )
+            final_pr_number = publication.get("pr_number")
+            if isinstance(final_pr_number, int):
+                self.github.abandon_run_pr(final_pr_number)
             shutil.rmtree(
                 self.states.root / "worktrees" / str(state["run_id"]), ignore_errors=True
             )
@@ -207,3 +228,18 @@ class RunPublicationApproval(RunPublicationShared):
             }
         )
         return self._save(state)
+
+
+def _change_pr_numbers(state: dict[str, Any]) -> list[int]:
+    numbers: set[int] = set()
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if isinstance(job, dict) and isinstance(job.get("pr_number"), int):
+                numbers.add(int(job["pr_number"]))
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        repair = acceptance.get("repair_job")
+        if isinstance(repair, dict) and isinstance(repair.get("pr_number"), int):
+            numbers.add(int(repair["pr_number"]))
+    return sorted(numbers)

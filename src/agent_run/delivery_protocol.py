@@ -34,6 +34,8 @@ class GitHubPublisher(Protocol):
 
     def abandon_run_pr(self, pr_number: int) -> None: ...
 
+    def abandon_change_pr(self, pr_number: int) -> None: ...
+
     def ensure_run_repair_branch(
         self, *, branch: str, base_branch: str
     ) -> None: ...
@@ -104,6 +106,15 @@ class GitHubPublisher(Protocol):
     ) -> None: ...
 
     def close_primary_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None: ...
+
+    def recover_abandoned_ticket(
         self,
         *,
         ticket_number: int,

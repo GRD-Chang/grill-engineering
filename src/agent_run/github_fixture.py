@@ -396,6 +396,15 @@ class FixtureGitHubPublisher:
             )
             self._save()
 
+    def abandon_change_pr(self, pr_number: int) -> None:
+        pull = self._pull(pr_number)
+        if pull.get("state") == "OPEN":
+            pull["state"] = "CLOSED"
+            _mutable_list(self._delivery(), "mutations").append(
+                {"action": "close_change_pr", "pr_number": pr_number}
+            )
+            self._save()
+
     def publish_branch(
         self,
         branch: str,
@@ -671,6 +680,55 @@ class FixtureGitHubPublisher:
             raise OSError(
                 "simulated lost response after Primary Ticket close"
             )
+
+    def recover_abandoned_ticket(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        pr_number: int,
+        integrated_sha: str,
+    ) -> None:
+        mutations = _mutable_list(self._delivery(), "mutations")
+        marker = {
+            "ticket_number": ticket_number,
+            "run_id": run_id,
+            "pr_number": pr_number,
+            "integrated_sha": integrated_sha,
+        }
+        if not any(
+            isinstance(item, dict)
+            and item.get("action") == "abandonment_recovery_comment"
+            and item.get("ticket_number") == ticket_number
+            and item.get("run_id") == run_id
+            for item in mutations
+        ):
+            mutations.append(
+                {"action": "abandonment_recovery_comment", **marker}
+            )
+        raw_issues = _mutable_mapping(self.data, "issues")
+        issue = raw_issues.get(str(ticket_number))
+        if isinstance(issue, dict) and issue.get("state") == "CLOSED":
+            issue["state"] = "OPEN"
+            closed = _mutable_list(self._delivery(), "closed_issues")
+            if ticket_number in closed:
+                closed.remove(ticket_number)
+            mutations.append(
+                {"action": "abandonment_reopen_issue", **marker}
+            )
+            for raw_issue in raw_issues.values():
+                if not isinstance(raw_issue, dict):
+                    continue
+                blockers = raw_issue.get("blocked_by")
+                if not isinstance(blockers, list):
+                    continue
+                for blocker in blockers:
+                    if (
+                        isinstance(blocker, dict)
+                        and blocker.get("number") == ticket_number
+                    ):
+                        blocker["state"] = "OPEN"
+        self._save()
 
     def mark_ready_for_human(self, ticket_number: int) -> None:
         raw_issues = _mutable_mapping(self.data, "issues")
