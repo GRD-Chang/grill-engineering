@@ -4,6 +4,7 @@ from typing import Any
 
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.git import GitError
+from agent_run.github import GitHubReadError
 from agent_run.run_publication_shared import RunPublicationShared
 
 
@@ -164,13 +165,25 @@ class RunPublicationApproval(RunPublicationShared):
                         and recorded_ownership.get("event_id") is None
                         and recorded_ownership.get("dispatch_attempted") is True
                     ):
-                        ownership = self.github.close_primary_ticket(
-                            ticket_number=int(ticket["ticket_number"]),
-                            run_id=run_id,
-                            pr_number=int(ticket["pr_number"]),
-                            integrated_sha=str(ticket["integrated_sha"]),
-                            close_intent=recorded_ownership,
-                        )
+                        try:
+                            ownership = self.github.ticket_close_ownership(
+                                ticket_number=int(ticket["ticket_number"]),
+                                run_id=run_id,
+                                recorded_ownership=recorded_ownership,
+                            )
+                        except GitHubReadError as error:
+                            if error.code != "ticket_close_dispatch_unobserved":
+                                raise
+                            checks = ticket.get("unobserved_dispatch_checks", 0)
+                            if not isinstance(checks, int) or isinstance(checks, bool):
+                                raise ValueError(
+                                    "Ticket dispatch observation count must be an integer"
+                                )
+                            ticket["unobserved_dispatch_checks"] = checks + 1
+                            self._save(state)
+                            if checks == 0:
+                                raise
+                            ownership = None
                     else:
                         ownership = self.github.ticket_close_ownership(
                             ticket_number=int(ticket["ticket_number"]),

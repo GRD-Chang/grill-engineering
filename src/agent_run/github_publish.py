@@ -1060,6 +1060,15 @@ class GhGitHubPublisher:
                 and issue.get("state") == "OPEN"
             ):
                 return None
+            if (
+                isinstance(recorded_ownership, dict)
+                and recorded_ownership.get("event_id") is None
+                and recorded_ownership.get("dispatch_attempted") is True
+            ):
+                raise GitHubReadError(
+                    "ticket_close_dispatch_unobserved",
+                    "GitHub has not exposed the attempted Ticket close yet",
+                )
             raise GitHubReadError(
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed the Ticket close event yet",
@@ -1120,6 +1129,11 @@ class GhGitHubPublisher:
                 and recorded_ownership.get("dispatch_attempted") is not True
             ):
                 return None
+            if recorded_ownership.get("dispatch_attempted") is True:
+                raise GitHubReadError(
+                    "ticket_close_dispatch_unobserved",
+                    "GitHub has not exposed the attempted Ticket close yet",
+                )
             raise GitHubReadError(
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed a transition after the close intent baseline yet",

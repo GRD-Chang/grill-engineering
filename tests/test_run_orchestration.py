@@ -701,7 +701,8 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
 
 
 @pytest.mark.parametrize(
-    "recovery_case", ["response_loss", "prepared_only", "dispatch_pending"]
+    "recovery_case",
+    ["response_loss", "prepared_only", "dispatch_pending", "external_reopen"],
 )
 def test_provisional_close_intent_can_abandon(
     git_repo: Path, recovery_case: str
@@ -710,6 +711,7 @@ def test_provisional_close_intent_can_abandon(
         "response_loss": "crash_after_close_once",
         "prepared_only": "crash_before_close_dispatch_once",
         "dispatch_pending": "crash_after_close_dispatch_boundary_once",
+        "external_reopen": "crash_after_close_dispatch_boundary_once",
     }[recovery_case]
     fixture = write_fixture(
         git_repo / "github.json",
@@ -759,8 +761,20 @@ def test_provisional_close_intent_can_abandon(
     assert (
         interrupted_job["ticket_close_intent"].get("dispatch_attempted") is True
     ) == (recovery_case != "prepared_only")
+    if recovery_case == "external_reopen":
+        interrupted_data["delivery"]["external_ticket_transitions"] = [2]
+        fixture.write_text(json.dumps(interrupted_data), encoding="utf-8")
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
+    if recovery_case == "dispatch_pending":
+        assert abandoned.returncode == 2
+        assert stdout_json(abandoned)["status"] == "abandonment_pending"
+        pending_data = json.loads(fixture.read_text(encoding="utf-8"))
+        assert not any(
+            mutation["action"] in {"close_issue", "abandonment_reopen_issue"}
+            for mutation in pending_data["delivery"]["mutations"]
+        )
+        abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
     assert abandoned.returncode == 0, abandoned.stderr
     assert stdout_json(abandoned)["status"] == "abandoned"
@@ -773,7 +787,7 @@ def test_provisional_close_intent_can_abandon(
     ]
     assert abandonment_mutations == (
         ["abandonment_reopen_issue", "abandonment_recovery_comment"]
-        if recovery_case != "prepared_only"
+        if recovery_case == "response_loss"
         else []
     )
     close_mutations = [
@@ -782,7 +796,9 @@ def test_provisional_close_intent_can_abandon(
         if mutation["action"] == "close_issue"
     ]
     assert close_mutations == (
-        [] if recovery_case == "prepared_only" else ["close_issue"]
+        ["close_issue"]
+        if recovery_case == "response_loss"
+        else []
     )
 
 

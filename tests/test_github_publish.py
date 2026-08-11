@@ -1012,7 +1012,7 @@ def test_dispatched_close_waits_for_open_ticket_timeline_to_converge(
 
     monkeypatch.setattr(publisher, "_json", fake_json)
 
-    with pytest.raises(GitHubReadError, match="close event"):
+    with pytest.raises(GitHubReadError, match="attempted Ticket close"):
         publisher.ticket_close_ownership(
             ticket_number=2,
             run_id="run-1",

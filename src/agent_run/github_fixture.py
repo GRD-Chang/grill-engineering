@@ -785,6 +785,21 @@ class FixtureGitHubPublisher:
             raise ValueError("delivery.ticket_close_ownership must be an object")
         current = raw_ownerships.get(str(ticket_number))
         expected = recorded_ownership if recorded_ownership is not None else current
+        if (
+            isinstance(issue, dict)
+            and issue.get("state") == "OPEN"
+            and isinstance(expected, dict)
+            and expected.get("event_id") is None
+            and expected.get("dispatch_attempted") is True
+            and not isinstance(current, dict)
+        ):
+            external = self._delivery().get("external_ticket_transitions", [])
+            if isinstance(external, list) and ticket_number in external:
+                return None
+            raise GitHubReadError(
+                "ticket_close_dispatch_unobserved",
+                "fixture has not observed the attempted Ticket close",
+            )
         owned = (
             isinstance(issue, dict)
             and issue.get("state") == "CLOSED"
