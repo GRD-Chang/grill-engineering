@@ -299,7 +299,11 @@ def _ticket_recovery_obligations(
                     "ticket_number": ticket_number,
                     "pr_number": pr_number,
                     "integrated_sha": integrated_sha,
-                    "eligible": None,
+                    "eligible": (
+                        job.get("ticket_closed_by_run")
+                        if isinstance(job.get("ticket_closed_by_run"), bool)
+                        else None
+                    ),
                     "status": "pending",
                 }
             )

@@ -110,6 +110,52 @@ def test_close_parent_issue_passes_repository_to_gh(
     assert calls[-1] == ("issue", "close", "1", "--repo", "example/project")
 
 
+@pytest.mark.parametrize(
+    ("closing_actor", "expected"),
+    [("agent-run-bot", True), ("maintainer", False)],
+)
+def test_ticket_close_ownership_requires_publisher_close_event(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closing_actor: str,
+    expected: bool,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "comments": [
+                    {
+                        "body": (
+                            "<!-- agent-run:run-1:ticket-2:"
+                            "publisher-close-intent -->"
+                        ),
+                        "createdAt": "2026-08-11T10:00:00Z",
+                        "author": {"login": "agent-run-bot"},
+                    }
+                ]
+            }
+        if arguments[:2] == (
+            "api",
+            "repos/example/project/issues/2/events",
+        ):
+            return [
+                {
+                    "event": "closed",
+                    "created_at": "2026-08-11T10:00:01Z",
+                    "actor": {"login": closing_actor},
+                }
+            ]
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    assert publisher.ticket_closed_by_run(
+        ticket_number=2, run_id="run-1"
+    ) is expected
+
+
 def test_publish_branch_accepts_retry_after_successful_push(
     git_repo: Path,
     tmp_path: Path,

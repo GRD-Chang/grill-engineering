@@ -801,23 +801,23 @@ class GhGitHubPublisher:
             )
         )
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:completed -->"
-        close_marker = (
-            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-closed -->"
+        close_intent = (
+            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-close-intent -->"
         )
         comments = issue.get("comments")
         already_recorded = isinstance(comments, list) and any(
             marker in str(_mapping(comment).get("body", "")) for comment in comments
         )
-        publisher_closed = isinstance(comments, list) and any(
-            close_marker in str(_mapping(comment).get("body", ""))
+        has_close_intent = isinstance(comments, list) and any(
+            close_intent in str(_mapping(comment).get("body", ""))
             for comment in comments
         )
         if not already_recorded or (
-            issue.get("state") != "CLOSED" and not publisher_closed
+            issue.get("state") != "CLOSED" and not has_close_intent
         ):
             body = (
                 f"{marker}\n"
-                f"{close_marker if issue.get('state') != 'CLOSED' else ''}\n"
+                f"{close_intent if issue.get('state') != 'CLOSED' else ''}\n"
                 f"Delivery Run `{run_id}` completed this ticket in "
                 f"PR #{pr_number}; Run Branch commit `{integrated_sha}`. "
                 "This change has not yet entered the default branch."
@@ -832,7 +832,6 @@ class GhGitHubPublisher:
                 body,
             )
         if issue.get("state") != "CLOSED":
-            publisher_closed = True
             self._require(
                 "issue",
                 "close",
@@ -840,7 +839,9 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
             )
-        return publisher_closed
+        return self.ticket_closed_by_run(
+            ticket_number=ticket_number, run_id=run_id
+        )
 
     def ticket_closed_by_run(
         self, *, ticket_number: int, run_id: str
@@ -857,12 +858,44 @@ class GhGitHubPublisher:
             )
         )
         marker = (
-            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-closed -->"
+            f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-close-intent -->"
         )
         comments = issue.get("comments")
-        return isinstance(comments, list) and any(
-            marker in str(_mapping(comment).get("body", ""))
+        if not isinstance(comments, list):
+            return False
+        intents = [
+            _mapping(comment)
             for comment in comments
+            if marker in str(_mapping(comment).get("body", ""))
+        ]
+        intents = [
+            intent
+            for intent in intents
+            if isinstance(intent.get("createdAt"), str)
+            and isinstance(intent.get("author"), dict)
+            and isinstance(intent["author"].get("login"), str)
+        ]
+        if not intents:
+            return False
+        intent = max(intents, key=lambda item: str(item["createdAt"]))
+        intent_time = str(intent["createdAt"])
+        intent_author = str(intent["author"]["login"])
+        events = self._json(
+            "api",
+            f"repos/{self.repository}/issues/{ticket_number}/events",
+            "--paginate",
+        )
+        if not isinstance(events, list):
+            raise GitHubReadError(
+                "github_invalid_response", "Issue events must be an array"
+            )
+        return any(
+            isinstance(event, dict)
+            and event.get("event") == "closed"
+            and str(event.get("created_at", "")) >= intent_time
+            and isinstance(event.get("actor"), dict)
+            and event["actor"].get("login") == intent_author
+            for event in events
         )
 
     def recover_abandoned_ticket(

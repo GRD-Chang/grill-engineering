@@ -268,3 +268,4 @@ def remove_run_worktrees(
             root.rmdir()
         except OSError:
             pass
+    git.prune_worktrees()

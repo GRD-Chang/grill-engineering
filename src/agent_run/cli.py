@@ -472,6 +472,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 else current_diagnostics
             ),
             "scope_change": state.get("unsupported_scope_change"),
+            "next_action": cli_presentation._next_action(state),
         }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if precondition_failed:

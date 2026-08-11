@@ -315,12 +315,16 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     ]
     assert after_fixture["delivery"]["mutations"] == frozen["mutations"]
 
+    after_fixture["delivery"]["closed_issues"] = []
     after_fixture["delivery"]["crash_after_recover_abandoned_ticket_once"] = True
     fixture.write_text(json.dumps(after_fixture), encoding="utf-8")
     interrupted_abandon = run_cli(git_repo, fixture, "abandon", run_id)
 
     assert interrupted_abandon.returncode == 2
     assert stdout_json(interrupted_abandon)["status"] == "abandonment_pending"
+    assert load_only_run_state(git_repo)["run_abandonment"]["tickets"][0][
+        "eligible"
+    ] is True
     interrupted_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     frozen_pending_mutations = interrupted_fixture["delivery"]["mutations"]
     for command in ("resume", "deliver", "approve"):
@@ -335,6 +339,17 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
         assert stdout_json(blocked)["status"] == "abandonment_pending"
         blocked_fixture = json.loads(fixture.read_text(encoding="utf-8"))
         assert blocked_fixture["delivery"]["mutations"] == frozen_pending_mutations
+    run_replay = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+    assert run_replay.returncode == 2
+    assert stdout_json(run_replay)["status"] == "abandonment_pending"
+    assert stdout_json(run_replay)["next_action"] == f"agent-run abandon {run_id}"
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 

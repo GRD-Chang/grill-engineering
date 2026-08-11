@@ -351,6 +351,9 @@ class GitRepository:
                 shutil.rmtree(checkout)
         self._run("worktree", "prune")
 
+    def prune_worktrees(self) -> None:
+        self._run("worktree", "prune")
+
     def _fetch_default_branch(self, default_branch: str) -> None:
         result = run_read_command(
             ["git", "fetch", "--no-tags", "origin", default_branch],

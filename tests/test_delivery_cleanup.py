@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from agent_run.controller import Controller
-from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -181,3 +183,35 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
 
     assert resumed == state
     assert github.deleted_branches == []
+
+
+def test_abandonment_prunes_missing_worktree_registry_entry(
+    git_repo: Path,
+) -> None:
+    git = GitRepository(git_repo)
+    root = git_repo / ".agent-run" / "worktrees" / "run-1"
+    checkout = root / "ticket-2"
+    branch = "agent-run/run-1/ticket-2"
+    git.prepare_ticket_checkout(
+        branch=branch,
+        base_sha=git.resolve("main"),
+        checkout=checkout,
+    )
+    shutil.rmtree(root)
+    assert str(checkout) in subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    remove_run_worktrees(git, StateStore(git_repo / ".agent-run"), "run-1")
+
+    assert str(checkout) not in subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout

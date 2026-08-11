@@ -23,7 +23,10 @@ def _run_to_human_gate(
     # A read budget exhausted while selecting the Run is itself the durable
     # recovery boundary.  Do not immediately spend another budget through the
     # nested resume in the same foreground invocation.
-    if resumed and state.get("status") != "execution_failed":
+    if resumed and state.get("status") not in {
+        "execution_failed",
+        "abandonment_pending",
+    }:
         _invoke_nested("resume", run_id, *arguments, *_agent_fixture_arguments(parsed, "resume"))
     state = _load_local_run(states, run_id)
     previous_marker: tuple[object, ...] | None = None
@@ -86,6 +89,7 @@ def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, 
         "waiting_checks",
         "ready_for_human",
         "unsupported_scope_change",
+        "abandonment_pending",
         "progress_exhausted",
         "execution_failed",
         "blocked",
