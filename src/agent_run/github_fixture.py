@@ -638,7 +638,7 @@ class FixtureGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         mutations = _mutable_list(self._delivery(), "mutations")
         marker = {
             "ticket_number": ticket_number,
@@ -655,6 +655,12 @@ class FixtureGitHubPublisher:
             mutations.append({"action": "completion_comment", **marker})
         closed = _mutable_list(self._delivery(), "closed_issues")
         publisher_closed = ticket_number in closed
+        raw_ownerships = self._delivery().setdefault(
+            "ticket_close_ownership", {}
+        )
+        if not isinstance(raw_ownerships, dict):
+            raise ValueError("delivery.ticket_close_ownership must be an object")
+        ownerships = raw_ownerships
         raw_issues = _mutable_mapping(self.data, "issues")
         issue = raw_issues.get(str(ticket_number))
         if self._delivery().pop("external_close_before_primary_ticket", False):
@@ -669,6 +675,11 @@ class FixtureGitHubPublisher:
             mutations.append({"action": "close_issue", **marker})
             issue["state"] = "CLOSED"
             publisher_closed = True
+        if publisher_closed and str(ticket_number) not in ownerships:
+            ownerships[str(ticket_number)] = {
+                "event_id": f"{run_id}:ticket-{ticket_number}:closed",
+                "actor": "fixture-publisher",
+            }
         for raw_issue in raw_issues.values():
             if not isinstance(raw_issue, dict):
                 continue
@@ -691,14 +702,31 @@ class FixtureGitHubPublisher:
             raise OSError(
                 "simulated lost response after Primary Ticket close"
             )
-        return publisher_closed
+        ownership = ownerships.get(str(ticket_number))
+        return dict(ownership) if isinstance(ownership, dict) else None
 
     def ticket_closed_by_run(
-        self, *, ticket_number: int, run_id: str
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
     ) -> bool:
         del run_id
-        return ticket_number in _mutable_list(
-            self._delivery(), "closed_issues"
+        issue = _mutable_mapping(self.data, "issues").get(str(ticket_number))
+        raw_ownerships = self._delivery().get("ticket_close_ownership", {})
+        if not isinstance(raw_ownerships, dict):
+            raise ValueError("delivery.ticket_close_ownership must be an object")
+        current = raw_ownerships.get(str(ticket_number))
+        expected = recorded_ownership if recorded_ownership is not None else current
+        return (
+            isinstance(issue, dict)
+            and issue.get("state") == "CLOSED"
+            and ticket_number
+            in _mutable_list(self._delivery(), "closed_issues")
+            and isinstance(current, dict)
+            and isinstance(expected, dict)
+            and current.get("event_id") == expected.get("event_id")
         )
 
     def recover_abandoned_ticket(

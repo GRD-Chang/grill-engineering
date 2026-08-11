@@ -157,6 +157,11 @@ class RunPublicationApproval(RunPublicationShared):
                     ticket["eligible"] = self.github.ticket_closed_by_run(
                         ticket_number=int(ticket["ticket_number"]),
                         run_id=run_id,
+                        recorded_ownership=(
+                            ticket.get("recorded_ownership")
+                            if isinstance(ticket.get("recorded_ownership"), dict)
+                            else None
+                        ),
                     )
                     self._save(state)
             for change_pr in _obligation_list(abandonment, "change_prs"):
@@ -299,9 +304,10 @@ def _ticket_recovery_obligations(
                     "ticket_number": ticket_number,
                     "pr_number": pr_number,
                     "integrated_sha": integrated_sha,
-                    "eligible": (
-                        job.get("ticket_closed_by_run")
-                        if isinstance(job.get("ticket_closed_by_run"), bool)
+                    "eligible": None,
+                    "recorded_ownership": (
+                        job.get("ticket_close_ownership")
+                        if isinstance(job.get("ticket_close_ownership"), dict)
                         else None
                     ),
                     "status": "pending",

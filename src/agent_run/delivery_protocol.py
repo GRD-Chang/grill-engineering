@@ -112,10 +112,14 @@ class GitHubPublisher(Protocol):
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> bool: ...
+    ) -> dict[str, Any] | None: ...
 
     def ticket_closed_by_run(
-        self, *, ticket_number: int, run_id: str
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
     ) -> bool: ...
 
     def recover_abandoned_ticket(

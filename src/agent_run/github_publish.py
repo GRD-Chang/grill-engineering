@@ -788,7 +788,7 @@ class GhGitHubPublisher:
         run_id: str,
         pr_number: int,
         integrated_sha: str,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         issue = _mapping(
             self._json(
                 "issue",
@@ -832,6 +832,7 @@ class GhGitHubPublisher:
                 body,
             )
         if issue.get("state") != "CLOSED":
+            publisher_login = self._publisher_login()
             self._require(
                 "issue",
                 "close",
@@ -839,13 +840,34 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
             )
-        return self.ticket_closed_by_run(
-            ticket_number=ticket_number, run_id=run_id
+            return {"actor": publisher_login, "event_id": None}
+        ownership = self._ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=None,
         )
+        return ownership
 
     def ticket_closed_by_run(
-        self, *, ticket_number: int, run_id: str
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
     ) -> bool:
+        return self._ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=recorded_ownership,
+        ) is not None
+
+    def _ticket_close_ownership(
+        self,
+        *,
+        ticket_number: int,
+        run_id: str,
+        recorded_ownership: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
         issue = _mapping(
             self._json(
                 "issue",
@@ -854,15 +876,66 @@ class GhGitHubPublisher:
                 "--repo",
                 self.repository,
                 "--json",
-                "comments",
+                "state,comments",
             )
         )
+        if issue.get("state") != "CLOSED":
+            return None
+        events = self._json(
+            "api",
+            f"repos/{self.repository}/issues/{ticket_number}/events",
+            "--paginate",
+        )
+        if not isinstance(events, list):
+            raise GitHubReadError(
+                "github_invalid_response", "Issue events must be an array"
+            )
+        transitions = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("event") in {"closed", "reopened"}
+            and event.get("id") is not None
+            and isinstance(event.get("created_at"), str)
+        ]
+        if not transitions:
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "GitHub has not exposed the Ticket close event yet",
+            )
+        latest = max(
+            transitions,
+            key=lambda event: (str(event["created_at"]), str(event["id"])),
+        )
+        if latest.get("event") != "closed":
+            return None
+        if isinstance(recorded_ownership, dict):
+            recorded_event_id = recorded_ownership.get("event_id")
+            actor = latest.get("actor")
+            if recorded_event_id is not None and str(latest["id"]) != str(
+                recorded_event_id
+            ):
+                return None
+            if (
+                recorded_event_id is None
+                and (
+                    not isinstance(actor, dict)
+                    or actor.get("login") != recorded_ownership.get("actor")
+                )
+            ):
+                return None
+            return {
+                "event_id": latest["id"],
+                "actor": recorded_ownership.get("actor"),
+                "created_at": latest["created_at"],
+            }
+        publisher_login = self._publisher_login()
         marker = (
             f"<!-- agent-run:{run_id}:ticket-{ticket_number}:publisher-close-intent -->"
         )
         comments = issue.get("comments")
         if not isinstance(comments, list):
-            return False
+            return None
         intents = [
             _mapping(comment)
             for comment in comments
@@ -874,29 +947,33 @@ class GhGitHubPublisher:
             if isinstance(intent.get("createdAt"), str)
             and isinstance(intent.get("author"), dict)
             and isinstance(intent["author"].get("login"), str)
+            and intent["author"].get("login") == publisher_login
         ]
         if not intents:
-            return False
+            return None
         intent = max(intents, key=lambda item: str(item["createdAt"]))
         intent_time = str(intent["createdAt"])
-        intent_author = str(intent["author"]["login"])
-        events = self._json(
-            "api",
-            f"repos/{self.repository}/issues/{ticket_number}/events",
-            "--paginate",
-        )
-        if not isinstance(events, list):
+        actor = latest.get("actor")
+        if (
+            str(latest.get("created_at", "")) < intent_time
+            or not isinstance(actor, dict)
+            or actor.get("login") != publisher_login
+        ):
+            return None
+        return {
+            "event_id": latest["id"],
+            "actor": publisher_login,
+            "created_at": latest["created_at"],
+        }
+
+    def _publisher_login(self) -> str:
+        identity = _mapping(self._json("api", "user"))
+        login = identity.get("login")
+        if not isinstance(login, str) or not login:
             raise GitHubReadError(
-                "github_invalid_response", "Issue events must be an array"
+                "github_invalid_response", "authenticated GitHub login is missing"
             )
-        return any(
-            isinstance(event, dict)
-            and event.get("event") == "closed"
-            and str(event.get("created_at", "")) >= intent_time
-            and isinstance(event.get("actor"), dict)
-            and event["actor"].get("login") == intent_author
-            for event in events
-        )
+        return login
 
     def recover_abandoned_ticket(
         self,

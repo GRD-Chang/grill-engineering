@@ -315,7 +315,6 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     ]
     assert after_fixture["delivery"]["mutations"] == frozen["mutations"]
 
-    after_fixture["delivery"]["closed_issues"] = []
     after_fixture["delivery"]["crash_after_recover_abandoned_ticket_once"] = True
     fixture.write_text(json.dumps(after_fixture), encoding="utf-8")
     interrupted_abandon = run_cli(git_repo, fixture, "abandon", run_id)

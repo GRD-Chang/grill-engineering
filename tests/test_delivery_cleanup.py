@@ -42,6 +42,11 @@ class FailingBranchCleanupGit(GitRepository):
         raise OSError(f"cannot delete {branch}")
 
 
+class FailingPruneGit(GitRepository):
+    def prune_worktrees(self) -> None:
+        raise GitError("cannot prune worktree registry")
+
+
 class RecordingBranchPublisher:
     def __init__(self) -> None:
         self.deleted_branches: list[str] = []
@@ -215,3 +220,14 @@ def test_abandonment_prunes_missing_worktree_registry_entry(
         capture_output=True,
         check=True,
     ).stdout
+
+
+def test_abandonment_keeps_recovery_pending_when_prune_fails(
+    git_repo: Path,
+) -> None:
+    with pytest.raises(GitError, match="cannot prune worktree registry"):
+        remove_run_worktrees(
+            FailingPruneGit(git_repo),
+            StateStore(git_repo / ".agent-run"),
+            "run-1",
+        )

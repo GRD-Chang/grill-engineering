@@ -352,7 +352,11 @@ class GitRepository:
         self._run("worktree", "prune")
 
     def prune_worktrees(self) -> None:
-        self._run("worktree", "prune")
+        result = self._run("worktree", "prune")
+        if result.returncode != 0:
+            raise GitError(
+                result.stderr.strip() or "could not prune Git worktree registry"
+            )
 
     def _fetch_default_branch(self, default_branch: str) -> None:
         result = run_read_command(
