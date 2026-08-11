@@ -583,6 +583,106 @@ def test_parent_only_approve_recovers_after_closeout_response_loss(
     ]
 
 
+def test_resume_freezes_parent_closeout_assets_after_graph_drift(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={},
+        delivery={"crash_after_close_parent_issue_once": True},
+    )
+    agent_fixture = git_repo / "parent-only-agents.json"
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-reviewer-1", "candidate passed"
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    interrupted = run_cli(git_repo, fixture, "approve", run_id)
+    assert interrupted.returncode == 2
+
+    before_state = load_only_run_state(git_repo)
+    before_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    parent_job = before_state["parent_job"]
+    branch = parent_job["parent_branch"]
+    frozen_local = {
+        "candidate_sha": parent_job["candidate_sha"],
+        "acceptance_record": parent_job["acceptance_record"],
+        "branch_sha": subprocess.run(
+            ["git", "rev-parse", branch],
+            cwd=git_repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip(),
+    }
+    frozen_remote = {
+        "published_branch": before_fixture["delivery"]["published_branches"][
+            branch
+        ],
+        "pull_requests": before_fixture["delivery"]["pull_requests"],
+        "mutations": before_fixture["delivery"]["mutations"],
+    }
+
+    before_fixture["parent"]["sub_issues"] = [3]
+    before_fixture["issues"] = {"3": ticket()}
+    fixture.write_text(json.dumps(before_fixture), encoding="utf-8")
+
+    resumed = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert resumed.returncode == 2
+    assert stdout_json(resumed)["status"] == "unsupported_scope_change"
+    after_state = load_only_run_state(git_repo)
+    after_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after_state["parent_job"]["candidate_sha"] == frozen_local[
+        "candidate_sha"
+    ]
+    assert after_state["parent_job"]["acceptance_record"] == frozen_local[
+        "acceptance_record"
+    ]
+    assert subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip() == frozen_local["branch_sha"]
+    assert after_fixture["delivery"]["published_branches"][branch] == (
+        frozen_remote["published_branch"]
+    )
+    assert after_fixture["delivery"]["pull_requests"] == frozen_remote[
+        "pull_requests"
+    ]
+    assert after_fixture["delivery"]["mutations"] == frozen_remote[
+        "mutations"
+    ]
+
+
 def test_parent_only_approve_rechecks_required_checks_before_merge(
     git_repo: Path,
 ) -> None:

@@ -10,6 +10,16 @@ def reconcile_structure(
 ) -> dict[str, Any]:
     """Compare scope facts mechanically without asking an Agent to interpret drift."""
     observed_graph_revision = _revision(projected, "ticket_graph")
+    observed_parent_revision = _revision(projected, "parent")
+    accepted_parent_revision = previous.get("accepted_parent_spec_revision")
+    if not isinstance(accepted_parent_revision, str):
+        previous_parent = previous.get("parent")
+        if isinstance(previous_parent, dict) and isinstance(
+            previous_parent.get("revision"), str
+        ):
+            accepted_parent_revision = previous_parent["revision"]
+        else:
+            accepted_parent_revision = observed_parent_revision
     accepted_graph_revision = previous.get("accepted_ticket_graph_revision")
     if not isinstance(accepted_graph_revision, str):
         previous_graph_revision = _mapping(previous, "ticket_graph").get(
@@ -21,12 +31,8 @@ def reconcile_structure(
             projected["accepted_ticket_graph_revision"] = (
                 observed_graph_revision
             )
-            projected["accepted_parent_spec_revision"] = _revision(
-                projected, "parent"
-            )
-            projected["observed_parent_spec_revision"] = _revision(
-                projected, "parent"
-            )
+            projected["accepted_parent_spec_revision"] = accepted_parent_revision
+            projected["observed_parent_spec_revision"] = observed_parent_revision
             return projected
 
     if observed_graph_revision != accepted_graph_revision:
@@ -48,15 +54,14 @@ def reconcile_structure(
                 "observed_ticket_graph": observed_graph,
                 "observed_at": _now(),
             }
-        return _unsupported(previous, change)
+        blocked = _unsupported(previous, change)
+        blocked["accepted_parent_spec_revision"] = accepted_parent_revision
+        blocked["observed_parent_spec_revision"] = observed_parent_revision
+        return blocked
 
     projected["accepted_ticket_graph_revision"] = accepted_graph_revision
     projected.pop("unsupported_scope_change", None)
 
-    observed_parent_revision = _revision(projected, "parent")
-    accepted_parent_revision = previous.get("accepted_parent_spec_revision")
-    if not isinstance(accepted_parent_revision, str):
-        accepted_parent_revision = _revision(previous, "parent")
     projected["accepted_parent_spec_revision"] = accepted_parent_revision
     projected["observed_parent_spec_revision"] = observed_parent_revision
     return projected
@@ -66,33 +71,6 @@ def _unsupported(
     previous: dict[str, Any], change: dict[str, Any]
 ) -> dict[str, Any]:
     blocked = dict(previous)
-    timeline = list(previous.get("timeline", []))
-    already_recorded = any(
-        isinstance(event, dict)
-        and event.get("kind") == "unsupported_scope_change"
-        and event.get("observed_graph_revision")
-        == change["observed_graph_revision"]
-        for event in timeline
-    )
-    if not already_recorded:
-        timeline.append(
-            {
-                "at": _now(),
-                "kind": "unsupported_scope_change",
-                "status": "unsupported_scope_change",
-                "accepted_graph_revision": change[
-                    "accepted_graph_revision"
-                ],
-                "observed_graph_revision": change[
-                    "observed_graph_revision"
-                ],
-                "graph_change_summary": deepcopy(
-                    change["graph_change_summary"]
-                ),
-                "next_action": "restore_graph_or_abandon",
-                "result": change["graph_change_summary"]["summary"],
-            }
-        )
     blocked.update(
         {
             "status": "unsupported_scope_change",
@@ -100,7 +78,6 @@ def _unsupported(
             "frontier": [],
             "active_ticket_job": None,
             "unsupported_scope_change": change,
-            "timeline": timeline,
             "diagnostics": [
                 {
                     "code": "unsupported_ticket_graph_change",

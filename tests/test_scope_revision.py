@@ -74,3 +74,34 @@ def test_parent_revision_drift_is_recorded_without_scope_agent(
     assert resumed["observed_parent_spec_revision"] != accepted
     assert "pending_structure_change" not in resumed
     assert "latest_scope_impact_assessment" not in resumed
+
+
+def test_parent_revision_is_recorded_when_ticket_graph_also_drifts(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _ticket(2)}
+    )
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    started, _ = controller.start(1)
+    accepted_parent = started["accepted_parent_spec_revision"]
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["parent"]["body"] += "\nChange the Parent and ticket graph together."
+    data["parent"]["sub_issues"].append(3)
+    data["issues"]["3"] = _ticket(3)
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    expected_observed_parent = state_from_graph(
+        started, FixtureGitHubReader(fixture).delivery_graph(1)
+    )["parent"]["revision"]
+
+    resumed, _ = controller.resume(str(started["run_id"]))
+
+    assert resumed["status"] == "unsupported_scope_change"
+    assert resumed["accepted_parent_spec_revision"] == accepted_parent
+    assert resumed["observed_parent_spec_revision"] == expected_observed_parent
+    assert expected_observed_parent != accepted_parent

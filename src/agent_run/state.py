@@ -6,6 +6,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -162,11 +163,17 @@ def _append_timeline_event(
         "pr_number",
         "commit_sha",
         "human_blockers",
+        "accepted_graph_revision",
+        "observed_graph_revision",
+        "graph_change_summary",
+        "next_action",
         "result",
     ):
         value = marker.get(key)
         if value is not None:
-            event[key] = value
+            event[key] = (
+                deepcopy(value) if key == "graph_change_summary" else value
+            )
     if _event_matches_marker(timeline[-1] if timeline else None, marker):
         return
     timeline.append(event)
@@ -174,6 +181,22 @@ def _append_timeline_event(
 
 def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
     status = str(state.get("status", "unknown"))
+    scope_change = state.get("unsupported_scope_change")
+    if status == "unsupported_scope_change" and isinstance(
+        scope_change, dict
+    ):
+        return {
+            "kind": "unsupported_scope_change",
+            "status": status,
+            "accepted_graph_revision": scope_change.get(
+                "accepted_graph_revision"
+            ),
+            "observed_graph_revision": scope_change.get(
+                "observed_graph_revision"
+            ),
+            "graph_change_summary": scope_change.get("graph_change_summary"),
+            "next_action": "restore_graph_or_abandon",
+        }
     publication = state.get("run_publication")
     if (
         status in {
@@ -344,6 +367,14 @@ def _event_matches_marker(event: object, marker: dict[str, object]) -> bool:
 
 
 def _timeline_result(state: dict[str, Any]) -> object:
+    if state.get("status") == "unsupported_scope_change":
+        change = state.get("unsupported_scope_change")
+        if isinstance(change, dict):
+            summary = change.get("graph_change_summary")
+            if isinstance(summary, dict) and isinstance(
+                summary.get("summary"), str
+            ):
+                return summary["summary"]
     diagnostics = state.get("diagnostics")
     if isinstance(diagnostics, list) and diagnostics:
         first = diagnostics[0]

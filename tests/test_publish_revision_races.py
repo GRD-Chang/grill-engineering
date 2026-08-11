@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +229,91 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
         for pr in delivery.get("pull_requests", [])
         if isinstance(pr, dict)
     )
+
+
+def test_resume_freezes_completed_ticket_assets_after_graph_drift(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket()},
+        delivery={"required_checks": ["none"]},
+    )
+    agents = _write_agents(git_repo / "agents.json", two_revisions=False)
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+
+    before_state = load_only_run_state(git_repo)
+    before_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    job = before_state["ticket_jobs"]["2"]
+    run_branch = before_state["run_branch"]
+    ticket_completion_record = {
+        "ticket_number": 2,
+        "integrated_sha": job["integrated_sha"],
+        "effective_revision": job["effective_revision"],
+        "acceptance_record": job["acceptance_record"],
+    }
+    frozen = {
+        "candidate_sha": job["candidate_sha"],
+        "acceptance_record": job["acceptance_record"],
+        "ticket_completion_record": ticket_completion_record,
+        "local_run_branch_sha": subprocess.run(
+            ["git", "rev-parse", run_branch],
+            cwd=git_repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip(),
+        "remote_run_branch_sha": before_fixture["delivery"][
+            "published_branches"
+        ][run_branch],
+        "pull_requests": before_fixture["delivery"]["pull_requests"],
+        "mutations": before_fixture["delivery"]["mutations"],
+    }
+
+    added = _ticket()
+    added.update({"number": 4, "title": "Unexpected added ticket"})
+    before_fixture["parent"]["sub_issues"] = [2, 4]
+    before_fixture["issues"]["4"] = added
+    fixture.write_text(json.dumps(before_fixture), encoding="utf-8")
+
+    resumed = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert resumed.returncode == 2
+    assert stdout_json(resumed)["status"] == "unsupported_scope_change"
+    after_state = load_only_run_state(git_repo)
+    after_fixture = json.loads(fixture.read_text(encoding="utf-8"))
+    after_job = after_state["ticket_jobs"]["2"]
+    assert after_job["candidate_sha"] == frozen["candidate_sha"]
+    assert after_job["acceptance_record"] == frozen["acceptance_record"]
+    assert {
+        "ticket_number": 2,
+        "integrated_sha": after_job["integrated_sha"],
+        "effective_revision": after_job["effective_revision"],
+        "acceptance_record": after_job["acceptance_record"],
+    } == frozen["ticket_completion_record"]
+    assert subprocess.run(
+        ["git", "rev-parse", run_branch],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip() == frozen["local_run_branch_sha"]
+    assert after_fixture["delivery"]["published_branches"][run_branch] == (
+        frozen["remote_run_branch_sha"]
+    )
+    assert after_fixture["delivery"]["pull_requests"] == frozen[
+        "pull_requests"
+    ]
+    assert after_fixture["delivery"]["mutations"] == frozen["mutations"]
 
 
 @pytest.mark.parametrize(

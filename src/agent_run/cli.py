@@ -138,6 +138,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state, resumed = controller.resume(
                 parsed.run_id, resume_human_blocker=True
             )
+            if state.get("status") == "unsupported_scope_change":
+                cli_presentation._print_precondition_failure(state)
+                return 2
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
