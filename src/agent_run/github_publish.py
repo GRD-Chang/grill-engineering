@@ -1142,6 +1142,19 @@ class GhGitHubPublisher:
                 "ticket_close_ownership_pending",
                 "GitHub has not exposed a transition after the close intent baseline yet",
             )
+        if any(
+            event.get("event") in {"closed", "reopened"}
+            and (
+                not isinstance(event.get("actor"), dict)
+                or not isinstance(event["actor"].get("login"), str)
+                or not event["actor"]["login"]
+            )
+            for event in after_baseline
+        ):
+            raise GitHubReadError(
+                "ticket_close_ownership_pending",
+                "GitHub has not exposed the Ticket transition actor yet",
+            )
         owned = next(
             (
                 event

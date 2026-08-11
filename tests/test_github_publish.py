@@ -1060,6 +1060,46 @@ def test_closed_ticket_waits_for_exact_close_event(
     assert error.value.code == "ticket_close_ownership_pending"
 
 
+def test_close_ownership_waits_for_transition_actor(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_json(*arguments: str) -> object:
+        if arguments[:2] == ("issue", "view"):
+            return {
+                "state": "CLOSED",
+                "comments": [],
+                "updatedAt": "2026-08-11T10:00:01Z",
+            }
+        return [
+            {
+                "id": 101,
+                "event": "closed",
+                "created_at": "2026-08-11T10:00:01Z",
+                "actor": None,
+            }
+        ]
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    with pytest.raises(GitHubReadError, match="transition actor") as error:
+        publisher.ticket_close_ownership(
+            ticket_number=2,
+            run_id="run-1",
+            recorded_ownership={
+                "actor": "agent-run-bot",
+                "event_id": None,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 100,
+                "intent_binding": "pr-3:sha-abc123",
+                "dispatch_attempted": True,
+            },
+        )
+
+    assert error.value.code == "ticket_close_ownership_pending"
+
+
 def test_close_retry_does_not_overwrite_external_reopen(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
