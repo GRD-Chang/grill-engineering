@@ -482,8 +482,10 @@ class RunAcceptanceEngine:
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
             "thread_id": (
-                job.get("publication_thread_id")
-                if job.get("prior_human_blockers")
+                None
+                if job.get("publication_new_thread") is True
+                else job.get("publication_thread_id")
+                if job.get("publication_thread_id")
                 else job["development_thread_id"]
                 if int(job.get("publication_attempts", 0))
                 < MAX_PUBLICATION_CONTEXT_ATTEMPTS

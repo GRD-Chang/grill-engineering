@@ -21,6 +21,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     active_thread = ""
 
     publication_result = {
+        "result_kind": "publication",
         "commit_message": "fix(agent): publish validated repair",
         "pr_title": "fix(agent): publish validated repair",
         "pr_body_markdown": (
@@ -29,6 +30,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "## User Impact\n\nDelivery can continue.\n\n"
             "## Evidence\n\nIndependent validation passed."
         ),
+        "human_blockers": None,
     }
     acceptance_result = {
         "verdict": "pass",

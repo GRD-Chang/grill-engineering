@@ -23,9 +23,10 @@ class RunPublicationAgents:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
 
-    def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
+    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
         self.requests.append(request)
         return {
+            "result_kind": "publication",
             "commit_message": "feat(run): publish the completed delivery",
             "pr_title": "feat(run): publish the completed delivery",
             "pr_body_markdown": (
@@ -34,6 +35,7 @@ class RunPublicationAgents:
                 "## User Impact\n\nMaintainers can inspect and approve one final PR.\n\n"
                 "## Evidence\n\nFresh Run Acceptance passed."
             ),
+            "human_blockers": None,
         }
 
 
@@ -59,6 +61,10 @@ class HumanThenRunPublicationAgents:
         self.requests.append(request)
         if len(self.requests) == 1:
             return {
+                "result_kind": "human_blocker",
+                "commit_message": None,
+                "pr_title": None,
+                "pr_body_markdown": None,
                 "human_blockers": [
                     "GitHub denied access; tried gh issue view; grant Issue read access."
                 ],
@@ -69,6 +75,7 @@ class HumanThenRunPublicationAgents:
             "GitHub denied access; tried gh issue view; grant Issue read access."
         ]
         return {
+            "result_kind": "publication",
             "commit_message": "feat(run): publish the completed delivery",
             "pr_title": "feat(run): publish the completed delivery",
             "pr_body_markdown": (
@@ -77,6 +84,7 @@ class HumanThenRunPublicationAgents:
                 "## User Impact\n\nMaintainers can approve the Run.\n\n"
                 "## Evidence\n\nThe original thread rechecked GitHub."
             ),
+            "human_blockers": None,
             "_thread_id": "blocked-publication-thread",
         }
 
@@ -711,6 +719,8 @@ def test_final_run_publication_receives_only_role_required_facts(git_repo: Path)
     ).publish(str(state["run_id"]))
 
     request = agents.requests[0]
+    assert callable(request.pop("_invocation_event"))
+    assert callable(request.pop("_currentness_check"))
     assert set(request) == {"acceptance_artifact", "checkout", "parent_issue_url"}
     assert request["parent_issue_url"].endswith("/issues/1")
 

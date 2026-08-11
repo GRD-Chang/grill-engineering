@@ -50,6 +50,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "diagnostics": state.get("diagnostics", []),
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
+        "agent_invocation": state.get("active_agent_invocation"),
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -88,16 +89,33 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     timeline = state.get("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
+    invocations = state.get("agent_invocation_history", [])
+    if not isinstance(invocations, list):
+        raise ValueError("agent_invocation_history must be an array")
     output = {
         "run_id": state.get("run_id"),
         "timeline": timeline,
         "next_action": _next_action(state),
         "abandonment": state.get("run_abandonment"),
+        "agent_invocations": invocations,
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
     print(f"交付运行: {output['run_id']}")
+    for invocation in invocations:
+        if not isinstance(invocation, dict):
+            continue
+        print(
+            "Agent Invocation "
+            f"{invocation.get('role')} {invocation.get('status')} "
+            f"attempts={invocation.get('attempt_count')} "
+            f"return_code={invocation.get('return_code')} "
+            f"signal={invocation.get('signal')} "
+            f"requested={invocation.get('requested_thread_id')} "
+            f"reported={invocation.get('reported_thread_id')} "
+            f"error={invocation.get('error')}"
+        )
     for event in timeline:
         if not isinstance(event, dict):
             continue

@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("run_id", help="交付运行标识")
     _add_common_options(resume)
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
+    resume.add_argument(
+        "--new-thread",
+        action="store_true",
+        help="为当前失败或人工阻塞的 Agent 阶段新开 Thread",
+    )
     deliver = subcommands.add_parser(
         "deliver", help="交付当前 Active Ticket Job"
     )
@@ -136,7 +141,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
         elif parsed.command == "resume":
             state, resumed = controller.resume(
-                parsed.run_id, resume_human_blocker=True
+                parsed.run_id,
+                resume_human_blocker=True,
+                new_thread=parsed.new_thread,
             )
             if state.get("status") == "unsupported_scope_change":
                 cli_presentation._print_precondition_failure(state)
@@ -584,7 +591,14 @@ def _positive_integer(value: str) -> int:
 
 
 def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
-    """Whether the explicit resume just re-entered a Human Blocker phase."""
+    """Whether explicit resume re-entered a blocked or failed Agent phase."""
+    invocation = state.get("active_agent_invocation")
+    if (
+        isinstance(invocation, dict)
+        and invocation.get("status") == "failed"
+        and invocation.get("role") in {"publication", "final_publication"}
+    ):
+        return True
     for key in ("active_ticket_job", "parent_job"):
         job = state.get(key)
         if isinstance(job, dict) and job.get("prior_human_blockers"):

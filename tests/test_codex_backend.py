@@ -20,6 +20,7 @@ import pytest
 from agent_run.codex import (
     CodexCliBackend,
     CodexProcessError,
+    _terminal_error,
 )
 from agent_run.agents import PublicationResult
 from agent_run.github_auth import (
@@ -33,6 +34,65 @@ from agent_run.worker_sandbox import (
     run_worker_process,
     worker_environment,
 )
+
+
+def test_publication_repairs_invalid_output_in_same_thread(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    attempts: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        if len(attempts) == 1:
+            output.write_text('{"invalid":"publication"}', encoding="utf-8")
+        else:
+            output.write_text(
+                json.dumps(
+                    {
+                        "result_kind": "publication",
+                        "commit_message": "fix(delivery): publish accepted candidate",
+                        "pr_title": "fix(delivery): publish accepted candidate",
+                        "pr_body_markdown": "body",
+                        "human_blockers": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"publication-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").publication(
+        {
+            "checkout": str(tmp_path),
+            "acceptance_artifact": {},
+            "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
+        }
+    )
+
+    assert isinstance(result, PublicationResult)
+    assert len(attempts) == 2
+    assert "resume" in attempts[1]
+    assert events[-1] == (
+        "completed",
+        {"reported_thread_id": "publication-thread", "attempt_count": 2},
+    )
+
+
+def test_terminal_error_prefers_structured_message_and_bounds_secrets() -> None:
+    error = _terminal_error(
+        '{"type":"task_complete","error":{"message":"token=secret-value\\u0000 failed"}}\n',
+        "less useful stderr",
+    )
+
+    assert error == "token=[REDACTED] failed"
+    assert len(_terminal_error("", "x" * 9000).encode()) <= 8192
 
 
 def test_codex_worker_environment_excludes_publisher_credentials(
@@ -210,9 +270,11 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
         Path(arguments[output_index]).write_text(
             json.dumps(
                 {
+                    "result_kind": "publication",
                     "commit_message": "feat: publish validated run",
                     "pr_title": "feat: publish validated run",
                     "pr_body_markdown": "## What Problem This Solves\n\nA complete Run needs a review boundary.",
+                    "human_blockers": None,
                 }
             ),
             encoding="utf-8",
@@ -520,7 +582,7 @@ def test_development_resume_failure_starts_replacement_with_full_context(
     assert "https://github.com/example/project/issues/3" in replacement_prompt
 
 
-def test_publication_resume_failure_starts_and_reports_replacement(
+def test_publication_resume_failure_does_not_replace_thread(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -564,28 +626,21 @@ def test_publication_resume_failure_starts_and_reports_replacement(
         )
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
-    result = CodexCliBackend(
-        credential_provider=lambda: "reader-secret",
-    ).publication(
-        {
-            "checkout": str(checkout),
-            "thread_id": "developer-1",
-            "parent_issue_url": "https://github.com/example/project/issues/1",
-            "task_issue_url": "https://github.com/example/project/issues/3",
-            "acceptance_artifact": {"verdict": "pass"},
-        }
-    )
+    with pytest.raises(CodexProcessError, match="resume target no longer exists"):
+        CodexCliBackend(
+            credential_provider=lambda: "reader-secret",
+        ).publication(
+            {
+                "checkout": str(checkout),
+                "thread_id": "developer-1",
+                "parent_issue_url": "https://github.com/example/project/issues/1",
+                "task_issue_url": "https://github.com/example/project/issues/3",
+                "acceptance_artifact": {"verdict": "pass"},
+            }
+        )
 
-    assert isinstance(result, PublicationResult)
-    assert result.thread_id == "developer-2"
-    assert result.replaced_thread_id == "developer-1"
-    assert result.artifact["commit_message"] == (
-        "fix(delivery): repair publication"
-    )
+    assert len(invocations) == 1
     assert "resume" in invocations[0][0]
-    assert "resume" not in invocations[1][0]
-    assert "恢复失败" in invocations[1][1]
-    assert "https://github.com/example/project/issues/3" in invocations[1][1]
 
 
 def test_publication_uses_a_read_only_checkout(
@@ -601,6 +656,7 @@ def test_publication_uses_a_read_only_checkout(
         return (
             json.dumps(
                 {
+                    "result_kind": "publication",
                     "commit_message": "fix(delivery): publish accepted candidate",
                     "pr_title": "fix(delivery): publish accepted candidate",
                     "pr_body_markdown": (
@@ -609,9 +665,10 @@ def test_publication_uses_a_read_only_checkout(
                         "## User Impact\n\nThe accepted change stays stable.\n\n"
                         "## Evidence\n\nFresh validation passed."
                     ),
+                    "human_blockers": None,
                 }
             ),
-            "publication-thread",
+            "development-thread",
         )
 
     monkeypatch.setattr(CodexCliBackend, "_invoke", fake_invoke)

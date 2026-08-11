@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -15,7 +17,7 @@ from agent_run.agent_schemas import (
     acceptance_schema,
     publication_or_human_blocker_schema,
 )
-from agent_run.artifacts import parse_human_blockers
+from agent_run.artifacts import parse_human_blockers, parse_publication_wire_result
 from agent_run.github_auth import (
     GitHubCredentialError,
     mint_read_only_installation_token,
@@ -29,7 +31,16 @@ from agent_run.worker_sandbox import (
 
 
 class CodexProcessError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        return_code: int | None = None,
+        signal_number: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.return_code = return_code
+        self.signal_number = signal_number
 
 
 class _CodexThreadResumeError(CodexProcessError):
@@ -228,68 +239,114 @@ class CodexCliBackend:
             else None
         )
         prompt = self._publication_prompt(request)
-        replaced_thread: str | None = None
-        if thread_id is None:
-            output, resumed_thread = self._invoke(
-                prompt=prompt,
-                checkout=checkout,
-                thread_id=None,
-                schema=publication_or_human_blocker_schema(),
-                writable_checkout=False,
-            )
-        else:
-            try:
-                output, resumed_thread = self._invoke(
-                    prompt=prompt,
-                    checkout=checkout,
-                    thread_id=thread_id,
-                    schema=publication_or_human_blocker_schema(),
-                    writable_checkout=False,
-                )
-            except _CodexThreadResumeError:
-                if request.get("prior_human_blockers"):
-                    raise
-                replaced_thread = thread_id
-                output, resumed_thread = self._invoke(
-                    prompt=(
-                        "旧发布叙事 Agent 恢复失败。你是接替该工作的发布叙事工程师；"
-                        "下面的 Publication Brief 是完整恢复上下文。保留同一 Candidate，"
-                        "不要重新开发、改动文件或改变发布范围。\n\n"
-                        + prompt
-                    ),
-                    checkout=checkout,
-                    thread_id=None,
-                    schema=publication_or_human_blocker_schema(),
-                    writable_checkout=False,
-                )
+        output, resumed_thread = self._invoke_publication(
+            request=request,
+            prompt=prompt,
+            checkout=checkout,
+            thread_id=thread_id,
+        )
         artifact = _json_object(output, "Publication Artifact")
         blockers = parse_human_blockers(artifact)
         if blockers is not None:
             return HumanBlockerResult(
                 thread_id=resumed_thread,
                 human_blockers=blockers,
-                replaced_thread_id=replaced_thread,
             )
         return PublicationResult(
             thread_id=resumed_thread,
             artifact=artifact,
-            replaced_thread_id=replaced_thread,
         )
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
         """Create final-PR prose with a read-only release-narrative writer."""
         checkout = Path(_string(request, "checkout"))
         prompt = self._run_publication_prompt(request)
-        output, thread_id = self._invoke(
+        output, thread_id = self._invoke_publication(
+            request=request,
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
-            schema=publication_or_human_blocker_schema(),
-            writable_checkout=False,
         )
         artifact = _json_object(output, "Run Publication Artifact")
         artifact["_thread_id"] = thread_id
         return artifact
+
+    def _invoke_publication(
+        self,
+        *,
+        request: dict[str, Any],
+        prompt: str,
+        checkout: Path,
+        thread_id: str | None,
+    ) -> tuple[str, str]:
+        event = request.get("_invocation_event")
+        notify = event if callable(event) else lambda _kind, **_facts: None
+        notify(
+            "started",
+            requested_thread_id=thread_id,
+            attempt_count=0,
+            invocation_mode=request.get("_invocation_mode"),
+        )
+        current_thread = thread_id
+        validation_error = ""
+        currentness = request.get("_currentness_check")
+        for attempt in range(1, 4):
+            if attempt > 1 and callable(currentness) and not currentness():
+                stale = CodexProcessError(
+                    "Publication currentness changed before Output Repair"
+                )
+                notify("failed", attempt_count=attempt - 1, error=str(stale))
+                raise stale
+            attempt_prompt = prompt
+            if attempt > 1:
+                attempt_prompt = (
+                    "上一输出未通过本地 Publication contract。只重新输出完整 JSON，"
+                    "不要修改文件或继续开发。校验错误："
+                    + validation_error[:2000]
+                )
+            try:
+                output, reported_thread = self._invoke(
+                    prompt=attempt_prompt,
+                    checkout=checkout,
+                    thread_id=current_thread,
+                    schema=publication_or_human_blocker_schema(),
+                    writable_checkout=False,
+                    on_thread=lambda value: notify(
+                        "thread_started",
+                        reported_thread_id=value,
+                        attempt_count=attempt,
+                    ),
+                )
+            except BaseException as error:
+                notify(
+                    "failed",
+                    attempt_count=attempt,
+                    error=_bounded_error(str(error)),
+                    return_code=getattr(error, "return_code", None),
+                    signal=getattr(error, "signal_number", None),
+                )
+                raise
+            if current_thread is not None and reported_thread != current_thread:
+                mismatch = CodexProcessError("Codex resume reported a different Thread ID")
+                notify("failed", attempt_count=attempt, error=str(mismatch))
+                raise mismatch
+            current_thread = reported_thread
+            try:
+                artifact = _json_object(output, "Publication Artifact")
+                parse_publication_wire_result(artifact)
+            except (CodexProcessError, ValueError) as error:
+                validation_error = str(error)
+                if attempt < 3:
+                    continue
+                notify("failed", attempt_count=attempt, error=validation_error)
+                raise CodexProcessError(validation_error) from error
+            notify(
+                "completed",
+                reported_thread_id=current_thread,
+                attempt_count=attempt,
+            )
+            return output, current_thread
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _run_publication_prompt(request: dict[str, Any]) -> str:
@@ -428,6 +485,7 @@ class CodexCliBackend:
         thread_id: str | None,
         schema: dict[str, Any] | None = None,
         writable_checkout: bool = True,
+        on_thread: Callable[[str], None] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
             temporary = Path(temp_name)
@@ -479,20 +537,33 @@ class CodexCliBackend:
                     writable_checkout=writable_checkout,
                     environment=environment,
                 )
-                result = run_worker_process(
-                    arguments,
-                    cwd=checkout,
-                    prompt=prompt,
-                    environment=environment,
-                    timeout=3600,
-                )
+                worker_options: dict[str, Any] = {
+                    "cwd": checkout,
+                    "prompt": prompt,
+                    "environment": environment,
+                    "timeout": 3600,
+                }
+                if "on_stdout_line" in inspect.signature(run_worker_process).parameters:
+                    worker_options["on_stdout_line"] = _thread_line_callback(
+                        expected=thread_id, callback=on_thread
+                    )
+                result = run_worker_process(arguments, **worker_options)
             except WorkerSandboxError as error:
                 raise CodexProcessError(str(error)) from error
             if result.returncode != 0:
-                message = result.stderr.strip() or "Codex worker failed"
+                message = _terminal_error(result.stdout, result.stderr)
+                signal_number = -result.returncode if result.returncode < 0 else None
                 if thread_id is not None:
-                    raise _CodexThreadResumeError(message)
-                raise CodexProcessError(message)
+                    raise _CodexThreadResumeError(
+                        message,
+                        return_code=result.returncode,
+                        signal_number=signal_number,
+                    )
+                raise CodexProcessError(
+                    message,
+                    return_code=result.returncode,
+                    signal_number=signal_number,
+                )
             if not output_path.exists():
                 raise CodexProcessError("Codex worker did not produce a final response")
             reported_thread = _thread_id(result.stdout)
@@ -520,6 +591,79 @@ def _thread_id(output: str) -> str | None:
         if found is not None:
             return found
     return None
+
+
+def _terminal_error(stdout: str, stderr: str) -> str:
+    candidates: dict[str, str] = {}
+    for line in stdout.splitlines():
+        try:
+            value: object = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        event_type = value.get("type")
+        if event_type == "task_complete":
+            nested = value.get("error")
+            if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+                candidates["task_complete"] = nested["message"]
+        elif event_type == "turn.failed":
+            nested = value.get("error")
+            if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+                candidates["turn.failed"] = nested["message"]
+            elif isinstance(nested, str):
+                candidates["turn.failed"] = nested
+        nested = value.get("error")
+        if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+            candidates.setdefault("error", nested["message"])
+        elif isinstance(nested, str):
+            candidates.setdefault("error", nested)
+    raw = (
+        candidates.get("task_complete")
+        or candidates.get("error")
+        or candidates.get("turn.failed")
+        or stderr.strip()
+        or "Codex worker failed"
+    )
+    return _bounded_error(raw)
+
+
+def _bounded_error(value: str) -> str:
+    clean = "".join(character for character in value if character >= " " or character in "\n\t")
+    clean = re.sub(
+        r"(?i)(token|authorization|api[_-]?key|secret|password)(\s*[:=]\s*)([^\s,;]+)",
+        r"\1\2[REDACTED]",
+        clean,
+    )
+    encoded = clean.encode("utf-8")[:8192]
+    return encoded.decode("utf-8", errors="ignore")
+
+
+def _thread_line_callback(
+    *, expected: str | None, callback: Callable[[str], None] | None
+) -> Callable[[str], None]:
+    reported: str | None = None
+
+    def consume(line: str) -> None:
+        nonlocal reported
+        try:
+            value: object = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(value, dict) or value.get("type") != "thread.started":
+            return
+        candidate = value.get("thread_id")
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise CodexProcessError("Codex worker reported an invalid Thread ID")
+        if reported is not None and candidate != reported:
+            raise CodexProcessError("Codex worker reported multiple Thread IDs")
+        if expected is not None and candidate != expected:
+            raise CodexProcessError("Codex resume reported a different Thread ID")
+        reported = candidate
+        if callback is not None:
+            callback(candidate)
+
+    return consume
 
 
 def _find_thread_id(value: object) -> str | None:

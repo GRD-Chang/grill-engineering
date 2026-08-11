@@ -39,7 +39,37 @@ def human_blocker_schema() -> dict[str, Any]:
 
 
 def publication_or_human_blocker_schema() -> dict[str, Any]:
-    return {"oneOf": [publication_schema(), human_blocker_schema()]}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "result_kind",
+            "commit_message",
+            "pr_title",
+            "pr_body_markdown",
+            "human_blockers",
+        ],
+        "properties": {
+            "result_kind": {
+                "type": "string",
+                "enum": ["publication", "human_blocker"],
+            },
+            **{
+                key: {"type": ["string", "null"]}
+                for key in ("commit_message", "pr_title", "pr_body_markdown")
+            },
+            "human_blockers": {
+                "type": ["array", "null"],
+                "maxItems": MAX_HUMAN_BLOCKERS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_HUMAN_BLOCKER_LENGTH,
+                    "pattern": r"\S",
+                },
+            },
+        },
+    }
 
 
 def acceptance_schema() -> dict[str, Any]:

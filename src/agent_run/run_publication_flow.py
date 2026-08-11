@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from agent_run.artifacts import (
     PublicationArtifact,
     append_human_blocker_history,
     clear_current_human_blocker,
-    parse_human_blockers,
+    parse_publication_wire_result,
 )
+from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError
@@ -101,11 +102,24 @@ class RunPublicationFlow(RunPublicationShared):
             self.git.prepare_validation_checkout(
                 head_sha=self.git.resolve(str(state["run_branch"])), checkout=checkout
             )
-            raw = self.agents.run_publication(self._publication_request(state, checkout))
+            request = self._publication_request(state, checkout)
+            request["_invocation_event"] = self._invocation_events(state)
+            request["_currentness_check"] = lambda: self._acceptance_is_current(
+                state, self._mapping(state, "run_acceptance")
+            )
+            if publication.get("publication_new_thread") is True:
+                request["_invocation_mode"] = "new-thread"
+            raw = self.agents.run_publication(request)
+            publication.pop("publication_new_thread", None)
             thread_id = raw.pop("_thread_id", None)
             if isinstance(thread_id, str):
                 publication["thread_id"] = thread_id
-            blockers = parse_human_blockers(raw)
+            normalized = parse_publication_wire_result(raw)
+            blockers = (
+                tuple(normalized["human_blockers"])
+                if normalized["result_kind"] == "human_blocker"
+                else None
+            )
             if blockers is not None:
                 append_human_blocker_history(
                     publication, phase="pending", blockers=blockers
@@ -129,7 +143,7 @@ class RunPublicationFlow(RunPublicationShared):
                 )
                 return None
             artifact = PublicationArtifact.parse(
-                raw,
+                normalized,
                 delivery_run=str(state["run_id"]),
             )
             clear_current_human_blocker(publication)
@@ -138,13 +152,23 @@ class RunPublicationFlow(RunPublicationShared):
             self.git.remove_worktree(checkout)
             self._remove_empty_directories(checkout)
 
+    def _invocation_events(
+        self, state: dict[str, Any]
+    ) -> Callable[..., None]:
+        return invocation_event_recorder(
+            state,
+            role="final_publication",
+            phase="run_publication",
+            save=self._save,
+        )
+
     def _publish_accepted_run(
         self,
         state: dict[str, Any],
         run: dict[str, Any],
         publication: dict[str, Any],
     ) -> dict[str, Any]:
-        artifact = PublicationArtifact.parse(
+        artifact = PublicationArtifact.from_stored(
             self._mapping(publication, "artifact"), delivery_run=str(state["run_id"])
         )
         run_head = self.git.resolve(str(state["run_branch"]))

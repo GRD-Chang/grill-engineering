@@ -26,6 +26,13 @@ _REQUIRED_SECTIONS = (
 MAX_HUMAN_BLOCKERS = 8
 MAX_HUMAN_BLOCKER_LENGTH = 2_000
 MAX_HUMAN_BLOCKER_HISTORY = 16
+_PUBLICATION_RESULT_FIELDS = {
+    "result_kind",
+    "commit_message",
+    "pr_title",
+    "pr_body_markdown",
+    "human_blockers",
+}
 
 
 @dataclass(frozen=True)
@@ -42,7 +49,9 @@ class PublicationArtifact:
         primary_ticket: int | None = None,
         delivery_run: str | None = None,
     ) -> PublicationArtifact:
-        data = _mapping(value, "publication artifact")
+        data = parse_publication_wire_result(value)
+        if data.get("result_kind", "publication") != "publication":
+            raise ValueError("publication artifact result_kind must be publication")
         commit_message = _nonempty_string(data, "commit_message")
         pr_title = _nonempty_string(data, "pr_title")
         body = _nonempty_string(data, "pr_body_markdown")
@@ -68,6 +77,31 @@ class PublicationArtifact:
             commit_message=commit_message,
             pr_title=pr_title,
             pr_body_markdown=body,
+        )
+
+    @classmethod
+    def from_stored(
+        cls,
+        value: object,
+        *,
+        primary_ticket: int | None = None,
+        delivery_run: str | None = None,
+    ) -> PublicationArtifact:
+        """Parse Controller-owned normalized storage, never untrusted wire output."""
+        data = _mapping(value, "stored publication artifact")
+        _exact_fields(
+            data,
+            {"commit_message", "pr_title", "pr_body_markdown"},
+            "stored publication artifact",
+        )
+        return cls.parse(
+            {
+                "result_kind": "publication",
+                **data,
+                "human_blockers": None,
+            },
+            primary_ticket=primary_ticket,
+            delivery_run=delivery_run,
         )
 
 
@@ -153,17 +187,55 @@ class AcceptanceArtifact:
         )
 
 
+def parse_publication_wire_result(value: object) -> dict[str, Any]:
+    """Validate and normalize the flat Publication Structured Output contract."""
+    data = _mapping(value, "publication result")
+    _exact_fields(data, _PUBLICATION_RESULT_FIELDS, "publication result")
+    result_kind = data.get("result_kind")
+    if result_kind == "publication":
+        if data.get("human_blockers") is not None:
+            raise ValueError("publication result human_blockers must be null")
+        return {
+            "result_kind": "publication",
+            "commit_message": _nonempty_string(data, "commit_message"),
+            "pr_title": _nonempty_string(data, "pr_title"),
+            "pr_body_markdown": _nonempty_string(data, "pr_body_markdown"),
+            "human_blockers": None,
+        }
+    if result_kind == "human_blocker":
+        for field in ("commit_message", "pr_title", "pr_body_markdown"):
+            if data.get(field) is not None:
+                raise ValueError(f"human blocker {field} must be null")
+        blockers = _bounded_blocker_list(data.get("human_blockers"))
+        if not blockers:
+            raise ValueError("human_blockers must contain non-empty strings")
+        return {
+            "result_kind": "human_blocker",
+            "commit_message": None,
+            "pr_title": None,
+            "pr_body_markdown": None,
+            "human_blockers": blockers,
+        }
+    raise ValueError("invalid publication result_kind")
+
+
 def parse_human_blockers(value: object) -> tuple[str, ...] | None:
-    """Return the exact minimal Human Blocker alternative, if supplied."""
+    """Return a normalized unified or legacy Human Blocker alternative."""
     if not isinstance(value, dict):
         return None
-    if "human_blockers" not in value:
+    if "result_kind" not in value:
+        if "human_blockers" not in value:
+            return None
+        if set(value) != {"human_blockers"}:
+            raise ValueError("human blocker output contains unexpected fields")
+        blockers = _bounded_blocker_list(value.get("human_blockers"))
+        if not blockers:
+            raise ValueError("human_blockers must contain non-empty strings")
+        return tuple(blockers)
+    normalized = parse_publication_wire_result(value)
+    if normalized["result_kind"] != "human_blocker":
         return None
-    if set(value) != {"human_blockers"}:
-        raise ValueError("human blocker output contains unexpected fields")
-    blockers = _bounded_blocker_list(value.get("human_blockers"))
-    if not blockers:
-        raise ValueError("human_blockers must contain non-empty strings")
+    blockers = _bounded_blocker_list(normalized["human_blockers"])
     return tuple(blockers)
 
 

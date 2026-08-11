@@ -244,6 +244,14 @@ _Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acc
 Development–Acceptance Engine 在独立验收后本地持久化的权威记录，将唯一一份 Acceptance Artifact 绑定到 acceptance scope、reviewed base、已验收 Candidate 或 Run head、对应 tree 或预期合并结果、有效 Revision 和 Reviewer 身份。每个合法的 `pass`、`request_changes` 或 `human` 结果都形成当前 Record；只有仍然 current 的 `pass` 可以授权 Publication，后续 Attempt 替换当前 Record，历史只按恢复需要有界保留，GitHub 只接收简洁的 Agent Run Status 投影。
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
+**Agent Invocation（Agent 调用）**:
+Controller 对一次阶段级 Codex 调用的持久记录。Publication Invocation 在首个 Output
+Attempt 前成为 active；`thread.started` 在进程运行中立即保存。零退出但不符合完整 wire
+contract 的输出可在同一 Thread、只读 checkout 中最多修复两次；进程失败、缺失或不匹配的
+Thread 只结束当前 Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原 Thread，
+或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
+_Avoid_: Development Attempt、自动替代 Thread、领域 Publication retry
+
 **Ticket Repair Budget（Ticket 修复预算）**:
 一个 Ticket Job 在 Fresh Acceptance 或 CI 失败后最多可触发十次自动修复 Development Attempt。等待 CI、重复读取状态或对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的修复 Attempt 才计数。预算耗尽、Git 完整性检查无法通过或 CI 无法自动修复时，Ticket 转为 `ready-for-human`；Controller 继续推进不依赖该 Ticket 的其他任务。
 _Avoid_: CI 等待次数、同一 SHA 重复审查、无限重试

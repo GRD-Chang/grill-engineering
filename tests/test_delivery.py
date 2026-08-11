@@ -994,7 +994,11 @@ class PublicationReplacementAgents(PassAgents):
         artifact = super().publication(request)
         return PublicationResult(
             thread_id="development-thread-2",
-            artifact=artifact,
+            artifact={
+                "result_kind": "publication",
+                **artifact,
+                "human_blockers": None,
+            },
             replaced_thread_id="development-thread-1",
         )
 
@@ -1824,7 +1828,7 @@ def test_replacement_development_thread_continues_same_ticket_job(
     assert publisher.created_prs == 1
 
 
-def test_publication_replacement_thread_continues_without_new_attempt(
+def test_publication_replacement_thread_is_rejected(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -1836,20 +1840,15 @@ def test_publication_replacement_thread_continues_without_new_attempt(
     agents = PublicationReplacementAgents(checkout)
     publisher = ScriptedPublisher(git_repo)
 
-    delivered = TicketDeliveryEngine(
-        git=GitRepository(git_repo),
-        states=states,
-        github=publisher,
-        agents=agents,
-    ).deliver(state["run_id"])
+    with pytest.raises(ValueError, match="cannot replace"):
+        TicketDeliveryEngine(
+            git=GitRepository(git_repo),
+            states=states,
+            github=publisher,
+            agents=agents,
+        ).deliver(state["run_id"])
 
-    job = delivered["active_ticket_job"]
-    assert delivered["status"] == "ticket_completed"
-    assert job["development_thread_id"] == "development-thread-2"
-    assert job["development_thread_history"] == ["development-thread-1"]
-    assert job["modification_attempts"] == 1
-    assert agents.publication_requests[0]["development_summary"]
-    assert publisher.created_prs == 1
+    assert publisher.created_prs == 0
 
 
 def test_published_head_gate_rejects_live_base_sha_drift(

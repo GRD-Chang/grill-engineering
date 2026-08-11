@@ -34,7 +34,7 @@ agent-run history <run-id> --repo OWNER/REPO
 ```bash
 agent-run start <parent-issue> --repo OWNER/REPO
 agent-run deliver <run-id> --repo OWNER/REPO
-agent-run resume <run-id> --repo OWNER/REPO
+agent-run resume <run-id> [--new-thread] --repo OWNER/REPO
 agent-run accept-run <run-id> --repo OWNER/REPO
 agent-run publish-run <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
@@ -47,6 +47,12 @@ AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
 ```
 
 `status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。
+Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.started` 会在进程仍运行时
+立即保存。`history --json` 的 `agent_invocations` 保留每次调用的模式、requested/reported
+Thread、Output Attempt 数量、时间和有界错误。Publication 的非法结构化输出会在同一
+Thread、只读 checkout 中最多修复两次；进程失败不会自动重试或替换 Thread。`resume`
+默认复用已保存 Thread，`--new-thread` 明确丢弃当前 Publication Thread 身份并使用标准阶段
+Prompt 新开 Thread。
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 

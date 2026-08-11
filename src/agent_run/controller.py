@@ -67,7 +67,11 @@ class Controller:
         )
 
     def resume(
-        self, run_id: str, *, resume_human_blocker: bool = False
+        self,
+        run_id: str,
+        *,
+        resume_human_blocker: bool = False,
+        new_thread: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
@@ -91,6 +95,10 @@ class Controller:
                 return state, True
             if resume_human_blocker:
                 _resume_agent_human_blocker(state)
+            if new_thread:
+                _clear_current_publication_thread(state)
+            else:
+                _restore_current_publication_thread(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
@@ -397,6 +405,107 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
                 "diagnostics": [],
             }
         )
+
+
+def _clear_current_publication_thread(state: dict[str, Any]) -> None:
+    invocation = state.get("active_agent_invocation")
+    if not isinstance(invocation, dict) or invocation.get("role") not in {
+        "publication",
+        "final_publication",
+    }:
+        raise ValueError("--new-thread requires a current Publication Invocation")
+    if invocation.get("role") == "final_publication":
+        publication = state.get("run_publication")
+        if isinstance(publication, dict):
+            publication.pop("thread_id", None)
+            publication["publication_new_thread"] = True
+        return
+    active = state.get("active_ticket_job")
+    if isinstance(active, dict):
+        active.pop("publication_thread_id", None)
+        active["publication_new_thread"] = True
+        number = active.get("ticket_number")
+        jobs = state.get("ticket_jobs")
+        job = jobs.get(str(number)) if isinstance(jobs, dict) else None
+        if isinstance(job, dict):
+            job.pop("publication_thread_id", None)
+            job["publication_new_thread"] = True
+        return
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        candidates = [
+            job
+            for job in jobs.values()
+            if isinstance(job, dict) and job.get("publication_thread_id")
+        ]
+        if len(candidates) == 1:
+            candidates[0].pop("publication_thread_id", None)
+            candidates[0]["publication_new_thread"] = True
+            return
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        parent.pop("publication_thread_id", None)
+        parent["publication_new_thread"] = True
+        return
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if isinstance(repair, dict):
+        repair.pop("publication_thread_id", None)
+        repair["publication_new_thread"] = True
+        return
+    raise ValueError("current Publication job is missing")
+
+
+def _restore_current_publication_thread(state: dict[str, Any]) -> None:
+    invocation = state.get("active_agent_invocation")
+    if (
+        not isinstance(invocation, dict)
+        or invocation.get("status") != "failed"
+        or invocation.get("role") not in {"publication", "final_publication"}
+    ):
+        return
+    thread_id = invocation.get("reported_thread_id") or invocation.get(
+        "requested_thread_id"
+    )
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return
+    if invocation.get("role") == "final_publication":
+        publication = state.get("run_publication")
+        if isinstance(publication, dict):
+            publication["thread_id"] = thread_id
+        return
+    active = state.get("active_ticket_job")
+    if isinstance(active, dict):
+        active["publication_thread_id"] = thread_id
+        active.pop("publication_new_thread", None)
+        number = active.get("ticket_number")
+        jobs = state.get("ticket_jobs")
+        job = jobs.get(str(number)) if isinstance(jobs, dict) else None
+        if isinstance(job, dict):
+            job["publication_thread_id"] = thread_id
+            job.pop("publication_new_thread", None)
+        return
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        candidates = [
+            job
+            for job in jobs.values()
+            if isinstance(job, dict) and job.get("phase") == "accepted"
+        ]
+        if len(candidates) == 1:
+            candidates[0]["publication_thread_id"] = thread_id
+            candidates[0].pop("publication_new_thread", None)
+            return
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        parent["publication_thread_id"] = thread_id
+        parent.pop("publication_new_thread", None)
+        return
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if isinstance(repair, dict):
+        repair["publication_thread_id"] = thread_id
+        repair.pop("publication_new_thread", None)
 
 
 def _resume_change_job(

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_run.agents import AgentBackend, HumanBlockerResult, PublicationResult
+from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.artifacts import (
     AcceptanceArtifact,
     PublicationArtifact,
@@ -247,9 +248,18 @@ class ChangeDeliveryEngine:
                 continue
             job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
             self.contract.save(state)
+            request["_invocation_event"] = self._invocation_events(
+                state, phase="publication"
+            )
+            request["_currentness_check"] = lambda: self._publication_is_current(
+                state, job
+            )
+            if job.get("publication_new_thread") is True:
+                request["_invocation_mode"] = "new-thread"
             raw = self.agents.publication(request)
             if isinstance(raw, HumanBlockerResult):
                 job["publication_thread_id"] = raw.thread_id
+                job.pop("publication_new_thread", None)
                 self._wait_for_human(
                     state,
                     job,
@@ -258,27 +268,29 @@ class ChangeDeliveryEngine:
                 )
                 return
             if isinstance(raw, PublicationResult):
+                job.pop("publication_new_thread", None)
                 if raw.replaced_thread_id is not None:
-                    if not self.contract.development_thread_is_allowed(
-                        state, raw.thread_id
-                    ):
-                        raise ValueError(
-                            "Change Job Development Thread is not independent"
-                        )
-                    _record_development_thread(
-                        job, raw.thread_id, raw.replaced_thread_id
+                    raise ValueError(
+                        "Publication Invocation cannot replace its Thread automatically"
                     )
                 elif raw.thread_id != job.get("development_thread_id"):
                     job["publication_thread_id"] = raw.thread_id
                 artifact_data = raw.artifact
+                parse_publication = PublicationArtifact.parse
             else:
                 artifact_data = raw
+                parse_publication = (
+                    PublicationArtifact.parse
+                    if isinstance(raw, dict) and "result_kind" in raw
+                    else PublicationArtifact.from_stored
+                )
+            job.pop("publication_new_thread", None)
             if isinstance(job.get("ticket_number"), int):
-                publication = PublicationArtifact.parse(
+                publication = parse_publication(
                     artifact_data, primary_ticket=int(job["ticket_number"])
                 )
             else:
-                publication = PublicationArtifact.parse(
+                publication = parse_publication(
                     artifact_data, delivery_run=str(job["run_id"])
                 )
             break
@@ -308,6 +320,16 @@ class ChangeDeliveryEngine:
         self.contract.save(state)
         self._reject_stale(
             state, job, "Publication was discarded after requirements changed"
+        )
+
+    def _invocation_events(
+        self, state: dict[str, Any], *, phase: str
+    ) -> Callable[..., None]:
+        return invocation_event_recorder(
+            state,
+            role="publication",
+            phase=phase,
+            save=self.contract.save,
         )
 
     def _review(
