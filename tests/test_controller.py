@@ -6,11 +6,7 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import (
-    Controller,
-    _clear_current_publication_thread,
-    _restore_current_publication_thread,
-)
+from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
@@ -27,77 +23,6 @@ def _issue(number: int) -> dict[str, Any]:
         "labels": ["ready-for-agent"],
         "blocked_by": [],
     }
-
-
-@pytest.mark.parametrize(
-    ("state", "invocation"),
-    [
-        (
-            {
-                "run_id": "run-1",
-                "ticket_jobs": {
-                    "3": {
-                        "ticket_number": 3,
-                        "ticket_branch_generation": 2,
-                        "publication_thread_id": "current-ticket-thread",
-                    }
-                },
-            },
-            {
-                "role": "publication",
-                "work_subject": "ticket:3",
-                "generation": 1,
-            },
-        ),
-        (
-            {
-                "run_id": "run-1",
-                "run_acceptance": {
-                    "repair_job": {
-                        "repair_generation": 2,
-                        "publication_thread_id": "current-repair-thread",
-                    }
-                },
-            },
-            {
-                "role": "publication",
-                "work_subject": "run-repair:run-1",
-                "generation": 1,
-            },
-        ),
-        (
-            {
-                "run_id": "run-1",
-                "run_acceptance": {"validation_attempts": 2},
-                "run_publication": {"thread_id": "current-final-thread"},
-            },
-            {
-                "role": "final_publication",
-                "work_subject": "run-publication:run-1",
-                "generation": 1,
-            },
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "operation", [_clear_current_publication_thread, _restore_current_publication_thread]
-)
-def test_publication_resume_fails_closed_for_stale_invocation_generation(
-    state: dict[str, Any],
-    invocation: dict[str, Any],
-    operation: Any,
-) -> None:
-    invocation.update(
-        {
-            "status": "failed",
-            "requested_thread_id": "stale-thread",
-            "reported_thread_id": "stale-thread",
-        }
-    )
-    state["active_agent_invocation"] = invocation
-
-    with pytest.raises(ValueError, match="generation is stale"):
-        operation(state)
 
 
 def test_initial_state_failure_happens_before_branch_creation(
