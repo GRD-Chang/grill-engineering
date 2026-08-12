@@ -42,7 +42,9 @@ def test_publication_repairs_invalid_output_in_same_thread(
     attempts: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
 
-    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
         attempts.append(arguments)
         output = Path(arguments[arguments.index("--output-last-message") + 1])
         if len(attempts) == 1:
@@ -524,7 +526,12 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
                     "result_kind": "publication",
                     "commit_message": "feat: publish validated run",
                     "pr_title": "feat: publish validated run",
-                    "pr_body_markdown": "## What Problem This Solves\n\nA complete Run needs a review boundary.",
+                    "pr_body_markdown": (
+                        "## What Problem This Solves\n\nA complete Run needs a review boundary.\n\n"
+                        "## Why This Change Was Made\n\nIt preserves the explicit approval gate.\n\n"
+                        "## User Impact\n\nMaintainers can review one final PR.\n\n"
+                        "## Evidence\n\nFresh Run Acceptance passed."
+                    ),
                     "human_blockers": None,
                 }
             ),

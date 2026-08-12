@@ -7,10 +7,9 @@ from typing import Any, Protocol
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
-from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
-from agent_run.revisions import effective_revision
+from agent_run.run_currentness import ticket_completion_records_fingerprint
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
 
@@ -146,7 +145,7 @@ class Controller:
             and boundary.get("parent_revision") == parent.get("revision")
             and boundary.get("ticket_graph_revision") == graph.get("revision")
             and boundary.get("ticket_completion_records_fingerprint")
-            == canonical_fingerprint(_ticket_completion_records(state))
+            == ticket_completion_records_fingerprint(state)
             and boundary.get("expected_merge_tree")
             == self.publisher.git.expected_merge_tree(
                 default_head_sha=str(boundary["reviewed_default_base_sha"]),
@@ -379,30 +378,6 @@ def _integer_list(state: dict[str, Any], key: str) -> list[int]:
     ):
         raise ValueError(f"run state field {key!r} must contain integers")
     return list(value)
-
-
-def _ticket_completion_records(state: dict[str, Any]) -> list[dict[str, Any]]:
-    tickets = _state_mapping(_state_mapping(state, "ticket_graph"), "tickets")
-    parent_revision = str(_state_mapping(state, "parent")["revision"])
-    graph_revision = str(_state_mapping(state, "ticket_graph")["revision"])
-    records: list[dict[str, Any]] = []
-    for key, job in sorted(_state_mapping(state, "ticket_jobs").items()):
-        if not isinstance(job, dict) or job.get("phase") != "completed":
-            continue
-        ticket = _state_mapping(tickets, key)
-        records.append(
-            {
-                "ticket_number": int(key),
-                "integrated_sha": job.get("integrated_sha"),
-                "effective_revision": effective_revision(
-                    ticket_revision=str(ticket["content_revision"]),
-                    parent_revision=parent_revision,
-                    graph_revision=graph_revision,
-                ),
-                "acceptance_record": job.get("acceptance_record"),
-            }
-        )
-    return records
 
 
 def _now() -> str:

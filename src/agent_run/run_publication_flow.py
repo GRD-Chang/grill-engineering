@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from agent_run.agent_invocation import (
-    canonical_fingerprint,
     fail_interrupted_invocation,
     invocation_event_recorder,
 )
@@ -18,6 +17,7 @@ from agent_run.git import GitError
 from agent_run.github import GitHubReadError
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.run_publication_shared import RunPublicationShared
+from agent_run.run_currentness import run_currentness_boundary
 
 
 class RunPublicationFlow(RunPublicationShared):
@@ -180,18 +180,12 @@ class RunPublicationFlow(RunPublicationShared):
             work_subject=f"run-publication:{state['run_id']}",
             generation=int(run.get("acceptance_generation", 1)),
             invocation_input=request,
-            currentness_boundary={
-                "reviewed_head_sha": acceptance["reviewed_head_sha"],
-                "reviewed_default_base_sha": acceptance[
-                    "reviewed_default_base_sha"
-                ],
-                "expected_merge_tree": acceptance["expected_merge_tree"],
-                "parent_revision": acceptance["parent_revision"],
-                "ticket_graph_revision": acceptance["ticket_graph_revision"],
-                "ticket_completion_records_fingerprint": canonical_fingerprint(
-                    acceptance["ticket_completion_records"]
-                ),
-            },
+            currentness_boundary=run_currentness_boundary(
+                state,
+                reviewed_head_sha=str(acceptance["reviewed_head_sha"]),
+                reviewed_default_base_sha=str(acceptance["reviewed_default_base_sha"]),
+                expected_merge_tree=str(acceptance["expected_merge_tree"]),
+            ),
             save=self._save,
         )
 

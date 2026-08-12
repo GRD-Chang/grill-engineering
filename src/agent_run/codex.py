@@ -256,6 +256,9 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
+            artifact_validator=lambda artifact: PublicationArtifact.parse(
+                artifact, delivery_run="final-run"
+            ),
         )
         artifact = _json_object(output, "Run Publication Artifact")
         artifact["_thread_id"] = thread_id
@@ -268,6 +271,7 @@ class CodexCliBackend:
         prompt: str,
         checkout: Path,
         thread_id: str | None,
+        artifact_validator: Callable[[dict[str, Any]], object] | None = None,
     ) -> tuple[str, str]:
         return self._invoke_structured_output(
             request=request,

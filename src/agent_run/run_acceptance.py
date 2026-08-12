@@ -5,7 +5,6 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import (
-    canonical_fingerprint,
     fail_interrupted_invocation,
     invocation_event_recorder,
     select_publication_thread,
@@ -148,18 +147,12 @@ class RunAcceptanceEngine:
                 work_subject=f"run-acceptance:{state['run_id']}",
                 generation=validation_attempt,
                 invocation_input=request,
-                currentness_boundary={
-                    "reviewed_head_sha": run_head,
-                    "reviewed_default_base_sha": default_head,
-                    "expected_merge_tree": expected_merge_tree,
-                    "parent_revision": self._mapping(state, "parent")["revision"],
-                    "ticket_graph_revision": self._mapping(
-                        state, "ticket_graph"
-                    )["revision"],
-                    "ticket_completion_records_fingerprint": canonical_fingerprint(
-                        self._ticket_completion_records(state)
-                    ),
-                },
+                currentness_boundary=run_currentness_boundary(
+                    state,
+                    reviewed_head_sha=run_head,
+                    reviewed_default_base_sha=default_head,
+                    expected_merge_tree=expected_merge_tree,
+                ),
                 save=self._save,
             )
             request["_currentness_check"] = lambda: (
@@ -169,7 +162,7 @@ class RunAcceptanceEngine:
                 == request["parent"]["revision"]
                 and self._mapping(state, "ticket_graph")["revision"]
                 == request["ticket_graph"]["revision"]
-                and self._ticket_completion_records(state)
+                and ticket_completion_records(state)
                 == request["ticket_completion_records"]
             )
             review = self.agents.review(request)
@@ -386,7 +379,7 @@ class RunAcceptanceEngine:
             "base_sha": base_sha,
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "repair_source": repair_source,
             "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
             "modification_attempts": int(run["modification_attempts"]),
@@ -446,7 +439,7 @@ class RunAcceptanceEngine:
             and record.get("parent_revision") == parent.get("revision")
             and record.get("ticket_graph_revision") == graph.get("revision")
             and record.get("ticket_completion_records")
-            == self._ticket_completion_records(state)
+            == ticket_completion_records(state)
         ):
             return
         for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
@@ -476,7 +469,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": default_head,
             "run_head_sha": run_head,
             "expected_merge_result": {
@@ -518,7 +511,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "head_sha": self.git.checkout_head(checkout),
             "checkout": str(checkout),
@@ -558,7 +551,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": self._mapping(state, "parent"),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
@@ -622,7 +615,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "run_head_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
@@ -708,7 +701,7 @@ class RunAcceptanceEngine:
             != job.get("parent_revision")
             or self._mapping(state, "ticket_graph").get("revision")
             != job.get("ticket_graph_revision")
-            or self._ticket_completion_records(state)
+            or ticket_completion_records(state)
             != job.get("ticket_completion_records")
         )
 
@@ -827,7 +820,7 @@ class RunAcceptanceEngine:
             "expected_merge_tree": expected_merge_tree,
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "reviewer_thread_id": reviewer_thread_id,
             "artifact": artifact,
         }
@@ -880,29 +873,6 @@ class RunAcceptanceEngine:
                 if isinstance(value, list):
                     values.update(item for item in value if isinstance(item, str))
         return values
-
-    def _ticket_completion_records(self, state: dict[str, Any]) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        tickets = self._mapping(self._mapping(state, "ticket_graph"), "tickets")
-        parent_revision = str(self._mapping(state, "parent")["revision"])
-        graph_revision = str(self._mapping(state, "ticket_graph")["revision"])
-        for key, job in sorted(self._mapping(state, "ticket_jobs").items()):
-            if not isinstance(job, dict) or job.get("phase") != "completed":
-                continue
-            ticket = self._mapping(tickets, key)
-            records.append(
-                {
-                    "ticket_number": int(key),
-                    "integrated_sha": job.get("integrated_sha"),
-                    "effective_revision": effective_revision(
-                        ticket_revision=str(ticket["content_revision"]),
-                        parent_revision=parent_revision,
-                        graph_revision=graph_revision,
-                    ),
-                    "acceptance_record": job.get("acceptance_record"),
-                }
-            )
-        return records
 
     def _all_tickets_completed(self, state: dict[str, Any]) -> bool:
         order = self._mapping(state, "ticket_graph").get("ordered_ticket_numbers")
