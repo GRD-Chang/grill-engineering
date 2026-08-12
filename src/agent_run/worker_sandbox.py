@@ -279,7 +279,11 @@ def run_worker_process(
         try:
             for line in stdout_pipe:
                 stdout_lines.append(line)
-                on_stdout_line(line)
+                if not reader_errors:
+                    try:
+                        on_stdout_line(line)
+                    except BaseException as error:
+                        reader_errors.append(error)
         except BaseException as error:
             reader_errors.append(error)
 

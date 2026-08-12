@@ -1549,3 +1549,37 @@ def test_successful_worker_cleans_background_processes(
     child_pid = int(child_path.read_text(encoding="utf-8").strip())
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
+
+
+def test_stdout_callback_error_does_not_stop_pipe_drain(tmp_path: Path) -> None:
+    callback_calls = 0
+
+    def fail_first_line(_line: str) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        raise CodexProcessError("reported Thread mismatch")
+
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "print('first'); "
+            "sys.stdout.write('x' * (1024 * 1024)); "
+            "sys.stdout.flush()"
+        ),
+    ]
+
+    started = time.monotonic()
+    with pytest.raises(CodexProcessError, match="Thread mismatch"):
+        run_worker_process(
+            command,
+            cwd=tmp_path,
+            prompt="",
+            environment=os.environ.copy(),
+            timeout=3,
+            on_stdout_line=fail_first_line,
+        )
+
+    assert callback_calls == 1
+    assert time.monotonic() - started < 2
