@@ -13,6 +13,7 @@ from agent_run.change_delivery import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 
 
@@ -125,8 +126,11 @@ class ParentDeliveryLoop:
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
-        if job.get("human_response_history"):
-            request["human_response_history"] = job["human_response_history"]
+        if history := current_human_response_history(
+            job,
+            generation=int(job.get("parent_generation", 1)),
+        ):
+            request["human_response_history"] = history
         if job.get("repair_source") == "acceptance":
             request["repair_source"] = "acceptance"
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
@@ -152,6 +156,11 @@ class ParentDeliveryLoop:
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job,
+            generation=int(job.get("parent_generation", 1)),
+        ):
+            request["human_response_history"] = history
         existing_pr = job.get("pr_number")
         if isinstance(existing_pr, int):
             request["existing_pr"] = self.github.publication_context(existing_pr)
@@ -210,8 +219,13 @@ class ParentDeliveryLoop:
                 else {}
             ),
             **(
-                {"human_response_history": job["human_response_history"]}
-                if job.get("human_response_history")
+                {"human_response_history": history}
+                if (
+                    history := current_human_response_history(
+                        job,
+                        generation=int(job.get("parent_generation", 1)),
+                    )
+                )
                 else {}
             ),
         }

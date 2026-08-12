@@ -358,6 +358,10 @@ def _resume_agent_human_blocker(
     the maintainer chose to resume.  The controller neither interprets the
     condition nor declares it fixed.
     """
+    if _human_blocker_subject_count(state) > 1:
+        raise ValueError(
+            "multiple current Human Blockers require an unambiguous resume target"
+        )
     ticket_jobs = state.get("ticket_jobs")
     if isinstance(ticket_jobs, dict):
         for job in ticket_jobs.values():
@@ -392,7 +396,7 @@ def _resume_agent_human_blocker(
             acceptance,
             blockers,
             human_response,
-            generation=int(acceptance.get("validation_attempts", 1)),
+            generation=int(acceptance.get("human_response_generation", 1)),
         )
         acceptance.update(
             {
@@ -690,6 +694,31 @@ def _human_blockers(subject: dict[str, Any]) -> list[str]:
     return list(value)
 
 
+def _human_blocker_subject_count(state: dict[str, Any]) -> int:
+    """Count current top-level Human Blocker subjects without choosing one."""
+    subjects: list[dict[str, Any]] = []
+    ticket_jobs = state.get("ticket_jobs")
+    if isinstance(ticket_jobs, dict):
+        subjects.extend(job for job in ticket_jobs.values() if isinstance(job, dict))
+    for key in ("parent_job", "run_acceptance", "run_publication"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            subjects.append(value)
+            if key == "run_acceptance":
+                repair = value.get("repair_job")
+                if isinstance(repair, dict):
+                    subjects.append(repair)
+    return sum(1 for subject in subjects if _is_human_blocker(subject))
+
+
+def _is_human_blocker(subject: dict[str, Any]) -> bool:
+    return subject.get("phase") in {"blocked", "ready_for_human"} and (
+        subject.get("blocked_reason")
+        in {"agent_requires_human", "reviewer_requires_human"}
+        or isinstance(subject.get("human_blockers"), list)
+    )
+
+
 def _validated_human_response(value: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -700,7 +729,11 @@ def _validated_human_response(value: str) -> str:
 
 
 def _subject_generation(subject: dict[str, Any]) -> int:
-    for key in ("ticket_branch_generation", "repair_generation"):
+    for key in (
+        "ticket_branch_generation",
+        "repair_generation",
+        "parent_generation",
+    ):
         value = subject.get(key)
         if isinstance(value, int):
             return value
@@ -708,9 +741,9 @@ def _subject_generation(subject: dict[str, Any]) -> int:
 
 
 def _publication_generation(state: dict[str, Any]) -> int:
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        attempts = acceptance.get("validation_attempts")
-        if isinstance(attempts, int):
-            return attempts
+    publication = state.get("run_publication")
+    if isinstance(publication, dict):
+        current = publication.get("human_response_generation")
+        if isinstance(current, int):
+            return current
     return 1

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
+from agent_run.controller import _human_blocker_subject_count
 from agent_run.state import StateStore
 from agent_run.cli_presentation import _print_precondition_failure
 
@@ -134,36 +135,7 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
     invocation = state.get("active_agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
         return True
-    for job in _resume_subjects(state):
-        if _subject_has_human_blocker(job):
-            return True
-    return False
-
-
-def _resume_subjects(state: dict[str, object]) -> list[dict[str, object]]:
-    subjects: list[dict[str, object]] = []
-    ticket_jobs = state.get("ticket_jobs")
-    if isinstance(ticket_jobs, dict):
-        subjects.extend(job for job in ticket_jobs.values() if isinstance(job, dict))
-    for key in ("parent_job", "run_acceptance", "run_publication"):
-        value = state.get(key)
-        if isinstance(value, dict):
-            subjects.append(value)
-            repair = value.get("repair_job")
-            if key == "run_acceptance" and isinstance(repair, dict):
-                subjects.append(repair)
-    return subjects
-
-
-def _subject_has_human_blocker(subject: dict[str, object]) -> bool:
-    blocked_reason = subject.get("blocked_reason")
-    return (
-        subject.get("phase") in {"blocked", "ready_for_human"}
-        and (
-            blocked_reason in {"agent_requires_human", "reviewer_requires_human"}
-            or isinstance(subject.get("human_blockers"), list)
-        )
-    )
+    return _human_blocker_subject_count(state) == 1
 
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:

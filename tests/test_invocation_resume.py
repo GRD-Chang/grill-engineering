@@ -5,7 +5,9 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import Controller
+from agent_run.controller import Controller, _resume_agent_human_blocker
+from agent_run.parent_delivery import ParentDeliveryEngine
+from agent_run.cli_surface import _resume_is_ready
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -35,6 +37,60 @@ def test_human_response_history_keeps_ordered_immutable_entries() -> None:
         "human_blockers": ["blocker-18"],
         "response": "response-18",
     }
+
+
+def test_resume_fails_closed_when_multiple_human_blockers_are_current() -> None:
+    blocker = {
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blockers": ["Need maintainer input."],
+    }
+    state: dict[str, Any] = {"ticket_jobs": {"2": blocker, "3": dict(blocker)}}
+
+    assert _resume_is_ready(state) is False
+
+
+def test_run_acceptance_keeps_multiple_human_responses_in_one_generation() -> None:
+    state: dict[str, Any] = {
+        "run_acceptance": {
+            "phase": "ready_for_human",
+            "blocked_reason": "reviewer_requires_human",
+            "human_blocker_phase": "pending",
+            "human_blockers": ["Need access."],
+        }
+    }
+
+    assert _resume_agent_human_blocker(state, "Access granted.")
+    acceptance = state["run_acceptance"]
+    acceptance.update(
+        {
+            "phase": "ready_for_human",
+            "blocked_reason": "reviewer_requires_human",
+            "human_blockers": ["Need approval."],
+        }
+    )
+
+    assert _resume_agent_human_blocker(state, "Approval granted.")
+    assert [entry["response"] for entry in acceptance["human_response_history"]] == [
+        "Access granted.",
+        "Approval granted.",
+    ]
+
+
+def test_parent_revision_reset_starts_a_new_human_response_generation() -> None:
+    state: dict[str, Any] = {"base": {"sha": "base"}}
+    job: dict[str, Any] = {
+        "parent_generation": 1,
+        "human_response_generation": 1,
+        "human_response_history": [{"generation": 1, "response": "old"}],
+        "prior_human_blockers": ["old blocker"],
+    }
+
+    ParentDeliveryEngine._reset_for_revision(state, job, "new-revision")
+
+    assert job["parent_generation"] == 2
+    assert "human_response_history" not in job
+    assert "prior_human_blockers" not in job
 
 
 def _ticket(number: int) -> dict[str, Any]:

@@ -126,6 +126,11 @@ class FixtureAgentBackend:
         self, request: dict[str, Any]
     ) -> dict[str, Any] | HumanBlockerResult:
         step = self._next("publications")
+        expected_history = step.pop("expected_human_response_history", None)
+        if expected_history is not None and expected_history != request.get(
+            "human_response_history"
+        ):
+            raise ValueError("scripted Publication response history mismatch")
         has_expected_thread = "expected_thread_id" in step
         expected_thread = step.pop("expected_thread_id", None)
         requested_thread = request.get("thread_id")

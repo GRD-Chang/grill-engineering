@@ -506,6 +506,13 @@ class RunAcceptanceEngine:
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job,
+            generation=int(
+                job.get("human_response_generation", job.get("repair_generation", 1))
+            ),
+        ):
+            request["human_response_history"] = history
         return request
 
     def _invalidate_stale_repair_publication(

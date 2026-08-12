@@ -269,6 +269,7 @@ class ParentDeliveryEngine:
             "parent_branch": branch,
             "base_sha": str(_mapping(state, "base")["sha"]),
             "effective_revision": str(parent["revision"]),
+            "parent_generation": 1,
             "phase": "developing",
             "modification_attempts": 0,
             "development_thread_id": None,
@@ -299,12 +300,16 @@ class ParentDeliveryEngine:
             "pending_attempt",
             "blocked_reason",
             "escalation_code",
+            "human_response_history",
+            "human_response_generation",
+            "prior_human_blockers",
         ):
             job.pop(key, None)
         job.update(
             {
                 "base_sha": str(_mapping(state, "base")["sha"]),
                 "effective_revision": revision,
+                "parent_generation": int(job.get("parent_generation", 1)) + 1,
                 "phase": "developing",
                 "modification_attempts": 0,
                 "validation_attempts": 0,
