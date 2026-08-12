@@ -19,6 +19,9 @@ from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
 from agent_run.run_currentness import (
+    invalidate_run_acceptance,
+    invalidate_stale_run_repair,
+    ticket_completion_records,
     ticket_completion_records_fingerprint,
 )
 from agent_run.scope_changes import reconcile_structure
@@ -377,12 +380,17 @@ class Controller:
         check_requeue_currentness: bool = False,
     ) -> dict[str, Any]:
         try:
+            repository = self.github.repository()
+            default_head = self.publisher.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
             self._mark_stale_change_job(
                 refreshed, check_requeue_currentness=check_requeue_currentness
             )
+            self._invalidate_stale_final_run(refreshed, default_head)
             return refreshed
         except GitHubReadError as error:
             failed = dict(state)
@@ -502,6 +510,9 @@ class Controller:
         reason = stale_change_job_reason(state, subject, job, self.publisher.git)
         if reason is None:
             return
+        if subject.startswith("run-repair:"):
+            invalidate_stale_run_repair(state)
+            return
         state.update(
             {
                 "status": "requeue_required",
@@ -512,6 +523,44 @@ class Controller:
                     "generation": _subject_generation(job),
                     "reason": reason,
                 },
+            }
+        )
+
+    def _invalidate_stale_final_run(
+        self, state: dict[str, Any], default_head: str
+    ) -> None:
+        """Route completed-Run boundary drift back to fresh Run Acceptance."""
+        if state.get("status") == "unsupported_scope_change":
+            return
+        acceptance = state.get("run_acceptance")
+        if (
+            not isinstance(acceptance, dict)
+            or acceptance.get("phase") != "accepted"
+        ):
+            return
+        record = acceptance.get("acceptance_record")
+        if not isinstance(record, dict):
+            return
+        run_branch = state.get("run_branch")
+        if not isinstance(run_branch, str):
+            return
+        parent = _state_mapping(state, "parent")
+        graph = _state_mapping(state, "ticket_graph")
+        if (
+            record.get("reviewed_head_sha") == self.publisher.git.resolve(run_branch)
+            and record.get("reviewed_default_base_sha") == default_head
+            and record.get("parent_revision") == parent.get("revision")
+            and record.get("ticket_graph_revision") == graph.get("revision")
+            and record.get("ticket_completion_records")
+            == ticket_completion_records(state)
+        ):
+            return
+        invalidate_run_acceptance(state)
+        state.update(
+            {
+                "status": "run_acceptance_pending",
+                "terminal_kind": "run_acceptance_stale",
+                "diagnostics": [],
             }
         )
 
@@ -909,33 +958,27 @@ def _run_acceptance_for_invocation(
 def _invalidate_stale_run_invocation(
     state: dict[str, Any], invocation: dict[str, Any]
 ) -> None:
+    """Discard a stale final-stage Invocation and restart Run Acceptance.
+
+    Run Acceptance and Final Publication do not own generation-local branches
+    or PRs.  Their changed authority boundary therefore calls for a new whole
+    Run review, not Change Job Requeue (which has no final-stage asset to
+    replace).
+    """
+    del invocation
     run = state.get("run_acceptance")
     if not isinstance(run, dict):
         raise ValueError("current Run Acceptance job is missing")
-    for key in (
-        "acceptance_record",
-        "acceptance_artifact",
-        "reviewed_head_sha",
-        "reviewer_resume_thread_id",
-        "reviewer_new_thread",
-    ):
-        run.pop(key, None)
-    run["phase"] = "pending"
+    invalidate_run_acceptance(state)
     publication = state.get("run_publication")
     if isinstance(publication, dict):
-        publication["phase"] = "stale"
         publication.pop("thread_id", None)
         publication.pop("publication_new_thread", None)
     state.update(
         {
-            "status": "requeue_required",
-            "terminal_kind": "requeue_required",
-            "diagnostics": [
-                {
-                    "code": "run_invocation_stale",
-                    "message": "Run Invocation boundary changed; requeue is required",
-                }
-            ],
+            "status": "run_acceptance_pending",
+            "terminal_kind": "run_acceptance_stale",
+            "diagnostics": [],
         }
     )
 

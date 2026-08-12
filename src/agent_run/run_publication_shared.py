@@ -8,7 +8,12 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
-from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_currentness import (
+    RunCurrentnessReader,
+    invalidate_run_acceptance,
+    refresh_run_currentness,
+    ticket_completion_records,
+)
 from agent_run.state import StateStore
 
 
@@ -24,6 +29,7 @@ class RunPublicationShared:
         github: GitHubPublisher,
         default_branch: str,
         default_head_sha: str,
+        currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
         self.states = states
@@ -31,6 +37,18 @@ class RunPublicationShared:
         self.github = github
         self.default_branch = default_branch
         self.default_head_sha = default_head_sha
+        self.currentness_reader = currentness_reader
+
+    def _refresh_currentness(self, state: dict[str, Any]) -> bool:
+        if self.currentness_reader is None:
+            return True
+        default_head = refresh_run_currentness(
+            state, reader=self.currentness_reader, git=self.git
+        )
+        if default_head is None:
+            return False
+        self.default_head_sha = default_head
+        return True
 
     def _acceptance_is_current(
         self, state: dict[str, Any], run: dict[str, Any]
@@ -54,20 +72,7 @@ class RunPublicationShared:
         )
 
     def _invalidate_for_fresh_acceptance(self, state: dict[str, Any]) -> dict[str, Any]:
-        run = self._mapping(state, "run_acceptance")
-        for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
-            run.pop(key, None)
-        for key in (
-            "human_response_history",
-            "human_response_generation",
-            "prior_human_blockers",
-        ):
-            run.pop(key, None)
-        run["acceptance_generation"] = int(run.get("acceptance_generation", 1)) + 1
-        run["phase"] = "pending"
-        publication = self._publication_state(state)
-        if publication["phase"] not in {"merged", "abandoned"}:
-            publication["phase"] = "stale"
+        invalidate_run_acceptance(state)
         state.update(
             {
                 "status": "run_acceptance_pending",
@@ -203,6 +208,7 @@ class RunPublicationShared:
             "expected_merge_tree": self._mapping(run, "acceptance_record")[
                 "expected_merge_tree"
             ],
+            "ticket_completion_records": ticket_completion_records(state),
         }
 
     def _publication_state(self, state: dict[str, Any]) -> dict[str, Any]:

@@ -247,6 +247,7 @@ class FixtureGitHubPublisher:
             pr for pr in pulls if isinstance(pr, dict)
             and pr.get("branch") == branch and pr.get("base_branch") == base_branch
             and pr.get("scope") == "final_run"
+            and pr.get("state") == "OPEN"
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate final Run PRs")
@@ -254,6 +255,7 @@ class FixtureGitHubPublisher:
             pull = matching[0]
             if pull.get("state") != "OPEN":
                 raise ValueError("fixture final Run PR is not open")
+            return int(pull["number"])
         else:
             pull = {
                 "number": len(pulls) + 1,
@@ -267,6 +269,43 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("ensure_run_pr")
         return int(pull["number"])
+
+    def find_run_pr(self, *, branch: str) -> int | None:
+        pulls = _mutable_list(self._delivery(), "pull_requests")
+        matching = [
+            pr
+            for pr in pulls
+            if isinstance(pr, dict)
+            and pr.get("branch") == branch
+            and pr.get("scope") == "final_run"
+            and pr.get("state") == "OPEN"
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate final Run PRs")
+        if not matching:
+            return None
+        return int(matching[0]["number"])
+
+    def refresh_run_pr_narrative(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+        title: str,
+        body: str,
+    ) -> None:
+        live = self.live_pull_request(pr_number)
+        if (
+            live.get("state") != "OPEN"
+            or live.get("head_sha") != expected_head_sha
+            or live.get("base_branch") != expected_base_branch
+            or live.get("base_sha") != expected_base_sha
+        ):
+            raise GitHubReadError("stale_run_pr", "Final Run PR changed before refresh")
+        self._pull(pr_number).update({"title": title, "body": body})
+        self._save()
 
     def ensure_parent_pr(
         self, *, branch: str, base_branch: str, title: str, body: str

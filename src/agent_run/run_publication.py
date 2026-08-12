@@ -7,6 +7,7 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.run_publication_approval import RunPublicationApproval
 from agent_run.run_publication_flow import RunPublicationFlow
+from agent_run.run_currentness import RunCurrentnessReader
 from agent_run.state import StateStore
 
 
@@ -22,6 +23,7 @@ class RunPublicationEngine:
         github: GitHubPublisher,
         default_branch: str,
         default_head_sha: str,
+        currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
         self.states = states
@@ -29,6 +31,7 @@ class RunPublicationEngine:
         self.github = github
         self.default_branch = default_branch
         self.default_head_sha = default_head_sha
+        self.currentness_reader = currentness_reader
 
     def publish(self, run_id: str) -> dict[str, Any]:
         return self._flow().publish(run_id)
@@ -53,6 +56,7 @@ class RunPublicationEngine:
             github=self.github,
             default_branch=self.default_branch,
             default_head_sha=self.default_head_sha,
+            currentness_reader=self.currentness_reader,
         )
 
     def _approval(self) -> RunPublicationApproval:
@@ -63,4 +67,5 @@ class RunPublicationEngine:
             github=self.github,
             default_branch=self.default_branch,
             default_head_sha=self.default_head_sha,
+            currentness_reader=self.currentness_reader,
         )

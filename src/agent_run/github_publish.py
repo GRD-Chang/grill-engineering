@@ -157,27 +157,49 @@ class GhGitHubPublisher:
         self, *, branch: str, base_branch: str, title: str, body: str
     ) -> int:
         self._ensure_remote_run_branch(branch)
+        existing = self.find_run_pr(branch=branch)
+        if existing is not None:
+            return existing
+        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
+        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        return _integer(_mapping(created), "number")
+
+    def refresh_run_pr_narrative(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+        title: str,
+        body: str,
+    ) -> None:
+        live = self.live_pull_request(pr_number)
+        if (
+            live.get("state") != "OPEN"
+            or live.get("head_sha") != expected_head_sha
+            or live.get("base_branch") != expected_base_branch
+            or live.get("base_sha") != expected_base_sha
+        ):
+            raise GitHubReadError("stale_run_pr", "Final Run PR changed before refresh")
+        self._require(
+            "pr", "edit", str(pr_number), "--repo", self.repository,
+            "--title", title, "--body", body,
+        )
+
+    def find_run_pr(self, *, branch: str) -> int | None:
         pulls = self._json(
-            "pr", "list", "--repo", self.repository, "--state", "all",
-            "--head", branch, "--base", base_branch, "--json", "number,state"
+            "pr", "list", "--repo", self.repository, "--state", "open",
+            "--head", branch, "--json", "number,state"
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         if len(pulls) > 1:
             raise GitHubReadError("ambiguous_run_pr", "more than one open final Run PR exists")
-        if pulls:
-            existing = _mapping(pulls[0])
-            number = _integer(existing, "number")
-            if existing.get("state") != "OPEN":
-                raise GitHubReadError(
-                    "final_run_pr_not_open",
-                    "the existing final Run PR is not open",
-                )
-            self._require("pr", "edit", str(number), "--repo", self.repository, "--title", title, "--body", body)
-            return number
-        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
-        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
-        return _integer(_mapping(created), "number")
+        if not pulls:
+            return None
+        existing = _mapping(pulls[0])
+        return _integer(existing, "number")
 
     def ensure_parent_pr(
         self, *, branch: str, base_branch: str, title: str, body: str

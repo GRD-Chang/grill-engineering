@@ -9,6 +9,7 @@ not get a shortcut from development to a Run Branch write.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +32,13 @@ from agent_run.publication_pending import publication_pending_diagnostic
 MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
 MAX_PUBLICATION_ATTEMPTS = MAX_PUBLICATION_CONTEXT_ATTEMPTS + 1
+
+
+class StaleDisposition(str, Enum):
+    """The shared engine's deterministic recovery for a stale change job."""
+
+    BLOCK = "block"
+    FRESH_RUN_ACCEPTANCE = "fresh_run_acceptance"
 
 
 @dataclass(frozen=True)
@@ -63,9 +71,10 @@ class ChangeJobContract:
     acceptance_is_current: Callable[
         [dict[str, Any], dict[str, Any], dict[str, Any]], bool
     ]
-    invalidate_stale_publication: Callable[
+    invalidate_stale: Callable[
         [dict[str, Any], dict[str, Any], Path], None
     ]
+    stale_disposition: StaleDisposition
     revision_changed: Callable[[dict[str, Any], dict[str, Any]], bool]
     requires_explicit_approval: Callable[[dict[str, Any], dict[str, Any]], bool]
     after_merge: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], bool]
@@ -143,7 +152,7 @@ class ChangeDeliveryEngine:
                 if job["phase"] == "escalating":
                     continue
                 if job["phase"] in {"publishing", "waiting_checks", "merging"}:
-                    terminal = self._publish_and_merge(state, job)
+                    terminal = self._publish_and_merge(state, job, checkout)
                     if terminal:
                         return state
                     continue
@@ -162,6 +171,12 @@ class ChangeDeliveryEngine:
     def _develop(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
+        self._reject_stale(
+            state,
+            job,
+            checkout,
+            "Development did not start after requirements changed",
+        )
         pending = job.get("pending_attempt")
         attempt = (
             pending
@@ -206,7 +221,10 @@ class ChangeDeliveryEngine:
         job["phase"] = "committing_candidate"
         self.contract.save(state)
         self._reject_stale(
-            state, job, "Development result was discarded after requirements changed"
+            state,
+            job,
+            checkout,
+            "Development result was discarded after requirements changed",
         )
 
     def _commit_candidate(
@@ -238,7 +256,7 @@ class ChangeDeliveryEngine:
     ) -> None:
         while True:
             if not self._publication_is_current(state, job):
-                self.contract.invalidate_stale_publication(state, job, checkout)
+                self._invalidate_stale(state, job, checkout)
                 self.contract.save(state)
                 return
             try:
@@ -313,7 +331,7 @@ class ChangeDeliveryEngine:
             break
         clear_current_human_blocker(job)
         if not self._publication_is_current(state, job):
-            self.contract.invalidate_stale_publication(state, job, checkout)
+            self._invalidate_stale(state, job, checkout)
             self.contract.save(state)
             return
         sha = self.git.create_publication_commit(
@@ -336,7 +354,7 @@ class ChangeDeliveryEngine:
         job.pop("last_publication_error", None)
         self.contract.save(state)
         self._reject_stale(
-            state, job, "Publication was discarded after requirements changed"
+            state, job, checkout, "Publication was discarded after requirements changed"
         )
 
     def _invocation_events(
@@ -424,7 +442,10 @@ class ChangeDeliveryEngine:
         # resume.
         self.contract.save(state)
         self._reject_stale(
-            state, job, "Fresh Acceptance was discarded after requirements changed"
+            state,
+            job,
+            checkout,
+            "Fresh Acceptance was discarded after requirements changed",
         )
         artifact = AcceptanceArtifact.parse(review.artifact)
         job["acceptance_artifact"] = artifact.raw
@@ -505,10 +526,15 @@ class ChangeDeliveryEngine:
         )
         self.contract.save(state)
 
-    def _publish_and_merge(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+    def _publish_and_merge(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> bool:
         if job.get("phase") != "merging":
             self._reject_stale(
-                state, job, "Published-Head Gate rejected stale requirements"
+                state,
+                job,
+                checkout,
+                "Published-Head Gate rejected stale requirements",
             )
         publication = _mapping(job, "publication")
         branch = self.contract.branch(job)
@@ -550,7 +576,7 @@ class ChangeDeliveryEngine:
                 self.contract.save(state)
                 return True
         self._reject_stale(
-            state, job, "Published-Head Gate rejected stale requirements"
+            state, job, checkout, "Published-Head Gate rejected stale requirements"
         )
         self.github.publish_branch(
             branch,
@@ -562,6 +588,7 @@ class ChangeDeliveryEngine:
         self._reject_stale(
             state,
             job,
+            checkout,
             "Published-Head Gate rejected requirements changed during publish",
         )
         pr_number = self.contract.ensure_pr(state, job, publication)
@@ -570,6 +597,7 @@ class ChangeDeliveryEngine:
         self._reject_stale(
             state,
             job,
+            checkout,
             "Published-Head Gate rejected requirements changed while creating PR",
         )
         created_live = self.github.live_pull_request(pr_number)
@@ -603,6 +631,7 @@ class ChangeDeliveryEngine:
         self._reject_stale(
             state,
             job,
+            checkout,
             "Published-Head Gate rejected requirements changed while reading checks",
         )
         self._record_agent_run_status(pr_number, job, checks)
@@ -761,11 +790,24 @@ class ChangeDeliveryEngine:
         )
 
     def _reject_stale(
-        self, state: dict[str, Any], job: dict[str, Any], message: str
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        checkout: Path,
+        message: str,
     ) -> None:
-        if self.contract.revision_changed(state, job):
+        if not self._agent_is_current(state, job):
+            if self.contract.stale_disposition is StaleDisposition.FRESH_RUN_ACCEPTANCE:
+                self._invalidate_stale(state, job, checkout)
+                self.contract.save(state)
+                raise _TerminalChangeJob()
             self._block(state, job, "effective_revision_mismatch", message)
             raise _TerminalChangeJob()
+
+    def _invalidate_stale(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        self.contract.invalidate_stale(state, job, checkout)
 
     def _block(
         self, state: dict[str, Any], job: dict[str, Any], code: str, message: str

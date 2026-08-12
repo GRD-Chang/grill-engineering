@@ -15,6 +15,19 @@ class GitHubPublisher(Protocol):
         self, *, branch: str, base_branch: str, title: str, body: str
     ) -> int: ...
 
+    def refresh_run_pr_narrative(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+        title: str,
+        body: str,
+    ) -> None: ...
+
+    def find_run_pr(self, *, branch: str) -> int | None: ...
+
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
     ) -> None: ...
