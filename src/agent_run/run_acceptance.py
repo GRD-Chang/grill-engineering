@@ -20,6 +20,7 @@ from agent_run.change_delivery import (
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
@@ -431,8 +432,13 @@ class RunAcceptanceEngine:
                 else {}
             ),
             **(
-                {"human_response_history": run["human_response_history"]}
-                if run.get("human_response_history")
+                {"human_response_history": history}
+                if (
+                    history := current_human_response_history(
+                        run,
+                        generation=int(run.get("human_response_generation", 1)),
+                    )
+                )
                 else {}
             ),
         }
@@ -469,8 +475,10 @@ class RunAcceptanceEngine:
             request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
-        if job.get("human_response_history"):
-            request["human_response_history"] = job["human_response_history"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("human_response_generation", job.get("repair_generation", 1)))
+        ):
+            request["human_response_history"] = history
         return request
 
     def _publication_request(
@@ -569,8 +577,18 @@ class RunAcceptanceEngine:
                 else {}
             ),
             **(
-                {"human_response_history": job["human_response_history"]}
-                if job.get("human_response_history")
+                {"human_response_history": history}
+                if (
+                    history := current_human_response_history(
+                        job,
+                        generation=int(
+                            job.get(
+                                "human_response_generation",
+                                job.get("repair_generation", 1),
+                            )
+                        ),
+                    )
+                )
                 else {}
             ),
         }

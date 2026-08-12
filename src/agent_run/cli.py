@@ -144,6 +144,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed.parent, reuse_existing=not parsed.new_run
             )
         elif parsed.command == "resume":
+            current = cli_surface._load_local_run(states, parsed.run_id)
+            if not cli_surface._resume_is_ready(current):
+                cli_presentation._print_precondition_failure(current)
+                return 2
             state, resumed = controller.resume(
                 parsed.run_id,
                 resume_human_blocker=True,
@@ -151,6 +155,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 human_response=parsed.message,
             )
             if state.get("status") == "unsupported_scope_change":
+                cli_presentation._print_precondition_failure(state)
+                return 2
+            if state.get("status") == "execution_failed":
                 cli_presentation._print_precondition_failure(state)
                 return 2
             if state.get("status") == "abandonment_pending":
@@ -206,92 +213,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             repository.default_branch, repository.default_head_sha
                         ),
                     ).publish(parsed.run_id)
-            parent_job = state.get("parent_job")
-            run_publication = state.get("run_publication")
-            if (
-                state.get("delivery_type") == "parent_only"
-                and isinstance(parent_job, dict)
-                and parent_job.get("phase") == "merging"
-            ):
-                state = ParentDeliveryEngine(
-                    git=git,
-                    states=states,
-                    github=publisher,
-                    agents=CodexCliBackend(),
-                ).recover_closeout(parsed.run_id)
-            elif (
-                state.get("delivery_type") == "parent_only"
-                and state.get("status") == "publication_pending"
-                and isinstance(parent_job, dict)
-                and parent_job.get("phase") == "publication_pending"
-            ):
-                agents = (
-                    FixtureAgentBackend(Path(parsed.agent_fixture))
-                    if parsed.agent_fixture
-                    else CodexCliBackend()
-                )
-                state = ParentDeliveryEngine(
-                    git=git,
-                    states=states,
-                    github=publisher,
-                    agents=agents,
-                ).deliver(parsed.run_id)
-                publication_retried = True
-            elif (
-                state.get("delivery_type") == "ticket_run"
-                and state.get("status") == "publication_pending"
-                and isinstance(run_publication, dict)
-                and run_publication.get("phase") == "publication_pending"
-            ):
-                repository = github.repository()
-                agents = (
-                    FixtureAgentBackend(Path(parsed.agent_fixture))
-                    if parsed.agent_fixture
-                    else CodexCliBackend()
-                )
-                state = RunPublicationEngine(
-                    git=git,
-                    states=states,
-                    agents=agents,
-                    github=publisher,
-                    default_branch=repository.default_branch,
-                    default_head_sha=git.resolve_base(
-                        repository.default_branch, repository.default_head_sha
-                    ),
-                ).publish(parsed.run_id)
-                publication_retried = True
-            elif (
-                state.get("delivery_type") == "ticket_run"
-                and state.get("status") == "parent_closeout_pending"
-                and isinstance(run_publication, dict)
-                and run_publication.get("phase") == "merged"
-            ):
-                repository = github.repository()
-                state = RunPublicationEngine(
-                    git=git,
-                    states=states,
-                    agents=CodexCliBackend(),
-                    github=publisher,
-                    default_branch=repository.default_branch,
-                    default_head_sha=git.resolve_base(
-                        repository.default_branch, repository.default_head_sha
-                    ),
-                ).recover_closeout(parsed.run_id)
-                publication_retried = True
-            elif (
-                state.get("delivery_type") == "ticket_run"
-                and isinstance(state.get("parent_job"), dict)
-            ):
-                state = ParentDeliveryEngine(
-                    git=git,
-                    states=states,
-                    github=publisher,
-                    agents=CodexCliBackend(),
-                ).retire_for_child_flow(parsed.run_id)
-            if not publication_retried:
-                state = DeliveryCleanupEngine(
-                    git=git, states=states, github=publisher
-                ).resume(parsed.run_id)
         elif parsed.command == "deliver":
             refreshed, _ = controller.resume(parsed.run_id)
             if refreshed.get("status") in {"completed", "abandoned"}:
@@ -423,13 +344,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     git=git, states=states, github=publisher, agents=agents
                 ).approve(parsed.run_id)
             elif (
+                parsed.command == "approve"
+                and refreshed.get("delivery_type") == "parent_only"
+                and refreshed.get("status") == "parent_closeout_pending"
+            ):
+                state = ParentDeliveryEngine(
+                    git=git, states=states, github=publisher, agents=agents
+                ).recover_closeout(parsed.run_id)
+            elif (
                 parsed.command == "publish-run"
                 and (
                     refreshed.get("status") == "run_publication_pending"
                     or (
                         isinstance(refreshed.get("run_publication"), dict)
                         and refreshed.get("status")
-                        in {"waiting_checks", "run_approval_pending"}
+                        in {
+                            "publication_pending",
+                            "waiting_checks",
+                            "run_approval_pending",
+                        }
                     )
                 )
             ):

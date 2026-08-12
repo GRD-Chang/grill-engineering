@@ -285,7 +285,7 @@ def test_graph_change_fails_closed_with_auditable_revisions(
     )
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    paused = run_cli(git_repo, fixture, "resume", run_id)
+    paused = run_cli(git_repo, fixture, "start", "1")
 
     assert paused.returncode == 2
     state = load_only_run_state(git_repo)
@@ -308,7 +308,7 @@ def test_graph_change_fails_closed_with_auditable_revisions(
     data["parent"]["sub_issues"] = [2]
     data["issues"].pop("3")
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    restored = run_cli(git_repo, fixture, "resume", run_id)
+    restored = run_cli(git_repo, fixture, "start", "1")
 
     assert restored.returncode == 0
     restored_state = load_only_run_state(git_repo)
@@ -329,7 +329,7 @@ def test_later_graph_drift_updates_observed_revision_without_accepting_it(
     data["parent"]["sub_issues"].append(3)
     data["issues"]["3"] = _ticket(3)
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    run_cli(git_repo, fixture, "resume", run_id)
+    run_cli(git_repo, fixture, "start", "1")
     first = load_only_run_state(git_repo)["unsupported_scope_change"]
     accepted = first["accepted_graph_revision"]
     first_observed = first["observed_graph_revision"]
@@ -338,7 +338,7 @@ def test_later_graph_drift_updates_observed_revision_without_accepting_it(
     data["parent"]["sub_issues"].append(4)
     data["issues"]["4"] = _ticket(4)
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    resumed = run_cli(git_repo, fixture, "resume", run_id)
+    resumed = run_cli(git_repo, fixture, "start", "1")
 
     assert resumed.returncode == 2
     state = load_only_run_state(git_repo)
@@ -395,7 +395,7 @@ def test_parent_clarification_and_comments_do_not_change_the_ticket_graph(
     data["issues"]["2"]["updated_at"] = "2099-01-01T00:00:00Z"
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    resumed = run_cli(git_repo, fixture, "resume", run_id)
+    resumed = run_cli(git_repo, fixture, "start", "1")
 
     assert resumed.returncode == 0
     state = load_only_run_state(git_repo)

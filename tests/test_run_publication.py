@@ -96,6 +96,7 @@ class HumanThenRunPublicationAgents:
         ]
         assert request["human_response_history"] == [
             {
+                "generation": 1,
                 "human_blockers": [
                     "GitHub denied access; tried gh issue view; grant Issue read access."
                 ],
@@ -673,7 +674,9 @@ def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
     assert persisted["run_publication"]["publication_attempts"] == 1
 
 
-def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> None:
+def test_publish_run_retries_only_exhausted_final_run_publication(
+    git_repo: Path,
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
     pending = RunPublicationEngine(
@@ -696,7 +699,7 @@ def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> 
     resumed = run_cli(
         git_repo,
         git_repo / "github.json",
-        "resume",
+        "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
         str(agents),

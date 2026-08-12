@@ -172,6 +172,7 @@ def test_resume_human_blocker_records_bounded_response_and_reuses_development_th
     assert job["development_thread_id"] == "parent-developer"
     assert job["human_response_history"] == [
         {
+            "generation": 1,
             "human_blockers": [HUMAN_BLOCKER],
             "response": "Access has been granted.",
         }
@@ -213,6 +214,7 @@ def test_ticket_human_response_reaches_fresh_acceptance(
 
     response_history = [
         {
+            "generation": 1,
             "human_blockers": [HUMAN_BLOCKER],
             "response": "Issue read access has been granted.",
         }
@@ -464,7 +466,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     assert mutable_fixture["delivery"]["closed_issues"] == []
 
     resumed = run_cli(git_repo, fixture, "resume", run_id)
-    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.returncode == 2
     assert stdout_json(resumed)["status"] == "parent_approval_pending"
 
     approved = run_cli(git_repo, fixture, "approve", run_id)
@@ -489,7 +491,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     ).returncode != 0
 
     replayed = run_cli(git_repo, fixture, "resume", run_id)
-    assert replayed.returncode == 0, replayed.stderr
+    assert replayed.returncode == 2
     assert stdout_json(replayed)["status"] == "completed"
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
     assert abandoned.returncode == 0, abandoned.stderr
@@ -750,17 +752,7 @@ def test_parent_only_malformed_publication_is_execution_failed_and_resumes(
     )
 
     assert resumed.returncode == 0, resumed.stderr
-    assert stdout_json(resumed)["status"] == "parent_delivery_pending"
-    recovered = run_cli(
-        git_repo,
-        fixture,
-        "deliver",
-        run_id,
-        "--agent-fixture",
-        str(agent_fixture),
-    )
-    assert recovered.returncode == 0, recovered.stderr
-    assert stdout_json(recovered)["status"] == "parent_approval_pending"
+    assert stdout_json(resumed)["status"] == "parent_approval_pending"
     resumed_job = load_only_run_state(git_repo)["parent_job"]
     assert resumed_job["modification_attempts"] == 1
     assert resumed_job["validation_attempts"] == 1
@@ -811,7 +803,7 @@ def test_parent_only_approve_recovers_after_closeout_response_loss(
     assert first["pull_requests"][0]["state"] == "MERGED"
     assert first["closed_issues"] == [1]
 
-    recovered = run_cli(git_repo, fixture, "resume", run_id)
+    recovered = run_cli(git_repo, fixture, "approve", run_id)
 
     assert recovered.returncode == 0, recovered.stderr
     assert stdout_json(recovered)["status"] == "completed"
@@ -894,7 +886,7 @@ def test_resume_freezes_parent_closeout_assets_after_graph_drift(
     before_fixture["issues"] = {"3": ticket()}
     fixture.write_text(json.dumps(before_fixture), encoding="utf-8")
 
-    resumed = run_cli(git_repo, fixture, "resume", run_id)
+    resumed = run_cli(git_repo, fixture, "run", "1")
 
     assert resumed.returncode == 2
     assert stdout_json(resumed)["status"] == "unsupported_scope_change"
@@ -1116,7 +1108,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     before_drift["parent"]["sub_issues"] = [3]
     before_drift["issues"] = {"3": ticket()}
     fixture.write_text(json.dumps(before_drift), encoding="utf-8")
-    blocked = run_cli(git_repo, fixture, "resume", run_id)
+    blocked = run_cli(git_repo, fixture, "run", "1")
     assert blocked.returncode == 2
     assert stdout_json(blocked)["status"] == "unsupported_scope_change"
 
@@ -1390,7 +1382,7 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
             if command == "deliver"
             else (),
         )
-        assert replayed.returncode == 0, replayed.stderr
+        assert replayed.returncode == (2 if command == "resume" else 0), replayed.stderr
         assert stdout_json(replayed)["status"] == "completed"
         assert load_only_run_state(git_repo) == completed_state
         replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))

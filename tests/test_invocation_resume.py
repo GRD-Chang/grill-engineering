@@ -5,7 +5,8 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import Controller, _append_human_response
+from agent_run.controller import Controller
+from agent_run.human_responses import append_human_response
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
@@ -15,19 +16,22 @@ from conftest import write_fixture
 def test_human_response_history_keeps_ordered_immutable_entries() -> None:
     subject: dict[str, Any] = {}
     for attempt in range(19):
-        _append_human_response(
+        append_human_response(
             subject,
             [f"blocker-{attempt}"],
             f"response-{attempt}",
+            generation=1,
         )
 
     history = subject["human_response_history"]
     assert len(history) == 19
     assert history[0] == {
+        "generation": 1,
         "human_blockers": ["blocker-0"],
         "response": "response-0",
     }
     assert history[-1] == {
+        "generation": 1,
         "human_blockers": ["blocker-18"],
         "response": "response-18",
     }

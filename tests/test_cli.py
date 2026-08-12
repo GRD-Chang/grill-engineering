@@ -195,19 +195,20 @@ def test_unreliable_sub_issue_order_falls_back_to_issue_number(git_repo: Path) -
     assert state["active_ticket_job"]["ticket_number"] == 2
 
 
-def test_resume_command_reuses_exact_run(git_repo: Path) -> None:
+def test_resume_rejects_a_run_without_an_agent_boundary(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
     resumed = run_cli(git_repo, fixture, "resume", run_id)
 
-    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.returncode == 2
     assert stdout_json(resumed)["result"] == "resumed"
     assert stdout_json(resumed)["run_id"] == run_id
+    assert stdout_json(resumed)["status"] == "active"
 
 
-def test_resume_accepts_run_branch_that_advanced_from_original_base(
+def test_resume_does_not_refresh_a_run_without_an_agent_boundary(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
@@ -245,8 +246,8 @@ def test_resume_accepts_run_branch_that_advanced_from_original_base(
         git_repo, fixture, "resume", stdout_json(started)["run_id"]
     )
 
-    assert resumed.returncode == 0, resumed.stderr
-    assert stdout_json(resumed)["result"] == "resumed"
+    assert resumed.returncode == 2
+    assert stdout_json(resumed)["status"] == "active"
     assert (
         subprocess.run(
             ["git", "rev-parse", state["run_branch"]],
@@ -431,7 +432,7 @@ def test_existing_run_records_repository_read_failure_without_network_retry(
     data["repository"] = 42
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    failed = run_cli(git_repo, fixture, "resume", run_id)
+    failed = run_cli(git_repo, fixture, "deliver", run_id)
 
     assert failed.returncode == 2
     assert stdout_json(failed)["status"] == "execution_failed"

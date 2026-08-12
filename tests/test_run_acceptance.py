@@ -378,6 +378,7 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
             ]
             assert request["human_response_history"] == [
                 {
+                    "generation": 1,
                     "human_blockers": [
                         "GitHub denied access; tried gh issue view; grant Issue read access."
                     ],

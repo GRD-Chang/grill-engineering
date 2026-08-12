@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from agent_run.graph import state_from_graph
+from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
@@ -91,7 +92,7 @@ class Controller:
             base = _state_mapping(existing, "base")
             base_sha = str(base["sha"])
             state = self._refresh(existing, parent_number)
-            if state.get("status") == "unsupported_scope_change":
+            if state.get("status") in {"unsupported_scope_change", "execution_failed"}:
                 self.states.save_run(run_id, state)
                 return state, True
             if human_response is not None:
@@ -381,7 +382,12 @@ def _resume_agent_human_blocker(
         }
     ):
         blockers = _human_blockers(acceptance)
-        _append_human_response(acceptance, blockers, human_response)
+        append_human_response(
+            acceptance,
+            blockers,
+            human_response,
+            generation=int(acceptance.get("validation_attempts", 1)),
+        )
         acceptance.update(
             {
                 "phase": str(acceptance.get("human_blocker_phase", "pending")),
@@ -409,7 +415,12 @@ def _resume_agent_human_blocker(
                 "prior_human_blockers": _human_blockers(publication),
             }
         )
-        _append_human_response(publication, _human_blockers(publication), human_response)
+        append_human_response(
+            publication,
+            _human_blockers(publication),
+            human_response,
+            generation=_publication_generation(state),
+        )
         state.update(
             {
                 "status": "run_publication_pending",
@@ -634,7 +645,12 @@ def _resume_change_job(
     ):
         return False
     blockers = _human_blockers(value)
-    _append_human_response(value, blockers, human_response)
+    append_human_response(
+        value,
+        blockers,
+        human_response,
+        generation=_subject_generation(value),
+    )
     value.update(
         {
             "phase": str(value.get("human_blocker_phase", "developing")),
@@ -671,12 +687,18 @@ def _validated_human_response(value: str) -> str:
     return normalized
 
 
-def _append_human_response(
-    subject: dict[str, Any], blockers: list[str], response: str | None
-) -> None:
-    if response is None:
-        return
-    history = subject.setdefault("human_response_history", [])
-    if not isinstance(history, list):
-        raise ValueError("human_response_history must be an array")
-    history.append({"human_blockers": list(blockers), "response": response})
+def _subject_generation(subject: dict[str, Any]) -> int:
+    for key in ("ticket_branch_generation", "repair_generation"):
+        value = subject.get(key)
+        if isinstance(value, int):
+            return value
+    return 1
+
+
+def _publication_generation(state: dict[str, Any]) -> int:
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        attempts = acceptance.get("validation_attempts")
+        if isinstance(attempts, int):
+            return attempts
+    return 1

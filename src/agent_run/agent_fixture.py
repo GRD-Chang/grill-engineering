@@ -151,6 +151,11 @@ class FixtureAgentBackend:
                 thread_id=str(thread_id),
                 human_blockers=blockers,
             )
+        if "invalid" in step:
+            error = "scripted invalid Publication Artifact"
+            if callable(event):
+                event("failed", attempt_count=1, error=error)
+            raise ValueError(error)
         if callable(event):
             event("completed", reported_thread_id=thread_id, attempt_count=1)
         return _publication_wire(step)

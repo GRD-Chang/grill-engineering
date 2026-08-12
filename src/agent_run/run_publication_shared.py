@@ -6,6 +6,7 @@ from typing import Any
 from agent_run.agents import AgentBackend
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
@@ -116,8 +117,11 @@ class RunPublicationShared:
         }
         if publication.get("prior_human_blockers"):
             request["prior_human_blockers"] = publication["prior_human_blockers"]
-        if publication.get("human_response_history"):
-            request["human_response_history"] = publication["human_response_history"]
+        if history := current_human_response_history(
+            publication,
+            generation=int(publication.get("human_response_generation", 1)),
+        ):
+            request["human_response_history"] = history
         if publication.get("thread_id"):
             request["thread_id"] = publication.get("thread_id")
         return request

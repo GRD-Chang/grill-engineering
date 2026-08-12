@@ -56,7 +56,9 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 Thread。`resume` 默认复用已保存 Thread，`--new-thread` 明确丢弃当前失败或 Human Blocker 阶段的
 Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许用于当前 Human Blocker；它 trim
 后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
-和 Fresh Acceptance 的权威上下文，不修改 Issue、不触发 Requeue、也不等同于 `revise` 的 Run Feedback。
+和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
+Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
+也不等同于 `revise` 的 Run Feedback。
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 
