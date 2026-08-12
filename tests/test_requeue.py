@@ -63,6 +63,7 @@ def test_requeue_ticket_archives_the_old_generation_and_releases_a_fresh_job() -
     assert state["retired_job_generations"] == [retired]
     assert state["retired_ticket_generations"] == {"7": 1}
     assert state["active_ticket_job"] is None
+    assert state["active_agent_invocation"] is None
     assert state["ticket_jobs"] == {}
     assert state["status"] == "active"
     assert state["terminal_kind"] is None
@@ -100,6 +101,7 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
     assert parent_retired["work_subject"] == "parent-only:run-1"
     assert parent_state["retired_parent_generation"] == 2
     assert "parent_job" not in parent_state
+    assert parent_state["active_agent_invocation"] is None
     assert parent_state["status"] == "parent_delivery_pending"
 
     repair = {
@@ -116,6 +118,7 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
     repair_retired = requeue_change_job(repair_state)
     assert repair_retired["work_subject"] == "run-repair:run-1"
     assert repair_state["run_acceptance"] == {"phase": "pending"}
+    assert repair_state["active_agent_invocation"] is None
     assert repair_state["status"] == "run_acceptance_pending"
 
 

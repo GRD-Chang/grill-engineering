@@ -108,8 +108,6 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
         "waiting_merge",
     }:
         return "deliver"
-    if status == "requeue_required":
-        return "requeue"
     if status == "run_acceptance_pending":
         return "accept-run"
     publication = state.get("run_publication")

@@ -108,7 +108,7 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
             run["discarded_repair_thread_ids"] = discarded
     run.pop("repair_job", None)
     run.pop("repair_request", None)
-    state.pop("active_agent_invocation", None)
+    state["active_agent_invocation"] = None
     state.pop("requeue_required", None)
     invalidate_run_acceptance(state)
     state.update(

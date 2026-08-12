@@ -12,28 +12,20 @@ def reconcile_structure(
     observed_graph_revision = _revision(projected, "ticket_graph")
     observed_parent_revision = _revision(projected, "parent")
     accepted_parent_revision = previous.get("accepted_parent_spec_revision")
-    if not isinstance(accepted_parent_revision, str):
-        previous_parent = previous.get("parent")
-        if isinstance(previous_parent, dict) and isinstance(
-            previous_parent.get("revision"), str
-        ):
-            accepted_parent_revision = previous_parent["revision"]
-        else:
-            accepted_parent_revision = observed_parent_revision
     accepted_graph_revision = previous.get("accepted_ticket_graph_revision")
-    if not isinstance(accepted_graph_revision, str):
-        previous_graph_revision = _mapping(previous, "ticket_graph").get(
-            "revision"
-        )
-        if isinstance(previous_graph_revision, str):
-            accepted_graph_revision = previous_graph_revision
-        else:
-            projected["accepted_ticket_graph_revision"] = (
-                observed_graph_revision
-            )
-            projected["accepted_parent_spec_revision"] = accepted_parent_revision
-            projected["observed_parent_spec_revision"] = observed_parent_revision
-            return projected
+    if (
+        accepted_parent_revision is None
+        and accepted_graph_revision is None
+        and previous.get("currentness_resolution_pending") is True
+    ):
+        projected["accepted_ticket_graph_revision"] = observed_graph_revision
+        projected["accepted_parent_spec_revision"] = observed_parent_revision
+        projected["observed_parent_spec_revision"] = observed_parent_revision
+        return projected
+    if not isinstance(accepted_parent_revision, str) or not isinstance(
+        accepted_graph_revision, str
+    ):
+        raise ValueError("legacy state lacks accepted currentness boundaries")
 
     reopened = _reopened_completed_tickets(previous, projected)
     if reopened:

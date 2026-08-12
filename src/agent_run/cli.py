@@ -9,7 +9,7 @@ from typing import Sequence
 from agent_run import cli_presentation, cli_surface
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.codex import CodexCliBackend, CodexProcessError
-from agent_run.controller import Controller
+from agent_run.controller import Controller, IncompatibleRunStateError
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
@@ -547,7 +547,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     ) as error:
         run_id = getattr(parsed, "run_id", None)
         failure_recorded = False
-        if controller is not None and isinstance(run_id, str):
+        incompatible_state = isinstance(error, IncompatibleRunStateError)
+        if (
+            not incompatible_state
+            and controller is not None
+            and isinstance(run_id, str)
+        ):
             failure_recorded = controller.record_execution_failure(
                 run_id, str(error)
             )
@@ -560,34 +565,43 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 diagnostics = durable.get("diagnostics")
                 if isinstance(diagnostics, list):
                     durable_diagnostics = diagnostics
-        diagnostic_code = (
+        diagnostic_code = "incompatible_run_state" if incompatible_state else (
             "multiple_unfinished_runs"
             if str(error).startswith("multiple unfinished Delivery Runs")
             else "command_failed"
         )
         diagnostic_message = (
-            "同一父 Issue 存在多个未终止交付运行；候选运行："
-            f"{str(error).partition(': ')[2]}。请先人工确定要保留的运行"
-            if diagnostic_code == "multiple_unfinished_runs"
-            else "命令执行失败；请通过 status 或 history 查看可恢复状态"
+            "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
+            "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run"
+            if diagnostic_code == "incompatible_run_state"
+            else (
+                "同一父 Issue 存在多个未终止交付运行；候选运行："
+                f"{str(error).partition(': ')[2]}。请先人工确定要保留的运行"
+                if diagnostic_code == "multiple_unfinished_runs"
+                else "命令执行失败；请通过 status 或 history 查看可恢复状态"
+            )
         )
         print(
             json.dumps(
                 {
                     "result": "error",
                     "status": (
-                        "execution_failed"
-                        if failure_recorded
+                        "incompatible_run_state"
+                        if incompatible_state
                         else (
-                            durable_status
-                            if durable_status
-                            in {
-                                "abandonment_pending",
-                                "completed",
-                                "abandoned",
-                                "requeue_required",
-                            }
-                            else "blocked"
+                            "execution_failed"
+                            if failure_recorded
+                            else (
+                                durable_status
+                                if durable_status
+                                in {
+                                    "abandonment_pending",
+                                    "completed",
+                                    "abandoned",
+                                    "requeue_required",
+                                }
+                                else "blocked"
+                            )
                         )
                     ),
                     "diagnostics": [

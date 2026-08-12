@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +128,9 @@ def test_start_creates_one_run_branch_and_resume_is_idempotent(
     assert first_output["run_id"] == second_output["run_id"] == state["run_id"]
     assert state["parent"]["number"] == 1
     assert state["base"]["branch"] == "main"
+    assert "schema_version" not in state
+    assert state["active_agent_invocation"] is None
+    assert state["agent_invocation_history"] == []
     assert state["ticket_graph"]["ordered_ticket_numbers"] == [2, 3]
     assert state["frontier"] == [2, 3]
     assert state["active_ticket_job"]["ticket_number"] == 2
@@ -206,6 +210,25 @@ def test_resume_rejects_a_run_without_an_agent_boundary(git_repo: Path) -> None:
     assert stdout_json(resumed)["result"] == "resumed"
     assert stdout_json(resumed)["run_id"] == run_id
     assert stdout_json(resumed)["status"] == "active"
+
+
+def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    started = run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["schema_version"] = 1
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "run", "1")
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
 
 
 def test_resume_does_not_refresh_a_run_without_an_agent_boundary(

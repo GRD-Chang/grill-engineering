@@ -9,7 +9,7 @@ import pytest
 
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
-from agent_run.controller import Controller
+from agent_run.controller import Controller, IncompatibleRunStateError
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -349,7 +349,7 @@ def test_later_graph_drift_updates_observed_revision_without_accepting_it(
     assert change["graph_change_summary"]["added_tickets"] == [3, 4]
 
 
-def test_legacy_run_does_not_silently_accept_graph_drift(
+def test_legacy_run_fails_closed_before_reading_graph_drift(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -367,13 +367,11 @@ def test_legacy_run_does_not_silently_accept_graph_drift(
     data["issues"]["3"] = _ticket(3)
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    resumed, _ = controller.resume(str(state["run_id"]))
+    before = states.load_run(str(state["run_id"]))
+    with pytest.raises(IncompatibleRunStateError, match="legacy state"):
+        controller.resume(str(state["run_id"]))
 
-    assert resumed["status"] == "unsupported_scope_change"
-    assert resumed["ticket_graph"]["ordered_ticket_numbers"] == [2]
-    assert resumed["unsupported_scope_change"]["graph_change_summary"][
-        "added_tickets"
-    ] == [3]
+    assert states.load_run(str(state["run_id"])) == before
 
 
 def test_parent_clarification_and_comments_do_not_change_the_ticket_graph(

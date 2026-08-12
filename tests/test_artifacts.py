@@ -159,10 +159,9 @@ def test_human_blocker_result_is_normalized_without_trimming() -> None:
     )
 
 
-def test_legacy_human_blocker_shape_remains_supported() -> None:
-    assert parse_human_blockers({"human_blockers": ["Needs approval."]}) == (
-        "Needs approval.",
-    )
+def test_human_blocker_rejects_the_removed_legacy_wire_shape() -> None:
+    with pytest.raises(ValueError, match="missing result_kind"):
+        parse_human_blockers({"human_blockers": ["Needs approval."]})
 
 
 def test_wire_result_requires_every_field() -> None:
