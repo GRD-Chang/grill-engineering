@@ -5,7 +5,8 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import Controller, _resume_agent_human_blocker
+from agent_run.change_delivery import ChangeDeliveryEngine
+from agent_run.controller import Controller, _change_job_for_invocation, _resume_agent_human_blocker
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.cli_surface import _resume_is_ready
 from agent_run.human_responses import append_human_response
@@ -91,6 +92,26 @@ def test_parent_revision_reset_starts_a_new_human_response_generation() -> None:
     assert job["parent_generation"] == 2
     assert "human_response_history" not in job
     assert "prior_human_blockers" not in job
+
+
+def test_parent_revision_reset_binds_invocations_to_the_new_generation() -> None:
+    state: dict[str, Any] = {"run_id": "run-1"}
+    job: dict[str, Any] = {"parent_generation": 2}
+
+    assert ChangeDeliveryEngine._invocation_identity(state, job) == (
+        "parent-only:run-1",
+        2,
+    )
+    state["parent_job"] = job
+    assert _change_job_for_invocation(
+        state,
+        {"work_subject": "parent-only:run-1", "generation": 2},
+    ) is job
+    with pytest.raises(ValueError, match="generation is stale"):
+        _change_job_for_invocation(
+            state,
+            {"work_subject": "parent-only:run-1", "generation": 1},
+        )
 
 
 def _ticket(number: int) -> dict[str, Any]:

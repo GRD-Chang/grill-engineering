@@ -386,7 +386,7 @@ class ChangeDeliveryEngine:
             )
         if isinstance(job.get("repair_generation"), int):
             return f"run-repair:{state['run_id']}", int(job["repair_generation"])
-        return f"parent-only:{state['run_id']}", 1
+        return f"parent-only:{state['run_id']}", int(job.get("parent_generation", 1))
 
     def _review(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path

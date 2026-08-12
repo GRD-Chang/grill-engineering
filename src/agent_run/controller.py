@@ -588,7 +588,7 @@ def _publication_job_for_invocation(
         parent = state.get("parent_job")
         if not isinstance(parent, dict):
             raise ValueError("current Parent-only Publication job is missing")
-        _require_invocation_generation(generation, 1)
+        _require_invocation_generation(generation, parent.get("parent_generation", 1))
         return parent, None
 
     if subject == f"run-repair:{run_id}":
@@ -632,7 +632,7 @@ def _change_job_for_invocation(
         job = state.get("parent_job")
         if not isinstance(job, dict):
             raise ValueError("current Parent-only Change Job is missing")
-        _require_invocation_generation(generation, 1)
+        _require_invocation_generation(generation, job.get("parent_generation", 1))
         return job
     if subject == f"run-repair:{run_id}":
         acceptance = state.get("run_acceptance")
@@ -746,4 +746,9 @@ def _publication_generation(state: dict[str, Any]) -> int:
         current = publication.get("human_response_generation")
         if isinstance(current, int):
             return current
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        generation = acceptance.get("validation_attempts")
+        if isinstance(generation, int):
+            return generation
     return 1
