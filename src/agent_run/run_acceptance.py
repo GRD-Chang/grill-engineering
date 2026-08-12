@@ -127,6 +127,7 @@ class RunAcceptanceEngine:
         finally:
             self.git.remove_worktree(checkout)
         self._record_reviewer(state, run, review.thread_id)
+        run.pop("review_new_thread", None)
         artifact = AcceptanceArtifact.parse(review.artifact)
         record = self._acceptance_record(
             state,
@@ -432,7 +433,7 @@ class RunAcceptanceEngine:
             },
             "checkout": str(checkout),
             "thread_id": latest_reviewer_thread(run)
-            if run.get("prior_human_blockers")
+            if run.get("prior_human_blockers") and not run.get("review_new_thread")
             else None,
             **(
                 {"prior_human_blockers": run["prior_human_blockers"]}

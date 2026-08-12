@@ -103,14 +103,19 @@ class Controller:
                 return state, True
             if human_response is not None:
                 human_response = _validated_human_response(human_response)
+            resuming_run_acceptance = False
             if resume_human_blocker:
+                resuming_run_acceptance = _run_acceptance_human_blocker(state)
                 resumed_subject = _resume_agent_human_blocker(state, human_response)
                 if human_response is not None and not resumed_subject:
                     raise ValueError("--message requires a current Human Blocker")
             elif human_response is not None:
                 raise ValueError("--message requires Human Blocker resume")
             if new_thread:
-                _clear_current_invocation_thread(state)
+                if resuming_run_acceptance:
+                    _state_mapping(state, "run_acceptance")["review_new_thread"] = True
+                else:
+                    _clear_current_invocation_thread(state)
             else:
                 _restore_current_invocation_thread(state)
             _mark_failed_invocation_resuming(state)
@@ -700,6 +705,15 @@ def _human_blockers(subject: dict[str, Any]) -> list[str]:
     ):
         raise ValueError("Agent Human Blocker is missing raw blocker strings")
     return list(value)
+
+
+def _run_acceptance_human_blocker(state: dict[str, Any]) -> bool:
+    acceptance = state.get("run_acceptance")
+    return isinstance(acceptance, dict) and (
+        acceptance.get("phase") == "ready_for_human"
+        and acceptance.get("blocked_reason")
+        in {"agent_requires_human", "reviewer_requires_human"}
+    )
 
 
 def _human_blocker_subject_count(state: dict[str, Any]) -> int:

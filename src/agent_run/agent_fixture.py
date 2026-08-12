@@ -35,7 +35,6 @@ class FixtureAgentBackend:
         expected = step.get("expected_thread_id")
         if expected != request.get("thread_id"):
             raise ValueError("scripted Development Thread expectation failed")
-        thread_id = _string(step, "thread_id")
         if notify is not None:
             notify(
                 "started",
@@ -43,6 +42,21 @@ class FixtureAgentBackend:
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+        no_thread = step.get("no_thread", False)
+        if not isinstance(no_thread, bool):
+            raise ValueError("scripted Development no_thread must be a boolean")
+        if no_thread:
+            error = "scripted Development did not report a Thread ID"
+            if notify is not None:
+                notify("failed", attempt_count=1, error=error)
+            raise ValueError(error)
+        try:
+            thread_id = _string(step, "thread_id")
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
+        if notify is not None:
             notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
         checkout = Path(_string(request, "checkout")).resolve()
         actual_head = subprocess.run(
@@ -206,7 +220,6 @@ class FixtureAgentBackend:
         if not isinstance(artifact, dict):
             artifact = dict(step)
             artifact.pop("thread_id", None)
-        thread_id = _string(step, "thread_id")
         if notify is not None:
             notify(
                 "started",
@@ -214,6 +227,21 @@ class FixtureAgentBackend:
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+        no_thread = step.get("no_thread", False)
+        if not isinstance(no_thread, bool):
+            raise ValueError("scripted Fresh Acceptance no_thread must be a boolean")
+        if no_thread:
+            error = "scripted Fresh Acceptance did not report a Thread ID"
+            if notify is not None:
+                notify("failed", attempt_count=1, error=error)
+            raise ValueError(error)
+        try:
+            thread_id = _string(step, "thread_id")
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
+        if notify is not None:
             notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
         configured_error = step.pop("error", None)
         if isinstance(configured_error, str):
