@@ -418,6 +418,7 @@ class ChangeDeliveryEngine:
         job.pop("review_new_thread", None)
         job.pop("review_failure_resume", None)
         job.pop("review_resume_thread_id", None)
+        job.pop("review_human_blocker_resume", None)
         # Persist the identity before parsing the Artifact.  A malformed
         # reviewer response must not make the same Reviewer appear fresh on
         # resume.
@@ -807,7 +808,11 @@ def _record_reviewer(
     reviewers = _string_list(job, "reviewer_thread_ids")
     if thread_id in development_ids:
         raise ValueError("Fresh Acceptance cannot reuse the Development Thread")
-    resumed = bool(job.get("prior_human_blockers"))
+    resumed = bool(
+        job.get("review_human_blocker_resume")
+        or job.get("review_failure_resume")
+        or job.get("review_resume_thread_id")
+    )
     if resumed and not new_thread and thread_id != latest_reviewer_thread(job):
         raise ValueError(
             "Human Blocker resume requires the latest Reviewer Thread"

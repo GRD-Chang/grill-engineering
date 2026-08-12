@@ -353,7 +353,10 @@ class TicketDeliveryLoop:
             "checkout": str(checkout),
             "thread_id": latest_reviewer_thread(job)
             if (
-                (job.get("prior_human_blockers") or job.get("review_resume_thread_id"))
+                (
+                    job.get("review_human_blocker_resume")
+                    or job.get("review_resume_thread_id")
+                )
                 and not job.get("review_new_thread")
             )
             else None,

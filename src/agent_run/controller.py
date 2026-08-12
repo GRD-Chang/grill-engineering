@@ -661,6 +661,10 @@ def _resume_change_job(
     ):
         return False
     blockers = _human_blockers(value)
+    reviewer_resume = (
+        value.get("blocked_reason") == "reviewer_requires_human"
+        and value.get("human_blocker_phase") == "candidate"
+    )
     append_human_response(
         value,
         blockers,
@@ -673,6 +677,10 @@ def _resume_change_job(
             "prior_human_blockers": blockers,
         }
     )
+    if reviewer_resume:
+        value["review_human_blocker_resume"] = True
+    else:
+        value.pop("review_human_blocker_resume", None)
     value.pop("blocked_reason", None)
     if ticket:
         state["active_ticket_job"] = value
