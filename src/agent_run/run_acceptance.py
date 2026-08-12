@@ -4,7 +4,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
-from agent_run.agent_invocation import select_publication_thread
+from agent_run.agent_invocation import (
+    canonical_fingerprint,
+    fail_interrupted_invocation,
+    invocation_event_recorder,
+    select_publication_thread,
+)
 from agent_run.artifacts import (
     AcceptanceArtifact,
     append_human_blocker_history,
@@ -23,6 +28,11 @@ from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
+
+
+def _reviewer_resume_thread(run: dict[str, Any]) -> str | None:
+    value = run.get("reviewer_resume_thread_id")
+    return value if isinstance(value, str) else latest_reviewer_thread(run)
 
 
 class RunAcceptanceEngine:
@@ -59,6 +69,10 @@ class RunAcceptanceEngine:
                     # before the reviewer returns. No verdict exists yet, so a
                     # later command must start a fresh attempt rather than get
                     # stuck on an in-flight transient state.
+                    if fail_interrupted_invocation(
+                        state, role="reviewer", save=self._save
+                    ):
+                        return state
                     run["phase"] = "pending"
                     self._save(state)
                     continue
@@ -121,9 +135,43 @@ class RunAcceptanceEngine:
                 default_head_sha=default_head,
                 run_head_sha=run_head,
             )
-            review = self.agents.review(
-                self._review_request(state, run, checkout, run_head, default_head)
+            request = self._review_request(
+                state, run, checkout, run_head, default_head
             )
+            if run.pop("reviewer_new_thread", None) is True:
+                request["_invocation_mode"] = "new-thread"
+            request["_invocation_event"] = invocation_event_recorder(
+                state,
+                role="reviewer",
+                phase="run_acceptance",
+                work_subject=f"run-acceptance:{state['run_id']}",
+                generation=validation_attempt,
+                invocation_input=request,
+                currentness_boundary={
+                    "reviewed_head_sha": run_head,
+                    "reviewed_default_base_sha": default_head,
+                    "expected_merge_tree": expected_merge_tree,
+                    "parent_revision": self._mapping(state, "parent")["revision"],
+                    "ticket_graph_revision": self._mapping(
+                        state, "ticket_graph"
+                    )["revision"],
+                    "ticket_completion_records_fingerprint": canonical_fingerprint(
+                        self._ticket_completion_records(state)
+                    ),
+                },
+                save=self._save,
+            )
+            request["_currentness_check"] = lambda: (
+                self.git.resolve(str(state["run_branch"])) == run_head
+                and self._default_head(state) == default_head
+                and self._mapping(state, "parent")["revision"]
+                == request["parent"]["revision"]
+                and self._mapping(state, "ticket_graph")["revision"]
+                == request["ticket_graph"]["revision"]
+                and self._ticket_completion_records(state)
+                == request["ticket_completion_records"]
+            )
+            review = self.agents.review(request)
         finally:
             self.git.remove_worktree(checkout)
         self._record_reviewer(state, run, review.thread_id)
@@ -781,8 +829,16 @@ class RunAcceptanceEngine:
     def _record_reviewer(
         self, state: dict[str, Any], run: dict[str, Any], thread_id: str
     ) -> None:
-        resumed = bool(run.get("prior_human_blockers"))
-        if resumed and thread_id != latest_reviewer_thread(run):
+        resumed_thread = run.get("reviewer_resume_thread_id")
+        resumed = bool(run.get("prior_human_blockers")) or isinstance(
+            resumed_thread, str
+        )
+        expected_thread = (
+            resumed_thread
+            if isinstance(resumed_thread, str)
+            else latest_reviewer_thread(run)
+        )
+        if resumed and thread_id != expected_thread:
             raise ValueError(
                 "Human Blocker resume requires the latest Reviewer Thread"
             )
@@ -794,6 +850,7 @@ class RunAcceptanceEngine:
         if thread_id not in reviewers:
             reviewers.append(thread_id)
         run["reviewer_thread_ids"] = reviewers
+        run.pop("reviewer_resume_thread_id", None)
         self._save(state)
 
     def _all_prior_threads(

@@ -136,3 +136,44 @@ def invocation_event_recorder(
         save(state)
 
     return record
+
+
+def fail_interrupted_invocation(
+    state: dict[str, Any], *, role: str, save: Callable[[dict[str, Any]], object]
+) -> bool:
+    """Close a durable running Invocation after its controller disappeared."""
+
+    active = state.get("active_agent_invocation")
+    if (
+        not isinstance(active, dict)
+        or active.get("role") != role
+        or active.get("status") != "running"
+    ):
+        return False
+    failed = dict(active)
+    failed.update(
+        {
+            "status": "failed",
+            "ended_at": datetime.now(UTC).isoformat(),
+            "error": "controller_interrupted",
+        }
+    )
+    history = state.setdefault("agent_invocation_history", [])
+    if not isinstance(history, list):
+        raise ValueError("agent_invocation_history must be an array")
+    history.append(failed)
+    state["active_agent_invocation"] = failed
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "diagnostics": [
+                {
+                    "code": "agent_invocation_failed",
+                    "message": "controller_interrupted",
+                }
+            ],
+        }
+    )
+    save(state)
+    return True

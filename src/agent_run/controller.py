@@ -7,8 +7,10 @@ from typing import Any, Protocol
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
+from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
+from agent_run.revisions import effective_revision
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
 
@@ -122,6 +124,35 @@ class Controller:
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
+
+    def _run_invocation_boundary_is_current(
+        self, state: dict[str, Any], invocation: dict[str, Any]
+    ) -> bool:
+        boundary = invocation.get("currentness_boundary")
+        if not isinstance(boundary, dict):
+            return True
+        parent = _state_mapping(state, "parent")
+        graph = _state_mapping(state, "ticket_graph")
+        run_branch = state.get("run_branch")
+        repository = self.github.repository()
+        if not isinstance(run_branch, str):
+            return False
+        return (
+            boundary.get("reviewed_head_sha") == self.publisher.git.resolve(run_branch)
+            and boundary.get("reviewed_default_base_sha")
+            == self.publisher.git.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
+            and boundary.get("parent_revision") == parent.get("revision")
+            and boundary.get("ticket_graph_revision") == graph.get("revision")
+            and boundary.get("ticket_completion_records_fingerprint")
+            == canonical_fingerprint(_ticket_completion_records(state))
+            and boundary.get("expected_merge_tree")
+            == self.publisher.git.expected_merge_tree(
+                default_head_sha=str(boundary["reviewed_default_base_sha"]),
+                run_head_sha=str(boundary["reviewed_head_sha"]),
+            )
+        )
 
     def record_execution_failure(
         self, run_id: str, message: str
@@ -350,6 +381,30 @@ def _integer_list(state: dict[str, Any], key: str) -> list[int]:
     return list(value)
 
 
+def _ticket_completion_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    tickets = _state_mapping(_state_mapping(state, "ticket_graph"), "tickets")
+    parent_revision = str(_state_mapping(state, "parent")["revision"])
+    graph_revision = str(_state_mapping(state, "ticket_graph")["revision"])
+    records: list[dict[str, Any]] = []
+    for key, job in sorted(_state_mapping(state, "ticket_jobs").items()):
+        if not isinstance(job, dict) or job.get("phase") != "completed":
+            continue
+        ticket = _state_mapping(tickets, key)
+        records.append(
+            {
+                "ticket_number": int(key),
+                "integrated_sha": job.get("integrated_sha"),
+                "effective_revision": effective_revision(
+                    ticket_revision=str(ticket["content_revision"]),
+                    parent_revision=parent_revision,
+                    graph_revision=graph_revision,
+                ),
+                "acceptance_record": job.get("acceptance_record"),
+            }
+        )
+    return records
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -396,6 +451,7 @@ def _resume_agent_human_blocker(
             "reviewer_requires_human",
         }
     ):
+        _record_human_response(acceptance, message=message)
         blockers = _human_blockers(acceptance)
         append_human_response(
             acceptance,
@@ -424,6 +480,7 @@ def _resume_agent_human_blocker(
         and publication.get("phase") == "ready_for_human"
         and publication.get("human_blockers") is not None
     ):
+        _record_human_response(publication, message=message)
         publication.update(
             {
                 "phase": str(publication.get("human_blocker_phase", "pending")),
@@ -532,6 +589,56 @@ def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:
     invocation = state.get("active_agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
         invocation["status"] = "resuming"
+
+
+def _run_acceptance_for_invocation(
+    state: dict[str, Any], invocation: dict[str, Any]
+) -> dict[str, Any]:
+    run_id = state.get("run_id")
+    if invocation.get("work_subject") != f"run-acceptance:{run_id}":
+        raise ValueError("Run Acceptance Invocation work_subject is invalid")
+    run = state.get("run_acceptance")
+    if not isinstance(run, dict):
+        raise ValueError("current Run Acceptance job is missing")
+    generation = invocation.get("generation")
+    if type(generation) is not int or generation < 1:
+        raise ValueError("current Agent Invocation generation is invalid")
+    _require_invocation_generation(generation, run.get("validation_attempts"))
+    return run
+
+
+def _invalidate_stale_run_invocation(
+    state: dict[str, Any], invocation: dict[str, Any]
+) -> None:
+    run = state.get("run_acceptance")
+    if not isinstance(run, dict):
+        raise ValueError("current Run Acceptance job is missing")
+    for key in (
+        "acceptance_record",
+        "acceptance_artifact",
+        "reviewed_head_sha",
+        "reviewer_resume_thread_id",
+        "reviewer_new_thread",
+    ):
+        run.pop(key, None)
+    run["phase"] = "pending"
+    publication = state.get("run_publication")
+    if isinstance(publication, dict):
+        publication["phase"] = "stale"
+        publication.pop("thread_id", None)
+        publication.pop("publication_new_thread", None)
+    state.update(
+        {
+            "status": "requeue_required",
+            "terminal_kind": "requeue_required",
+            "diagnostics": [
+                {
+                    "code": "run_invocation_stale",
+                    "message": "Run Invocation boundary changed; requeue is required",
+                }
+            ],
+        }
+    )
 
 
 def _publication_job_for_invocation(

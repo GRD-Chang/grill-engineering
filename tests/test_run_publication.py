@@ -246,6 +246,9 @@ def test_final_publication_human_resume_clears_current_blocker(
     assert resumed["run_publication"]["prior_human_blockers"] == [
         "GitHub denied access; tried gh issue view; grant Issue read access."
     ]
+    assert resumed["run_publication"]["human_responses"] == [
+        "Issue read access is now available."
+    ]
 
     published = engine.publish(str(state["run_id"]))
 

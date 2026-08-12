@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from agent_run.agent_invocation import (
     canonical_fingerprint,
+    fail_interrupted_invocation,
     invocation_event_recorder,
 )
 from agent_run.artifacts import (
@@ -39,6 +40,10 @@ class RunPublicationFlow(RunPublicationShared):
                 publication["phase"] = "pending"
                 state["terminal_kind"] = "run_publication_pending"
             if publication["phase"] == "publishing":
+                if fail_interrupted_invocation(
+                    state, role="final_publication", save=self._save
+                ):
+                    return state
                 publication.pop("artifact", None)
                 publication["phase"] = "pending"
             if not self._acceptance_is_current(state, run):

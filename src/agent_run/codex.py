@@ -376,6 +376,67 @@ class CodexCliBackend:
             thread_id=thread_id,
             artifact=_json_object(output, "Acceptance Artifact"),
         )
+        validation_error = ""
+        currentness = request.get("_currentness_check")
+        for attempt in range(1, 4):
+            if attempt > 1 and callable(currentness) and not currentness():
+                stale = CodexProcessError(
+                    "Acceptance currentness changed before Output Repair"
+                )
+                notify("failed", attempt_count=attempt - 1, error=str(stale))
+                raise stale
+            attempt_prompt = prompt
+            if attempt > 1:
+                attempt_prompt = (
+                    "上一输出未通过本地 Acceptance contract。只重新输出完整 JSON，"
+                    "不要修改文件或继续验收。校验错误："
+                    + validation_error[:2000]
+                )
+            try:
+                output, reported_thread = self._invoke(
+                    prompt=attempt_prompt,
+                    checkout=checkout,
+                    thread_id=current_thread,
+                    schema=acceptance_schema(),
+                    writable_checkout=attempt == 1,
+                    on_thread=lambda value: notify(
+                        "thread_started",
+                        reported_thread_id=value,
+                        attempt_count=attempt,
+                    ),
+                )
+            except BaseException as error:
+                notify(
+                    "failed",
+                    attempt_count=attempt,
+                    error=_bounded_error(str(error)),
+                    return_code=getattr(error, "return_code", None),
+                    signal=getattr(error, "signal_number", None),
+                )
+                raise
+            if current_thread is not None and reported_thread != current_thread:
+                mismatch = CodexProcessError(
+                    "Codex resume reported a different Thread ID"
+                )
+                notify("failed", attempt_count=attempt, error=str(mismatch))
+                raise mismatch
+            current_thread = reported_thread
+            try:
+                artifact = _json_object(output, "Acceptance Artifact")
+                AcceptanceArtifact.parse(artifact)
+            except (CodexProcessError, ValueError) as error:
+                validation_error = str(error)
+                if attempt < 3:
+                    continue
+                notify("failed", attempt_count=attempt, error=validation_error)
+                raise CodexProcessError(validation_error) from error
+            notify(
+                "completed",
+                reported_thread_id=current_thread,
+                attempt_count=attempt,
+            )
+            return ReviewResult(thread_id=current_thread, artifact=artifact)
+        raise AssertionError("unreachable")
 
     def _invoke_structured_output(
         self,
@@ -822,6 +883,7 @@ def _resume_recheck_instruction(context: dict[str, Any]) -> str:
         return ""
     return (
         "这是一次 Human Blocker 恢复。prior_human_blockers 是上一轮未经改写的求助内容，"
+        "human_response（如有）是维护者对此求助的未经改写回复；"
         "不表示问题已经解决；必须重新读取权威来源、重新检查受影响工作，然后继续或报告"
         "更新后的 Human Blocker。"
     )
