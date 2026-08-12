@@ -997,6 +997,74 @@ def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
 
+def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    first_agents = git_repo / "parent-first.json"
+    first_agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "parent-old",
+                    "summary": "Initial parent implementation.",
+                    "write_files": {"parent-feature.txt": "old\n"},
+                }],
+                "publications": [parent_publication()],
+                "reviews": [passing_acceptance("parent-reviewer-old", "Initial pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    first = run_cli(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
+    )
+    assert stdout_json(first)["status"] == "parent_approval_pending"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["parent"]["body"] = "Changed parent requirement."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    stale = run_cli(git_repo, fixture, "approve", run_id)
+    assert stdout_json(stale)["status"] == "requeue_required"
+
+    replacement_agents = git_repo / "parent-replacement.json"
+    replacement_agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "parent-new",
+                    "summary": "Replacement parent implementation.",
+                    "write_files": {"parent-feature.txt": "new\n"},
+                }],
+                "publications": [parent_publication()],
+                "reviews": [passing_acceptance("parent-reviewer-new", "Replacement pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    requeued = run_cli(
+        git_repo,
+        fixture,
+        "requeue",
+        run_id,
+        "--agent-fixture",
+        str(replacement_agents),
+    )
+    assert requeued.returncode == 0, requeued.stderr
+    assert stdout_json(requeued)["status"] == "parent_approval_pending"
+    state = load_only_run_state(git_repo)
+    assert state["parent_job"]["parent_generation"] == 2
+    assert state["parent_job"]["development_thread_id"] == "parent-new"
+    assert state["retired_job_generations"][0]["thread_ids"] == [
+        "parent-old",
+        "parent-reviewer-old",
+    ]
+    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
+    assert [pull["state"] for pull in pulls] == ["CLOSED", "OPEN"]
+
+
 def test_child_addition_cannot_continue_parent_only_delivery(
     git_repo: Path,
 ) -> None:

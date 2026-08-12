@@ -23,14 +23,8 @@ def _run_to_human_gate(
         raise ValueError("Delivery Run is missing its Run ID")
     state = _load_local_run(states, run_id)
     previous_marker: tuple[object, ...] | None = None
-    automatic_requeues = 0
     while True:
         command = _next_automatic_command(state)
-        if command is None and state.get("status") == "requeue_required":
-            if automatic_requeues >= 1:
-                return state, resumed
-            command = "requeue"
-            automatic_requeues += 1
         if command is None:
             return state, resumed
         marker = _progress_marker(state, command)

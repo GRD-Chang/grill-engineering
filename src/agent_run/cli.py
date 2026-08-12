@@ -232,8 +232,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             close_superseded_pull_request(publisher, retired)
             remove_superseded_worktree(git, states.root, parsed.run_id, retired)
-            retired["pr_status"] = "superseded_closed"
-            states.save_run(parsed.run_id, state)
+            state = controller.finalize_requeue(parsed.run_id)
             subject = str(retired["work_subject"])
             agent_fixture = getattr(parsed, "agent_fixture", None)
             agents = (

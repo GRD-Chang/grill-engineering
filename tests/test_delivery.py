@@ -2335,9 +2335,13 @@ def test_post_merge_revision_drift_continues_same_job_with_new_pr(
         "generation": 1,
         "reason": "ticket_requirements_changed",
     }
-    queued, retired = Controller(
+    prepared, retired = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).requeue(state["run_id"])
+    assert prepared["status"] == "requeue_required"
+    queued = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).finalize_requeue(state["run_id"])
     assert queued["status"] == "active"
     assert retired["pr_number"] == 11
     assert retired["effective_revision"] == old_effective_revision

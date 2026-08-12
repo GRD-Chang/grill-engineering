@@ -110,6 +110,9 @@ class Controller:
             ):
                 self.states.save_run(run_id, state)
                 return state, True
+            if state.get("status") == "requeue_required":
+                self.states.save_run(run_id, state)
+                return state, True
             invocation = state.get("active_agent_invocation")
             if (
                 isinstance(invocation, dict)
@@ -155,6 +158,11 @@ class Controller:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
             parent_number = int(_state_mapping(existing, "parent")["number"])
+            transition = existing.get("requeue_transition")
+            if isinstance(transition, dict):
+                retired = transition.get("retired")
+                if existing.get("status") == "requeue_required" and isinstance(retired, dict):
+                    return existing, retired
             state = self._refresh(existing, parent_number)
             if state.get("status") != "requeue_required":
                 self.states.save_run(run_id, state)
@@ -164,17 +172,37 @@ class Controller:
             base["sha"] = self.publisher.resolve_base(
                 repository.default_branch, repository.default_head_sha
             )
-            retired = requeue_change_job(state)
+            transition_state = dict(state)
+            retired = requeue_change_job(transition_state)
+            state["requeue_transition"] = {
+                "retired": retired,
+                "base_sha": base["sha"],
+            }
+            self.states.save_run(run_id, state)
+            return state, retired
+
+    def finalize_requeue(self, run_id: str) -> dict[str, Any]:
+        """Commit a prepared replacement only after old assets are retired."""
+        with self.states.locked():
+            state = self._load_bound_run(run_id)
+            transition = _state_mapping(state, "requeue_transition")
+            retired = _state_mapping(transition, "retired")
+            base_sha = transition.get("base_sha")
+            if not isinstance(base_sha, str):
+                raise RequeueError("prepared requeue base is invalid")
+            _state_mapping(state, "base")["sha"] = base_sha
+            applied = requeue_change_job(state)
+            if applied != retired:
+                raise RequeueError("prepared requeue no longer matches current Job")
             if retired["work_subject"].startswith("parent-only:"):
                 generation = int(retired["generation"]) + 1
-                state["parent_branch"] = (
-                    f"agent-run/{run_id}/parent-generation-{generation}"
-                )
-            # Release the empty subject through the same graph projection that
-            # starts a brand-new Run; never reconstruct it from old artifacts.
+                state["parent_branch"] = f"agent-run/{run_id}/parent-generation-{generation}"
+            parent_number = int(_state_mapping(state, "parent")["number"])
+            state.pop("requeue_transition", None)
             state = self._refresh(state, parent_number)
-            self._ensure_delivery_branch(state, str(base["sha"]))
-            return state, retired
+            self._ensure_delivery_branch(state, base_sha)
+            self.states.save_run(run_id, state)
+            return state
 
     def _run_invocation_boundary_is_current(
         self, state: dict[str, Any], invocation: dict[str, Any]
@@ -323,9 +351,11 @@ class Controller:
             # first generation and currentness facts.
             return
         external = (
-            _unknown_pr_mutation(state, subject, job, self.github, self.publisher.git)
-            if job.get("phase") != "blocked"
-            else None
+            None
+            if job.get("blocked_reason") == "merged_revision_mismatch"
+            else _unknown_pr_mutation(
+                state, subject, job, self.github, self.publisher.git
+            )
         )
         if external is not None:
             state.update(

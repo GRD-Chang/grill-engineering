@@ -208,10 +208,16 @@ def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
     assert stale["status"] == "requeue_required"
     assert stale["requeue_required"]["work_subject"] == "ticket:7"
 
-    queued, retired = controller.requeue(str(state["run_id"]))
+    prepared, retired = controller.requeue(str(state["run_id"]))
 
     assert retired["generation"] == 1
     assert retired["work_subject"] == "ticket:7"
+    assert prepared["status"] == "requeue_required"
+    assert prepared["requeue_transition"]["retired"] == retired
+    repeated, repeated_retired = controller.requeue(str(state["run_id"]))
+    assert repeated["requeue_transition"]["retired"] == retired
+    assert repeated_retired == retired
+    queued = controller.finalize_requeue(str(state["run_id"]))
     new_job = queued["active_ticket_job"]
     assert isinstance(new_job, dict)
     assert new_job["ticket_number"] == 7
@@ -254,6 +260,35 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
     assert updated_job["ticket_branch_generation"] == 1
     assert updated_job["effective_revision"] == "old-revision"
     assert "candidate_sha" not in updated_job
+
+
+def test_stale_human_blocker_cannot_resume_the_old_generation(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    state, _ = controller.start(1)
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
+            "phase": "blocked",
+            "blocked_reason": "reviewer_requires_human",
+            "human_blocker_phase": "candidate",
+            "human_blockers": ["need decision"],
+            "effective_revision": "old-revision",
+            "base_sha": git.resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
+    states.save_run(str(state["run_id"]), state)
+
+    resumed, _ = controller.resume(str(state["run_id"]), resume_human_blocker=True)
+
+    assert resumed["status"] == "requeue_required"
+    assert resumed["active_ticket_job"]["phase"] == "blocked"
 
 
 def test_pr_base_or_head_mutation_requires_human_not_requeue(git_repo: Path) -> None:
