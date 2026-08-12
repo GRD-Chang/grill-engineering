@@ -8,6 +8,7 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
+from agent_run.run_currentness import ticket_completion_records
 from agent_run.state import StateStore
 
 
@@ -49,7 +50,7 @@ class RunPublicationShared:
             and record.get("ticket_graph_revision")
             == self._mapping(state, "ticket_graph").get("revision")
             and record.get("ticket_completion_records")
-            == self._ticket_completion_records(state)
+            == ticket_completion_records(state)
         )
 
     def _invalidate_for_fresh_acceptance(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -211,27 +212,6 @@ class RunPublicationShared:
         publication = {"phase": "pending"}
         state["run_publication"] = publication
         return publication
-
-    def _ticket_completion_records(self, state: dict[str, Any]) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        tickets = self._mapping(self._mapping(state, "ticket_graph"), "tickets")
-        parent_revision = str(self._mapping(state, "parent")["revision"])
-        graph_revision = str(self._mapping(state, "ticket_graph")["revision"])
-        for key, job in sorted(self._mapping(state, "ticket_jobs").items()):
-            if isinstance(job, dict) and job.get("phase") == "completed":
-                records.append(
-                    {
-                        "ticket_number": int(key),
-                        "integrated_sha": job.get("integrated_sha"),
-                        "effective_revision": effective_revision(
-                            ticket_revision=str(self._mapping(tickets, key)["content_revision"]),
-                            parent_revision=parent_revision,
-                            graph_revision=graph_revision,
-                        ),
-                        "acceptance_record": job.get("acceptance_record"),
-                    }
-                )
-        return records
 
     def _publication_checkout(self, state: dict[str, Any]) -> Path:
         return self.states.root / "worktrees" / str(state["run_id"]) / "run-publication"

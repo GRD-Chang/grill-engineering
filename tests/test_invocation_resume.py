@@ -6,7 +6,11 @@ from typing import Any
 import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine
-from agent_run.controller import Controller, _change_job_for_invocation, _resume_agent_human_blocker
+from agent_run.controller import (
+    Controller,
+    _change_job_for_invocation,
+    _resume_agent_human_blocker,
+)
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.human_responses import current_human_response_history
 from agent_run.cli_surface import _resume_is_ready

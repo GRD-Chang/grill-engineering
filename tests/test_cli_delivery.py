@@ -1905,12 +1905,16 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
         resumed_state["ticket_jobs"]["3"]["publication_thread_id"]
         == "completed-ticket-publication"
     )
-    successor = resumed_state["active_agent_invocation"]
-    assert successor["work_subject"] == f"run-repair:{run_id}"
-    assert successor["mode"] == successor_mode
-    assert successor["requested_thread_id"] == expected_thread
-    assert successor["reported_thread_id"] == (
+    repair_successor = resumed_state["agent_invocation_history"][-2]
+    assert repair_successor["work_subject"] == f"run-repair:{run_id}"
+    assert repair_successor["mode"] == successor_mode
+    assert repair_successor["requested_thread_id"] == expected_thread
+    assert repair_successor["reported_thread_id"] == (
         expected_thread or "run-repair-publication-2"
+    )
+    # The completed repair is followed by the new whole-Run Fresh Acceptance.
+    assert resumed_state["active_agent_invocation"]["work_subject"] == (
+        f"run-acceptance:{run_id}"
     )
 
 

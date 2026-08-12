@@ -280,13 +280,19 @@ def append_human_blocker_history(
     if not current:
         raise ValueError("human_blockers must contain non-empty strings")
     history.append({"phase": phase, "human_blockers": current})
+    subject.pop("current_human_response", None)
     if len(history) > MAX_HUMAN_BLOCKER_HISTORY:
         del history[:-MAX_HUMAN_BLOCKER_HISTORY]
 
 
 def clear_current_human_blocker(subject: dict[str, Any]) -> None:
     """Clear the resolved alert while retaining bounded historical attempts."""
-    for key in ("human_blockers", "human_blocker_phase", "prior_human_blockers"):
+    for key in (
+        "human_blockers",
+        "human_blocker_phase",
+        "prior_human_blockers",
+        "current_human_response",
+    ):
         subject.pop(key, None)
     if subject.get("blocked_reason") in {
         "agent_requires_human",

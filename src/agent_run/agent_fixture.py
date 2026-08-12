@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
-from agent_run.artifacts import AcceptanceArtifact
+from agent_run.artifacts import (
+    AcceptanceArtifact,
+    PublicationArtifact,
+    parse_publication_wire_result,
+)
 from agent_run.worker_sandbox import WorkerSandboxError
 
 
@@ -204,6 +208,22 @@ class FixtureAgentBackend:
             and isinstance(self.data.get("run_reviews"), list)
             else "reviews"
         )
+        if request.get("acceptance_scope") != "run" or request.get(
+            "repair_scope"
+        ) == "run_repair":
+            return self._legacy_review(name, request)
+        artifact, thread_id = self._output_attempts(
+            name,
+            request,
+            default_thread="fixture-reviewer",
+            decode=_review_artifact,
+            validate=AcceptanceArtifact.parse,
+        )
+        return ReviewResult(thread_id=thread_id, artifact=artifact)
+
+    def _legacy_review(
+        self, name: str, request: dict[str, Any]
+    ) -> ReviewResult:
         step = self._next(name)
         has_expected_thread = "expected_thread_id" in step
         expected_thread = step.pop("expected_thread_id", None)
@@ -258,34 +278,118 @@ class FixtureAgentBackend:
             raise
         if notify is not None:
             notify("completed", reported_thread_id=thread_id, attempt_count=1)
-        return ReviewResult(
-            thread_id=thread_id,
-            artifact=artifact,
-        )
+        return ReviewResult(thread_id=thread_id, artifact=artifact)
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        step = self._next("run_publications")
-        has_expected_thread = "expected_thread_id" in step
-        expected_thread = step.pop("expected_thread_id", None)
-        requested_thread = request.get("thread_id")
-        if has_expected_thread and expected_thread != requested_thread:
-            raise ValueError(
-                "agent fixture run publication expected a different Thread ID"
-            )
-        thread_id = step.pop("thread_id", None) or requested_thread or "fixture-run-publication"
+        result, thread_id = self._output_attempts(
+            "run_publications",
+            request,
+            default_thread="fixture-run-publication",
+            decode=_publication_result,
+            validate=lambda value: _validate_publication(
+                value, delivery_run=str(request.get("run_id", "fixture"))
+            ),
+        )
+        result["_thread_id"] = thread_id
+        return result
+
+    def _output_attempts(
+        self,
+        name: str,
+        request: dict[str, Any],
+        *,
+        default_thread: str,
+        decode: Callable[[dict[str, Any]], dict[str, Any]],
+        validate: Callable[[dict[str, Any]], object],
+    ) -> tuple[dict[str, Any], str]:
         event = request.get("_invocation_event")
-        if callable(event):
-            event(
+        notify = event if callable(event) else lambda _kind, **_facts: None
+        current_thread = request.get("thread_id")
+        if current_thread is not None and not isinstance(current_thread, str):
+            raise ValueError("agent fixture request thread_id must be a string")
+        invocation_started = False
+
+        def start_invocation() -> None:
+            nonlocal invocation_started
+            if invocation_started:
+                return
+            notify(
                 "started",
-                requested_thread_id=requested_thread,
+                requested_thread_id=request.get("thread_id"),
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
-            event("thread_started", reported_thread_id=thread_id, attempt_count=1)
-            event("completed", reported_thread_id=thread_id, attempt_count=1)
-        result = _publication_wire(step)
-        result["_thread_id"] = thread_id
-        return result
+            invocation_started = True
+
+        def report_thread(thread_id: str, attempt: int) -> None:
+            start_invocation()
+            notify(
+                "thread_started",
+                reported_thread_id=thread_id,
+                attempt_count=attempt,
+            )
+
+        start_invocation()
+        currentness = request.get("_currentness_check")
+        for attempt in range(1, 4):
+            if attempt > 1 and callable(currentness) and not currentness():
+                message = "Fixture currentness changed before Output Repair"
+                start_invocation()
+                notify("failed", attempt_count=attempt - 1, error=message)
+                raise ValueError(message)
+            try:
+                step = self._next(name)
+                has_expected_thread = "expected_thread_id" in step
+                expected_thread = step.pop("expected_thread_id", None)
+                if expected_thread is not None and not isinstance(expected_thread, str):
+                    raise ValueError("expected_thread_id must be a string or null")
+                if has_expected_thread and expected_thread != current_thread:
+                    raise ValueError("agent fixture expected a different Thread ID")
+                configured_thread = step.pop("thread_id", None)
+                if configured_thread is not None and (
+                    not isinstance(configured_thread, str)
+                    or not configured_thread.strip()
+                ):
+                    raise ValueError("thread_id must be a non-empty string")
+                no_thread = step.pop("no_thread", False)
+                if not isinstance(no_thread, bool):
+                    raise ValueError("no_thread must be a boolean")
+                if no_thread:
+                    raise ValueError("scripted Run Invocation did not report a Thread ID")
+                configured_error = step.pop("error", None)
+                if isinstance(configured_error, str):
+                    raise ValueError(configured_error)
+                if configured_error is not None:
+                    raise ValueError("error must be a string")
+            except ValueError as error:
+                start_invocation()
+                notify("failed", attempt_count=attempt, error=str(error))
+                raise
+            reported_thread = configured_thread or current_thread or default_thread
+            if current_thread is not None and reported_thread != current_thread:
+                message = "agent fixture resume reported a different Thread ID"
+                report_thread(reported_thread, attempt)
+                notify("failed", attempt_count=attempt, error=message)
+                raise ValueError(message)
+            try:
+                result = decode(step)
+                validate(result)
+            except ValueError as error:
+                report_thread(reported_thread, attempt)
+                if attempt < 3:
+                    current_thread = reported_thread
+                    continue
+                notify("failed", attempt_count=attempt, error=str(error))
+                raise
+            report_thread(reported_thread, attempt)
+            current_thread = reported_thread
+            notify(
+                "completed",
+                reported_thread_id=current_thread,
+                attempt_count=attempt,
+            )
+            return result, current_thread
+        raise AssertionError("unreachable")
 
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)
@@ -317,6 +421,35 @@ def _human_blockers(data: dict[str, Any]) -> tuple[str, ...] | None:
     ):
         raise ValueError("human_blockers must contain non-empty strings")
     return tuple(value)
+
+
+def _review_artifact(data: dict[str, Any]) -> dict[str, Any]:
+    artifact = data.get("artifact")
+    if isinstance(artifact, dict):
+        return dict(artifact)
+    artifact = dict(data)
+    artifact.pop("thread_id", None)
+    artifact.pop("expected_thread_id", None)
+    return artifact
+
+
+def _publication_result(data: dict[str, Any]) -> dict[str, Any]:
+    blockers = _human_blockers(data)
+    if blockers is not None:
+        return {
+            "result_kind": "human_blocker",
+            "commit_message": None,
+            "pr_title": None,
+            "pr_body_markdown": None,
+            "human_blockers": list(blockers),
+        }
+    return _publication_wire(data)
+
+
+def _validate_publication(data: dict[str, Any], *, delivery_run: str) -> None:
+    normalized = parse_publication_wire_result(data)
+    if normalized["result_kind"] == "publication":
+        PublicationArtifact.parse(normalized, delivery_run=delivery_run)
 
 
 def _publication_wire(data: dict[str, Any]) -> dict[str, Any]:

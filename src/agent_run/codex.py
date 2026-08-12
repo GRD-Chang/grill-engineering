@@ -21,6 +21,7 @@ from agent_run.agent_schemas import (
 )
 from agent_run.artifacts import (
     AcceptanceArtifact,
+    PublicationArtifact,
     parse_development_wire_result,
     parse_human_blockers,
     parse_publication_wire_result,
@@ -256,6 +257,9 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
+            artifact_validator=lambda artifact: PublicationArtifact.parse(
+                artifact, delivery_run="final-run"
+            ),
         )
         artifact = _json_object(output, "Run Publication Artifact")
         artifact["_thread_id"] = thread_id
@@ -268,7 +272,17 @@ class CodexCliBackend:
         prompt: str,
         checkout: Path,
         thread_id: str | None,
+        artifact_validator: Callable[[dict[str, Any]], object] | None = None,
     ) -> tuple[str, str]:
+        def validate_publication(artifact: object) -> object:
+            normalized = parse_publication_wire_result(artifact)
+            if (
+                normalized["result_kind"] == "publication"
+                and artifact_validator is not None
+            ):
+                artifact_validator(normalized)
+            return normalized
+
         return self._invoke_structured_output(
             request=request,
             prompt=prompt,
@@ -276,7 +290,7 @@ class CodexCliBackend:
             thread_id=thread_id,
             schema=publication_or_human_blocker_schema(),
             output_name="Publication Artifact",
-            validate=parse_publication_wire_result,
+            validate=validate_publication,
             initial_writable_checkout=False,
         )
 
@@ -376,6 +390,14 @@ class CodexCliBackend:
             thread_id=thread_id,
             artifact=_json_object(output, "Acceptance Artifact"),
         )
+        return ReviewResult(
+            thread_id=thread_id,
+            artifact=_json_object(output, "Acceptance Artifact"),
+        )
+
+    @staticmethod
+    def _validate_acceptance_output(output: str) -> None:
+        AcceptanceArtifact.parse(_json_object(output, "Acceptance Artifact"))
 
     def _invoke_structured_output(
         self,
@@ -822,6 +844,7 @@ def _resume_recheck_instruction(context: dict[str, Any]) -> str:
         return ""
     return (
         "这是一次 Human Blocker 恢复。prior_human_blockers 是上一轮未经改写的求助内容，"
+        "human_response（如有）是维护者对此求助的未经改写回复；"
         "不表示问题已经解决；必须重新读取权威来源、重新检查受影响工作，然后继续或报告"
         "更新后的 Human Blocker。"
     )

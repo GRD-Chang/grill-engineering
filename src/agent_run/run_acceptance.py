@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
-from agent_run.agent_invocation import select_publication_thread
+from agent_run.agent_invocation import (
+    fail_interrupted_invocation,
+    invocation_event_recorder,
+    select_publication_thread,
+)
 from agent_run.artifacts import (
     AcceptanceArtifact,
     append_human_blocker_history,
@@ -22,7 +26,16 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
+from agent_run.run_currentness import (
+    run_currentness_boundary,
+    ticket_completion_records,
+)
 from agent_run.state import StateStore
+
+
+def _reviewer_resume_thread(run: dict[str, Any]) -> str | None:
+    value = run.get("reviewer_resume_thread_id")
+    return value if isinstance(value, str) else latest_reviewer_thread(run)
 
 
 class RunAcceptanceEngine:
@@ -59,6 +72,10 @@ class RunAcceptanceEngine:
                     # before the reviewer returns. No verdict exists yet, so a
                     # later command must start a fresh attempt rather than get
                     # stuck on an in-flight transient state.
+                    if fail_interrupted_invocation(
+                        state, role="reviewer", save=self._save
+                    ):
+                        return state
                     run["phase"] = "pending"
                     self._save(state)
                     continue
@@ -101,9 +118,10 @@ class RunAcceptanceEngine:
                     continue
                 if phase != "pending":
                     raise ValueError(f"unknown Run Acceptance phase: {phase}")
-                self._review(state, run)
+                if not self._review(state, run):
+                    return self._save(state)
 
-    def _review(self, state: dict[str, Any], run: dict[str, Any]) -> None:
+    def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
         run_head = self.git.resolve(str(state["run_branch"]))
         validation_attempt = int(run.get("validation_attempts", 0)) + 1
         run["validation_attempts"] = validation_attempt
@@ -121,9 +139,41 @@ class RunAcceptanceEngine:
                 default_head_sha=default_head,
                 run_head_sha=run_head,
             )
-            review = self.agents.review(
-                self._review_request(state, run, checkout, run_head, default_head)
+            request = self._review_request(
+                state, run, checkout, run_head, default_head
             )
+            if run.pop("reviewer_new_thread", None) is True:
+                request["_invocation_mode"] = "new-thread"
+            request["_invocation_event"] = invocation_event_recorder(
+                state,
+                role="reviewer",
+                phase="run_acceptance",
+                work_subject=f"run-acceptance:{state['run_id']}",
+                generation=validation_attempt,
+                invocation_input=request,
+                currentness_boundary=run_currentness_boundary(
+                    state,
+                    reviewed_head_sha=run_head,
+                    reviewed_default_base_sha=default_head,
+                    expected_merge_tree=expected_merge_tree,
+                ),
+                save=self._save,
+            )
+            request["_currentness_check"] = lambda: (
+                self.git.resolve(str(state["run_branch"])) == run_head
+                and self._default_head(state) == default_head
+                and self._mapping(state, "parent")["revision"]
+                == request["parent"]["revision"]
+                and self._mapping(state, "ticket_graph")["revision"]
+                == request["ticket_graph"]["revision"]
+                and ticket_completion_records(state)
+                == request["ticket_completion_records"]
+            )
+            review = self.agents.review(request)
+            if not request["_currentness_check"]():
+                run["phase"] = "pending"
+                self._save(state)
+                return False
         finally:
             self.git.remove_worktree(checkout)
         self._record_reviewer(state, run, review.thread_id)
@@ -178,6 +228,7 @@ class RunAcceptanceEngine:
         if artifact.verdict != "human":
             self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
+        return True
 
     def _record_final_pr_status(
         self, state: dict[str, Any], artifact: dict[str, Any], run_head: str
@@ -332,7 +383,7 @@ class RunAcceptanceEngine:
             "base_sha": base_sha,
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "repair_source": repair_source,
             "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
             "modification_attempts": int(run["modification_attempts"]),
@@ -392,7 +443,7 @@ class RunAcceptanceEngine:
             and record.get("parent_revision") == parent.get("revision")
             and record.get("ticket_graph_revision") == graph.get("revision")
             and record.get("ticket_completion_records")
-            == self._ticket_completion_records(state)
+            == ticket_completion_records(state)
         ):
             return
         for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
@@ -422,7 +473,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": default_head,
             "run_head_sha": run_head,
             "expected_merge_result": {
@@ -432,9 +483,15 @@ class RunAcceptanceEngine:
                 "checkout_state": "merged working tree; HEAD remains default base",
             },
             "checkout": str(checkout),
-            "thread_id": latest_reviewer_thread(run)
-            if run.get("prior_human_blockers") and not run.get("review_new_thread")
-            else None,
+            "thread_id": (
+                _reviewer_resume_thread(run)
+                if (
+                    run.get("prior_human_blockers")
+                    or run.get("reviewer_resume_thread_id")
+                )
+                and not run.get("review_new_thread")
+                else None
+            ),
             **(
                 {"prior_human_blockers": run["prior_human_blockers"]}
                 if run.get("prior_human_blockers")
@@ -464,7 +521,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "head_sha": self.git.checkout_head(checkout),
             "checkout": str(checkout),
@@ -504,7 +561,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": self._mapping(state, "parent"),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
             "checkout": str(checkout),
@@ -568,7 +625,7 @@ class RunAcceptanceEngine:
             "run_id": state["run_id"],
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "base_sha": job["base_sha"],
             "run_head_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
@@ -654,7 +711,7 @@ class RunAcceptanceEngine:
             != job.get("parent_revision")
             or self._mapping(state, "ticket_graph").get("revision")
             != job.get("ticket_graph_revision")
-            or self._ticket_completion_records(state)
+            or ticket_completion_records(state)
             != job.get("ticket_completion_records")
         )
 
@@ -773,7 +830,7 @@ class RunAcceptanceEngine:
             "expected_merge_tree": expected_merge_tree,
             "parent_revision": self._mapping(state, "parent")["revision"],
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": self._ticket_completion_records(state),
+            "ticket_completion_records": ticket_completion_records(state),
             "reviewer_thread_id": reviewer_thread_id,
             "artifact": artifact,
         }
@@ -781,8 +838,17 @@ class RunAcceptanceEngine:
     def _record_reviewer(
         self, state: dict[str, Any], run: dict[str, Any], thread_id: str
     ) -> None:
-        resumed = bool(run.get("prior_human_blockers"))
-        if resumed and thread_id != latest_reviewer_thread(run):
+        resumed_thread = run.get("reviewer_resume_thread_id")
+        resumed = not run.get("reviewer_new_thread") and (
+            bool(run.get("prior_human_blockers"))
+            or isinstance(resumed_thread, str)
+        )
+        expected_thread = (
+            resumed_thread
+            if isinstance(resumed_thread, str)
+            else latest_reviewer_thread(run)
+        )
+        if resumed and thread_id != expected_thread:
             raise ValueError(
                 "Human Blocker resume requires the latest Reviewer Thread"
             )
@@ -794,6 +860,8 @@ class RunAcceptanceEngine:
         if thread_id not in reviewers:
             reviewers.append(thread_id)
         run["reviewer_thread_ids"] = reviewers
+        run.pop("reviewer_resume_thread_id", None)
+        run.pop("reviewer_new_thread", None)
         self._save(state)
 
     def _all_prior_threads(
@@ -817,29 +885,6 @@ class RunAcceptanceEngine:
                 if isinstance(value, list):
                     values.update(item for item in value if isinstance(item, str))
         return values
-
-    def _ticket_completion_records(self, state: dict[str, Any]) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        tickets = self._mapping(self._mapping(state, "ticket_graph"), "tickets")
-        parent_revision = str(self._mapping(state, "parent")["revision"])
-        graph_revision = str(self._mapping(state, "ticket_graph")["revision"])
-        for key, job in sorted(self._mapping(state, "ticket_jobs").items()):
-            if not isinstance(job, dict) or job.get("phase") != "completed":
-                continue
-            ticket = self._mapping(tickets, key)
-            records.append(
-                {
-                    "ticket_number": int(key),
-                    "integrated_sha": job.get("integrated_sha"),
-                    "effective_revision": effective_revision(
-                        ticket_revision=str(ticket["content_revision"]),
-                        parent_revision=parent_revision,
-                        graph_revision=graph_revision,
-                    ),
-                    "acceptance_record": job.get("acceptance_record"),
-                }
-            )
-        return records
 
     def _all_tickets_completed(self, state: dict[str, Any]) -> bool:
         order = self._mapping(state, "ticket_graph").get("ordered_ticket_numbers")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from agent_run.agent_invocation import (
-    canonical_fingerprint,
+    fail_interrupted_invocation,
     invocation_event_recorder,
 )
 from agent_run.artifacts import (
@@ -17,6 +17,7 @@ from agent_run.git import GitError
 from agent_run.github import GitHubReadError
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.run_publication_shared import RunPublicationShared
+from agent_run.run_currentness import run_currentness_boundary
 
 
 class RunPublicationFlow(RunPublicationShared):
@@ -39,6 +40,10 @@ class RunPublicationFlow(RunPublicationShared):
                 publication["phase"] = "pending"
                 state["terminal_kind"] = "run_publication_pending"
             if publication["phase"] == "publishing":
+                if fail_interrupted_invocation(
+                    state, role="final_publication", save=self._save
+                ):
+                    return state
                 publication.pop("artifact", None)
                 publication["phase"] = "pending"
             if not self._acceptance_is_current(state, run):
@@ -117,6 +122,11 @@ class RunPublicationFlow(RunPublicationShared):
             raw = self.agents.run_publication(request)
             publication.pop("publication_failure_resume", None)
             publication.pop("publication_new_thread", None)
+            if not self._acceptance_is_current(
+                state, self._mapping(state, "run_acceptance")
+            ):
+                self._invalidate_for_fresh_acceptance(state)
+                return None
             thread_id = raw.pop("_thread_id", None)
             if isinstance(thread_id, str):
                 publication["thread_id"] = thread_id
@@ -170,18 +180,12 @@ class RunPublicationFlow(RunPublicationShared):
             work_subject=f"run-publication:{state['run_id']}",
             generation=int(run.get("acceptance_generation", 1)),
             invocation_input=request,
-            currentness_boundary={
-                "reviewed_head_sha": acceptance["reviewed_head_sha"],
-                "reviewed_default_base_sha": acceptance[
-                    "reviewed_default_base_sha"
-                ],
-                "expected_merge_tree": acceptance["expected_merge_tree"],
-                "parent_revision": acceptance["parent_revision"],
-                "ticket_graph_revision": acceptance["ticket_graph_revision"],
-                "ticket_completion_records_fingerprint": canonical_fingerprint(
-                    acceptance["ticket_completion_records"]
-                ),
-            },
+            currentness_boundary=run_currentness_boundary(
+                state,
+                reviewed_head_sha=str(acceptance["reviewed_head_sha"]),
+                reviewed_default_base_sha=str(acceptance["reviewed_default_base_sha"]),
+                expected_merge_tree=str(acceptance["expected_merge_tree"]),
+            ),
             save=self._save,
         )
 
