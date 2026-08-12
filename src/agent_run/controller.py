@@ -4,7 +4,6 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from agent_run.artifacts import MAX_HUMAN_BLOCKER_HISTORY
 from agent_run.graph import state_from_graph
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
@@ -433,6 +432,7 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
             job.pop("development_thread_id", None)
             job["development_new_thread"] = True
         else:
+            job.pop("review_resume_thread_id", None)
             job["review_new_thread"] = True
         return
     if role not in {"publication", "final_publication"}:
@@ -472,8 +472,11 @@ def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
         if role == "development":
             job["development_thread_id"] = thread_id
             job.pop("development_new_thread", None)
+            job["development_failure_resume"] = True
         else:
+            job["review_resume_thread_id"] = thread_id
             job["review_new_thread"] = False
+            job["review_failure_resume"] = True
         return
     job, mirror = _publication_job_for_invocation(state, invocation)
     thread_id = invocation.get("reported_thread_id") or invocation.get(
@@ -677,5 +680,3 @@ def _append_human_response(
     if not isinstance(history, list):
         raise ValueError("human_response_history must be an array")
     history.append({"human_blockers": list(blockers), "response": response})
-    if len(history) > MAX_HUMAN_BLOCKER_HISTORY:
-        del history[:-MAX_HUMAN_BLOCKER_HISTORY]

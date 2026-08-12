@@ -163,6 +163,10 @@ class FixtureAgentBackend:
             else "reviews"
         )
         step = self._next(name)
+        has_expected_thread = "expected_thread_id" in step
+        expected_thread = step.pop("expected_thread_id", None)
+        if has_expected_thread and expected_thread != request.get("thread_id"):
+            raise ValueError("scripted Fresh Acceptance Thread expectation failed")
         expected_history = step.pop("expected_human_response_history", None)
         if expected_history is not None and expected_history != request.get(
             "human_response_history"
@@ -183,6 +187,14 @@ class FixtureAgentBackend:
                 invocation_mode=request.get("_invocation_mode"),
             )
             notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
+        configured_error = step.pop("error", None)
+        if isinstance(configured_error, str):
+            if notify is not None:
+                notify("failed", attempt_count=1, error=configured_error)
+            raise ValueError(configured_error)
+        if configured_error is not None:
+            raise ValueError("scripted Fresh Acceptance error must be a string")
+        if notify is not None:
             notify("completed", reported_thread_id=thread_id, attempt_count=1)
         return ReviewResult(
             thread_id=thread_id,

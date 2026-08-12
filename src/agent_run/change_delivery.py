@@ -181,12 +181,15 @@ class ChangeDeliveryEngine:
         request["_currentness_check"] = lambda: self._agent_is_current(state, job)
         if job.get("development_new_thread") is True:
             request["_invocation_mode"] = "new-thread"
+        elif job.get("development_failure_resume") is True:
+            request["_invocation_mode"] = "resume"
         result = self.agents.develop(request)
         if isinstance(result, HumanBlockerResult):
             if not self.contract.development_thread_is_allowed(state, result.thread_id):
                 raise ValueError("Change Job Development Thread is not independent")
             _record_development_thread(job, result.thread_id, result.replaced_thread_id)
             job.pop("development_new_thread", None)
+            job.pop("development_failure_resume", None)
             self._wait_for_human(
                 state, job, phase=str(job["phase"]), blockers=result.human_blockers
             )
@@ -197,6 +200,7 @@ class ChangeDeliveryEngine:
             raise ValueError("Change Job Development Thread is not independent")
         _record_development_thread(job, result.thread_id, result.replaced_thread_id)
         job.pop("development_new_thread", None)
+        job.pop("development_failure_resume", None)
         job["development_summary"] = result.summary
         clear_current_human_blocker(job)
         job["phase"] = "committing_candidate"
@@ -400,6 +404,8 @@ class ChangeDeliveryEngine:
             request["_currentness_check"] = lambda: self._agent_is_current(state, job)
             if job.get("review_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
+            elif job.get("review_failure_resume") is True:
+                request["_invocation_mode"] = "resume"
             review = self.agents.review(request)
         finally:
             self.git.remove_worktree(validation)
@@ -407,6 +413,8 @@ class ChangeDeliveryEngine:
             job, review.thread_id, new_thread=job.get("review_new_thread") is True
         )
         job.pop("review_new_thread", None)
+        job.pop("review_failure_resume", None)
+        job.pop("review_resume_thread_id", None)
         # Persist the identity before parsing the Artifact.  A malformed
         # reviewer response must not make the same Reviewer appear fresh on
         # resume.
@@ -809,7 +817,10 @@ def _record_reviewer(
 
 
 def latest_reviewer_thread(subject: dict[str, Any]) -> str | None:
-    """Return the only Reviewer Thread eligible for Human Blocker resume."""
+    """Return the Reviewer Thread eligible for a same-Thread resume."""
+    resume_thread = subject.get("review_resume_thread_id")
+    if isinstance(resume_thread, str) and resume_thread.strip():
+        return resume_thread
     threads = subject.get("reviewer_thread_ids")
     if isinstance(threads, list) and threads and isinstance(threads[-1], str):
         return threads[-1]

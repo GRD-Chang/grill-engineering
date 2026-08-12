@@ -94,6 +94,14 @@ class HumanThenRunPublicationAgents:
         assert request["prior_human_blockers"] == [
             "GitHub denied access; tried gh issue view; grant Issue read access."
         ]
+        assert request["human_response_history"] == [
+            {
+                "human_blockers": [
+                    "GitHub denied access; tried gh issue view; grant Issue read access."
+                ],
+                "response": "Issue read access has been granted.",
+            }
+        ]
         return {
             "result_kind": "publication",
             "commit_message": "feat(run): publish the completed delivery",
@@ -229,7 +237,11 @@ def test_final_publication_human_resume_clears_current_blocker(
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
-    ).resume(str(state["run_id"]), resume_human_blocker=True)
+    ).resume(
+        str(state["run_id"]),
+        resume_human_blocker=True,
+        human_response="Issue read access has been granted.",
+    )
     assert resumed["run_publication"]["prior_human_blockers"] == [
         "GitHub denied access; tried gh issue view; grant Issue read access."
     ]

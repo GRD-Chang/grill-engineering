@@ -286,6 +286,7 @@ class CodexCliBackend:
             request,
             "parent_issue_url",
             "prior_human_blockers",
+            "human_response_history",
         )
         artifact = request.get("acceptance_artifact")
         if not isinstance(artifact, dict):
@@ -401,6 +402,11 @@ class CodexCliBackend:
         current_thread = thread_id
         validation_error = ""
         currentness = request.get("_currentness_check")
+        if request.get("_invocation_mode") == "resume" and thread_id is not None:
+            prompt = (
+                "这是一次因前次调用失败而继续的同 Thread Resume。请基于当前 workspace "
+                "重新核验权威输入和实际工作，再满足完整阶段 contract。\n\n" + prompt
+            )
         for attempt in range(1, 4):
             if attempt > 1 and callable(currentness) and not currentness():
                 stale = CodexProcessError(

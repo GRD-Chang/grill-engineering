@@ -5,7 +5,6 @@ from typing import Any
 
 import pytest
 
-from agent_run.artifacts import MAX_HUMAN_BLOCKER_HISTORY
 from agent_run.controller import Controller, _append_human_response
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -13,9 +12,9 @@ from agent_run.state import StateStore
 from conftest import write_fixture
 
 
-def test_human_response_history_is_bounded_and_keeps_recent_entries() -> None:
+def test_human_response_history_keeps_ordered_immutable_entries() -> None:
     subject: dict[str, Any] = {}
-    for attempt in range(MAX_HUMAN_BLOCKER_HISTORY + 3):
+    for attempt in range(19):
         _append_human_response(
             subject,
             [f"blocker-{attempt}"],
@@ -23,14 +22,14 @@ def test_human_response_history_is_bounded_and_keeps_recent_entries() -> None:
         )
 
     history = subject["human_response_history"]
-    assert len(history) == MAX_HUMAN_BLOCKER_HISTORY
+    assert len(history) == 19
     assert history[0] == {
-        "human_blockers": ["blocker-3"],
-        "response": "response-3",
+        "human_blockers": ["blocker-0"],
+        "response": "response-0",
     }
     assert history[-1] == {
-        "human_blockers": [f"blocker-{MAX_HUMAN_BLOCKER_HISTORY + 2}"],
-        "response": f"response-{MAX_HUMAN_BLOCKER_HISTORY + 2}",
+        "human_blockers": ["blocker-18"],
+        "response": "response-18",
     }
 
 

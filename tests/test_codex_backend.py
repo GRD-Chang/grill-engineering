@@ -122,6 +122,44 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     assert "resume" in attempts[1]
 
 
+def test_failure_resume_rechecks_current_workspace_before_development(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompts: list[str] = []
+
+    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Rechecked the current workspace.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"developer-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {
+            "checkout": str(tmp_path),
+            "thread_id": "developer-thread",
+            "_invocation_mode": "resume",
+        }
+    )
+
+    assert "因前次调用失败而继续的同 Thread Resume" in prompts[0]
+    assert "重新核验权威输入和实际工作" in prompts[0]
+
+
 @pytest.mark.parametrize(
     ("stdout", "stderr", "expected"),
     [

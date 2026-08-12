@@ -116,6 +116,8 @@ class RunPublicationShared:
         }
         if publication.get("prior_human_blockers"):
             request["prior_human_blockers"] = publication["prior_human_blockers"]
+        if publication.get("human_response_history"):
+            request["human_response_history"] = publication["human_response_history"]
         if publication.get("thread_id"):
             request["thread_id"] = publication.get("thread_id")
         return request

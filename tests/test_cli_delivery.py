@@ -260,6 +260,91 @@ def test_ticket_human_response_reaches_fresh_acceptance(
     assert job["phase"] == "completed"
 
 
+@pytest.mark.parametrize(
+    ("resume_args", "expected_thread", "successor_thread"),
+    [
+        ((), "ticket-reviewer-1", "ticket-reviewer-1"),
+        (("--new-thread",), None, "ticket-reviewer-2"),
+    ],
+)
+def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
+    git_repo: Path,
+    resume_args: tuple[str, ...],
+    expected_thread: str | None,
+    successor_thread: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    failed_agents = git_repo / "failed-ticket-review.json"
+    failed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "ticket-developer",
+                        "summary": "Completed the Ticket candidate.",
+                        "write_files": {"feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [],
+                "reviews": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "ticket-reviewer-1",
+                        "error": "simulated reviewer timeout",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    failed = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(failed_agents),
+    )
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+
+    resumed_agents = git_repo / "resumed-ticket-review.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [],
+                "publications": [publication()],
+                "reviews": [
+                    {
+                        **passing_acceptance(
+                            successor_thread,
+                            "The resumed Fresh Acceptance passed.",
+                        ),
+                        "expected_thread_id": expected_thread,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        *resume_args,
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert job["phase"] == "completed"
+    assert job["reviewer_thread_ids"] == [successor_thread]
+
+
 def assert_human_status_and_history(
     git_repo: Path,
     fixture: Path,
