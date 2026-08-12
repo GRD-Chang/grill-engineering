@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.artifacts import AcceptanceArtifact
@@ -186,7 +186,7 @@ class FixtureAgentBackend:
                 event("completed", reported_thread_id=thread_id, attempt_count=1)
             return HumanBlockerResult(
                 thread_id=str(thread_id),
-                human_blockers=blockers,
+                human_blockers=tuple(result["human_blockers"]),
             )
         if "invalid" in step:
             error = "scripted invalid Publication Artifact"
@@ -284,23 +284,77 @@ class FixtureAgentBackend:
             event("thread_started", reported_thread_id=thread_id, attempt_count=1)
         result = _publication_wire(step)
         result["_thread_id"] = thread_id
-        if callable(event) and has_expected_thread:
-            try:
-                normalized = parse_publication_wire_result(result)
-                if normalized["result_kind"] == "publication":
-                    PublicationArtifact.parse(
-                        normalized, delivery_run=str(request.get("run_id", "fixture"))
-                    )
-            except ValueError as error:
-                event(
-                    "failed",
-                    reported_thread_id=thread_id,
-                    attempt_count=1,
-                    error=str(error),
-                )
-                raise
-            event("completed", reported_thread_id=thread_id, attempt_count=1)
         return result
+
+    def _output_attempts(
+        self,
+        name: str,
+        request: dict[str, Any],
+        *,
+        default_thread: str,
+        decode: Callable[[dict[str, Any]], dict[str, Any]],
+        validate: Callable[[dict[str, Any]], object],
+    ) -> tuple[dict[str, Any], str]:
+        event = request.get("_invocation_event")
+        notify = event if callable(event) else lambda _kind, **_facts: None
+        current_thread = request.get("thread_id")
+        if current_thread is not None and not isinstance(current_thread, str):
+            raise ValueError("agent fixture request thread_id must be a string")
+        notify(
+            "started",
+            requested_thread_id=current_thread,
+            attempt_count=0,
+            invocation_mode=request.get("_invocation_mode"),
+        )
+        currentness = request.get("_currentness_check")
+        for attempt in range(1, 4):
+            if attempt > 1 and callable(currentness) and not currentness():
+                message = "Fixture currentness changed before Output Repair"
+                notify("failed", attempt_count=attempt - 1, error=message)
+                raise ValueError(message)
+            try:
+                step = self._next(name)
+                has_expected_thread = "expected_thread_id" in step
+                expected_thread = step.pop("expected_thread_id", None)
+                if expected_thread is not None and not isinstance(expected_thread, str):
+                    raise ValueError("expected_thread_id must be a string or null")
+                if has_expected_thread and expected_thread != current_thread:
+                    raise ValueError("agent fixture expected a different Thread ID")
+                configured_thread = step.pop("thread_id", None)
+                if configured_thread is not None and (
+                    not isinstance(configured_thread, str)
+                    or not configured_thread.strip()
+                ):
+                    raise ValueError("thread_id must be a non-empty string")
+            except ValueError as error:
+                notify("failed", attempt_count=attempt, error=str(error))
+                raise
+            reported_thread = configured_thread or current_thread or default_thread
+            notify(
+                "thread_started",
+                reported_thread_id=reported_thread,
+                attempt_count=attempt,
+            )
+            if current_thread is not None and reported_thread != current_thread:
+                message = "agent fixture resume reported a different Thread ID"
+                notify("failed", attempt_count=attempt, error=message)
+                raise ValueError(message)
+            current_thread = reported_thread
+            try:
+                result = decode(step)
+                validate(result)
+            except ValueError as error:
+                if attempt < 3:
+                    continue
+                notify("failed", attempt_count=attempt, error=str(error))
+                raise
+            notify(
+                "completed",
+                reported_thread_id=current_thread,
+                attempt_count=attempt,
+            )
+            return result, current_thread
+        raise AssertionError("unreachable")
 
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)
@@ -332,6 +386,32 @@ def _human_blockers(data: dict[str, Any]) -> tuple[str, ...] | None:
     ):
         raise ValueError("human_blockers must contain non-empty strings")
     return tuple(value)
+
+
+def _review_artifact(data: dict[str, Any]) -> dict[str, Any]:
+    artifact = data.get("artifact")
+    if isinstance(artifact, dict):
+        return dict(artifact)
+    return dict(data)
+
+
+def _publication_result(data: dict[str, Any]) -> dict[str, Any]:
+    blockers = _human_blockers(data)
+    if blockers is not None:
+        return {
+            "result_kind": "human_blocker",
+            "commit_message": None,
+            "pr_title": None,
+            "pr_body_markdown": None,
+            "human_blockers": list(blockers),
+        }
+    return _publication_wire(data)
+
+
+def _validate_publication(data: dict[str, Any], *, delivery_run: str) -> None:
+    normalized = parse_publication_wire_result(data)
+    if normalized["result_kind"] == "publication":
+        PublicationArtifact.parse(normalized, delivery_run=delivery_run)
 
 
 def _publication_wire(data: dict[str, Any]) -> dict[str, Any]:

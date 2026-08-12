@@ -666,6 +666,49 @@ def test_run_acceptance_discards_a_review_when_its_parent_snapshot_drifts(
     assert "acceptance_record" not in pending["run_acceptance"]
 
 
+def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
+    git_repo: Path,
+) -> None:
+    state, states, _git = _completed_run(git_repo)
+    agents = git_repo / "repair-run-review.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "run_reviews": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "run-reviewer-thread",
+                        "artifact": {"invalid": "acceptance"},
+                    },
+                    {
+                        "expected_thread_id": "run-reviewer-thread",
+                        "thread_id": "run-reviewer-thread",
+                        "artifact": _passing_artifact(),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accepted = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "accept-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    invocation = persisted["active_agent_invocation"]
+    assert invocation["status"] == "completed"
+    assert invocation["reported_thread_id"] == "run-reviewer-thread"
+    assert invocation["attempt_count"] == 2
+
+
 def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     git_repo: Path,
 ) -> None:

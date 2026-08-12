@@ -720,6 +720,126 @@ def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
     assert persisted["terminal_kind"] == "execution_failed"
     assert persisted["run_publication"]["phase"] == "publishing"
     assert persisted["run_publication"]["publication_attempts"] == 1
+    invocation = persisted["active_agent_invocation"]
+    assert invocation["role"] == "final_publication"
+    assert invocation["status"] == "failed"
+
+
+def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
+    git_repo: Path,
+) -> None:
+    state, states, _git, _publisher = _accepted_run(git_repo)
+    agents = git_repo / "repair-run-publication.json"
+    artifact = RunPublicationAgents().run_publication({})
+    agents.write_text(
+        json.dumps(
+            {
+                "run_publications": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "run-publication-thread",
+                        "invalid": "publication",
+                    },
+                    {
+                        "expected_thread_id": "run-publication-thread",
+                        "thread_id": "run-publication-thread",
+                        **artifact,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    published = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "publish-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert published.returncode == 0, published.stderr
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    invocation = persisted["active_agent_invocation"]
+    assert invocation["status"] == "completed"
+    assert invocation["reported_thread_id"] == "run-publication-thread"
+    assert invocation["attempt_count"] == 2
+
+
+def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
+    git_repo: Path,
+) -> None:
+    state, states, _git, _publisher = _accepted_run(git_repo)
+    failed_agents = git_repo / "failed-run-publication.json"
+    failed_agents.write_text(
+        json.dumps(
+            {
+                "run_publications": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "failed-run-publication-thread",
+                        "invalid": "publication",
+                    },
+                    {
+                        "expected_thread_id": "failed-run-publication-thread",
+                        "thread_id": "failed-run-publication-thread",
+                        "invalid": "publication",
+                    },
+                    {
+                        "expected_thread_id": "failed-run-publication-thread",
+                        "thread_id": "failed-run-publication-thread",
+                        "invalid": "publication",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "publish-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(failed_agents),
+    )
+    assert failed.returncode == 2
+
+    resumed_agents = git_repo / "resumed-run-publication.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "run_publications": [
+                    {
+                        "expected_thread_id": "failed-run-publication-thread",
+                        "thread_id": "failed-run-publication-thread",
+                        **RunPublicationAgents().run_publication({}),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "resume",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    history = persisted["agent_invocation_history"]
+    assert history[-2]["status"] == "failed"
+    assert history[-2]["attempt_count"] == 3
+    assert history[-1]["status"] == "completed"
+    assert history[-1]["attempt_count"] == 1
 
 
 def test_publish_run_retries_only_exhausted_final_run_publication(
