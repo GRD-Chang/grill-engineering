@@ -56,6 +56,13 @@ class RunPublicationShared:
         run = self._mapping(state, "run_acceptance")
         for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
             run.pop(key, None)
+        for key in (
+            "human_response_history",
+            "human_response_generation",
+            "prior_human_blockers",
+        ):
+            run.pop(key, None)
+        run["acceptance_generation"] = int(run.get("acceptance_generation", 1)) + 1
         run["phase"] = "pending"
         publication = self._publication_state(state)
         if publication["phase"] not in {"merged", "abandoned"}:

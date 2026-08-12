@@ -336,6 +336,7 @@ class RunAcceptanceEngine:
             "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
             "modification_attempts": int(run["modification_attempts"]),
             "validation_attempts": 0,
+            "acceptance_generation": 1,
             "development_thread_id": None,
             "development_thread_history": [],
             "reviewer_thread_ids": prior_threads,
@@ -395,6 +396,13 @@ class RunAcceptanceEngine:
             return
         for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
             run.pop(key, None)
+        for key in (
+            "human_response_history",
+            "human_response_generation",
+            "prior_human_blockers",
+        ):
+            run.pop(key, None)
+        run["acceptance_generation"] = int(run.get("acceptance_generation", 1)) + 1
         run["phase"] = "pending"
 
     def _review_request(
@@ -436,7 +444,7 @@ class RunAcceptanceEngine:
                 if (
                     history := current_human_response_history(
                         run,
-                        generation=int(run.get("human_response_generation", 1)),
+                        generation=int(run.get("acceptance_generation", 1)),
                     )
                 )
                 else {}

@@ -168,7 +168,7 @@ class RunPublicationFlow(RunPublicationShared):
             role="final_publication",
             phase="run_publication",
             work_subject=f"run-publication:{state['run_id']}",
-            generation=int(run.get("validation_attempts", 1)),
+            generation=int(run.get("acceptance_generation", 1)),
             invocation_input=request,
             currentness_boundary={
                 "reviewed_head_sha": acceptance["reviewed_head_sha"],

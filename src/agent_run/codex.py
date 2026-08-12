@@ -406,11 +406,11 @@ class CodexCliBackend:
             prompt = (
                 "这是一次因前次调用失败而继续的同 Thread Resume。请基于当前 workspace "
                 "重新核验权威输入和实际工作，再满足完整阶段 contract。\n\n" + prompt
-            )
+        )
         for attempt in range(1, 4):
-            if attempt > 1 and callable(currentness) and not currentness():
+            if callable(currentness) and not currentness():
                 stale = CodexProcessError(
-                    f"{output_name} currentness changed before Output Repair"
+                    f"{output_name} currentness changed before Invocation"
                 )
                 notify("failed", attempt_count=attempt - 1, error=str(stale))
                 raise stale
@@ -455,6 +455,12 @@ class CodexCliBackend:
                     continue
                 notify("failed", attempt_count=attempt, error=validation_error)
                 raise CodexProcessError(validation_error) from error
+            if callable(currentness) and not currentness():
+                stale = CodexProcessError(
+                    f"{output_name} currentness changed before result application"
+                )
+                notify("failed", attempt_count=attempt, error=str(stale))
+                raise stale
             notify(
                 "completed",
                 reported_thread_id=current_thread,

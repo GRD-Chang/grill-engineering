@@ -174,7 +174,10 @@ def _prepared_resume(
         role = "publication"
         work_subject = f"run-repair:{run_id}"
     elif subject_kind == "final_publication":
-        state["run_acceptance"] = {"validation_attempts": 2}
+        state["run_acceptance"] = {
+            "validation_attempts": 2,
+            "acceptance_generation": 2,
+        }
         state["run_publication"] = {"thread_id": "current-final-thread"}
         role = "final_publication"
         work_subject = f"run-publication:{run_id}"

@@ -396,7 +396,7 @@ def _resume_agent_human_blocker(
             acceptance,
             blockers,
             human_response,
-            generation=int(acceptance.get("human_response_generation", 1)),
+            generation=int(acceptance.get("acceptance_generation", 1)),
         )
         acceptance.update(
             {
@@ -553,7 +553,7 @@ def _publication_job_for_invocation(
             raise ValueError("current Final Publication job is missing")
         acceptance = state.get("run_acceptance")
         current_generation = (
-            acceptance.get("validation_attempts")
+            acceptance.get("acceptance_generation", 1)
             if isinstance(acceptance, dict)
             else None
         )
@@ -748,7 +748,7 @@ def _publication_generation(state: dict[str, Any]) -> int:
             return current
     acceptance = state.get("run_acceptance")
     if isinstance(acceptance, dict):
-        generation = acceptance.get("validation_attempts")
+        generation = acceptance.get("acceptance_generation")
         if isinstance(generation, int):
             return generation
     return 1
