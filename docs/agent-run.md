@@ -34,7 +34,7 @@ agent-run history <run-id> --repo OWNER/REPO
 ```bash
 agent-run start <parent-issue> --repo OWNER/REPO
 agent-run deliver <run-id> --repo OWNER/REPO
-agent-run resume <run-id> [--new-thread] --repo OWNER/REPO
+agent-run resume <run-id> [--new-thread] [--message "..."] --repo OWNER/REPO
 agent-run accept-run <run-id> --repo OWNER/REPO
 agent-run publish-run <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
@@ -50,10 +50,13 @@ AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
 Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.started` 会在进程仍运行时
 立即保存。`history --json` 的 `agent_invocations` 保留每次调用的 Work Subject、Generation、
 输入指纹、Currentness Boundary、模式、requested/reported Thread、Output Attempt 数量、时间和
-有界错误；它不保存 Prompt、transcript 或 Acceptance Artifact。Publication 的非法结构化输出
-会在同一 Thread、只读 checkout 中最多修复两次；进程失败不会自动重试或替换 Thread。
-`resume` 默认复用已保存 Thread，`--new-thread` 明确丢弃当前 Publication Thread 身份并使用
-标准阶段 Prompt 新开 Thread。
+有界错误；它不保存 Prompt、transcript 或 Acceptance Artifact。Ticket、Parent-only 和 Run Repair
+的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
+同一 Thread、只读 checkout 中最多修复两次，且不增加领域 attempt；进程失败不会自动重试或替换
+Thread。`resume` 默认复用已保存 Thread，`--new-thread` 明确丢弃当前失败或 Human Blocker 阶段的
+Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许用于当前 Human Blocker；它 trim
+后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
+和 Fresh Acceptance 的权威上下文，不修改 Issue、不触发 Requeue、也不等同于 `revise` 的 Run Feedback。
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 

@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="为当前失败或人工阻塞的 Agent 阶段新开 Thread",
     )
+    resume.add_argument(
+        "--message",
+        help="仅用于当前 Human Blocker 的未经改写人工响应（最多 8 KiB）",
+    )
     deliver = subcommands.add_parser(
         "deliver", help="交付当前 Active Ticket Job"
     )
@@ -144,6 +148,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed.run_id,
                 resume_human_blocker=True,
                 new_thread=parsed.new_thread,
+                human_response=parsed.message,
             )
             if state.get("status") == "unsupported_scope_change":
                 cli_presentation._print_precondition_failure(state)
@@ -595,8 +600,9 @@ def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
     invocation = state.get("active_agent_invocation")
     if (
         isinstance(invocation, dict)
-        and invocation.get("status") == "failed"
-        and invocation.get("role") in {"publication", "final_publication"}
+        and invocation.get("status") in {"failed", "resuming"}
+        and invocation.get("role")
+        in {"development", "fresh_acceptance", "publication", "final_publication"}
     ):
         return True
     for key in ("active_ticket_job", "parent_job"):

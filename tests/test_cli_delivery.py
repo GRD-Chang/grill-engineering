@@ -110,6 +110,156 @@ def human_blocker_step(thread_id: str) -> dict[str, object]:
     }
 
 
+def test_resume_human_blocker_records_bounded_response_and_reuses_development_thread(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    blocked_agents = git_repo / "blocked-agents.json"
+    blocked_agents.write_text(
+        json.dumps(
+            {
+                "developments": [human_blocker_step("parent-developer")],
+                "publications": [],
+                "reviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    blocked = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(blocked_agents),
+    )
+    assert blocked.returncode == 2
+
+    resumed_agents = git_repo / "resumed-agents.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": "parent-developer",
+                        "thread_id": "parent-developer",
+                        "summary": "Access was restored and the Parent request is complete.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer", "The resumed candidate passed.")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--message",
+        "  Access has been granted.  ",
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    job = load_only_run_state(git_repo)["parent_job"]
+    assert job["development_thread_id"] == "parent-developer"
+    assert job["human_response_history"] == [
+        {
+            "human_blockers": [HUMAN_BLOCKER],
+            "response": "Access has been granted.",
+        }
+    ]
+    assert job["phase"] == "ready_for_approval"
+    invocations = load_only_run_state(git_repo)["agent_invocation_history"]
+    assert [item["role"] for item in invocations[-3:]] == [
+        "development",
+        "fresh_acceptance",
+        "publication",
+    ]
+
+
+def test_ticket_human_response_reaches_fresh_acceptance(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    blocked_agents = git_repo / "blocked-ticket-agents.json"
+    blocked_agents.write_text(
+        json.dumps(
+            {
+                "developments": [human_blocker_step("ticket-developer")],
+                "publications": [],
+                "reviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    blocked = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(blocked_agents),
+    )
+    assert blocked.returncode == 2
+
+    response_history = [
+        {
+            "human_blockers": [HUMAN_BLOCKER],
+            "response": "Issue read access has been granted.",
+        }
+    ]
+    resumed_agents = git_repo / "resumed-ticket-agents.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": "ticket-developer",
+                        "thread_id": "ticket-developer",
+                        "summary": "Completed the Ticket after access was granted.",
+                        "write_files": {"feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [publication()],
+                "reviews": [
+                    {
+                        **passing_acceptance(
+                            "ticket-reviewer", "The resumed Ticket passed."
+                        ),
+                        "expected_human_response_history": response_history,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--message",
+        response_history[0]["response"],
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert job["human_response_history"] == response_history
+    assert job["phase"] == "completed"
+
+
 def assert_human_status_and_history(
     git_repo: Path,
     fixture: Path,
@@ -366,8 +516,8 @@ def test_parent_only_publication_human_blocker_stops_before_pr_mutation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    publication_blocker = human_blocker_step("parent-publication-blocked")
-    publication_blocker.pop("expected_thread_id")
+    publication_blocker = human_blocker_step("parent-developer")
+    publication_blocker["expected_thread_id"] = "parent-developer"
     agents = git_repo / "parent-publication-human.json"
     agents.write_text(
         json.dumps(
@@ -404,14 +554,14 @@ def test_parent_only_publication_human_blocker_stops_before_pr_mutation(
     job = load_only_run_state(git_repo)["parent_job"]
     assert job["phase"] == "blocked"
     assert job["human_blocker_phase"] == "accepted"
-    assert job["publication_thread_id"] == "parent-publication-blocked"
+    assert job["publication_thread_id"] == "parent-developer"
     assert job["publication_attempts"] == 1
     assert "publication_sha" not in job
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
         "pull_requests"
     ] == []
     assert_human_status_and_history(
-        git_repo, fixture, run_id, "parent-publication-blocked"
+        git_repo, fixture, run_id, "parent-developer"
     )
     agents.write_text(
         json.dumps(
@@ -1305,8 +1455,8 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = git_repo / "ticket-publication-human.json"
-    publication_blocker = human_blocker_step("ticket-publication-blocked")
-    publication_blocker.pop("expected_thread_id")
+    publication_blocker = human_blocker_step("ticket-developer")
+    publication_blocker["expected_thread_id"] = "ticket-developer"
     agents.write_text(
         json.dumps(
             {
@@ -1342,7 +1492,7 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
     job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
     assert job["phase"] == "blocked"
     assert job["human_blocker_phase"] == "accepted"
-    assert job["publication_thread_id"] == "ticket-publication-blocked"
+    assert job["publication_thread_id"] == "ticket-developer"
     assert job["publication_attempts"] == 1
     assert "publication_sha" not in job
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
@@ -1353,7 +1503,7 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
         git_repo,
         fixture,
         run_id,
-        "ticket-publication-blocked",
+        "ticket-developer",
         expected_status="progress_exhausted",
     )
     agents.write_text(
@@ -1462,6 +1612,17 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     state_path.write_text(
         json.dumps(failed_state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    bypass = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+    assert bypass.returncode == 2
+    assert stdout_json(bypass)["status"] == "execution_failed"
 
     agent_fixture.write_text(
         json.dumps(

@@ -29,7 +29,7 @@ Development–Acceptance Engine 处理 Ticket Job、Parent-only Delivery 或 Run
 _Avoid_: Development Brief、Agent Artifact、Controller 全局配置
 
 **Development Thread（开发线程）**:
-一个 Change Job 独有并跨 Development Attempt 复用的持久 Codex Thread。它保存该任务的开发与修复上下文，但每个 Turn 都必须重新提供当前权威 Issue 引用、准备好的 checkout 和适用的原始反馈证据；其身份由 Change Job Record 保存，不与任何 Reviewer Thread 共享。因 Human Blocker 暂停后，`resume` 必须复用原 Thread 与保留的工作区，并让 Codex 重新核验；Thread 无法恢复时，Controller 才自动创建替代 Thread。
+一个 Change Job 独有并跨 Development Attempt 复用的持久 Codex Thread。它保存该任务的开发与修复上下文，但每个 Turn 都必须重新提供当前权威 Issue 引用、准备好的 checkout 和适用的原始反馈证据；其身份由 Change Job Record 保存，不与任何 Reviewer Thread 共享。因 Human Blocker 或 `execution_failed` 暂停后，`resume` 默认复用原 Thread 与保留的工作区并让 Codex 重新核验；Thread 无法恢复时停止为 `execution_failed`，只能由维护者显式用 `--new-thread` 开启标准阶段 Prompt 的新 Thread。
 _Avoid_: Development Attempt、Reviewer Thread、Delivery Run 全局会话
 
 **Change Job Record（变更任务记录）**:
@@ -97,7 +97,7 @@ Run Acceptance 通过后由 Controller 启动的只读 YOLO Codex，读取 Paren
 _Avoid_: Run Acceptance Reviewer、Controller 拼接正文、Run Repair Thread
 
 **Run Repair Thread（运行修复线程）**:
-Delivery Run 独有并跨最终集成修复 Attempt 复用的持久 Development Codex Thread。它只接收 Run Acceptance Artifact、Run PR CI Evidence 或默认分支合并冲突证据，以及 Parent Spec、完整 Run diff 和当前 Run Repair checkout，不复用任何 Ticket Development Thread；无法恢复时按 Development Thread 的相同规则自动重建。
+Delivery Run 独有并跨最终集成修复 Attempt 复用的持久 Development Codex Thread。它只接收 Run Acceptance Artifact、Run PR CI Evidence 或默认分支合并冲突证据，以及 Parent Spec、完整 Run diff 和当前 Run Repair checkout，不复用任何 Ticket Development Thread；无法恢复时按 Development Thread 的相同显式 Resume / `--new-thread` 规则停止或恢复。
 _Avoid_: Ticket Development Thread、Run Reviewer Thread、人工修复会话
 
 **Run Repair Job（运行修复任务）**:
@@ -217,7 +217,7 @@ _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方�
 _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
 
 **Human Blocker（人工阻塞）**:
-顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在现有 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；Development 等普通顶层阶段以唯一替代输出 `{"human_blockers":["…"]}` 表达；Ticket、Parent-only、Run Repair 与 Final Run Publication 则遵守统一的五字段 flat wire contract，以 `result_kind: "human_blocker"`、三个 Publication 字段为 `null`、非空 `human_blockers` 表达。Controller 只保存、展示与在 resume 时原样传回它，不解释或裁决其语义。恢复成功后当前 blocker 告警会清除，最近的原始 blocker 尝试仍作为有界历史保留。
+顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；可选的不可变 Human Response 仅绑定当前 Job Generation，按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。恢复成功后当前 blocker 告警会清除，最近的原始 blocker/response 尝试仍作为有界历史保留。
 _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
 **Review Finding（审查发现）**:
@@ -245,14 +245,15 @@ Development–Acceptance Engine 在独立验收后本地持久化的权威记录
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Agent Invocation（Agent 调用）**:
-Controller 对一次阶段级 Codex 调用的持久记录。Publication Invocation 在首个 Output
-Attempt 前成为 active，并绑定 Work Subject、Generation、输入指纹与机械 Currentness Boundary；
-记录只保存输入指纹和有界边界事实，不保存 Prompt、transcript 或 Acceptance Artifact。
-`thread.started` 在进程运行中立即保存。零退出但不符合完整 wire contract 的输出可在同一
-Thread、只读 checkout 中最多修复两次；进程失败、缺失或不匹配的 Thread 只结束当前
-Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原 Thread，或用
-`--new-thread` 明确以标准阶段 Prompt 新开 Thread。
-_Avoid_: Development Attempt、自动替代 Thread、领域 Publication retry
+Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
+Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output Attempt 前成为 active，
+并绑定 Work Subject、Generation、输入指纹与机械 Currentness Boundary；记录只保存输入指纹和
+有界边界事实，不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
+立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
+checkout 只读，且不增加领域 Development、Validation 或 Publication Attempt。进程失败、缺失或
+不匹配的 Thread 只结束当前 Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原
+Thread，或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
+_Avoid_: Development Attempt、自动替代 Thread、领域 retry
 
 **Ticket Repair Budget（Ticket 修复预算）**:
 一个 Ticket Job 在 Fresh Acceptance 或 CI 失败后最多可触发十次自动修复 Development Attempt。等待 CI、重复读取状态或对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的修复 Attempt 才计数。预算耗尽、Git 完整性检查无法通过或 CI 无法自动修复时，Ticket 转为 `ready-for-human`；Controller 继续推进不依赖该 Ticket 的其他任务。

@@ -174,13 +174,19 @@ class ChangeDeliveryEngine:
         # running, and leaves an observable recovery boundary on interruption.
         job["pending_attempt"] = attempt
         self.contract.save(state)
-        result = self.agents.develop(
-            self.contract.development_request(state, job, checkout)
+        request = self.contract.development_request(state, job, checkout)
+        request["_invocation_event"] = self._invocation_events(
+            state, job, request, role="development", phase=str(job["phase"])
         )
+        request["_currentness_check"] = lambda: self._agent_is_current(state, job)
+        if job.get("development_new_thread") is True:
+            request["_invocation_mode"] = "new-thread"
+        result = self.agents.develop(request)
         if isinstance(result, HumanBlockerResult):
             if not self.contract.development_thread_is_allowed(state, result.thread_id):
                 raise ValueError("Change Job Development Thread is not independent")
             _record_development_thread(job, result.thread_id, result.replaced_thread_id)
+            job.pop("development_new_thread", None)
             self._wait_for_human(
                 state, job, phase=str(job["phase"]), blockers=result.human_blockers
             )
@@ -190,6 +196,7 @@ class ChangeDeliveryEngine:
         if not self.contract.development_thread_is_allowed(state, result.thread_id):
             raise ValueError("Change Job Development Thread is not independent")
         _record_development_thread(job, result.thread_id, result.replaced_thread_id)
+        job.pop("development_new_thread", None)
         job["development_summary"] = result.summary
         clear_current_human_blocker(job)
         job["phase"] = "committing_candidate"
@@ -252,7 +259,7 @@ class ChangeDeliveryEngine:
             job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
             self.contract.save(state)
             request["_invocation_event"] = self._invocation_events(
-                state, job, request, phase="publication"
+                state, job, request, role="publication", phase="publication"
             )
             request["_currentness_check"] = lambda: self._publication_is_current(
                 state, job
@@ -331,25 +338,18 @@ class ChangeDeliveryEngine:
         job: dict[str, Any],
         request: dict[str, Any],
         *,
+        role: str = "publication",
         phase: str,
     ) -> Callable[..., None]:
-        acceptance = job.get("acceptance_record")
-        if not isinstance(acceptance, dict):
-            raise ValueError("Publication requires a current Acceptance Record")
-        if isinstance(job.get("ticket_number"), int):
-            work_subject = f"ticket:{int(job['ticket_number'])}"
-            generation = int(job.get("ticket_branch_generation", 1))
-        elif isinstance(job.get("repair_generation"), int):
-            work_subject = f"run-repair:{state['run_id']}"
-            generation = int(job["repair_generation"])
-        else:
-            work_subject = f"parent-only:{state['run_id']}"
-            generation = 1
+        work_subject, generation = self._invocation_identity(state, job)
         boundary: dict[str, Any] = {
             "base_sha": str(job["base_sha"]),
-            "candidate_sha": str(job["candidate_sha"]),
-            "candidate_tree": str(acceptance["reviewed_candidate_tree"]),
         }
+        if "candidate_sha" in job:
+            boundary["candidate_sha"] = str(job["candidate_sha"])
+        acceptance = job.get("acceptance_record")
+        if isinstance(acceptance, dict) and "reviewed_candidate_tree" in acceptance:
+            boundary["candidate_tree"] = str(acceptance["reviewed_candidate_tree"])
         for key in ("effective_revision", "parent_revision", "ticket_graph_revision"):
             if key in job:
                 boundary[key] = job[key]
@@ -359,7 +359,7 @@ class ChangeDeliveryEngine:
             )
         return invocation_event_recorder(
             state,
-            role="publication",
+            role=role,
             phase=phase,
             work_subject=work_subject,
             generation=generation,
@@ -367,6 +367,19 @@ class ChangeDeliveryEngine:
             currentness_boundary=boundary,
             save=self.contract.save,
         )
+
+    @staticmethod
+    def _invocation_identity(
+        state: dict[str, Any], job: dict[str, Any]
+    ) -> tuple[str, int]:
+        if isinstance(job.get("ticket_number"), int):
+            return (
+                f"ticket:{int(job['ticket_number'])}",
+                int(job.get("ticket_branch_generation", 1)),
+            )
+        if isinstance(job.get("repair_generation"), int):
+            return f"run-repair:{state['run_id']}", int(job["repair_generation"])
+        return f"parent-only:{state['run_id']}", 1
 
     def _review(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -380,12 +393,20 @@ class ChangeDeliveryEngine:
         )
         try:
             self.contract.prepare_validation(checkout, job, validation)
-            review = self.agents.review(
-                self.contract.review_request(state, job, validation)
+            request = self.contract.review_request(state, job, validation)
+            request["_invocation_event"] = self._invocation_events(
+                state, job, request, role="fresh_acceptance", phase="reviewing"
             )
+            request["_currentness_check"] = lambda: self._agent_is_current(state, job)
+            if job.get("review_new_thread") is True:
+                request["_invocation_mode"] = "new-thread"
+            review = self.agents.review(request)
         finally:
             self.git.remove_worktree(validation)
-        _record_reviewer(job, review.thread_id)
+        _record_reviewer(
+            job, review.thread_id, new_thread=job.get("review_new_thread") is True
+        )
+        job.pop("review_new_thread", None)
         # Persist the identity before parsing the Artifact.  A malformed
         # reviewer response must not make the same Reviewer appear fresh on
         # resume.
@@ -721,6 +742,12 @@ class ChangeDeliveryEngine:
             and not self.contract.revision_changed(state, job)
         )
 
+    def _agent_is_current(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+        return (
+            self.git.resolve(self.contract.base_branch(state)) == job.get("base_sha")
+            and not self.contract.revision_changed(state, job)
+        )
+
     def _reject_stale(
         self, state: dict[str, Any], job: dict[str, Any], message: str
     ) -> None:
@@ -761,14 +788,16 @@ def _record_development_thread(
     job["development_thread_id"] = thread_id
 
 
-def _record_reviewer(job: dict[str, Any], thread_id: str) -> None:
+def _record_reviewer(
+    job: dict[str, Any], thread_id: str, *, new_thread: bool = False
+) -> None:
     history = _string_list(job, "development_thread_history")
     development_ids = {str(job.get("development_thread_id", "")), *history}
     reviewers = _string_list(job, "reviewer_thread_ids")
     if thread_id in development_ids:
         raise ValueError("Fresh Acceptance cannot reuse the Development Thread")
     resumed = bool(job.get("prior_human_blockers"))
-    if resumed and thread_id != latest_reviewer_thread(job):
+    if resumed and not new_thread and thread_id != latest_reviewer_thread(job):
         raise ValueError(
             "Human Blocker resume requires the latest Reviewer Thread"
         )

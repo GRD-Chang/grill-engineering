@@ -85,6 +85,43 @@ def test_publication_repairs_invalid_output_in_same_thread(
     )
 
 
+def test_development_repairs_invalid_output_in_same_thread_without_second_write(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    attempts: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_options: Any) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {"invalid": "development"}
+                if len(attempts) == 1
+                else {
+                    "result_kind": "development",
+                    "summary": "Reformatted the completed development result.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"development-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {"checkout": str(tmp_path)}
+    )
+
+    assert result.thread_id == "development-thread"
+    assert len(attempts) == 2
+    assert "resume" in attempts[1]
+
+
 @pytest.mark.parametrize(
     ("stdout", "stderr", "expected"),
     [
@@ -246,7 +283,14 @@ def test_codex_worker_environment_excludes_publisher_credentials(
         gh_config = Path(environment["GH_CONFIG_DIR"])
         output_index = arguments.index("--output-last-message") + 1
         Path(arguments[output_index]).write_text(
-            "Implemented and tested.\n", encoding="utf-8"
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Implemented and tested.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
         )
         return subprocess.CompletedProcess(
             arguments,
@@ -311,26 +355,32 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     ) -> subprocess.CompletedProcess[str]:
         prompts.append(str(options["prompt"]))
         output_index = arguments.index("--output-last-message") + 1
-        output = "Implemented and tested."
+        output = json.dumps(
+            {
+                "result_kind": "development",
+                "summary": "Implemented and tested.",
+                "human_blockers": None,
+            }
+        )
         if "--output-schema" in arguments:
             schema_index = arguments.index("--output-schema") + 1
-            schemas.append(
-                json.loads(Path(arguments[schema_index]).read_text(encoding="utf-8"))
-            )
-            output = json.dumps(
-                {
-                    "verdict": "pass",
-                    "checks": {
-                        lane: {
-                            "status": "pass",
-                            "evidence": f"{lane} independently passed.",
-                        }
-                        for lane in ("e2e", "standards", "spec")
-                    },
-                    "findings": [],
-                    "human_blockers": [],
-                }
-            )
+            schema = json.loads(Path(arguments[schema_index]).read_text(encoding="utf-8"))
+            schemas.append(schema)
+            if "verdict" in schema["properties"]:
+                output = json.dumps(
+                    {
+                        "verdict": "pass",
+                        "checks": {
+                            lane: {
+                                "status": "pass",
+                                "evidence": f"{lane} independently passed.",
+                            }
+                            for lane in ("e2e", "standards", "spec")
+                        },
+                        "findings": [],
+                        "human_blockers": [],
+                    }
+                )
         Path(arguments[output_index]).write_text(output, encoding="utf-8")
         return subprocess.CompletedProcess(
             arguments,
@@ -367,8 +417,9 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert acceptance.count("skill:code-review") >= 2
     assert "不得替代" in acceptance
     assert "findings 与 human_blockers 必须都是空数组" in acceptance
-    assert len(schemas) == 1
-    assert "allOf" not in schemas[0]
+    assert len(schemas) == 2
+    assert all("allOf" not in schema for schema in schemas)
+    assert schemas[0]["required"] == ["result_kind", "summary", "human_blockers"]
 
 
 def test_publication_prompts_require_semantic_titles() -> None:
@@ -487,7 +538,14 @@ def test_development_prompt_matches_normal_and_repair_contracts(
         prompts.append(str(options["prompt"]))
         output_index = arguments.index("--output-last-message") + 1
         Path(arguments[output_index]).write_text(
-            "Implemented and tested.\n", encoding="utf-8"
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Implemented and tested.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
         )
         return subprocess.CompletedProcess(
             arguments,
@@ -581,6 +639,8 @@ def test_development_human_blocker_is_an_exact_result(
         Path(arguments[output_index]).write_text(
             json.dumps(
                 {
+                    "result_kind": "human_blocker",
+                    "summary": None,
                     "human_blockers": [
                         "GitHub denied Issue read; tried gh issue view; grant read access."
                     ]
@@ -644,7 +704,7 @@ def test_development_rejects_non_exact_structured_results(
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
 
-    with pytest.raises(CodexProcessError, match="structured result|Human Blocker"):
+    with pytest.raises(CodexProcessError, match="Development result|development result"):
         CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
             {
                 "checkout": str(tmp_path),
@@ -654,7 +714,7 @@ def test_development_rejects_non_exact_structured_results(
         )
 
 
-def test_development_resume_failure_starts_replacement_with_full_context(
+def test_development_resume_failure_stops_without_replacement_thread(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -667,52 +727,34 @@ def test_development_resume_failure_starts_replacement_with_full_context(
         **options: Any,
     ) -> subprocess.CompletedProcess[str]:
         invocations.append((arguments, str(options["prompt"])))
-        if len(invocations) == 1:
-            return subprocess.CompletedProcess(
-                arguments,
-                1,
-                stdout="",
-                stderr="resume target no longer exists",
-            )
-        output_index = arguments.index("--output-last-message") + 1
-        Path(arguments[output_index]).write_text(
-            "Replacement completed the repair.\n", encoding="utf-8"
-        )
         return subprocess.CompletedProcess(
             arguments,
-            0,
-            stdout='{"type":"thread.started","thread_id":"developer-2"}\n',
-            stderr="",
+            1,
+            stdout="",
+            stderr="resume target no longer exists",
         )
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
-    result = CodexCliBackend(
-        credential_provider=lambda: "reader-secret",
-    ).develop(
-        {
-            "checkout": str(checkout),
-            "thread_id": "developer-1",
-            "parent_issue_url": "https://github.com/example/project/issues/1",
-            "task_issue_url": "https://github.com/example/project/issues/3",
-            "acceptance_artifact": {
-                "verdict": "request_changes",
-                "findings": [{"id": "F1", "problem": "Repair this."}],
-            },
-            "repair_source": "acceptance",
-        }
-    )
+    with pytest.raises(CodexProcessError, match="resume target no longer exists"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+            {
+                "checkout": str(checkout),
+                "thread_id": "developer-1",
+                "parent_issue_url": "https://github.com/example/project/issues/1",
+                "task_issue_url": "https://github.com/example/project/issues/3",
+                "acceptance_artifact": {
+                    "verdict": "request_changes",
+                    "findings": [{"id": "F1", "problem": "Repair this."}],
+                },
+                "repair_source": "acceptance",
+            }
+        )
 
-    assert result.thread_id == "developer-2"
-    assert result.replaced_thread_id == "developer-1"
+    assert len(invocations) == 1
     assert "resume" in invocations[0][0]
-    assert "resume" not in invocations[1][0]
-    replacement_prompt = invocations[1][1]
-    assert "恢复失败" in replacement_prompt
-    assert "Repair this." in replacement_prompt
-    assert "https://github.com/example/project/issues/3" in replacement_prompt
 
 
-def test_development_does_not_use_publication_streaming_callback(
+def test_development_avoids_streaming_callback_for_legacy_worker_shim(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     callback_options: list[object] = []
@@ -723,7 +765,14 @@ def test_development_does_not_use_publication_streaming_callback(
         callback_options.append(options.get("on_stdout_line"))
         output_index = arguments.index("--output-last-message") + 1
         Path(arguments[output_index]).write_text(
-            "Development completed.", encoding="utf-8"
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Development completed.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
         )
         return subprocess.CompletedProcess(
             arguments,

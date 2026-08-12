@@ -4,6 +4,7 @@ import pytest
 
 from agent_run.agent_schemas import (
     acceptance_schema,
+    development_or_human_blocker_schema,
     human_blocker_schema,
     publication_or_human_blocker_schema,
 )
@@ -16,6 +17,7 @@ from agent_run.artifacts import (
     append_human_blocker_history,
     clear_current_human_blocker,
     parse_human_blockers,
+    parse_development_wire_result,
     parse_publication_wire_result,
 )
 
@@ -72,6 +74,30 @@ def test_publication_wire_schema_is_a_flat_strict_object() -> None:
         "publication",
         "human_blocker",
     ]
+
+
+def test_development_wire_schema_and_parser_are_flat_and_mutually_exclusive() -> None:
+    schema = development_or_human_blocker_schema()
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["result_kind", "summary", "human_blockers"]
+    assert "oneOf" not in schema
+    assert parse_development_wire_result(
+        {
+            "result_kind": "development",
+            "summary": "Implemented the requested change.",
+            "human_blockers": None,
+        }
+    )["summary"] == "Implemented the requested change."
+    with pytest.raises(ValueError, match="must be null"):
+        parse_development_wire_result(
+            {
+                "result_kind": "development",
+                "summary": "Implemented the requested change.",
+                "human_blockers": ["mixed result"],
+            }
+        )
 
 
 def test_publication_result_rejects_blockers_and_unexpected_fields() -> None:

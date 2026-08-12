@@ -4,6 +4,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from agent_run.artifacts import MAX_HUMAN_BLOCKER_HISTORY
 from agent_run.graph import state_from_graph
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
@@ -72,6 +73,7 @@ class Controller:
         *,
         resume_human_blocker: bool = False,
         new_thread: bool = False,
+        human_response: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
@@ -93,12 +95,19 @@ class Controller:
             if state.get("status") == "unsupported_scope_change":
                 self.states.save_run(run_id, state)
                 return state, True
+            if human_response is not None:
+                human_response = _validated_human_response(human_response)
             if resume_human_blocker:
-                _resume_agent_human_blocker(state)
+                resumed_subject = _resume_agent_human_blocker(state, human_response)
+                if human_response is not None and not resumed_subject:
+                    raise ValueError("--message requires a current Human Blocker")
+            elif human_response is not None:
+                raise ValueError("--message requires Human Blocker resume")
             if new_thread:
-                _clear_current_publication_thread(state)
+                _clear_current_invocation_thread(state)
             else:
-                _restore_current_publication_thread(state)
+                _restore_current_invocation_thread(state)
+            _mark_failed_invocation_resuming(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
@@ -334,7 +343,9 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
+def _resume_agent_human_blocker(
+    state: dict[str, Any], human_response: str | None = None
+) -> bool:
     """Re-enter exactly one top-level Agent phase after an explicit resume.
 
     This is deliberately mechanical: Codex supplied the raw blocker text and
@@ -344,16 +355,16 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
     ticket_jobs = state.get("ticket_jobs")
     if isinstance(ticket_jobs, dict):
         for job in ticket_jobs.values():
-            if _resume_change_job(state, job, ticket=True):
-                return
+            if _resume_change_job(state, job, ticket=True, human_response=human_response):
+                return True
     parent = state.get("parent_job")
-    if _resume_change_job(state, parent, ticket=False):
-        return
+    if _resume_change_job(state, parent, ticket=False, human_response=human_response):
+        return True
     acceptance = state.get("run_acceptance")
     if not isinstance(acceptance, dict):
-        return
+        return False
     repair = acceptance.get("repair_job")
-    if _resume_change_job(state, repair, ticket=False):
+    if _resume_change_job(state, repair, ticket=False, human_response=human_response):
         acceptance["phase"] = "repairing"
         state.update(
             {
@@ -362,7 +373,7 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
                 "diagnostics": [],
             }
         )
-        return
+        return True
     if (
         acceptance.get("phase") == "ready_for_human"
         and acceptance.get("blocked_reason") in {
@@ -371,6 +382,7 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
         }
     ):
         blockers = _human_blockers(acceptance)
+        _append_human_response(acceptance, blockers, human_response)
         acceptance.update(
             {
                 "phase": str(acceptance.get("human_blocker_phase", "pending")),
@@ -385,7 +397,7 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
                 "diagnostics": [],
             }
         )
-        return
+        return True
     publication = state.get("run_publication")
     if (
         isinstance(publication, dict)
@@ -398,6 +410,7 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
                 "prior_human_blockers": _human_blockers(publication),
             }
         )
+        _append_human_response(publication, _human_blockers(publication), human_response)
         state.update(
             {
                 "status": "run_publication_pending",
@@ -405,15 +418,25 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
                 "diagnostics": [],
             }
         )
+        return True
+    return False
 
 
-def _clear_current_publication_thread(state: dict[str, Any]) -> None:
+def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     invocation = state.get("active_agent_invocation")
-    if not isinstance(invocation, dict) or invocation.get("role") not in {
-        "publication",
-        "final_publication",
-    }:
-        raise ValueError("--new-thread requires a current Publication Invocation")
+    if not isinstance(invocation, dict):
+        raise ValueError("--new-thread requires a current Agent Invocation")
+    role = invocation.get("role")
+    if role in {"development", "fresh_acceptance"}:
+        job = _change_job_for_invocation(state, invocation)
+        if role == "development":
+            job.pop("development_thread_id", None)
+            job["development_new_thread"] = True
+        else:
+            job["review_new_thread"] = True
+        return
+    if role not in {"publication", "final_publication"}:
+        raise ValueError("--new-thread requires a current Agent Invocation")
     job, mirror = _publication_job_for_invocation(state, invocation)
     if invocation.get("role") == "final_publication":
         job.pop("thread_id", None)
@@ -425,13 +448,32 @@ def _clear_current_publication_thread(state: dict[str, Any]) -> None:
         mirror["publication_new_thread"] = True
 
 
-def _restore_current_publication_thread(state: dict[str, Any]) -> None:
+def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
     invocation = state.get("active_agent_invocation")
     if (
         not isinstance(invocation, dict)
         or invocation.get("status") != "failed"
-        or invocation.get("role") not in {"publication", "final_publication"}
+        or invocation.get("role") not in {
+            "development",
+            "fresh_acceptance",
+            "publication",
+            "final_publication",
+        }
     ):
+        return
+    role = invocation.get("role")
+    if role in {"development", "fresh_acceptance"}:
+        job = _change_job_for_invocation(state, invocation)
+        thread_id = invocation.get("reported_thread_id") or invocation.get(
+            "requested_thread_id"
+        )
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            return
+        if role == "development":
+            job["development_thread_id"] = thread_id
+            job.pop("development_new_thread", None)
+        else:
+            job["review_new_thread"] = False
         return
     job, mirror = _publication_job_for_invocation(state, invocation)
     thread_id = invocation.get("reported_thread_id") or invocation.get(
@@ -443,10 +485,18 @@ def _restore_current_publication_thread(state: dict[str, Any]) -> None:
         job["thread_id"] = thread_id
     else:
         job["publication_thread_id"] = thread_id
-    job.pop("publication_new_thread", None)
-    if mirror is not None:
-        mirror["publication_thread_id"] = thread_id
-        mirror.pop("publication_new_thread", None)
+        job.pop("publication_new_thread", None)
+        if mirror is not None:
+            mirror["publication_thread_id"] = thread_id
+            mirror.pop("publication_new_thread", None)
+
+
+def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:
+    """Make an explicit resume distinguishable from a still-unacknowledged failure."""
+
+    invocation = state.get("active_agent_invocation")
+    if isinstance(invocation, dict) and invocation.get("status") == "failed":
+        invocation["status"] = "resuming"
 
 
 def _publication_job_for_invocation(
@@ -526,13 +576,51 @@ def _publication_job_for_invocation(
     raise ValueError("Publication Invocation work_subject is invalid")
 
 
+def _change_job_for_invocation(
+    state: dict[str, Any], invocation: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve a Change Job for Development or Fresh Acceptance resume."""
+
+    subject = invocation.get("work_subject")
+    generation = invocation.get("generation")
+    run_id = state.get("run_id")
+    if not isinstance(subject, str) or type(generation) is not int or generation < 1:
+        raise ValueError("current Change Job Invocation identity is invalid")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("Delivery Run ID is missing")
+    if subject.startswith("ticket:"):
+        ticket_text = subject.removeprefix("ticket:")
+        if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
+            raise ValueError("current Ticket Change Job Invocation work_subject is invalid")
+        jobs = state.get("ticket_jobs")
+        job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
+        if not isinstance(job, dict) or job.get("ticket_number") != int(ticket_text):
+            raise ValueError("current Ticket Change Job is missing")
+        _require_invocation_generation(generation, job.get("ticket_branch_generation"))
+        return job
+    if subject == f"parent-only:{run_id}":
+        job = state.get("parent_job")
+        if not isinstance(job, dict):
+            raise ValueError("current Parent-only Change Job is missing")
+        _require_invocation_generation(generation, 1)
+        return job
+    if subject == f"run-repair:{run_id}":
+        acceptance = state.get("run_acceptance")
+        job = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+        if not isinstance(job, dict):
+            raise ValueError("current Run Repair Change Job is missing")
+        _require_invocation_generation(generation, job.get("repair_generation"))
+        return job
+    raise ValueError("Change Job Invocation work_subject is invalid")
+
+
 def _require_invocation_generation(invocation: int, current: object) -> None:
     if type(current) is not int or invocation != current:
         raise ValueError("Publication Invocation generation is stale")
 
 
 def _resume_change_job(
-    state: dict[str, Any], value: object, *, ticket: bool
+    state: dict[str, Any], value: object, *, ticket: bool, human_response: str | None
 ) -> bool:
     if not isinstance(value, dict):
         return False
@@ -542,10 +630,12 @@ def _resume_change_job(
         not in {"agent_requires_human", "reviewer_requires_human"}
     ):
         return False
+    blockers = _human_blockers(value)
+    _append_human_response(value, blockers, human_response)
     value.update(
         {
             "phase": str(value.get("human_blocker_phase", "developing")),
-            "prior_human_blockers": _human_blockers(value),
+            "prior_human_blockers": blockers,
         }
     )
     value.pop("blocked_reason", None)
@@ -567,3 +657,25 @@ def _human_blockers(subject: dict[str, Any]) -> list[str]:
     ):
         raise ValueError("Agent Human Blocker is missing raw blocker strings")
     return list(value)
+
+
+def _validated_human_response(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("--message must be non-empty after trimming")
+    if len(normalized.encode("utf-8")) > 8192:
+        raise ValueError("--message must be at most 8 KiB")
+    return normalized
+
+
+def _append_human_response(
+    subject: dict[str, Any], blockers: list[str], response: str | None
+) -> None:
+    if response is None:
+        return
+    history = subject.setdefault("human_response_history", [])
+    if not isinstance(history, list):
+        raise ValueError("human_response_history must be an array")
+    history.append({"human_blockers": list(blockers), "response": response})
+    if len(history) > MAX_HUMAN_BLOCKER_HISTORY:
+        del history[:-MAX_HUMAN_BLOCKER_HISTORY]

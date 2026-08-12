@@ -138,11 +138,16 @@ def _is_lifecycle_action(command: str) -> bool:
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:
     status = state.get("status")
-    # Existing commands are also recovery entry points. A previous process
-    # failure (or an abandoned Run queried idempotently) must reach their
-    # established reconciliation path instead of being rejected locally.
-    if status in {"execution_failed", "abandoned"}:
+    if status == "abandoned":
         return True
+    if status == "execution_failed":
+        invocation = state.get("active_agent_invocation")
+        # A failed Agent Invocation has exactly one recovery path: `resume`.
+        # Deterministic publisher/check reconciliation retains its historical
+        # lifecycle command recovery path.
+        return not (
+            isinstance(invocation, dict) and invocation.get("status") == "failed"
+        )
     if status in {"unsupported_scope_change", "abandonment_pending"}:
         return False
     if command == "deliver":

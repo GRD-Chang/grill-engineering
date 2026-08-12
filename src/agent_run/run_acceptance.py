@@ -448,7 +448,9 @@ class RunAcceptanceEngine:
             "base_sha": job["base_sha"],
             "head_sha": self.git.checkout_head(checkout),
             "checkout": str(checkout),
-            "thread_id": job.get("development_thread_id"),
+            "thread_id": None
+            if job.get("development_new_thread")
+            else job.get("development_thread_id"),
             "development_summary": job.get("development_summary"),
         }
         source = str(request["repair_source"])
@@ -462,6 +464,8 @@ class RunAcceptanceEngine:
             request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
+        if job.get("human_response_history"):
+            request["human_response_history"] = job["human_response_history"]
         return request
 
     def _publication_request(
@@ -549,11 +553,16 @@ class RunAcceptanceEngine:
             },
             "checkout": str(checkout),
             "thread_id": latest_reviewer_thread(job)
-            if job.get("prior_human_blockers")
+            if job.get("prior_human_blockers") and not job.get("review_new_thread")
             else None,
             **(
                 {"prior_human_blockers": job["prior_human_blockers"]}
                 if job.get("prior_human_blockers")
+                else {}
+            ),
+            **(
+                {"human_response_history": job["human_response_history"]}
+                if job.get("human_response_history")
                 else {}
             ),
         }
