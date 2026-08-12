@@ -544,7 +544,9 @@ class CodexCliBackend:
                     "environment": environment,
                     "timeout": 3600,
                 }
-                if "on_stdout_line" in inspect.signature(run_worker_process).parameters:
+                if on_thread is not None and "on_stdout_line" in inspect.signature(
+                    run_worker_process
+                ).parameters:
                     worker_options["on_stdout_line"] = _thread_line_callback(
                         expected=thread_id, callback=on_thread
                     )

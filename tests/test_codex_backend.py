@@ -712,6 +712,39 @@ def test_development_resume_failure_starts_replacement_with_full_context(
     assert "https://github.com/example/project/issues/3" in replacement_prompt
 
 
+def test_development_does_not_use_publication_streaming_callback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    callback_options: list[object] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        callback_options.append(options.get("on_stdout_line"))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            "Development completed.", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"developer-1"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+
+    CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {
+            "checkout": str(tmp_path),
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/3",
+        }
+    )
+
+    assert callback_options == [None]
+
+
 def test_publication_resume_failure_does_not_replace_thread(
     tmp_path: Path,
     monkeypatch: Any,
