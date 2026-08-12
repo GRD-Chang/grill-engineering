@@ -21,6 +21,7 @@ from agent_run.agent_schemas import (
 )
 from agent_run.artifacts import (
     AcceptanceArtifact,
+    PublicationArtifact,
     parse_development_wire_result,
     parse_human_blockers,
     parse_publication_wire_result,
@@ -273,6 +274,15 @@ class CodexCliBackend:
         thread_id: str | None,
         artifact_validator: Callable[[dict[str, Any]], object] | None = None,
     ) -> tuple[str, str]:
+        def validate_publication(artifact: object) -> object:
+            normalized = parse_publication_wire_result(artifact)
+            if (
+                normalized["result_kind"] == "publication"
+                and artifact_validator is not None
+            ):
+                artifact_validator(normalized)
+            return normalized
+
         return self._invoke_structured_output(
             request=request,
             prompt=prompt,
@@ -280,7 +290,7 @@ class CodexCliBackend:
             thread_id=thread_id,
             schema=publication_or_human_blocker_schema(),
             output_name="Publication Artifact",
-            validate=parse_publication_wire_result,
+            validate=validate_publication,
             initial_writable_checkout=False,
         )
 

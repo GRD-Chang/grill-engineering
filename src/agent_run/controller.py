@@ -75,6 +75,7 @@ class Controller:
         resume_human_blocker: bool = False,
         new_thread: bool = False,
         human_response: str | None = None,
+        message: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
@@ -102,6 +103,20 @@ class Controller:
             ):
                 self.states.save_run(run_id, state)
                 return state, True
+            invocation = state.get("active_agent_invocation")
+            if (
+                isinstance(invocation, dict)
+                and invocation.get("role") in {"reviewer", "final_publication"}
+                and not self._run_invocation_boundary_is_current(state, invocation)
+            ):
+                _invalidate_stale_run_invocation(state, invocation)
+                self._ensure_delivery_branch(state, base_sha)
+                self.states.save_run(run_id, state)
+                return state, True
+            if message is not None:
+                if human_response is not None:
+                    raise ValueError("pass only one Human Blocker response")
+                human_response = message
             if human_response is not None:
                 human_response = _validated_human_response(human_response)
             resuming_run_acceptance = False
@@ -129,6 +144,9 @@ class Controller:
     ) -> bool:
         boundary = invocation.get("currentness_boundary")
         if not isinstance(boundary, dict):
+            # Invocations recorded before the Run boundary was introduced retain
+            # their pre-existing resume behavior. Every #45 Run invocation writes
+            # a boundary through invocation_event_recorder.
             return True
         parent = _state_mapping(state, "parent")
         graph = _state_mapping(state, "ticket_graph")
@@ -426,7 +444,6 @@ def _resume_agent_human_blocker(
             "reviewer_requires_human",
         }
     ):
-        _record_human_response(acceptance, message=message)
         blockers = _human_blockers(acceptance)
         append_human_response(
             acceptance,
@@ -455,7 +472,6 @@ def _resume_agent_human_blocker(
         and publication.get("phase") == "ready_for_human"
         and publication.get("human_blockers") is not None
     ):
-        _record_human_response(publication, message=message)
         publication.update(
             {
                 "phase": str(publication.get("human_blocker_phase", "pending")),
@@ -484,6 +500,19 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     if not isinstance(invocation, dict):
         raise ValueError("--new-thread requires a current Agent Invocation")
     role = invocation.get("role")
+    if role == "reviewer":
+        run = _run_acceptance_for_invocation(state, invocation)
+        run.pop("reviewer_resume_thread_id", None)
+        run["reviewer_new_thread"] = True
+        run["phase"] = "pending"
+        state.update(
+            {
+                "status": "run_acceptance_pending",
+                "terminal_kind": "run_acceptance_pending",
+                "diagnostics": [],
+            }
+        )
+        return
     if role in {"development", "fresh_acceptance"}:
         job = _change_job_for_invocation(state, invocation)
         if role == "development":
@@ -519,10 +548,28 @@ def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
             "fresh_acceptance",
             "publication",
             "final_publication",
+            "reviewer",
         }
     ):
         return
     role = invocation.get("role")
+    if role == "reviewer":
+        run = _run_acceptance_for_invocation(state, invocation)
+        thread_id = invocation.get("reported_thread_id") or invocation.get(
+            "requested_thread_id"
+        )
+        if isinstance(thread_id, str) and thread_id.strip():
+            run["reviewer_resume_thread_id"] = thread_id
+        run.pop("reviewer_new_thread", None)
+        run["phase"] = "pending"
+        state.update(
+            {
+                "status": "run_acceptance_pending",
+                "terminal_kind": "run_acceptance_pending",
+                "diagnostics": [],
+            }
+        )
+        return
     if role in {"development", "fresh_acceptance"}:
         job = _change_job_for_invocation(state, invocation)
         thread_id = invocation.get("reported_thread_id") or invocation.get(

@@ -26,6 +26,10 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
+from agent_run.run_currentness import (
+    run_currentness_boundary,
+    ticket_completion_records,
+)
 from agent_run.state import StateStore
 
 
@@ -479,9 +483,15 @@ class RunAcceptanceEngine:
                 "checkout_state": "merged working tree; HEAD remains default base",
             },
             "checkout": str(checkout),
-            "thread_id": latest_reviewer_thread(run)
-            if run.get("prior_human_blockers") and not run.get("review_new_thread")
-            else None,
+            "thread_id": (
+                _reviewer_resume_thread(run)
+                if (
+                    run.get("prior_human_blockers")
+                    or run.get("reviewer_resume_thread_id")
+                )
+                and not run.get("review_new_thread")
+                else None
+            ),
             **(
                 {"prior_human_blockers": run["prior_human_blockers"]}
                 if run.get("prior_human_blockers")
@@ -829,8 +839,9 @@ class RunAcceptanceEngine:
         self, state: dict[str, Any], run: dict[str, Any], thread_id: str
     ) -> None:
         resumed_thread = run.get("reviewer_resume_thread_id")
-        resumed = bool(run.get("prior_human_blockers")) or isinstance(
-            resumed_thread, str
+        resumed = not run.get("reviewer_new_thread") and (
+            bool(run.get("prior_human_blockers"))
+            or isinstance(resumed_thread, str)
         )
         expected_thread = (
             resumed_thread
@@ -850,6 +861,7 @@ class RunAcceptanceEngine:
             reviewers.append(thread_id)
         run["reviewer_thread_ids"] = reviewers
         run.pop("reviewer_resume_thread_id", None)
+        run.pop("reviewer_new_thread", None)
         self._save(state)
 
     def _all_prior_threads(

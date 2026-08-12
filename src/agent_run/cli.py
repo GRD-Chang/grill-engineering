@@ -163,6 +163,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if state.get("status") == "abandonment_pending":
                 cli_presentation._print_precondition_failure(state)
                 return 2
+            if state.get("status") == "requeue_required":
+                cli_presentation._print_precondition_failure(state)
+                return 2
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
@@ -535,7 +538,13 @@ def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
         isinstance(invocation, dict)
         and invocation.get("status") in {"failed", "resuming"}
         and invocation.get("role")
-        in {"development", "fresh_acceptance", "publication", "final_publication"}
+        in {
+            "development",
+            "fresh_acceptance",
+            "publication",
+            "final_publication",
+            "reviewer",
+        }
     ):
         return True
     for key in ("active_ticket_job", "parent_job"):

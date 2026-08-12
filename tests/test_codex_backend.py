@@ -87,6 +87,109 @@ def test_publication_repairs_invalid_output_in_same_thread(
     )
 
 
+def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    attempts: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        artifact = {
+            "result_kind": "publication",
+            "commit_message": (
+                "invalid title"
+                if len(attempts) == 1
+                else "fix(run): publish accepted delivery"
+            ),
+            "pr_title": "fix(run): publish accepted delivery",
+            "pr_body_markdown": (
+                "## What Problem This Solves\n\nThe accepted Run needs a review boundary.\n\n"
+                "## Why This Change Was Made\n\nIt preserves the explicit approval gate.\n\n"
+                "## User Impact\n\nMaintainers can review one final PR.\n\n"
+                "## Evidence\n\nFresh Run Acceptance passed."
+            ),
+            "human_blockers": None,
+        }
+        output.write_text(json.dumps(artifact), encoding="utf-8")
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"run-publication-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(
+        credential_provider=lambda: "reader-secret"
+    ).run_publication(
+        {
+            "checkout": str(tmp_path),
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "acceptance_artifact": {"verdict": "pass"},
+            "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
+        }
+    )
+
+    assert result["_thread_id"] == "run-publication-thread"
+    assert len(attempts) == 2
+    assert "resume" in attempts[1]
+    assert events[-1] == (
+        "completed",
+        {"reported_thread_id": "run-publication-thread", "attempt_count": 2},
+    )
+
+
+def test_run_publication_marks_exhausted_semantic_output_as_failed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "result_kind": "publication",
+                    "commit_message": "invalid title",
+                    "pr_title": "invalid title",
+                    "pr_body_markdown": "invalid body",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"run-publication-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    with pytest.raises(CodexProcessError, match="commit_message"):
+        CodexCliBackend(
+            credential_provider=lambda: "reader-secret"
+        ).run_publication(
+            {
+                "checkout": str(tmp_path),
+                "parent_issue_url": "https://github.com/example/project/issues/1",
+                "acceptance_artifact": {"verdict": "pass"},
+                "_invocation_event": lambda kind, **facts: events.append(
+                    (kind, facts)
+                ),
+            }
+        )
+
+    assert events[-1][0] == "failed"
+    assert events[-1][1]["attempt_count"] == 3
+
+
 def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

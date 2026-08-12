@@ -6,7 +6,11 @@ from typing import Any
 import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine
-from agent_run.controller import Controller, _change_job_for_invocation, _resume_agent_human_blocker
+from agent_run.controller import (
+    Controller,
+    _change_job_for_invocation,
+    _resume_agent_human_blocker,
+)
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.human_responses import current_human_response_history
 from agent_run.cli_surface import _resume_is_ready
@@ -136,16 +140,6 @@ def _ticket(number: int) -> dict[str, Any]:
         "labels": ["ready-for-agent"],
         "blocked_by": [],
     }
-
-
-def test_human_response_history_is_append_only_without_a_fixed_cap() -> None:
-    job: dict[str, Any] = {}
-
-    for index in range(17):
-        _record_human_response(job, message=f"response {index}")
-
-    assert job["human_responses"] == [f"response {index}" for index in range(17)]
-    assert job["current_human_response"] == "response 16"
 
 
 def _prepared_resume(

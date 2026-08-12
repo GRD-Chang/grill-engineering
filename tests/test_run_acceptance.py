@@ -296,6 +296,98 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
         assert run["reviewer_resume_thread_id"] == "failed-run-reviewer"
 
 
+@pytest.mark.parametrize(
+    ("role", "work_subject"),
+    [
+        ("reviewer", "run-acceptance:{run_id}"),
+        ("final_publication", "run-publication:{run_id}"),
+    ],
+)
+def test_resume_rejects_stale_run_invocation_before_agent_start(
+    git_repo: Path, role: str, work_subject: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    state["run_acceptance"] = {
+        "phase": "reviewing",
+        "modification_attempts": 0,
+        "validation_attempts": 1,
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+    }
+    state["active_agent_invocation"] = {
+        "role": role,
+        "phase": "run_acceptance" if role == "reviewer" else "run_publication",
+        "work_subject": work_subject.format(run_id=state["run_id"]),
+        "generation": 1,
+        "status": "failed",
+        "requested_thread_id": "failed-thread",
+        "reported_thread_id": "failed-thread",
+        "currentness_boundary": {"reviewed_head_sha": "stale-head"},
+    }
+    state["status"] = "execution_failed"
+    states.save_run(str(state["run_id"]), state)
+
+    resumed, _ = Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).resume(str(state["run_id"]))
+
+    assert resumed["status"] == "requeue_required"
+    assert resumed["terminal_kind"] == "requeue_required"
+    assert resumed["run_acceptance"]["phase"] == "pending"
+    assert "reviewer_resume_thread_id" not in resumed["run_acceptance"]
+
+
+def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    state["run_acceptance"] = {
+        "phase": "reviewing",
+        "modification_attempts": 0,
+        "validation_attempts": 1,
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+    }
+    state["active_agent_invocation"] = {
+        "role": "reviewer",
+        "phase": "run_acceptance",
+        "work_subject": f"run-acceptance:{state['run_id']}",
+        "generation": 1,
+        "status": "failed",
+        "requested_thread_id": None,
+        "reported_thread_id": "failed-run-reviewer",
+    }
+    state["status"] = "execution_failed"
+    states.save_run(str(state["run_id"]), state)
+
+    resumed, _ = Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).resume(str(state["run_id"]), new_thread=True)
+
+    class NewThreadReviewer:
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            assert request["thread_id"] is None
+            event = request["_invocation_event"]
+            event("started", requested_thread_id=None, attempt_count=0)
+            event("thread_started", reported_thread_id="new-run-reviewer", attempt_count=1)
+            event("completed", reported_thread_id="new-run-reviewer", attempt_count=1)
+            return ReviewResult("new-run-reviewer", _passing_artifact())
+
+    accepted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=NewThreadReviewer(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    ).accept(str(resumed["run_id"]))
+
+    assert accepted["status"] == "run_publication_pending"
+    assert accepted["run_acceptance"]["reviewer_thread_ids"] == [
+        "new-run-reviewer"
+    ]
+
+
 def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     git_repo: Path,
 ) -> None:
@@ -497,8 +589,14 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
     assert resumed["run_acceptance"]["prior_human_blockers"] == [
         "GitHub denied access; tried gh issue view; grant Issue read access."
     ]
-    assert resumed["run_acceptance"]["human_responses"] == [
-        "Issue read access has been granted."
+    assert resumed["run_acceptance"]["human_response_history"] == [
+        {
+            "generation": 1,
+            "human_blockers": [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ],
+            "response": "Issue read access has been granted.",
+        }
     ]
 
     accepted = engine.accept(str(state["run_id"]))
@@ -707,6 +805,33 @@ def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
     assert invocation["status"] == "completed"
     assert invocation["reported_thread_id"] == "run-reviewer-thread"
     assert invocation["attempt_count"] == 2
+
+
+def test_run_acceptance_fixture_missing_thread_marks_invocation_failed(
+    git_repo: Path,
+) -> None:
+    state, states, _git = _completed_run(git_repo)
+    agents = git_repo / "missing-run-review-thread.json"
+    agents.write_text(
+        json.dumps(
+            {"run_reviews": [{"no_thread": True, "artifact": _passing_artifact()}]}
+        ),
+        encoding="utf-8",
+    )
+
+    failed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "accept-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert failed.returncode == 2
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["active_agent_invocation"]["status"] == "failed"
 
 
 def test_run_acceptance_fixture_records_a_fresh_thread_without_expectation(

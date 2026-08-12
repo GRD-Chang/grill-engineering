@@ -8,6 +8,7 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
+from agent_run.run_currentness import ticket_completion_records
 from agent_run.state import StateStore
 
 

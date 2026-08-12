@@ -100,7 +100,7 @@ class HumanThenRunPublicationAgents:
                 "human_blockers": [
                     "GitHub denied access; tried gh issue view; grant Issue read access."
                 ],
-                "response": "Issue read access has been granted.",
+                "response": "Issue read access is now available.",
             }
         ]
         return {
@@ -241,13 +241,19 @@ def test_final_publication_human_resume_clears_current_blocker(
     ).resume(
         str(state["run_id"]),
         resume_human_blocker=True,
-        human_response="Issue read access has been granted.",
+        message="Issue read access is now available.",
     )
     assert resumed["run_publication"]["prior_human_blockers"] == [
         "GitHub denied access; tried gh issue view; grant Issue read access."
     ]
-    assert resumed["run_publication"]["human_responses"] == [
-        "Issue read access is now available."
+    assert resumed["run_publication"]["human_response_history"] == [
+        {
+            "generation": 1,
+            "human_blockers": [
+                "GitHub denied access; tried gh issue view; grant Issue read access."
+            ],
+            "response": "Issue read access is now available.",
+        }
     ]
 
     published = engine.publish(str(state["run_id"]))
@@ -723,6 +729,31 @@ def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
     invocation = persisted["active_agent_invocation"]
     assert invocation["role"] == "final_publication"
     assert invocation["status"] == "failed"
+
+
+def test_final_publication_fixture_missing_thread_marks_invocation_failed(
+    git_repo: Path,
+) -> None:
+    state, states, _git, _publisher = _accepted_run(git_repo)
+    agents = git_repo / "missing-run-publication-thread.json"
+    agents.write_text(
+        json.dumps({"run_publications": [{"no_thread": True}]}),
+        encoding="utf-8",
+    )
+
+    failed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "publish-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert failed.returncode == 2
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["active_agent_invocation"]["status"] == "failed"
 
 
 def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
