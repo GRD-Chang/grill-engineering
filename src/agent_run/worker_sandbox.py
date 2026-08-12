@@ -273,42 +273,63 @@ def run_worker_process(
     assert stderr_pipe is not None
     stdout_lines: list[str] = []
     stderr_parts: list[str] = []
+    callback_errors: list[BaseException] = []
     reader_errors: list[BaseException] = []
 
     def read_stdout() -> None:
         try:
             for line in stdout_pipe:
                 stdout_lines.append(line)
-                if not reader_errors:
+                if not callback_errors:
                     try:
                         on_stdout_line(line)
                     except BaseException as error:
-                        reader_errors.append(error)
+                        callback_errors.append(error)
+                        _terminate_process_group(process)
         except BaseException as error:
             reader_errors.append(error)
 
     def read_stderr() -> None:
         stderr_parts.append(stderr_pipe.read())
 
-    stdout_reader = threading.Thread(target=read_stdout, daemon=True)
-    stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+    stdout_reader = threading.Thread(
+        target=read_stdout,
+        daemon=True,
+        name=f"agent-run-worker-{process.pid}-stdout",
+    )
+    stderr_reader = threading.Thread(
+        target=read_stderr,
+        daemon=True,
+        name=f"agent-run-worker-{process.pid}-stderr",
+    )
     stdout_reader.start()
     stderr_reader.start()
+    wait_error: BaseException | None = None
     try:
         stdin.write(prompt)
         stdin.close()
         process.wait(timeout=timeout)
-        stdout_reader.join()
-        stderr_reader.join()
-        if reader_errors:
-            raise reader_errors[0]
     except subprocess.TimeoutExpired as error:
+        wait_error = WorkerSandboxError("Codex worker timed out")
+        wait_error.__cause__ = error
+    except BaseException as error:
+        wait_error = error
+    finally:
         _terminate_process_group(process)
-        raise WorkerSandboxError("Codex worker timed out") from error
-    except BaseException:
-        _terminate_process_group(process)
-        raise
-    _terminate_process_group(process)
+        stdout_reader.join(timeout=1)
+        stderr_reader.join(timeout=1)
+        if stdout_reader.is_alive():
+            stdout_pipe.close()
+            stdout_reader.join(timeout=1)
+        if stderr_reader.is_alive():
+            stderr_pipe.close()
+            stderr_reader.join(timeout=1)
+    if callback_errors:
+        raise callback_errors[0]
+    if wait_error is not None:
+        raise wait_error
+    if reader_errors:
+        raise reader_errors[0]
     return subprocess.CompletedProcess(
         arguments,
         process.returncode,

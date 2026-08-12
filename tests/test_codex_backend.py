@@ -1583,3 +1583,46 @@ def test_stdout_callback_error_does_not_stop_pipe_drain(tmp_path: Path) -> None:
 
     assert callback_calls == 1
     assert time.monotonic() - started < 2
+
+
+def test_stdout_callback_error_terminates_hanging_worker(tmp_path: Path) -> None:
+    def reject_thread(_line: str) -> None:
+        raise CodexProcessError("reported Thread mismatch")
+
+    started = time.monotonic()
+    with pytest.raises(CodexProcessError, match="Thread mismatch"):
+        run_worker_process(
+            ["sh", "-c", "printf 'thread.started\\n'; sleep 60"],
+            cwd=tmp_path,
+            prompt="",
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout=5,
+            on_stdout_line=reject_thread,
+        )
+
+    assert time.monotonic() - started < 2
+
+
+def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
+    before = {
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("agent-run-worker-")
+    }
+
+    with pytest.raises(WorkerSandboxError, match="timed out"):
+        run_worker_process(
+            ["sh", "-c", "sleep 60"],
+            cwd=tmp_path,
+            prompt="",
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout=0.1,
+            on_stdout_line=lambda _line: None,
+        )
+
+    after = {
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("agent-run-worker-")
+    }
+    assert after == before
