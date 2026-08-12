@@ -213,6 +213,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             repository.default_branch, repository.default_head_sha
                         ),
                         github=publisher,
+                        currentness_reader=github,
                     ).accept(parsed.run_id)
                 elif state.get("status") == "run_publication_pending":
                     repository = github.repository()
@@ -225,6 +226,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         default_head_sha=git.resolve_base(
                             repository.default_branch, repository.default_head_sha
                         ),
+                        currentness_reader=github,
                     ).publish(parsed.run_id)
         elif parsed.command == "requeue":
             state, retired = controller.requeue(parsed.run_id)
@@ -276,10 +278,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     git=git,
                     states=states,
                     agents=agents,
-                    default_head_sha=git.resolve_base(
-                        repository.default_branch, repository.default_head_sha
-                    ),
-                    github=publisher,
+                        default_head_sha=git.resolve_base(
+                            repository.default_branch, repository.default_head_sha
+                        ),
+                        github=publisher,
+                        currentness_reader=github,
                 ).accept(parsed.run_id)
             resumed = True
         elif parsed.command == "deliver":
@@ -376,6 +379,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     agents=agents,
                     default_head_sha=default_head,
                     github=publisher,
+                    currentness_reader=github,
                 ).accept(parsed.run_id)
             resumed = True
         else:
@@ -405,6 +409,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 github=publisher,
                 default_branch=repository.default_branch,
                 default_head_sha=default_head,
+                currentness_reader=github,
             )
             if refreshed.get("status") in {"abandoned", "completed"}:
                 state = refreshed

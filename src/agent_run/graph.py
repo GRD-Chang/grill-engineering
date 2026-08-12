@@ -61,6 +61,7 @@ def state_from_graph(
         tickets[str(number)] = _ticket_state(issue, eligible, reason)
 
     ticket_jobs = _retained_ticket_jobs(previous, order)
+    _preserve_completed_ticket_snapshots(previous, tickets, ticket_jobs)
     parent_revision = fingerprint(
         {"title": graph.parent.title, "body": graph.parent.body}
     )
@@ -292,6 +293,42 @@ def _retained_ticket_jobs(
         if isinstance(number, int) and key in allowed:
             retained[key] = dict(previous_active)
     return retained
+
+
+def _preserve_completed_ticket_snapshots(
+    previous: dict[str, Any],
+    tickets: dict[str, Any],
+    ticket_jobs: dict[str, dict[str, Any]],
+) -> None:
+    """Keep a completed Ticket's immutable completion revision in the Run.
+
+    Later edits to a closed GitHub Issue are outside the completed Ticket's
+    delivery identity.  The current Parent remains live, but Run Acceptance
+    and Run Repair must retain the Ticket facts that were actually integrated.
+    """
+    previous_graph = previous.get("ticket_graph")
+    previous_tickets = (
+        previous_graph.get("tickets") if isinstance(previous_graph, dict) else None
+    )
+    if not isinstance(previous_tickets, dict):
+        return
+    for key, job in ticket_jobs.items():
+        if job.get("phase") != TicketPhase.COMPLETED.value:
+            continue
+        snapshot = previous_tickets.get(key)
+        live = tickets.get(key)
+        if (
+            isinstance(snapshot, dict)
+            and isinstance(live, dict)
+            and str(live.get("state", "")).upper() == "CLOSED"
+        ):
+            frozen = dict(snapshot)
+            # Keep the immutable content revision, but retain the live
+            # lifecycle state so the next refresh can distinguish ordinary
+            # completed state from a later external reopen.
+            for lifecycle_key in ("state", "labels", "blocked_by", "eligibility"):
+                frozen[lifecycle_key] = live[lifecycle_key]
+            tickets[key] = frozen
 
 
 def _first_job_in_phase(

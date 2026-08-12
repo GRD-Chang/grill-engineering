@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import (
+    canonical_fingerprint,
     fail_interrupted_invocation,
     invocation_event_recorder,
     select_publication_thread,
@@ -19,6 +20,7 @@ from agent_run.change_delivery import (
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryEngine,
     ChangeJobContract,
+    StaleDisposition,
     latest_reviewer_thread,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
@@ -27,6 +29,10 @@ from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import (
+    RunCurrentnessReader,
+    invalidate_run_acceptance,
+    invalidate_stale_run_repair,
+    refresh_run_currentness,
     run_currentness_boundary,
     ticket_completion_records,
 )
@@ -49,18 +55,22 @@ class RunAcceptanceEngine:
         agents: AgentBackend,
         default_head_sha: str | None = None,
         github: GitHubPublisher | None = None,
+        currentness_reader: RunCurrentnessReader | None = None,
     ) -> None:
         self.git = git
         self.states = states
         self.agents = agents
         self.default_head_sha = default_head_sha
         self.github = github
+        self.currentness_reader = currentness_reader
 
     def accept(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
             state = self.states.load_run(run_id)
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
+            if not self._refresh_run_currentness(state):
+                return self._save(state)
             if not self._all_tickets_completed(state):
                 raise ValueError("Run Acceptance requires every Ticket to be completed")
             run = self._run_state(state)
@@ -96,8 +106,9 @@ class RunAcceptanceEngine:
                         run["phase"] = "pending"
                         run.pop("acceptance_record", None)
                         run.pop("acceptance_artifact", None)
-                        self._save(state)
-                        continue
+                        # A discarded Repair establishes the fresh Acceptance
+                        # boundary; it does not reuse this invocation to run it.
+                        return self._save(state)
                     if repair == "no_code_changes":
                         run["phase"] = "ready_for_human"
                         run["blocked_reason"] = "no_code_changes"
@@ -160,6 +171,8 @@ class RunAcceptanceEngine:
                 save=self._save,
             )
             request["_currentness_check"] = lambda: (
+                self._refresh_run_currentness(state)
+                and
                 self.git.resolve(str(state["run_branch"])) == run_head
                 and self._default_head(state) == default_head
                 and self._mapping(state, "parent")["revision"]
@@ -170,13 +183,16 @@ class RunAcceptanceEngine:
                 == request["ticket_completion_records"]
             )
             review = self.agents.review(request)
+            # The reviewer has already consumed this identity even if a live
+            # authority refresh discards its verdict.  Keep it unavailable to
+            # the fresh Acceptance that follows a drift.
+            self._record_reviewer(state, run, review.thread_id)
             if not request["_currentness_check"]():
                 run["phase"] = "pending"
                 self._save(state)
                 return False
         finally:
             self.git.remove_worktree(checkout)
-        self._record_reviewer(state, run, review.thread_id)
         run.pop("review_new_thread", None)
         artifact = AcceptanceArtifact.parse(review.artifact)
         record = self._acceptance_record(
@@ -228,6 +244,18 @@ class RunAcceptanceEngine:
         if artifact.verdict != "human":
             self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
+        return True
+
+    def _refresh_run_currentness(self, state: dict[str, Any]) -> bool:
+        """Re-read GitHub before applying a Reviewer result when configured."""
+        if self.currentness_reader is None:
+            return True
+        default_head = refresh_run_currentness(
+            state, reader=self.currentness_reader, git=self.git
+        )
+        if default_head is None:
+            return False
+        self.default_head_sha = default_head
         return True
 
     def _record_final_pr_status(
@@ -338,7 +366,8 @@ class RunAcceptanceEngine:
                 ),
                 acceptance_record=self._repair_acceptance_record,
                 acceptance_is_current=self._repair_acceptance_is_current,
-                invalidate_stale_publication=self._invalidate_stale_repair_publication,
+                invalidate_stale=self._invalidate_stale_repair,
+                stale_disposition=StaleDisposition.FRESH_RUN_ACCEPTANCE,
                 revision_changed=self._repair_revision_changed,
                 requires_explicit_approval=lambda _state, _job: False,
                 after_merge=self._after_repair_merge,
@@ -394,6 +423,9 @@ class RunAcceptanceEngine:
             "reviewer_thread_ids": prior_threads,
             "prior_reviewer_thread_ids": prior_threads,
         }
+        trigger = self._repair_trigger(state, repair_source, repair_request)
+        if trigger is not None:
+            job["repair_trigger"] = trigger
         if repair_source == "human_revision":
             feedback = repair_request.get("human_feedback")
             if not isinstance(feedback, str) or not feedback.strip():
@@ -446,16 +478,7 @@ class RunAcceptanceEngine:
             == ticket_completion_records(state)
         ):
             return
-        for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
-            run.pop(key, None)
-        for key in (
-            "human_response_history",
-            "human_response_generation",
-            "prior_human_blockers",
-        ):
-            run.pop(key, None)
-        run["acceptance_generation"] = int(run.get("acceptance_generation", 1)) + 1
-        run["phase"] = "pending"
+        invalidate_run_acceptance(state)
 
     def _review_request(
         self,
@@ -581,15 +604,12 @@ class RunAcceptanceEngine:
             request["human_response_history"] = history
         return request
 
-    def _invalidate_stale_repair_publication(
+    def _invalidate_stale_repair(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         del checkout
-        run = self._run_state(state)
-        run.pop("repair_job", None)
+        invalidate_stale_run_repair(state)
         job["phase"] = "stale"
-        state["status"] = "run_acceptance_pending"
-        state["diagnostics"] = []
 
     def _render_run_repair_pr_body(
         self, state: dict[str, Any], publication: dict[str, Any]
@@ -706,13 +726,63 @@ class RunAcceptanceEngine:
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
         return (
-            self.git.resolve(str(state["run_branch"])) != job.get("base_sha")
+            not self._refresh_run_currentness(state)
+            or not self._repair_trigger_is_current(job)
+            or self.git.resolve(str(state["run_branch"])) != job.get("base_sha")
             or self._mapping(state, "parent").get("revision")
             != job.get("parent_revision")
             or self._mapping(state, "ticket_graph").get("revision")
             != job.get("ticket_graph_revision")
             or ticket_completion_records(state)
             != job.get("ticket_completion_records")
+        )
+
+    def _repair_trigger(
+        self,
+        state: dict[str, Any],
+        repair_source: str,
+        repair_request: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        publication = state.get("run_publication")
+        pr_number = publication.get("pr_number") if isinstance(publication, dict) else None
+        if not isinstance(pr_number, int):
+            return None
+        if self.github is None:
+            raise ValueError("Run Repair requires the Publisher")
+        live = self.github.live_pull_request(pr_number)
+        trigger = {
+            "pr_number": pr_number,
+            "state": live.get("state"),
+            "head_sha": live.get("head_sha"),
+            "base_branch": live.get("base_branch"),
+            "base_sha": live.get("base_sha"),
+        }
+        if repair_source == "required_checks":
+            evidence = repair_request.get("ci_evidence")
+            if not isinstance(evidence, dict):
+                raise ValueError("required-check repair evidence must be an object")
+            trigger["ci_evidence_fingerprint"] = canonical_fingerprint(evidence)
+        return trigger
+
+    def _repair_trigger_is_current(self, job: dict[str, Any]) -> bool:
+        trigger = job.get("repair_trigger")
+        if trigger is None:
+            return True
+        if not isinstance(trigger, dict) or self.github is None:
+            return False
+        pr_number = trigger.get("pr_number")
+        if not isinstance(pr_number, int):
+            return False
+        live = self.github.live_pull_request(pr_number)
+        if any(
+            trigger.get(key) != live.get(key)
+            for key in ("state", "head_sha", "base_branch", "base_sha")
+        ):
+            return False
+        evidence_fingerprint = trigger.get("ci_evidence_fingerprint")
+        return not isinstance(evidence_fingerprint, str) or (
+            evidence_fingerprint
+            == canonical_fingerprint(self.github.required_check_evidence(pr_number))
         )
 
     def _after_repair_merge(
@@ -873,6 +943,9 @@ class RunAcceptanceEngine:
             if isinstance(value, str):
                 values.add(value)
         values.update(self._string_list(run, "development_thread_history"))
+        discarded = run.get("discarded_repair_thread_ids")
+        if discarded is not None:
+            values.update(self._string_list(run, "discarded_repair_thread_ids"))
         for job in self._mapping(state, "ticket_jobs").values():
             if not isinstance(job, dict):
                 continue

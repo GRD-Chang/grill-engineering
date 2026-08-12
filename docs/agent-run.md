@@ -60,14 +60,21 @@ Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许�
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
 也不等同于 `revise` 的 Run Feedback。
-`resume` 只恢复当前 failed 或 Human Blocker Invocation；其 preflight 发现 requirements、
-base/head 或 Run Repair 边界已 stale 时绝不启动 Codex，而是进入 `requeue_required`。此状态下
-只允许 `status`、`history`、`requeue` 与 `abandon`。`requeue` 在执行时重新读取 GitHub 和 Git
-权威事实，封存旧 Job Generation、关闭其仍开放的自动化 Change PR，并创建不携带旧 Candidate、
-Acceptance 或 Thread 的新 generation；它不自动 rebase，也不继续旧 worktree。
+`resume` 只恢复当前 failed 或 Human Blocker Invocation。Ticket 与 Parent-only Change Job 的
+preflight 若发现 requirements 或 base/head 已 stale，绝不启动 Codex，而是进入
+`requeue_required`。此状态下只允许 `status`、`history`、`requeue` 与 `abandon`。Run Repair 的
+Parent、Graph、Ticket Completion 或 Run Branch 边界发生漂移时，不创建 replacement generation；
+它会丢弃旧 Repair 并回到 fresh Run Acceptance，再判断 Repair 是否仍然必要。
+`requeue` 在执行时重新读取 GitHub 和 Git 权威事实，封存旧 Job Generation、关闭其仍开放的
+自动化 Change PR，并创建不携带旧 Candidate、Acceptance 或 Thread 的新 generation；它不自动
+rebase，也不继续旧 worktree。Run Acceptance 或 Final Run Publication 不拥有 generation-local
+branch/PR；它们的 Invocation 在 Parent、Graph、Ticket Completion、Run Branch 或 default base
+漂移后会废弃旧结果并回到 `run_acceptance_pending`，由全新的 Run Reviewer 验收，而不是 Requeue
+或只重写 PR 文案。
 若 PR 的 live head/base、Candidate/Acceptance 绑定或外部状态无法与当前 Generation 对齐，控制器
 fail closed 为 Human Blocker，不将未知外部变更误路由为 Requeue。Run Repair 还绑定 Parent、Graph、
-Run Branch 与 Ticket Completion Records；任一可重建输入变化都从最新 Run Acceptance 进入新 generation。
+Run Branch、Ticket Completion Records，以及触发它的 Final Run PR state/head/base 与 Required Checks
+evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 Repair 是否仍然必要。
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 
@@ -83,7 +90,10 @@ Required Check 失败时，Controller 将失败 check 的名称、workflow、描
 Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
 复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
 最终 Ticket 集合和依赖，
-检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条验证 lane；Completion Record、
+检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条验证 lane；Ticket Completion
+Revision 按 Ticket number 数值排序，且只绑定已集成 SHA、冻结 Effective Revision 与已验收
+base/tree；已关闭 Ticket 后续 title/body 编辑不改变该版本，普通 reopen 则 fail closed。
+Completion Record、
 Expected Merge Result 与 SHA/Revision 绑定只由 Controller 在验收外层校验，不进入 Codex
 Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
 代码修改形成新的 Run Branch commit、废弃旧验收，再由全新 Reviewer 重新检查完整累计结果。

@@ -1386,6 +1386,110 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert replay_fixture["delivery"]["closed_issues"] == [3]
 
 
+@pytest.mark.parametrize(
+    ("base_branch", "head_sha"),
+    [("main", "f" * 40), ("release", None)],
+    ids=("head", "base"),
+)
+def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
+    git_repo: Path,
+    base_branch: str,
+    head_sha: str | None,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    ticket_agents = git_repo / "ticket-agents.json"
+    ticket_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "ticket-developer",
+                        "summary": "Delivered the Ticket.",
+                        "write_files": {"feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("ticket-reviewer", "Ticket passed.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_cli(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
+    )
+    assert stdout_json(delivered)["status"] == "run_acceptance_pending"
+    run_agents = git_repo / "run-agents.json"
+    run_agents.write_text(
+        json.dumps(
+            {"reviews": [passing_acceptance("run-reviewer", "Run passed.")]}
+        ),
+        encoding="utf-8",
+    )
+    accepted = run_cli(
+        git_repo, fixture, "accept-run", run_id, "--agent-fixture", str(run_agents)
+    )
+    assert stdout_json(accepted)["status"] == "run_publication_pending"
+
+    state = load_only_run_state(git_repo)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    actual_head = state["run_acceptance"]["acceptance_record"]["reviewed_head_sha"]
+    if base_branch != "main":
+        subprocess.run(["git", "branch", base_branch, "main"], cwd=git_repo, check=True)
+    data.setdefault("delivery", {}).setdefault("pull_requests", []).append(
+        {
+            "number": 99,
+            "branch": state["run_branch"],
+            "base_branch": base_branch,
+            "state": "OPEN",
+            "scope": "final_run",
+            "title": "preserve this title",
+            "body": "preserve this body",
+            "head_sha": head_sha or actual_head,
+        }
+    )
+    data["delivery"].setdefault("published_branches", {})[state["run_branch"]] = (
+        head_sha or actual_head
+    )
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    final_agents = git_repo / "final-agents.json"
+    final_agents.write_text(
+        json.dumps(
+            {
+                "run_publications": [
+                    {
+                        "commit_message": "feat(run): publish the completed delivery",
+                        "pr_title": "feat(run): publish the completed delivery",
+                        "pr_body_markdown": (
+                            "## What Problem This Solves\n\nThe completed Ticket needs one review boundary.\n\n"
+                            "## Why This Change Was Made\n\nThe Run branch keeps the standard delivery route.\n\n"
+                            "## User Impact\n\nMaintainers can approve the complete Parent delivery.\n\n"
+                            "## Evidence\n\nThe independent expected-merge review passed."
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stale = run_cli(
+        git_repo, fixture, "publish-run", run_id, "--agent-fixture", str(final_agents)
+    )
+
+    assert stale.returncode == 0, stale.stderr
+    assert stdout_json(stale)["status"] == "run_acceptance_pending"
+    assert load_only_run_state(git_repo)["run_acceptance"]["phase"] == "pending"
+    preserved = next(
+        pull
+        for pull in json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
+        if pull["number"] == 99
+    )
+    assert preserved["title"] == "preserve this title"
+    assert preserved["body"] == "preserve this body"
+
+
 def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     ticket_agents = git_repo / "ticket-agents.json"

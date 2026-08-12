@@ -35,6 +35,44 @@ def reconcile_structure(
             projected["observed_parent_spec_revision"] = observed_parent_revision
             return projected
 
+    reopened = _reopened_completed_tickets(previous, projected)
+    if reopened:
+        blocked = dict(previous)
+        blocked.update(
+            {
+                "parent": _mapping(projected, "parent"),
+                "status": "unsupported_scope_change",
+                "terminal_kind": "unsupported_scope_change",
+                "frontier": [],
+                "active_ticket_job": None,
+                "unsupported_scope_change": {
+                    "accepted_graph_revision": accepted_graph_revision,
+                    "observed_graph_revision": observed_graph_revision,
+                    "graph_change_summary": {
+                        "reopened_completed_tickets": reopened,
+                    },
+                    "observed_ticket_graph": deepcopy(
+                        _mapping(projected, "ticket_graph")
+                    ),
+                    "observed_at": _now(),
+                },
+                "diagnostics": [
+                    {
+                        "code": "completed_ticket_reopened",
+                        "message": (
+                            f"Completed Ticket #{reopened[0]} was reopened outside "
+                            "Run Abandonment Recovery"
+                        ),
+                        "ticket_numbers": reopened,
+                    }
+                ],
+                "accepted_parent_spec_revision": accepted_parent_revision,
+                "observed_parent_spec_revision": observed_parent_revision,
+                "updated_at": _now(),
+            }
+        )
+        return blocked
+
     if observed_graph_revision != accepted_graph_revision:
         existing = previous.get("unsupported_scope_change")
         observed_graph = deepcopy(_mapping(projected, "ticket_graph"))
@@ -120,6 +158,26 @@ def _graph_change_summary(
             for ticket, blocker in removed_edges
         ],
     }
+
+
+def _reopened_completed_tickets(
+    previous: dict[str, Any], projected: dict[str, Any]
+) -> list[int]:
+    jobs = previous.get("ticket_jobs")
+    tickets = _mapping(_mapping(projected, "ticket_graph"), "tickets")
+    if not isinstance(jobs, dict):
+        return []
+    reopened: list[int] = []
+    for key, job in jobs.items():
+        ticket = tickets.get(key)
+        if (
+            isinstance(job, dict)
+            and job.get("phase") == "completed"
+            and isinstance(ticket, dict)
+            and str(ticket.get("state", "")).upper() != "CLOSED"
+        ):
+            reopened.append(int(key))
+    return sorted(reopened)
 
 
 def _edges(graph: dict[str, Any]) -> set[tuple[int, int]]:

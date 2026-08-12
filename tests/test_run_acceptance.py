@@ -13,6 +13,7 @@ from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.run_currentness import invalidate_stale_run_repair, ticket_completion_records
 from agent_run.state import StateStore
 
 from conftest import write_fixture
@@ -151,6 +152,9 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
             "development_thread_history": [],
             "reviewer_thread_ids": ["ticket-reviewer"],
             "modification_attempts": 1,
+            "effective_revision": state["ticket_graph"]["tickets"]["2"][
+                "content_revision"
+            ],
             "acceptance_record": {"artifact": _passing_artifact()},
             "integrated_sha": git.resolve(str(state["run_branch"])),
         }
@@ -332,10 +336,147 @@ def test_resume_rejects_stale_run_invocation_before_agent_start(
         FixtureGitHubReader(git_repo / "github.json"), git, states
     ).resume(str(state["run_id"]))
 
-    assert resumed["status"] == "requeue_required"
-    assert resumed["terminal_kind"] == "requeue_required"
+    assert resumed["status"] == "run_acceptance_pending"
+    assert resumed["terminal_kind"] == "run_acceptance_stale"
     assert resumed["run_acceptance"]["phase"] == "pending"
     assert "reviewer_resume_thread_id" not in resumed["run_acceptance"]
+
+
+def test_ticket_completion_records_are_minimal_and_sorted_numerically(
+    git_repo: Path,
+) -> None:
+    state, _states, git = _completed_run(git_repo)
+    state["ticket_graph"]["tickets"]["10"] = {
+        "number": 10,
+        "title": "Ticket 10",
+        "body": "Deliver ticket 10.",
+        "content_revision": "ticket-10-revision",
+    }
+    state["ticket_jobs"]["10"] = {
+        "ticket_number": 10,
+        "phase": "completed",
+        "integrated_sha": "integrated-10",
+        "effective_revision": "effective-10",
+        "acceptance_record": {
+            "reviewed_base_sha": git.resolve(str(state["run_branch"])),
+            "reviewed_candidate_tree": "tree-10",
+            "artifact": _passing_artifact(),
+        },
+    }
+    state["ticket_jobs"]["2"].update(
+        {
+            "integrated_sha": "integrated-2",
+            "effective_revision": "effective-2",
+            "acceptance_record": {
+                "reviewed_base_sha": git.resolve(str(state["run_branch"])),
+                "reviewed_candidate_tree": "tree-2",
+                "artifact": _passing_artifact(),
+            },
+        }
+    )
+
+    records = ticket_completion_records(state)
+
+    assert records == [
+        {
+            "ticket_number": 2,
+            "integrated_sha": "integrated-2",
+            "effective_revision": "effective-2",
+            "reviewed_base_sha": git.resolve(str(state["run_branch"])),
+            "reviewed_candidate_tree": "tree-2",
+        },
+        {
+            "ticket_number": 10,
+            "integrated_sha": "integrated-10",
+            "effective_revision": "effective-10",
+            "reviewed_base_sha": git.resolve(str(state["run_branch"])),
+            "reviewed_candidate_tree": "tree-10",
+        },
+    ]
+
+
+def test_closed_ticket_edits_do_not_change_its_completion_revision(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    original_ticket = dict(state["ticket_graph"]["tickets"]["2"])
+    original_completion = ticket_completion_records(state)
+    fixture = git_repo / "github.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["issues"]["2"]["title"] = "Edited after completion"
+    data["issues"]["2"]["body"] = "This edit is outside the completed Ticket."
+    data["parent"]["body"] = "The live Parent changed after Ticket completion."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        str(state["run_id"])
+    )
+
+    assert refreshed["status"] == "run_acceptance_pending"
+    assert refreshed["ticket_graph"]["tickets"]["2"] == original_ticket
+    assert ticket_completion_records(refreshed) == original_completion
+
+
+def test_parent_drift_immediately_stales_completed_run_acceptance(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    accepted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=ScriptedRunAgents(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    ).accept(str(state["run_id"]))
+    assert accepted["run_acceptance"]["phase"] == "accepted"
+    accepted["run_acceptance"].update(
+        {
+            "prior_human_blockers": ["An old blocker must not cross generations."],
+            "human_response_history": [{"generation": 1, "response": "old"}],
+            "reviewer_resume_thread_id": "old-run-reviewer",
+        }
+    )
+    accepted["run_publication"] = {"phase": "pending"}
+    states.save_run(str(state["run_id"]), accepted)
+    fixture = git_repo / "github.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["parent"]["body"] = "Updated after all Tickets completed."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        str(state["run_id"])
+    )
+
+    assert refreshed["status"] == "run_acceptance_pending"
+    assert refreshed["terminal_kind"] == "run_acceptance_stale"
+    assert refreshed["run_acceptance"]["phase"] == "pending"
+    assert "prior_human_blockers" not in refreshed["run_acceptance"]
+    assert "human_response_history" not in refreshed["run_acceptance"]
+    assert "reviewer_resume_thread_id" not in refreshed["run_acceptance"]
+    assert refreshed["run_publication"]["phase"] == "stale"
+
+
+def test_reopened_completed_ticket_fails_closed(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["issues"]["2"]["state"] = "OPEN"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        str(state["run_id"])
+    )
+
+    assert refreshed["status"] == "unsupported_scope_change"
+    assert refreshed["terminal_kind"] == "unsupported_scope_change"
+    assert refreshed["diagnostics"] == [
+        {
+            "code": "completed_ticket_reopened",
+            "message": "Completed Ticket #2 was reopened outside Run Abandonment Recovery",
+            "ticket_numbers": [2],
+        }
+    ]
 
 
 def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
@@ -683,17 +824,14 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
     }
     run["repair_job"] = job
 
-    engine._invalidate_stale_repair_publication(
+    engine._invalidate_stale_repair(
         state, job, git_repo / "unused-checkout"
     )
 
     assert job["phase"] == "stale"
     assert "repair_job" not in run
     assert state["status"] == "run_acceptance_pending"
-    assert run["phase"] == "repairing"
-    replacement = engine._repair_job(state, run)
-    assert replacement["repair_generation"] == 2
-    assert replacement["repair_branch"].endswith("/1-generation-2")
+    assert run["phase"] == "pending"
 
 
 def test_run_acceptance_rejects_run_repair_developer_as_a_reviewer(
@@ -747,9 +885,13 @@ def test_run_acceptance_discards_a_review_when_its_parent_snapshot_drifts(
 ) -> None:
     state, states, git = _completed_run(git_repo)
 
+    fixture = git_repo / "github.json"
+
     class DriftingReviewer:
         def review(self, request: dict[str, Any]) -> ReviewResult:
-            request["parent"]["revision"] = "drifted-during-review"
+            data = json.loads(fixture.read_text(encoding="utf-8"))
+            data["parent"]["body"] = "Changed while the Reviewer was running."
+            fixture.write_text(json.dumps(data), encoding="utf-8")
             return ReviewResult("run-reviewer", _passing_artifact())
 
     pending = RunAcceptanceEngine(
@@ -757,11 +899,53 @@ def test_run_acceptance_discards_a_review_when_its_parent_snapshot_drifts(
         states=states,
         agents=DriftingReviewer(),
         github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        currentness_reader=FixtureGitHubReader(fixture),
     ).accept(str(state["run_id"]))
 
     assert pending["run_acceptance"]["phase"] == "pending"
     assert "acceptance_artifact" not in pending["run_acceptance"]
     assert "acceptance_record" not in pending["run_acceptance"]
+
+
+def test_run_acceptance_refreshes_currentness_before_reusing_an_accepted_run(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    initial = ScriptedRunAgents()
+    initial._reviews = [_passing_artifact()]
+    RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=initial,
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    ).accept(str(state["run_id"]))
+
+    fixture = git_repo / "github.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["parent"]["body"] = "Changed after acceptance."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    class FreshReviewer:
+        def __init__(self) -> None:
+            self.review_requests: list[dict[str, Any]] = []
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.review_requests.append(request)
+            return ReviewResult("fresh-run-reviewer", _passing_artifact())
+
+    refreshed = FreshReviewer()
+
+    result = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=refreshed,
+        github=FixtureGitHubPublisher(fixture, git),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert result["status"] == "run_publication_pending"
+    assert result["run_acceptance"]["validation_attempts"] == 2
+    assert len(refreshed.review_requests) == 1
 
 
 def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
@@ -1004,7 +1188,7 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     assert stdout_json(accepted)["status"] == "run_publication_pending"
 
 
-def test_run_repair_requeue_closes_old_pr_and_returns_to_fresh_acceptance(
+def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -1045,137 +1229,161 @@ def test_run_repair_requeue_closes_old_pr_and_returns_to_fresh_acceptance(
         },
     }
     state["run_acceptance"] = run
-    state["status"] = "requeue_required"
-    state["requeue_required"] = {
-        "work_subject": f"run-repair:{state['run_id']}",
-        "generation": 1,
-        "reason": "run_repair_base_changed",
-    }
+    state["status"] = "run_acceptance_pending"
     states.save_run(str(state["run_id"]), state)
-    agents = git_repo / "fresh-run-review.json"
-    agents.write_text(
-        json.dumps(
-            {
-                "run_reviews": [
-                    {
-                        "thread_id": "fresh-run-reviewer",
-                        "artifact": _repair_artifact(),
-                    },
-                    {
-                        "thread_id": "repair-reviewer-new",
-                        "artifact": _passing_artifact(),
-                    },
-                    {
-                        "thread_id": "fresh-run-reviewer-after-repair",
-                        "artifact": _passing_artifact(),
-                    },
-                ],
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "repair-new",
-                        "summary": "Repaired the fresh Run finding.",
-                        "write_files": {"run-repair.txt": "repaired\n"},
-                    }
-                ],
-                "publications": [
-                    {
-                        "commit_message": "fix(run): repair fresh validation finding",
-                        "pr_title": "fix(run): repair fresh validation finding",
-                        "pr_body_markdown": (
-                            "## What Problem This Solves\n\nThe fresh Run finding remains.\n\n"
-                            "## Why This Change Was Made\n\nRepair the finding.\n\n"
-                            "## User Impact\n\nThe full Run works.\n\n"
-                            "## Evidence\n\nFresh acceptance passed."
-                        ),
-                    }
-                ],
-            },
-        ),
-        encoding="utf-8",
+    refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        str(state["run_id"])
     )
 
-    requeued = run_cli(
-        git_repo, fixture, "requeue", str(state["run_id"]), "--agent-fixture", str(agents)
-    )
-
-    assert requeued.returncode == 0, requeued.stderr
-    assert stdout_json(requeued)["status"] == "run_publication_pending"
-    persisted = states.load_run(str(state["run_id"]))
-    assert persisted is not None
-    assert persisted["retired_job_generations"][0]["work_subject"] == (
-        f"run-repair:{state['run_id']}"
-    )
-    assert persisted["retired_job_generations"][0]["thread_ids"] == [
-        "repair-old",
-        "repair-reviewer-old",
-    ]
+    assert refreshed["status"] == "run_acceptance_pending"
+    assert "requeue_required" not in refreshed
+    assert "repair_job" not in refreshed["run_acceptance"]
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
-    assert [pull["state"] for pull in pulls] == ["CLOSED", "MERGED"]
-    replacement = persisted["run_acceptance"]
-    assert replacement["repair_generation"] == 2
-    assert replacement["reviewer_thread_ids"][-1] == "fresh-run-reviewer-after-repair"
-    completed_repairs = replacement["completed_repair_jobs"]
-    assert completed_repairs[0]["repair_branch"].endswith("/1-generation-2")
-    repair_threads = {
-        invocation["reported_thread_id"]
-        for invocation in persisted["agent_invocation_history"]
-        if invocation["work_subject"] == f"run-repair:{state['run_id']}"
-        and invocation["generation"] == 2
-    }
-    assert {"repair-new", "repair-reviewer-new"} <= repair_threads
+    assert pulls[0]["state"] == "OPEN"
 
 
-def test_run_repair_requeue_blocks_an_externally_closed_old_pr(
+def test_run_repair_discards_an_inflight_development_after_parent_drift(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    original_head = git.resolve(str(state["run_branch"]))
+
+    class DriftingRepairDeveloper(ScriptedRunAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            result = super().develop(request)
+            data = json.loads(fixture.read_text(encoding="utf-8"))
+            data["parent"]["body"] = "Changed while Run Repair was running."
+            fixture.write_text(json.dumps(data), encoding="utf-8")
+            return result
+
+    agents = DriftingRepairDeveloper()
+    agents._reviews = [_repair_artifact()]
+    stale = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert stale["status"] == "run_acceptance_pending"
+    assert stale["run_acceptance"]["phase"] == "pending"
+    assert "repair_job" not in stale["run_acceptance"]
+    assert "run-repair-developer" in stale["run_acceptance"][
+        "discarded_repair_thread_ids"
+    ]
+    assert git.resolve(str(state["run_branch"])) == original_head
+
+
+def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
-    repair_branch = f"agent-run-repair/{state['run_id']}/1"
-    publisher.ensure_run_repair_branch(
-        branch=repair_branch, base_branch=str(state["run_branch"])
+    pr_number = publisher.ensure_run_pr(
+        branch=str(state["run_branch"]),
+        base_branch="main",
+        title="Final Run",
+        body="Original final Run narrative.",
     )
-    pr_number = publisher.ensure_run_repair_pr(
-        branch=repair_branch,
-        base_branch=str(state["run_branch"]),
-        title="old repair",
-        body="old repair body",
-    )
+    state["run_publication"] = {"phase": "ready_for_approval", "pr_number": pr_number}
     state["run_acceptance"] = {
         "phase": "repairing",
-        "repair_generation": 1,
-        "repair_job": {
-            "phase": "developing",
-            "repair_generation": 1,
-            "repair_branch": repair_branch,
-            "base_sha": "stale-run-base",
-            "parent_revision": state["parent"]["revision"],
-            "ticket_graph_revision": state["ticket_graph"]["revision"],
-            "ticket_completion_records": [],
-            "pr_number": pr_number,
-            "publication_sha": git.resolve(str(state["run_branch"])),
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "reviewer_thread_ids": [],
+        "development_thread_history": [],
+        "acceptance_artifact": _repair_artifact(),
+        "repair_request": {
+            "repair_source": "required_checks",
+            "ci_evidence": publisher.required_check_evidence(pr_number),
         },
     }
-    state["status"] = "requeue_required"
-    state["terminal_kind"] = "requeue_required"
-    state["requeue_required"] = {
-        "work_subject": f"run-repair:{state['run_id']}",
-        "generation": 1,
-        "reason": "run_repair_base_changed",
-    }
     states.save_run(str(state["run_id"]), state)
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
-    fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    blocked = run_cli(git_repo, fixture, "requeue", str(state["run_id"]))
+    class DriftingRepairDeveloper(ScriptedRunAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            result = super().develop(request)
+            for pull in publisher.data["delivery"]["pull_requests"]:
+                if pull["number"] == pr_number:
+                    pull["state"] = "CLOSED"
+            return result
 
-    assert blocked.returncode == 2
-    assert stdout_json(blocked)["status"] == "blocked"
-    assert stdout_json(blocked)["diagnostics"][0]["code"] == (
-        "change_pr_closed_or_merged_externally"
+    agents = DriftingRepairDeveloper()
+    stale = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert stale["status"] == "run_acceptance_pending"
+    assert stale["run_acceptance"]["phase"] == "pending"
+    assert "repair_job" not in stale["run_acceptance"]
+
+
+def test_stale_run_repair_keeps_inflight_review_threads_out_of_fresh_review(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class DriftingRepairReviewer(ScriptedRunAgents):
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            result = super().review(request)
+            if request.get("repair_scope") == "run_repair":
+                data = json.loads(fixture.read_text(encoding="utf-8"))
+                data["parent"]["body"] = "Changed while Run Repair review was running."
+                fixture.write_text(json.dumps(data), encoding="utf-8")
+            return result
+
+    stale = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=DriftingRepairReviewer(),
+        github=FixtureGitHubPublisher(fixture, git),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert stale["status"] == "run_acceptance_pending"
+    assert set(stale["run_acceptance"]["discarded_repair_thread_ids"]) >= {
+        "run-repair-developer",
+        "run-reviewer-1",
+    }
+
+
+def test_stale_run_repair_keeps_threads_out_of_fresh_review(
+    git_repo: Path,
+) -> None:
+    state, _states, _git = _completed_run(git_repo)
+    run = state["run_acceptance"] = {
+        "phase": "repairing",
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": ["run-reviewer"],
+        "repair_job": {
+            "development_thread_id": "repair-developer",
+            "development_thread_history": ["repair-developer-old"],
+            "reviewer_thread_ids": ["repair-reviewer"],
+        },
+    }
+
+    invalidate_stale_run_repair(state)
+
+    engine = RunAcceptanceEngine(
+        git=_git,
+        states=_states,
+        agents=ScriptedRunAgents(),
     )
+    assert engine._all_prior_threads(state, run) >= {
+        "run-reviewer",
+        "repair-developer",
+        "repair-developer-old",
+        "repair-reviewer",
+    }
 
 
 def test_accept_run_does_not_review_after_a_github_refresh_failure(
@@ -1268,6 +1476,116 @@ def test_default_branch_drift_invalidates_run_acceptance_and_rechecks_merge_prev
     assert result["status"] == "run_publication_pending"
     assert result["run_acceptance"]["validation_attempts"] == 2
     assert result["run_acceptance"]["acceptance_record"]["reviewed_default_base_sha"] == git.resolve("main")
+
+
+def test_controller_default_branch_drift_stales_accepted_run(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    first = ScriptedRunAgents()
+    first._reviews = [_passing_artifact()]
+    accepted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=first,
+        github=FixtureGitHubPublisher(fixture, git),
+        default_head_sha=git.resolve("main"),
+    ).accept(str(state["run_id"]))
+    assert accepted["run_acceptance"]["phase"] == "accepted"
+
+    (git_repo / "controller-default-drift.txt").write_text(
+        "advanced\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "controller-default-drift.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "advance default for controller refresh"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["default_head_sha"] = git.resolve("main")
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        str(state["run_id"])
+    )
+
+    assert refreshed["status"] == "run_acceptance_pending"
+    assert refreshed["run_acceptance"]["phase"] == "pending"
+
+
+def test_run_acceptance_discards_inflight_review_when_default_base_advances(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class DriftingDefaultReviewer:
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            (git_repo / "default-branch.txt").write_text("advanced\n", encoding="utf-8")
+            subprocess.run(["git", "add", "default-branch.txt"], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "advance default during review"],
+                cwd=git_repo,
+                check=True,
+                capture_output=True,
+            )
+            data = json.loads(fixture.read_text(encoding="utf-8"))
+            data["default_head_sha"] = git.resolve("main")
+            fixture.write_text(json.dumps(data), encoding="utf-8")
+            return ReviewResult("stale-reviewer", _passing_artifact())
+
+    stale = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=DriftingDefaultReviewer(),
+        github=FixtureGitHubPublisher(fixture, git),
+        default_head_sha=git.resolve("main"),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert stale["status"] == "run_acceptance_pending"
+    assert stale["run_acceptance"]["phase"] == "pending"
+    assert "acceptance_record" not in stale["run_acceptance"]
+
+    class ReusedReviewer:
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            del request
+            return ReviewResult("stale-reviewer", _passing_artifact())
+
+    with pytest.raises(ValueError, match="new Reviewer Thread"):
+        RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=ReusedReviewer(),
+            github=FixtureGitHubPublisher(fixture, git),
+            default_head_sha=git.resolve("main"),
+            currentness_reader=FixtureGitHubReader(fixture),
+        ).accept(str(state["run_id"]))
+
+    class FreshReviewer:
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            return ReviewResult("fresh-reviewer", _passing_artifact())
+
+    accepted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=FreshReviewer(),
+        github=FixtureGitHubPublisher(fixture, git),
+        default_head_sha=git.resolve("main"),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert accepted["status"] == "run_publication_pending"
+    assert accepted["run_acceptance"]["reviewer_thread_ids"] == [
+        "stale-reviewer",
+        "fresh-reviewer",
+    ]
+    assert accepted["run_acceptance"]["acceptance_record"]["reviewed_default_base_sha"] == (
+        git.resolve("main")
+    )
 
 
 def test_run_acceptance_binds_the_previewed_merge_tree(git_repo: Path) -> None:

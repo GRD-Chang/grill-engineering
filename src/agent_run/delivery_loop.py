@@ -13,6 +13,7 @@ from agent_run.change_delivery import (
     ChangeJobContract,
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     latest_reviewer_thread,
+    StaleDisposition,
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -81,7 +82,8 @@ class TicketDeliveryLoop:
                 ),
                 acceptance_record=self._acceptance_record,
                 acceptance_is_current=self._acceptance_is_current,
-                invalidate_stale_publication=self._invalidate_stale_publication,
+                invalidate_stale=self._invalidate_stale,
+                stale_disposition=StaleDisposition.BLOCK,
                 revision_changed=self._live_revision_changed,
                 requires_explicit_approval=lambda _state, _job: False,
                 after_merge=self._after_merge,
@@ -125,7 +127,7 @@ class TicketDeliveryLoop:
             and acceptance.get("effective_revision") == job.get("effective_revision")
         )
 
-    def _invalidate_stale_publication(
+    def _invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         self.git.reset_checkout_to_base(checkout, str(state["run_branch"]))

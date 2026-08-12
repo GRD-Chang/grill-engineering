@@ -26,6 +26,8 @@ class RunPublicationFlow(RunPublicationShared):
     def publish(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
+            if not self._refresh_currentness(state):
+                return self._save(state)
             run = self._mapping(state, "run_acceptance")
             publication = self._publication_state(state)
             if publication["phase"] in {"merged", "abandoned"}:
@@ -112,8 +114,11 @@ class RunPublicationFlow(RunPublicationShared):
             )
             request = self._publication_request(state, checkout)
             request["_invocation_event"] = self._invocation_events(state, request)
-            request["_currentness_check"] = lambda: self._acceptance_is_current(
-                state, self._mapping(state, "run_acceptance")
+            request["_currentness_check"] = lambda: (
+                self._refresh_currentness(state)
+                and self._acceptance_is_current(
+                    state, self._mapping(state, "run_acceptance")
+                )
             )
             if publication.get("publication_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
@@ -122,7 +127,7 @@ class RunPublicationFlow(RunPublicationShared):
             raw = self.agents.run_publication(request)
             publication.pop("publication_failure_resume", None)
             publication.pop("publication_new_thread", None)
-            if not self._acceptance_is_current(
+            if not self._refresh_currentness(state) or not self._acceptance_is_current(
                 state, self._mapping(state, "run_acceptance")
             ):
                 self._invalidate_for_fresh_acceptance(state)
@@ -198,21 +203,42 @@ class RunPublicationFlow(RunPublicationShared):
         artifact = PublicationArtifact.from_stored(
             self._mapping(publication, "artifact"), delivery_run=str(state["run_id"])
         )
+        if not self._publication_is_current(state):
+            return self._invalidate_for_fresh_acceptance(state)
+        run = self._mapping(state, "run_acceptance")
         run_head = self.git.resolve(str(state["run_branch"]))
-        pr_number = self.github.ensure_run_pr(
-            branch=str(state["run_branch"]),
-            base_branch=self.default_branch,
-            title=artifact.pr_title,
-            body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+        known_pr = publication.get("pr_number")
+        existing = (
+            known_pr
+            if isinstance(known_pr, int)
+            else self.github.find_run_pr(branch=str(state["run_branch"]))
         )
+        if not self._publication_is_current(state):
+            return self._invalidate_for_fresh_acceptance(state)
+        run = self._mapping(state, "run_acceptance")
+        run_head = self.git.resolve(str(state["run_branch"]))
+        if existing is not None and not self._final_pr_is_current(existing, run_head):
+            return self._invalidate_for_fresh_acceptance(state)
+        pr_number = existing
+        if pr_number is None:
+            pr_number = self.github.ensure_run_pr(
+                branch=str(state["run_branch"]),
+                base_branch=self.default_branch,
+                title=artifact.pr_title,
+                body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+            )
+        else:
+            self.github.refresh_run_pr_narrative(
+                pr_number=pr_number,
+                expected_head_sha=run_head,
+                expected_base_branch=self.default_branch,
+                expected_base_sha=self.default_head_sha,
+                title=artifact.pr_title,
+                body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+            )
         live = self.github.live_pull_request(pr_number)
-        if (
-            live.get("state") != "OPEN"
-            or live.get("head_sha") != run_head
-            or live.get("base_branch") != self.default_branch
-            or live.get("base_sha") != self.default_head_sha
-        ):
-            raise ValueError("final Run PR does not match the accepted publication")
+        if not self._final_pr_is_current(pr_number, run_head):
+            return self._invalidate_for_fresh_acceptance(state)
         record = self._record(state, run_head, str(live["head_sha"]))
         self.github.record_run_publication(pr_number, record)
         publication.update({"pr_number": pr_number, "record": record})
@@ -236,3 +262,19 @@ class RunPublicationFlow(RunPublicationShared):
             state["terminal_kind"] = "waiting_human"
             state["diagnostics"] = []
         return self._save(state)
+
+    def _publication_is_current(self, state: dict[str, Any]) -> bool:
+        if not self._refresh_currentness(state):
+            return False
+        return self._acceptance_is_current(
+            state, self._mapping(state, "run_acceptance")
+        )
+
+    def _final_pr_is_current(self, pr_number: int, run_head: str) -> bool:
+        live = self.github.live_pull_request(pr_number)
+        return (
+            live.get("state") == "OPEN"
+            and live.get("head_sha") == run_head
+            and live.get("base_branch") == self.default_branch
+            and live.get("base_sha") == self.default_head_sha
+        )

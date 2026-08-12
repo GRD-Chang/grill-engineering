@@ -4,6 +4,7 @@ from typing import Any
 
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.git import GitError
+from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_publication_shared import RunPublicationShared
 
 
@@ -13,6 +14,8 @@ class RunPublicationApproval(RunPublicationShared):
     def approve(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
+            if not self._refresh_currentness(state):
+                return self._save(state)
             publication = self._publication_state(state)
             if publication["phase"] == "merged":
                 return self._complete_parent_closeout(state)
@@ -42,6 +45,8 @@ class RunPublicationApproval(RunPublicationShared):
                 record.get("pr_head_sha") != live.get("head_sha")
                 or record.get("run_head_sha") != self.git.resolve(str(state["run_branch"]))
                 or record.get("default_head_sha") != self.default_head_sha
+                or record.get("ticket_completion_records")
+                != ticket_completion_records(state)
                 or live.get("base_sha") != self.default_head_sha
                 or live.get("base_branch") != self.default_branch
             ):

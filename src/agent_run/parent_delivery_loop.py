@@ -10,6 +10,7 @@ from agent_run.change_delivery import (
     ChangeDeliveryEngine,
     ChangeJobContract,
     latest_reviewer_thread,
+    StaleDisposition,
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -58,7 +59,8 @@ class ParentDeliveryLoop:
                 ),
                 acceptance_record=self._acceptance_record,
                 acceptance_is_current=self._acceptance_is_current,
-                invalidate_stale_publication=self._invalidate_stale_publication,
+                invalidate_stale=self._invalidate_stale,
+                stale_disposition=StaleDisposition.BLOCK,
                 revision_changed=self._revision_changed,
                 requires_explicit_approval=lambda _state, _job: True,
                 after_merge=lambda _state, _job, _live: True,
@@ -168,7 +170,7 @@ class ParentDeliveryLoop:
             request["ci_evidence"] = _mapping(job, "ci_evidence")
         return request
 
-    def _invalidate_stale_publication(
+    def _invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         base_branch = str(_mapping(state, "base")["branch"])
