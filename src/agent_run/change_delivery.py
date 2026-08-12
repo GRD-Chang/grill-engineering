@@ -270,7 +270,10 @@ class ChangeDeliveryEngine:
             )
             if job.get("publication_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
+            elif job.get("publication_failure_resume") is True:
+                request["_invocation_mode"] = "resume"
             raw = self.agents.publication(request)
+            job.pop("publication_failure_resume", None)
             if isinstance(raw, HumanBlockerResult):
                 job["publication_thread_id"] = raw.thread_id
                 job.pop("publication_new_thread", None)

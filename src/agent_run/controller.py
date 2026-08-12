@@ -92,7 +92,13 @@ class Controller:
             base = _state_mapping(existing, "base")
             base_sha = str(base["sha"])
             state = self._refresh(existing, parent_number)
-            if state.get("status") in {"unsupported_scope_change", "execution_failed"}:
+            if state.get("status") == "unsupported_scope_change" or (
+                state.get("status") == "execution_failed"
+                and (
+                    existing.get("status") != "execution_failed"
+                    or state.get("diagnostics") != existing.get("diagnostics")
+                )
+            ):
                 self.states.save_run(run_id, state)
                 return state, True
             if human_response is not None:
@@ -451,12 +457,15 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     job, mirror = _publication_job_for_invocation(state, invocation)
     if invocation.get("role") == "final_publication":
         job.pop("thread_id", None)
+        job.pop("publication_failure_resume", None)
     else:
         job.pop("publication_thread_id", None)
     job["publication_new_thread"] = True
+    job.pop("publication_failure_resume", None)
     if mirror is not None:
         mirror.pop("publication_thread_id", None)
         mirror["publication_new_thread"] = True
+        mirror.pop("publication_failure_resume", None)
 
 
 def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
@@ -497,12 +506,15 @@ def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
         return
     if invocation.get("role") == "final_publication":
         job["thread_id"] = thread_id
+        job["publication_failure_resume"] = True
     else:
         job["publication_thread_id"] = thread_id
         job.pop("publication_new_thread", None)
+        job["publication_failure_resume"] = True
         if mirror is not None:
             mirror["publication_thread_id"] = thread_id
             mirror.pop("publication_new_thread", None)
+            mirror["publication_failure_resume"] = True
 
 
 def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:

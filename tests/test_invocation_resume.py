@@ -165,6 +165,43 @@ def test_parent_only_resume_accepts_generation_one(
     assert store.load_run(run_id) == resumed
 
 
+@pytest.mark.parametrize(
+    ("subject_kind", "invocation_generation"),
+    [
+        ("ticket", 2),
+        ("run_repair", 2),
+        ("final_publication", 2),
+        ("parent_only", 1),
+    ],
+)
+@pytest.mark.parametrize("new_thread", [False, True])
+def test_publication_failure_resume_marks_the_successor_mode(
+    git_repo: Path,
+    subject_kind: str,
+    invocation_generation: int,
+    new_thread: bool,
+) -> None:
+    controller, _store, run_id = _prepared_resume(
+        git_repo,
+        subject_kind=subject_kind,
+        invocation_generation=invocation_generation,
+    )
+
+    resumed, _ = controller.resume(run_id, new_thread=new_thread)
+    if subject_kind == "final_publication":
+        publication = resumed["run_publication"]
+    elif subject_kind == "run_repair":
+        publication = resumed["run_acceptance"]["repair_job"]
+    elif subject_kind == "ticket":
+        publication = resumed["ticket_jobs"]["3"]
+    else:
+        publication = resumed["parent_job"]
+    if new_thread:
+        assert "publication_failure_resume" not in publication
+    else:
+        assert publication["publication_failure_resume"] is True
+
+
 _MISSING = object()
 
 

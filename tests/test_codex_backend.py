@@ -160,6 +160,38 @@ def test_failure_resume_rechecks_current_workspace_before_development(
     assert "重新核验权威输入和实际工作" in prompts[0]
 
 
+def test_failure_resume_rechecks_current_workspace_before_publication(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompts: list[str] = []
+
+    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"publication-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    CodexCliBackend(credential_provider=lambda: "reader-secret")._invoke_structured_output(
+        request={"_invocation_mode": "resume"},
+        prompt="Publication stage prompt",
+        checkout=tmp_path,
+        thread_id="publication-thread",
+        schema={},
+        output_name="Publication Artifact",
+        validate=lambda _value: None,
+        initial_writable_checkout=False,
+    )
+
+    assert "因前次调用失败而继续的同 Thread Resume" in prompts[0]
+    assert "重新核验权威输入和实际工作" in prompts[0]
+
+
 @pytest.mark.parametrize(
     ("stdout", "stderr", "expected"),
     [

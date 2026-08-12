@@ -285,7 +285,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     before_fixture["issues"]["4"] = added
     fixture.write_text(json.dumps(before_fixture), encoding="utf-8")
 
-    resumed = run_cli(git_repo, fixture, "resume", run_id)
+    resumed = run_cli(git_repo, fixture, "deliver", run_id)
 
     assert resumed.returncode == 2
     assert stdout_json(resumed)["status"] == "unsupported_scope_change"
@@ -372,7 +372,9 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
             run_id,
             *("--agent-fixture", str(agents)) if command == "deliver" else (),
         )
-        assert replayed.returncode == 0, replayed.stderr
+        assert replayed.returncode == (2 if command == "resume" else 0), (
+            replayed.stderr
+        )
         assert stdout_json(replayed)["status"] == "abandoned"
     replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert replayed_fixture["delivery"]["mutations"] == frozen_after_abandon
@@ -405,7 +407,7 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
     before_drift["parent"]["sub_issues"] = [2, 4]
     before_drift["issues"]["4"] = added
     fixture.write_text(json.dumps(before_drift), encoding="utf-8")
-    blocked = run_cli(git_repo, fixture, "resume", run_id)
+    blocked = run_cli(git_repo, fixture, "deliver", run_id)
     assert blocked.returncode == 2
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
@@ -506,7 +508,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     drifted["parent"]["sub_issues"] = [2, 4]
     drifted["issues"]["4"] = added
     fixture.write_text(json.dumps(drifted), encoding="utf-8")
-    assert run_cli(git_repo, fixture, "resume", run_id).returncode == 2
+    assert run_cli(git_repo, fixture, "deliver", run_id).returncode == 2
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 

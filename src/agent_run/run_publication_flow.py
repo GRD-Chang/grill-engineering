@@ -112,7 +112,10 @@ class RunPublicationFlow(RunPublicationShared):
             )
             if publication.get("publication_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
+            elif publication.get("publication_failure_resume") is True:
+                request["_invocation_mode"] = "resume"
             raw = self.agents.run_publication(request)
+            publication.pop("publication_failure_resume", None)
             publication.pop("publication_new_thread", None)
             thread_id = raw.pop("_thread_id", None)
             if isinstance(thread_id, str):
