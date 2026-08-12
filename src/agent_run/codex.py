@@ -667,7 +667,15 @@ def _is_json_scalar(value: object) -> bool:
 def _bounded_error(value: str) -> str:
     clean = "".join(character for character in value if character >= " " or character in "\n\t")
     clean = re.sub(
-        r"(?i)(token|authorization|api[_-]?key|secret|password)(\s*[:=]\s*)([^\s,;]+)",
+        r"(?i)\b(authorization|proxy-authorization)"
+        r"([\"']?\s*[:=]\s*[\"']?)(?:(?:bearer|basic)\s+)?"
+        r"([^\s,;\"'}]+)",
+        r"\1\2[REDACTED]",
+        clean,
+    )
+    clean = re.sub(
+        r"(?i)\b(token|api[_-]?key|secret|password)"
+        r"([\"']?\s*[:=]\s*[\"']?)([^\s,;\"'}]+)",
         r"\1\2[REDACTED]",
         clean,
     )

@@ -139,6 +139,63 @@ def test_terminal_error_strips_controls_redacts_and_bounds_utf8() -> None:
     assert len(_terminal_error("", "密" * 9000).encode()) <= 8192
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "Authorization: Bearer sk-live-secret",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "proxy-authorization=Basic dXNlcjpwYXNzd29yZA==",
+            "proxy-authorization=[REDACTED]",
+        ),
+        (
+            '{"authorization":"Bearer sk-json-secret"}',
+            '{"authorization":"[REDACTED]"}',
+        ),
+    ],
+)
+def test_terminal_error_redacts_complete_authorization_credentials(
+    message: str, expected: str
+) -> None:
+    assert _terminal_error("", message) == expected
+
+
+def test_publication_failure_event_never_exposes_authorization_secret(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(
+        arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            arguments,
+            1,
+            stdout='{"type":"thread.started","thread_id":"publication-thread"}\n',
+            stderr="Authorization: Bearer sk-persisted-secret",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+
+    with pytest.raises(CodexProcessError, match=r"Authorization: \[REDACTED\]"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret").publication(
+            {
+                "checkout": str(tmp_path),
+                "acceptance_artifact": {},
+                "_invocation_event": lambda kind, **facts: events.append(
+                    (kind, facts)
+                ),
+            }
+        )
+
+    failed = events[-1]
+    assert failed[0] == "failed"
+    assert failed[1]["error"] == "Authorization: [REDACTED]"
+    assert "sk-persisted-secret" not in repr(events)
+
+
 def test_terminal_error_projects_embedded_api_error_json() -> None:
     message = (
         "API request failed: "
