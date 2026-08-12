@@ -1126,6 +1126,58 @@ def test_run_repair_requeue_closes_old_pr_and_returns_to_fresh_acceptance(
     assert {"repair-new", "repair-reviewer-new"} <= repair_threads
 
 
+def test_run_repair_requeue_blocks_an_externally_closed_old_pr(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    repair_branch = f"agent-run-repair/{state['run_id']}/1"
+    publisher.ensure_run_repair_branch(
+        branch=repair_branch, base_branch=str(state["run_branch"])
+    )
+    pr_number = publisher.ensure_run_repair_pr(
+        branch=repair_branch,
+        base_branch=str(state["run_branch"]),
+        title="old repair",
+        body="old repair body",
+    )
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "repair_generation": 1,
+        "repair_job": {
+            "phase": "developing",
+            "repair_generation": 1,
+            "repair_branch": repair_branch,
+            "base_sha": "stale-run-base",
+            "parent_revision": state["parent"]["revision"],
+            "ticket_graph_revision": state["ticket_graph"]["revision"],
+            "ticket_completion_records": [],
+            "pr_number": pr_number,
+            "publication_sha": git.resolve(str(state["run_branch"])),
+        },
+    }
+    state["status"] = "requeue_required"
+    state["terminal_kind"] = "requeue_required"
+    state["requeue_required"] = {
+        "work_subject": f"run-repair:{state['run_id']}",
+        "generation": 1,
+        "reason": "run_repair_base_changed",
+    }
+    states.save_run(str(state["run_id"]), state)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    blocked = run_cli(git_repo, fixture, "requeue", str(state["run_id"]))
+
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "blocked"
+    assert stdout_json(blocked)["diagnostics"][0]["code"] == (
+        "change_pr_closed_or_merged_externally"
+    )
+
+
 def test_accept_run_does_not_review_after_a_github_refresh_failure(
     git_repo: Path,
 ) -> None:

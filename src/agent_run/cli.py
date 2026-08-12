@@ -512,7 +512,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "run_approval_pending",
                 "completed",
                 "abandoned",
-                "requeue_required",
                 "waiting_merge",
             }
             else 2
@@ -532,10 +531,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 run_id, str(error)
             )
         durable_status = None
+        durable_diagnostics: list[object] | None = None
         if states is not None and isinstance(run_id, str):
             durable = states.load_run(run_id)
             if isinstance(durable, dict):
                 durable_status = durable.get("status")
+                diagnostics = durable.get("diagnostics")
+                if isinstance(diagnostics, list):
+                    durable_diagnostics = diagnostics
         diagnostic_code = (
             "multiple_unfinished_runs"
             if str(error).startswith("multiple unfinished Delivery Runs")
@@ -571,7 +574,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             "code": diagnostic_code,
                             "message": diagnostic_message,
                         }
-                    ],
+                    ]
+                    if durable_status != "blocked" or durable_diagnostics is None
+                    else durable_diagnostics,
                 },
                 ensure_ascii=False,
                 sort_keys=True,

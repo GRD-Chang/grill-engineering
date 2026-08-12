@@ -35,6 +35,11 @@ def _run_to_human_gate(
         agent_arguments = _agent_fixture_arguments(parsed, command)
         _invoke_nested(command, run_id, *arguments, *agent_arguments)
         state = _load_local_run(states, run_id)
+        if command == "requeue":
+            # `requeue` itself enters the replacement Job Loop. Returning
+            # here enforces the one automatic replacement budget for this
+            # top-level `run` command.
+            return state, resumed
 def _nested_arguments(parsed: argparse.Namespace) -> list[str]:
     arguments: list[str] = []
     if parsed.repo:
@@ -88,6 +93,7 @@ def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, 
         "execution_failed",
         "blocked",
         "waiting_merge",
+        "requeue_required",
     }:
         raise ValueError(f"{command} failed without a recoverable Run state")
     return result
@@ -102,6 +108,8 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
         "waiting_merge",
     }:
         return "deliver"
+    if status == "requeue_required":
+        return "requeue"
     if status == "run_acceptance_pending":
         return "accept-run"
     publication = state.get("run_publication")

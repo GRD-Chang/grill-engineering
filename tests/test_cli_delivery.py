@@ -1065,6 +1065,49 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     assert [pull["state"] for pull in pulls] == ["CLOSED", "OPEN"]
 
 
+def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "parent-developer",
+                    "summary": "Parent implementation.",
+                    "write_files": {"parent-feature.txt": "old\n"},
+                }],
+                "publications": [parent_publication()],
+                "reviews": [passing_acceptance("parent-reviewer", "Parent pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    assert stdout_json(
+        run_cli(git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents))
+    )["status"] == "parent_approval_pending"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["parent"]["body"] = "Changed parent requirement."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == (
+        "requeue_required"
+    )
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    blocked = run_cli(git_repo, fixture, "requeue", run_id)
+
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "blocked"
+    assert stdout_json(blocked)["diagnostics"][0]["code"] == (
+        "change_pr_closed_or_merged_externally"
+    )
+
+
 def test_child_addition_cannot_continue_parent_only_delivery(
     git_repo: Path,
 ) -> None:
@@ -2164,3 +2207,133 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     assert delivery["mutations"].count(
         {"action": "close_change_pr", "pr_number": 1}
     ) == 1
+
+
+def test_run_automatically_requeues_one_stale_generation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"required_checks": ["pending", "pending"]},
+    )
+    first_agents = git_repo / "first-agents.json"
+    first_agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "developer-old",
+                    "summary": "Initial implementation.",
+                    "write_files": {"feature.txt": "old\n"},
+                }],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("reviewer-old", "Initial pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    waiting = run_cli(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
+    )
+    assert stdout_json(waiting)["status"] == "waiting_checks"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["issues"]["3"]["body"] += "\nNew requirement."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    replacement_agents = git_repo / "replacement-agents.json"
+    replacement_agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "developer-new",
+                    "summary": "Replacement implementation.",
+                    "write_files": {"feature.txt": "new\n"},
+                }],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("reviewer-new", "Replacement pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    requeued = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(replacement_agents)
+    )
+
+    assert requeued.returncode == 0, requeued.stderr
+    state = load_only_run_state(git_repo)
+    replacement = state["active_ticket_job"]
+    assert replacement["ticket_branch_generation"] == 2
+    assert replacement["development_thread_id"] == "developer-new"
+    assert state["retired_job_generations"][0]["thread_ids"] == [
+        "developer-old",
+        "reviewer-old",
+    ]
+
+
+def test_run_stops_when_a_replacement_generation_drifts_again(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"required_checks": ["pending", "pending"]},
+    )
+    first_agents = git_repo / "first-agents.json"
+    first_agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "developer-old",
+                    "summary": "Initial implementation.",
+                    "write_files": {"feature.txt": "old\n"},
+                }],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("reviewer-old", "Initial pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    assert stdout_json(
+        run_cli(
+            git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
+        )
+    )["status"] == "waiting_checks"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["issues"]["3"]["body"] += "\nFirst replacement requirement."
+    data["delivery"]["drift_after"] = {
+        "action": "publish_branch",
+        "kind": "ticket_content",
+        "ticket_number": 3,
+    }
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    replacement_agents = git_repo / "replacement-agents.json"
+    replacement_agents.write_text(
+        json.dumps(
+            {
+                "developments": [{
+                    "expected_thread_id": None,
+                    "thread_id": "developer-new",
+                    "summary": "Replacement implementation.",
+                    "write_files": {"feature.txt": "new\n"},
+                }],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("reviewer-new", "Replacement pass.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stopped = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(replacement_agents)
+    )
+
+    assert stopped.returncode == 2
+    assert stdout_json(stopped)["status"] == "requeue_required"
+    state = load_only_run_state(git_repo)
+    assert state["active_ticket_job"]["ticket_branch_generation"] == 2
+    assert len(state["retired_job_generations"]) == 1
