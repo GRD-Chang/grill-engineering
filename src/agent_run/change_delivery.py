@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_run.agents import AgentBackend, HumanBlockerResult, PublicationResult
+from agent_run.agent_invocation import (
+    canonical_fingerprint,
+    invocation_event_recorder,
+)
 from agent_run.artifacts import (
     AcceptanceArtifact,
     PublicationArtifact,
@@ -247,9 +251,18 @@ class ChangeDeliveryEngine:
                 continue
             job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
             self.contract.save(state)
+            request["_invocation_event"] = self._invocation_events(
+                state, job, request, phase="publication"
+            )
+            request["_currentness_check"] = lambda: self._publication_is_current(
+                state, job
+            )
+            if job.get("publication_new_thread") is True:
+                request["_invocation_mode"] = "new-thread"
             raw = self.agents.publication(request)
             if isinstance(raw, HumanBlockerResult):
                 job["publication_thread_id"] = raw.thread_id
+                job.pop("publication_new_thread", None)
                 self._wait_for_human(
                     state,
                     job,
@@ -258,27 +271,29 @@ class ChangeDeliveryEngine:
                 )
                 return
             if isinstance(raw, PublicationResult):
+                job.pop("publication_new_thread", None)
                 if raw.replaced_thread_id is not None:
-                    if not self.contract.development_thread_is_allowed(
-                        state, raw.thread_id
-                    ):
-                        raise ValueError(
-                            "Change Job Development Thread is not independent"
-                        )
-                    _record_development_thread(
-                        job, raw.thread_id, raw.replaced_thread_id
+                    raise ValueError(
+                        "Publication Invocation cannot replace its Thread automatically"
                     )
                 elif raw.thread_id != job.get("development_thread_id"):
                     job["publication_thread_id"] = raw.thread_id
                 artifact_data = raw.artifact
+                parse_publication = PublicationArtifact.parse
             else:
                 artifact_data = raw
+                parse_publication = (
+                    PublicationArtifact.parse
+                    if isinstance(raw, dict) and "result_kind" in raw
+                    else PublicationArtifact.from_stored
+                )
+            job.pop("publication_new_thread", None)
             if isinstance(job.get("ticket_number"), int):
-                publication = PublicationArtifact.parse(
+                publication = parse_publication(
                     artifact_data, primary_ticket=int(job["ticket_number"])
                 )
             else:
-                publication = PublicationArtifact.parse(
+                publication = parse_publication(
                     artifact_data, delivery_run=str(job["run_id"])
                 )
             break
@@ -308,6 +323,49 @@ class ChangeDeliveryEngine:
         self.contract.save(state)
         self._reject_stale(
             state, job, "Publication was discarded after requirements changed"
+        )
+
+    def _invocation_events(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        request: dict[str, Any],
+        *,
+        phase: str,
+    ) -> Callable[..., None]:
+        acceptance = job.get("acceptance_record")
+        if not isinstance(acceptance, dict):
+            raise ValueError("Publication requires a current Acceptance Record")
+        if isinstance(job.get("ticket_number"), int):
+            work_subject = f"ticket:{int(job['ticket_number'])}"
+            generation = int(job.get("ticket_branch_generation", 1))
+        elif isinstance(job.get("repair_generation"), int):
+            work_subject = f"run-repair:{state['run_id']}"
+            generation = int(job["repair_generation"])
+        else:
+            work_subject = f"parent-only:{state['run_id']}"
+            generation = 1
+        boundary: dict[str, Any] = {
+            "base_sha": str(job["base_sha"]),
+            "candidate_sha": str(job["candidate_sha"]),
+            "candidate_tree": str(acceptance["reviewed_candidate_tree"]),
+        }
+        for key in ("effective_revision", "parent_revision", "ticket_graph_revision"):
+            if key in job:
+                boundary[key] = job[key]
+        if "ticket_completion_records" in job:
+            boundary["ticket_completion_records_fingerprint"] = canonical_fingerprint(
+                job["ticket_completion_records"]
+            )
+        return invocation_event_recorder(
+            state,
+            role="publication",
+            phase=phase,
+            work_subject=work_subject,
+            generation=generation,
+            invocation_input=request,
+            currentness_boundary=boundary,
+            save=self.contract.save,
         )
 
     def _review(

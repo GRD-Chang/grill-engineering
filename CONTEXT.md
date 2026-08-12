@@ -217,7 +217,7 @@ _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方�
 _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
 
 **Human Blocker（人工阻塞）**:
-顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在现有 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；其他顶层阶段以唯一替代输出 `{"human_blockers":["…"]}` 表达。Controller 只保存、展示与在 resume 时原样传回它，不解释或裁决其语义。恢复成功后当前 blocker 告警会清除，最近的原始 blocker 尝试仍作为有界历史保留。
+顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在现有 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；Development 等普通顶层阶段以唯一替代输出 `{"human_blockers":["…"]}` 表达；Ticket、Parent-only、Run Repair 与 Final Run Publication 则遵守统一的五字段 flat wire contract，以 `result_kind: "human_blocker"`、三个 Publication 字段为 `null`、非空 `human_blockers` 表达。Controller 只保存、展示与在 resume 时原样传回它，不解释或裁决其语义。恢复成功后当前 blocker 告警会清除，最近的原始 blocker 尝试仍作为有界历史保留。
 _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
 **Review Finding（审查发现）**:
@@ -243,6 +243,16 @@ _Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acc
 **Acceptance Record（验收记录）**:
 Development–Acceptance Engine 在独立验收后本地持久化的权威记录，将唯一一份 Acceptance Artifact 绑定到 acceptance scope、reviewed base、已验收 Candidate 或 Run head、对应 tree 或预期合并结果、有效 Revision 和 Reviewer 身份。每个合法的 `pass`、`request_changes` 或 `human` 结果都形成当前 Record；只有仍然 current 的 `pass` 可以授权 Publication，后续 Attempt 替换当前 Record，历史只按恢复需要有界保留，GitHub 只接收简洁的 Agent Run Status 投影。
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
+
+**Agent Invocation（Agent 调用）**:
+Controller 对一次阶段级 Codex 调用的持久记录。Publication Invocation 在首个 Output
+Attempt 前成为 active，并绑定 Work Subject、Generation、输入指纹与机械 Currentness Boundary；
+记录只保存输入指纹和有界边界事实，不保存 Prompt、transcript 或 Acceptance Artifact。
+`thread.started` 在进程运行中立即保存。零退出但不符合完整 wire contract 的输出可在同一
+Thread、只读 checkout 中最多修复两次；进程失败、缺失或不匹配的 Thread 只结束当前
+Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原 Thread，或用
+`--new-thread` 明确以标准阶段 Prompt 新开 Thread。
+_Avoid_: Development Attempt、自动替代 Thread、领域 Publication retry
 
 **Ticket Repair Budget（Ticket 修复预算）**:
 一个 Ticket Job 在 Fresh Acceptance 或 CI 失败后最多可触发十次自动修复 Development Attempt。等待 CI、重复读取状态或对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的修复 Attempt 才计数。预算耗尽、Git 完整性检查无法通过或 CI 无法自动修复时，Ticket 转为 `ready-for-human`；Controller 继续推进不依赖该 Ticket 的其他任务。

@@ -4,8 +4,10 @@ import os
 import signal
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 
@@ -237,6 +239,7 @@ def run_worker_process(
     prompt: str,
     environment: dict[str, str],
     timeout: int,
+    on_stdout_line: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         arguments,
@@ -248,17 +251,90 @@ def run_worker_process(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    if on_stdout_line is None:
+        try:
+            stdout, stderr = process.communicate(input=prompt, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            _terminate_process_group(process)
+            raise WorkerSandboxError("Codex worker timed out") from error
+        except BaseException:
+            _terminate_process_group(process)
+            raise
+        _terminate_process_group(process)
+        return subprocess.CompletedProcess(
+            arguments, process.returncode, stdout, stderr
+        )
+
+    stdin = process.stdin
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+    assert stdin is not None
+    assert stdout_pipe is not None
+    assert stderr_pipe is not None
+    stdout_lines: list[str] = []
+    stderr_parts: list[str] = []
+    callback_errors: list[BaseException] = []
+    reader_errors: list[BaseException] = []
+
+    def read_stdout() -> None:
+        try:
+            for line in stdout_pipe:
+                stdout_lines.append(line)
+                if not callback_errors:
+                    try:
+                        on_stdout_line(line)
+                    except BaseException as error:
+                        callback_errors.append(error)
+                        _terminate_process_group(process)
+        except BaseException as error:
+            reader_errors.append(error)
+
+    def read_stderr() -> None:
+        stderr_parts.append(stderr_pipe.read())
+
+    stdout_reader = threading.Thread(
+        target=read_stdout,
+        daemon=True,
+        name=f"agent-run-worker-{process.pid}-stdout",
+    )
+    stderr_reader = threading.Thread(
+        target=read_stderr,
+        daemon=True,
+        name=f"agent-run-worker-{process.pid}-stderr",
+    )
+    stdout_reader.start()
+    stderr_reader.start()
+    wait_error: BaseException | None = None
     try:
-        stdout, stderr = process.communicate(input=prompt, timeout=timeout)
+        stdin.write(prompt)
+        stdin.close()
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as error:
+        wait_error = WorkerSandboxError("Codex worker timed out")
+        wait_error.__cause__ = error
+    except BaseException as error:
+        wait_error = error
+    finally:
         _terminate_process_group(process)
-        raise WorkerSandboxError("Codex worker timed out") from error
-    except BaseException:
-        _terminate_process_group(process)
-        raise
-    _terminate_process_group(process)
+        stdout_reader.join(timeout=1)
+        stderr_reader.join(timeout=1)
+        if stdout_reader.is_alive():
+            stdout_pipe.close()
+            stdout_reader.join(timeout=1)
+        if stderr_reader.is_alive():
+            stderr_pipe.close()
+            stderr_reader.join(timeout=1)
+    if callback_errors:
+        raise callback_errors[0]
+    if wait_error is not None:
+        raise wait_error
+    if reader_errors:
+        raise reader_errors[0]
     return subprocess.CompletedProcess(
-        arguments, process.returncode, stdout, stderr
+        arguments,
+        process.returncode,
+        "".join(stdout_lines),
+        "".join(stderr_parts),
     )
 
 

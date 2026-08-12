@@ -67,7 +67,11 @@ class Controller:
         )
 
     def resume(
-        self, run_id: str, *, resume_human_blocker: bool = False
+        self,
+        run_id: str,
+        *,
+        resume_human_blocker: bool = False,
+        new_thread: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             existing = self._load_bound_run(run_id)
@@ -91,6 +95,10 @@ class Controller:
                 return state, True
             if resume_human_blocker:
                 _resume_agent_human_blocker(state)
+            if new_thread:
+                _clear_current_publication_thread(state)
+            else:
+                _restore_current_publication_thread(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
@@ -397,6 +405,130 @@ def _resume_agent_human_blocker(state: dict[str, Any]) -> None:
                 "diagnostics": [],
             }
         )
+
+
+def _clear_current_publication_thread(state: dict[str, Any]) -> None:
+    invocation = state.get("active_agent_invocation")
+    if not isinstance(invocation, dict) or invocation.get("role") not in {
+        "publication",
+        "final_publication",
+    }:
+        raise ValueError("--new-thread requires a current Publication Invocation")
+    job, mirror = _publication_job_for_invocation(state, invocation)
+    if invocation.get("role") == "final_publication":
+        job.pop("thread_id", None)
+    else:
+        job.pop("publication_thread_id", None)
+    job["publication_new_thread"] = True
+    if mirror is not None:
+        mirror.pop("publication_thread_id", None)
+        mirror["publication_new_thread"] = True
+
+
+def _restore_current_publication_thread(state: dict[str, Any]) -> None:
+    invocation = state.get("active_agent_invocation")
+    if (
+        not isinstance(invocation, dict)
+        or invocation.get("status") != "failed"
+        or invocation.get("role") not in {"publication", "final_publication"}
+    ):
+        return
+    job, mirror = _publication_job_for_invocation(state, invocation)
+    thread_id = invocation.get("reported_thread_id") or invocation.get(
+        "requested_thread_id"
+    )
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return
+    if invocation.get("role") == "final_publication":
+        job["thread_id"] = thread_id
+    else:
+        job["publication_thread_id"] = thread_id
+    job.pop("publication_new_thread", None)
+    if mirror is not None:
+        mirror["publication_thread_id"] = thread_id
+        mirror.pop("publication_new_thread", None)
+
+
+def _publication_job_for_invocation(
+    state: dict[str, Any], invocation: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Resolve a Publication job from its persisted, unambiguous subject."""
+
+    subject = invocation.get("work_subject")
+    generation = invocation.get("generation")
+    run_id = state.get("run_id")
+    if not isinstance(subject, str) or not subject.strip():
+        raise ValueError("current Publication Invocation work_subject is missing")
+    if type(generation) is not int or generation < 1:
+        raise ValueError("current Publication Invocation generation is invalid")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("Delivery Run ID is missing")
+
+    role = invocation.get("role")
+    if role == "final_publication":
+        if subject != f"run-publication:{run_id}":
+            raise ValueError("Final Publication Invocation work_subject is invalid")
+        publication = state.get("run_publication")
+        if not isinstance(publication, dict):
+            raise ValueError("current Final Publication job is missing")
+        acceptance = state.get("run_acceptance")
+        current_generation = (
+            acceptance.get("validation_attempts")
+            if isinstance(acceptance, dict)
+            else None
+        )
+        _require_invocation_generation(generation, current_generation)
+        return publication, None
+    if role != "publication":
+        raise ValueError("current Publication Invocation role is invalid")
+
+    if subject.startswith("ticket:"):
+        ticket_text = subject.removeprefix("ticket:")
+        if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
+            raise ValueError("Ticket Publication Invocation work_subject is invalid")
+        ticket_number = int(ticket_text)
+        jobs = state.get("ticket_jobs")
+        job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
+        if not isinstance(job, dict) or job.get("ticket_number") != ticket_number:
+            raise ValueError("current Ticket Publication job is missing")
+        _require_invocation_generation(
+            generation, job.get("ticket_branch_generation")
+        )
+        active = state.get("active_ticket_job")
+        mirror = (
+            active
+            if isinstance(active, dict)
+            and active.get("ticket_number") == ticket_number
+            and active is not job
+            else None
+        )
+        return job, mirror
+
+    if subject == f"parent-only:{run_id}":
+        parent = state.get("parent_job")
+        if not isinstance(parent, dict):
+            raise ValueError("current Parent-only Publication job is missing")
+        _require_invocation_generation(generation, 1)
+        return parent, None
+
+    if subject == f"run-repair:{run_id}":
+        acceptance = state.get("run_acceptance")
+        repair = (
+            acceptance.get("repair_job")
+            if isinstance(acceptance, dict)
+            else None
+        )
+        if not isinstance(repair, dict):
+            raise ValueError("current Run Repair Publication job is missing")
+        _require_invocation_generation(generation, repair.get("repair_generation"))
+        return repair, None
+
+    raise ValueError("Publication Invocation work_subject is invalid")
+
+
+def _require_invocation_generation(invocation: int, current: object) -> None:
+    if type(current) is not int or invocation != current:
+        raise ValueError("Publication Invocation generation is stale")
 
 
 def _resume_change_job(

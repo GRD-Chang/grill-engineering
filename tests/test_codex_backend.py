@@ -20,6 +20,7 @@ import pytest
 from agent_run.codex import (
     CodexCliBackend,
     CodexProcessError,
+    _terminal_error,
 )
 from agent_run.agents import PublicationResult
 from agent_run.github_auth import (
@@ -33,6 +34,195 @@ from agent_run.worker_sandbox import (
     run_worker_process,
     worker_environment,
 )
+
+
+def test_publication_repairs_invalid_output_in_same_thread(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    attempts: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        if len(attempts) == 1:
+            output.write_text('{"invalid":"publication"}', encoding="utf-8")
+        else:
+            output.write_text(
+                json.dumps(
+                    {
+                        "result_kind": "publication",
+                        "commit_message": "fix(delivery): publish accepted candidate",
+                        "pr_title": "fix(delivery): publish accepted candidate",
+                        "pr_body_markdown": "body",
+                        "human_blockers": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"publication-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").publication(
+        {
+            "checkout": str(tmp_path),
+            "acceptance_artifact": {},
+            "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
+        }
+    )
+
+    assert isinstance(result, PublicationResult)
+    assert len(attempts) == 2
+    assert "resume" in attempts[1]
+    assert events[-1] == (
+        "completed",
+        {"reported_thread_id": "publication-thread", "attempt_count": 2},
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected"),
+    [
+        (
+            '{"type":"error","error":{"message":"api_key=key-value\\u0000 failed"}}\n',
+            "less useful stderr",
+            "api_key=[REDACTED] failed",
+        ),
+        (
+            '{"type":"turn.failed","error":{"message":"password=bad-value denied"}}\n',
+            "less useful stderr",
+            "password=[REDACTED] denied",
+        ),
+        (
+            '{"type":"turn.failed","error":"authorization=bad-value denied"}\n',
+            "less useful stderr",
+            "authorization=[REDACTED] denied",
+        ),
+        (
+            '{malformed jsonl}\nnot-json\n',
+            "secret=stderr-value failed",
+            "secret=[REDACTED] failed",
+        ),
+    ],
+)
+def test_terminal_error_extracts_real_jsonl_failure_shapes(
+    stdout: str, stderr: str, expected: str
+) -> None:
+    assert _terminal_error(stdout, stderr) == expected
+
+
+def test_terminal_error_prefers_task_complete_then_top_level_error_then_turn_failed() -> None:
+    stdout = "\n".join(
+        (
+            '{"type":"turn.failed","error":{"message":"turn failed"}}',
+            '{"type":"error","error":{"message":"top-level error"}}',
+            '{"type":"task_complete","error":{"message":"task complete error"}}',
+        )
+    )
+
+    assert _terminal_error(stdout, "stderr error") == "task complete error"
+    assert _terminal_error(
+        "\n".join(stdout.splitlines()[:2]), "stderr error"
+    ) == "top-level error"
+
+
+def test_terminal_error_strips_controls_redacts_and_bounds_utf8() -> None:
+    assert _terminal_error(
+        '{"type":"task_complete","error":{"message":"token=secret-value\\u0000 failed"}}\n',
+        "less useful stderr",
+    ) == "token=[REDACTED] failed"
+    assert len(_terminal_error("", "密" * 9000).encode()) <= 8192
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "Authorization: Bearer sk-live-secret",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "proxy-authorization=Basic dXNlcjpwYXNzd29yZA==",
+            "proxy-authorization=[REDACTED]",
+        ),
+        (
+            '{"authorization":"Bearer sk-json-secret"}',
+            '{"authorization":"[REDACTED]"}',
+        ),
+    ],
+)
+def test_terminal_error_redacts_complete_authorization_credentials(
+    message: str, expected: str
+) -> None:
+    assert _terminal_error("", message) == expected
+
+
+def test_publication_failure_event_never_exposes_authorization_secret(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(
+        arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            arguments,
+            1,
+            stdout='{"type":"thread.started","thread_id":"publication-thread"}\n',
+            stderr="Authorization: Bearer sk-persisted-secret",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+
+    with pytest.raises(CodexProcessError, match=r"Authorization: \[REDACTED\]"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret").publication(
+            {
+                "checkout": str(tmp_path),
+                "acceptance_artifact": {},
+                "_invocation_event": lambda kind, **facts: events.append(
+                    (kind, facts)
+                ),
+            }
+        )
+
+    failed = events[-1]
+    assert failed[0] == "failed"
+    assert failed[1]["error"] == "Authorization: [REDACTED]"
+    assert "sk-persisted-secret" not in repr(events)
+
+
+def test_terminal_error_projects_embedded_api_error_json() -> None:
+    message = (
+        "API request failed: "
+        '{"request_id":"req-sensitive","status":429,'
+        '"error":{"type":"invalid_request_error","code":"invalid_api_key",'
+        '"message":"api_key=secret-value denied","param":null,'
+        '"headers":{"authorization":"Bearer sensitive"},'
+        '"response_body":{"customer":"private"}}}'
+        "; contact upstream support"
+    )
+    stdout = json.dumps(
+        {"type": "turn.failed", "error": {"message": message}}
+    )
+
+    assert _terminal_error(stdout, "less useful stderr") == (
+        '{"type":"invalid_request_error","code":"invalid_api_key",'
+        '"status":429,"message":"api_key=[REDACTED] denied","param":null}'
+    )
+
+
+def test_terminal_error_keeps_plain_text_message() -> None:
+    message = "plain upstream failure without an API response"
+    stdout = json.dumps(
+        {"type": "task_complete", "error": {"message": message}}
+    )
+
+    assert _terminal_error(stdout, "less useful stderr") == message
 
 
 def test_codex_worker_environment_excludes_publisher_credentials(
@@ -210,9 +400,11 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
         Path(arguments[output_index]).write_text(
             json.dumps(
                 {
+                    "result_kind": "publication",
                     "commit_message": "feat: publish validated run",
                     "pr_title": "feat: publish validated run",
                     "pr_body_markdown": "## What Problem This Solves\n\nA complete Run needs a review boundary.",
+                    "human_blockers": None,
                 }
             ),
             encoding="utf-8",
@@ -520,7 +712,40 @@ def test_development_resume_failure_starts_replacement_with_full_context(
     assert "https://github.com/example/project/issues/3" in replacement_prompt
 
 
-def test_publication_resume_failure_starts_and_reports_replacement(
+def test_development_does_not_use_publication_streaming_callback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    callback_options: list[object] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        callback_options.append(options.get("on_stdout_line"))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            "Development completed.", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"developer-1"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+
+    CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {
+            "checkout": str(tmp_path),
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/3",
+        }
+    )
+
+    assert callback_options == [None]
+
+
+def test_publication_resume_failure_does_not_replace_thread(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -564,28 +789,21 @@ def test_publication_resume_failure_starts_and_reports_replacement(
         )
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
-    result = CodexCliBackend(
-        credential_provider=lambda: "reader-secret",
-    ).publication(
-        {
-            "checkout": str(checkout),
-            "thread_id": "developer-1",
-            "parent_issue_url": "https://github.com/example/project/issues/1",
-            "task_issue_url": "https://github.com/example/project/issues/3",
-            "acceptance_artifact": {"verdict": "pass"},
-        }
-    )
+    with pytest.raises(CodexProcessError, match="resume target no longer exists"):
+        CodexCliBackend(
+            credential_provider=lambda: "reader-secret",
+        ).publication(
+            {
+                "checkout": str(checkout),
+                "thread_id": "developer-1",
+                "parent_issue_url": "https://github.com/example/project/issues/1",
+                "task_issue_url": "https://github.com/example/project/issues/3",
+                "acceptance_artifact": {"verdict": "pass"},
+            }
+        )
 
-    assert isinstance(result, PublicationResult)
-    assert result.thread_id == "developer-2"
-    assert result.replaced_thread_id == "developer-1"
-    assert result.artifact["commit_message"] == (
-        "fix(delivery): repair publication"
-    )
+    assert len(invocations) == 1
     assert "resume" in invocations[0][0]
-    assert "resume" not in invocations[1][0]
-    assert "恢复失败" in invocations[1][1]
-    assert "https://github.com/example/project/issues/3" in invocations[1][1]
 
 
 def test_publication_uses_a_read_only_checkout(
@@ -601,6 +819,7 @@ def test_publication_uses_a_read_only_checkout(
         return (
             json.dumps(
                 {
+                    "result_kind": "publication",
                     "commit_message": "fix(delivery): publish accepted candidate",
                     "pr_title": "fix(delivery): publish accepted candidate",
                     "pr_body_markdown": (
@@ -609,9 +828,10 @@ def test_publication_uses_a_read_only_checkout(
                         "## User Impact\n\nThe accepted change stays stable.\n\n"
                         "## Evidence\n\nFresh validation passed."
                     ),
+                    "human_blockers": None,
                 }
             ),
-            "publication-thread",
+            "development-thread",
         )
 
     monkeypatch.setattr(CodexCliBackend, "_invoke", fake_invoke)
@@ -1362,3 +1582,80 @@ def test_successful_worker_cleans_background_processes(
     child_pid = int(child_path.read_text(encoding="utf-8").strip())
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
+
+
+def test_stdout_callback_error_does_not_stop_pipe_drain(tmp_path: Path) -> None:
+    callback_calls = 0
+
+    def fail_first_line(_line: str) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        raise CodexProcessError("reported Thread mismatch")
+
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "print('first'); "
+            "sys.stdout.write('x' * (1024 * 1024)); "
+            "sys.stdout.flush()"
+        ),
+    ]
+
+    started = time.monotonic()
+    with pytest.raises(CodexProcessError, match="Thread mismatch"):
+        run_worker_process(
+            command,
+            cwd=tmp_path,
+            prompt="",
+            environment=os.environ.copy(),
+            timeout=3,
+            on_stdout_line=fail_first_line,
+        )
+
+    assert callback_calls == 1
+    assert time.monotonic() - started < 2
+
+
+def test_stdout_callback_error_terminates_hanging_worker(tmp_path: Path) -> None:
+    def reject_thread(_line: str) -> None:
+        raise CodexProcessError("reported Thread mismatch")
+
+    started = time.monotonic()
+    with pytest.raises(CodexProcessError, match="Thread mismatch"):
+        run_worker_process(
+            ["sh", "-c", "printf 'thread.started\\n'; sleep 60"],
+            cwd=tmp_path,
+            prompt="",
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout=5,
+            on_stdout_line=reject_thread,
+        )
+
+    assert time.monotonic() - started < 2
+
+
+def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
+    before = {
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("agent-run-worker-")
+    }
+
+    with pytest.raises(WorkerSandboxError, match="timed out"):
+        run_worker_process(
+            ["sh", "-c", "sleep 60"],
+            cwd=tmp_path,
+            prompt="",
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout=0.1,
+            on_stdout_line=lambda _line: None,
+        )
+
+    after = {
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("agent-run-worker-")
+    }
+    assert after == before

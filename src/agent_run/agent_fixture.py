@@ -106,15 +106,35 @@ class FixtureAgentBackend:
     def publication(
         self, request: dict[str, Any]
     ) -> dict[str, Any] | HumanBlockerResult:
-        del request
         step = self._next("publications")
+        has_expected_thread = "expected_thread_id" in step
+        expected_thread = step.pop("expected_thread_id", None)
+        requested_thread = request.get("thread_id")
+        if has_expected_thread and expected_thread != requested_thread:
+            raise ValueError(
+                "agent fixture publication expected a different Thread ID"
+            )
+        thread_id = step.pop("thread_id", None) or requested_thread or "fixture-publication"
+        event = request.get("_invocation_event")
+        if callable(event) and has_expected_thread:
+            event(
+                "started",
+                requested_thread_id=requested_thread,
+                attempt_count=0,
+                invocation_mode=request.get("_invocation_mode"),
+            )
+            event("thread_started", reported_thread_id=thread_id, attempt_count=1)
         blockers = _human_blockers(step)
         if blockers is not None:
+            if callable(event) and has_expected_thread:
+                event("completed", reported_thread_id=thread_id, attempt_count=1)
             return HumanBlockerResult(
-                thread_id=_string(step, "thread_id"),
+                thread_id=str(thread_id),
                 human_blockers=blockers,
             )
-        return step
+        if callable(event) and has_expected_thread:
+            event("completed", reported_thread_id=thread_id, attempt_count=1)
+        return _publication_wire(step)
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         name = (
@@ -134,8 +154,28 @@ class FixtureAgentBackend:
         )
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        del request
-        return self._next("run_publications")
+        step = self._next("run_publications")
+        has_expected_thread = "expected_thread_id" in step
+        expected_thread = step.pop("expected_thread_id", None)
+        requested_thread = request.get("thread_id")
+        if has_expected_thread and expected_thread != requested_thread:
+            raise ValueError(
+                "agent fixture run publication expected a different Thread ID"
+            )
+        thread_id = step.pop("thread_id", None) or requested_thread or "fixture-run-publication"
+        event = request.get("_invocation_event")
+        if callable(event) and has_expected_thread:
+            event(
+                "started",
+                requested_thread_id=requested_thread,
+                attempt_count=0,
+                invocation_mode=request.get("_invocation_mode"),
+            )
+            event("thread_started", reported_thread_id=thread_id, attempt_count=1)
+            event("completed", reported_thread_id=thread_id, attempt_count=1)
+        result = _publication_wire(step)
+        result["_thread_id"] = thread_id
+        return result
 
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)
@@ -167,3 +207,12 @@ def _human_blockers(data: dict[str, Any]) -> tuple[str, ...] | None:
     ):
         raise ValueError("human_blockers must contain non-empty strings")
     return tuple(value)
+
+
+def _publication_wire(data: dict[str, Any]) -> dict[str, Any]:
+    if "result_kind" in data or "invalid" in data:
+        return data
+    result = dict(data)
+    result["result_kind"] = "publication"
+    result["human_blockers"] = None
+    return result

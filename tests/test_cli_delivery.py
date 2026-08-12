@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from conftest import write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
 
@@ -1380,8 +1382,18 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
     assert resumed_job["phase"] == "completed"
 
 
+@pytest.mark.parametrize(
+    ("resume_args", "expected_thread", "successor_thread"),
+    [
+        ((), "publication-thread-1", "publication-thread-1"),
+        (("--new-thread",), None, "publication-thread-2"),
+    ],
+)
 def test_malformed_publication_is_execution_failed_and_resumes_without_revalidation(
     git_repo: Path,
+    resume_args: tuple[str, ...],
+    expected_thread: str | None,
+    successor_thread: str,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agent_fixture = git_repo / "agents.json"
@@ -1426,12 +1438,42 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     assert failed_job["validation_attempts"] == 1
     assert failed_job["publication_attempts"] == 1
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"] == []
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    failed_state["active_agent_invocation"] = {
+        "work_subject": "ticket:3",
+        "generation": failed_job["ticket_branch_generation"],
+        "role": "publication",
+        "phase": "publication",
+        "mode": "fresh",
+        "status": "failed",
+        "requested_thread_id": None,
+        "reported_thread_id": "publication-thread-1",
+        "attempt_count": 1,
+        "started_at": "2026-08-11T00:00:00+00:00",
+        "ended_at": "2026-08-11T00:00:01+00:00",
+        "error": "invalid publication",
+        "return_code": 0,
+        "signal": None,
+    }
+    failed_job["publication_thread_id"] = "publication-thread-1"
+    active_job = failed_state.get("active_ticket_job")
+    if isinstance(active_job, dict):
+        active_job["publication_thread_id"] = "publication-thread-1"
+    state_path.write_text(
+        json.dumps(failed_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     agent_fixture.write_text(
         json.dumps(
             {
                 "developments": [],
-                "publications": [publication()],
+                "publications": [
+                    {
+                        **publication(),
+                        "expected_thread_id": expected_thread,
+                        "thread_id": successor_thread,
+                    }
+                ],
                 "reviews": [],
             }
         ),
@@ -1440,10 +1482,11 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     resumed = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(agent_fixture),
+        *resume_args,
     )
 
     assert resumed.returncode == 0, resumed.stderr
@@ -1453,6 +1496,184 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     assert completed_job["validation_attempts"] == 1
     assert completed_job["publication_attempts"] == 2
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
+    completed_state = load_only_run_state(git_repo)
+    successor = completed_state["active_agent_invocation"]
+    assert successor["status"] == "completed"
+    assert successor["mode"] == (
+        "resume" if expected_thread else "new-thread"
+    )
+    assert successor["requested_thread_id"] == expected_thread
+    assert successor["reported_thread_id"] == successor_thread
+    assert successor["work_subject"] == "ticket:3"
+    assert successor["generation"] == completed_job["ticket_branch_generation"]
+    assert successor["input_fingerprint"].startswith("sha256:")
+    assert len(successor["input_fingerprint"]) == 71
+    acceptance = completed_job["acceptance_record"]
+    assert successor["currentness_boundary"] == {
+        "base_sha": completed_job["base_sha"],
+        "candidate_sha": completed_job["candidate_sha"],
+        "candidate_tree": acceptance["reviewed_candidate_tree"],
+        "effective_revision": completed_job["effective_revision"],
+    }
+    assert completed_state["agent_invocation_history"][-1] == successor
+
+
+@pytest.mark.parametrize(
+    ("resume_args", "expected_thread", "successor_mode"),
+    [
+        ((), "run-repair-publication-1", "resume"),
+        (("--new-thread",), None, "new-thread"),
+    ],
+)
+def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
+    git_repo: Path,
+    resume_args: tuple[str, ...],
+    expected_thread: str | None,
+    successor_mode: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    ticket_agents = git_repo / "ticket-agents.json"
+    ticket_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "ticket-developer",
+                        "summary": "Delivered the Ticket candidate.",
+                        "write_files": {"feature.txt": "ticket\n"},
+                    }
+                ],
+                "publications": [publication()],
+                "reviews": [
+                    passing_acceptance("ticket-reviewer", "Ticket passed.")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_cli(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(ticket_agents),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+
+    failed_agents = git_repo / "failed-run-repair-agents.json"
+    failed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "run-repair-developer",
+                        "summary": "Repaired the accumulated Run.",
+                        "write_files": {"run-repair.txt": "repaired\n"},
+                    }
+                ],
+                "publications": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "run-repair-publication-1",
+                        "invalid": "publication",
+                    }
+                ],
+                "run_reviews": [
+                    repair_acceptance("run-reviewer-1"),
+                    passing_acceptance(
+                        "run-repair-reviewer", "Run repair candidate passed."
+                    ),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = run_cli(
+        git_repo,
+        fixture,
+        "accept-run",
+        run_id,
+        "--agent-fixture",
+        str(failed_agents),
+    )
+    assert failed.returncode == 2, failed.stderr
+    assert stdout_json(failed)["status"] == "execution_failed"
+
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    failed_state = load_only_run_state(git_repo)
+    completed_ticket = failed_state["ticket_jobs"]["3"]
+    completed_ticket["publication_thread_id"] = "completed-ticket-publication"
+    repair_job = failed_state["run_acceptance"]["repair_job"]
+    repair_job["publication_thread_id"] = "run-repair-publication-1"
+    failed_state["active_agent_invocation"] = {
+        "work_subject": f"run-repair:{run_id}",
+        "generation": repair_job["repair_generation"],
+        "role": "publication",
+        "phase": "publication",
+        "mode": "fresh",
+        "status": "failed",
+        "requested_thread_id": None,
+        "reported_thread_id": "run-repair-publication-1",
+        "attempt_count": 1,
+        "started_at": "2026-08-11T00:00:00+00:00",
+        "ended_at": "2026-08-11T00:00:01+00:00",
+        "error": "invalid publication",
+        "return_code": 0,
+        "signal": None,
+    }
+    state_path.write_text(
+        json.dumps(failed_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    resume_agents = git_repo / "resume-run-repair-agents.json"
+    resume_agents.write_text(
+        json.dumps(
+            {
+                "developments": [],
+                "publications": [
+                    {
+                        **publication(),
+                        "expected_thread_id": expected_thread,
+                        "thread_id": (
+                            expected_thread or "run-repair-publication-2"
+                        ),
+                    }
+                ],
+                "run_reviews": [
+                    passing_acceptance("run-reviewer-2", "Complete Run passed.")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(resume_agents),
+        *resume_args,
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    resumed_state = load_only_run_state(git_repo)
+    assert resumed_state["status"] == "run_publication_pending"
+    assert (
+        resumed_state["ticket_jobs"]["3"]["publication_thread_id"]
+        == "completed-ticket-publication"
+    )
+    successor = resumed_state["active_agent_invocation"]
+    assert successor["work_subject"] == f"run-repair:{run_id}"
+    assert successor["mode"] == successor_mode
+    assert successor["requested_thread_id"] == expected_thread
+    assert successor["reported_thread_id"] == (
+        expected_thread or "run-repair-publication-2"
+    )
 
 
 def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:

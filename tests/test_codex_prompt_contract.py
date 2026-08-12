@@ -10,6 +10,49 @@ import pytest
 from agent_run.codex import CodexCliBackend, CodexProcessError
 
 
+PUBLICATION_BLOCKER_SHAPE = (
+    '`{"result_kind":"human_blocker","commit_message":null,'
+    '"pr_title":null,"pr_body_markdown":null,'
+    '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
+)
+DEVELOPMENT_BLOCKER_SHAPE = (
+    '`{"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
+)
+
+
+def test_publication_prompts_use_flat_human_blocker_wire_shape() -> None:
+    ticket = CodexCliBackend._publication_prompt(
+        {
+            "acceptance_scope": "ticket",
+            "acceptance_artifact": {},
+        }
+    )
+    run_repair = CodexCliBackend._publication_prompt(
+        {
+            "acceptance_scope": "run",
+            "acceptance_artifact": {},
+        }
+    )
+    final_run = CodexCliBackend._run_publication_prompt(
+        {"acceptance_artifact": {}}
+    )
+
+    for prompt in (ticket, run_repair, final_run):
+        assert PUBLICATION_BLOCKER_SHAPE in prompt
+        assert DEVELOPMENT_BLOCKER_SHAPE not in prompt
+
+
+def test_non_publication_prompt_keeps_exact_human_blocker_result() -> None:
+    development = CodexCliBackend._development_prompt(
+        {
+            "acceptance_scope": "ticket",
+        }
+    )
+
+    assert DEVELOPMENT_BLOCKER_SHAPE in development
+    assert PUBLICATION_BLOCKER_SHAPE not in development
+
+
 def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -21,6 +64,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     active_thread = ""
 
     publication_result = {
+        "result_kind": "publication",
         "commit_message": "fix(agent): publish validated repair",
         "pr_title": "fix(agent): publish validated repair",
         "pr_body_markdown": (
@@ -29,6 +73,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "## User Impact\n\nDelivery can continue.\n\n"
             "## Evidence\n\nIndependent validation passed."
         ),
+        "human_blockers": None,
     }
     acceptance_result = {
         "verdict": "pass",

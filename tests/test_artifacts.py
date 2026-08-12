@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from agent_run.agent_schemas import acceptance_schema, human_blocker_schema
+from agent_run.agent_schemas import (
+    acceptance_schema,
+    human_blocker_schema,
+    publication_or_human_blocker_schema,
+)
 from agent_run.artifacts import (
     MAX_HUMAN_BLOCKER_HISTORY,
     MAX_HUMAN_BLOCKER_LENGTH,
@@ -12,11 +16,13 @@ from agent_run.artifacts import (
     append_human_blocker_history,
     clear_current_human_blocker,
     parse_human_blockers,
+    parse_publication_wire_result,
 )
 
 
-def publication_data() -> dict[str, str]:
+def publication_data() -> dict[str, object]:
     return {
+        "result_kind": "publication",
         "commit_message": "feat(delivery): complete one ticket autonomously",
         "pr_title": "feat(delivery): complete one ticket autonomously",
         "pr_body_markdown": """
@@ -36,6 +42,7 @@ Maintainers can deliver the ticket without manual GitHub mutations.
 
 `pytest tests/test_delivery.py` passed.
 """.strip(),
+        "human_blockers": None,
     }
 
 
@@ -44,6 +51,100 @@ def test_publication_artifact_enforces_ticket_narrative_contract() -> None:
 
     assert artifact.commit_message.startswith("feat(delivery):")
     assert artifact.pr_title == artifact.commit_message
+
+
+def test_publication_wire_schema_is_a_flat_strict_object() -> None:
+    schema = publication_or_human_blocker_schema()
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert "oneOf" not in schema
+    assert schema["properties"]["human_blockers"]["type"] == ["array", "null"]
+    assert "anyOf" not in schema
+    assert schema["required"] == [
+        "result_kind",
+        "commit_message",
+        "pr_title",
+        "pr_body_markdown",
+        "human_blockers",
+    ]
+    assert schema["properties"]["result_kind"]["enum"] == [
+        "publication",
+        "human_blocker",
+    ]
+
+
+def test_publication_result_rejects_blockers_and_unexpected_fields() -> None:
+    data = publication_data()
+    data["human_blockers"] = ["Cannot publish."]
+    with pytest.raises(ValueError, match="must be null"):
+        PublicationArtifact.parse(data, primary_ticket=3)
+
+    data = publication_data()
+    data["extra"] = "unexpected"
+    with pytest.raises(ValueError, match="unexpected fields"):
+        PublicationArtifact.parse(data, primary_ticket=3)
+
+
+def test_wire_parser_normalizes_publication_without_requiring_identity() -> None:
+    data = publication_data()
+    data["commit_message"] = "  feat(delivery): complete one ticket autonomously  "
+
+    normalized = parse_publication_wire_result(data)
+
+    assert normalized["result_kind"] == "publication"
+    assert normalized["commit_message"] == (
+        "feat(delivery): complete one ticket autonomously"
+    )
+    assert normalized["human_blockers"] is None
+
+
+def test_wire_parser_rejects_empty_human_blocker_result() -> None:
+    with pytest.raises(ValueError, match="must contain non-empty strings"):
+        parse_publication_wire_result(human_blocker_data([]))
+
+
+@pytest.mark.parametrize("field", ["commit_message", "pr_title", "pr_body_markdown"])
+def test_human_blocker_result_requires_null_publication_fields(field: str) -> None:
+    data: dict[str, object] = {
+        "result_kind": "human_blocker",
+        "commit_message": None,
+        "pr_title": None,
+        "pr_body_markdown": None,
+        "human_blockers": ["A maintainer must grant access."],
+    }
+    data[field] = "must not leak publication content"
+
+    with pytest.raises(ValueError, match="must be null"):
+        parse_human_blockers(data)
+
+
+def test_human_blocker_result_is_normalized_without_trimming() -> None:
+    data = {
+        "result_kind": "human_blocker",
+        "commit_message": None,
+        "pr_title": None,
+        "pr_body_markdown": None,
+        "human_blockers": ["  A maintainer must grant access.  "],
+    }
+
+    assert parse_human_blockers(data) == (
+        "  A maintainer must grant access.  ",
+    )
+
+
+def test_legacy_human_blocker_shape_remains_supported() -> None:
+    assert parse_human_blockers({"human_blockers": ["Needs approval."]}) == (
+        "Needs approval.",
+    )
+
+
+def test_wire_result_requires_every_field() -> None:
+    data = publication_data()
+    del data["human_blockers"]
+
+    with pytest.raises(ValueError, match="missing fields"):
+        PublicationArtifact.parse(data, primary_ticket=3)
 
 
 @pytest.mark.parametrize(
@@ -100,6 +201,16 @@ def passing_acceptance() -> dict[str, object]:
         },
         "findings": [],
         "human_blockers": [],
+    }
+
+
+def human_blocker_data(blockers: list[str]) -> dict[str, object]:
+    return {
+        "result_kind": "human_blocker",
+        "commit_message": None,
+        "pr_title": None,
+        "pr_body_markdown": None,
+        "human_blockers": blockers,
     }
 
 
@@ -245,13 +356,13 @@ def test_request_changes_rejects_blocked_only_checks() -> None:
 
 def test_human_blockers_have_bounded_count_length_and_history() -> None:
     blockers = ["x" * MAX_HUMAN_BLOCKER_LENGTH] * MAX_HUMAN_BLOCKERS
-    assert parse_human_blockers({"human_blockers": blockers}) == tuple(blockers)
+    assert parse_human_blockers(human_blocker_data(blockers)) == tuple(blockers)
 
     with pytest.raises(ValueError, match="at most"):
-        parse_human_blockers({"human_blockers": blockers + ["one too many"]})
+        parse_human_blockers(human_blocker_data(blockers + ["one too many"]))
     with pytest.raises(ValueError, match="at most"):
         parse_human_blockers(
-            {"human_blockers": ["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)]}
+            human_blocker_data(["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)])
         )
 
     subject: dict[str, object] = {
