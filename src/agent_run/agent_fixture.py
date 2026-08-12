@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.worker_sandbox import WorkerSandboxError
 
 
@@ -115,12 +116,15 @@ class FixtureAgentBackend:
                 thread_id=thread_id,
                 human_blockers=blockers,
             )
+        try:
+            summary = _string(step, "summary")
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
         if notify is not None:
             notify("completed", reported_thread_id=thread_id, attempt_count=1)
-        return DevelopmentResult(
-            thread_id=thread_id,
-            summary=_string(step, "summary"),
-        )
+        return DevelopmentResult(thread_id=thread_id, summary=summary)
 
     def publication(
         self, request: dict[str, Any]
@@ -204,6 +208,12 @@ class FixtureAgentBackend:
             raise ValueError(configured_error)
         if configured_error is not None:
             raise ValueError("scripted Fresh Acceptance error must be a string")
+        try:
+            AcceptanceArtifact.parse(artifact)
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
         if notify is not None:
             notify("completed", reported_thread_id=thread_id, attempt_count=1)
         return ReviewResult(

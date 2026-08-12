@@ -293,7 +293,7 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
                     {
                         "expected_thread_id": None,
                         "thread_id": "ticket-reviewer-1",
-                        "error": "simulated reviewer timeout",
+                        "artifact": {"verdict": "pass"},
                     }
                 ],
             }
