@@ -769,6 +769,34 @@ def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
     assert invocation["attempt_count"] == 2
 
 
+def test_final_publication_fixture_records_a_fresh_thread_without_expectation(
+    git_repo: Path,
+) -> None:
+    state, states, _git, _publisher = _accepted_run(git_repo)
+    agents = git_repo / "fresh-run-publication.json"
+    agents.write_text(
+        json.dumps({"run_publications": [RunPublicationAgents().run_publication({})]}),
+        encoding="utf-8",
+    )
+
+    published = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "publish-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert published.returncode == 0, published.stderr
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    invocation = persisted["active_agent_invocation"]
+    assert invocation["status"] == "completed"
+    assert invocation["requested_thread_id"] is None
+    assert invocation["reported_thread_id"] == "fixture-run-publication"
+
+
 def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
     git_repo: Path,
 ) -> None:

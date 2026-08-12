@@ -709,6 +709,109 @@ def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
     assert invocation["attempt_count"] == 2
 
 
+def test_run_acceptance_fixture_records_a_fresh_thread_without_expectation(
+    git_repo: Path,
+) -> None:
+    state, states, _git = _completed_run(git_repo)
+    agents = git_repo / "fresh-run-review.json"
+    agents.write_text(
+        json.dumps(
+            {"run_reviews": [{"thread_id": "fresh-run-reviewer", "artifact": _passing_artifact()}]}
+        ),
+        encoding="utf-8",
+    )
+
+    accepted = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "accept-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    invocation = persisted["active_agent_invocation"]
+    assert invocation["status"] == "completed"
+    assert invocation["requested_thread_id"] is None
+    assert invocation["reported_thread_id"] == "fresh-run-reviewer"
+
+
+def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
+    git_repo: Path,
+) -> None:
+    state, states, _git = _completed_run(git_repo)
+    failed_agents = git_repo / "failed-run-review.json"
+    failed_agents.write_text(
+        json.dumps(
+            {
+                "run_reviews": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "failed-run-reviewer-thread",
+                        "artifact": {"invalid": "acceptance"},
+                    },
+                    {
+                        "expected_thread_id": "failed-run-reviewer-thread",
+                        "thread_id": "failed-run-reviewer-thread",
+                        "artifact": {"invalid": "acceptance"},
+                    },
+                    {
+                        "expected_thread_id": "failed-run-reviewer-thread",
+                        "thread_id": "failed-run-reviewer-thread",
+                        "artifact": {"invalid": "acceptance"},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "accept-run",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(failed_agents),
+    )
+    assert failed.returncode == 2
+
+    resumed_agents = git_repo / "resumed-run-review.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "run_reviews": [
+                    {
+                        "expected_thread_id": "failed-run-reviewer-thread",
+                        "thread_id": "failed-run-reviewer-thread",
+                        "artifact": _passing_artifact(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "resume",
+        str(state["run_id"]),
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    history = persisted["agent_invocation_history"]
+    assert history[-2]["status"] == "failed"
+    assert history[-2]["attempt_count"] == 3
+    assert history[-1]["status"] == "completed"
+    assert history[-1]["attempt_count"] == 1
+
+
 def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     git_repo: Path,
 ) -> None:

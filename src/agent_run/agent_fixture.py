@@ -356,6 +356,7 @@ class FixtureAgentBackend:
                 attempt_count=attempt,
             )
 
+        start_invocation()
         currentness = request.get("_currentness_check")
         for attempt in range(1, 4):
             if attempt > 1 and callable(currentness) and not currentness():
@@ -397,11 +398,8 @@ class FixtureAgentBackend:
                     continue
                 notify("failed", attempt_count=attempt, error=str(error))
                 raise
-            if has_expected_thread or invocation_started:
-                report_thread(reported_thread, attempt)
+            report_thread(reported_thread, attempt)
             current_thread = reported_thread
-            if not invocation_started:
-                return result, current_thread
             notify(
                 "completed",
                 reported_thread_id=current_thread,
