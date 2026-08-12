@@ -14,7 +14,7 @@ from agent_run.controller import (
 )
 from agent_run.cli_surface import _command_is_ready
 from agent_run.git import GitRepository
-from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.requeue import RequeueError, requeue_change_job
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.state import StateStore
@@ -224,6 +224,62 @@ def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
     assert "effective_revision" not in new_job
     assert "candidate_sha" not in new_job
     assert queued["retired_ticket_generations"] == {"7": 1}
+
+
+def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    state = states.load_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    branch = f"agent-run/{run_id}/ticket-7"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.ensure_ticket_branch(
+        branch=branch, base_branch=str(state["run_branch"]), ticket_number=7
+    )
+    pr_number = publisher.ensure_ticket_pr(
+        branch=branch,
+        base_branch=str(state["run_branch"]),
+        title="old change",
+        body="old change",
+        primary_ticket=7,
+    )
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": branch,
+            "phase": "developing",
+            "effective_revision": "stale",
+            "base_sha": git.resolve(str(state["run_branch"])),
+            "pr_number": pr_number,
+            "publication_sha": git.resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
+    states.save_run(run_id, state)
+
+    stale = run_cli(git_repo, fixture, "deliver", run_id)
+    assert stdout_json(stale)["status"] == "requeue_required"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    rejected = run_cli(git_repo, fixture, "requeue", run_id)
+
+    assert rejected.returncode == 2
+    assert stdout_json(rejected)["status"] == "blocked"
+    blocked = states.load_run(run_id)
+    assert blocked is not None
+    assert blocked["status"] == "blocked"
+    assert blocked["terminal_kind"] == "waiting_human"
+    assert blocked["diagnostics"][0]["code"] == "change_pr_closed_or_merged_externally"
+    assert "requeue_transition" not in blocked
 
 
 def test_deliver_cannot_restart_a_stale_generation_without_requeue(

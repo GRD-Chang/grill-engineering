@@ -542,7 +542,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         else (
                             durable_status
                             if durable_status
-                            in {"abandonment_pending", "completed", "abandoned"}
+                            in {
+                                "abandonment_pending",
+                                "completed",
+                                "abandoned",
+                                "requeue_required",
+                            }
                             else "blocked"
                         )
                     ),

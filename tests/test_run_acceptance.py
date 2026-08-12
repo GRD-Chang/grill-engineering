@@ -1004,6 +1004,128 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     assert stdout_json(accepted)["status"] == "run_publication_pending"
 
 
+def test_run_repair_requeue_closes_old_pr_and_returns_to_fresh_acceptance(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    repair_branch = f"agent-run-repair/{state['run_id']}/1"
+    publisher.ensure_run_repair_branch(
+        branch=repair_branch, base_branch=str(state["run_branch"])
+    )
+    pr_number = publisher.ensure_run_repair_pr(
+        branch=repair_branch,
+        base_branch=str(state["run_branch"]),
+        title="old repair",
+        body="old repair body",
+    )
+    run = {
+        "phase": "repairing",
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "reviewer_thread_ids": [],
+        "development_thread_history": [],
+        "repair_generation": 1,
+        "acceptance_artifact": _repair_artifact(),
+        "repair_job": {
+            "phase": "developing",
+            "repair_generation": 1,
+            "repair_branch": repair_branch,
+            "base_sha": "stale-run-base",
+            "parent_revision": state["parent"]["revision"],
+            "ticket_graph_revision": state["ticket_graph"]["revision"],
+            "ticket_completion_records": [],
+            "repair_source": "acceptance",
+            "acceptance_artifact": _repair_artifact(),
+            "development_thread_id": "repair-old",
+            "reviewer_thread_ids": ["repair-reviewer-old"],
+            "pr_number": pr_number,
+            "publication_sha": git.resolve(str(state["run_branch"])),
+        },
+    }
+    state["run_acceptance"] = run
+    state["status"] = "requeue_required"
+    state["requeue_required"] = {
+        "work_subject": f"run-repair:{state['run_id']}",
+        "generation": 1,
+        "reason": "run_repair_base_changed",
+    }
+    states.save_run(str(state["run_id"]), state)
+    agents = git_repo / "fresh-run-review.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "run_reviews": [
+                    {
+                        "thread_id": "fresh-run-reviewer",
+                        "artifact": _repair_artifact(),
+                    },
+                    {
+                        "thread_id": "repair-reviewer-new",
+                        "artifact": _passing_artifact(),
+                    },
+                    {
+                        "thread_id": "fresh-run-reviewer-after-repair",
+                        "artifact": _passing_artifact(),
+                    },
+                ],
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "repair-new",
+                        "summary": "Repaired the fresh Run finding.",
+                        "write_files": {"run-repair.txt": "repaired\n"},
+                    }
+                ],
+                "publications": [
+                    {
+                        "commit_message": "fix(run): repair fresh validation finding",
+                        "pr_title": "fix(run): repair fresh validation finding",
+                        "pr_body_markdown": (
+                            "## What Problem This Solves\n\nThe fresh Run finding remains.\n\n"
+                            "## Why This Change Was Made\n\nRepair the finding.\n\n"
+                            "## User Impact\n\nThe full Run works.\n\n"
+                            "## Evidence\n\nFresh acceptance passed."
+                        ),
+                    }
+                ],
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    requeued = run_cli(
+        git_repo, fixture, "requeue", str(state["run_id"]), "--agent-fixture", str(agents)
+    )
+
+    assert requeued.returncode == 0, requeued.stderr
+    assert stdout_json(requeued)["status"] == "run_publication_pending"
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["retired_job_generations"][0]["work_subject"] == (
+        f"run-repair:{state['run_id']}"
+    )
+    assert persisted["retired_job_generations"][0]["thread_ids"] == [
+        "repair-old",
+        "repair-reviewer-old",
+    ]
+    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
+    assert [pull["state"] for pull in pulls] == ["CLOSED", "MERGED"]
+    replacement = persisted["run_acceptance"]
+    assert replacement["repair_generation"] == 2
+    assert replacement["reviewer_thread_ids"][-1] == "fresh-run-reviewer-after-repair"
+    completed_repairs = replacement["completed_repair_jobs"]
+    assert completed_repairs[0]["repair_branch"].endswith("/1-generation-2")
+    repair_threads = {
+        invocation["reported_thread_id"]
+        for invocation in persisted["agent_invocation_history"]
+        if invocation["work_subject"] == f"run-repair:{state['run_id']}"
+        and invocation["generation"] == 2
+    }
+    assert {"repair-new", "repair-reviewer-new"} <= repair_threads
+
+
 def test_accept_run_does_not_review_after_a_github_refresh_failure(
     git_repo: Path,
 ) -> None:

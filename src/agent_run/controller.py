@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -163,7 +164,9 @@ class Controller:
                 retired = transition.get("retired")
                 if existing.get("status") == "requeue_required" and isinstance(retired, dict):
                     return existing, retired
-            state = self._refresh(existing, parent_number)
+            state = self._refresh(
+                existing, parent_number, check_requeue_currentness=True
+            )
             if state.get("status") != "requeue_required":
                 self.states.save_run(run_id, state)
                 raise RequeueError("requeue is only allowed in requeue_required state")
@@ -172,7 +175,7 @@ class Controller:
             base["sha"] = self.publisher.resolve_base(
                 repository.default_branch, repository.default_head_sha
             )
-            transition_state = dict(state)
+            transition_state = deepcopy(state)
             retired = requeue_change_job(transition_state)
             state["requeue_transition"] = {
                 "retired": retired,
@@ -187,9 +190,17 @@ class Controller:
             state = self._load_bound_run(run_id)
             transition = _state_mapping(state, "requeue_transition")
             retired = _state_mapping(transition, "retired")
-            base_sha = transition.get("base_sha")
-            if not isinstance(base_sha, str):
+            prepared_base_sha = transition.get("base_sha")
+            if not isinstance(prepared_base_sha, str):
                 raise RequeueError("prepared requeue base is invalid")
+            # The initial intent is durable so an old-PR close can be retried,
+            # but the new Generation binds its base only after that retirement
+            # completes. This prevents a response-loss retry from reviving an
+            # already superseded default-branch snapshot.
+            repository = self.github.repository()
+            base_sha = self.publisher.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
             _state_mapping(state, "base")["sha"] = base_sha
             applied = requeue_change_job(state)
             if applied != retired:
@@ -250,6 +261,20 @@ class Controller:
                 "parent_closeout_pending",
             }:
                 return False
+            # Requeue persists its replacement intent before it performs any
+            # Publisher mutation. A lost response while retiring the old PR
+            # must leave that intent retryable, never turn it into an ordinary
+            # failed invocation.
+            if (
+                state.get("status") == "requeue_required"
+                and isinstance(state.get("requeue_transition"), dict)
+            ):
+                return False
+            if (
+                state.get("status") == "blocked"
+                and state.get("terminal_kind") == "waiting_human"
+            ):
+                return False
             hint_reader = getattr(self.github, "repository_hint", None)
             repository_hint = (
                 hint_reader() if callable(hint_reader) else None
@@ -297,13 +322,19 @@ class Controller:
         return state
 
     def _refresh(
-        self, state: dict[str, Any], parent_number: int
+        self,
+        state: dict[str, Any],
+        parent_number: int,
+        *,
+        check_requeue_currentness: bool = False,
     ) -> dict[str, Any]:
         try:
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
-            self._mark_stale_change_job(refreshed)
+            self._mark_stale_change_job(
+                refreshed, check_requeue_currentness=check_requeue_currentness
+            )
             return refreshed
         except GitHubReadError as error:
             failed = dict(state)
@@ -321,15 +352,21 @@ class Controller:
             )
             return failed
 
-    def _mark_stale_change_job(self, state: dict[str, Any]) -> None:
+    def _mark_stale_change_job(
+        self, state: dict[str, Any], *, check_requeue_currentness: bool = False
+    ) -> None:
         """Route only mechanically provable Change Job drift to Requeue."""
         if state.get("status") in {
             "unsupported_scope_change",
             "abandoned",
             "abandonment_pending",
             "completed",
-            "requeue_required",
         }:
+            return
+        if (
+            state.get("status") == "requeue_required"
+            and not check_requeue_currentness
+        ):
             return
         subject, job, _ = current_change_job(state)
         if job is None or job.get("phase") in {
@@ -349,6 +386,12 @@ class Controller:
             # A graph-selected Ticket is only a frontier projection.  It
             # becomes a Change Job once its normal constructor has bound the
             # first generation and currentness facts.
+            return
+        if not _has_change_job_currentness_facts(subject, job):
+            # Historical interrupted invocations can predate the persisted
+            # currentness boundary. They remain eligible for their normal
+            # invocation-recovery checks, but cannot be mechanically labelled
+            # stale solely because a required fact is absent.
             return
         external = (
             None
@@ -562,6 +605,21 @@ def _stale_change_job_reason(
     if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
         return "run_repair_base_changed"
     return None
+
+
+def _has_change_job_currentness_facts(subject: str, job: dict[str, Any]) -> bool:
+    """Whether this Generation has the facts required for stale routing."""
+    if not isinstance(job.get("base_sha"), str):
+        return False
+    if subject.startswith("ticket:"):
+        return isinstance(job.get("effective_revision"), str)
+    if subject.startswith("parent-only:"):
+        return isinstance(job.get("effective_revision"), str)
+    return (
+        isinstance(job.get("parent_revision"), str)
+        and isinstance(job.get("ticket_graph_revision"), str)
+        and isinstance(job.get("ticket_completion_records"), list)
+    )
 
 
 def _unknown_pr_mutation(

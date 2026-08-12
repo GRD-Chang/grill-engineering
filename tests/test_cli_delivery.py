@@ -2091,8 +2091,8 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
             {
                 "developments": [
                     {
-                        "expected_thread_id": "developer-1",
-                        "thread_id": "developer-1",
+                        "expected_thread_id": None,
+                        "thread_id": "developer-2",
                         "summary": "Implemented revision two.",
                         "write_files": {"feature.txt": "revision two\n"},
                     }
@@ -2100,7 +2100,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
                 "publications": [publication()],
                 "reviews": [
                     passing_acceptance(
-                        "reviewer-1", "A reused reviewer must be rejected."
+                        "reviewer-2", "The replacement candidate passed."
                     )
                 ],
             }
@@ -2124,3 +2124,43 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     assert state["active_ticket_job"]["modification_attempts"] == 1
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(mutable_fixture["delivery"]["pull_requests"]) == 1
+    mutable_fixture["delivery"]["crash_after_abandon_change_pr_once"] = True
+    fixture.write_text(json.dumps(mutable_fixture), encoding="utf-8")
+
+    interrupted = run_cli(
+        git_repo,
+        fixture,
+        "requeue",
+        run_id,
+        "--agent-fixture",
+        str(second_agents),
+    )
+    assert interrupted.returncode == 2
+    assert stdout_json(interrupted)["status"] == "requeue_required"
+    prepared = load_only_run_state(git_repo)
+    assert prepared["status"] == "requeue_required"
+    assert prepared["requeue_transition"]["retired"]["pr_number"] == 1
+
+    requeued = run_cli(
+        git_repo,
+        fixture,
+        "requeue",
+        run_id,
+        "--agent-fixture",
+        str(second_agents),
+    )
+    assert requeued.returncode == 0, requeued.stderr
+    state = load_only_run_state(git_repo)
+    replacement = state["ticket_jobs"]["3"]
+    assert replacement["ticket_branch_generation"] == 2
+    assert replacement["development_thread_id"] == "developer-2"
+    assert state["retired_job_generations"][0]["thread_ids"] == [
+        "developer-1",
+        "reviewer-1",
+    ]
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    pulls = delivery["pull_requests"]
+    assert [pull["state"] for pull in pulls] == ["CLOSED", "MERGED"]
+    assert delivery["mutations"].count(
+        {"action": "close_change_pr", "pr_number": 1}
+    ) == 1
