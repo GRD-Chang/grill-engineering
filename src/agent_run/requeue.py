@@ -98,13 +98,7 @@ def current_change_job(
 
 def _retired_record(subject: str, job: dict[str, Any]) -> dict[str, Any]:
     generation = _generation(job)
-    thread_ids = sorted(
-        {
-            value
-            for key, value in job.items()
-            if key.endswith("thread_id") and isinstance(value, str) and value
-        }
-    )
+    thread_ids = sorted(_thread_ids(job))
     record: dict[str, Any] = {
         "work_subject": subject,
         "generation": generation,
@@ -127,6 +121,20 @@ def _retired_record(subject: str, job: dict[str, Any]) -> dict[str, Any]:
         "had_publication": isinstance(job.get("publication"), dict),
     }
     return record
+
+
+def _thread_ids(job: dict[str, Any]) -> set[str]:
+    """Project every persisted generation-local Thread identity into audit."""
+    ids = {
+        value
+        for key, value in job.items()
+        if key.endswith("thread_id") and isinstance(value, str) and value
+    }
+    for key in ("development_thread_history", "reviewer_thread_ids"):
+        history = job.get(key)
+        if isinstance(history, list):
+            ids.update(value for value in history if isinstance(value, str) and value)
+    return ids
 
 
 def _generation(job: dict[str, Any]) -> int:

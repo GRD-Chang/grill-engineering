@@ -34,6 +34,8 @@ def _ticket_state() -> dict[str, Any]:
         "acceptance_record": {"artifact": {"verdict": "pass"}},
         "pr_number": 12,
         "development_thread_id": "thread-old",
+        "development_thread_history": ["thread-old", "development-earlier"],
+        "reviewer_thread_ids": ["reviewer-old"],
     }
     return {
         "run_id": "run-1",
@@ -54,7 +56,11 @@ def test_requeue_ticket_archives_the_old_generation_and_releases_a_fresh_job() -
     assert retired["generation"] == 1
     assert retired["work_subject"] == "ticket:7"
     assert retired["pr_number"] == 12
-    assert retired["thread_ids"] == ["thread-old"]
+    assert retired["thread_ids"] == [
+        "development-earlier",
+        "reviewer-old",
+        "thread-old",
+    ]
     assert retired["had_acceptance"] is True
     assert "job" not in retired
     assert state["retired_job_generations"] == [retired]
