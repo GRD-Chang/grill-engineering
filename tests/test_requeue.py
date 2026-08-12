@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agent_run.controller import Controller
+from agent_run.cli_surface import _command_is_ready
+from agent_run.git import GitRepository
+from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.requeue import RequeueError, requeue_change_job
+from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
+from agent_run.state import StateStore
+from conftest import write_fixture
+from test_cli import issue, run_cli, stdout_json
+
+
+def _ticket_state() -> dict[str, Any]:
+    job = {
+        "ticket_number": 7,
+        "ticket_branch": "agent-run/run-1/ticket-7",
+        "ticket_branch_generation": 1,
+        "phase": "blocked",
+        "effective_revision": "old-revision",
+        "base_sha": "old-base",
+        "candidate_sha": "candidate",
+        "acceptance_record": {"artifact": {"verdict": "pass"}},
+        "pr_number": 12,
+        "development_thread_id": "thread-old",
+    }
+    return {
+        "run_id": "run-1",
+        "status": "requeue_required",
+        "terminal_kind": "requeue_required",
+        "active_ticket_job": job,
+        "ticket_jobs": {"7": job},
+        "retired_ticket_generations": {},
+        "diagnostics": [{"code": "ticket_requirements_changed"}],
+    }
+
+
+def test_requeue_ticket_archives_the_old_generation_and_releases_a_fresh_job() -> None:
+    state = _ticket_state()
+
+    retired = requeue_change_job(state)
+
+    assert retired["generation"] == 1
+    assert retired["work_subject"] == "ticket:7"
+    assert retired["pr_number"] == 12
+    assert retired["thread_ids"] == ["thread-old"]
+    assert retired["had_acceptance"] is True
+    assert "job" not in retired
+    assert state["retired_job_generations"] == [retired]
+    assert state["retired_ticket_generations"] == {"7": 1}
+    assert state["active_ticket_job"] is None
+    assert state["ticket_jobs"] == {}
+    assert state["status"] == "active"
+    assert state["terminal_kind"] is None
+    assert state["diagnostics"] == []
+
+
+@pytest.mark.parametrize("status", ["active", "execution_failed", "completed"])
+def test_requeue_rejects_any_state_except_requeue_required(status: str) -> None:
+    state = _ticket_state()
+    state["status"] = status
+
+    with pytest.raises(RequeueError, match="only allowed"):
+        requeue_change_job(state)
+
+
+def test_requeue_refuses_ambiguous_change_job_identity() -> None:
+    state = _ticket_state()
+    state["parent_job"] = deepcopy(state["active_ticket_job"])
+
+    with pytest.raises(RequeueError, match="exactly one"):
+        requeue_change_job(state)
+
+
+def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
+    parent_state: dict[str, Any] = {
+        "run_id": "run-1",
+        "status": "requeue_required",
+        "parent_job": {
+            "parent_generation": 2,
+            "phase": "developing",
+            "parent_branch": "agent-run/run-1/parent-generation-2",
+        },
+    }
+    parent_retired = requeue_change_job(parent_state)
+    assert parent_retired["work_subject"] == "parent-only:run-1"
+    assert parent_state["retired_parent_generation"] == 2
+    assert "parent_job" not in parent_state
+    assert parent_state["status"] == "parent_delivery_pending"
+
+    repair = {
+        "repair_generation": 3,
+        "phase": "developing",
+        "repair_branch": "agent-run-repair/run-1/2-generation-3",
+        "ticket_completion_records": [{"ticket_number": 7}],
+    }
+    repair_state: dict[str, Any] = {
+        "run_id": "run-1",
+        "status": "requeue_required",
+        "run_acceptance": {"phase": "repairing", "repair_job": repair},
+    }
+    repair_retired = requeue_change_job(repair_state)
+    assert repair_retired["work_subject"] == "run-repair:run-1"
+    assert repair_state["run_acceptance"] == {"phase": "pending"}
+    assert repair_state["status"] == "run_acceptance_pending"
+
+
+def test_only_requeue_is_a_lifecycle_action_at_the_stale_generation_boundary() -> None:
+    state: dict[str, object] = {"status": "requeue_required"}
+
+    assert _command_is_ready(state, "requeue") is True
+    assert _command_is_ready(state, "deliver") is False
+    assert _command_is_ready(state, "accept-run") is False
+    assert _command_is_ready(state, "publish-run") is False
+    assert _command_is_ready(state, "approve") is False
+    assert _command_is_ready(state, "revise") is False
+
+
+def test_requeue_closes_only_the_old_change_pr_and_removes_its_checkout(
+    tmp_path: Path,
+) -> None:
+    class Publisher:
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+
+        def abandon_change_pr(self, number: int) -> None:
+            self.closed.append(number)
+
+        def record_agent_run_status(self, _number: int, _status: dict[str, object]) -> None:
+            return None
+
+    class Git:
+        def __init__(self) -> None:
+            self.removed: list[Path] = []
+
+        def remove_worktree(self, checkout: Path) -> None:
+            self.removed.append(checkout)
+
+    checkout = tmp_path / "worktrees" / "run-1" / "ticket-7"
+    checkout.mkdir(parents=True)
+    publisher = Publisher()
+    git = Git()
+    retired = {"work_subject": "ticket:7", "pr_number": 12}
+
+    close_superseded_pull_request(publisher, retired)
+    remove_superseded_worktree(git, tmp_path, "run-1", retired)
+
+    assert publisher.closed == [12]
+    assert git.removed == [checkout]
+
+
+def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={
+            "7": {
+                "number": 7,
+                "title": "Ticket",
+                "body": "old requirements",
+                "state": "OPEN",
+                "labels": ["ready-for-agent"],
+                "blocked_by": [],
+            }
+        },
+    )
+    git = GitRepository.discover(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    state, _ = controller.start(1)
+    active = state["active_ticket_job"]
+    assert isinstance(active, dict)
+    active.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
+            "phase": "developing",
+            "effective_revision": "stale",
+            "base_sha": git.resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": active}
+    states.save_run(str(state["run_id"]), state)
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["issues"]["7"]["body"] = "new requirements"
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    stale, _ = controller.resume(str(state["run_id"]))
+    assert stale["status"] == "requeue_required"
+    assert stale["requeue_required"]["work_subject"] == "ticket:7"
+
+    queued, retired = controller.requeue(str(state["run_id"]))
+
+    assert retired["generation"] == 1
+    assert retired["work_subject"] == "ticket:7"
+    new_job = queued["active_ticket_job"]
+    assert isinstance(new_job, dict)
+    assert new_job["ticket_number"] == 7
+    assert "effective_revision" not in new_job
+    assert "candidate_sha" not in new_job
+    assert queued["retired_ticket_generations"] == {"7": 1}
+
+
+def test_deliver_cannot_restart_a_stale_generation_without_requeue(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    state = states.load_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{run_id}/ticket-7",
+            "phase": "developing",
+            "effective_revision": "old-revision",
+            "base_sha": GitRepository(git_repo).resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
+    states.save_run(run_id, state)
+
+    blocked = run_cli(git_repo, fixture, "deliver", run_id)
+
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "requeue_required"
+    updated = states.load_run(run_id)
+    assert updated is not None
+    updated_job = updated["active_ticket_job"]
+    assert isinstance(updated_job, dict)
+    assert updated_job["ticket_branch_generation"] == 1
+    assert updated_job["effective_revision"] == "old-revision"
+    assert "candidate_sha" not in updated_job

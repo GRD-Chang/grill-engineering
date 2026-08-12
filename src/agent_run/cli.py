@@ -19,6 +19,7 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
@@ -49,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="为当前失败或人工阻塞的 Agent 阶段新开 Thread",
     )
+    requeue = subcommands.add_parser(
+        "requeue", help="从最新权威状态创建新的 Change Job Generation"
+    )
+    requeue.add_argument("run_id", help="交付运行标识")
+    _add_common_options(requeue)
+    requeue.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--message",
         help="仅用于当前 Human Blocker 的未经改写人工响应（最多 8 KiB）",
@@ -216,10 +223,54 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             repository.default_branch, repository.default_head_sha
                         ),
                     ).publish(parsed.run_id)
+        elif parsed.command == "requeue":
+            state, retired = controller.requeue(parsed.run_id)
+            publisher = (
+                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                if parsed.github_fixture
+                else GhGitHubPublisher(github.repository().name_with_owner, git)
+            )
+            close_superseded_pull_request(publisher, retired)
+            remove_superseded_worktree(git, states.root, parsed.run_id, retired)
+            retired["pr_status"] = "superseded_closed"
+            states.save_run(parsed.run_id, state)
+            subject = str(retired["work_subject"])
+            agent_fixture = getattr(parsed, "agent_fixture", None)
+            agents = (
+                FixtureAgentBackend(Path(agent_fixture))
+                if agent_fixture
+                else CodexCliBackend()
+            )
+            if subject.startswith("ticket:") and state.get("status") == "active":
+                state = DeliveryRunEngine(
+                    controller=controller,
+                    tickets=TicketDeliveryEngine(
+                        git=git, states=states, github=publisher, agents=agents
+                    ),
+                ).deliver_from_state(parsed.run_id, state)
+            elif subject.startswith("parent-only:"):
+                state = ParentDeliveryEngine(
+                    git=git, states=states, github=publisher, agents=agents
+                ).deliver(parsed.run_id)
+            elif subject.startswith("run-repair:"):
+                repository = github.repository()
+                state = RunAcceptanceEngine(
+                    git=git,
+                    states=states,
+                    agents=agents,
+                    default_head_sha=git.resolve_base(
+                        repository.default_branch, repository.default_head_sha
+                    ),
+                    github=publisher,
+                ).accept(parsed.run_id)
+            resumed = True
         elif parsed.command == "deliver":
             refreshed, _ = controller.resume(parsed.run_id)
             if refreshed.get("status") in {"completed", "abandoned"}:
                 state = refreshed
+            elif refreshed.get("status") == "requeue_required":
+                state = refreshed
+                precondition_failed = True
             elif refreshed.get("status") == "unsupported_scope_change":
                 state = refreshed
                 precondition_failed = True
@@ -277,7 +328,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 else CodexCliBackend()
             )
             refreshed, _ = controller.resume(parsed.run_id)
-            if refreshed.get("status") not in {
+            if refreshed.get("status") == "requeue_required":
+                state = refreshed
+                precondition_failed = True
+            elif refreshed.get("status") not in {
                 "run_acceptance_pending",
                 "run_publication_pending",
             }:
@@ -330,6 +384,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             if refreshed.get("status") in {"abandoned", "completed"}:
                 state = refreshed
+            elif refreshed.get("status") == "requeue_required":
+                state = refreshed
+                precondition_failed = True
             elif (
                 refreshed.get("status") == "unsupported_scope_change"
                 and parsed.command != "abandon"
@@ -441,6 +498,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "run_approval_pending",
                 "completed",
                 "abandoned",
+                "requeue_required",
                 "waiting_merge",
             }
             else 2

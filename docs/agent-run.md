@@ -35,6 +35,7 @@ agent-run history <run-id> --repo OWNER/REPO
 agent-run start <parent-issue> --repo OWNER/REPO
 agent-run deliver <run-id> --repo OWNER/REPO
 agent-run resume <run-id> [--new-thread] [--message "..."] --repo OWNER/REPO
+agent-run requeue <run-id> --repo OWNER/REPO
 agent-run accept-run <run-id> --repo OWNER/REPO
 agent-run publish-run <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
@@ -59,6 +60,11 @@ Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许�
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
 也不等同于 `revise` 的 Run Feedback。
+`resume` 只恢复当前 failed 或 Human Blocker Invocation；其 preflight 发现 requirements、
+base/head 或 Run Repair 边界已 stale 时绝不启动 Codex，而是进入 `requeue_required`。此状态下
+只允许 `status`、`history`、`requeue` 与 `abandon`。`requeue` 在执行时重新读取 GitHub 和 Git
+权威事实，封存旧 Job Generation、关闭其仍开放的自动化 Change PR，并创建不携带旧 Candidate、
+Acceptance 或 Thread 的新 generation；它不自动 rebase，也不继续旧 worktree。
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 
@@ -104,11 +110,12 @@ Run Repair → fresh Run Acceptance → 新 PR 语义。`abandon` 先把
 Run 保持 `abandonment_pending`，不会猜测 ownership 或制造新的 close。完成后保留 Run state、
 已发布 PR 与其他远端审计事实，并通过 Git worktree 操作删除该 Run 的本地临时 worktrees。
 
-Ticket title/body 在运行中变化时，旧开发结果、Publication 和 Acceptance 会失效；
-Controller 沿用同一个 Ticket Job、Ticket Branch 和 Development Thread，从最新 revision
-自动重启。Issue 评论不参与 revision，Controller 自身产生的本地修改也不会改变 revision。
-Parent title/body 变化会更新 observed Parent revision，同时保留 accepted revision，供后续
-Job Generation currentness 路由使用；Controller 不再派发 Scope Impact Assessment Codex。
+Ticket 或 Parent title/body、以及 Change Job 的适用 base/head 在运行中变化时，旧开发结果、
+Publication 和 Acceptance 会失效。Controller 不再原地重置或让旧 Thread 解释变化：它进入
+`requeue_required`，等待维护者显式执行 `requeue`。Issue 评论不参与 revision；Controller 自身
+产生的本地修改也不会改变 revision。Parent title/body 变化会更新 observed Parent revision，
+同时保留 accepted revision，供 Job Generation currentness 路由使用；Controller 不再派发
+Scope Impact Assessment Codex。
 
 原生 Sub-issue 集合或 `blockedBy` 边发生变化时，Run 进入
 `unsupported_scope_change`。耐久状态中的 `unsupported_scope_change` 保存 accepted/observed

@@ -51,6 +51,19 @@ class GhGitHubReader:
         }
         return DeliveryGraph(parent=parent, issues=issues)
 
+    def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+        repository = self.repository()
+        data = self._gh_json(
+            "pr", "view", str(pr_number), "--repo", repository.name_with_owner,
+            "--json", "state,headRefOid,baseRefName,baseRefOid",
+        )
+        return {
+            "state": _string(data, "state"),
+            "head_sha": _string(data, "headRefOid"),
+            "base_branch": _string(data, "baseRefName"),
+            "base_sha": _string(data, "baseRefOid"),
+        }
+
     def _read_parent(
         self, owner: str, name: str, parent_number: int
     ) -> tuple[ParentIssue, tuple[int, ...]]:

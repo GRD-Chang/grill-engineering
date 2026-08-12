@@ -956,7 +956,7 @@ def test_parent_only_approve_rechecks_required_checks_before_merge(
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
 
-def test_parent_only_approve_rejects_stale_parent_revision(
+def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -989,10 +989,11 @@ def test_parent_only_approve_rejects_stale_parent_revision(
 
     approval = run_cli(git_repo, fixture, "approve", run_id)
 
-    assert approval.returncode == 0, approval.stderr
-    assert stdout_json(approval)["status"] == "parent_delivery_pending"
+    assert approval.returncode == 2, approval.stderr
+    assert stdout_json(approval)["status"] == "requeue_required"
     state = load_only_run_state(git_repo)
-    assert state["parent_job"]["phase"] == "developing"
+    assert state["parent_job"]["phase"] == "ready_for_approval"
+    assert state["requeue_required"]["work_subject"].startswith("parent-only:")
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
 
@@ -1970,7 +1971,7 @@ def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:
     assert mutable_fixture["delivery"]["pull_requests"][0]["state"] == "OPEN"
 
 
-def test_ticket_revision_change_invalidates_old_acceptance_and_reuses_job(
+def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -2048,38 +2049,10 @@ def test_ticket_revision_change_invalidates_old_acceptance_and_reuses_job(
         str(second_agents),
     )
     assert rejected.returncode != 0
-    assert stdout_json(rejected)["diagnostics"][0]["code"] == "command_failed"
-
-    final_agents = git_repo / "agents-final.json"
-    final_agents.write_text(
-        json.dumps(
-                {
-                    "developments": [],
-                    "publications": [publication()],
-                "reviews": [
-                    passing_acceptance(
-                        "reviewer-2", "Revision two passed."
-                    )
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    completed = run_cli(
-        git_repo,
-        fixture,
-        "deliver",
-        run_id,
-        "--agent-fixture",
-        str(final_agents),
-    )
-
-    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(rejected)["diagnostics"][0]["code"] == "ticket_requirements_changed"
     state = load_only_run_state(git_repo)
-    job = state["ticket_jobs"]["3"]
-    assert job["effective_revision"] != old_revision
-    assert job["development_thread_id"] == "developer-1"
-    assert job["reviewer_thread_ids"] == ["reviewer-1", "reviewer-2"]
-    assert job["modification_attempts"] == 1
+    assert state["status"] == "requeue_required"
+    assert state["active_ticket_job"]["effective_revision"] == old_revision
+    assert state["active_ticket_job"]["modification_attempts"] == 1
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(mutable_fixture["delivery"]["pull_requests"]) == 1

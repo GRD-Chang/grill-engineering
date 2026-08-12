@@ -23,8 +23,14 @@ def _run_to_human_gate(
         raise ValueError("Delivery Run is missing its Run ID")
     state = _load_local_run(states, run_id)
     previous_marker: tuple[object, ...] | None = None
+    automatic_requeues = 0
     while True:
         command = _next_automatic_command(state)
+        if command is None and state.get("status") == "requeue_required":
+            if automatic_requeues >= 1:
+                return state, resumed
+            command = "requeue"
+            automatic_requeues += 1
         if command is None:
             return state, resumed
         marker = _progress_marker(state, command)
@@ -58,6 +64,7 @@ def _agent_fixture_arguments(
         "deliver",
         "accept-run",
         "publish-run",
+        "requeue",
     }:
         return ["--agent-fixture", agent_fixture]
     return []
@@ -126,6 +133,7 @@ def _is_lifecycle_action(command: str) -> bool:
         "publish-run",
         "approve",
         "revise",
+        "requeue",
     }
 
 
@@ -151,6 +159,10 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
             isinstance(invocation, dict) and invocation.get("status") == "failed"
         )
     if status in {"unsupported_scope_change", "abandonment_pending"}:
+        return False
+    if command == "requeue":
+        return status == "requeue_required"
+    if status == "requeue_required":
         return False
     if command == "deliver":
         return True

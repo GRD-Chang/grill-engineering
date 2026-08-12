@@ -42,6 +42,25 @@ class FixtureGitHubReader:
             should_retry=_is_transient_read_error,
         )
 
+    def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+        delivery = _mapping(self._load(), "delivery")
+        pulls = delivery.get("pull_requests")
+        if not isinstance(pulls, list):
+            raise GitHubReadError("invalid_fixture", "delivery.pull_requests must be an array")
+        for pull in pulls:
+            if isinstance(pull, dict) and pull.get("number") == pr_number:
+                branch = _string(pull, "branch")
+                published = _mapping(delivery, "published_branches")
+                head = published.get(branch) or pull.get("head_sha")
+                if not isinstance(head, str):
+                    raise GitHubReadError("invalid_fixture", "PR head is missing")
+                return {
+                    "state": pull.get("state"), "head_sha": head,
+                    "base_branch": _string(pull, "base_branch"),
+                    "base_sha": self.repository().default_head_sha,
+                }
+        raise GitHubReadError("missing_pull_request", f"PR #{pr_number} is missing")
+
     def _delivery_graph_once(self, parent_number: int) -> DeliveryGraph:
         self.data = self._load()
         configured_failures = self.data.get("delivery_graph_read_failures")

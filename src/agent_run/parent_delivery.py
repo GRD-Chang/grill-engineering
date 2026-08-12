@@ -269,7 +269,7 @@ class ParentDeliveryEngine:
             "parent_branch": branch,
             "base_sha": str(_mapping(state, "base")["sha"]),
             "effective_revision": str(parent["revision"]),
-            "parent_generation": 1,
+            "parent_generation": int(state.get("retired_parent_generation", 0)) + 1,
             "phase": "developing",
             "modification_attempts": 0,
             "development_thread_id": None,

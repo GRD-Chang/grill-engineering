@@ -9,6 +9,8 @@ from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
+from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
+from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records_fingerprint
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
@@ -18,6 +20,8 @@ class GitHubReader(Protocol):
     def repository(self) -> Repository: ...
 
     def delivery_graph(self, parent_number: int) -> DeliveryGraph: ...
+
+    def live_pull_request(self, pr_number: int) -> dict[str, Any]: ...
 
 
 class Controller:
@@ -139,6 +143,36 @@ class Controller:
             self.states.save_run(run_id, state)
             return state, True
 
+    def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Create a blank Change Job Generation from facts read *now*.
+
+        Requeue is intentionally separate from ``resume``: it never tries to
+        attach an old Thread or retain candidate/acceptance state.
+        """
+        with self.states.locked():
+            existing = self._load_bound_run(run_id)
+            parent_number = int(_state_mapping(existing, "parent")["number"])
+            state = self._refresh(existing, parent_number)
+            if state.get("status") != "requeue_required":
+                self.states.save_run(run_id, state)
+                raise RequeueError("requeue is only allowed in requeue_required state")
+            repository = self.github.repository()
+            base = _state_mapping(state, "base")
+            base["sha"] = self.publisher.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
+            retired = requeue_change_job(state)
+            if retired["work_subject"].startswith("parent-only:"):
+                generation = int(retired["generation"]) + 1
+                state["parent_branch"] = (
+                    f"agent-run/{run_id}/parent-generation-{generation}"
+                )
+            # Release the empty subject through the same graph projection that
+            # starts a brand-new Run; never reconstruct it from old artifacts.
+            state = self._refresh(state, parent_number)
+            self._ensure_delivery_branch(state, str(base["sha"]))
+            return state, retired
+
     def _run_invocation_boundary_is_current(
         self, state: dict[str, Any], invocation: dict[str, Any]
     ) -> bool:
@@ -237,7 +271,9 @@ class Controller:
         try:
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
-            return reconcile_structure(state, projected)
+            refreshed = reconcile_structure(state, projected)
+            self._mark_stale_change_job(refreshed)
+            return refreshed
         except GitHubReadError as error:
             failed = dict(state)
             failed.update(
@@ -253,6 +289,74 @@ class Controller:
                 }
             )
             return failed
+
+    def _mark_stale_change_job(self, state: dict[str, Any]) -> None:
+        """Route only mechanically provable Change Job drift to Requeue."""
+        if state.get("status") in {
+            "unsupported_scope_change",
+            "abandoned",
+            "abandonment_pending",
+            "completed",
+            "requeue_required",
+        }:
+            return
+        subject, job, _ = current_change_job(state)
+        if job is None or job.get("phase") in {
+            "completed",
+            "merged",
+            "merging",
+        }:
+            return
+        if not any(
+            type(job.get(key)) is int
+            for key in (
+                "ticket_branch_generation",
+                "parent_generation",
+                "repair_generation",
+            )
+        ):
+            # A graph-selected Ticket is only a frontier projection.  It
+            # becomes a Change Job once its normal constructor has bound the
+            # first generation and currentness facts.
+            return
+        external = (
+            _unknown_pr_mutation(job, self.github)
+            if job.get("phase") != "blocked"
+            else None
+        )
+        if external is not None:
+            state.update(
+                {
+                    "status": "blocked",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{"code": external, "message": "Change PR changed outside the current Generation"}],
+                }
+            )
+            return
+        if _candidate_or_acceptance_is_inconsistent(job):
+            state.update(
+                {
+                    "status": "blocked",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{"code": "candidate_or_acceptance_inconsistent", "message": "Candidate or Acceptance cannot be safely requeued"}],
+                }
+            )
+            return
+        reason = _stale_change_job_reason(state, subject, job, self.publisher.git)
+        if reason is None:
+            return
+        state.update(
+            {
+                "status": "requeue_required",
+                "terminal_kind": "requeue_required",
+                "diagnostics": [{"code": reason, "message": "Change Job Generation is stale; run requeue"}],
+                "requeue_required": {
+                    "work_subject": subject,
+                    "generation": _subject_generation(job),
+                    "reason": reason,
+                },
+            }
+        )
 
     def _initial_state(
         self,
@@ -387,6 +491,64 @@ def _state_mapping(state: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"run state field {key!r} is invalid")
     return value
+
+
+def _stale_change_job_reason(
+    state: dict[str, Any], subject: str, job: dict[str, Any], git: GitRepository
+) -> str | None:
+    parent = _state_mapping(state, "parent")
+    graph = _state_mapping(state, "ticket_graph")
+    if subject.startswith("ticket:"):
+        ticket = _state_mapping(_state_mapping(graph, "tickets"), subject.removeprefix("ticket:"))
+        expected = effective_revision(
+            ticket_revision=str(ticket["content_revision"]),
+            parent_revision=str(parent["revision"]),
+            graph_revision=str(graph["revision"]),
+        )
+        if job.get("effective_revision") != expected:
+            return "ticket_requirements_changed"
+        run_branch = state.get("run_branch")
+        if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
+            return "ticket_base_changed"
+        return None
+    if subject.startswith("parent-only:"):
+        if job.get("effective_revision") != parent.get("revision"):
+            return "parent_requirements_changed"
+        base = _state_mapping(state, "base")
+        branch = base.get("branch")
+        if not isinstance(branch, str) or job.get("base_sha") != git.resolve(branch):
+            return "parent_base_changed"
+        return None
+    if job.get("parent_revision") != parent.get("revision"):
+        return "run_repair_parent_changed"
+    if job.get("ticket_graph_revision") != graph.get("revision"):
+        return "run_repair_graph_changed"
+    run_branch = state.get("run_branch")
+    if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
+        return "run_repair_base_changed"
+    return None
+
+
+def _unknown_pr_mutation(job: dict[str, Any], github: GitHubReader) -> str | None:
+    pr_number = job.get("pr_number")
+    if not isinstance(pr_number, int):
+        return None
+    live = github.live_pull_request(pr_number)
+    if live.get("state") != "OPEN":
+        return "change_pr_closed_or_merged_externally"
+    if live.get("head_sha") != job.get("publication_sha"):
+        return "change_pr_head_changed_externally"
+    return None
+
+
+def _candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
+    candidate = job.get("candidate_sha")
+    record = job.get("acceptance_record")
+    if record is None:
+        return False
+    if not isinstance(record, dict) or not isinstance(candidate, str):
+        return True
+    return record.get("reviewed_candidate_sha") != candidate
 
 
 def _integer_list(state: dict[str, Any], key: str) -> list[int]:
