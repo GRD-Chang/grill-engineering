@@ -142,6 +142,10 @@ class FixtureAgentBackend:
             raise ValueError(
                 "agent fixture publication expected a different Thread ID"
             )
+        configured_error = step.pop("error", None)
+        no_thread = step.pop("no_thread", False)
+        if not isinstance(no_thread, bool):
+            raise ValueError("scripted Publication no_thread must be a boolean")
         thread_id = step.pop("thread_id", None) or requested_thread or "fixture-publication"
         event = request.get("_invocation_event")
         if callable(event):
@@ -151,7 +155,17 @@ class FixtureAgentBackend:
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+            if no_thread:
+                error = "scripted Publication did not report a Thread ID"
+                event("failed", attempt_count=1, error=error)
+                raise ValueError(error)
             event("thread_started", reported_thread_id=thread_id, attempt_count=1)
+        if isinstance(configured_error, str):
+            if callable(event):
+                event("failed", attempt_count=1, error=configured_error)
+            raise ValueError(configured_error)
+        if configured_error is not None:
+            raise ValueError("scripted Publication error must be a string")
         blockers = _human_blockers(step)
         if blockers is not None:
             if callable(event):
