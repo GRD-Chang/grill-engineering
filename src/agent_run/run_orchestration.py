@@ -42,6 +42,11 @@ class DeliveryRunEngine:
             if result.get("status") in {"waiting_checks", "publication_pending"}:
                 return result
             state, _ = self.controller.resume(run_id)
+            if state.get("status") == "requeue_required":
+                # A Requeue command may launch one replacement Generation, but
+                # a second drift in that same top-level command needs a fresh
+                # maintainer decision rather than another in-place reset.
+                return state
             active = state.get("active_ticket_job")
             if not isinstance(active, dict):
                 return state

@@ -36,6 +36,14 @@ _Avoid_: Development Attempt、Reviewer Thread、Delivery Run 全局会话
 Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 使用同一规范记录骨架和生命周期语义，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
 _Avoid_: Development Brief、Agent Artifact、PR 正文
 
+**Job Generation（任务世代）**:
+同一 Work Subject 在一组准确 requirements、base/head、Candidate、Acceptance 与 PR currentness
+边界下的一次可执行身份。requirements 或明确的 base 漂移会使当前 Generation 成为
+`requeue_required`；操作者执行 `requeue` 后，Controller 封存旧 generation 的轻量审计事实，
+从命令执行时重新读取的权威状态创建新的 branch/PR/Thread identity，绝不迁移旧 Candidate、
+Acceptance、Human Response 或 worktree。
+_Avoid_: Invocation Resume、自动 rebase、跨 generation 复用 Thread
+
 **Execution Guard（执行约束）**:
 Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用完整真实 Git/`gh` CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。它只通过只读权威 Git metadata 和不向 Worker 注入 Publisher 写凭据保留 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回不含 URL 或凭据的固定错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
@@ -77,7 +85,12 @@ _Avoid_: 默认分支、Ticket Branch、永久集成分支
 _Avoid_: Run Branch、Final Run PR、跳过独立验收、自动合并
 
 **Ticket PR（Ticket 拉取请求）**:
-承载一张 Ticket 候选变更并以所属 Run Branch 为 base 的拉取请求。Publisher 从 Primary Ticket 创建 GitHub 原生关联的 Ticket Branch，并在 PR 正文保留可读引用；该 PR 只在自动门禁通过后使用 squash merge 进入 Run Branch，不直接进入默认分支。普通 repair 始终更新同一张 active PR；current PR 被关闭但未合并时 Job 阻塞，不自动创建替代 PR。若 PR 已合并但 Ticket 在显式完成前发生 Revision 漂移，该 PR 记为 superseded integration，同一 Ticket Job 与 Ticket Branch 针对最新 Revision 创建新的 active PR，已合并 PR 不再编辑或复用。
+承载一张 Ticket Job Generation 的候选变更并以所属 Run Branch 为 base 的拉取请求。Publisher 从
+Primary Ticket 创建 GitHub 原生关联的 generation-local Ticket Branch，并在 PR 正文保留可读引用；
+该 PR 只在自动门禁通过后使用 squash merge 进入 Run Branch，不直接进入默认分支。普通 repair 始终
+更新同一 generation 的 active PR；current PR 被关闭但未合并时 Job 阻塞，不自动创建替代 PR。明确
+requirements/base 漂移时旧开放 PR 被标记 superseded 并关闭，新 Generation 创建新的 branch/PR；
+已合并 PR 只作为审计记录，不再编辑或复用。
 _Avoid_: 最终集成 PR、多 Ticket PR、默认分支 PR
 
 **Run PR（运行拉取请求）**:
@@ -260,8 +273,12 @@ _Avoid_: Development Attempt、自动替代 Thread、领域 retry
 _Avoid_: CI 等待次数、同一 SHA 重复审查、无限重试
 
 **Ticket Resume Command（Ticket 恢复命令）**:
-维护者在修改阻塞 Ticket 的 Issue 标题或正文，并恢复其 `ready-for-agent` 资格后执行的本地 `agent-run resume <run-id>`。Controller 只有检测到新的 Ticket Content Revision 时，才复用原 Ticket Job、Ticket Branch 和 Development Thread，并为该 Ticket 开启新的十次修复预算；普通或 pre-merge Revision 继续复用 active Ticket PR，post-merge、pre-completion Revision 则保留旧 PR 为 superseded integration 并创建新的 active PR。内容未变化时拒绝重置，避免无限重试。
-_Avoid_: 新 Ticket Job、无内容变化重试、Run Feedback Revision
+维护者通过 `agent-run resume <run-id>` 恢复当前 failed 或 Human Blocker Invocation。若 preflight
+发现 Ticket Content Revision、Parent Revision 或适用 base 已变化，Controller 不启动 Codex，也不
+复用原 Ticket Job、Ticket Branch 或 Development Thread；它停在 `requeue_required`，维护者需执行
+`agent-run requeue <run-id>` 创建新的 generation。内容未变化时 Resume 仍可复用当前 Invocation 的
+Thread；它不重置修复预算。
+_Avoid_: 隐式 Requeue、无内容变化重试、Run Feedback Revision
 
 **Progress Exhaustion（推进耗尽）**:
 Delivery Run 中已不存在可激活的 Ticket Job，但 Ticket Set 尚未全部完成的状态。单张 Ticket 转为 `ready-for-human` 不会立即造成推进耗尽；Controller 仍应完成所有不依赖该 Ticket 的可执行工作，只有进入推进耗尽后才汇总阻塞项并请求人工介入。

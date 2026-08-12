@@ -1684,8 +1684,8 @@ def test_no_change_attempt_does_not_consume_modification_budget(
     revised, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
-    assert revised["status"] == "active"
-    assert revised["active_ticket_job"]["ticket_number"] == 3
+    assert revised["status"] == "requeue_required"
+    assert revised["requeue_required"]["work_subject"] == "ticket:3"
 
 
 def test_cancelled_worker_cleans_stable_ticket_checkout(
@@ -2329,54 +2329,23 @@ def test_post_merge_revision_drift_continues_same_job_with_new_pr(
     resumed, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
-    assert resumed["status"] == "blocked"
-    assert resumed["diagnostics"] == [
-        {
-            "code": "merged_revision_mismatch",
-            "message": (
-                "Merged Ticket PR was integrated, but no longer matches "
-                "the current revision"
-            ),
-            "ticket_number": 3,
-        }
-    ]
-    assert resumed["active_ticket_job"]["blocked_reason"] == (
-        "merged_revision_mismatch"
-    )
-    publisher.pr_number = 12
-    publisher.merged_sha = None
-    publisher.merged_head = None
-
-    completed = engine.deliver(state["run_id"])
-
-    assert completed["status"] == "ticket_completed"
-    assert completed["active_ticket_job"]["effective_revision"] == (
-        new_effective_revision
-    )
-    assert completed["active_ticket_job"]["pr_number"] == 12
-    assert completed["active_ticket_job"]["base_sha"] == first_integrated
-    assert completed["active_ticket_job"]["superseded_integrations"] == [
-        {
-            "pr_number": 11,
-            "integrated_sha": first_integrated,
-            "effective_revision": old_effective_revision,
-        }
-    ]
-    assert publisher.closed_issues == [3]
-    assert publisher.created_prs == 2
-
-    repeated = engine.deliver(state["run_id"])
-
-    assert repeated["status"] == "ticket_completed"
-    assert repeated["active_ticket_job"]["superseded_integrations"] == [
-        {
-            "pr_number": 11,
-            "integrated_sha": first_integrated,
-            "effective_revision": old_effective_revision,
-        }
-    ]
-    assert publisher.closed_issues == [3]
-    assert publisher.created_prs == 2
+    assert resumed["status"] == "requeue_required"
+    assert resumed["requeue_required"] == {
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "reason": "ticket_requirements_changed",
+    }
+    prepared, retired = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).requeue(state["run_id"])
+    assert prepared["status"] == "requeue_required"
+    queued = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).finalize_requeue(state["run_id"])
+    assert queued["status"] == "active"
+    assert retired["pr_number"] == 11
+    assert retired["effective_revision"] == old_effective_revision
+    assert queued["retired_job_generations"] == [retired]
 
 
 def test_revision_drift_after_merged_save_archives_before_reset(

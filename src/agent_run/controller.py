@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from agent_run.change_currentness import (
+    candidate_or_acceptance_is_inconsistent,
+    has_currentness_facts,
+    stale_change_job_reason,
+    unknown_pr_mutation,
+)
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
-from agent_run.run_currentness import ticket_completion_records_fingerprint
+from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
+from agent_run.run_currentness import (
+    ticket_completion_records_fingerprint,
+)
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
 
@@ -18,6 +29,8 @@ class GitHubReader(Protocol):
     def repository(self) -> Repository: ...
 
     def delivery_graph(self, parent_number: int) -> DeliveryGraph: ...
+
+    def live_pull_request(self, pr_number: int) -> dict[str, Any]: ...
 
 
 class Controller:
@@ -103,6 +116,15 @@ class Controller:
             ):
                 self.states.save_run(run_id, state)
                 return state, True
+            if state.get("status") == "requeue_required":
+                self.states.save_run(run_id, state)
+                return state, True
+            if _is_currentness_human_blocker(state):
+                # A live Change PR no longer matches the persisted
+                # Generation. Do not repair invocations or touch a managed
+                # branch while the maintainer decides how to resolve it.
+                self.states.save_run(run_id, state)
+                return state, True
             invocation = state.get("active_agent_invocation")
             if (
                 isinstance(invocation, dict)
@@ -138,6 +160,108 @@ class Controller:
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
+
+    def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Create a blank Change Job Generation from facts read *now*.
+
+        Requeue is intentionally separate from ``resume``: it never tries to
+        attach an old Thread or retain candidate/acceptance state.
+        """
+        with self.states.locked():
+            existing = self._load_bound_run(run_id)
+            parent_number = int(_state_mapping(existing, "parent")["number"])
+            transition = existing.get("requeue_transition")
+            if isinstance(transition, dict):
+                retired = transition.get("retired")
+                if existing.get("status") == "requeue_required" and isinstance(retired, dict):
+                    refreshed = self._refresh_transition_facts(existing, parent_number)
+                    if refreshed.get("status") != "requeue_required":
+                        self.states.save_run(run_id, refreshed)
+                        raise RequeueError(
+                            "requeue transition no longer has a current Change Job"
+                        )
+                    self.states.save_run(run_id, refreshed)
+                    return refreshed, retired
+            state = self._refresh(
+                existing, parent_number, check_requeue_currentness=True
+            )
+            if state.get("status") != "requeue_required":
+                self.states.save_run(run_id, state)
+                raise RequeueError("requeue is only allowed in requeue_required state")
+            repository = self.github.repository()
+            base = _state_mapping(state, "base")
+            base["sha"] = self.publisher.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
+            transition_state = deepcopy(state)
+            retired = requeue_change_job(transition_state)
+            state["requeue_transition"] = {
+                "retired": retired,
+                "base_sha": base["sha"],
+                "close_nonce": secrets.token_hex(16),
+            }
+            self.states.save_run(run_id, state)
+            return state, retired
+
+    def finalize_requeue(self, run_id: str) -> dict[str, Any]:
+        """Commit a prepared replacement only after old assets are retired."""
+        with self.states.locked():
+            state = self._load_bound_run(run_id)
+            transition = _state_mapping(state, "requeue_transition")
+            retired = _state_mapping(transition, "retired")
+            prepared_base_sha = transition.get("base_sha")
+            if not isinstance(prepared_base_sha, str):
+                raise RequeueError("prepared requeue base is invalid")
+            # The initial intent is durable so an old-PR close can be retried,
+            # but the new Generation binds its base only after that retirement
+            # completes. This prevents a response-loss retry from reviving an
+            # already superseded default-branch snapshot.
+            repository = self.github.repository()
+            base_sha = self.publisher.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            )
+            _state_mapping(state, "base")["sha"] = base_sha
+            applied = requeue_change_job(state)
+            if applied != retired:
+                raise RequeueError("prepared requeue no longer matches current Job")
+            if retired["work_subject"].startswith("parent-only:"):
+                generation = int(retired["generation"]) + 1
+                state["parent_branch"] = f"agent-run/{run_id}/parent-generation-{generation}"
+            parent_number = int(_state_mapping(state, "parent")["number"])
+            state.pop("requeue_transition", None)
+            state = self._refresh(state, parent_number)
+            self._ensure_delivery_branch(state, base_sha)
+            self.states.save_run(run_id, state)
+            return state
+
+    def reject_requeue_after_pr_race(self, run_id: str) -> dict[str, Any]:
+        """Persist a Human Blocker when old-PR retirement lost its race."""
+        with self.states.locked():
+            state = self._load_bound_run(run_id)
+            subject, job, _ = current_change_job(state)
+            reason = (
+                unknown_pr_mutation(
+                    state, subject, job, self.github, self.publisher.git
+                )
+                if job is not None
+                else None
+            )
+            state.pop("requeue_transition", None)
+            state.update(
+                {
+                    "status": "blocked",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [
+                        {
+                            "code": reason or "change_pr_supersession_unknown",
+                            "message": "Change PR changed while Requeue retired its Generation",
+                        }
+                    ],
+                    "updated_at": _now(),
+                }
+            )
+            self.states.save_run(run_id, state)
+            return state
 
     def _run_invocation_boundary_is_current(
         self, state: dict[str, Any], invocation: dict[str, Any]
@@ -184,6 +308,20 @@ class Controller:
                 "completed",
                 "parent_closeout_pending",
             }:
+                return False
+            # Requeue persists its replacement intent before it performs any
+            # Publisher mutation. A lost response while retiring the old PR
+            # must preserve the pending state for a fresh currentness decision,
+            # never turn it into an ordinary failed invocation.
+            if (
+                state.get("status") == "requeue_required"
+                and isinstance(state.get("requeue_transition"), dict)
+            ):
+                return False
+            if (
+                state.get("status") == "blocked"
+                and state.get("terminal_kind") == "waiting_human"
+            ):
                 return False
             hint_reader = getattr(self.github, "repository_hint", None)
             repository_hint = (
@@ -232,12 +370,20 @@ class Controller:
         return state
 
     def _refresh(
-        self, state: dict[str, Any], parent_number: int
+        self,
+        state: dict[str, Any],
+        parent_number: int,
+        *,
+        check_requeue_currentness: bool = False,
     ) -> dict[str, Any]:
         try:
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
-            return reconcile_structure(state, projected)
+            refreshed = reconcile_structure(state, projected)
+            self._mark_stale_change_job(
+                refreshed, check_requeue_currentness=check_requeue_currentness
+            )
+            return refreshed
         except GitHubReadError as error:
             failed = dict(state)
             failed.update(
@@ -253,6 +399,121 @@ class Controller:
                 }
             )
             return failed
+
+    def _refresh_transition_facts(
+        self, state: dict[str, Any], parent_number: int
+    ) -> dict[str, Any]:
+        """Refresh authority before retrying a durable PR-retirement intent.
+
+        The old PR may already be closed by this Publisher, so its PR facts
+        are verified at the retirement seam. Graph/scope facts must still be
+        refreshed before that seam performs another mutation.
+        """
+        try:
+            graph = self.github.delivery_graph(parent_number)
+            projected = state_from_graph(state, graph)
+            refreshed = reconcile_structure(state, projected)
+            if refreshed.get("status") == "unsupported_scope_change":
+                return refreshed
+            # Preserve the durable replacement intent while binding its retry
+            # to the latest authoritative parent/graph facts.
+            state["parent"] = _state_mapping(refreshed, "parent")
+            state["ticket_graph"] = _state_mapping(refreshed, "ticket_graph")
+            state["updated_at"] = _now()
+            return state
+        except GitHubReadError as error:
+            failed = dict(state)
+            failed.update(
+                {
+                    "status": "execution_failed",
+                    "terminal_kind": "execution_failed",
+                    "diagnostics": [{"code": error.code, "message": error.message}],
+                    "updated_at": _now(),
+                }
+            )
+            return failed
+
+    def _mark_stale_change_job(
+        self, state: dict[str, Any], *, check_requeue_currentness: bool = False
+    ) -> None:
+        """Route only mechanically provable Change Job drift to Requeue."""
+        if state.get("status") in {
+            "unsupported_scope_change",
+            "abandoned",
+            "abandonment_pending",
+            "completed",
+        }:
+            return
+        if (
+            state.get("status") == "requeue_required"
+            and not check_requeue_currentness
+        ):
+            return
+        subject, job, _ = current_change_job(state)
+        if job is None or job.get("phase") in {
+            "completed",
+            "merged",
+            "merging",
+        }:
+            return
+        if not any(
+            type(job.get(key)) is int
+            for key in (
+                "ticket_branch_generation",
+                "parent_generation",
+                "repair_generation",
+            )
+        ):
+            # A graph-selected Ticket is only a frontier projection.  It
+            # becomes a Change Job once its normal constructor has bound the
+            # first generation and currentness facts.
+            return
+        if not has_currentness_facts(subject, job):
+            # Historical interrupted invocations can predate the persisted
+            # currentness boundary. They remain eligible for their normal
+            # invocation-recovery checks, but cannot be mechanically labelled
+            # stale solely because a required fact is absent.
+            return
+        external = (
+            None
+            if job.get("blocked_reason") == "merged_revision_mismatch"
+            else unknown_pr_mutation(
+                state, subject, job, self.github, self.publisher.git
+            )
+        )
+        if external is not None:
+            state.update(
+                {
+                    "status": "blocked",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{"code": external, "message": "Change PR changed outside the current Generation"}],
+                }
+            )
+            return
+        if candidate_or_acceptance_is_inconsistent(job):
+            state.update(
+                {
+                    "status": "blocked",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{"code": "candidate_or_acceptance_inconsistent", "message": "Candidate or Acceptance cannot be safely requeued"}],
+                }
+            )
+            return
+        reason = stale_change_job_reason(state, subject, job, self.publisher.git)
+        if reason is None:
+            return
+        state.update(
+            {
+                "status": "requeue_required",
+                "terminal_kind": "requeue_required",
+                "diagnostics": [{"code": reason, "message": "Change Job Generation is stale; run requeue"}],
+                "requeue_required": {
+                    "work_subject": subject,
+                    "generation": _subject_generation(job),
+                    "reason": reason,
+                },
+            }
+        )
 
     def _initial_state(
         self,
@@ -292,7 +553,10 @@ class Controller:
             "unsupported_scope_change",
             "abandoned",
             "completed",
+            "requeue_required",
         }:
+            return
+        if _is_currentness_human_blocker(state):
             return
         graph = _state_mapping(state, "ticket_graph")
         ordered = _integer_list(graph, "ordered_ticket_numbers")
@@ -362,6 +626,11 @@ class Controller:
             state["terminal_kind"] = None
             state["diagnostics"] = []
         state = self._refresh(state, parent_number)
+        if state.get("status") == "requeue_required" or _is_currentness_human_blocker(
+            state
+        ):
+            self.states.save_run(run_id, state)
+            return state, resumed
         self._ensure_delivery_branch(state, base_sha)
         self.states.save_run(run_id, state)
         return state, resumed
@@ -381,6 +650,14 @@ def _run_id(repository: str, parent_number: int, base_sha: str) -> str:
     identity = f"{repository}\0{parent_number}\0{base_sha}".encode()
     suffix = hashlib.sha256(identity).hexdigest()[:16]
     return f"run-{parent_number}-{suffix}"
+
+
+def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:
+    """Whether fresh external Change-PR facts require a maintainer decision."""
+    return (
+        state.get("status") == "blocked"
+        and state.get("terminal_kind") == "waiting_human"
+    )
 
 def _state_mapping(state: dict[str, Any], key: str) -> dict[str, Any]:
     value = state.get(key)

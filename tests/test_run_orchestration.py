@@ -600,7 +600,7 @@ def test_run_recovers_after_process_failure_between_tickets(
     assert len(mutable["delivery"]["pull_requests"]) == 2
 
 
-def test_inflight_ticket_revision_discards_stale_work_and_restarts_same_job(
+def test_inflight_ticket_revision_requires_a_fresh_requeue(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -622,16 +622,13 @@ def test_inflight_ticket_revision_discards_stale_work_and_restarts_same_job(
         controller=controller, tickets=tickets
     ).deliver(str(state["run_id"]))
 
-    assert completed["status"] == "run_acceptance_pending"
+    assert completed["status"] == "requeue_required"
     job = completed["ticket_jobs"]["2"]
+    assert job["ticket_branch_generation"] == 1
     assert job["development_thread_id"] == "developer-2"
-    assert job["modification_attempts"] == 1
-    assert len(agents.development_requests) == 2
-    assert len(agents.publication_requests) == 1
-    assert len(agents.review_requests) == 1
-    first_revision = agents.development_requests[0]["effective_revision"]
-    second_revision = agents.development_requests[1]["effective_revision"]
-    assert first_revision != second_revision
+    assert len(agents.development_requests) == 1
+    assert agents.publication_requests == []
+    assert agents.review_requests == []
 
 
 def test_close_response_loss_recovers_completed_job_without_duplicates(

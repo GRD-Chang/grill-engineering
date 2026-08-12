@@ -202,10 +202,12 @@ class GhGitHubPublisher:
         created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
         return _integer(_mapping(created), "number")
 
-    def abandon_parent_pr(self, pr_number: int) -> None:
+    def abandon_parent_pr(self, pr_number: int) -> bool:
         live = self.live_pull_request(pr_number)
-        if live.get("state") == "OPEN":
-            self._require("pr", "close", str(pr_number), "--repo", self.repository)
+        if live.get("state") != "OPEN":
+            return False
+        self._require("pr", "close", str(pr_number), "--repo", self.repository)
+        return True
 
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
@@ -307,10 +309,12 @@ class GhGitHubPublisher:
         if live.get("state") == "OPEN":
             self._require("pr", "close", str(pr_number), "--repo", self.repository)
 
-    def abandon_change_pr(self, pr_number: int) -> None:
+    def abandon_change_pr(self, pr_number: int) -> bool:
         live = self.live_pull_request(pr_number)
-        if live.get("state") == "OPEN":
-            self._require("pr", "close", str(pr_number), "--repo", self.repository)
+        if live.get("state") != "OPEN":
+            return False
+        self._require("pr", "close", str(pr_number), "--repo", self.repository)
+        return True
 
     def _ensure_remote_run_branch(self, branch: str) -> None:
         remote = run_read_command(
@@ -707,10 +711,9 @@ class GhGitHubPublisher:
     ) -> None:
         body = _render_agent_run_status(status)
         comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate"
+            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
         )
-        if not isinstance(comments, list):
-            raise GitHubReadError("github_invalid_response", "comments must be an array")
+        comments = _flatten_pages(comments, "comments")
         existing = next(
             (
                 _mapping(comment)
@@ -729,6 +732,95 @@ class GhGitHubPublisher:
                 f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
                 "-f", f"body={body}",
             )
+
+    def has_supersession_close_receipt(
+        self, pr_number: int, generation: object, close_nonce: object
+    ) -> bool:
+        if type(generation) is not int or not isinstance(close_nonce, str):
+            return False
+        live = self.live_pull_request(pr_number)
+        if live.get("state") != "CLOSED":
+            return False
+        comments = self._json(
+            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+        )
+        comments = _flatten_pages(comments, "comments")
+        events = self._json(
+            "api", f"repos/{self.repository}/issues/{pr_number}/events", "--paginate", "--slurp"
+        )
+        events = _flatten_pages(events, "events")
+        viewer = self._json("api", "user")
+        viewer_login = _mapping(viewer).get("login")
+        if not isinstance(viewer_login, str) or not viewer_login:
+            return False
+        if not self.has_supersession_close_intent(
+            pr_number, generation, close_nonce
+        ):
+            return False
+        lifecycle_events = [
+            _mapping(event)
+            for event in events
+            if _mapping(event).get("event") in {"closed", "reopened"}
+        ]
+        if not lifecycle_events:
+            return False
+        if not all(type(event.get("id")) is int for event in lifecycle_events):
+            return False
+        latest = max(lifecycle_events, key=lambda event: int(event["id"]))
+        return (
+            latest.get("event") == "closed"
+            and _mapping(latest.get("actor", {})).get("login") == viewer_login
+        )
+
+    def has_supersession_close_intent(
+        self, pr_number: int, generation: object, close_nonce: object
+    ) -> bool:
+        if type(generation) is not int or not isinstance(close_nonce, str):
+            return False
+        comments = self._json(
+            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+        )
+        viewer = self._json("api", "user")
+        viewer_login = _mapping(viewer).get("login")
+        if not isinstance(viewer_login, str):
+            return False
+        comments = _flatten_pages(comments, "comments")
+        return any(
+            _supersession_status_matches(
+                str(_mapping(comment).get("body", "")), generation, close_nonce
+            )
+            and _mapping(_mapping(comment).get("user", {})).get("login")
+            == viewer_login
+            for comment in comments
+        )
+
+    def has_supersession_close_record(
+        self, pr_number: int, generation: object, close_nonce: object
+    ) -> bool:
+        if type(generation) is not int or not isinstance(close_nonce, str):
+            return False
+        comments = self._json(
+            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+        )
+        viewer = self._json("api", "user")
+        viewer_login = _mapping(viewer).get("login")
+        if not isinstance(viewer_login, str):
+            return False
+        comments = _flatten_pages(comments, "comments")
+        record = (
+            f"{_AGENT_RUN_STATUS_MARKER}\n"
+            "## Superseded Change Generation\n\n"
+            "- Scope: `superseded_generation`\n"
+            f"- Generation: `{generation}`\n"
+            "- Retirement: `closed`\n"
+            f"- Close nonce: `{close_nonce}`"
+        )
+        return any(
+            record in str(_mapping(comment).get("body", ""))
+            and _mapping(_mapping(comment).get("user", {})).get("login")
+            == viewer_login
+            for comment in comments
+        )
 
     def squash_merge(
         self,
@@ -1626,6 +1718,24 @@ def _matches_ref(reference: str, pattern: object) -> bool:
 
 
 def _render_agent_run_status(status: dict[str, Any]) -> str:
+    if status.get("scope") == "superseded_generation":
+        generation = status.get("generation")
+        if type(generation) is not int or generation < 1:
+            raise GitHubReadError("github_invalid_response", "generation must be positive")
+        if status.get("retirement") not in {"closing", "closed"}:
+            raise GitHubReadError(
+                "github_invalid_response", "superseded status has invalid retirement"
+            )
+        nonce = _string(status, "close_nonce")
+        return (
+            f"{_AGENT_RUN_STATUS_MARKER}\n"
+            "## Superseded Change Generation\n\n"
+            "- Scope: `superseded_generation`\n"
+            f"- Generation: `{generation}`\n"
+            f"- Retirement: `{_string(status, 'retirement')}`\n"
+            f"- Close nonce: `{nonce}`\n"
+            f"- Next action: {_string(status, 'next_action')}"
+        )
     lanes = _mapping(status.get("lane_statuses"))
     lane_summary = ", ".join(
         f"{lane}={lanes.get(lane)}" for lane in ("e2e", "standards", "spec")
@@ -1649,3 +1759,27 @@ def _string(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise GitHubReadError("github_invalid_response", f"{key} must be a string")
     return value
+
+
+def _flatten_pages(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise GitHubReadError("github_invalid_response", f"{label} must be an array")
+    if all(isinstance(page, list) for page in value):
+        return [item for page in value for item in page]
+    if all(isinstance(item, dict) for item in value):
+        # Mocks and older gh clients can return the one-page form despite
+        # requesting --slurp; it carries the same list semantics.
+        return list(value)
+    raise GitHubReadError("github_invalid_response", f"{label} pages must be arrays")
+
+
+def _supersession_status_matches(
+    body: str, generation: int, close_nonce: str
+) -> bool:
+    return (
+        _AGENT_RUN_STATUS_MARKER in body
+        and "## Superseded Change Generation" in body
+        and "- Scope: `superseded_generation`" in body
+        and f"- Generation: `{generation}`" in body
+        and f"- Close nonce: `{close_nonce}`" in body
+    )

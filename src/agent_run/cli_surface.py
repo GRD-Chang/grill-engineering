@@ -35,6 +35,11 @@ def _run_to_human_gate(
         agent_arguments = _agent_fixture_arguments(parsed, command)
         _invoke_nested(command, run_id, *arguments, *agent_arguments)
         state = _load_local_run(states, run_id)
+        if command == "requeue":
+            # `requeue` itself enters the replacement Job Loop. Returning
+            # here enforces the one automatic replacement budget for this
+            # top-level `run` command.
+            return state, resumed
 def _nested_arguments(parsed: argparse.Namespace) -> list[str]:
     arguments: list[str] = []
     if parsed.repo:
@@ -58,6 +63,7 @@ def _agent_fixture_arguments(
         "deliver",
         "accept-run",
         "publish-run",
+        "requeue",
     }:
         return ["--agent-fixture", agent_fixture]
     return []
@@ -87,6 +93,7 @@ def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, 
         "execution_failed",
         "blocked",
         "waiting_merge",
+        "requeue_required",
     }:
         raise ValueError(f"{command} failed without a recoverable Run state")
     return result
@@ -101,6 +108,8 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
         "waiting_merge",
     }:
         return "deliver"
+    if status == "requeue_required":
+        return "requeue"
     if status == "run_acceptance_pending":
         return "accept-run"
     publication = state.get("run_publication")
@@ -126,6 +135,7 @@ def _is_lifecycle_action(command: str) -> bool:
         "publish-run",
         "approve",
         "revise",
+        "requeue",
     }
 
 
@@ -151,6 +161,10 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
             isinstance(invocation, dict) and invocation.get("status") == "failed"
         )
     if status in {"unsupported_scope_change", "abandonment_pending"}:
+        return False
+    if command == "requeue":
+        return status == "requeue_required"
+    if status == "requeue_required":
         return False
     if command == "deliver":
         return True
