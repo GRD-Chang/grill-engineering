@@ -8,6 +8,7 @@ import pytest
 from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.controller import Controller, _change_job_for_invocation, _resume_agent_human_blocker
 from agent_run.parent_delivery import ParentDeliveryEngine
+from agent_run.human_responses import current_human_response_history
 from agent_run.cli_surface import _resume_is_ready
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitRepository
@@ -38,6 +39,18 @@ def test_human_response_history_keeps_ordered_immutable_entries() -> None:
         "human_blockers": ["blocker-18"],
         "response": "response-18",
     }
+
+
+def test_old_or_mixed_generation_response_history_is_not_reusable() -> None:
+    subject: dict[str, Any] = {
+        "human_response_generation": 1,
+        "human_response_history": [{"generation": 1, "response": "old"}],
+    }
+    assert current_human_response_history(subject, generation=2) is None
+
+    subject["human_response_generation"] = 2
+    with pytest.raises(ValueError, match="mixed Job Generations"):
+        current_human_response_history(subject, generation=2)
 
 
 def test_resume_fails_closed_when_multiple_human_blockers_are_current() -> None:

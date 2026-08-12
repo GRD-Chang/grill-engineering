@@ -17,6 +17,7 @@ from agent_run.change_delivery import (
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
+from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 
@@ -286,8 +287,10 @@ class TicketDeliveryLoop:
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
-        if job.get("human_response_history"):
-            request["human_response_history"] = job["human_response_history"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("ticket_branch_generation", 1))
+        ):
+            request["human_response_history"] = history
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
         if job.get("repair_source") == "acceptance":
@@ -319,8 +322,10 @@ class TicketDeliveryLoop:
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
-        if job.get("human_response_history"):
-            request["human_response_history"] = job["human_response_history"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("ticket_branch_generation", 1))
+        ):
+            request["human_response_history"] = history
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
         existing_pr = job.get("pr_number")
@@ -358,8 +363,13 @@ class TicketDeliveryLoop:
                 else {}
             ),
             **(
-                {"human_response_history": job["human_response_history"]}
-                if job.get("human_response_history")
+                {"human_response_history": history}
+                if (
+                    history := current_human_response_history(
+                        job,
+                        generation=int(job.get("ticket_branch_generation", 1)),
+                    )
+                )
                 else {}
             ),
         }
