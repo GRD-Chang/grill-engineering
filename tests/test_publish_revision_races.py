@@ -118,10 +118,36 @@ def _write_recovery_agents(path: Path) -> Path:
     return path
 
 
+def _write_replacement_agents(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-current",
+                        "summary": "Rebuilt in a replacement Generation.",
+                        "write_files": {"revision.txt": "current\n"},
+                    }
+                ],
+                "publications": [_publication("current")],
+                "reviews": [
+                    passing_acceptance(
+                        "reviewer-current",
+                        "The current candidate passed.",
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.mark.parametrize(
     "action", ["publish_branch", "ensure_ticket_pr", "required_checks"]
 )
-def test_content_change_at_publish_boundary_restarts_before_merge(
+def test_content_change_at_publish_boundary_requires_explicit_requeue(
     git_repo: Path, action: str
 ) -> None:
     fixture = write_fixture(
@@ -139,8 +165,9 @@ def test_content_change_at_publish_boundary_restarts_before_merge(
             ),
         },
     )
-    agents = _write_agents(
-        git_repo / "agents.json", two_revisions=True
+    agents = _write_agents(git_repo / "agents.json", two_revisions=False)
+    replacement_agents = _write_replacement_agents(
+        git_repo / "replacement-agents.json"
     )
     run_id = stdout_json(
         run_cli(git_repo, fixture, "start", "1")
@@ -155,27 +182,47 @@ def test_content_change_at_publish_boundary_restarts_before_merge(
         str(agents),
     )
 
-    assert delivered.returncode == 0, delivered.stdout
+    assert delivered.returncode == 2, delivered.stdout
+    state = load_only_run_state(git_repo)
+    assert state["status"] == "requeue_required"
+    job = state["ticket_jobs"]["2"]
+    assert job["ticket_branch_generation"] == 1
+    assert job["development_thread_id"] == "developer-2"
+
+    requeued = run_cli(
+        git_repo,
+        fixture,
+        "requeue",
+        run_id,
+        "--agent-fixture",
+        str(replacement_agents),
+    )
+
+    assert requeued.returncode == 0, requeued.stdout
     state = load_only_run_state(git_repo)
     job = state["ticket_jobs"]["2"]
     assert state["status"] == "run_acceptance_pending"
     assert job["phase"] == "completed"
-    assert job["modification_attempts"] == 1
-    assert job["validation_attempts"] == 1
-    assert job["reviewer_thread_ids"] == [
-        "reviewer-original",
-        "reviewer-current",
-    ]
-    assert job["acceptance_record"]["reviewer_thread_id"] == (
-        "reviewer-current"
-    )
-    assert job["acceptance_record"]["effective_revision"] == (
-        job["effective_revision"]
-    )
+    assert job["ticket_branch_generation"] == 2
+    assert job["development_thread_id"] == "developer-current"
+    assert job["reviewer_thread_ids"] == ["reviewer-current"]
+    assert job["acceptance_record"]["reviewer_thread_id"] == "reviewer-current"
     live = json.loads(fixture.read_text(encoding="utf-8"))
-    assert len(live["delivery"]["pull_requests"]) == 1
+    pull_states = [pull["state"] for pull in live["delivery"]["pull_requests"]]
+    assert pull_states[-1] == "MERGED"
+    assert "OPEN" not in pull_states
+    if action == "publish_branch":
+        assert pull_states == ["MERGED"]
+    else:
+        assert pull_states == ["CLOSED", "MERGED"]
     assert live["delivery"]["acceptance_records"] == []
-    assert len(live["delivery"]["agent_run_status"]) == 1
+    statuses = live["delivery"]["agent_run_status"]
+    if action == "publish_branch":
+        assert len(statuses) == 1
+    else:
+        assert statuses[0]["scope"] == "superseded_generation"
+        assert statuses[0]["generation"] == 1
+        assert len(statuses) == 2
     assert live["delivery"]["closed_issues"] == [2]
 
 

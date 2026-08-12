@@ -137,11 +137,27 @@ def test_requeue_closes_only_the_old_change_pr_and_removes_its_checkout(
         def __init__(self) -> None:
             self.closed: list[int] = []
 
-        def abandon_change_pr(self, number: int) -> None:
+        def abandon_change_pr(self, number: int) -> bool:
             self.closed.append(number)
+            return True
 
         def record_agent_run_status(self, _number: int, _status: dict[str, object]) -> None:
             return None
+
+        def has_supersession_close_receipt(
+            self, _number: int, _generation: object, _nonce: object
+        ) -> bool:
+            return False
+
+        def has_supersession_close_record(
+            self, _number: int, _generation: object, _nonce: object
+        ) -> bool:
+            return False
+
+        def has_supersession_close_intent(
+            self, _number: int, _generation: object, _nonce: object
+        ) -> bool:
+            return False
 
     class Git:
         def __init__(self) -> None:
@@ -156,7 +172,7 @@ def test_requeue_closes_only_the_old_change_pr_and_removes_its_checkout(
     git = Git()
     retired = {"work_subject": "ticket:7", "pr_number": 12}
 
-    close_superseded_pull_request(publisher, retired)
+    close_superseded_pull_request(publisher, retired, "test-nonce")
     remove_superseded_worktree(git, tmp_path, "run-1", retired)
 
     assert publisher.closed == [12]
@@ -279,15 +295,113 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     assert "requeue_transition" not in blocked
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["delivery"]["crash_after_ensure_ticket_branch_once"] = True
+    data["delivery"]["crash_after_ensure_run_branch_once"] = True
     fixture.write_text(json.dumps(data), encoding="utf-8")
+    blocked_start = run_cli(git_repo, fixture, "start", "1")
+
+    assert blocked_start.returncode == 2
+    assert stdout_json(blocked_start)["status"] == "blocked"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "crash_after_ensure_run_branch_once"
+    ] is True
     blocked_delivery = run_cli(git_repo, fixture, "deliver", run_id)
 
     assert blocked_delivery.returncode == 2
     assert stdout_json(blocked_delivery)["status"] == "blocked"
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
-        "crash_after_ensure_ticket_branch_once"
+        "crash_after_ensure_run_branch_once"
     ] is True
+
+
+def test_requeue_blocks_an_external_close_during_retirement(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    state = states.load_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    branch = f"agent-run/{run_id}/ticket-7"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.ensure_ticket_branch(
+        branch=branch, base_branch=str(state["run_branch"]), ticket_number=7
+    )
+    pr_number = publisher.ensure_ticket_pr(
+        branch=branch,
+        base_branch=str(state["run_branch"]),
+        title="old change",
+        body="old change",
+        primary_ticket=7,
+    )
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": branch,
+            "phase": "developing",
+            "effective_revision": "stale",
+            "base_sha": git.resolve(str(state["run_branch"])),
+            "pr_number": pr_number,
+            "publication_sha": git.resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
+    states.save_run(run_id, state)
+
+    assert stdout_json(run_cli(git_repo, fixture, "deliver", run_id))["status"] == (
+        "requeue_required"
+    )
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["external_close_before_abandon_change_pr_once"] = True
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    blocked = run_cli(git_repo, fixture, "requeue", run_id)
+
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "blocked"
+    persisted = states.load_run(run_id)
+    assert persisted is not None
+    assert persisted["terminal_kind"] == "waiting_human"
+    assert persisted["diagnostics"][0]["code"] == (
+        "change_pr_closed_or_merged_externally"
+    )
+    assert "requeue_transition" not in persisted
+    assert persisted["ticket_jobs"]["7"]["ticket_branch_generation"] == 1
+    live = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert live["pull_requests"][0]["state"] == "CLOSED"
+    assert live["external_close_before_abandon_change_pr_once"] is False
+
+
+def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    state = states.load_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    branch = f"agent-run/{run_id}/ticket-7"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.ensure_ticket_branch(branch=branch, base_branch=str(state["run_branch"]), ticket_number=7)
+    pr_number = publisher.ensure_ticket_pr(branch=branch, base_branch=str(state["run_branch"]), title="old", body="old", primary_ticket=7)
+    job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
+    state["ticket_jobs"] = {"7": job}
+    states.save_run(run_id, state)
+    assert stdout_json(run_cli(git_repo, fixture, "deliver", run_id))["status"] == "requeue_required"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["external_reopen_after_supersession_receipt_once"] = True
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    blocked = run_cli(git_repo, fixture, "requeue", run_id)
+
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "blocked"
+    assert states.load_run(run_id)["ticket_jobs"]["7"]["ticket_branch_generation"] == 1
 
 
 def test_requeue_blocks_when_the_persisted_pr_cannot_be_read(git_repo: Path) -> None:

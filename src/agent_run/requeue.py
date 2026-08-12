@@ -145,24 +145,64 @@ def _generation(job: dict[str, Any]) -> int:
     raise RequeueError("current Change Job has no valid generation")
 
 
-def close_superseded_pull_request(publisher: Any, retired: dict[str, Any]) -> None:
+def close_superseded_pull_request(
+    publisher: Any, retired: dict[str, Any], close_nonce: str | None = None
+) -> bool:
     """Close an old open Change PR through the Publisher-owned mutation seam."""
     pr_number = retired.get("pr_number")
     if not isinstance(pr_number, int):
-        return
+        return True
+    generation = retired.get("generation")
+    if not isinstance(close_nonce, str) or not close_nonce:
+        raise RequeueError("requeue close nonce is invalid")
+    receipt_reader = getattr(publisher, "has_supersession_close_receipt", None)
+    record_reader = getattr(publisher, "has_supersession_close_record", None)
+    intent_reader = getattr(publisher, "has_supersession_close_intent", None)
+    if (
+        not callable(receipt_reader)
+        or not callable(record_reader)
+        or not callable(intent_reader)
+    ):
+        raise RequeueError("Publisher cannot verify supersession closure")
+    if receipt_reader(pr_number, generation, close_nonce):
+        return True
+    if record_reader(pr_number, generation, close_nonce):
+        # A known prior closure no longer has a matching live PR. An external
+        # reopen or mutation is a Human Blocker, not permission to re-close it.
+        return False
+    if intent_reader(pr_number, generation, close_nonce):
+        # An intent without the matching close receipt has an unknown outcome.
+        return False
     publisher.record_agent_run_status(
         pr_number,
         {
             "scope": "superseded_generation",
-            "generation": retired.get("generation"),
+            "generation": generation,
+            "retirement": "closing",
+            "close_nonce": close_nonce,
             "next_action": "superseded by explicit requeue",
         },
     )
     subject = retired.get("work_subject")
     if isinstance(subject, str) and subject.startswith("parent-only:"):
-        publisher.abandon_parent_pr(pr_number)
+        closed = publisher.abandon_parent_pr(pr_number) is True
     else:
-        publisher.abandon_change_pr(pr_number)
+        closed = publisher.abandon_change_pr(pr_number) is True
+    if not closed:
+        return False
+    publisher.record_agent_run_status(
+        pr_number,
+        {
+            "scope": "superseded_generation",
+            "generation": generation,
+            "retirement": "closed",
+            "close_nonce": close_nonce,
+            "next_action": "superseded by explicit requeue",
+        },
+    )
+    # Closing is not enough: a maintainer can reopen the PR before the audit
+    # receipt lands. Re-read the live lifecycle after recording the receipt.
+    return receipt_reader(pr_number, generation, close_nonce) is True
 
 
 def remove_superseded_worktree(

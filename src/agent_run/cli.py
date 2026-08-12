@@ -228,14 +228,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ).publish(parsed.run_id)
         elif parsed.command == "requeue":
             state, retired = controller.requeue(parsed.run_id)
+            transition = state.get("requeue_transition")
+            close_nonce = (
+                transition.get("close_nonce") if isinstance(transition, dict) else None
+            )
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
                 else GhGitHubPublisher(github.repository().name_with_owner, git)
             )
-            close_superseded_pull_request(publisher, retired)
-            remove_superseded_worktree(git, states.root, parsed.run_id, retired)
-            state = controller.finalize_requeue(parsed.run_id)
+            retired_cleanly = close_superseded_pull_request(
+                publisher, retired, close_nonce
+            )
+            if not retired_cleanly:
+                state = controller.reject_requeue_after_pr_race(parsed.run_id)
+                precondition_failed = True
+            else:
+                remove_superseded_worktree(git, states.root, parsed.run_id, retired)
+                state = controller.finalize_requeue(parsed.run_id)
             subject = str(retired["work_subject"])
             agent_fixture = getattr(parsed, "agent_fixture", None)
             agents = (
@@ -250,11 +260,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         git=git, states=states, github=publisher, agents=agents
                     ),
                 ).deliver_from_state(parsed.run_id, state)
-            elif subject.startswith("parent-only:"):
+            elif (
+                subject.startswith("parent-only:")
+                and state.get("status") == "parent_delivery_pending"
+            ):
                 state = ParentDeliveryEngine(
                     git=git, states=states, github=publisher, agents=agents
                 ).deliver(parsed.run_id)
-            elif subject.startswith("run-repair:"):
+            elif (
+                subject.startswith("run-repair:")
+                and state.get("status") == "run_acceptance_pending"
+            ):
                 repository = github.repository()
                 state = RunAcceptanceEngine(
                     git=git,

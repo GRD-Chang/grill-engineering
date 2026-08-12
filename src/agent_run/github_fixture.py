@@ -164,6 +164,10 @@ class FixtureGitHubPublisher:
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
 
+    def ensure_run_branch(self, branch: str, base_sha: str) -> None:
+        self.git.ensure_run_branch(branch, base_sha)
+        self._crash_once("ensure_run_branch")
+
     def ensure_parent_branch(
         self, *, parent_number: int, branch: str, base_branch: str
     ) -> None:
@@ -296,15 +300,19 @@ class FixtureGitHubPublisher:
         self._crash_once("ensure_parent_pr")
         return int(pull["number"])
 
-    def abandon_parent_pr(self, pr_number: int) -> None:
+    def abandon_parent_pr(self, pr_number: int) -> bool:
         pull = self._pull(pr_number)
+        self._inject_external_close_before_abandon("parent", pull)
         if pull.get("state") == "OPEN":
             pull["state"] = "CLOSED"
+            pull["closed_by"] = self._publisher_login()
             _mutable_list(self._delivery(), "mutations").append(
                 {"action": "close_parent_pr", "pr_number": pr_number}
             )
             self._save()
             self._crash_once("abandon_parent_pr")
+            return True
+        return False
 
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]
@@ -422,15 +430,19 @@ class FixtureGitHubPublisher:
             self._save()
             self._crash_once("abandon_run_pr")
 
-    def abandon_change_pr(self, pr_number: int) -> None:
+    def abandon_change_pr(self, pr_number: int) -> bool:
         pull = self._pull(pr_number)
+        self._inject_external_close_before_abandon("change", pull)
         if pull.get("state") == "OPEN":
             pull["state"] = "CLOSED"
+            pull["closed_by"] = self._publisher_login()
             _mutable_list(self._delivery(), "mutations").append(
                 {"action": "close_change_pr", "pr_number": pr_number}
             )
             self._save()
             self._crash_once("abandon_change_pr")
+            return True
+        return False
 
     def publish_branch(
         self,
@@ -582,7 +594,47 @@ class FixtureGitHubPublisher:
         else:
             statuses.append(replacement)
         self._save()
+        if status.get("retirement") == "closed":
+            self._inject_external_reopen_after_receipt(pr_number)
         self._crash_once("record_agent_run_status")
+
+    def has_supersession_close_receipt(
+        self, pr_number: int, generation: object, close_nonce: object
+    ) -> bool:
+        pull = self._pull(pr_number)
+        return (
+            pull.get("state") == "CLOSED"
+            and pull.get("closed_by") == self._publisher_login()
+            and self.has_supersession_close_intent(
+                pr_number, generation, close_nonce
+            )
+        )
+
+    def has_supersession_close_record(
+        self, pr_number: int, generation: object, close_nonce: object
+    ) -> bool:
+        return any(
+            isinstance(status, dict)
+            and status.get("pr_number") == pr_number
+            and status.get("scope") == "superseded_generation"
+            and status.get("generation") == generation
+            and status.get("close_nonce") == close_nonce
+            and status.get("retirement") == "closed"
+            for status in _mutable_list(self._delivery(), "agent_run_status")
+        )
+
+    def has_supersession_close_intent(
+        self, pr_number: int, generation: object, close_nonce: object
+    ) -> bool:
+        return any(
+            isinstance(status, dict)
+            and status.get("pr_number") == pr_number
+            and status.get("scope") == "superseded_generation"
+            and status.get("generation") == generation
+            and status.get("close_nonce") == close_nonce
+            and status.get("retirement") in {"closing", "closed"}
+            for status in _mutable_list(self._delivery(), "agent_run_status")
+        )
 
     def squash_merge(
         self,
@@ -990,6 +1042,33 @@ class FixtureGitHubPublisher:
         self._delivery()[key] = False
         self._save()
         raise OSError(f"simulated lost response after {action}")
+
+    def _inject_external_close_before_abandon(
+        self, subject: str, pull: dict[str, Any]
+    ) -> None:
+        key = f"external_close_before_abandon_{subject}_pr_once"
+        if not bool(self._delivery().get(key)):
+            return
+        self._delivery()[key] = False
+        pull["state"] = "CLOSED"
+        pull["closed_by"] = "external"
+        self._save()
+
+    def _inject_external_reopen_after_receipt(self, pr_number: int) -> None:
+        key = "external_reopen_after_supersession_receipt_once"
+        if not bool(self._delivery().get(key)):
+            return
+        self._delivery()[key] = False
+        pull = self._pull(pr_number)
+        pull["state"] = "OPEN"
+        pull["closed_by"] = "external"
+        self._save()
+
+    def _publisher_login(self) -> str:
+        configured = self._delivery().get("publisher_login", "fixture-publisher")
+        if not isinstance(configured, str) or not configured:
+            raise ValueError("fixture publisher_login must be a non-empty string")
+        return configured
 
     def _inject_revision_drift(self, action: str) -> None:
         configured = self._delivery().get("drift_after")

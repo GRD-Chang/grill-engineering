@@ -7,7 +7,88 @@ import pytest
 
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
-from agent_run.github_publish import GhGitHubPublisher, _matches_ref
+from agent_run.github_publish import (
+    GhGitHubPublisher,
+    _matches_ref,
+    _render_agent_run_status,
+)
+
+
+def test_supersession_status_renders_the_receipt_fields() -> None:
+    rendered = _render_agent_run_status(
+        {
+            "scope": "superseded_generation",
+            "generation": 2,
+            "retirement": "closed",
+            "close_nonce": "nonce-123",
+            "next_action": "superseded by explicit requeue",
+        }
+    )
+
+    assert "## Superseded Change Generation\n\n- Scope: `superseded_generation`" in rendered
+    assert "- Generation: `2`" in rendered
+    assert "- Retirement: `closed`" in rendered
+    assert "- Close nonce: `nonce-123`" in rendered
+
+
+def test_supersession_receipt_recognizes_its_rendered_comment(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    comment = {
+        "body": _render_agent_run_status(
+            {
+                "scope": "superseded_generation",
+                "generation": 2,
+                "retirement": "closing",
+                "close_nonce": "nonce-123",
+                "next_action": "superseded by explicit requeue",
+            }
+        ),
+        "user": {"login": "agent-run-bot"},
+    }
+    monkeypatch.setattr(publisher, "live_pull_request", lambda _number: {"state": "CLOSED"})
+
+    def fake_json(*arguments: str, **_kwargs: object) -> object:
+        if arguments == ("api", "user"):
+            return {"login": "agent-run-bot"}
+        if "comments" in arguments[1]:
+            return [[comment]]
+        if "events" in arguments[1]:
+            return [[{"id": 10, "event": "closed", "created_at": "2026-01-01T00:00:00Z", "actor": {"login": "agent-run-bot"}}]]
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    assert publisher.has_supersession_close_intent(12, 2, "nonce-123")
+    assert publisher.has_supersession_close_receipt(12, 2, "nonce-123")
+
+
+def test_supersession_status_scan_flattens_comment_pages(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    calls: list[tuple[str, ...]] = []
+
+    def fake_json(*arguments: str, **_kwargs: object) -> object:
+        calls.append(arguments)
+        if "comments" in arguments[1]:
+            return [[{"id": 9, "body": "ordinary", "user": {"login": "x"}}], []]
+        return {"id": 10}
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    publisher.record_agent_run_status(
+        12,
+        {
+            "scope": "superseded_generation",
+            "generation": 2,
+            "retirement": "closing",
+            "close_nonce": "nonce-123",
+            "next_action": "superseded by explicit requeue",
+        },
+    )
+
+    assert "--slurp" in calls[0]
 
 
 def test_publish_branch_refuses_remote_drift(
