@@ -7,11 +7,8 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import (
-    Controller,
-    _stale_change_job_reason,
-    _unknown_pr_mutation,
-)
+from agent_run.change_currentness import stale_change_job_reason, unknown_pr_mutation
+from agent_run.controller import Controller
 from agent_run.cli_surface import _command_is_ready
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -281,6 +278,58 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     assert blocked["diagnostics"][0]["code"] == "change_pr_closed_or_merged_externally"
     assert "requeue_transition" not in blocked
 
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["crash_after_ensure_ticket_branch_once"] = True
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    blocked_delivery = run_cli(git_repo, fixture, "deliver", run_id)
+
+    assert blocked_delivery.returncode == 2
+    assert stdout_json(blocked_delivery)["status"] == "blocked"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "crash_after_ensure_ticket_branch_once"
+    ] is True
+
+
+def test_requeue_blocks_when_the_persisted_pr_cannot_be_read(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    state = states.load_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{run_id}/ticket-7",
+            "phase": "developing",
+            "effective_revision": "stale",
+            "base_sha": git.resolve(str(state["run_branch"])),
+            "pr_number": 99,
+            "publication_sha": "missing-pr-head",
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
+    state["status"] = "requeue_required"
+    state["terminal_kind"] = "requeue_required"
+    state["requeue_required"] = {
+        "work_subject": "ticket:7",
+        "generation": 1,
+        "reason": "ticket_requirements_changed",
+    }
+    states.save_run(run_id, state)
+
+    rejected = run_cli(git_repo, fixture, "requeue", run_id)
+
+    assert rejected.returncode == 2
+    assert stdout_json(rejected)["status"] == "blocked"
+    blocked = states.load_run(run_id)
+    assert blocked is not None
+    assert blocked["terminal_kind"] == "waiting_human"
+    assert blocked["diagnostics"][0]["code"] == "change_pr_currentness_unknown"
+
 
 def test_deliver_cannot_restart_a_stale_generation_without_requeue(
     git_repo: Path,
@@ -364,7 +413,7 @@ def test_pr_base_or_head_mutation_requires_human_not_requeue(git_repo: Path) -> 
     }
     job = {"pr_number": 2, "publication_sha": "expected-head"}
 
-    assert _unknown_pr_mutation(state, "ticket:7", job, Reader(), git) == (
+    assert unknown_pr_mutation(state, "ticket:7", job, Reader(), git) == (
         "change_pr_base_changed_externally"
     )
 
@@ -386,6 +435,6 @@ def test_run_repair_completion_drift_requires_a_new_generation(
         "base_sha": git.resolve("main"),
     }
 
-    assert _stale_change_job_reason(state, "run-repair:run-1", job, git) == (
+    assert stale_change_job_reason(state, "run-repair:run-1", job, git) == (
         "run_repair_ticket_completion_changed"
     )

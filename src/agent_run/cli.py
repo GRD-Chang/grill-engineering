@@ -173,6 +173,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if state.get("status") == "requeue_required":
                 cli_presentation._print_precondition_failure(state)
                 return 2
+            if _is_currentness_human_blocker(state):
+                cli_presentation._print_precondition_failure(state)
+                return 2
             publisher = (
                 FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                 if parsed.github_fixture
@@ -270,6 +273,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             elif refreshed.get("status") == "requeue_required":
                 state = refreshed
                 precondition_failed = True
+            elif _is_currentness_human_blocker(refreshed):
+                state = refreshed
+                precondition_failed = True
             elif refreshed.get("status") == "unsupported_scope_change":
                 state = refreshed
                 precondition_failed = True
@@ -330,6 +336,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if refreshed.get("status") == "requeue_required":
                 state = refreshed
                 precondition_failed = True
+            elif _is_currentness_human_blocker(refreshed):
+                state = refreshed
+                precondition_failed = True
             elif refreshed.get("status") not in {
                 "run_acceptance_pending",
                 "run_publication_pending",
@@ -384,6 +393,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if refreshed.get("status") in {"abandoned", "completed"}:
                 state = refreshed
             elif refreshed.get("status") == "requeue_required":
+                state = refreshed
+                precondition_failed = True
+            elif (
+                _is_currentness_human_blocker(refreshed)
+                and parsed.command != "abandon"
+            ):
                 state = refreshed
                 precondition_failed = True
             elif (
@@ -623,6 +638,14 @@ def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
     publication = state.get("run_publication")
     return isinstance(publication, dict) and bool(
         publication.get("prior_human_blockers")
+    )
+
+
+def _is_currentness_human_blocker(state: dict[str, object]) -> bool:
+    """Whether fresh external-state evidence has stopped this command."""
+    return (
+        state.get("status") == "blocked"
+        and state.get("terminal_kind") == "waiting_human"
     )
 
 

@@ -5,15 +5,19 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from agent_run.change_currentness import (
+    candidate_or_acceptance_is_inconsistent,
+    has_currentness_facts,
+    stale_change_job_reason,
+    unknown_pr_mutation,
+)
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
-from agent_run.revisions import effective_revision
 from agent_run.run_currentness import (
-    ticket_completion_records,
     ticket_completion_records_fingerprint,
 )
 from agent_run.scope_changes import reconcile_structure
@@ -387,7 +391,7 @@ class Controller:
             # becomes a Change Job once its normal constructor has bound the
             # first generation and currentness facts.
             return
-        if not _has_change_job_currentness_facts(subject, job):
+        if not has_currentness_facts(subject, job):
             # Historical interrupted invocations can predate the persisted
             # currentness boundary. They remain eligible for their normal
             # invocation-recovery checks, but cannot be mechanically labelled
@@ -396,7 +400,7 @@ class Controller:
         external = (
             None
             if job.get("blocked_reason") == "merged_revision_mismatch"
-            else _unknown_pr_mutation(
+            else unknown_pr_mutation(
                 state, subject, job, self.github, self.publisher.git
             )
         )
@@ -409,7 +413,7 @@ class Controller:
                 }
             )
             return
-        if _candidate_or_acceptance_is_inconsistent(job):
+        if candidate_or_acceptance_is_inconsistent(job):
             state.update(
                 {
                     "status": "blocked",
@@ -418,7 +422,7 @@ class Controller:
                 }
             )
             return
-        reason = _stale_change_job_reason(state, subject, job, self.publisher.git)
+        reason = stale_change_job_reason(state, subject, job, self.publisher.git)
         if reason is None:
             return
         state.update(
@@ -567,98 +571,6 @@ def _state_mapping(state: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"run state field {key!r} is invalid")
     return value
-
-
-def _stale_change_job_reason(
-    state: dict[str, Any], subject: str, job: dict[str, Any], git: GitRepository
-) -> str | None:
-    parent = _state_mapping(state, "parent")
-    graph = _state_mapping(state, "ticket_graph")
-    if subject.startswith("ticket:"):
-        ticket = _state_mapping(_state_mapping(graph, "tickets"), subject.removeprefix("ticket:"))
-        expected = effective_revision(
-            ticket_revision=str(ticket["content_revision"]),
-            parent_revision=str(parent["revision"]),
-            graph_revision=str(graph["revision"]),
-        )
-        if job.get("effective_revision") != expected:
-            return "ticket_requirements_changed"
-        run_branch = state.get("run_branch")
-        if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
-            return "ticket_base_changed"
-        return None
-    if subject.startswith("parent-only:"):
-        if job.get("effective_revision") != parent.get("revision"):
-            return "parent_requirements_changed"
-        base = _state_mapping(state, "base")
-        branch = base.get("branch")
-        if not isinstance(branch, str) or job.get("base_sha") != git.resolve(branch):
-            return "parent_base_changed"
-        return None
-    if job.get("parent_revision") != parent.get("revision"):
-        return "run_repair_parent_changed"
-    if job.get("ticket_graph_revision") != graph.get("revision"):
-        return "run_repair_graph_changed"
-    if job.get("ticket_completion_records") != ticket_completion_records(state):
-        return "run_repair_ticket_completion_changed"
-    run_branch = state.get("run_branch")
-    if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
-        return "run_repair_base_changed"
-    return None
-
-
-def _has_change_job_currentness_facts(subject: str, job: dict[str, Any]) -> bool:
-    """Whether this Generation has the facts required for stale routing."""
-    if not isinstance(job.get("base_sha"), str):
-        return False
-    if subject.startswith("ticket:"):
-        return isinstance(job.get("effective_revision"), str)
-    if subject.startswith("parent-only:"):
-        return isinstance(job.get("effective_revision"), str)
-    return (
-        isinstance(job.get("parent_revision"), str)
-        and isinstance(job.get("ticket_graph_revision"), str)
-        and isinstance(job.get("ticket_completion_records"), list)
-    )
-
-
-def _unknown_pr_mutation(
-    state: dict[str, Any],
-    subject: str,
-    job: dict[str, Any],
-    github: GitHubReader,
-    git: GitRepository,
-) -> str | None:
-    pr_number = job.get("pr_number")
-    if not isinstance(pr_number, int):
-        return None
-    live = github.live_pull_request(pr_number)
-    if live.get("state") != "OPEN":
-        return "change_pr_closed_or_merged_externally"
-    if live.get("head_sha") != job.get("publication_sha"):
-        return "change_pr_head_changed_externally"
-    expected_base_branch = (
-        state.get("run_branch")
-        if subject.startswith(("ticket:", "run-repair:"))
-        else _state_mapping(state, "base").get("branch")
-    )
-    if not isinstance(expected_base_branch, str):
-        return "change_pr_base_unknown"
-    if live.get("base_branch") != expected_base_branch:
-        return "change_pr_base_changed_externally"
-    if live.get("base_sha") != git.resolve(expected_base_branch):
-        return "change_pr_base_changed_externally"
-    return None
-
-
-def _candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
-    candidate = job.get("candidate_sha")
-    record = job.get("acceptance_record")
-    if record is None:
-        return False
-    if not isinstance(record, dict) or not isinstance(candidate, str):
-        return True
-    return record.get("reviewed_candidate_sha") != candidate
 
 
 def _integer_list(state: dict[str, Any], key: str) -> list[int]:
