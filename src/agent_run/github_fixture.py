@@ -54,10 +54,14 @@ class FixtureGitHubReader:
                 head = published.get(branch) or pull.get("head_sha")
                 if not isinstance(head, str):
                     raise GitHubReadError("invalid_fixture", "PR head is missing")
+                base_branch = _string(pull, "base_branch")
+                base_sha = _mapping(delivery, "published_branches").get(base_branch)
+                if not isinstance(base_sha, str):
+                    base_sha = self.repository().default_head_sha
                 return {
                     "state": pull.get("state"), "head_sha": head,
-                    "base_branch": _string(pull, "base_branch"),
-                    "base_sha": self.repository().default_head_sha,
+                    "base_branch": base_branch,
+                    "base_sha": base_sha,
                 }
         raise GitHubReadError("missing_pull_request", f"PR #{pr_number} is missing")
 

@@ -7,7 +7,11 @@ from typing import Any
 
 import pytest
 
-from agent_run.controller import Controller
+from agent_run.controller import (
+    Controller,
+    _stale_change_job_reason,
+    _unknown_pr_mutation,
+)
 from agent_run.cli_surface import _command_is_ready
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -244,3 +248,47 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
     assert updated_job["ticket_branch_generation"] == 1
     assert updated_job["effective_revision"] == "old-revision"
     assert "candidate_sha" not in updated_job
+
+
+def test_pr_base_or_head_mutation_requires_human_not_requeue(git_repo: Path) -> None:
+    class Reader:
+        def live_pull_request(self, _number: int) -> dict[str, Any]:
+            return {
+                "state": "OPEN",
+                "head_sha": "expected-head",
+                "base_branch": "unexpected-base",
+                "base_sha": "unexpected-base-sha",
+            }
+
+    git = GitRepository(git_repo)
+    state = {
+        "base": {"branch": "main"},
+        "run_branch": "main",
+    }
+    job = {"pr_number": 2, "publication_sha": "expected-head"}
+
+    assert _unknown_pr_mutation(state, "ticket:7", job, Reader(), git) == (
+        "change_pr_base_changed_externally"
+    )
+
+
+def test_run_repair_completion_drift_requires_a_new_generation(
+    git_repo: Path,
+) -> None:
+    git = GitRepository(git_repo)
+    state = {
+        "parent": {"revision": "parent"},
+        "ticket_graph": {"revision": "graph", "tickets": {}},
+        "ticket_jobs": {},
+        "run_branch": "main",
+    }
+    job = {
+        "parent_revision": "parent",
+        "ticket_graph_revision": "graph",
+        "ticket_completion_records": [{"ticket_number": 7}],
+        "base_sha": git.resolve("main"),
+    }
+
+    assert _stale_change_job_reason(state, "run-repair:run-1", job, git) == (
+        "run_repair_ticket_completion_changed"
+    )

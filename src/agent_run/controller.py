@@ -11,7 +11,10 @@ from agent_run.github import GitHubReadError
 from agent_run.models import DeliveryGraph, Repository
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
 from agent_run.revisions import effective_revision
-from agent_run.run_currentness import ticket_completion_records_fingerprint
+from agent_run.run_currentness import (
+    ticket_completion_records,
+    ticket_completion_records_fingerprint,
+)
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
 
@@ -320,7 +323,7 @@ class Controller:
             # first generation and currentness facts.
             return
         external = (
-            _unknown_pr_mutation(job, self.github)
+            _unknown_pr_mutation(state, subject, job, self.github, self.publisher.git)
             if job.get("phase") != "blocked"
             else None
         )
@@ -523,13 +526,21 @@ def _stale_change_job_reason(
         return "run_repair_parent_changed"
     if job.get("ticket_graph_revision") != graph.get("revision"):
         return "run_repair_graph_changed"
+    if job.get("ticket_completion_records") != ticket_completion_records(state):
+        return "run_repair_ticket_completion_changed"
     run_branch = state.get("run_branch")
     if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
         return "run_repair_base_changed"
     return None
 
 
-def _unknown_pr_mutation(job: dict[str, Any], github: GitHubReader) -> str | None:
+def _unknown_pr_mutation(
+    state: dict[str, Any],
+    subject: str,
+    job: dict[str, Any],
+    github: GitHubReader,
+    git: GitRepository,
+) -> str | None:
     pr_number = job.get("pr_number")
     if not isinstance(pr_number, int):
         return None
@@ -538,6 +549,17 @@ def _unknown_pr_mutation(job: dict[str, Any], github: GitHubReader) -> str | Non
         return "change_pr_closed_or_merged_externally"
     if live.get("head_sha") != job.get("publication_sha"):
         return "change_pr_head_changed_externally"
+    expected_base_branch = (
+        state.get("run_branch")
+        if subject.startswith(("ticket:", "run-repair:"))
+        else _state_mapping(state, "base").get("branch")
+    )
+    if not isinstance(expected_base_branch, str):
+        return "change_pr_base_unknown"
+    if live.get("base_branch") != expected_base_branch:
+        return "change_pr_base_changed_externally"
+    if live.get("base_sha") != git.resolve(expected_base_branch):
+        return "change_pr_base_changed_externally"
     return None
 
 

@@ -65,6 +65,9 @@ base/head 或 Run Repair 边界已 stale 时绝不启动 Codex，而是进入 `r
 只允许 `status`、`history`、`requeue` 与 `abandon`。`requeue` 在执行时重新读取 GitHub 和 Git
 权威事实，封存旧 Job Generation、关闭其仍开放的自动化 Change PR，并创建不携带旧 Candidate、
 Acceptance 或 Thread 的新 generation；它不自动 rebase，也不继续旧 worktree。
+若 PR 的 live head/base、Candidate/Acceptance 绑定或外部状态无法与当前 Generation 对齐，控制器
+fail closed 为 Human Blocker，不将未知外部变更误路由为 Requeue。Run Repair 还绑定 Parent、Graph、
+Run Branch 与 Ticket Completion Records；任一可重建输入变化都从最新 Run Acceptance 进入新 generation。
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 
