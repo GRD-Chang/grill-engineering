@@ -186,7 +186,7 @@ class FixtureAgentBackend:
                 event("completed", reported_thread_id=thread_id, attempt_count=1)
             return HumanBlockerResult(
                 thread_id=str(thread_id),
-                human_blockers=tuple(result["human_blockers"]),
+                human_blockers=blockers,
             )
         if "invalid" in step:
             error = "scripted invalid Publication Artifact"
@@ -263,6 +263,40 @@ class FixtureAgentBackend:
             artifact=artifact,
         )
 
+    def _legacy_review(
+        self, name: str, request: dict[str, Any]
+    ) -> ReviewResult:
+        step = self._next(name)
+        has_expected_thread = "expected_thread_id" in step
+        expected_thread = step.get("expected_thread_id")
+        requested_thread = request.get("thread_id")
+        if has_expected_thread and expected_thread != requested_thread:
+            raise ValueError("agent fixture review expected a different Thread ID")
+        thread_id = _string(step, "thread_id")
+        event = request.get("_invocation_event")
+        if callable(event) and has_expected_thread:
+            event(
+                "started",
+                requested_thread_id=requested_thread,
+                attempt_count=0,
+                invocation_mode=request.get("_invocation_mode"),
+            )
+            event("thread_started", reported_thread_id=thread_id, attempt_count=1)
+        artifact = _review_artifact(step)
+        if callable(event) and has_expected_thread:
+            try:
+                AcceptanceArtifact.parse(artifact)
+            except ValueError as error:
+                event(
+                    "failed",
+                    reported_thread_id=thread_id,
+                    attempt_count=1,
+                    error=str(error),
+                )
+                raise
+            event("completed", reported_thread_id=thread_id, attempt_count=1)
+        return ReviewResult(thread_id=thread_id, artifact=artifact)
+
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
         step = self._next("run_publications")
         has_expected_thread = "expected_thread_id" in step
@@ -300,16 +334,33 @@ class FixtureAgentBackend:
         current_thread = request.get("thread_id")
         if current_thread is not None and not isinstance(current_thread, str):
             raise ValueError("agent fixture request thread_id must be a string")
-        notify(
-            "started",
-            requested_thread_id=current_thread,
-            attempt_count=0,
-            invocation_mode=request.get("_invocation_mode"),
-        )
+        invocation_started = False
+
+        def start_invocation() -> None:
+            nonlocal invocation_started
+            if invocation_started:
+                return
+            notify(
+                "started",
+                requested_thread_id=request.get("thread_id"),
+                attempt_count=0,
+                invocation_mode=request.get("_invocation_mode"),
+            )
+            invocation_started = True
+
+        def report_thread(thread_id: str, attempt: int) -> None:
+            start_invocation()
+            notify(
+                "thread_started",
+                reported_thread_id=thread_id,
+                attempt_count=attempt,
+            )
+
         currentness = request.get("_currentness_check")
         for attempt in range(1, 4):
             if attempt > 1 and callable(currentness) and not currentness():
                 message = "Fixture currentness changed before Output Repair"
+                start_invocation()
                 notify("failed", attempt_count=attempt - 1, error=message)
                 raise ValueError(message)
             try:
@@ -327,27 +378,30 @@ class FixtureAgentBackend:
                 ):
                     raise ValueError("thread_id must be a non-empty string")
             except ValueError as error:
+                start_invocation()
                 notify("failed", attempt_count=attempt, error=str(error))
                 raise
             reported_thread = configured_thread or current_thread or default_thread
-            notify(
-                "thread_started",
-                reported_thread_id=reported_thread,
-                attempt_count=attempt,
-            )
             if current_thread is not None and reported_thread != current_thread:
                 message = "agent fixture resume reported a different Thread ID"
+                report_thread(reported_thread, attempt)
                 notify("failed", attempt_count=attempt, error=message)
                 raise ValueError(message)
-            current_thread = reported_thread
             try:
                 result = decode(step)
                 validate(result)
             except ValueError as error:
+                report_thread(reported_thread, attempt)
                 if attempt < 3:
+                    current_thread = reported_thread
                     continue
                 notify("failed", attempt_count=attempt, error=str(error))
                 raise
+            if has_expected_thread or invocation_started:
+                report_thread(reported_thread, attempt)
+            current_thread = reported_thread
+            if not invocation_started:
+                return result, current_thread
             notify(
                 "completed",
                 reported_thread_id=current_thread,
@@ -392,7 +446,10 @@ def _review_artifact(data: dict[str, Any]) -> dict[str, Any]:
     artifact = data.get("artifact")
     if isinstance(artifact, dict):
         return dict(artifact)
-    return dict(data)
+    artifact = dict(data)
+    artifact.pop("thread_id", None)
+    artifact.pop("expected_thread_id", None)
+    return artifact
 
 
 def _publication_result(data: dict[str, Any]) -> dict[str, Any]:
