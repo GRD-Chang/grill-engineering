@@ -94,6 +94,15 @@ class HumanThenRunPublicationAgents:
         assert request["prior_human_blockers"] == [
             "GitHub denied access; tried gh issue view; grant Issue read access."
         ]
+        assert request["human_response_history"] == [
+            {
+                "generation": 1,
+                "human_blockers": [
+                    "GitHub denied access; tried gh issue view; grant Issue read access."
+                ],
+                "response": "Issue read access has been granted.",
+            }
+        ]
         return {
             "result_kind": "publication",
             "commit_message": "feat(run): publish the completed delivery",
@@ -229,7 +238,11 @@ def test_final_publication_human_resume_clears_current_blocker(
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
-    ).resume(str(state["run_id"]), resume_human_blocker=True)
+    ).resume(
+        str(state["run_id"]),
+        resume_human_blocker=True,
+        human_response="Issue read access has been granted.",
+    )
     assert resumed["run_publication"]["prior_human_blockers"] == [
         "GitHub denied access; tried gh issue view; grant Issue read access."
     ]
@@ -661,7 +674,9 @@ def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
     assert persisted["run_publication"]["publication_attempts"] == 1
 
 
-def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> None:
+def test_publish_run_retries_only_exhausted_final_run_publication(
+    git_repo: Path,
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
     pending = RunPublicationEngine(
@@ -684,7 +699,7 @@ def test_resume_retries_only_exhausted_final_run_publication(git_repo: Path) -> 
     resumed = run_cli(
         git_repo,
         git_repo / "github.json",
-        "resume",
+        "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
         str(agents),

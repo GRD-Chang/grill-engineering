@@ -20,6 +20,7 @@ from agent_run.change_delivery import (
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 
@@ -126,6 +127,7 @@ class RunAcceptanceEngine:
         finally:
             self.git.remove_worktree(checkout)
         self._record_reviewer(state, run, review.thread_id)
+        run.pop("review_new_thread", None)
         artifact = AcceptanceArtifact.parse(review.artifact)
         record = self._acceptance_record(
             state,
@@ -335,6 +337,7 @@ class RunAcceptanceEngine:
             "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
             "modification_attempts": int(run["modification_attempts"]),
             "validation_attempts": 0,
+            "acceptance_generation": 1,
             "development_thread_id": None,
             "development_thread_history": [],
             "reviewer_thread_ids": prior_threads,
@@ -394,6 +397,13 @@ class RunAcceptanceEngine:
             return
         for key in ("acceptance_record", "acceptance_artifact", "reviewed_head_sha"):
             run.pop(key, None)
+        for key in (
+            "human_response_history",
+            "human_response_generation",
+            "prior_human_blockers",
+        ):
+            run.pop(key, None)
+        run["acceptance_generation"] = int(run.get("acceptance_generation", 1)) + 1
         run["phase"] = "pending"
 
     def _review_request(
@@ -423,11 +433,21 @@ class RunAcceptanceEngine:
             },
             "checkout": str(checkout),
             "thread_id": latest_reviewer_thread(run)
-            if run.get("prior_human_blockers")
+            if run.get("prior_human_blockers") and not run.get("review_new_thread")
             else None,
             **(
                 {"prior_human_blockers": run["prior_human_blockers"]}
                 if run.get("prior_human_blockers")
+                else {}
+            ),
+            **(
+                {"human_response_history": history}
+                if (
+                    history := current_human_response_history(
+                        run,
+                        generation=int(run.get("acceptance_generation", 1)),
+                    )
+                )
                 else {}
             ),
         }
@@ -448,7 +468,9 @@ class RunAcceptanceEngine:
             "base_sha": job["base_sha"],
             "head_sha": self.git.checkout_head(checkout),
             "checkout": str(checkout),
-            "thread_id": job.get("development_thread_id"),
+            "thread_id": None
+            if job.get("development_new_thread")
+            else job.get("development_thread_id"),
             "development_summary": job.get("development_summary"),
         }
         source = str(request["repair_source"])
@@ -462,6 +484,10 @@ class RunAcceptanceEngine:
             request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("human_response_generation", job.get("repair_generation", 1)))
+        ):
+            request["human_response_history"] = history
         return request
 
     def _publication_request(
@@ -489,6 +515,13 @@ class RunAcceptanceEngine:
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job,
+            generation=int(
+                job.get("human_response_generation", job.get("repair_generation", 1))
+            ),
+        ):
+            request["human_response_history"] = history
         return request
 
     def _invalidate_stale_repair_publication(
@@ -549,11 +582,32 @@ class RunAcceptanceEngine:
             },
             "checkout": str(checkout),
             "thread_id": latest_reviewer_thread(job)
-            if job.get("prior_human_blockers")
+            if (
+                (
+                    job.get("review_human_blocker_resume")
+                    or job.get("review_resume_thread_id")
+                )
+                and not job.get("review_new_thread")
+            )
             else None,
             **(
                 {"prior_human_blockers": job["prior_human_blockers"]}
                 if job.get("prior_human_blockers")
+                else {}
+            ),
+            **(
+                {"human_response_history": history}
+                if (
+                    history := current_human_response_history(
+                        job,
+                        generation=int(
+                            job.get(
+                                "human_response_generation",
+                                job.get("repair_generation", 1),
+                            )
+                        ),
+                    )
+                )
                 else {}
             ),
         }

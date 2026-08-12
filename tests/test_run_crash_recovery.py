@@ -395,8 +395,8 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
             {
                 "developments": [
                     {
-                        "expected_thread_id": None,
-                        "thread_id": "developer-recovered",
+                        "expected_thread_id": "unused-after-error",
+                        "thread_id": "unused-after-error",
                         "summary": "Completed the preserved work.",
                         "expected_files": {
                             "uncommitted.txt": "survives worker error\n"
@@ -419,7 +419,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
     publisher_interrupted = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),

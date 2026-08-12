@@ -112,7 +112,10 @@ class RunPublicationFlow(RunPublicationShared):
             )
             if publication.get("publication_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
+            elif publication.get("publication_failure_resume") is True:
+                request["_invocation_mode"] = "resume"
             raw = self.agents.run_publication(request)
+            publication.pop("publication_failure_resume", None)
             publication.pop("publication_new_thread", None)
             thread_id = raw.pop("_thread_id", None)
             if isinstance(thread_id, str):
@@ -165,7 +168,7 @@ class RunPublicationFlow(RunPublicationShared):
             role="final_publication",
             phase="run_publication",
             work_subject=f"run-publication:{state['run_id']}",
-            generation=int(run.get("validation_attempts", 1)),
+            generation=int(run.get("acceptance_generation", 1)),
             invocation_input=request,
             currentness_boundary={
                 "reviewed_head_sha": acceptance["reviewed_head_sha"],

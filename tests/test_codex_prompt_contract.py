@@ -16,7 +16,8 @@ PUBLICATION_BLOCKER_SHAPE = (
     '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
 )
 DEVELOPMENT_BLOCKER_SHAPE = (
-    '`{"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
+    '`{"result_kind":"human_blocker","summary":null,'
+    '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
 )
 
 
@@ -84,6 +85,11 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
         "findings": [],
         "human_blockers": [],
     }
+    development_result = {
+        "result_kind": "development",
+        "summary": "Implemented and verified.",
+        "human_blockers": None,
+    }
 
     def fake_run(
         arguments: list[str], **options: Any
@@ -95,7 +101,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
         elif active_method == "review":
             output = json.dumps(acceptance_result)
         else:
-            output = "Implemented and verified."
+            output = json.dumps(development_result)
         Path(arguments[output_index]).write_text(output, encoding="utf-8")
         return subprocess.CompletedProcess(
             arguments,
@@ -398,7 +404,14 @@ def test_human_blocker_resume_context_reaches_original_thread_stdin_verbatim(
         captured["prompt"] = str(options["prompt"])
         output_index = arguments.index("--output-last-message") + 1
         Path(arguments[output_index]).write_text(
-            "Access was rechecked; implementation completed.", encoding="utf-8"
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Access was rechecked; implementation completed.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
         )
         return subprocess.CompletedProcess(
             arguments,
@@ -442,7 +455,14 @@ def test_human_blocker_resume_rejects_a_different_reported_thread(
     ) -> subprocess.CompletedProcess[str]:
         output_index = arguments.index("--output-last-message") + 1
         Path(arguments[output_index]).write_text(
-            "Access was rechecked; implementation completed.", encoding="utf-8"
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Access was rechecked; implementation completed.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
         )
         return subprocess.CompletedProcess(
             arguments,

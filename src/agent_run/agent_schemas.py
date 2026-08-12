@@ -38,6 +38,33 @@ def human_blocker_schema() -> dict[str, Any]:
     }
 
 
+def development_or_human_blocker_schema() -> dict[str, Any]:
+    """Wire contract for a Development result and its one semantic escape hatch."""
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["result_kind", "summary", "human_blockers"],
+        "properties": {
+            "result_kind": {
+                "type": "string",
+                "enum": ["development", "human_blocker"],
+            },
+            "summary": {"type": ["string", "null"]},
+            "human_blockers": {
+                "type": ["array", "null"],
+                "maxItems": MAX_HUMAN_BLOCKERS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_HUMAN_BLOCKER_LENGTH,
+                    "pattern": r"\S",
+                },
+            },
+        },
+    }
+
+
 def publication_or_human_blocker_schema() -> dict[str, Any]:
     return {
         "type": "object",

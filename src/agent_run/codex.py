@@ -16,9 +16,15 @@ from agent_run.agents import (
 )
 from agent_run.agent_schemas import (
     acceptance_schema,
+    development_or_human_blocker_schema,
     publication_or_human_blocker_schema,
 )
-from agent_run.artifacts import parse_human_blockers, parse_publication_wire_result
+from agent_run.artifacts import (
+    AcceptanceArtifact,
+    parse_development_wire_result,
+    parse_human_blockers,
+    parse_publication_wire_result,
+)
 from agent_run.github_auth import (
     GitHubCredentialError,
     mint_read_only_installation_token,
@@ -63,47 +69,28 @@ class CodexCliBackend:
         self, request: dict[str, Any]
     ) -> DevelopmentResult | HumanBlockerResult:
         checkout = Path(_string(request, "checkout"))
-        thread_id = request.get("thread_id")
         prompt = self._development_prompt(request)
-        resumed_thread = str(thread_id) if isinstance(thread_id, str) else None
-        replaced_thread: str | None = None
-        try:
-            output, actual_thread = self._invoke(
-                prompt=prompt,
-                checkout=checkout,
-                thread_id=resumed_thread,
-            )
-        except _CodexThreadResumeError:
-            if resumed_thread is None or request.get("prior_human_blockers"):
-                raise
-            replaced_thread = resumed_thread
-            job_name = (
-                "Parent-only Delivery"
-                if request.get("acceptance_scope") == "parent_only"
-                else "Ticket Job"
-            )
-            output, actual_thread = self._invoke(
-                prompt=(
-                    "之前的开发会话恢复失败。你是接替该工作的开发工程师；下面的 Development "
-                    "Brief 是完整恢复上下文，请在同一 "
-                    f"{job_name}、branch 和 PR 上继续，不要重新规划或丢失未解决证据。"
-                    "\n\n"
-                    + prompt
-                ),
-                checkout=checkout,
-                thread_id=None,
-            )
-        blockers = _human_blocker_output(output, "Development result")
-        if blockers is not None:
+        output, actual_thread = self._invoke_structured_output(
+            request=request,
+            prompt=prompt,
+            checkout=checkout,
+            thread_id=_optional_string(request, "thread_id"),
+            schema=development_or_human_blocker_schema(),
+            output_name="Development result",
+            validate=parse_development_wire_result,
+            initial_writable_checkout=True,
+        )
+        result = parse_development_wire_result(
+            _json_object(output, "Development result")
+        )
+        if result["result_kind"] == "human_blocker":
             return HumanBlockerResult(
                 thread_id=actual_thread,
-                human_blockers=blockers,
-                replaced_thread_id=replaced_thread,
+                human_blockers=tuple(result["human_blockers"]),
             )
         return DevelopmentResult(
             thread_id=actual_thread,
-            summary=output.strip(),
-            replaced_thread_id=replaced_thread,
+            summary=str(result["summary"]),
         )
 
     @staticmethod
@@ -225,7 +212,9 @@ class CodexCliBackend:
             "\n\nPublisher 是唯一 Mutation Authority；不要 commit、push、merge、"
             "close 或修改 PR/Issue。Run Repair 不得关闭 Ticket、创建 Ticket PR 或使用"
             "Ticket 的修改预算。开发侧验证不是正式 Acceptance。最后只用普通文本"
-            "总结改动、实际验证、两个审查结果和剩余 blocker。\n\n"
+            "总结改动、实际验证、两个审查结果和剩余 blocker。最后只输出完整 Development "
+            'wire JSON：正常完成时 `{"result_kind":"development","summary":"...",'
+            '"human_blockers":null}`；Human Blocker 时 summary 必须是 null。\n\n'
             f"{heading}:\n{prompt_input}"
         )
 
@@ -280,74 +269,16 @@ class CodexCliBackend:
         checkout: Path,
         thread_id: str | None,
     ) -> tuple[str, str]:
-        event = request.get("_invocation_event")
-        notify = event if callable(event) else lambda _kind, **_facts: None
-        notify(
-            "started",
-            requested_thread_id=thread_id,
-            attempt_count=0,
-            invocation_mode=request.get("_invocation_mode"),
+        return self._invoke_structured_output(
+            request=request,
+            prompt=prompt,
+            checkout=checkout,
+            thread_id=thread_id,
+            schema=publication_or_human_blocker_schema(),
+            output_name="Publication Artifact",
+            validate=parse_publication_wire_result,
+            initial_writable_checkout=False,
         )
-        current_thread = thread_id
-        validation_error = ""
-        currentness = request.get("_currentness_check")
-        for attempt in range(1, 4):
-            if attempt > 1 and callable(currentness) and not currentness():
-                stale = CodexProcessError(
-                    "Publication currentness changed before Output Repair"
-                )
-                notify("failed", attempt_count=attempt - 1, error=str(stale))
-                raise stale
-            attempt_prompt = prompt
-            if attempt > 1:
-                attempt_prompt = (
-                    "上一输出未通过本地 Publication contract。只重新输出完整 JSON，"
-                    "不要修改文件或继续开发。校验错误："
-                    + validation_error[:2000]
-                )
-            try:
-                output, reported_thread = self._invoke(
-                    prompt=attempt_prompt,
-                    checkout=checkout,
-                    thread_id=current_thread,
-                    schema=publication_or_human_blocker_schema(),
-                    writable_checkout=False,
-                    on_thread=lambda value: notify(
-                        "thread_started",
-                        reported_thread_id=value,
-                        attempt_count=attempt,
-                    ),
-                )
-            except BaseException as error:
-                notify(
-                    "failed",
-                    attempt_count=attempt,
-                    error=_bounded_error(str(error)),
-                    return_code=getattr(error, "return_code", None),
-                    signal=getattr(error, "signal_number", None),
-                )
-                raise
-            if current_thread is not None and reported_thread != current_thread:
-                mismatch = CodexProcessError("Codex resume reported a different Thread ID")
-                notify("failed", attempt_count=attempt, error=str(mismatch))
-                raise mismatch
-            current_thread = reported_thread
-            try:
-                artifact = _json_object(output, "Publication Artifact")
-                parse_publication_wire_result(artifact)
-            except (CodexProcessError, ValueError) as error:
-                validation_error = str(error)
-                if attempt < 3:
-                    continue
-                notify("failed", attempt_count=attempt, error=validation_error)
-                raise CodexProcessError(validation_error) from error
-            notify(
-                "completed",
-                reported_thread_id=current_thread,
-                attempt_count=attempt,
-            )
-            return output, current_thread
-        raise AssertionError("unreachable")
 
     @staticmethod
     def _run_publication_prompt(request: dict[str, Any]) -> str:
@@ -355,6 +286,7 @@ class CodexCliBackend:
             request,
             "parent_issue_url",
             "prior_human_blockers",
+            "human_response_history",
         )
         artifact = request.get("acceptance_artifact")
         if not isinstance(artifact, dict):
@@ -383,6 +315,7 @@ class CodexCliBackend:
             "parent_issue_url",
             "task_issue_url",
             "prior_human_blockers",
+            "human_response_history",
         )
         artifact = request.get("acceptance_artifact")
         if not isinstance(artifact, dict):
@@ -429,16 +362,112 @@ class CodexCliBackend:
     def review(self, request: dict[str, Any]) -> ReviewResult:
         checkout = Path(_string(request, "checkout"))
         prompt = self._review_prompt(request)
-        output, thread_id = self._invoke(
+        output, thread_id = self._invoke_structured_output(
+            request=request,
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
             schema=acceptance_schema(),
+            output_name="Acceptance Artifact",
+            validate=lambda value: AcceptanceArtifact.parse(value),
+            initial_writable_checkout=True,
         )
         return ReviewResult(
             thread_id=thread_id,
             artifact=_json_object(output, "Acceptance Artifact"),
         )
+
+    def _invoke_structured_output(
+        self,
+        *,
+        request: dict[str, Any],
+        prompt: str,
+        checkout: Path,
+        thread_id: str | None,
+        schema: dict[str, Any],
+        output_name: str,
+        validate: Callable[[object], object],
+        initial_writable_checkout: bool,
+    ) -> tuple[str, str]:
+        """Run one Invocation with at most two same-Thread output repairs."""
+
+        event = request.get("_invocation_event")
+        notify = event if callable(event) else lambda _kind, **_facts: None
+        notify(
+            "started",
+            requested_thread_id=thread_id,
+            attempt_count=0,
+            invocation_mode=request.get("_invocation_mode"),
+        )
+        current_thread = thread_id
+        validation_error = ""
+        currentness = request.get("_currentness_check")
+        if request.get("_invocation_mode") == "resume" and thread_id is not None:
+            prompt = (
+                "这是一次因前次调用失败而继续的同 Thread Resume。请基于当前 workspace "
+                "重新核验权威输入和实际工作，再满足完整阶段 contract。\n\n" + prompt
+        )
+        for attempt in range(1, 4):
+            if callable(currentness) and not currentness():
+                stale = CodexProcessError(
+                    f"{output_name} currentness changed before Invocation"
+                )
+                notify("failed", attempt_count=attempt - 1, error=str(stale))
+                raise stale
+            attempt_prompt = prompt
+            if attempt > 1:
+                attempt_prompt = (
+                    f"上一输出未通过本地 {output_name} contract。只重新输出完整 JSON，"
+                    "不要修改文件或继续开发。校验错误：" + validation_error[:2000]
+                )
+            try:
+                output, reported_thread = self._invoke(
+                    prompt=attempt_prompt,
+                    checkout=checkout,
+                    thread_id=current_thread,
+                    schema=schema,
+                    writable_checkout=initial_writable_checkout and attempt == 1,
+                    on_thread=lambda value: notify(
+                        "thread_started",
+                        reported_thread_id=value,
+                        attempt_count=attempt,
+                    ),
+                )
+            except BaseException as error:
+                notify(
+                    "failed",
+                    attempt_count=attempt,
+                    error=_bounded_error(str(error)),
+                    return_code=getattr(error, "return_code", None),
+                    signal=getattr(error, "signal_number", None),
+                )
+                raise
+            if current_thread is not None and reported_thread != current_thread:
+                mismatch = CodexProcessError("Codex resume reported a different Thread ID")
+                notify("failed", attempt_count=attempt, error=str(mismatch))
+                raise mismatch
+            current_thread = reported_thread
+            try:
+                validate(_json_object(output, output_name))
+            except (CodexProcessError, ValueError) as error:
+                validation_error = str(error)
+                if attempt < 3:
+                    continue
+                notify("failed", attempt_count=attempt, error=validation_error)
+                raise CodexProcessError(validation_error) from error
+            if callable(currentness) and not currentness():
+                stale = CodexProcessError(
+                    f"{output_name} currentness changed before result application"
+                )
+                notify("failed", attempt_count=attempt, error=str(stale))
+                raise stale
+            notify(
+                "completed",
+                reported_thread_id=current_thread,
+                attempt_count=attempt,
+            )
+            return output, current_thread
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _review_prompt(request: dict[str, Any]) -> str:
@@ -447,6 +476,7 @@ class CodexCliBackend:
             "parent_issue_url",
             "task_issue_url",
             "prior_human_blockers",
+            "human_response_history",
         )
         scope_instruction = (
             "这是 Run Acceptance：从 Parent Issue 和 GitHub 独立读取最终 Ticket Set 与"
@@ -769,6 +799,7 @@ def _development_context(request: dict[str, Any]) -> dict[str, Any]:
         "parent_issue_url",
         "task_issue_url",
         "prior_human_blockers",
+        "human_response_history",
     )
 
 
@@ -799,8 +830,10 @@ def _resume_recheck_instruction(context: dict[str, Any]) -> str:
 def _human_blocker_instruction() -> str:
     return (
         "若出现确实必须由人处理的外部权限、GitHub 访问、产品决定、敏感凭证或不可替代"
-        '外部操作，停止当前阶段且只输出 JSON `{"human_blockers":["发生了什么；尝试了什么；'
-        '人必须做什么"]}`。不要把可自行修复的问题作为 Human Blocker。'
+        "外部操作，停止当前阶段且只输出完整 Development wire JSON "
+        '`{"result_kind":"human_blocker","summary":null,'
+        '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`。'
+        "不要把可自行修复的问题作为 Human Blocker。"
     )
 
 

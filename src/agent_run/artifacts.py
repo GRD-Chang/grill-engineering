@@ -33,6 +33,7 @@ _PUBLICATION_RESULT_FIELDS = {
     "pr_body_markdown",
     "human_blockers",
 }
+_DEVELOPMENT_RESULT_FIELDS = {"result_kind", "summary", "human_blockers"}
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,34 @@ def parse_publication_wire_result(value: object) -> dict[str, Any]:
             "human_blockers": blockers,
         }
     raise ValueError("invalid publication result_kind")
+
+
+def parse_development_wire_result(value: object) -> dict[str, Any]:
+    """Validate the flat Development/Human Blocker Structured Output contract."""
+
+    data = _mapping(value, "development result")
+    _exact_fields(data, _DEVELOPMENT_RESULT_FIELDS, "development result")
+    result_kind = data.get("result_kind")
+    if result_kind == "development":
+        if data.get("human_blockers") is not None:
+            raise ValueError("development result human_blockers must be null")
+        return {
+            "result_kind": "development",
+            "summary": _nonempty_string(data, "summary"),
+            "human_blockers": None,
+        }
+    if result_kind == "human_blocker":
+        if data.get("summary") is not None:
+            raise ValueError("human blocker summary must be null")
+        blockers = _bounded_blocker_list(data.get("human_blockers"))
+        if not blockers:
+            raise ValueError("human_blockers must contain non-empty strings")
+        return {
+            "result_kind": "human_blocker",
+            "summary": None,
+            "human_blockers": blockers,
+        }
+    raise ValueError("invalid development result_kind")
 
 
 def parse_human_blockers(value: object) -> tuple[str, ...] | None:

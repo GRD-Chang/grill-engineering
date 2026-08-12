@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
+from agent_run.controller import _human_blocker_subject_count
 from agent_run.state import StateStore
 from agent_run.cli_presentation import _print_precondition_failure
 
@@ -20,14 +21,6 @@ def _run_to_human_gate(
     run_id = state.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("Delivery Run is missing its Run ID")
-    # A read budget exhausted while selecting the Run is itself the durable
-    # recovery boundary.  Do not immediately spend another budget through the
-    # nested resume in the same foreground invocation.
-    if resumed and state.get("status") not in {
-        "execution_failed",
-        "abandonment_pending",
-    }:
-        _invoke_nested("resume", run_id, *arguments, *_agent_fixture_arguments(parsed, "resume"))
     state = _load_local_run(states, run_id)
     previous_marker: tuple[object, ...] | None = None
     while True:
@@ -136,13 +129,27 @@ def _is_lifecycle_action(command: str) -> bool:
     }
 
 
+def _resume_is_ready(state: dict[str, object]) -> bool:
+    """Whether `resume` has a current failed or Human Blocker Invocation."""
+
+    invocation = state.get("active_agent_invocation")
+    if isinstance(invocation, dict) and invocation.get("status") == "failed":
+        return True
+    return _human_blocker_subject_count(state) == 1
+
+
 def _command_is_ready(state: dict[str, object], command: str) -> bool:
     status = state.get("status")
-    # Existing commands are also recovery entry points. A previous process
-    # failure (or an abandoned Run queried idempotently) must reach their
-    # established reconciliation path instead of being rejected locally.
-    if status in {"execution_failed", "abandoned"}:
+    if status == "abandoned":
         return True
+    if status == "execution_failed":
+        invocation = state.get("active_agent_invocation")
+        # A failed Agent Invocation has exactly one recovery path: `resume`.
+        # Deterministic publisher/check reconciliation retains its historical
+        # lifecycle command recovery path.
+        return not (
+            isinstance(invocation, dict) and invocation.get("status") == "failed"
+        )
     if status in {"unsupported_scope_change", "abandonment_pending"}:
         return False
     if command == "deliver":
@@ -153,12 +160,13 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
         publication = state.get("run_publication")
         return status == "run_publication_pending" or (
             isinstance(publication, dict)
-            and status in {"waiting_checks", "run_approval_pending"}
+            and status
+            in {"publication_pending", "waiting_checks", "run_approval_pending"}
         )
     if command == "approve":
         return (
             state.get("delivery_type") == "parent_only"
-            and status == "parent_approval_pending"
+            and status in {"parent_approval_pending", "parent_closeout_pending"}
         ) or status == "run_approval_pending"
     if command == "revise":
         return status in {"ready_for_human", "run_approval_pending"}

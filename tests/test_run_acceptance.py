@@ -376,6 +376,15 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
             assert request["prior_human_blockers"] == [
                 "GitHub denied access; tried gh issue view; grant Issue read access."
             ]
+            assert request["human_response_history"] == [
+                {
+                    "generation": 1,
+                    "human_blockers": [
+                        "GitHub denied access; tried gh issue view; grant Issue read access."
+                    ],
+                    "response": "Issue read access has been granted.",
+                }
+            ]
             return ReviewResult("blocked-run-reviewer", _passing_artifact())
 
     agents = HumanThenPassingReviewer()
@@ -392,7 +401,11 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
-    ).resume(str(state["run_id"]), resume_human_blocker=True)
+    ).resume(
+        str(state["run_id"]),
+        resume_human_blocker=True,
+        human_response="Issue read access has been granted.",
+    )
     assert resumed["run_acceptance"]["prior_human_blockers"] == [
         "GitHub denied access; tried gh issue view; grant Issue read access."
     ]

@@ -91,9 +91,25 @@ def invocation_event_recorder(
                 if requested is not None and requested != invocation.get(
                     "reported_thread_id"
                 ):
-                    raise ValueError(
-                        "reported Thread ID does not match requested Thread ID"
+                    error = "reported Thread ID does not match requested Thread ID"
+                    invocation.update(
+                        {"status": "failed", "ended_at": now, "error": error}
                     )
+                    history = state.setdefault("agent_invocation_history", [])
+                    if not isinstance(history, list):
+                        raise ValueError("agent_invocation_history must be an array")
+                    history.append(dict(invocation))
+                    state.update(
+                        {
+                            "status": "execution_failed",
+                            "terminal_kind": "execution_failed",
+                            "diagnostics": [
+                                {"code": "agent_invocation_failed", "message": error}
+                            ],
+                        }
+                    )
+                    save(state)
+                    raise ValueError(error)
             elif kind in {"completed", "failed"}:
                 invocation["status"] = kind
                 invocation["ended_at"] = now

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.worker_sandbox import WorkerSandboxError
 
 
@@ -29,9 +30,34 @@ class FixtureAgentBackend:
         self, request: dict[str, Any]
     ) -> DevelopmentResult | HumanBlockerResult:
         step = self._next("developments")
+        event = request.get("_invocation_event")
+        notify = event if callable(event) else None
         expected = step.get("expected_thread_id")
         if expected != request.get("thread_id"):
             raise ValueError("scripted Development Thread expectation failed")
+        if notify is not None:
+            notify(
+                "started",
+                requested_thread_id=request.get("thread_id"),
+                attempt_count=0,
+                invocation_mode=request.get("_invocation_mode"),
+            )
+        no_thread = step.get("no_thread", False)
+        if not isinstance(no_thread, bool):
+            raise ValueError("scripted Development no_thread must be a boolean")
+        if no_thread:
+            error = "scripted Development did not report a Thread ID"
+            if notify is not None:
+                notify("failed", attempt_count=1, error=error)
+            raise ValueError(error)
+        try:
+            thread_id = _string(step, "thread_id")
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
+        if notify is not None:
+            notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
         checkout = Path(_string(request, "checkout")).resolve()
         actual_head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -88,25 +114,41 @@ class FixtureAgentBackend:
             target.write_text(content, encoding="utf-8")
         configured_error = step.get("error_after_writes")
         if isinstance(configured_error, str):
+            if notify is not None:
+                notify("failed", attempt_count=1, error=configured_error)
             raise ValueError(configured_error)
         sandbox_error = step.get("sandbox_error_after_writes")
         if isinstance(sandbox_error, str):
+            if notify is not None:
+                notify("failed", attempt_count=1, error=sandbox_error)
             raise WorkerSandboxError(sandbox_error)
         blockers = _human_blockers(step)
         if blockers is not None:
+            if notify is not None:
+                notify("completed", reported_thread_id=thread_id, attempt_count=1)
             return HumanBlockerResult(
-                thread_id=_string(step, "thread_id"),
+                thread_id=thread_id,
                 human_blockers=blockers,
             )
-        return DevelopmentResult(
-            thread_id=_string(step, "thread_id"),
-            summary=_string(step, "summary"),
-        )
+        try:
+            summary = _string(step, "summary")
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
+        if notify is not None:
+            notify("completed", reported_thread_id=thread_id, attempt_count=1)
+        return DevelopmentResult(thread_id=thread_id, summary=summary)
 
     def publication(
         self, request: dict[str, Any]
     ) -> dict[str, Any] | HumanBlockerResult:
         step = self._next("publications")
+        expected_history = step.pop("expected_human_response_history", None)
+        if expected_history is not None and expected_history != request.get(
+            "human_response_history"
+        ):
+            raise ValueError("scripted Publication response history mismatch")
         has_expected_thread = "expected_thread_id" in step
         expected_thread = step.pop("expected_thread_id", None)
         requested_thread = request.get("thread_id")
@@ -114,25 +156,44 @@ class FixtureAgentBackend:
             raise ValueError(
                 "agent fixture publication expected a different Thread ID"
             )
+        configured_error = step.pop("error", None)
+        no_thread = step.pop("no_thread", False)
+        if not isinstance(no_thread, bool):
+            raise ValueError("scripted Publication no_thread must be a boolean")
         thread_id = step.pop("thread_id", None) or requested_thread or "fixture-publication"
         event = request.get("_invocation_event")
-        if callable(event) and has_expected_thread:
+        if callable(event):
             event(
                 "started",
                 requested_thread_id=requested_thread,
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+            if no_thread:
+                error = "scripted Publication did not report a Thread ID"
+                event("failed", attempt_count=1, error=error)
+                raise ValueError(error)
             event("thread_started", reported_thread_id=thread_id, attempt_count=1)
+        if isinstance(configured_error, str):
+            if callable(event):
+                event("failed", attempt_count=1, error=configured_error)
+            raise ValueError(configured_error)
+        if configured_error is not None:
+            raise ValueError("scripted Publication error must be a string")
         blockers = _human_blockers(step)
         if blockers is not None:
-            if callable(event) and has_expected_thread:
+            if callable(event):
                 event("completed", reported_thread_id=thread_id, attempt_count=1)
             return HumanBlockerResult(
                 thread_id=str(thread_id),
                 human_blockers=blockers,
             )
-        if callable(event) and has_expected_thread:
+        if "invalid" in step:
+            error = "scripted invalid Publication Artifact"
+            if callable(event):
+                event("failed", attempt_count=1, error=error)
+            raise ValueError(error)
+        if callable(event):
             event("completed", reported_thread_id=thread_id, attempt_count=1)
         return _publication_wire(step)
 
@@ -144,12 +205,61 @@ class FixtureAgentBackend:
             else "reviews"
         )
         step = self._next(name)
+        has_expected_thread = "expected_thread_id" in step
+        expected_thread = step.pop("expected_thread_id", None)
+        if has_expected_thread and expected_thread != request.get("thread_id"):
+            raise ValueError("scripted Fresh Acceptance Thread expectation failed")
+        expected_history = step.pop("expected_human_response_history", None)
+        if expected_history is not None and expected_history != request.get(
+            "human_response_history"
+        ):
+            raise ValueError("scripted Fresh Acceptance response history mismatch")
+        event = request.get("_invocation_event")
+        notify = event if callable(event) else None
         artifact = step.get("artifact")
         if not isinstance(artifact, dict):
             artifact = dict(step)
             artifact.pop("thread_id", None)
+        if notify is not None:
+            notify(
+                "started",
+                requested_thread_id=request.get("thread_id"),
+                attempt_count=0,
+                invocation_mode=request.get("_invocation_mode"),
+            )
+        no_thread = step.get("no_thread", False)
+        if not isinstance(no_thread, bool):
+            raise ValueError("scripted Fresh Acceptance no_thread must be a boolean")
+        if no_thread:
+            error = "scripted Fresh Acceptance did not report a Thread ID"
+            if notify is not None:
+                notify("failed", attempt_count=1, error=error)
+            raise ValueError(error)
+        try:
+            thread_id = _string(step, "thread_id")
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
+        if notify is not None:
+            notify("thread_started", reported_thread_id=thread_id, attempt_count=1)
+        configured_error = step.pop("error", None)
+        if isinstance(configured_error, str):
+            if notify is not None:
+                notify("failed", attempt_count=1, error=configured_error)
+            raise ValueError(configured_error)
+        if configured_error is not None:
+            raise ValueError("scripted Fresh Acceptance error must be a string")
+        try:
+            AcceptanceArtifact.parse(artifact)
+        except ValueError as error:
+            if notify is not None:
+                notify("failed", attempt_count=1, error=str(error))
+            raise
+        if notify is not None:
+            notify("completed", reported_thread_id=thread_id, attempt_count=1)
         return ReviewResult(
-            thread_id=_string(step, "thread_id"),
+            thread_id=thread_id,
             artifact=artifact,
         )
 
@@ -164,7 +274,7 @@ class FixtureAgentBackend:
             )
         thread_id = step.pop("thread_id", None) or requested_thread or "fixture-run-publication"
         event = request.get("_invocation_event")
-        if callable(event) and has_expected_thread:
+        if callable(event):
             event(
                 "started",
                 requested_thread_id=requested_thread,
