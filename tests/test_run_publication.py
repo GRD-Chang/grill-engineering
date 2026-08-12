@@ -648,6 +648,51 @@ def test_malformed_final_run_publication_is_not_retried(
     assert interrupted["run_publication"]["publication_attempts"] == 1
 
 
+def test_final_publication_discards_an_artifact_when_run_head_drifts(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+
+    class DriftingRunPublication(RunPublicationAgents):
+        def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+            result = super().run_publication(request)
+            tree = git.resolve(f"{state['run_branch']}^{{tree}}")
+            drifted = subprocess.run(
+                [
+                    "git",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    str(state["run_branch"]),
+                    "-m",
+                    "test: drift run head during publication",
+                ],
+                cwd=git_repo,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "update-ref", f"refs/heads/{state['run_branch']}", drifted],
+                cwd=git_repo,
+                check=True,
+            )
+            return result
+
+    stale = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=DriftingRunPublication(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    assert stale["status"] == "run_acceptance_pending"
+    assert stale["run_acceptance"]["phase"] == "pending"
+    assert "artifact" not in stale["run_publication"]
+
+
 def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
     git_repo: Path,
 ) -> None:

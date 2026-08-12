@@ -115,9 +115,10 @@ class RunAcceptanceEngine:
                     continue
                 if phase != "pending":
                     raise ValueError(f"unknown Run Acceptance phase: {phase}")
-                self._review(state, run)
+                if not self._review(state, run):
+                    return self._save(state)
 
-    def _review(self, state: dict[str, Any], run: dict[str, Any]) -> None:
+    def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
         run_head = self.git.resolve(str(state["run_branch"]))
         validation_attempt = int(run.get("validation_attempts", 0)) + 1
         run["validation_attempts"] = validation_attempt
@@ -172,6 +173,10 @@ class RunAcceptanceEngine:
                 == request["ticket_completion_records"]
             )
             review = self.agents.review(request)
+            if not request["_currentness_check"]():
+                run["phase"] = "pending"
+                self._save(state)
+                return False
         finally:
             self.git.remove_worktree(checkout)
         self._record_reviewer(state, run, review.thread_id)
@@ -226,6 +231,7 @@ class RunAcceptanceEngine:
         if artifact.verdict != "human":
             self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
+        return True
 
     def _record_final_pr_status(
         self, state: dict[str, Any], artifact: dict[str, Any], run_head: str

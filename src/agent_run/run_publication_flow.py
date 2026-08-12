@@ -122,6 +122,11 @@ class RunPublicationFlow(RunPublicationShared):
             raw = self.agents.run_publication(request)
             publication.pop("publication_failure_resume", None)
             publication.pop("publication_new_thread", None)
+            if not self._acceptance_is_current(
+                state, self._mapping(state, "run_acceptance")
+            ):
+                self._invalidate_for_fresh_acceptance(state)
+                return None
             thread_id = raw.pop("_thread_id", None)
             if isinstance(thread_id, str):
                 publication["thread_id"] = thread_id

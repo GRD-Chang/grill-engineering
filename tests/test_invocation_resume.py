@@ -138,6 +138,16 @@ def _ticket(number: int) -> dict[str, Any]:
     }
 
 
+def test_human_response_history_is_append_only_without_a_fixed_cap() -> None:
+    job: dict[str, Any] = {}
+
+    for index in range(17):
+        _record_human_response(job, message=f"response {index}")
+
+    assert job["human_responses"] == [f"response {index}" for index in range(17)]
+    assert job["current_human_response"] == "response 16"
+
+
 def _prepared_resume(
     git_repo: Path,
     *,

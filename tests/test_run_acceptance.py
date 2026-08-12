@@ -644,6 +644,28 @@ def test_run_repair_rejects_ticket_development_thread_reuse(
         ).accept(str(state["run_id"]))
 
 
+def test_run_acceptance_discards_a_review_when_its_parent_snapshot_drifts(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+
+    class DriftingReviewer:
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            request["parent"]["revision"] = "drifted-during-review"
+            return ReviewResult("run-reviewer", _passing_artifact())
+
+    pending = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=DriftingReviewer(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    ).accept(str(state["run_id"]))
+
+    assert pending["run_acceptance"]["phase"] == "pending"
+    assert "acceptance_artifact" not in pending["run_acceptance"]
+    assert "acceptance_record" not in pending["run_acceptance"]
+
+
 def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     git_repo: Path,
 ) -> None:

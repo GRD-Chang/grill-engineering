@@ -195,7 +195,7 @@ class FixtureAgentBackend:
             raise ValueError(error)
         if callable(event):
             event("completed", reported_thread_id=thread_id, attempt_count=1)
-        return _publication_wire(step)
+        return result
 
     def review(self, request: dict[str, Any]) -> ReviewResult:
         name = (
@@ -282,9 +282,24 @@ class FixtureAgentBackend:
                 invocation_mode=request.get("_invocation_mode"),
             )
             event("thread_started", reported_thread_id=thread_id, attempt_count=1)
-            event("completed", reported_thread_id=thread_id, attempt_count=1)
         result = _publication_wire(step)
         result["_thread_id"] = thread_id
+        if callable(event) and has_expected_thread:
+            try:
+                normalized = parse_publication_wire_result(result)
+                if normalized["result_kind"] == "publication":
+                    PublicationArtifact.parse(
+                        normalized, delivery_run=str(request.get("run_id", "fixture"))
+                    )
+            except ValueError as error:
+                event(
+                    "failed",
+                    reported_thread_id=thread_id,
+                    attempt_count=1,
+                    error=str(error),
+                )
+                raise
+            event("completed", reported_thread_id=thread_id, attempt_count=1)
         return result
 
     def _next(self, name: str) -> dict[str, Any]:
