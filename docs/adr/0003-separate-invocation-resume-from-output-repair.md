@@ -1,4 +1,4 @@
-# ADR 0003：区分 Invocation Resume 与 Output Repair
+# ADR 0003：区分 Invocation Resume、Requeue 与 Output Repair
 
 ## 状态
 
@@ -14,10 +14,22 @@ currentness。
 进程、凭据、sandbox、timeout、signal、非零退出、缺少最终输出或 Thread mismatch 均结束为
 一次 `execution_failed`，不自动重试或替换 Thread。Controller 在启动前保存 active Invocation，
 收到 `thread.started` 时立即保存 reported Thread。操作者后续 `resume` 默认恢复该 Thread，只有
-显式 `--new-thread` 或没有可恢复 Thread 时才以标准阶段 Prompt 新开。
+显式 `--new-thread` 或没有可恢复 Thread 时才以标准阶段 Prompt 新开。Resume 是同一 Job Generation
+内的 Invocation successor，不迁移或重置 Candidate、Acceptance、Human Response、branch/PR 或修复预算。
+
+当机械 Currentness Boundary 已经漂移，Controller 不让 Resume 猜测新事实或继续旧 checkout。Ticket 与
+Parent-only Change Job 停在 `requeue_required`，只能由操作者显式 `requeue`：旧 Generation 只保留有界
+审计事实，新 Generation 从该命令时重新读取的权威状态获得新的 Thread，且在拥有 generation-local
+branch/PR 时获得新的 branch/PR。Run Acceptance 与 Final Run Publication 不使用 generation-local
+branch/PR；它们的边界漂移回到 fresh Run Acceptance。未知外部 PR mutation、Candidate/Acceptance
+不一致等不可机械重建的事实仍是 Human Blocker，而不是 Requeue。
 
 ## 后果
 
 Output Repair 不增加 Development、Fresh Acceptance 或领域 Publication attempt。Candidate 与
 仍 current 的 Acceptance 可在 Invocation 失败后保留。`status`/`history` 可展示有界错误与
 Invocation 事实，而无需保存 stdout、Prompt、transcript 或 tool events。
+
+这个分层使三种动作互不替代：Output Repair 只修复零退出后的格式问题；Resume 只继续当前失败或
+Human Blocker Invocation；Requeue 只替换已经 stale 的 Generation。任何一层都不授予 Publisher
+Mutation Authority，也不能绕过 Required Checks 或 Published-Head Gate。

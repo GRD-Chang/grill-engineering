@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.error_safety import bounded_error
+
 
 MAX_TIMELINE_EVENTS = 256
 
@@ -39,8 +41,12 @@ class StateStore:
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         destination = self.runs_directory / f"{run_id}.json"
         previous = self.load_run(run_id)
-        if "run_id" in state:
-            _append_timeline_event(state, previous)
+        durable_state = _sanitize_durable_errors(deepcopy(state))
+        if "run_id" in durable_state:
+            _append_timeline_event(durable_state, previous)
+            state["timeline"] = durable_state["timeline"]
+            if durable_state.get("timeline_at_capacity") is True:
+                state["timeline_at_capacity"] = True
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.runs_directory,
             prefix=f".{run_id}.",
@@ -51,7 +57,7 @@ class StateStore:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
                 json.dump(
-                    state,
+                    durable_state,
                     temporary_file,
                     ensure_ascii=False,
                     indent=2,
@@ -398,6 +404,32 @@ def _timeline_result(state: dict[str, Any]) -> object:
         not in {"waiting_human", "waiting_checks", "all_tickets_completed"}
         else None
     )
+
+
+def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
+    """Redact only error-bearing fields before a Run state reaches disk."""
+
+    sanitized = _sanitize_error_value(value)
+    if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
+        raise ValueError("durable Run state must be a mapping")
+    return sanitized
+
+
+def _sanitize_error_value(value: object, *, diagnostic: bool = False) -> object:
+    if isinstance(value, list):
+        return [_sanitize_error_value(item, diagnostic=diagnostic) for item in value]
+    if not isinstance(value, dict):
+        return value
+    sanitized: dict[object, object] = {}
+    for key, item in value.items():
+        is_diagnostic = key == "diagnostics"
+        if (key == "error" or key.endswith("_error")) and isinstance(item, str):
+            sanitized[key] = bounded_error(item)
+        elif key == "message" and diagnostic and isinstance(item, str):
+            sanitized[key] = bounded_error(item)
+        else:
+            sanitized[key] = _sanitize_error_value(item, diagnostic=is_diagnostic)
+    return sanitized
 
 
 class FaultInjectingStateStore(StateStore):

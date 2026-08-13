@@ -21,6 +21,15 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.parent_delivery import ParentDeliveryEngine
+from agent_run.error_safety import bounded_error
+from agent_run.runner_promotion import (
+    codex_cli_version,
+    current_immutable_runner,
+    promotion_audit_file,
+    require_promotion_audit,
+    run_promotion_handshake,
+    verify_immutable_runner,
+)
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.worker_sandbox import WorkerSandboxError
@@ -37,12 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(start)
     start.add_argument("--new-run", action="store_true", help=argparse.SUPPRESS)
     run = subcommands.add_parser(
-        "run", help="自动推进交付运行至需要人工处理的阶段"
+        "run", help="推进正常 Job Loop，停在需要操作者处理的边界"
     )
     run.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(run)
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    resume = subcommands.add_parser("resume", help="按稳定运行 ID 恢复交付运行")
+    resume = subcommands.add_parser(
+        "resume", help="仅恢复当前失败或 Human Blocker 的 Agent Invocation"
+    )
     resume.add_argument("run_id", help="交付运行标识")
     _add_common_options(resume)
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
@@ -52,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="为当前失败或人工阻塞的 Agent 阶段新开 Thread",
     )
     requeue = subcommands.add_parser(
-        "requeue", help="从最新权威状态创建新的 Change Job Generation"
+        "requeue", help="仅从 requeue_required 创建新的 Change Job Generation"
     )
     requeue.add_argument("run_id", help="交付运行标识")
     _add_common_options(requeue)
@@ -82,24 +93,32 @@ def build_parser() -> argparse.ArgumentParser:
     publish_run.add_argument("run_id", help="交付运行标识")
     _add_common_options(publish_run)
     publish_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    approve = subcommands.add_parser("approve", help="显式合并最终 Run PR")
+    approve = subcommands.add_parser("approve", help="显式批准并合并已通过门禁的最终 Run PR")
     approve.add_argument("run_id", help="交付运行标识")
     _add_common_options(approve)
-    revise = subcommands.add_parser("revise", help="以人工反馈开启新的 Run 修复窗口")
+    revise = subcommands.add_parser("revise", help="以 Run 级人工反馈开启新的修复窗口")
     revise.add_argument("run_id", help="交付运行标识")
     revise.add_argument("--message", required=True, help="未经改写的修订反馈")
     _add_common_options(revise)
-    abandon = subcommands.add_parser("abandon", help="放弃交付运行并清理本地临时资源")
+    abandon = subcommands.add_parser("abandon", help="放弃交付运行并执行受限恢复与清理")
     abandon.add_argument("run_id", help="交付运行标识")
     _add_common_options(abandon)
-    status = subcommands.add_parser("status", help="显示当前交付运行状态")
+    status = subcommands.add_parser("status", help="显示当前状态与下一条允许的操作")
     status.add_argument("run_id", help="交付运行标识")
     _add_common_options(status)
     status.add_argument("--json", action="store_true", dest="as_json")
-    history = subcommands.add_parser("history", help="显示交付运行时间线")
+    history = subcommands.add_parser("history", help="显示有界 Invocation 与状态时间线")
     history.add_argument("run_id", help="交付运行标识")
     _add_common_options(history)
     history.add_argument("--json", action="store_true", dest="as_json")
+    promotion = subcommands.add_parser(
+        "promotion-handshake",
+        help="从不可变 Runner 执行一次真实 Structured Outputs promotion handshake",
+    )
+    promotion.add_argument("runner_sha", help="已合入 origin/main 的完整 40 位 commit SHA")
+    promotion.add_argument(
+        "--audit-file", required=True, help="新建的脱敏 promotion 审计 JSON 路径"
+    )
     return parser
 
 
@@ -107,9 +126,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     parsed = parser.parse_args(arguments)
     controller: Controller | None = None
+    states: StateStore | FaultInjectingStateStore | None = None
     precondition_failed = False
     try:
         git = GitRepository.discover(Path.cwd())
+        if parsed.command == "promotion-handshake":
+            verification = verify_immutable_runner(git.root, parsed.runner_sha)
+            record = run_promotion_handshake(
+                checkout=git.root,
+                audit_file=Path(parsed.audit_file),
+                verification=verification,
+            )
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            return 0 if record["handshake_verdict"] == "passed" else 2
         state_root = (
             Path(parsed.state_dir).resolve()
             if parsed.state_dir
@@ -140,6 +169,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state = cli_surface._load_local_run(states, parsed.run_id)
             cli_presentation._print_history(state, as_json=parsed.as_json)
             return 0
+        runner_verification = current_immutable_runner()
+        if runner_verification is None:
+            if fixture_path is None:
+                raise ValueError(
+                    "self-hosting lifecycle commands require an immutable promoted Runner"
+                )
+        else:
+            active_codex_version = codex_cli_version()
+            if active_codex_version is None:
+                raise ValueError("could not determine Codex CLI version for promotion audit")
+            require_promotion_audit(
+                runner_verification,
+                promotion_audit_file(runner_verification),
+                active_codex_version,
+            )
         if cli_surface._is_lifecycle_action(parsed.command):
             local_state = cli_surface._load_local_run(states, parsed.run_id)
             if not cli_surface._command_is_ready(local_state, parsed.command):
@@ -555,7 +599,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             and isinstance(run_id, str)
         ):
             failure_recorded = controller.record_execution_failure(
-                run_id, str(error)
+                run_id, bounded_error(str(error))
             )
         durable_status = None
         durable_diagnostics: list[object] | None = None

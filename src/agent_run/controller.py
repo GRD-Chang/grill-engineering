@@ -12,6 +12,7 @@ from agent_run.change_currentness import (
     stale_change_job_reason,
     unknown_pr_mutation,
 )
+from agent_run.error_safety import bounded_error
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
@@ -361,7 +362,7 @@ class Controller:
                     "diagnostics": [
                         {
                             "code": "command_failed",
-                            "message": message,
+                            "message": bounded_error(message),
                         }
                     ],
                     "updated_at": _now(),

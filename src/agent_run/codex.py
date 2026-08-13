@@ -30,6 +30,7 @@ from agent_run.github_auth import (
     GitHubCredentialError,
     mint_read_only_installation_token,
 )
+from agent_run.error_safety import bounded_error
 from agent_run.worker_sandbox import (
     WorkerSandboxError,
     bubblewrap_command,
@@ -92,6 +93,21 @@ class CodexCliBackend:
         return DevelopmentResult(
             thread_id=actual_thread,
             summary=str(result["summary"]),
+        )
+
+    def publication_schema_handshake(self, checkout: Path) -> tuple[str, str]:
+        """Exercise the production Publication schema boundary once, read-only."""
+
+        return self._invoke(
+            prompt=(
+                "这是一次受控 Structured Outputs schema handshake。不要读取或修改仓库，不要调用"
+                "工具。仅返回 result_kind 为 human_blocker，三个 publication 字段为 null，"
+                "human_blockers 为只含一条非空中文字符串的数组。"
+            ),
+            checkout=checkout,
+            thread_id=None,
+            schema=publication_or_human_blocker_schema(),
+            writable_checkout=False,
         )
 
     @staticmethod
@@ -719,22 +735,7 @@ def _is_json_scalar(value: object) -> bool:
 
 
 def _bounded_error(value: str) -> str:
-    clean = "".join(character for character in value if character >= " " or character in "\n\t")
-    clean = re.sub(
-        r"(?i)\b(authorization|proxy-authorization)"
-        r"([\"']?\s*[:=]\s*[\"']?)(?:(?:bearer|basic)\s+)?"
-        r"([^\s,;\"'}]+)",
-        r"\1\2[REDACTED]",
-        clean,
-    )
-    clean = re.sub(
-        r"(?i)\b(token|api[_-]?key|secret|password)"
-        r"([\"']?\s*[:=]\s*[\"']?)([^\s,;\"'}]+)",
-        r"\1\2[REDACTED]",
-        clean,
-    )
-    encoded = clean.encode("utf-8")[:8192]
-    return encoded.decode("utf-8", errors="ignore")
+    return bounded_error(value)
 
 
 def _thread_line_callback(
