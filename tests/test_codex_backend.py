@@ -608,7 +608,7 @@ def test_publication_prompts_require_semantic_titles() -> None:
     assert "Conventional Commit 语义标题格式" in ticket_prompt
     assert "Conventional Commit 语义标题格式" in run_prompt
     assert "`Primary Ticket: #" not in ticket_prompt
-    assert "Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入" in run_prompt
+    assert "CI、Candidate、SHA、门禁和生命周期事实不得写入叙事" in run_prompt
 
 
 def test_run_publication_prompt_reserves_identity_for_publisher(

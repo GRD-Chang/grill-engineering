@@ -13,8 +13,16 @@ Codex Worker 返回的结构化意图、判断与证据。它可以包含代码�
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **Development Brief（开发简报）**:
-提供给 Development Codex 的最小语义输入，包括 Parent Issue URL、适用时的当前 Ticket URL、不可重建的原始失败证据、GitHub 上下文约定和输出要求。Codex 直接从本地 worktree 与只读 GitHub 访问获取代码、Issue 与历史 PR 事实，并自主判断需要读取哪些相关对象；Controller 不把 Delivery Run、Revision、SHA 或其他内部运行账本作为任务输入。
+提供给 Development Codex 的最小语义输入，包括 Parent Issue URL、适用时的当前 Ticket URL、不可重建的原始失败证据、GitHub 上下文约定和输出要求。当前 Issue 的 title/body 是需求源；Issue 评论、历史 PR、开发者总结和旧 Artifact 仅是调查线索，不能覆盖当前需求或单独构成验收证据。Codex 直接从本地 worktree 与只读 GitHub 访问获取代码、Issue 与历史 PR 事实，并自主判断需要读取哪些相关对象；Controller 不把 Delivery Run、Revision、SHA 或其他内部运行账本作为任务输入。
 _Avoid_: Change Job Record、完整环境快照、实现计划
+
+**Delivery Hygiene（交付卫生）**:
+Development 与 Repair 在当前 checkout 中承担完整交付整理责任：检查全部未提交内容，保留本任务必须交付的代码、测试、文档和配置，删除本次产生的临时、构建和测试产物；仅长期、可再生且不应版本控制的项目产物可进入 `.gitignore`。Fresh Validation、Run Acceptance 与 Publication 只能清理自己创建的验证或临时产物，不得整理交付内容或修改源码、测试、配置和 `.gitignore`。任一 Codex 在 checkout 外创建的临时路径必须可定位、只服务本次任务并在完成前清理，不得进行宽泛删除。Codex 不提交，最终 Git/GitHub 写入仍属于 Publisher。
+_Avoid_: 用 `.gitignore` 隐藏交付、验证者修改交付、留下不应交付的中间产物、Codex 自行提交
+
+**Managed Development Checkout（受管开发工作区）**:
+Controller 为一个 Change Job 创建并在 Development Attempt、Repair 与 Resume 间复用的专属 worktree。它与主工作区、其他 Change Job 和一次性 Validation Checkout 隔离；系统只允许该 Job 的 Codex 整理其未提交内容，并在 Candidate 创建后交由 Publisher 写入 Git 历史。系统运行约束禁止向其中人工混入无关改动。
+_Avoid_: 主工作区、共享 scratch worktree、Validation Checkout
 
 **Development Attempt（开发尝试）**:
 Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内部规划、代码编辑和开发验证的一轮工作。同一 Change Job 的各次 Development Attempt 复用其 Development Thread，通过新的 Turn 接收最新版 Development Brief 与 Acceptance Artifact；它直接产出 worktree diff 与 Development Summary，不经过独立 Planning Phase。
@@ -63,7 +71,7 @@ Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用�
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:
-Development 与 Fresh Validation Codex 必须按 Prompt 派发不同 subagent、处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 状态/证据与外层 SHA/Revision 绑定。内部 subagent 发现的 Human Blocker 先交给本阶段顶层 Codex；只有顶层 Codex 的最终结构化输出可传给 Controller。
+Development 与 Repair Codex 必须在自测后按 Prompt 派发 Standards 与 Spec 预审 subagent，尽早修复发现的问题；该预审不构成通过决定，也不替代独立验收。Fresh Validation 与 Run Acceptance Codex 必须按 Prompt 派发独立的 E2E、Standards 与 Spec 三条 lane，处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 状态/证据与外层 SHA/Revision 绑定。内部 subagent 发现的 Human Blocker 先交给本阶段顶层 Codex；只有顶层 Codex 的最终结构化输出可传给 Controller。
 _Avoid_: Controller 内部 Agent 编排器、subagent provenance ledger、父 Agent 自签
 
 **Controller（控制器）**:
@@ -120,7 +128,7 @@ _Avoid_: Ticket Fresh Acceptance、简单汇总各票 pass、最终人工验收
 _Avoid_: Ticket Content Revision、人工逐次确认、复用旧验收
 
 **Run Publication Codex（运行发布 Codex）**:
-Run Acceptance 通过后由 Controller 启动的只读 YOLO Codex，读取 Parent Spec、完整 Ticket Set、各 Ticket PR、准确累计 diff 与真实验证证据，生成符合统一 PR Narrative 的 Run PR title/body。正常 Run Publication Attempt 使用新的 Codex Thread；失败或 Human Blocker 只能通过显式 `resume` 继续同一 Thread，或用 `--new-thread` 新开 Thread，并重新读取权威状态后继续或再次报告 blocker。完整 flat contract 输出不合法时最多进行两次同 Thread、只读 Output Repair。它的职责只包含发布语义，不复用 Reviewer Thread、不执行验收；Run Branch、默认分支 base、有效需求或证据变化后必须基于新状态重新生成。
+Run Acceptance 通过后由 Controller 启动的只读 YOLO Codex，读取 Parent Spec、完整 Ticket Set、各 Ticket PR、准确累计 diff 与真实验证证据，生成符合统一 PR Narrative 的 Run PR title/body。正常 Run Publication Attempt 使用新的 Codex Thread；失败或 Human Blocker 只能通过显式 `resume` 继续同一 Thread，或用 `--new-thread` 新开 Thread，并重新读取权威状态后继续或再次报告 blocker。完整 flat contract 输出不合法时最多进行两次同 Thread、只读 Output Repair。它的职责只包含发布语义，不复用 Reviewer Thread、不执行验收、不整理 Candidate checkout；若自己创建 checkout 外临时路径，负责在完成前按 Delivery Hygiene 清理。Run Branch、默认分支 base、有效需求或证据变化后必须基于新状态重新生成。
 _Avoid_: Run Acceptance Reviewer、Controller 拼接正文、Run Repair Thread
 
 **Run Repair Thread（运行修复线程）**:
@@ -212,11 +220,11 @@ Development Codex 在 Development Attempt 结束时返回的普通、可读最�
 _Avoid_: Publication Artifact、Controller Evidence、完成证明
 
 **Publication Artifact（发布产物）**:
-Candidate Commit 通过 Fresh Acceptance 后，Development Codex 根据已验收的最终 diff 与实际验证生成的小型结构化语义产物，提供语义 commit message、`type(scope): user-facing outcome` 格式的 PR title 和符合统一 PR Narrative 的完整正文。需求、最终方案、用户影响、验证证据或 Cross-Ticket Note 变化时，原 Development Thread 必须按累计 diff 更新对应语义；Publisher 只校验结构并执行写入，不改写 Agent 内容。
+Candidate Commit 通过 Fresh Acceptance 后，由独立、只读的 Publication Codex 根据当前 Issue、已验收的最终 diff 与完整 Fresh Acceptance 证据生成的小型结构化语义产物，提供语义 commit message、`type(scope): user-facing outcome` 格式的 PR title 和符合统一 PR Narrative 的完整正文。需求、最终方案、用户影响或验证证据变化时，Publication Codex 必须重新读取当前事实并更新产物；Publisher 只校验结构并执行写入，不改写 Agent 内容。
 _Avoid_: Development Summary、独立发现工作流、验证记录
 
 **PR Narrative（PR 语义正文）**:
-Development Codex 为 Ticket PR 与 Run Repair PR、Run Publication Codex 为 Run PR 编写并保持准确的统一耐久说明，顶部身份分别使用 `Primary Ticket: #N`、`Delivery Run: <id>`、或 `Parent Spec: #N` 加 `Delivery Run: <id>`，正文均包含非空的 `What Problem This Solves`、`Why This Change Was Made`、`User Impact` 和 `Evidence`，Ticket PR 还可包含 Cross-Ticket Note。`Evidence` 只记录真实执行的命令与结果、CI、人工观察或相关产物；UI、交互或可视输出变化时才加入 before/after 图片或视频，无内容的可选段落必须整个省略。
+Publication Codex 为 Ticket PR、Run Repair PR 与 Run PR 编写并保持准确的统一耐久说明，顶部身份分别使用 `Primary Ticket: #N`、`Delivery Run: <id>`、或 `Parent Spec: #N` 加 `Delivery Run: <id>`，正文均包含非空的 `What Problem This Solves`、`Why This Change Was Made`、`User Impact` 和 `Evidence`，Ticket PR 还可包含 Cross-Ticket Note。`Evidence` 只记录独立 Fresh Acceptance 或 Run Acceptance 三条 lane 的真实证据，每条以“场景 → 实际操作或命令 → 可观察结果”表达；CI、Candidate、SHA、门禁和生命周期等机器事实由 Publisher 的 Agent Run Status 评论呈现，不进入叙事正文。UI、交互或可视输出变化时才加入 before/after 图片或视频，无内容的可选段落必须整个省略。
 _Avoid_: Files changed 复述、通用 checklist、Agent 内部元数据
 
 **Cross-Ticket Note（跨 Ticket 说明）**:
@@ -228,7 +236,7 @@ Publisher 为每张已创建的开放自动化 PR 维护的一条 `Agent Run Sta
 _Avoid_: PR Narrative、Agent 自述、重复验证说明
 
 **Fresh Acceptance（独立验收）**:
-Candidate Commit 创建后、生成 Publication Artifact 与 Publication Commit 前，由 Controller 按 Change Job Contract 启动全新 YOLO Reviewer Thread，在独立 Validation Checkout 中针对准确的 base SHA、Candidate Commit SHA、有效 Revision、需求源和验收标准执行实际使用与代码审查。正常新一轮验收使用新的 Thread 和 checkout，不继承 Development Thread、旧 Reviewer Thread 或任何开发者自我判断；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Reviewer Thread，但仍重新创建一次性 Validation Checkout 并重新核验。只有其通过结果、Publication Commit 与已验收 Candidate 的 tree equality 以及随后 Published-Head Gate 同时有效，目标 PR 才可进入 Run Branch。
+Candidate Commit 创建后、生成 Publication Artifact 与 Publication Commit 前，由 Controller 按 Change Job Contract 启动全新 YOLO Reviewer Thread，在独立 Validation Checkout 中针对准确的 base SHA、Candidate Commit SHA、有效 Revision、需求源和验收标准执行实际使用与代码审查。正常新一轮验收使用新的 Thread 和 checkout，不继承 Development Thread、旧 Reviewer Thread 或任何开发者自我判断；唯一例外是 Human Blocker resume：它复用刚刚被阻塞的 Reviewer Thread，但仍重新创建一次性 Validation Checkout 并重新核验。它可为验证构建和运行测试，但不得修复源码、测试、配置或 `.gitignore`，发现的问题必须进入 Acceptance Artifact。只有其通过结果、Publication Commit 与已验收 Candidate 的 tree equality 以及随后 Published-Head Gate 同时有效，目标 PR 才可进入 Run Branch。
 _Avoid_: 开发者自测、第二次 GitHub Codex Review、仅测试通过
 
 **Validation Checkout（验收工作区）**:

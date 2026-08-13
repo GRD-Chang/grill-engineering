@@ -367,6 +367,24 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "PRIOR_BLOCKER_SENTINEL" not in prompt
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
+            assert "Controller" not in prompt, active_case
+            assert "Publisher" not in prompt, active_case
+            assert "受管工作区" not in prompt, active_case
+            assert "当前 Issue 的 title/body 是唯一需求源" in prompt, active_case
+            if method == "develop":
+                assert "在当前 checkout 中检查全部未提交内容" in prompt, active_case
+                assert "仅长期、可再生且不应版本控制的项目产物" in prompt, active_case
+                assert "不得 commit、push、merge、关闭或修改 GitHub" in prompt, active_case
+            elif method == "review":
+                assert "真实 E2E、Standards Review 和 Spec Review" in prompt, active_case
+                assert "不得修复源码、测试、配置或 `.gitignore`" in prompt, active_case
+                if name == "run_acceptance":
+                    assert "跨 Ticket 交互" in prompt
+                    assert "预期合并结果" in prompt
+            else:
+                assert "What Problem This Solves" in prompt, active_case
+                assert "场景 → 实际操作或命令 → 可观察结果" in prompt, active_case
+                assert "CI、Candidate、SHA、门禁和生命周期" in prompt, active_case
 
 
 def test_run_prompts_describe_run_scope_without_controller_private_records() -> None:
@@ -389,7 +407,7 @@ def test_run_prompts_describe_run_scope_without_controller_private_records() -> 
     assert "Required-Checks Repair：当前 Ticket" not in checks_repair
     assert "Completion Record" not in run_acceptance
     assert "Expected Merge Result" not in run_acceptance
-    assert "准备好的累计 diff" in run_acceptance
+    assert "累计 diff、跨 Ticket 交互、整体需求和预期合并结果" in run_acceptance
 
 
 def test_human_blocker_resume_context_reaches_original_thread_stdin_verbatim(
