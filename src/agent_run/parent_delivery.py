@@ -230,7 +230,7 @@ class ParentDeliveryEngine:
 
     def retire_for_child_flow(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
-            state = self.states.load_run(run_id)
+            state = self.states.load_current_run(run_id)
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
             job = state.get("parent_job")
@@ -246,7 +246,7 @@ class ParentDeliveryEngine:
             return state
 
     def _load(self, run_id: str) -> dict[str, Any]:
-        state = self.states.load_run(run_id)
+        state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         if state.get("delivery_type") != "parent_only":

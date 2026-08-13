@@ -9,7 +9,7 @@ from typing import Sequence
 from agent_run import cli_presentation, cli_surface
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.codex import CodexCliBackend, CodexProcessError
-from agent_run.controller import Controller, IncompatibleRunStateError
+from agent_run.controller import Controller
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
@@ -22,6 +22,7 @@ from agent_run.run_publication import RunPublicationEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.state import FaultInjectingStateStore, StateStore
+from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.worker_sandbox import WorkerSandboxError
 
 
@@ -558,7 +559,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
         durable_status = None
         durable_diagnostics: list[object] | None = None
-        if states is not None and isinstance(run_id, str):
+        if not incompatible_state and states is not None and isinstance(run_id, str):
             durable = states.load_run(run_id)
             if isinstance(durable, dict):
                 durable_status = durable.get("status")
@@ -610,7 +611,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             "message": diagnostic_message,
                         }
                     ]
-                    if durable_status != "blocked" or durable_diagnostics is None
+                    if incompatible_state
+                    or durable_status != "blocked"
+                    or durable_diagnostics is None
                     else durable_diagnostics,
                 },
                 ensure_ascii=False,

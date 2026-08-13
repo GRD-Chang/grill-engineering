@@ -66,7 +66,7 @@ class RunAcceptanceEngine:
 
     def accept(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
-            state = self.states.load_run(run_id)
+            state = self.states.load_current_run(run_id)
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
             if not self._refresh_run_currentness(state):
@@ -160,7 +160,7 @@ class RunAcceptanceEngine:
                 role="reviewer",
                 phase="run_acceptance",
                 work_subject=f"run-acceptance:{state['run_id']}",
-                generation=validation_attempt,
+                generation=int(run["acceptance_generation"]),
                 invocation_input=request,
                 currentness_boundary=run_currentness_boundary(
                     state,
@@ -451,6 +451,7 @@ class RunAcceptanceEngine:
             return existing
         run = {
             "phase": "pending",
+            "acceptance_generation": 1,
             "modification_attempts": 0,
             "validation_attempts": 0,
             "development_thread_id": None,

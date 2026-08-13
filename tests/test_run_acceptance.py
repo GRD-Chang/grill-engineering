@@ -68,6 +68,31 @@ def _human_artifact() -> dict[str, object]:
     return artifact
 
 
+def _failed_invocation(
+    *, role: str, phase: str, work_subject: str, generation: int,
+    requested_thread_id: str | None, reported_thread_id: str | None,
+    currentness_boundary: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "work_subject": work_subject,
+        "generation": generation,
+        "role": role,
+        "phase": phase,
+        "mode": "fresh",
+        "input_fingerprint": "fixture",
+        "currentness_boundary": currentness_boundary or {},
+        "status": "failed",
+        "requested_thread_id": requested_thread_id,
+        "reported_thread_id": reported_thread_id,
+        "attempt_count": 1,
+        "started_at": "2026-08-13T00:00:00+00:00",
+        "ended_at": "2026-08-13T00:00:01+00:00",
+        "error": "fixture failure",
+        "return_code": 1,
+        "signal": None,
+    }
+
+
 class ScriptedRunAgents:
     def __init__(self) -> None:
         self.development_requests: list[dict[str, Any]] = []
@@ -268,21 +293,21 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": [],
     }
-    state["active_agent_invocation"] = {
-        "role": "reviewer",
-        "phase": "run_acceptance",
-        "work_subject": f"run-acceptance:{state['run_id']}",
-        "generation": 1,
-        "status": "failed",
-        "requested_thread_id": None,
-        "reported_thread_id": "failed-run-reviewer",
-    }
+    state["active_agent_invocation"] = _failed_invocation(
+        role="reviewer",
+        phase="run_acceptance",
+        work_subject=f"run-acceptance:{state['run_id']}",
+        generation=1,
+        requested_thread_id=None,
+        reported_thread_id="failed-run-reviewer",
+    )
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -300,6 +325,40 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
         assert run["reviewer_resume_thread_id"] == "failed-run-reviewer"
 
 
+def test_second_reviewer_attempt_keeps_the_run_acceptance_generation(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    state["run_acceptance"] = {
+        "phase": "reviewing",
+        "acceptance_generation": 1,
+        "modification_attempts": 0,
+        "validation_attempts": 2,
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+    }
+    state["active_agent_invocation"] = _failed_invocation(
+        role="reviewer",
+        phase="run_acceptance",
+        work_subject=f"run-acceptance:{state['run_id']}",
+        generation=1,
+        requested_thread_id=None,
+        reported_thread_id="second-run-reviewer",
+    )
+    state["status"] = "execution_failed"
+    states.save_run(str(state["run_id"]), state)
+
+    resumed, _ = Controller(
+        FixtureGitHubReader(git_repo / "github.json"), git, states
+    ).resume(str(state["run_id"]))
+
+    assert resumed["status"] == "run_acceptance_pending"
+    assert resumed["run_acceptance"]["validation_attempts"] == 2
+    assert resumed["active_agent_invocation"]["generation"] == 1
+    assert resumed["active_agent_invocation"]["status"] == "resuming"
+
+
 @pytest.mark.parametrize(
     ("role", "work_subject"),
     [
@@ -313,22 +372,25 @@ def test_resume_rejects_stale_run_invocation_before_agent_start(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": [],
     }
-    state["active_agent_invocation"] = {
-        "role": role,
-        "phase": "run_acceptance" if role == "reviewer" else "run_publication",
-        "work_subject": work_subject.format(run_id=state["run_id"]),
-        "generation": 1,
-        "status": "failed",
-        "requested_thread_id": "failed-thread",
-        "reported_thread_id": "failed-thread",
-        "currentness_boundary": {"reviewed_head_sha": "stale-head"},
-    }
+    if role == "final_publication":
+        state["run_acceptance"]["phase"] = "accepted"
+        state["run_publication"] = {"phase": "publishing"}
+    state["active_agent_invocation"] = _failed_invocation(
+        role=role,
+        phase="run_acceptance" if role == "reviewer" else "run_publication",
+        work_subject=work_subject.format(run_id=state["run_id"]),
+        generation=1,
+        requested_thread_id="failed-thread",
+        reported_thread_id="failed-thread",
+        currentness_boundary={"reviewed_head_sha": "stale-head"},
+    )
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -485,21 +547,21 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": [],
     }
-    state["active_agent_invocation"] = {
-        "role": "reviewer",
-        "phase": "run_acceptance",
-        "work_subject": f"run-acceptance:{state['run_id']}",
-        "generation": 1,
-        "status": "failed",
-        "requested_thread_id": None,
-        "reported_thread_id": "failed-run-reviewer",
-    }
+    state["active_agent_invocation"] = _failed_invocation(
+        role="reviewer",
+        phase="run_acceptance",
+        work_subject=f"run-acceptance:{state['run_id']}",
+        generation=1,
+        requested_thread_id=None,
+        reported_thread_id="failed-run-reviewer",
+    )
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -1417,6 +1479,7 @@ def test_interrupted_run_review_restarts_with_a_fresh_attempt(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
         "development_thread_id": None,

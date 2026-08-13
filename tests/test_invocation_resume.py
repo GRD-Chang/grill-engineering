@@ -18,6 +18,7 @@ from agent_run.human_responses import append_human_response
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
+from agent_run.state_contract import IncompatibleRunStateError
 from conftest import write_fixture
 
 
@@ -163,6 +164,7 @@ def _prepared_resume(
             {
                 "ticket_number": 3,
                 "ticket_branch_generation": 2,
+                "phase": "accepted",
                 "publication_thread_id": "current-ticket-thread",
             }
         )
@@ -170,7 +172,9 @@ def _prepared_resume(
         work_subject = "ticket:3"
     elif subject_kind == "run_repair":
         state["run_acceptance"] = {
+            "phase": "repairing",
             "repair_job": {
+                "phase": "accepted",
                 "repair_generation": 2,
                 "publication_thread_id": "current-repair-thread",
             }
@@ -179,14 +183,19 @@ def _prepared_resume(
         work_subject = f"run-repair:{run_id}"
     elif subject_kind == "final_publication":
         state["run_acceptance"] = {
+            "phase": "accepted",
             "validation_attempts": 2,
             "acceptance_generation": 2,
         }
-        state["run_publication"] = {"thread_id": "current-final-thread"}
+        state["run_publication"] = {
+            "phase": "publishing",
+            "thread_id": "current-final-thread",
+        }
         role = "final_publication"
         work_subject = f"run-publication:{run_id}"
     elif subject_kind == "parent_only":
         state["parent_job"] = {
+            "phase": "accepted",
             "publication_thread_id": "current-parent-thread"
         }
         role = "publication"
@@ -197,14 +206,24 @@ def _prepared_resume(
     invocation: dict[str, Any] = {
         "role": role,
         "work_subject": work_subject,
+        "phase": "run_publication" if role == "final_publication" else "publication",
+        "mode": "fresh",
+        "input_fingerprint": "fixture",
+        "currentness_boundary": {},
         "status": "failed",
         "requested_thread_id": "failed-thread",
         "reported_thread_id": "failed-thread",
+        "attempt_count": 1,
+        "started_at": "2026-08-13T00:00:00+00:00",
+        "ended_at": "2026-08-13T00:00:01+00:00",
+        "error": "fixture failure",
+        "return_code": 1,
+        "signal": None,
     }
     if invocation_generation is not _MISSING:
         invocation["generation"] = invocation_generation
     state["active_agent_invocation"] = invocation
-    state["agent_invocation_history"] = [{"marker": "before-resume"}]
+    state["agent_invocation_history"] = []
     state["status"] = "execution_failed"
     state["terminal_kind"] = "execution_failed"
     store.save_run(run_id, state)
@@ -233,7 +252,7 @@ def test_resume_fails_closed_for_stale_publication_generation(
         lambda saved_run_id, _state: save_calls.append(saved_run_id),
     )
 
-    with pytest.raises(ValueError, match="generation is stale"):
+    with pytest.raises(IncompatibleRunStateError, match="stale active"):
         controller.resume(run_id, new_thread=new_thread)
 
     assert save_calls == []
@@ -324,7 +343,7 @@ def test_parent_only_resume_rejects_invalid_generation_without_mutation(
         lambda saved_run_id, _state: save_calls.append(saved_run_id),
     )
 
-    with pytest.raises(ValueError, match="generation is invalid"):
+    with pytest.raises(IncompatibleRunStateError, match="generation"):
         controller.resume(run_id, new_thread=new_thread)
 
     assert save_calls == []

@@ -26,10 +26,11 @@ from agent_run.run_currentness import (
 )
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
-
-
-class IncompatibleRunStateError(ValueError):
-    """A persisted Run predates the one supported Invocation/Generation shape."""
+from agent_run.state_contract import (
+    IncompatibleRunStateError,
+    human_blocker_subject_count,
+    require_current_run_state,
+)
 
 
 class GitHubReader(Protocol):
@@ -274,7 +275,7 @@ class Controller:
         self, state: dict[str, Any], invocation: dict[str, Any]
     ) -> bool:
         boundary = invocation.get("currentness_boundary")
-        if not isinstance(boundary, dict):
+        if not isinstance(boundary, dict) or not boundary:
             # Invocations recorded before the Run boundary was introduced retain
             # their pre-existing resume behavior. Every #45 Run invocation writes
             # a boundary through invocation_event_recorder.
@@ -310,7 +311,7 @@ class Controller:
             if state is None:
                 return False
             try:
-                _require_current_run_state(state)
+                require_current_run_state(state)
             except IncompatibleRunStateError:
                 return False
             if state.get("status") in {
@@ -373,7 +374,7 @@ class Controller:
         state = self.states.load_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
-        _require_current_run_state(state)
+        require_current_run_state(state)
         repository = self.github.repository()
         if state.get("repository") != repository.name_with_owner:
             raise ValueError(
@@ -657,7 +658,7 @@ class Controller:
             self.states.save_run(run_id, state)
         else:
             state = existing
-            _require_current_run_state(state)
+            require_current_run_state(state)
             run_id = str(state["run_id"])
             if state.get("status") in {"abandoned", "abandonment_pending"}:
                 return state, True
@@ -743,72 +744,6 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _require_current_run_state(state: dict[str, Any]) -> None:
-    """Reject pre-cutover records before a Controller can mutate them.
-
-    No migration or compatibility read path exists. A partially written first
-    start is the only intentionally incomplete record: it carries explicit
-    null currentness fields while base resolution is pending.
-    """
-
-    if "schema_version" in state:
-        raise IncompatibleRunStateError(
-            "legacy state is incompatible with the Invocation/Generation contract"
-        )
-    for key, expected in (
-        ("run_id", str),
-        ("repository", str),
-        ("parent", dict),
-        ("base", dict),
-        ("ticket_graph", dict),
-        ("ticket_jobs", dict),
-        ("retired_ticket_generations", dict),
-        ("pending_ticket_retirements", dict),
-        ("frontier", list),
-        ("agent_invocation_history", list),
-        ("diagnostics", list),
-        ("status", str),
-    ):
-        if not isinstance(state.get(key), expected):
-            raise IncompatibleRunStateError(
-                f"legacy state is missing canonical {key}"
-            )
-    active = state.get("active_agent_invocation")
-    if active is not None and not isinstance(active, dict):
-        raise IncompatibleRunStateError(
-            "legacy state has an invalid active Agent Invocation"
-        )
-    active_ticket = state.get("active_ticket_job")
-    if active_ticket is not None and not isinstance(active_ticket, dict):
-        raise IncompatibleRunStateError(
-            "legacy state has an invalid active Ticket Job"
-        )
-    for key in (
-        "accepted_ticket_graph_revision",
-        "accepted_parent_spec_revision",
-    ):
-        if key not in state:
-            raise IncompatibleRunStateError(
-                f"legacy state is missing canonical {key}"
-            )
-    accepted_graph = state["accepted_ticket_graph_revision"]
-    accepted_parent = state["accepted_parent_spec_revision"]
-    if state.get("base_resolution_pending") is True:
-        if accepted_graph is not None or accepted_parent is not None:
-            raise IncompatibleRunStateError(
-                "initializing state has invalid currentness boundaries"
-            )
-        return
-    if not isinstance(accepted_graph, str) or not isinstance(accepted_parent, str):
-        if state.get("currentness_resolution_pending") is True and (
-            accepted_graph is None and accepted_parent is None
-        ):
-            return
-        raise IncompatibleRunStateError(
-            "legacy state lacks accepted currentness boundaries"
-        )
-
-
 def _resume_agent_human_blocker(
     state: dict[str, Any], human_response: str | None = None
 ) -> bool:
@@ -818,7 +753,7 @@ def _resume_agent_human_blocker(
     the maintainer chose to resume.  The controller neither interprets the
     condition nor declares it fixed.
     """
-    if _human_blocker_subject_count(state) > 1:
+    if human_blocker_subject_count(state) > 1:
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
@@ -1032,7 +967,7 @@ def _run_acceptance_for_invocation(
     generation = invocation.get("generation")
     if type(generation) is not int or generation < 1:
         raise ValueError("current Agent Invocation generation is invalid")
-    _require_invocation_generation(generation, run.get("validation_attempts"))
+    _require_invocation_generation(generation, run.get("acceptance_generation"))
     return run
 
 
@@ -1243,31 +1178,6 @@ def _run_acceptance_human_blocker(state: dict[str, Any]) -> bool:
         acceptance.get("phase") == "ready_for_human"
         and acceptance.get("blocked_reason")
         in {"agent_requires_human", "reviewer_requires_human"}
-    )
-
-
-def _human_blocker_subject_count(state: dict[str, Any]) -> int:
-    """Count current top-level Human Blocker subjects without choosing one."""
-    subjects: list[dict[str, Any]] = []
-    ticket_jobs = state.get("ticket_jobs")
-    if isinstance(ticket_jobs, dict):
-        subjects.extend(job for job in ticket_jobs.values() if isinstance(job, dict))
-    for key in ("parent_job", "run_acceptance", "run_publication"):
-        value = state.get(key)
-        if isinstance(value, dict):
-            subjects.append(value)
-            if key == "run_acceptance":
-                repair = value.get("repair_job")
-                if isinstance(repair, dict):
-                    subjects.append(repair)
-    return sum(1 for subject in subjects if _is_human_blocker(subject))
-
-
-def _is_human_blocker(subject: dict[str, Any]) -> bool:
-    return subject.get("phase") in {"blocked", "ready_for_human"} and (
-        subject.get("blocked_reason")
-        in {"agent_requires_human", "reviewer_requires_human"}
-        or isinstance(subject.get("human_blockers"), list)
     )
 
 

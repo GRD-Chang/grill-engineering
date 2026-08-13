@@ -9,6 +9,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from conftest import write_fixture
 
 
@@ -104,6 +106,34 @@ def load_only_run_state(repo: Path) -> dict[str, Any]:
     loaded: object = json.loads(run_files[0].read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
     return loaded
+
+
+def failed_invocation(
+    *,
+    work_subject: str,
+    role: str,
+    phase: str,
+    generation: int = 1,
+    status: str = "failed",
+) -> dict[str, Any]:
+    return {
+        "work_subject": work_subject,
+        "generation": generation,
+        "role": role,
+        "phase": phase,
+        "mode": "fresh",
+        "input_fingerprint": "fixture",
+        "currentness_boundary": {},
+        "status": status,
+        "requested_thread_id": None,
+        "reported_thread_id": None,
+        "attempt_count": 1,
+        "started_at": "2026-08-13T00:00:00+00:00",
+        "ended_at": "2026-08-13T00:00:01+00:00",
+        "error": "fixture failure",
+        "return_code": 1,
+        "signal": None,
+    }
 
 
 def test_start_creates_one_run_branch_and_resume_is_idempotent(
@@ -229,6 +259,474 @@ def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
     assert stdout_json(result)["status"] == "incompatible_run_state"
     assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
     assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history"])
+def test_status_and_history_reject_an_incompatible_legacy_state(
+    git_repo: Path, command: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+    state = load_only_run_state(git_repo)
+    state["schema_version"] = 1
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, command, run_id, "--json")
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history"])
+@pytest.mark.parametrize("timeline", [None, {}, "not an event list"])
+def test_status_and_history_reject_an_invalid_timeline_without_mutation(
+    git_repo: Path, command: str, timeline: object
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    if timeline is None:
+        state.pop("timeline")
+    else:
+        state["timeline"] = timeline
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, command, run_id, "--json")
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+def test_history_rejects_a_timeline_with_a_non_event_without_mutation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["timeline"] = ["not an event"]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "history", run_id, "--json")
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history", "resume"])
+def test_cli_rejects_a_malformed_canonical_nested_state(
+    git_repo: Path, command: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["parent"].pop("number")
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+    arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
+
+    result = run_cli(git_repo, fixture, *arguments)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("active_agent_invocation", {"status": ["failed"]}),
+        ("agent_invocation_history", ["not an invocation record"]),
+    ],
+)
+def test_status_rejects_malformed_invocation_records(
+    git_repo: Path, field: str, value: object
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["status"] = "execution_failed"
+    state[field] = value
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "status", run_id, "--json")
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+def test_resume_rejects_unknown_invocation_role_without_mutation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["status"] = "execution_failed"
+    state["active_agent_invocation"] = failed_invocation(
+        work_subject="ticket:2", role="unknown", phase="developing"
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+def test_resume_rejects_active_invocation_for_missing_ticket(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["status"] = "execution_failed"
+    state["active_agent_invocation"] = failed_invocation(
+        work_subject="ticket:999", role="development", phase="developing"
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("owner", [None, {}, {"phase": "unknown"}])
+def test_resume_rejects_final_publication_without_a_valid_owner(
+    git_repo: Path,
+    owner: dict[str, str] | None,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state.update(
+        {
+            "status": "execution_failed",
+            "run_acceptance": {"acceptance_generation": 1},
+            **({"run_publication": owner} if owner is not None else {}),
+            "active_agent_invocation": failed_invocation(
+                work_subject=f"run-publication:{run_id}",
+                role="final_publication",
+                phase="run_publication",
+            ),
+        }
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history", "resume"])
+@pytest.mark.parametrize(
+    "owner",
+    [
+        {"validation_attempts": 1},
+        {"acceptance_generation": 1},
+        {"acceptance_generation": 1, "validation_attempts": 1},
+    ],
+)
+def test_resume_rejects_an_incomplete_run_acceptance_owner(
+    git_repo: Path,
+    owner: dict[str, int | str],
+    command: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state.update(
+        {
+            "status": "execution_failed",
+            "run_acceptance": owner,
+            "active_agent_invocation": failed_invocation(
+                work_subject=f"run-acceptance:{run_id}",
+                role="reviewer",
+                phase="run_acceptance",
+            ),
+        }
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
+    result = run_cli(git_repo, fixture, *arguments)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize(
+    ("role", "phase", "owner"),
+    [
+        ("reviewer", "run_acceptance", {"phase": "accepted", "acceptance_generation": 1, "validation_attempts": 1}),
+        ("final_publication", "run_publication", {"phase": "waiting_checks"}),
+    ],
+)
+def test_resume_rejects_an_owner_that_has_already_advanced(
+    git_repo: Path, role: str, phase: str, owner: dict[str, int | str]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state.update(
+        {
+            "status": "execution_failed",
+            "run_acceptance": {
+                "phase": "accepted",
+                "acceptance_generation": 1,
+                "validation_attempts": 1,
+            },
+            "active_agent_invocation": failed_invocation(
+                work_subject=(
+                    f"run-acceptance:{run_id}"
+                    if role == "reviewer"
+                    else f"run-publication:{run_id}"
+                ),
+                role=role,
+                phase=phase,
+            ),
+        }
+    )
+    if role == "final_publication":
+        state["run_publication"] = owner
+    else:
+        state["run_acceptance"] = owner
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history", "resume"])
+@pytest.mark.parametrize(
+    ("role", "invocation_phase", "owner_phase"),
+    [
+        ("development", "developing", "accepted"),
+        ("fresh_acceptance", "reviewing", "accepted"),
+        ("publication", "publication", "publishing"),
+    ],
+)
+def test_change_resume_rejects_an_owner_that_has_already_advanced(
+    git_repo: Path,
+    command: str,
+    role: str,
+    invocation_phase: str,
+    owner_phase: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["ticket_jobs"]["2"].update(
+        {"ticket_branch_generation": 1, "phase": owner_phase}
+    )
+    state.update(
+        {
+            "status": "execution_failed",
+            "active_agent_invocation": failed_invocation(
+                work_subject="ticket:2", role=role, phase=invocation_phase
+            ),
+        }
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
+    result = run_cli(git_repo, fixture, *arguments)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history"])
+def test_completed_invocation_remains_a_readable_audit_snapshot(
+    git_repo: Path, command: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state.update(
+        {
+            "status": "run_publication_pending",
+            "run_acceptance": {
+                "phase": "accepted",
+                "acceptance_generation": 1,
+                "validation_attempts": 1,
+            },
+            "active_agent_invocation": {
+                **failed_invocation(
+                    work_subject=f"run-acceptance:{run_id}",
+                    role="reviewer",
+                    phase="run_acceptance",
+                    status="completed",
+                ),
+                "reported_thread_id": "reviewer-thread",
+                "error": None,
+                "return_code": 0,
+            },
+        }
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, command, run_id, "--json")
+
+    assert result.returncode == 0
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["status"] = "blocked"
+    state["diagnostics"] = [{"code": "attacker", "message": "not canonical"}]
+    state["parent"].pop("number")
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "status", run_id, "--json")
+
+    assert result.returncode == 2
+    output = stdout_json(result)
+    assert output["status"] == "incompatible_run_state"
+    assert output["diagnostics"] == [
+        {
+            "code": "incompatible_run_state",
+            "message": "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
+            "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run",
+        }
+    ]
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+def test_cli_rejects_malformed_human_blocker_without_mutation(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state.update(
+        {
+            "status": "ready_for_human",
+            "parent_job": {
+                "phase": "blocked",
+                "blocked_reason": "agent_requires_human",
+                "human_blockers": [1],
+            },
+        }
+    )
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+
+    result = run_cli(git_repo, fixture, "resume", run_id)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize("command", ["status", "history", "resume"])
+def test_cli_rejects_resolved_run_with_missing_observed_revisions(
+    git_repo: Path, command: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state = load_only_run_state(git_repo)
+    state["parent"]["revision"] = None
+    state["ticket_graph"]["revision"] = None
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = deepcopy(state)
+    arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
+
+    result = run_cli(git_repo, fixture, *arguments)
+
+    assert result.returncode == 2
+    assert stdout_json(result)["status"] == "incompatible_run_state"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == before
+
+
+def test_status_prints_the_recovery_command_for_manual_boundaries(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    current = load_only_run_state(git_repo)
+    cases = [
+        (
+            "execution_failed",
+            {
+                "active_agent_invocation": failed_invocation(
+                    work_subject="ticket:2", role="development", phase="developing"
+                )
+            },
+            f"agent-run resume {run_id}",
+        ),
+        (
+            "ready_for_human",
+            {
+                "parent_job": {
+                    "phase": "blocked",
+                    "blocked_reason": "agent_requires_human",
+                    "human_blockers": ["Need maintainer input."],
+                }
+            },
+            f"agent-run resume {run_id}",
+        ),
+        ("requeue_required", {}, f"agent-run requeue {run_id}"),
+    ]
+
+    for status, additions, expected_action in cases:
+        state = deepcopy(current)
+        state["status"] = status
+        state.update(additions)
+        if state.get("active_agent_invocation") is not None:
+            state["ticket_jobs"]["2"].update(
+                {"ticket_branch_generation": 1, "phase": "developing"}
+            )
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = run_cli(git_repo, fixture, "status", run_id, "--json")
+
+        assert result.returncode == 0
+        assert stdout_json(result)["next_action"] == expected_action
 
 
 def test_resume_does_not_refresh_a_run_without_an_agent_boundary(

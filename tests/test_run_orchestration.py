@@ -9,8 +9,9 @@ import pytest
 
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
-from agent_run.controller import Controller, IncompatibleRunStateError
+from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
