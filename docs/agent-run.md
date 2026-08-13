@@ -301,7 +301,11 @@ Controller 完全使用同一 Codex CLI、`publication_or_human_blocker_schema()
 checkout 与 GitHub App 只读凭据边界。握手只要求服务端接受 schema；`publication` 与
 `human_blocker` 的完整语义分支仍由离线测试覆盖。API 返回 schema rejection 时结果为 **failed**；
 认证、网络或 rate limit 结果为 **inconclusive**，绝不是 green。只有 **passed** 才可以把该 Runner
-用于新的 self-hosting Run。
+用于新的 self-hosting Run。这个条件由除只读 `status`/`history` 外的 lifecycle 命令强制执行：从不可变 Runner 启动时，它只接受
+`$RUNNER_ROOT/promotions/$RUNNER_SHA.json` 中与当前 Runner 身份完全一致、且 verdict、sandbox、凭据
+脱敏和 thread ID 都为 passed 的审计记录；缺失、损坏、失败或不匹配都将拒绝启动。审计目录是维护者
+受限的信任边界：有能力篡改 Runner 或审计文件的宿主操作者不在这项本地门禁的威胁模型内。
+从 source/editable checkout 运行 lifecycle 命令同样会被拒绝；仅隐藏的 GitHub fixture 测试路径可例外。
 
 每次 attempt 都要保存一条小型 JSON 或 Markdown 审计记录（不得保存 Prompt、完整 stdout、transcript、
 token 或私钥），至少包含：
@@ -311,12 +315,13 @@ runner_commit_sha: <40-char SHA>
 runner_python: <absolute Runner Python path>
 runner_module: <installed agent_run module path>
 runner_package_sha256: <sha256 of installed Runner package>
-codex_cli_version: <codex --version>
+codex_cli_version: <codex --version；无法取得时为 unavailable 且 attempt failed>
 publication_schema_sha256: <sha256 of canonical schema JSON>
 started_at_utc: <RFC 3339>
 finished_at_utc: <RFC 3339>
 credential_redaction: passed | failed
 handshake_verdict: passed | failed | inconclusive
+thread_id_present: true | false
 bounded_error: <redacted error or null>
 ```
 

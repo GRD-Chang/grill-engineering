@@ -30,25 +30,6 @@ _SCHEMA_REJECTION = re.compile(
     r"(?:invalid|reject).{0,80}schema",
     re.IGNORECASE,
 )
-_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
-_AUTHORIZATION = re.compile(
-    r"(?i)\b(authorization|proxy-authorization)"
-    r"([\"']?\s*[:=]\s*[\"']?)(?:(?:bearer|basic)\s+)?"
-    r"([^\s,;\"'}]+)"
-)
-_SECRET = re.compile(
-    r"(?i)\b(token|api[_-]?key|secret|password|private[ _-]?key)"
-    r"([\"']?\s*[:=]\s*[\"']?)([^\s,;\"'}]+)"
-)
-_QUOTED_SECRET = re.compile(
-    r"(?is)\b(token|api[_-]?key|secret|password|private[ _-]?key)\b[\"']?"
-    r"\s*[:=]\s*([\"']).*?\2"
-)
-_MULTILINE_PRIVATE_KEY = re.compile(
-    r"(?is)\bprivate[ _-]?key\b[\"']?\s*[:=]\s*"
-    r"(?:[\"']?-----BEGIN .*?-----END [^-]*-----|[^\r\n]*(?:\r?\n[^\r\n]*)+)"
-)
-_MAX_ERROR_LENGTH = 8 * 1024
 
 
 class PublicationHandshakeBackend(Protocol):
@@ -63,17 +44,74 @@ class PromotionVerification:
     runner_package_sha256: str
 
 
+def current_immutable_runner() -> PromotionVerification | None:
+    """Return this installed Runner's identity, or ``None`` for source execution."""
+
+    module = Path(agent_run.__file__).resolve()
+    prefix = Path(sys.prefix).resolve()
+    if prefix not in module.parents:
+        return None
+    runner_sha = prefix.name
+    if not _COMMIT_SHA.fullmatch(runner_sha):
+        raise ValueError("immutable Runner environment must be named by its 40-character SHA")
+    return PromotionVerification(
+        runner_commit_sha=runner_sha,
+        runner_python=str(Path(sys.executable).resolve()),
+        runner_module=str(module),
+        runner_package_sha256=_package_sha256(module.parent),
+    )
+
+
+def promotion_audit_file(verification: PromotionVerification) -> Path:
+    """Return the canonical external audit location for this Runner."""
+
+    return Path(sys.prefix).resolve().parent / "promotions" / (
+        f"{verification.runner_commit_sha}.json"
+    )
+
+
+def require_promotion_audit(
+    verification: PromotionVerification, audit_file: Path, codex_version: str
+) -> None:
+    """Refuse self-hosting until this exact Runner has a passed promotion audit."""
+
+    try:
+        loaded: object = json.loads(audit_file.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError("immutable Runner has no promotion audit") from error
+    except json.JSONDecodeError as error:
+        raise ValueError("immutable Runner promotion audit is invalid") from error
+    if not isinstance(loaded, dict):
+        raise ValueError("immutable Runner promotion audit is invalid")
+    expected = {
+        "runner_commit_sha": verification.runner_commit_sha,
+        "runner_python": verification.runner_python,
+        "runner_module": verification.runner_module,
+        "runner_package_sha256": verification.runner_package_sha256,
+        "codex_cli_version": codex_version,
+        "publication_schema_sha256": _schema_sha256(),
+        "credential_redaction": "passed",
+        "sandbox": "passed",
+        "handshake_verdict": "passed",
+        "thread_id_present": True,
+        "bounded_error": None,
+    }
+    if not codex_version or any(loaded.get(key) != value for key, value in expected.items()):
+        raise ValueError("immutable Runner promotion audit does not authorize self-hosting")
+
+
 def verify_immutable_runner(checkout: Path, runner_sha: str) -> PromotionVerification:
     """Verify this non-editable Runner and checkout are pinned to one SHA."""
 
     if not _COMMIT_SHA.fullmatch(runner_sha):
         raise ValueError("runner SHA must be a lowercase 40-character commit SHA")
-    module = Path(agent_run.__file__).resolve()
-    prefix = Path(sys.prefix).resolve()
-    if prefix not in module.parents:
+    verification = current_immutable_runner()
+    if verification is None:
         raise ValueError("Runner must import agent_run from its own non-editable environment")
     source_package = checkout / "src" / "agent_run"
-    if _package_sha256(module.parent) != _package_sha256(source_package):
+    if verification.runner_commit_sha != runner_sha:
+        raise ValueError("Runner environment name does not match the requested SHA")
+    if verification.runner_package_sha256 != _package_sha256(source_package):
         raise ValueError("Runner package does not match the immutable checkout source")
     if _git(checkout, "rev-parse", "HEAD") != runner_sha:
         raise ValueError("checkout HEAD does not match the requested Runner SHA")
@@ -89,12 +127,7 @@ def verify_immutable_runner(checkout: Path, runner_sha: str) -> PromotionVerific
     )
     if attached.returncode == 0:
         raise ValueError("Runner checkout must be detached at the immutable SHA")
-    return PromotionVerification(
-        runner_commit_sha=runner_sha,
-        runner_python=str(Path(sys.executable).resolve()),
-        runner_module=str(module),
-        runner_package_sha256=_package_sha256(module.parent),
-    )
+    return verification
 
 
 def run_promotion_handshake(
@@ -113,13 +146,28 @@ def run_promotion_handshake(
         raise ValueError(f"promotion audit already exists: {audit_file}")
     started_at = _now()
     schema_sha256 = _schema_sha256()
+    record: dict[str, object]
+    resolved_version = codex_version or codex_cli_version()
+    if resolved_version is None:
+        record = {
+            **_record_identity(verification, schema_sha256, "unavailable"),
+            "started_at_utc": started_at,
+            "finished_at_utc": _now(),
+            "credential_redaction": "failed",
+            "sandbox": "not_started",
+            "handshake_verdict": "failed",
+            "thread_id_present": False,
+            "bounded_error": "could not determine Codex CLI version",
+        }
+        _write_audit(audit_file, record)
+        return record
     active_backend = backend or CodexCliBackend()
     try:
         _output, thread_id = active_backend.publication_schema_handshake(checkout)
     except Exception as error:
         verdict, bounded_error = _classify_error(error)
-        record: dict[str, object] = {
-            **_record_identity(verification, schema_sha256, codex_version),
+        record = {
+            **_record_identity(verification, schema_sha256, resolved_version),
             "started_at_utc": started_at,
             "finished_at_utc": _now(),
             "credential_redaction": "failed",
@@ -130,7 +178,7 @@ def run_promotion_handshake(
         }
     else:
         record = {
-            **_record_identity(verification, schema_sha256, codex_version),
+            **_record_identity(verification, schema_sha256, resolved_version),
             "started_at_utc": started_at,
             "finished_at_utc": _now(),
             "credential_redaction": "passed",
@@ -139,21 +187,20 @@ def run_promotion_handshake(
             "thread_id_present": bool(thread_id),
             "bounded_error": None,
         }
-    audit_file.parent.mkdir(parents=True, exist_ok=True)
-    audit_file.write_text(
-        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_audit(audit_file, record)
     return record
 
 
-def codex_cli_version() -> str:
-    result = subprocess.run(
-        ["codex", "--version"], text=True, capture_output=True, check=False
-    )
+def codex_cli_version() -> str | None:
+    try:
+        result = subprocess.run(
+            ["codex", "--version"], text=True, capture_output=True, check=False
+        )
+    except OSError:
+        return None
     if result.returncode != 0:
-        raise ValueError("could not determine Codex CLI version")
-    return result.stdout.strip()
+        return None
+    return result.stdout.strip() or None
 
 
 def _git(checkout: Path, *arguments: str) -> str:
@@ -169,7 +216,7 @@ def _git(checkout: Path, *arguments: str) -> str:
 
 
 def _record_identity(
-    verification: PromotionVerification, schema_sha256: str, codex_version: str | None
+    verification: PromotionVerification, schema_sha256: str, codex_version: str
 ) -> dict[str, object]:
     return {
         "runner_commit_sha": verification.runner_commit_sha,
@@ -179,6 +226,14 @@ def _record_identity(
         "codex_cli_version": codex_version or codex_cli_version(),
         "publication_schema_sha256": schema_sha256,
     }
+
+
+def _write_audit(audit_file: Path, record: dict[str, object]) -> None:
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    audit_file.write_text(
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _schema_sha256() -> str:
@@ -200,21 +255,15 @@ def _package_sha256(package: Path) -> str:
 
 
 def _classify_error(error: Exception) -> tuple[str, str]:
-    message = _bounded_error(str(error))
+    message = str(error)
     if _SCHEMA_REJECTION.search(message):
-        return "failed", message
+        return "failed", "Codex rejected the canonical Structured Outputs schema"
     if _INCONCLUSIVE.search(message):
-        return "inconclusive", message
-    return "failed", message
-
-
-def _bounded_error(message: str) -> str:
-    private_key_redacted = _MULTILINE_PRIVATE_KEY.sub("private_key=[REDACTED]", message)
-    clean = _CONTROL_CHARACTERS.sub(" ", private_key_redacted)
-    redacted = _AUTHORIZATION.sub(r"\1\2[REDACTED]", clean)
-    redacted = _QUOTED_SECRET.sub(r"\1=[REDACTED]", redacted)
-    redacted = _SECRET.sub(r"\1\2[REDACTED]", redacted)
-    return redacted[:_MAX_ERROR_LENGTH]
+        return (
+            "inconclusive",
+            "Codex handshake did not complete because of an external condition",
+        )
+    return "failed", "Codex handshake failed before schema acceptance was confirmed"
 
 
 def _now() -> str:

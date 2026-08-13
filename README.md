@@ -75,7 +75,8 @@ agent-run approve <run-id> --repo OWNER/REPO
 
 必须遵循 `docs/agent-run.md` 的 promotion gate：从干净 detached checkout 的完整 40 位 SHA 安装，
 再运行一次 `promotion-handshake` 并保存新的 audit 文件。只有 audit verdict 为 `passed`，才允许在
-专用干净 clone 中启动 Run。
+专用干净 clone 中启动 Run；不可变 Runner 的 lifecycle 命令会机械校验其专属审计记录，缺失、失败或
+身份不一致都会拒绝启动。
 
 在首次 `run` 前必须完成并保存真实 promotion handshake 的脱敏审计记录。该记录要包含 Runner SHA、
 Codex CLI 版本、Publication schema SHA256、时间、凭据脱敏结果及 `passed` / `failed` /

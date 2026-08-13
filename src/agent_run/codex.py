@@ -30,6 +30,7 @@ from agent_run.github_auth import (
     GitHubCredentialError,
     mint_read_only_installation_token,
 )
+from agent_run.error_safety import bounded_error
 from agent_run.worker_sandbox import (
     WorkerSandboxError,
     bubblewrap_command,
@@ -734,22 +735,7 @@ def _is_json_scalar(value: object) -> bool:
 
 
 def _bounded_error(value: str) -> str:
-    clean = "".join(character for character in value if character >= " " or character in "\n\t")
-    clean = re.sub(
-        r"(?i)\b(authorization|proxy-authorization)"
-        r"([\"']?\s*[:=]\s*[\"']?)(?:(?:bearer|basic)\s+)?"
-        r"([^\s,;\"'}]+)",
-        r"\1\2[REDACTED]",
-        clean,
-    )
-    clean = re.sub(
-        r"(?i)\b(token|api[_-]?key|secret|password)"
-        r"([\"']?\s*[:=]\s*[\"']?)([^\s,;\"'}]+)",
-        r"\1\2[REDACTED]",
-        clean,
-    )
-    encoded = clean.encode("utf-8")[:8192]
-    return encoded.decode("utf-8", errors="ignore")
+    return bounded_error(value)
 
 
 def _thread_line_callback(

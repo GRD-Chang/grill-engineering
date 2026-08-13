@@ -21,8 +21,12 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.parent_delivery import ParentDeliveryEngine
+from agent_run.error_safety import bounded_error
 from agent_run.runner_promotion import (
     codex_cli_version,
+    current_immutable_runner,
+    promotion_audit_file,
+    require_promotion_audit,
     run_promotion_handshake,
     verify_immutable_runner,
 )
@@ -132,7 +136,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 checkout=git.root,
                 audit_file=Path(parsed.audit_file),
                 verification=verification,
-                codex_version=codex_cli_version(),
             )
             print(json.dumps(record, ensure_ascii=False, sort_keys=True))
             return 0 if record["handshake_verdict"] == "passed" else 2
@@ -166,6 +169,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
             state = cli_surface._load_local_run(states, parsed.run_id)
             cli_presentation._print_history(state, as_json=parsed.as_json)
             return 0
+        runner_verification = current_immutable_runner()
+        if runner_verification is None:
+            if fixture_path is None:
+                raise ValueError(
+                    "self-hosting lifecycle commands require an immutable promoted Runner"
+                )
+        else:
+            active_codex_version = codex_cli_version()
+            if active_codex_version is None:
+                raise ValueError("could not determine Codex CLI version for promotion audit")
+            require_promotion_audit(
+                runner_verification,
+                promotion_audit_file(runner_verification),
+                active_codex_version,
+            )
         if cli_surface._is_lifecycle_action(parsed.command):
             local_state = cli_surface._load_local_run(states, parsed.run_id)
             if not cli_surface._command_is_ready(local_state, parsed.command):
@@ -581,7 +599,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             and isinstance(run_id, str)
         ):
             failure_recorded = controller.record_execution_failure(
-                run_id, str(error)
+                run_id, bounded_error(str(error))
             )
         durable_status = None
         durable_diagnostics: list[object] | None = None

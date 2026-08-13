@@ -11,7 +11,9 @@ from typing import Any
 
 import pytest
 
+import agent_run.cli as cli
 from agent_run.cli import build_parser, main
+from agent_run.runner_promotion import PromotionVerification
 from conftest import write_fixture
 
 
@@ -38,6 +40,42 @@ def test_promotion_preflight_failure_returns_a_cli_error(
     monkeypatch.chdir(PROJECT_ROOT)
 
     assert main(["promotion-handshake", "not-a-sha", "--audit-file", str(tmp_path / "audit.json")]) == 2
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["result"] == "error"
+    assert output["status"] == "blocked"
+
+
+def test_immutable_runner_blocks_start_without_a_promotion_audit(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    immutable_runner = PromotionVerification(
+        runner_commit_sha="a" * 40,
+        runner_python="/runner/bin/python",
+        runner_module="/runner/lib/python/site-packages/agent_run/__init__.py",
+        runner_package_sha256="sha256:runner-package",
+    )
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr(cli, "current_immutable_runner", lambda: immutable_runner)
+    monkeypatch.setattr(
+        cli,
+        "require_promotion_audit",
+        lambda verification, audit_file, codex_version: (_ for _ in ()).throw(
+            ValueError("immutable Runner has no promotion audit")
+        ),
+    )
+
+    assert main(["start", "1", "--github-fixture", str(fixture)]) == 2
+    assert not (git_repo / ".agent-run").exists()
+
+
+def test_source_runner_rejects_production_lifecycle_commands(
+    git_repo: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(git_repo)
+
+    assert main(["start", "1", "--repo", "example/project"]) == 2
 
     output = json.loads(capsys.readouterr().out)
     assert output["result"] == "error"
