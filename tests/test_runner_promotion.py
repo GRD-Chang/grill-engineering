@@ -255,6 +255,57 @@ def test_promotion_handshake_marks_common_auth_errors_inconclusive(tmp_path: Pat
     assert result["handshake_verdict"] == "inconclusive"
 
 
+def test_promotion_handshake_marks_missing_github_app_credentials_inconclusive(
+    tmp_path: Path,
+) -> None:
+    class MissingCredentialsBackend:
+        def publication_schema_handshake(self, checkout: Path) -> tuple[str, str]:
+            raise RuntimeError(
+                "GitHub App ID, installation ID, and private key are required"
+            )
+
+    result = run_promotion_handshake(
+        checkout=tmp_path / "checkout",
+        audit_file=tmp_path / "audit.json",
+        backend=MissingCredentialsBackend(),
+        verification=verification(),
+        codex_version="codex-cli test",
+    )
+
+    assert result["handshake_verdict"] == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "could not create a GitHub App installation token",
+        "GitHub token response is invalid",
+        "GitHub token response has no token",
+        "GitHub did not grant the exact worker read permissions",
+        "OpenSSL is required to sign App JWTs",
+        "could not sign GitHub App JWT",
+        "error:1E08010C:DECODER routines::unsupported",
+    ],
+)
+def test_promotion_handshake_marks_github_app_token_failures_inconclusive(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    class TokenMintFailureBackend:
+        def publication_schema_handshake(self, checkout: Path) -> tuple[str, str]:
+            raise RuntimeError(message)
+
+    result = run_promotion_handshake(
+        checkout=tmp_path / "checkout",
+        audit_file=tmp_path / "audit.json",
+        backend=TokenMintFailureBackend(),
+        verification=verification(),
+        codex_version="codex-cli test",
+    )
+
+    assert result["handshake_verdict"] == "inconclusive"
+
+
 def test_promotion_handshake_refuses_to_overwrite_an_audit(tmp_path: Path) -> None:
     audit_file = tmp_path / "audit.json"
     audit_file.write_text("{}", encoding="utf-8")

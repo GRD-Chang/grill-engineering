@@ -1244,6 +1244,25 @@ def test_app_jwt_is_rs256_and_cleans_temporary_key(
     assert set(Path(tempfile.gettempdir()).glob("agent-run-app-key-*")) == before
 
 
+def test_app_jwt_signing_failure_does_not_expose_openssl_stderr(
+    monkeypatch: Any,
+) -> None:
+    def failed_signing(*arguments: Any, **options: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            list(arguments[0]),
+            1,
+            b"",
+            b"Provider routines::bad decrypt private-key-material",
+        )
+
+    monkeypatch.setattr("agent_run.github_auth.subprocess.run", failed_signing)
+
+    with pytest.raises(GitHubCredentialError, match="could not sign GitHub App JWT") as error:
+        _create_app_jwt("123", "private-key")
+
+    assert "private-key-material" not in str(error.value)
+
+
 def _decode_base64url(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 

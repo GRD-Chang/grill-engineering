@@ -96,10 +96,7 @@ def _create_app_jwt(app_id: str, private_key: str) -> str:
             check=False,
         )
         if signed.returncode != 0:
-            raise GitHubCredentialError(
-                signed.stderr.decode(errors="replace").strip()
-                or "could not sign GitHub App JWT"
-            )
+            raise GitHubCredentialError("could not sign GitHub App JWT")
         signature = base64.urlsafe_b64encode(signed.stdout).rstrip(b"=").decode()
         return f"{signing_input}.{signature}"
     except OSError as error:
