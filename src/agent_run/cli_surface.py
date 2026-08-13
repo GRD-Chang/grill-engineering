@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
-from agent_run.controller import _human_blocker_subject_count
 from agent_run.state import StateStore
+from agent_run.state_contract import human_blocker_subject_count, require_current_run_state
 from agent_run.cli_presentation import _print_precondition_failure
 
 def _run_to_human_gate(
@@ -108,8 +108,6 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
         "waiting_merge",
     }:
         return "deliver"
-    if status == "requeue_required":
-        return "requeue"
     if status == "run_acceptance_pending":
         return "accept-run"
     publication = state.get("run_publication")
@@ -145,7 +143,7 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
     invocation = state.get("active_agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
         return True
-    return _human_blocker_subject_count(state) == 1
+    return human_blocker_subject_count(state) == 1
 
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:
@@ -211,7 +209,7 @@ def _progress_marker(state: dict[str, Any], command: str) -> tuple[object, ...]:
 
 
 def _load_local_run(states: StateStore, run_id: str) -> dict[str, object]:
-    state = states.load_run(run_id)
+    state = states.load_current_run(run_id)
     if state is None:
         raise ValueError(f"unknown Delivery Run: {run_id}")
     return state

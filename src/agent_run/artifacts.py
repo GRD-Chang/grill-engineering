@@ -249,18 +249,13 @@ def parse_development_wire_result(value: object) -> dict[str, Any]:
 
 
 def parse_human_blockers(value: object) -> tuple[str, ...] | None:
-    """Return a normalized unified or legacy Human Blocker alternative."""
+    """Return the unified Publication Human Blocker alternative."""
     if not isinstance(value, dict):
         return None
     if "result_kind" not in value:
-        if "human_blockers" not in value:
-            return None
-        if set(value) != {"human_blockers"}:
-            raise ValueError("human blocker output contains unexpected fields")
-        blockers = _bounded_blocker_list(value.get("human_blockers"))
-        if not blockers:
-            raise ValueError("human_blockers must contain non-empty strings")
-        return tuple(blockers)
+        if "human_blockers" in value:
+            raise ValueError("human blocker result is missing result_kind")
+        return None
     normalized = parse_publication_wire_result(value)
     if normalized["result_kind"] != "human_blocker":
         return None

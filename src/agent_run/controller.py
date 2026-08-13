@@ -26,6 +26,11 @@ from agent_run.run_currentness import (
 )
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
+from agent_run.state_contract import (
+    IncompatibleRunStateError,
+    human_blocker_subject_count,
+    require_current_run_state,
+)
 
 
 class GitHubReader(Protocol):
@@ -270,7 +275,7 @@ class Controller:
         self, state: dict[str, Any], invocation: dict[str, Any]
     ) -> bool:
         boundary = invocation.get("currentness_boundary")
-        if not isinstance(boundary, dict):
+        if not isinstance(boundary, dict) or not boundary:
             # Invocations recorded before the Run boundary was introduced retain
             # their pre-existing resume behavior. Every #45 Run invocation writes
             # a boundary through invocation_event_recorder.
@@ -304,6 +309,10 @@ class Controller:
         with self.states.locked():
             state = self.states.load_run(run_id)
             if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
                 return False
             if state.get("status") in {
                 "abandoned",
@@ -365,6 +374,7 @@ class Controller:
         state = self.states.load_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        require_current_run_state(state)
         repository = self.github.repository()
         if state.get("repository") != repository.name_with_owner:
             raise ValueError(
@@ -387,6 +397,7 @@ class Controller:
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
+            refreshed.pop("currentness_resolution_pending", None)
             self._mark_stale_change_job(
                 refreshed, check_requeue_currentness=check_requeue_currentness
             )
@@ -573,7 +584,6 @@ class Controller:
     ) -> dict[str, Any]:
         now = _now()
         return {
-            "schema_version": 1,
             "run_id": run_id,
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
@@ -588,6 +598,11 @@ class Controller:
             "ticket_jobs": {},
             "retired_ticket_generations": {},
             "pending_ticket_retirements": {},
+            "accepted_ticket_graph_revision": None,
+            "accepted_parent_spec_revision": None,
+            "currentness_resolution_pending": True,
+            "active_agent_invocation": None,
+            "agent_invocation_history": [],
             "status": "starting",
             "diagnostics": [],
             "created_at": now,
@@ -643,6 +658,7 @@ class Controller:
             self.states.save_run(run_id, state)
         else:
             state = existing
+            require_current_run_state(state)
             run_id = str(state["run_id"])
             if state.get("status") in {"abandoned", "abandonment_pending"}:
                 return state, True
@@ -737,7 +753,7 @@ def _resume_agent_human_blocker(
     the maintainer chose to resume.  The controller neither interprets the
     condition nor declares it fixed.
     """
-    if _human_blocker_subject_count(state) > 1:
+    if human_blocker_subject_count(state) > 1:
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
@@ -951,7 +967,7 @@ def _run_acceptance_for_invocation(
     generation = invocation.get("generation")
     if type(generation) is not int or generation < 1:
         raise ValueError("current Agent Invocation generation is invalid")
-    _require_invocation_generation(generation, run.get("validation_attempts"))
+    _require_invocation_generation(generation, run.get("acceptance_generation"))
     return run
 
 
@@ -1162,31 +1178,6 @@ def _run_acceptance_human_blocker(state: dict[str, Any]) -> bool:
         acceptance.get("phase") == "ready_for_human"
         and acceptance.get("blocked_reason")
         in {"agent_requires_human", "reviewer_requires_human"}
-    )
-
-
-def _human_blocker_subject_count(state: dict[str, Any]) -> int:
-    """Count current top-level Human Blocker subjects without choosing one."""
-    subjects: list[dict[str, Any]] = []
-    ticket_jobs = state.get("ticket_jobs")
-    if isinstance(ticket_jobs, dict):
-        subjects.extend(job for job in ticket_jobs.values() if isinstance(job, dict))
-    for key in ("parent_job", "run_acceptance", "run_publication"):
-        value = state.get(key)
-        if isinstance(value, dict):
-            subjects.append(value)
-            if key == "run_acceptance":
-                repair = value.get("repair_job")
-                if isinstance(repair, dict):
-                    subjects.append(repair)
-    return sum(1 for subject in subjects if _is_human_blocker(subject))
-
-
-def _is_human_blocker(subject: dict[str, Any]) -> bool:
-    return subject.get("phase") in {"blocked", "ready_for_human"} and (
-        subject.get("blocked_reason")
-        in {"agent_requires_human", "reviewer_requires_human"}
-        or isinstance(subject.get("human_blockers"), list)
     )
 
 

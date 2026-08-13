@@ -16,6 +16,7 @@ from agent_run.state import StateStore
 from agent_run.ticket_phase import (
     BLOCKED_MESSAGES,
     TicketPhase,
+    parse_ticket_phase,
     sync_active_ticket_job,
 )
 
@@ -36,7 +37,7 @@ class TicketDeliveryEngine:
 
     def deliver(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
-            state = self.states.load_run(run_id)
+            state = self.states.load_current_run(run_id)
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
             job = self._job(state)
@@ -105,10 +106,14 @@ class TicketDeliveryEngine:
 
     def _job(self, state: dict[str, Any]) -> dict[str, Any]:
         active = _mapping(state, "active_ticket_job")
-        ticket_number = int(active["ticket_number"])
+        ticket_number = active.get("ticket_number")
+        if not isinstance(ticket_number, int):
+            raise ValueError("active Ticket Job has invalid ticket_number")
         tickets = _mapping(_mapping(state, "ticket_graph"), "tickets")
         ticket = _mapping(tickets, str(ticket_number))
         expected_revision = _effective_revision(state, ticket)
+        if "phase" in active:
+            parse_ticket_phase(active["phase"])
         if "phase" not in active:
             active.update(self._new_job_fields(state, ticket_number, expected_revision))
             self._save(state)

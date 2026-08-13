@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.state import StateStore
 from conftest import write_fixture
 
@@ -123,6 +125,48 @@ def test_wrong_repository_cannot_mutate_existing_run_state(
     assert persisted["status"] == "active"
     with pytest.raises(ValueError, match="does not match"):
         wrong.resume(str(state["run_id"]))
+
+
+def test_legacy_state_fails_closed_before_controller_mutates_it(
+    git_repo: Path,
+) -> None:
+    store = StateStore(git_repo / ".agent-run")
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _issue(2)}
+    )
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    )
+    state, _ = controller.start(1)
+    state["schema_version"] = 1
+    store.save_run(str(state["run_id"]), state)
+    before = deepcopy(store.load_run(str(state["run_id"])))
+
+    with pytest.raises(IncompatibleRunStateError, match="legacy state"):
+        controller.resume(str(state["run_id"]))
+
+    assert store.load_run(str(state["run_id"])) == before
+
+
+def test_state_missing_active_invocation_fails_closed_before_controller_mutates_it(
+    git_repo: Path,
+) -> None:
+    store = StateStore(git_repo / ".agent-run")
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _issue(2)}
+    )
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    )
+    state, _ = controller.start(1)
+    state.pop("active_agent_invocation")
+    store.save_run(str(state["run_id"]), state)
+    before = deepcopy(store.load_run(str(state["run_id"])))
+
+    with pytest.raises(IncompatibleRunStateError, match="active_agent_invocation"):
+        controller.resume(str(state["run_id"]))
+
+    assert store.load_run(str(state["run_id"])) == before
 
 
 class UnavailableRepositoryReader:

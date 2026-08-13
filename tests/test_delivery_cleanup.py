@@ -87,22 +87,22 @@ def test_partial_checkout_is_cleaned_when_preparation_fails(
 def test_completed_ticket_cleanup_retries_without_reopening_delivery(
     git_repo: Path,
 ) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
-    branch = "agent-run/run-1/ticket-3"
     git = GitRepository(git_repo)
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), git, states
+    ).start(1)
+    state["status"] = "completed"
+    branch = f"agent-run/{state['run_id']}/ticket-3"
     git.ensure_run_branch(branch, git.resolve("main"))
-    state = {
-        "run_id": "run-1",
-        "status": "completed",
-        "ticket_jobs": {},
-    }
     job = {
         "ticket_number": 3,
         "ticket_branch": branch,
         "phase": "completed",
         "integrated_sha": git.resolve(branch),
     }
-    states.save_run("run-1", state)
+    states.save_run(state["run_id"], state)
 
     failed = DeliveryCleanupEngine(
         git=FailingBranchCleanupGit(git_repo), states=states
@@ -115,7 +115,7 @@ def test_completed_ticket_cleanup_retries_without_reopening_delivery(
     assert cleanup["items"][branch]["attempts"] == 3
     assert git.resolve(branch)
 
-    recovered = DeliveryCleanupEngine(git=git, states=states).resume("run-1")
+    recovered = DeliveryCleanupEngine(git=git, states=states).resume(state["run_id"])
 
     assert recovered["status"] == "completed"
     assert recovered["delivery_cleanup"]["status"] == "completed"
@@ -147,44 +147,41 @@ def test_cleanup_never_deletes_a_maintainer_branch(git_repo: Path) -> None:
 
 
 def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> None:
-    branch = "agent-run/run-1/ticket-2"
-    state = {
-        "run_id": "run-1",
-        "status": "abandoned",
-        "ticket_jobs": {
-            "2": {
-                "phase": "completed",
-                "ticket_number": 2,
-                "ticket_branch": branch,
-                "integrated_sha": "integrated",
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    run_id = state["run_id"]
+    branch = f"agent-run/{run_id}/ticket-2"
+    state["status"] = "abandoned"
+    state["ticket_jobs"]["2"].update(
+        {
+            "phase": "completed",
+            "ticket_branch": branch,
+            "integrated_sha": "integrated",
+        }
+    )
+    state["delivery_cleanup"] = {
+        "status": "cleanup_pending",
+        "items": {
+            branch: {
+                "kind": "ticket",
+                "branch": branch,
+                "checkout": str(
+                    git_repo / ".agent-run" / "worktrees" / run_id / "ticket-2"
+                ),
+                "attempts": 3,
+                "status": "cleanup_pending",
             }
         },
-        "delivery_cleanup": {
-            "status": "cleanup_pending",
-            "items": {
-                branch: {
-                    "kind": "ticket",
-                    "branch": branch,
-                    "checkout": str(
-                        git_repo
-                        / ".agent-run"
-                        / "worktrees"
-                        / "run-1"
-                        / "ticket-2"
-                    ),
-                    "attempts": 3,
-                    "status": "cleanup_pending",
-                }
-            },
-        },
     }
-    states = StateStore(git_repo / ".agent-run")
-    states.save_run("run-1", state)
+    states.save_run(run_id, state)
     github = RecordingBranchPublisher()
 
     resumed = DeliveryCleanupEngine(
         git=GitRepository(git_repo), states=states, github=github
-    ).resume("run-1")
+    ).resume(run_id)
 
     assert resumed == state
     assert github.deleted_branches == []

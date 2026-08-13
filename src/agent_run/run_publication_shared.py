@@ -231,7 +231,7 @@ class RunPublicationShared:
                 pass
 
     def _load(self, run_id: str) -> dict[str, Any]:
-        state = self.states.load_run(run_id)
+        state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         return state

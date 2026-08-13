@@ -57,7 +57,7 @@ def requeue_change_job(state: dict[str, Any]) -> dict[str, Any]:
         container["phase"] = "pending"
         next_status = "run_acceptance_pending"
 
-    state.pop("active_agent_invocation", None)
+    state["active_agent_invocation"] = None
     state.pop("requeue_required", None)
     state.update(
         {

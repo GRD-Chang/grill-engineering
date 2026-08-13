@@ -2967,9 +2967,10 @@ def test_resume_switches_frontier_without_deleting_blocked_ticket_job(
     old_job = state["active_ticket_job"]
     old_job.update(
         {
-            "phase": "blocked",
-            "blocked_reason": "reviewer_requires_human",
-            "development_thread_id": "developer-3",
+                "phase": "blocked",
+                "blocked_reason": "reviewer_requires_human",
+                "human_blockers": ["A maintainer must resolve the review block."],
+                "development_thread_id": "developer-3",
             "reviewer_thread_ids": ["standards-3", "spec-3"],
             "pr_number": 33,
             "merge_intent": {"expected_head_sha": "a" * 40},

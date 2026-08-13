@@ -75,6 +75,16 @@ class StateStore:
             raise ValueError(f"Invalid run state: {path}")
         return loaded
 
+    def load_current_run(self, run_id: str) -> dict[str, Any] | None:
+        """Load only the one supported persisted Run contract."""
+
+        state = self.load_run(run_id)
+        if state is not None:
+            from agent_run.state_contract import require_current_run_state
+
+            require_current_run_state(state)
+        return state
+
     def find_run(self, repository: str, parent_number: int) -> dict[str, Any] | None:
         if not self.runs_directory.exists():
             return None

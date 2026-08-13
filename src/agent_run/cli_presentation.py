@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_run.state_contract import human_blocker_subject_count
+
 def _print_precondition_failure(state: dict[str, object]) -> None:
     active = _active_ticket_job(state)
     diagnostics = state.get("diagnostics")
@@ -168,6 +170,22 @@ def _next_action(state: dict[str, Any]) -> str:
         return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
     if status == "abandonment_pending" and isinstance(run_id, str):
         return f"agent-run abandon {run_id}"
+    if status == "requeue_required" and isinstance(run_id, str):
+        return f"agent-run requeue {run_id}"
+    invocation = state.get("active_agent_invocation")
+    if (
+        status == "execution_failed"
+        and isinstance(invocation, dict)
+        and invocation.get("status") == "failed"
+        and isinstance(run_id, str)
+    ):
+        return f"agent-run resume {run_id}"
+    if (
+        status in {"ready_for_human", "progress_exhausted"}
+        and human_blocker_subject_count(state) == 1
+        and isinstance(run_id, str)
+    ):
+        return f"agent-run resume {run_id}"
     if status in {"ready_for_human", "progress_exhausted", "blocked"}:
         return "处理诊断中的人工事项"
     if status in {

@@ -1888,6 +1888,8 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
         "role": "publication",
         "phase": "publication",
         "mode": "fresh",
+        "input_fingerprint": "fixture",
+        "currentness_boundary": {},
         "status": "failed",
         "requested_thread_id": None,
         "reported_thread_id": "publication-thread-1",
@@ -2069,6 +2071,8 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
         "role": "publication",
         "phase": "publication",
         "mode": "fresh",
+        "input_fingerprint": "fixture",
+        "currentness_boundary": {},
         "status": "failed",
         "requested_thread_id": None,
         "reported_thread_id": "run-repair-publication-1",
@@ -2313,7 +2317,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     ) == 1
 
 
-def test_run_automatically_requeues_one_stale_generation(
+def test_run_stops_for_an_operator_to_requeue_a_stale_generation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -2362,19 +2366,17 @@ def test_run_automatically_requeues_one_stale_generation(
         encoding="utf-8",
     )
 
-    requeued = run_cli(
+    stopped = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(replacement_agents)
     )
 
-    assert requeued.returncode == 0, requeued.stderr
+    assert stopped.returncode == 2
+    assert stdout_json(stopped)["status"] == "requeue_required"
     state = load_only_run_state(git_repo)
-    replacement = state["active_ticket_job"]
-    assert replacement["ticket_branch_generation"] == 2
-    assert replacement["development_thread_id"] == "developer-new"
-    assert state["retired_job_generations"][0]["thread_ids"] == [
-        "developer-old",
-        "reviewer-old",
-    ]
+    assert state["active_ticket_job"]["ticket_branch_generation"] == 1
+    assert state.get("retired_job_generations") is None
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert [pull["state"] for pull in delivery["pull_requests"]] == ["OPEN"]
 
 
 def test_run_stops_when_a_replacement_generation_drifts_again(
@@ -2439,5 +2441,5 @@ def test_run_stops_when_a_replacement_generation_drifts_again(
     assert stopped.returncode == 2
     assert stdout_json(stopped)["status"] == "requeue_required"
     state = load_only_run_state(git_repo)
-    assert state["active_ticket_job"]["ticket_branch_generation"] == 2
-    assert len(state["retired_job_generations"]) == 1
+    assert state["active_ticket_job"]["ticket_branch_generation"] == 1
+    assert state.get("retired_job_generations") is None
