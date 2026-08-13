@@ -20,7 +20,11 @@ from agent_run.codex import CodexCliBackend
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _INCONCLUSIVE = re.compile(
     r"auth(?:entication)?|credential|unauthorized|forbidden|invalid[ _-]?(?:api[ _-]?)?key|"
-    r"invalid token|\b40[13]\b|\b429\b|"
+    r"invalid token|could not create.{0,120}github app.{0,120}token|"
+    r"github app.{0,120}(?:required|missing)|"
+    r"github token response.{0,120}(?:invalid|no token)|"
+    r"github did not grant.{0,120}permission|could not sign.{0,120}github app.{0,120}jwt|"
+    r"decoder routines|\b40[13]\b|\b429\b|"
     r"network|connection|econn(?:refused|reset)|enotfound|socket hang up|dns|tls|ssl|"
     r"certificate|rate.?limit|too many requests|throttl(?:ed|ing)?|timeout|timed out",
     re.IGNORECASE,
