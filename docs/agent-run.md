@@ -4,7 +4,7 @@
 
 - 从 Parent Issue 启动或恢复 Delivery Run；
 - 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
-- 让持久 Development Thread 实现、修复和生成发布语义；
+- 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
@@ -147,7 +147,9 @@ Required Check 失败时，Controller 将失败 check 的名称、workflow、描
 Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
 复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
 最终 Ticket 集合和依赖，
-检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条验证 lane；Ticket Completion
+检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条独立验证 lane，后两条使用
+`skill:code-review`，且不得由父 Reviewer 替代缺失 lane；Run Reviewer 可构建、测试和清理自身
+中间产物，但不得修复源码、测试、配置或 `.gitignore`。Ticket Completion
 Revision 按 Ticket number 数值排序，且只绑定已集成 SHA、冻结 Effective Revision 与已验收
 base/tree；已关闭 Ticket 后续 title/body 编辑不改变该版本，普通 reopen 则 fail closed。
 Completion Record、
@@ -356,7 +358,8 @@ GitHub App 的创建、安装和私钥保管不属于 Controller 自动化范围
 `.agent-run/worktrees/`：Required Checks pending 或 Worker/Publisher 普通失败、超时、
 进程异常时保留，以恢复未提交成果；Development/Repair Codex 报告 Human Blocker 时也保留，供同一 Thread 在 `resume` 后重新核验并继续。Ticket 完成、非恢复性的明确终止或操作者显式取消后清理。
 Checkout 尚未准备完成时产生的部分目录也会清理。每轮独立 Validation Checkout 在验收
-结束后完整删除，允许验收期间创建构建、测试和诊断中间产物。Codex 的临时 schema、输出
+结束后完整删除，允许验收期间创建构建、测试和诊断中间产物；Reviewer 只清理自身产物，不修改
+交付内容。Codex 的临时 schema、输出
 文件和空 GitHub 配置目录也会随子进程调用清理。
 
 Graph drift fail closed 时，Controller 保留当前 Candidate、Acceptance、checkout、branch、

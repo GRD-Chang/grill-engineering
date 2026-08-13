@@ -212,24 +212,9 @@ class CodexCliBackend:
         return (
             f"你是负责{role}。使用 skill:implement 完成开发或修复。"
             f"{mode}\n\n"
-            + _issue_context_instruction(_development_context(request))
-            + _human_blocker_instruction()
-            + "\n\n"
-            "阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置尽量"
-            "采用 TDD。运行相关单测、typecheck、lint 和完整测试套件，并从真实用户"
-            "入口复验受影响的成功路径、失败路径和边界情况。记录实际命令、exit code、"
-            "可观察结果和必要状态变化；不要用 mock、单元测试或代码阅读替代能够真实"
-            "运行的核心路径。\n\n"
-            "完成实现和使用验证后，必须使用 skill:code-review 派发两个不同 "
-            "subagent：Standards Review Subagent 检查仓库标准以及具体 correctness、"
-            "security、regression 和 maintainability 问题；Spec Review Subagent "
-            "检查 Acceptance Criteria 是否完整实现、是否错误实现或存在有实际影响的 "
-            "scope creep。你不得自行宣布必要审查通过。发现 blocking finding 后必须"
-            "修复、重跑受影响测试和真实路径，并重新取得受影响 subagent 的有效复查。"
-            "\n\nPublisher 是唯一 Mutation Authority；不要 commit、push、merge、"
-            "close 或修改 PR/Issue。Run Repair 不得关闭 Ticket、创建 Ticket PR 或使用"
-            "Ticket 的修改预算。开发侧验证不是正式 Acceptance。最后只用普通文本"
-            "总结改动、实际验证、两个审查结果和剩余 blocker。最后只输出完整 Development "
+            + _development_contract(_development_context(request))
+            + "\n\n最后只用普通文本总结改动、实际验证、两个审查结果和剩余 blocker。"
+            "最后只输出完整 Development "
             'wire JSON：正常完成时 `{"result_kind":"development","summary":"...",'
             '"human_blockers":null}`；Human Blocker 时 summary 必须是 null。\n\n'
             f"{heading}:\n{prompt_input}"
@@ -322,16 +307,9 @@ class CodexCliBackend:
         if not isinstance(artifact, dict):
             raise ValueError("Final Run Publication requires acceptance_artifact")
         return (
-            "你是本次 Final Run 的发布叙事工程师。先用 `gh issue view` 读取 "
-            "parent_issue_url 指向的 Parent Issue；它定义整体交付目标。然后在当前 "
-            "checkout 中阅读实际累计 diff。只读取事实，生成最终 Run PR 的语义标题和正文；"
-            "不要编辑文件、不要执行 Git/GitHub 写操作，也不要做验收或替代人工批准。"
-            "必须包含非空 What Problem This Solves、Why This Change Was Made、User Impact、"
-            "Evidence 四个二级标题；不得包含 closing keywords。commit_message 与 pr_title "
-            "必须采用 Conventional Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，"
-            "type 只能是 feat、fix、improve、refactor、docs、test、chore。"
-            + _publication_human_blocker_instruction()
-            + _resume_recheck_instruction(context)
+            "你是本次 Final Run 的发布叙事工程师。阅读当前 checkout 的实际累计 diff，"
+            "生成最终 Run PR 的语义标题和正文。\n\n"
+            + _publication_contract(context)
             + "\n\nRun Acceptance Artifact (verbatim JSON):\n"
             + _pretty(artifact)
             + "\n\nFinal Run Publication Context:\n"
@@ -353,36 +331,18 @@ class CodexCliBackend:
         artifact_input = "Acceptance Artifact (verbatim JSON):\n" + _pretty(artifact)
         if request.get("acceptance_scope") == "run":
             return (
-                "你是本次 Run Repair 的发布叙事工程师。先用 `gh issue view` 读取 "
-                "parent_issue_url 指向的 Parent Issue，再依据当前 checkout 的实际 diff 和"
-                "下方完整独立验收证据，输出小型 Publication Artifact。"
-                "不要修改文件，也不要执行任何 Git/GitHub 写操作。Parent Issue、"
-                "Delivery Type、Delivery Run、SHA、CI 与生命周期事实由 Publisher 注入，"
-                "叙事中不得输出这些字段；并包含四个非空二级标题："
-                "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
-                "禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
-                "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
-                "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
-                + _publication_human_blocker_instruction()
-                + _resume_recheck_instruction(context)
+                "你是本次 Run Repair 的发布叙事工程师。依据当前 checkout 的实际 diff 和"
+                "下方完整独立验收证据，输出小型 Publication Artifact。\n\n"
+                + _publication_contract(context)
                 + "\n\n"
                 + artifact_input
                 + "\n\nPublication Context:\n"
                 + _pretty(context)
             )
         return (
-            "你是本次交付的发布叙事工程师。先用 `gh issue view` 读取 parent_issue_url；"
-            "若给出 task_issue_url，也必须读取该当前 Ticket。然后依据 checkout 的实际 diff 和"
-            "下方完整独立验收证据，输出小型 Publication Artifact。"
-            "不要修改文件，也不要执行任何 Git/GitHub 写操作。PR 叙事包含四个非空二级标题："
-            "What Problem This Solves、Why This Change Was Made、User Impact、Evidence。"
-            "只描述已经发生的真实验证；不要把开发者自述当作验证事实。Parent Issue、"
-            "Primary Ticket、Delivery Type、Delivery Run、SHA、CI 与生命周期事实由 Publisher"
-            "注入，叙事中不得输出这些字段。禁止 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
-            "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
-            "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。\n\n"
-            + _publication_human_blocker_instruction()
-            + _resume_recheck_instruction(context)
+            "你是本次交付的发布叙事工程师。依据当前 checkout 的实际 diff 和下方完整独立"
+            "验收证据，输出小型 Publication Artifact。\n\n"
+            + _publication_contract(context)
             + "\n\n"
             + artifact_input
             + "\n\nPublication Context:\n"
@@ -516,31 +476,29 @@ class CodexCliBackend:
             "prior_human_blockers",
             "human_response_history",
         )
+        role = (
+            "独立 Run 整体验收工程师"
+            if request.get("acceptance_scope") == "run"
+            else "独立 Fresh Validation 工程师"
+        )
         scope_instruction = (
             "这是 Run Acceptance：从 Parent Issue 和 GitHub 独立读取最终 Ticket Set 与"
-            "依赖关系，并检查准备好的累计 diff 及整体验收标准；不要寻找或猜测 Controller "
-            "私有账本，也不要把单 Ticket 通过当成整体验收通过。"
+            "依赖关系，检查累计 diff、跨 Ticket 交互、整体需求和预期合并结果；不得把单 "
+            "Ticket 通过当成整体验收通过。"
             if request.get("acceptance_scope") == "run"
-            else "这是 Parent-only Fresh Acceptance：以当前 Parent Issue 的完整验收标准为范围。"
+            else "这是 Parent-only Fresh Validation：以当前 Parent Issue 的完整验收标准为范围。"
             if request.get("acceptance_scope") == "parent_only"
-            else "这是 Ticket Fresh Acceptance：以当前 Ticket 的完整验收标准为范围。"
+            else "这是 Ticket Fresh Validation：以当前 Ticket 的完整验收标准为范围。"
         )
         prompt = (
-            "你是全新且独立的 Fresh Validation 工程师。不要依赖开发者总结、自测、"
-            "开发审查、PR 文案或 Publication Artifact；先用 `gh issue view` 读取 "
-            "parent_issue_url，若给出 task_issue_url 也读取它，并使用真实 Git/gh 自行建立"
-            "事实。必须派发三个不同 subagent：一个真实执行 E2E 使用；一个使用 "
-            "skill:code-review 执行 Standards Review；另一个使用 "
-            "skill:code-review 执行 Spec Review。你不得替代任何缺失 lane 或自行"
-            "签署通过；subagent 失败时必须解决派发问题并重新派发。Validation "
-            "Checkout 可写，允许构建和测试中间产物。汇总三条 lane 的实际证据后，"
-            "只输出符合 schema 的 Acceptance Artifact。可修复问题写入自包含 "
-            "findings。human 必须克制，仅限确实需要产品决策、外部权限、敏感凭证"
-            "或不可替代外部操作的阻塞。若 verdict 为 pass，三个 check 都必须是 pass，"
+            f"你是{role}。\n\n"
+            + _acceptance_contract(context)
+            + "\n\n"
+            + "汇总三条 lane 的实际证据后，只输出符合 schema 的 Acceptance Artifact。"
+            "可修复问题写入自包含 findings。human 必须克制，仅限确实需要产品决策、"
+            "外部权限、敏感凭证或不可替代外部操作的阻塞。若 verdict 为 pass，三个 check 都必须是 pass，"
             "findings 与 human_blockers 必须都是空数组 `[]`；不要输出提示、风格建议、"
             "未来改进或其他非阻塞观察。\n\n"
-            + _resume_recheck_instruction(context)
-            + "\n\n"
             f"{scope_instruction}\n\n"
             f"Acceptance Context:\n{_pretty(context)}"
         )
@@ -834,9 +792,69 @@ def _issue_context_instruction(context: dict[str, Any]) -> str:
     )
     return (
         "动态 Context 中的 parent_issue_url 是定义整体交付目标的 Parent Issue，开始前"
-        "必须通过只读 `gh issue view` 读取它；URL 不是需求摘要。"
+        "必须通过只读 `gh issue view` 读取它；URL 不是需求摘要。当前 Issue 的 title/body "
+        "是唯一需求源；Issue 评论、历史 PR、旧 Artifact、开发者总结和上游 Agent 结论只能"
+        "作为调查线索，不能覆盖当前需求或单独构成验收证据。"
         + task_instruction
         + _resume_recheck_instruction(context)
+    )
+
+
+def _development_contract(context: dict[str, Any]) -> str:
+    return (
+        _issue_context_instruction(context)
+        + "\n\n"
+        + _human_blocker_instruction()
+        + "\n\n阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置尽量"
+        "采用 TDD。运行相关单测、typecheck、lint 和完整测试套件，并从真实用户入口"
+        "复验受影响的成功路径、失败路径和边界情况。记录实际命令、exit code、可观察"
+        "结果和必要状态变化；不要用 mock、单元测试或代码阅读替代能够真实运行的核心路径。"
+        "\n\n在当前 checkout 中检查全部未提交内容：保留本任务需要交付"
+        "的代码、测试、文档和配置，清理本次产生的临时、构建和测试产物。仅长期、可再生"
+        "且不应版本控制的项目产物可以加入 `.gitignore`；不得用 `.gitignore` 隐藏应交付"
+        "内容。若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成前清理，"
+        "不得进行宽泛删除。\n\n"
+        "完成实现和使用验证后，必须使用 skill:code-review 派发两个不同 subagent："
+        "Standards Review Subagent 检查仓库标准以及具体 correctness、security、regression 和"
+        "maintainability 问题；Spec Review Subagent 检查 Acceptance Criteria 是否完整实现、"
+        "是否错误实现或存在有实际影响的 scope creep。你不得自行宣布必要审查通过。发现"
+        "blocking finding 后必须修复、重跑受影响测试和真实路径，并重新取得受影响 subagent"
+        "的有效复查。开发侧预审不是正式独立验收。\n\n"
+        "不得 commit、push、merge、关闭或修改 GitHub。"
+    )
+
+
+def _acceptance_contract(context: dict[str, Any]) -> str:
+    return (
+        _issue_context_instruction(context)
+        + "\n\n不要依赖开发者总结、自测、开发审查、PR 文案或 Publication Artifact；"
+        "使用真实 Git/gh 自行建立事实。必须派发三个不同 subagent 执行真实 E2E、Standards "
+        "Review 和 Spec Review 三条不同 lane：Standards Review 使用 skill:code-review，Spec Review 也使用 "
+        "skill:code-review。你不得替代任何缺失 lane 或自行签署通过；subagent 失败时必须"
+        "解决派发问题并重新派发。\n\n"
+        "可构建、测试和产生验证中间产物，并在结束前清理自己创建的验证或临时产物；不得"
+        "修复源码、测试、配置或 `.gitignore`，也不得整理交付内容。发现的问题只能通过"
+        "Acceptance Artifact 返回。不得 commit、push、merge、关闭或修改 GitHub。"
+    )
+
+
+def _publication_contract(context: dict[str, Any]) -> str:
+    return (
+        _issue_context_instruction(context)
+        + "\n\n只读取事实：不得修改 checkout、执行 Git/GitHub 写操作、执行验收或替代"
+        "人工批准。若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成"
+        "前清理。\n\n"
+        "PR 叙事必须有四个非空二级标题：What Problem This Solves 写改前限制、改后能力"
+        "和覆盖边界；Why This Change Was Made 写关键设计路径与约束，不要逐文件罗列；"
+        "User Impact 写用户可执行的结果和兼容或迁移行为；Evidence 只使用完整独立验收"
+        "三条 lane 的实际证据，每条使用“场景 → 实际操作或命令 → 可观察结果”。不得用"
+        "“tests passed”“已验证”“修复完成”等没有场景、操作和结果的空泛表述，不得把"
+        "开发者自述当作验证事实。CI、Candidate、SHA、门禁和生命周期事实不得写入叙事。"
+        "\n\n不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
+        "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
+        "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。"
+        + "\n\n"
+        + _publication_human_blocker_instruction()
     )
 
 

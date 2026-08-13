@@ -7,37 +7,32 @@
 
 ## Runtime Dynamic Context（运行时动态上下文，唯一合同）
 
-本节优先于本文后续历史示例。Controller 的 Revision、SHA、Candidate、Ticket Graph、Completion Record、开发总结、既有 PR、Run/Thread/Attempt 身份只用于确定性门禁，绝不进入 Codex stdin Prompt。Worker 已有正确 checkout 与只读 GitHub token；开始工作前必须用 `gh issue view` 读取每个 URL。URL 不是需求摘要。
+本节优先于本文后续历史示例。Controller 的 Revision、SHA、Candidate、Ticket Graph、Completion Record、开发总结、既有 PR、Run/Thread/Attempt 身份只用于确定性门禁，绝不进入 Codex stdin Prompt。Worker 已有正确 checkout 与只读 GitHub token；开始工作前必须用 `gh issue view` 读取每个 URL。URL 不是需求摘要，当前 Issue 的 title/body 才是需求源；评论、历史 PR、旧 Artifact 和上游总结只能作为调查线索，不能覆盖需求或单独构成验收证据。
 
 | 顶层角色 | 正常动态字段 | Human Blocker 恢复额外字段 |
 | --- | --- | --- |
-| Ticket Development | `parent_issue_url`, `task_issue_url` | `prior_human_blockers` |
-| Parent-only Development | `parent_issue_url` | `prior_human_blockers` |
-| Ticket Repair | 两个 URL，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers` |
-| Parent-only Repair | `parent_issue_url`，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers` |
-| Run Repair | `parent_issue_url`，加一个 `acceptance_artifact`、`ci_evidence`、`human_feedback` 或 `merge_conflict_evidence` | `prior_human_blockers` |
-| Ticket / Parent-only Fresh Validation | 相应 Parent URL，Ticket 时再有 task URL | `prior_human_blockers` |
-| Run Acceptance | `parent_issue_url` | `prior_human_blockers` |
-| Ticket Publication | 两个 URL，加完整 `acceptance_artifact` | `prior_human_blockers` |
-| Parent-only / Run Repair Publication | `parent_issue_url`，加完整 `acceptance_artifact` | `prior_human_blockers` |
-| Final Run Publication | `parent_issue_url`，加完整 Run `acceptance_artifact` | `prior_human_blockers` |
+| Ticket Development | `parent_issue_url`, `task_issue_url` | `prior_human_blockers`，适用时 `human_response_history` |
+| Parent-only Development | `parent_issue_url` | `prior_human_blockers`，适用时 `human_response_history` |
+| Ticket Repair | 两个 URL，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers`，适用时 `human_response_history` |
+| Parent-only Repair | `parent_issue_url`，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers`，适用时 `human_response_history` |
+| Run Repair | `parent_issue_url`，加一个 `acceptance_artifact`、`ci_evidence`、`human_feedback` 或 `merge_conflict_evidence` | `prior_human_blockers`，适用时 `human_response_history` |
+| Ticket / Parent-only Fresh Validation | 相应 Parent URL，Ticket 时再有 task URL | `prior_human_blockers`，适用时 `human_response_history` |
+| Run Acceptance | `parent_issue_url` | `prior_human_blockers`，适用时 `human_response_history` |
+| Ticket Publication | 两个 URL，加完整 `acceptance_artifact` | `prior_human_blockers`，适用时 `human_response_history` |
+| Parent-only / Run Repair Publication | `parent_issue_url`，加完整 `acceptance_artifact` | `prior_human_blockers`，适用时 `human_response_history` |
+| Final Run Publication | `parent_issue_url`，加完整 Run `acceptance_artifact` | `prior_human_blockers`，适用时 `human_response_history` |
 
 原始 Artifact 与修复证据逐字序列化，不能由 Controller 总结或裁剪。恢复时 `prior_human_blockers` 是上一轮未改写的求助内容，不代表问题已解决；同一顶层 Codex Thread 必须重新读取权威来源、重新检查受影响工作后继续或返回更新后的 blocker。
 
-除 Fresh/Run Acceptance 现有的 `verdict: "human"` 外，Development、Repair、Publication 和 Final Publication 需要人处理时只输出：
+除 Fresh/Run Acceptance 现有的 `verdict: "human"` 外，Development 与 Repair 需要人处理时仍输出完整 Development wire JSON，`result_kind` 为 `human_blocker`、`summary` 为 `null`，并在 `human_blockers` 中写入请求；Publication 与 Final Publication 同样输出完整 Publication wire JSON，`result_kind` 为 `human_blocker`，三个发布字段为 `null`，并在 `human_blockers` 中写入请求。两类请求的每条内容均为“发生了什么；尝试了什么；人必须做什么”。
 
-```json
-{"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}
-```
-
-Controller 只验证这个精确最小形状、保存/展示原字符串并暂停；多字段、空字符串、超出数量或长度上限的输出属于 malformed output，按普通执行失败处理，绝不能当作 Development Summary。Controller 不分类、不自动重试、不会以保存的 Issue body 兜底，也不读取或管理 Codex 内部 subagent 对话。恢复成功后清除当前告警字段，只保留最近的有界原始历史。
+Controller 按各自既有 schema 验证完整结果、保存/展示原字符串并暂停；字段缺失、非法额外形状、空字符串或超出数量/长度上限的输出属于 malformed output，按普通执行失败处理，绝不能当作 Development Summary。Controller 不分类、不自动重试、不会以保存的 Issue body 兜底，也不读取或管理 Codex 内部 subagent 对话。恢复成功后清除当前告警字段，只保留最近的有界原始历史。
 
 ### 固定 Prompt 行为
 
-- Development/Repair：先读 Parent Issue；有 task URL 时也读当前 Ticket。执行 `skill:implement`、真实使用验证和两个独立 review subagent；不得 commit、push、merge、关闭或修改 GitHub。
-- Fresh Validation：首次使用新 Reviewer Thread；先读适用 Issue，派发 E2E、Standards 与 Spec 三条独立 lane，只输出现有 Acceptance Artifact。Human 恢复才复用该 Reviewer Thread，并重新准备验证 checkout。
-- Publication：只读 Issue、checkout diff 与完整 Acceptance Artifact；不得修改文件或 Git/GitHub，输出既有 Publication Artifact，PR 叙事必须有四个必需章节。
-- Final Run Publication：只读 Parent Issue、累计 diff 与完整 Run Acceptance Artifact；输出既有 Publication Artifact，不替代验收或人工批准。
+- Development/Repair：先读 Parent Issue；有 task URL 时也读当前 Ticket。执行 `skill:implement`、真实使用验证和两个独立 review subagent。Agent 在当前 checkout 整理全部未提交内容：保留本任务交付，清理本次中间产物；仅长期、可再生且不应版本控制的项目产物可进入 `.gitignore`。checkout 外临时路径必须可定位、只服务本次任务并在完成前清理。不得 commit、push、merge、关闭或修改 GitHub；开发预审不替代独立验收。
+- Fresh Validation 与 Run Acceptance：首次使用新 Reviewer Thread；先读适用 Issue，派发 E2E、Standards 与 Spec 三条独立 lane，后两条使用 `skill:code-review`，只输出现有 Acceptance Artifact。两者都可构建、测试并清理自身中间产物，但不得修复源码、测试、配置或 `.gitignore`。Run Acceptance 额外独立检查累计 diff、跨 Ticket 交互和预期合并结果。Human 恢复才复用该 Reviewer Thread，并重新准备验证 checkout。
+- Publication 与 Final Run Publication：只读适用 Issue、checkout diff 与完整 Fresh/Run Acceptance Artifact；不得修改文件或 Git/GitHub，不替代验收或人工批准。PR 叙事必须有四个必需章节：问题段写改前限制、改后能力和边界；理由段写关键设计与约束；影响段写用户可执行结果和兼容/迁移行为；证据段仅写三条独立验收 lane 的“场景 → 实际操作或命令 → 可观察结果”。CI、SHA、Candidate、门禁和生命周期事实由 Publisher 的状态评论呈现。
 - Scope Impact Assessment 已删除。Ticket Graph drift 由 Controller 机械比较并 fail closed，
   不构造语义分类 Prompt，也不创建 Codex Thread。
 
