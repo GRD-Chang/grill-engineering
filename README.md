@@ -70,25 +70,18 @@ agent-run approve <run-id> --repo OWNER/REPO
 2. 从专用干净 clone 启动 Delivery Run，不使用日常脏工作区；
 3. 整个 Run 始终使用同一个 Runner 环境；
 4. Run 完成并合入 `main` 后，才从新 commit 创建下一版 Runner；
-5. 新版完成一次完整验证后，只保留当前版和上一版，清理更旧环境。
+5. 新版必须先通过一次真实 Structured Outputs promotion handshake；API schema rejection 为 failed，认证、网络或 rate limit 只算 inconclusive，均不得启动新的 self-hosting Run；
+6. 新版完成 promotion 后，只保留当前版和上一版，清理更旧环境。
 
-示例：
+必须遵循 `docs/agent-run.md` 的 promotion gate：从干净 detached checkout 的完整 40 位 SHA 安装，
+再运行一次 `promotion-handshake` 并保存新的 audit 文件。只有 audit verdict 为 `passed`，才允许在
+专用干净 clone 中启动 Run。
 
-```bash
-# 先确认来源 checkout 干净，并记录完整 commit SHA。
-git -C /path/to/clean/grill-engineer status --short
-git -C /path/to/clean/grill-engineer rev-parse HEAD
-
-# <commit-sha> 必须逐字使用上一条命令输出的 SHA。
-python -m venv ~/.local/share/agent-run/runners/<commit-sha>
-~/.local/share/agent-run/runners/<commit-sha>/bin/python \
-  -m pip install /path/to/clean/grill-engineer
-
-# agent-run 从当前目录发现本地仓库；启动和后续操作都要在该干净 clone 中执行。
-cd /path/to/clean/grill-engineer
-~/.local/share/agent-run/runners/<commit-sha>/bin/agent-run \
-  run <parent-issue> --repo GRD-Chang/grill-engineer
-```
+在首次 `run` 前必须完成并保存真实 promotion handshake 的脱敏审计记录。该记录要包含 Runner SHA、
+Codex CLI 版本、Publication schema SHA256、时间、凭据脱敏结果及 `passed` / `failed` /
+`inconclusive` verdict；它不能保存 token、私钥、Prompt、完整 stdout 或 transcript。完整的 immutable
+SHA pin、`promotion-handshake` 命令、Output Repair、Resume 与 Requeue 操作边界见
+[`docs/agent-run.md`](docs/agent-run.md)。
 
 目标仓库应通过 GitHub Ruleset 将 `quality` 设为 Required Check，并覆盖默认分支及
 Delivery Run 使用的 Run Branch。没有 Required Checks 时，`agent-run` 会按设计继续，

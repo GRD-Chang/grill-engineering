@@ -78,6 +78,63 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 `run` 不会执行最终人工批准：到达 `run_approval_pending` 或 `parent_approval_pending` 后仍须
 维护者检查最终 PR，再显式执行 `approve`。
 
+### 命令边界与状态轮转
+
+下表是 `run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。底层
+`start`、`deliver`、`accept-run` 和 `publish-run` 只用于逐阶段排障；它们不能越过下表中的
+人工边界。
+
+| 命令 | 允许的起点 | 作用 | 不做什么 |
+| --- | --- | --- | --- |
+| `run` | 新 Run 或正常可推进状态 | 创建或继续正常 Job Loop，至 checks、Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式 Resume、Requeue、批准或合并 |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`，或当前唯一对象为 Human Blocker | 为同一 Generation 创建 successor Invocation；默认复用 Thread | 不处理 Publisher/check 恢复，不重置预算，不吸收 stale 边界 |
+| `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
+| `status` / `history` | 任意已知 Run | 查看当前状态、允许的下一步与有界 Invocation 审计事实 | 不改变状态或恢复工作 |
+| `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
+| `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
+| `abandon` | 未完成 Run（包括人工边界） | 写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支，也不猜测外部 close 的 ownership |
+
+### Output Repair、Resume 与 Requeue
+
+三者按失败层级分开，不可替换：
+
+- **Output Repair**：同一个 Invocation 的 Codex 进程零退出、Thread 身份正确，但最终结构化输出不符合完整阶段 contract 时自动执行。它最多追加两次同 Thread、只读的输出请求；不创建新的 Invocation，也不增加领域 attempt。
+- **Resume**：进程、凭据、sandbox、timeout、signal、非零退出、缺少最终输出或 Thread mismatch 导致 `execution_failed`，或 Agent 成功给出 Human Blocker 时，由维护者显式恢复当前 Invocation。
+- **Requeue**：Currentness Boundary 已经 stale 时替换整个 Job Generation。它不是失败进程的 retry；Ticket 与 Parent-only Change Job 只有在 `requeue_required` 才能执行，Run Acceptance 与 Final Run Publication 的漂移则回到 fresh Run Acceptance。
+
+默认 Resume 在仍 current 且保存了 Thread ID 时复用同一 Thread：
+
+```bash
+agent-run status <run-id> --repo OWNER/REPO --json
+agent-run resume <run-id> --repo OWNER/REPO
+agent-run history <run-id> --repo OWNER/REPO --json
+```
+
+只有维护者明确要丢弃当前 Invocation 上下文，或没有可恢复 Thread ID 时才使用新 Thread；新 Thread
+接收该阶段完整标准 Prompt，不会得到“接替上一位 Agent”的手工交接叙述：
+
+```bash
+agent-run resume <run-id> --new-thread --repo OWNER/REPO
+```
+
+Human Blocker 与失败共用 Resume UX，但只有 Human Blocker 可以附带不可变、未经改写的维护者响应：
+
+```bash
+agent-run resume <run-id> \
+  --message '已授权使用内部测试仓库；继续当前验收。' \
+  --repo OWNER/REPO
+```
+
+`--message` 会 trim 校验为非空、限制为 8 KiB，并按顺序绑定当前 Job Generation；它会进入后续
+Development 与 Fresh Acceptance 的权威上下文。它不修改 Issue、不触发 Requeue，也不能替代
+`revise --message` 的 Run 级反馈。若 Resume preflight 发现 stale，命令不会运行 Codex，而是返回
+`requeue_required`；此时只能先查看状态/历史，再由维护者显式 Requeue：
+
+```bash
+agent-run status <run-id> --repo OWNER/REPO
+agent-run requeue <run-id> --repo OWNER/REPO
+```
+
 `start` 只创建 Run、Run Branch 和工作前沿；`deliver` 从当前 Active Ticket 开始，
 在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
 重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
@@ -200,7 +257,73 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 使用 `agent-run` 开发本仓库时，运行中的 Controller 必须来自已验证且固定的 commit，
 不得从正在被 Worker 修改的 editable checkout 导入代码。推荐把 Runner 安装到按 commit
 SHA 命名的独立 Python 环境，并从专用干净 clone 启动；同一 Delivery Run 从开始到完成始终
-使用同一个 Runner。最终 PR 合入默认分支并完成全量验证后，才创建下一版 Runner。
+使用同一个 Runner。最终 PR 合入默认分支并完成全量验证后，才创建下一版 Runner。#34–#39 是
+已废弃的执行序列，不得作为 Runner 的来源、行为基线、验收证据或恢复对象；只以 #42 及其原生
+Sub-issues 的最终 merged commit 为准。
+
+### Immutable Runner promotion gate
+
+Promotion 只能从已经合入 `origin/main` 的**完整 40 位 commit SHA**进行。不要用可变 branch 名、
+正在开发的 checkout、未合并 PR head、旧失败 Run 或任何 #34–#39 记录代替。以下流程在新、干净
+checkout 执行；示例中的路径必须位于仓库和 Worker checkout 之外：
+
+```bash
+RUNNER_SOURCE=/path/to/clean/grill-engineer
+git -C "$RUNNER_SOURCE" fetch origin main
+RUNNER_SHA="$(git -C "$RUNNER_SOURCE" rev-parse origin/main)"
+test "${#RUNNER_SHA}" -eq 40
+git -C "$RUNNER_SOURCE" merge-base --is-ancestor "$RUNNER_SHA" origin/main
+
+RUNNER_ROOT=/path/outside/the/repository/agent-run-runners
+RUNNER="$RUNNER_ROOT/$RUNNER_SHA"
+RUNNER_CHECKOUT=/path/outside/the/repository/agent-run-sources/$RUNNER_SHA
+git -C "$RUNNER_SOURCE" worktree add --detach "$RUNNER_CHECKOUT" "$RUNNER_SHA"
+test "$(git -C "$RUNNER_CHECKOUT" rev-parse HEAD)" = "$RUNNER_SHA"
+test -z "$(git -C "$RUNNER_CHECKOUT" status --porcelain)"
+python -m venv "$RUNNER"
+"$RUNNER/bin/python" -m pip install --no-deps "$RUNNER_CHECKOUT"
+"$RUNNER/bin/python" -c 'import agent_run; print(agent_run.__file__)'
+```
+
+`pip install` 不能使用 `-e/--editable`。最后一条必须解析到该 Runner 环境的 `site-packages`，而不是
+`RUNNER_SOURCE` 或 `RUNNER_CHECKOUT`。完成后从这个仍干净、detached 且精确 SHA 的 checkout 让 Runner
+执行一次真实 Structured Outputs promotion handshake；命令会拒绝 source/editable 环境、脏 checkout、
+非该 SHA 的 HEAD、未合入 `origin/main` 的 SHA 或已有 audit 文件：
+
+```bash
+AUDIT_FILE="$RUNNER_ROOT/promotions/$RUNNER_SHA.json"
+cd "$RUNNER_CHECKOUT"
+"$RUNNER/bin/agent-run" promotion-handshake "$RUNNER_SHA" --audit-file "$AUDIT_FILE"
+```
+
+该命令必须与
+Controller 完全使用同一 Codex CLI、`publication_or_human_blocker_schema()`、bubblewrap readonly
+checkout 与 GitHub App 只读凭据边界。握手只要求服务端接受 schema；`publication` 与
+`human_blocker` 的完整语义分支仍由离线测试覆盖。API 返回 schema rejection 时结果为 **failed**；
+认证、网络或 rate limit 结果为 **inconclusive**，绝不是 green。只有 **passed** 才可以把该 Runner
+用于新的 self-hosting Run。
+
+每次 attempt 都要保存一条小型 JSON 或 Markdown 审计记录（不得保存 Prompt、完整 stdout、transcript、
+token 或私钥），至少包含：
+
+```text
+runner_commit_sha: <40-char SHA>
+runner_python: <absolute Runner Python path>
+runner_module: <installed agent_run module path>
+runner_package_sha256: <sha256 of installed Runner package>
+codex_cli_version: <codex --version>
+publication_schema_sha256: <sha256 of canonical schema JSON>
+started_at_utc: <RFC 3339>
+finished_at_utc: <RFC 3339>
+credential_redaction: passed | failed
+handshake_verdict: passed | failed | inconclusive
+bounded_error: <redacted error or null>
+```
+
+将记录写在 Runner 环境旁的受限审计目录或运行维护系统中。不得把它作为 Run state、Issue 评论或
+PR 叙事的一部分。凭据边界或真实 handshake 任一项未通过时，删除半成品 Runner，保留小型脱敏
+记录，并停止 promotion；通过后才可删除 detached `RUNNER_CHECKOUT`。不要用本地 schema 测试、
+模拟 Agent Fixture 或 Codex 的非结构化成功代替。
 
 仓库 CI 的 Required Check 名称是 `quality`。GitHub Ruleset 应覆盖默认分支以及 Ticket PR、
 Run Repair PR 所针对的 Run Branch。没有 Required Checks 时 Controller 会按无托管 CI 继续，

@@ -94,6 +94,21 @@ class CodexCliBackend:
             summary=str(result["summary"]),
         )
 
+    def publication_schema_handshake(self, checkout: Path) -> tuple[str, str]:
+        """Exercise the production Publication schema boundary once, read-only."""
+
+        return self._invoke(
+            prompt=(
+                "这是一次受控 Structured Outputs schema handshake。不要读取或修改仓库，不要调用"
+                "工具。仅返回 result_kind 为 human_blocker，三个 publication 字段为 null，"
+                "human_blockers 为只含一条非空中文字符串的数组。"
+            ),
+            checkout=checkout,
+            thread_id=None,
+            schema=publication_or_human_blocker_schema(),
+            writable_checkout=False,
+        )
+
     @staticmethod
     def _development_prompt(request: dict[str, Any]) -> str:
         is_run_repair = request.get("acceptance_scope") == "run"

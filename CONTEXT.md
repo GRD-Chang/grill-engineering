@@ -44,6 +44,20 @@ _Avoid_: Development Brief、Agent Artifact、PR 正文
 Acceptance、Human Response 或 worktree。
 _Avoid_: Invocation Resume、自动 rebase、跨 generation 复用 Thread
 
+**Work Subject（工作主体）**:
+一个跨 Job Generation 保持稳定的交付目标：Ticket、Parent-only Delivery、Run Repair、Run
+Acceptance 或 Final Run Publication。它是审计和 currentness 绑定的对象，不等于一次 Codex
+Thread、一次 Invocation 或一个可变 branch/PR identity。
+_Avoid_: Job Generation、Agent Invocation、Codex Thread
+
+**Currentness Boundary（当前性边界）**:
+Controller 为 Work Subject 的一个 Job Generation 机械保存并比较的权威事实集合。它按阶段包含
+requirements revision、适用 base/head、Candidate、Acceptance、PR、Parent、Graph、Ticket Completion
+或 Run Branch 等输入；Codex Thread、Prompt、stdout 与 Agent 的语义判断不属于该边界。明确且可重建的
+边界漂移会使旧 Generation 停在 `requeue_required` 或回到 fresh Run Acceptance；矛盾、缺失或未知外部
+mutation 则是 Human Blocker。
+_Avoid_: Agent 判断是否 stale、Thread 连续性、自动 rebase
+
 **Execution Guard（执行约束）**:
 Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用完整真实 Git/`gh` CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。它只通过只读权威 Git metadata 和不向 Worker 注入 Publisher 写凭据保留 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回不含 URL 或凭据的固定错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
@@ -233,6 +247,13 @@ _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
 顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；可选的不可变 Human Response 仅绑定当前 Job Generation，按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。恢复成功后当前 blocker 告警会清除，原始 blocker/response 尝试按顺序保留。
 _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
+**Human Response（人工响应）**:
+维护者通过 `agent-run resume <run-id> --message "..."` 为当前 Human Blocker 提供的原样、不可变
+上下文。它 trim 后必须非空且最多 8 KiB，按顺序只绑定当前 Job Generation，进入后续 Development 与
+Fresh Acceptance；它不适用于 `execution_failed`、不修改 Issue、不触发 Requeue，也不等同于 Run
+Feedback Revision。替换 Generation 从空序列开始。
+_Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
+
 **Review Finding（审查发现）**:
 Acceptance Artifact 中一个可由 Development Codex 独立修复和验证的问题单元。它说明具体问题、代码或行为证据、必须达到的结果以及验证方式；人工产品决策、外部权限或不可替代操作进入 `human_blockers`，不伪装成 finding。
 _Avoid_: 风格意见、无证据猜测、实现方案命令
@@ -268,6 +289,20 @@ checkout 只读，且不增加领域 Development、Validation 或 Publication At
 Thread，或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
 
+**Output Attempt（输出尝试）**:
+一个 Agent Invocation 内的一次 `codex exec` 进程执行。初始输出是第一个 Output Attempt；仅当进程
+零退出、Thread 身份正确而本地完整 contract 不合法时，Controller 才在同一 Thread、只读 checkout 中
+最多追加两次机械 Output Repair。Repair 不产生新的 Invocation、不消耗领域 Development、Validation 或
+Publication attempt，也不适用于进程、凭据、sandbox、timeout、signal 或 Thread 错配失败。
+_Avoid_: Invocation Resume、智能重试、独立持久 journal
+
+**Invocation Resume（调用恢复）**:
+维护者以 `agent-run resume <run-id>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
+successor Invocation。存在可恢复 Thread 时默认复用它；`--new-thread` 或无可恢复 Thread 时才以该阶段
+完整标准 Prompt 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness
+Boundary 已 stale 时不启动 Codex，只进入 `requeue_required`。
+_Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
+
 **Ticket Repair Budget（Ticket 修复预算）**:
 一个 Ticket Job 在 Fresh Acceptance 或 CI 失败后最多可触发十次自动修复 Development Attempt。等待 CI、重复读取状态或对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的修复 Attempt 才计数。预算耗尽、Git 完整性检查无法通过或 CI 无法自动修复时，Ticket 转为 `ready-for-human`；Controller 继续推进不依赖该 Ticket 的其他任务。
 _Avoid_: CI 等待次数、同一 SHA 重复审查、无限重试
@@ -285,7 +320,7 @@ Delivery Run 中已不存在可激活的 Ticket Job，但 Ticket Set 尚未全�
 _Avoid_: 单 Ticket 失败、正常依赖等待、最终整体验收
 
 **Ticket Content Revision（Ticket 内容版本）**:
-一张 Ticket 当前标题和正文的稳定版本指纹。Agent Artifact 必须绑定该指纹；指纹变化会使基于旧内容产生的 Plan、代码候选和验收结论失效，但不会改变 Ticket Job 身份。若 Ticket Graph Revision 未变化，Controller 自动按最新内容重启开发并刷新累计 PR 说明，不请求人工确认；Issue 评论可由 Codex 阅读，但不属于权威需求且不触发 Revision。
+一张 Ticket 当前标题和正文的稳定版本指纹。Agent Artifact 必须绑定该指纹；指纹变化会使基于旧内容产生的 Plan、代码候选和验收结论失效，但不会改变 Ticket Job 身份。若 Ticket Graph Revision 未变化，Controller 停在 `requeue_required`，只有维护者显式 `requeue` 才会从最新权威事实创建新的 Job Generation；Issue 评论可由 Codex 阅读，但不属于权威需求且不触发 Revision。
 _Avoid_: Issue 评论、Git commit、Ticket Job ID
 
 **Ticket Graph Revision（Ticket 图版本）**:
