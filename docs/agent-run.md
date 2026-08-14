@@ -6,6 +6,8 @@
 - 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
+- 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
+- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；维护者可用同一 `run` 或 `resume` 命令开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -142,6 +144,15 @@ Required Checks 仍为 pending 时，命令保存 `waiting_checks` 状态并退�
 执行同一个 `deliver` 命令即可继续，不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
 原始 CI Evidence 交回同一 Development Thread。
+
+新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、仓库根和 `.agent-run` state 目录，最多保留
+最近 32 条，不回填或迁移历史 Run。因此，`status` 与 `history` 可在任意目录下按 Run ID 自动定位；
+若索引缺失、失效或冲突，命令明确要求 `--state-dir`，绝不全盘搜索。其他会推进 Run 或改变外部状态
+的命令仍必须从目标仓库运行，或显式指定 state 目录。
+
+如果 merge 的写入响应出现网络错误或无法解析的响应，Publisher 不盲目重放：先在 GitHub 对账。PR 已
+合并即恢复成功；PR 仍 OPEN 且 live head/base、Required Checks 与 mergeability 均保持当前时，最多重试
+同一个带精确 head 绑定的 merge intent 三次；任一状态矛盾则停止等待人工处理。
 
 当 `deliver` 返回 `run_acceptance_pending` 后，执行 `accept-run`。正常 Run Acceptance
 Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得

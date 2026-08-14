@@ -28,6 +28,36 @@ export AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(</secure/agent-run-app.pem)"
 Controller 会为每个 Worker 创建短期只读 installation token；不要把 Publisher token
 复用为 Worker token。
 
+### 目标 GitHub 仓库配置
+
+除本机依赖外，运行前还必须在**目标仓库**完成以下配置。缺失其中任一项时，自动交付可能
+在检查或合并阶段停住。
+
+1. 在 **Settings → General → Pull Requests** 启用 **Allow squash merging**。Ticket PR
+   固定使用 squash merge 合入 Run Branch；仅开启 merge commit 或 rebase merge 不满足要求。
+2. 先让仓库 CI 真实产出并成功一次名为 `quality` 的 Check；仅有 workflow 文件、但从未运行
+   成功，不足以证明 Required Check 可用。
+3. 在 **Settings → Rules → Rulesets** 创建并启用两条 *Active branch ruleset*：
+   - 默认分支（仓库实际的 default branch，例如 `main` 或 `master`）：要求 Pull Request 和
+     `quality`，并禁止 force push 与删除；
+   - Run Branch：匹配 `refs/heads/agent-run/**/run`，要求 `quality`，但设置
+     **Do not enforce on create**，并允许交付完成后的受控删除。
+4. Required Check 选择 **Any source**，只填写 context `quality`，不要绑定 GitHub Actions
+   App / integration。当前 Controller 对非空 `integration_id` 会安全拒绝继续；同时应限制
+   仓库写权限，避免其他写入主体伪造同名 status。
+5. 将前述专用 GitHub App 安装到该仓库；App 只用于 Worker 的短期只读 token。Publisher
+   仍使用独立、具仓库写权限的宿主 `gh` 登录。
+
+启用后，应读回 Ruleset 并对一张指向 Run Branch 的 PR 验证 Required Check：
+
+```bash
+gh api repos/OWNER/REPO/rulesets
+gh pr checks <pr-number> --repo OWNER/REPO --required --json bucket,name
+```
+
+第二个命令必须能看到 `quality` 且为 `pass`，再启动正式 Run。更完整的 Ruleset 兼容性和
+权限说明见 [`docs/agent-run.md`](docs/agent-run.md#自托管开发)。
+
 ## 开发
 
 ```bash

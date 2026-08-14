@@ -12,6 +12,14 @@ _Avoid_: GitHub Bot、Publisher、Mutation Authority
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
+**验收 Finding（Acceptance Finding）**:
+独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 由 Agent 用一段自包含文本写明问题、可观察证据、必须达到的结果和复验方式；不另分 P1/P2 或建议类别。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。只有纯主观偏好或与当前 Ticket 无关的未来想法不构成 Finding；不得因问题优先级较低而省略有事实依据的 Finding。
+_Avoid_: 非空 Finding 的 pass、无行动依据的泛泛建议、Controller 解释或重写 Finding、重复写入多个 lane
+
+**验收 Lane 状态（Acceptance Lane Status）**:
+每个 E2E、Standards、Spec lane 独立输出 `status`、`evidence` 与 `findings`。`pass` 表示该 lane 已完整执行且 Findings 为空；`fail` 表示其 Findings 非空；`blocked` 表示该 lane 因权限、凭据、产品决策或不可替代外部操作而无法形成结论，Findings 必须为空且原因写入 evidence。Controller 只从三个 lane 推导结果：任一 `fail` 回到 Development；没有 `fail` 而存在 `blocked` 时成为 Human Blocker；三个均 `pass` 才通过验收。
+_Avoid_: 顶层 verdict、pass 携带 Finding、fail 没有 Finding、blocked 同时产出部分 Finding
+
 **Development Brief（开发简报）**:
 提供给 Development Codex 的最小语义输入，包括 Parent Issue URL、适用时的当前 Ticket URL、不可重建的原始失败证据、GitHub 上下文约定和输出要求。当前 Issue 的 title/body 是需求源；Issue 评论、历史 PR、开发者总结和旧 Artifact 仅是调查线索，不能覆盖当前需求或单独构成验收证据。Codex 直接从本地 worktree 与只读 GitHub 访问获取代码、Issue 与历史 PR 事实，并自主判断需要读取哪些相关对象；Controller 不把 Delivery Run、Revision、SHA 或其他内部运行账本作为任务输入。
 _Avoid_: Change Job Record、完整环境快照、实现计划
@@ -71,12 +79,28 @@ Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用�
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:
-Development 与 Repair Codex 必须在自测后按 Prompt 派发 Standards 与 Spec 预审 subagent，尽早修复发现的问题；该预审不构成通过决定，也不替代独立验收。Fresh Validation 与 Run Acceptance Codex 必须按 Prompt 派发独立的 E2E、Standards 与 Spec 三条 lane，处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 状态/证据与外层 SHA/Revision 绑定。内部 subagent 发现的 Human Blocker 先交给本阶段顶层 Codex；只有顶层 Codex 的最终结构化输出可传给 Controller。
+Development 与 Repair Codex 必须在自测后按 Prompt 派发 Standards 与 Spec 预审 subagent，尽早修复发现的问题；该预审不构成通过决定，也不替代独立验收。Fresh Validation 与 Run Acceptance Codex 必须按 Prompt 派发独立的 E2E、Standards 与 Spec 三条 lane，处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 的 status、evidence、findings 与外层 SHA/Revision 绑定。内部 subagent 发现的人工阻塞先交给本阶段顶层 Codex，并由其写入对应 lane 的 `blocked` evidence；只有顶层 Codex 的最终结构化输出可传给 Controller。
 _Avoid_: Controller 内部 Agent 编排器、subagent provenance ledger、父 Agent 自签
 
 **Controller（控制器）**:
 本地 `agent-run` 单进程中的确定性编排层。它读取 GitHub 与本地事实、维护状态机和 Revision、选择可执行 Job、启动 Codex Threads、校验 Artifacts、执行预算与门禁，并调用 Publisher 完成允许的写操作；它不替 Agent 做需求、代码或修复方案的语义判断。
 _Avoid_: Codex Worker、独立 daemon、GitHub Mutation Authority
+
+**Run 内部监督（In-Run Supervision）**:
+一次由维护者显式启动或恢复的 `agent-run run`，在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。真正需要产品决策、权限、凭据或不可替代外部操作时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
+_Avoid_: 维护者轮询 CI、常驻的第二套控制器、自动越过 Final Human Acceptance
+
+**监督截止时间（Supervision Deadline）**:
+Run 内部监督按远端状态类别采用有限等待预算。预算内保持自动轮询与重对账；到期时保存最后的权威证据并进入监督超时暂停，而不是执行失败或假装通过。GitHub 只读状态或事件收敛的默认预算为 10 分钟，Required Checks 的默认预算为 45 分钟；其他类别须有自己的明确预算。
+_Avoid_: 无限占用进程、把超时吞成 pass、把正常 pending 伪装成需要外部授权的 Human Blocker
+
+**监督超时暂停（Supervision Timeout Pause）**:
+可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据并退出，等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。后续 `agent-run run` 或 `agent-run resume` 重新读取权威状态并开始新的对应等待窗口。
+_Avoid_: execution_failed、Human Blocker、常驻 watcher、无界单次进程
+
+**Ticket 关闭归属（Ticket Close Ownership）**:
+Publisher 关闭 Primary Ticket 的可重建证明：它绑定 close-intent、PR 与 integrated SHA、intent 前的 Timeline watermark、baseline 后最新的关闭事件、Publisher actor 和 Issue 的 CLOSED 状态。GitHub Issue 与 Timeline 的时间字段可能异步收敛，不能要求其字符串完全相等；证据尚未收敛时属于 Run 内部监督，只有观察到更晚外部更新、重开、actor 或 binding 不匹配时才构成 Human Blocker。
+_Avoid_: 仅凭 Issue 已关闭、时间字符串相等、把最终一致性延迟当作执行失败
 
 **Publisher（发布器）**:
 `agent-run` 单进程中唯一持有写凭证的受限模块，也是系统唯一的 Mutation Authority。它只接受 Controller 已校验且被 Change Job Contract 允许的动作，执行 Git、GitHub PR、评论、Issue 与合并写入；它不是独立服务，写凭证不会进入 Codex 子进程环境。
@@ -89,6 +113,14 @@ _Avoid_: Agent 自治、结构化输出、候选就绪
 **Delivery Run（交付运行）**:
 由一次人工授权启动、覆盖一组相关 Ticket 并以最终整体验收结束的交付范围。不同 Delivery Run 彼此拥有独立身份和集成边界。
 _Avoid_: 单张 Ticket、单次 Codex 执行、长期后台服务
+
+**Run 定位索引（Run Locator Index）**:
+本机维护的最小 Run ID 到仓库根和 state 目录的定位记录。它只让新版本创建的 Run 在任意目录下由 `status` 与 `history` 找到正确的本地 state，不回填或迁移历史 Run；记录失效或冲突时要求维护者显式指定 state 目录，不扫描磁盘。索引最多保留最近 32 条，且不参与 Agent 编排、GitHub 状态、权限或生命周期 mutation。
+_Avoid_: 全盘搜索、历史 state 迁移、跨仓库自动 mutation、Agent 执行日志、第二套 Run state
+
+**Merge 结果对账（Merge Outcome Reconciliation）**:
+Publisher 发出带精确 head 绑定的 merge intent 后，如网络或 GitHub 响应使结果未知，先在 GitHub 只读事实中对账：已 MERGED 即恢复成功；仍 OPEN 且 head、base、Required Checks 与 mergeability 仍全部匹配时，最多重试同一 intent 三次；任一矛盾状态才停止为人工处理。结果读取使用 GitHub 事件与只读状态的监督预算。
+_Avoid_: 盲目重放未知写入、仅凭 CLI stderr 判定失败、绕过 currentness 的 merge retry
 
 **Operator Start（人工启动）**:
 维护者通过本地显式命令选择 Parent Spec 并授权创建或恢复 Delivery Run。它是唯一启动授权，任何 GitHub 标签都不能替代。
@@ -244,7 +276,7 @@ _Avoid_: 开发者自测、第二次 GitHub Codex Review、仅测试通过
 _Avoid_: Development checkout、持久 Reviewer worktree、验收后清理单个产物
 
 **Acceptance Artifact（验收产物）**:
-Fresh Acceptance 或 Run Acceptance Codex 输出的共享结构化语义判断，第一读者是下一轮 Development Codex，而非人类报告。它只包含 `verdict`、固定的 E2E/Standards/Spec checks、自包含的可修复 findings 和克制使用的 `human_blockers`；Ticket Acceptance Criteria 由 Spec check 覆盖，scope、reviewed base/head 与有效 Revision 由 Controller 绑定在外层 Acceptance Record。
+Fresh Acceptance 或 Run Acceptance Codex 输出的共享结构化语义判断，第一读者是下一轮 Development Codex，而非人类报告。它只包含固定的 E2E/Standards/Spec lane；每条 lane 均有 `status`、可复核 `evidence` 与自包含 `findings`。Controller 从这三条 lane 推导通过、返工或人工阻塞；Ticket Acceptance Criteria 由 Spec lane 覆盖，scope、reviewed base/head 与有效 Revision 由 Controller 绑定在外层 Acceptance Record。
 _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方案
 
 **Run Acceptance Artifact（运行验收产物）**:
@@ -252,7 +284,7 @@ _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方�
 _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
 
 **Human Blocker（人工阻塞）**:
-顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 在 Acceptance Artifact 中以 `verdict: "human"` 与 `human_blockers` 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；可选的不可变 Human Response 仅绑定当前 Job Generation，按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。恢复成功后当前 blocker 告警会清除，原始 blocker/response 尝试按顺序保留。
+顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 以一个或多个 `blocked` lane 的 evidence 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；可选的不可变 Human Response 仅绑定当前 Job Generation，按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。恢复成功后当前 blocker 告警会清除，原始 blocker/response 尝试按顺序保留。
 _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
 **Human Response（人工响应）**:
@@ -263,7 +295,7 @@ Feedback Revision。替换 Generation 从空序列开始。
 _Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
 
 **Review Finding（审查发现）**:
-Acceptance Artifact 中一个可由 Development Codex 独立修复和验证的问题单元。它说明具体问题、代码或行为证据、必须达到的结果以及验证方式；人工产品决策、外部权限或不可替代操作进入 `human_blockers`，不伪装成 finding。
+Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以一条自包含文本说明具体问题、代码或行为证据、必须达到的结果以及验证方式；人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
 _Avoid_: 风格意见、无证据猜测、实现方案命令
 
 **Acceptance Repair Loop（验收修复循环）**:
@@ -283,7 +315,7 @@ _Avoid_: Hosted CI Gate、Fresh Acceptance、本地 changed-surface validation
 _Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acceptance
 
 **Acceptance Record（验收记录）**:
-Development–Acceptance Engine 在独立验收后本地持久化的权威记录，将唯一一份 Acceptance Artifact 绑定到 acceptance scope、reviewed base、已验收 Candidate 或 Run head、对应 tree 或预期合并结果、有效 Revision 和 Reviewer 身份。每个合法的 `pass`、`request_changes` 或 `human` 结果都形成当前 Record；只有仍然 current 的 `pass` 可以授权 Publication，后续 Attempt 替换当前 Record，历史只按恢复需要有界保留，GitHub 只接收简洁的 Agent Run Status 投影。
+Development–Acceptance Engine 在独立验收后本地持久化的权威记录，将唯一一份 Acceptance Artifact 绑定到 acceptance scope、reviewed base、已验收 Candidate 或 Run head、对应 tree 或预期合并结果、有效 Revision 和 Reviewer 身份。Controller 从 Artifact 的三个 lane 推导通过、返工或人工阻塞；只有仍然 current 的三个 lane 全部 `pass` 可以授权 Publication，后续 Attempt 替换当前 Record，历史只按恢复需要有界保留，GitHub 只接收简洁的 Agent Run Status 投影。
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Agent Invocation（Agent 调用）**:
