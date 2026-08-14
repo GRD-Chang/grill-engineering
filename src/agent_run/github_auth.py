@@ -17,9 +17,11 @@ class GitHubCredentialError(RuntimeError):
 
 
 _REQUIRED_READ_PERMISSIONS = {
+    "checks": "read",
     "issues": "read",
     "metadata": "read",
     "pull_requests": "read",
+    "statuses": "read",
 }
 
 

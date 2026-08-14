@@ -208,8 +208,10 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 ## 权限边界
 
 Controller 使用专属 GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数
-创建短期 installation token。创建请求只申请 `metadata: read`、`issues: read`、
-`pull_requests: read`，且只接受 GitHub 在同一响应中返回完全一致 permissions 的 token。
+创建短期 installation token。创建请求只申请 `checks: read`、`issues: read`、
+`metadata: read`、`pull_requests: read` 和 `statuses: read`，且只接受 GitHub 在同一响应中
+返回完全一致 permissions 的 token。这些只读权限使独立验收可以读取远端 Checks 与 commit
+statuses，确认 Hosted CI 结果。
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
 Publisher GitHub token、SSH agent 和交互式凭据入口，只向 worker 注入该短期只读 token，
 并要求系统安装 `bubblewrap`。Codex 使用 YOLO 模式，可以读写宿主文件系统、联网以及
@@ -349,8 +351,8 @@ status，因此仍应限制仓库写权限，并保持 Worker 只持有短期只
 让 `quality` 在仓库中成功运行一次，启用后再通过 API 读回实际条件和 Required Check。
 
 GitHub App 的创建、安装和私钥保管不属于 Controller 自动化范围。App 必须只授予
-`metadata: read`、`issues: read`、`pull_requests: read`，私钥保存在仓库和 Runner checkout
-之外；Publisher 继续使用独立的宿主 `gh` 写凭据。
+`checks: read`、`issues: read`、`metadata: read`、`pull_requests: read` 和 `statuses: read`，
+私钥保存在仓库和 Runner checkout 之外；Publisher 继续使用独立的宿主 `gh` 写凭据。
 
 ## 本地状态与清理
 

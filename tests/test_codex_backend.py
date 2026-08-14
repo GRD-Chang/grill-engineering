@@ -1115,9 +1115,11 @@ def test_controller_mints_token_with_exact_read_permissions(
     monkeypatch: Any,
 ) -> None:
     permissions = {
+        "checks": "read",
         "issues": "read",
         "metadata": "read",
         "pull_requests": "read",
+        "statuses": "read",
     }
     response = io.BytesIO(
         json.dumps({"token": "minted-reader", "permissions": permissions}).encode()
@@ -1156,9 +1158,11 @@ def test_controller_rejects_minted_token_with_different_permissions(
             {
                 "token": "over-scoped",
                 "permissions": {
+                    "checks": "read",
                     "issues": "write",
                     "metadata": "read",
                     "pull_requests": "read",
+                    "statuses": "read",
                 },
             }
         ).encode()
