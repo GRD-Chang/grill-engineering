@@ -13,8 +13,8 @@
 - 已登录的 `codex` 和 `gh` CLI；
 - Git、OpenSSL 和 Linux `bubblewrap`；
 - 安装在目标仓库上的专用 GitHub App，权限严格限定为
-  `checks: read`、`issues: read`、`metadata: read`、`pull_requests: read` 和
-  `statuses: read`；
+  `actions: read`、`checks: read`、`contents: read`、`issues: read`、
+  `metadata: read`、`pull_requests: read` 和 `statuses: read`；
 - Publisher 使用的宿主 `gh` 登录具有目标仓库写权限。
 
 GitHub App 的私钥必须保存在仓库外。运行前注入：

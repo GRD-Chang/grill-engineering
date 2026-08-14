@@ -1115,7 +1115,9 @@ def test_controller_mints_token_with_exact_read_permissions(
     monkeypatch: Any,
 ) -> None:
     permissions = {
+        "actions": "read",
         "checks": "read",
+        "contents": "read",
         "issues": "read",
         "metadata": "read",
         "pull_requests": "read",
@@ -1150,20 +1152,44 @@ def test_controller_mints_token_with_exact_read_permissions(
     }
 
 
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        {
+            "actions": "read",
+            "checks": "read",
+            "contents": "read",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "read",
+            "statuses": "read",
+        },
+        {
+            "checks": "read",
+            "contents": "read",
+            "issues": "read",
+            "metadata": "read",
+            "pull_requests": "read",
+            "statuses": "read",
+        },
+        {
+            "actions": "read",
+            "checks": "read",
+            "issues": "read",
+            "metadata": "read",
+            "pull_requests": "read",
+            "statuses": "read",
+        },
+    ],
+)
 def test_controller_rejects_minted_token_with_different_permissions(
-    monkeypatch: Any,
+    monkeypatch: Any, permissions: dict[str, str]
 ) -> None:
     response = io.BytesIO(
         json.dumps(
             {
                 "token": "over-scoped",
-                "permissions": {
-                    "checks": "read",
-                    "issues": "write",
-                    "metadata": "read",
-                    "pull_requests": "read",
-                    "statuses": "read",
-                },
+                "permissions": permissions,
             }
         ).encode()
     )
