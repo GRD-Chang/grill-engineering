@@ -26,55 +26,104 @@ class RunPublicationFlow(RunPublicationShared):
     def publish(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
-            if not self._refresh_currentness(state):
-                return self._save(state)
-            run = self._mapping(state, "run_acceptance")
             publication = self._publication_state(state)
-            if publication["phase"] in {"merged", "abandoned"}:
+            try:
+                return self._publish_locked(state, publication)
+            except GitHubReadError as error:
+                if not self._is_reconcilable_github_read(error):
+                    raise
+                return self._wait_for_github_convergence(state, publication, error)
+
+    def _publish_locked(
+        self, state: dict[str, Any], publication: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self._refresh_currentness(state):
+            return self._save(state)
+        run = self._mapping(state, "run_acceptance")
+        if publication["phase"] in {"merged", "abandoned"}:
+            return state
+        if publication["phase"] == "stale":
+            publication.clear()
+            publication["phase"] = "pending"
+        if publication["phase"] == "publication_pending":
+            publication.pop("artifact", None)
+            publication.pop("last_publication_error", None)
+            publication["publication_attempts"] = 0
+            publication["phase"] = "pending"
+            state["terminal_kind"] = "run_publication_pending"
+        if publication["phase"] == "publishing":
+            if fail_interrupted_invocation(
+                state, role="final_publication", save=self._save
+            ):
                 return state
-            if publication["phase"] == "stale":
-                publication.clear()
-                publication["phase"] = "pending"
-            if publication["phase"] == "publication_pending":
-                publication.pop("artifact", None)
-                publication.pop("last_publication_error", None)
-                publication["publication_attempts"] = 0
-                publication["phase"] = "pending"
-                state["terminal_kind"] = "run_publication_pending"
-            if publication["phase"] == "publishing":
-                if fail_interrupted_invocation(
-                    state, role="final_publication", save=self._save
-                ):
-                    return state
-                publication.pop("artifact", None)
-                publication["phase"] = "pending"
-            if not self._acceptance_is_current(state, run):
-                return self._invalidate_for_fresh_acceptance(state)
-            if publication["phase"] in {"waiting_checks", "ready_for_approval"}:
+            publication.pop("artifact", None)
+            publication["phase"] = "pending"
+        if not self._acceptance_is_current(state, run):
+            return self._invalidate_for_fresh_acceptance(state)
+        if publication["phase"] in {
+            "waiting_checks",
+            "waiting_external",
+            "ready_for_approval",
+        }:
+            return self._publish_accepted_run(state, run, publication)
+        if publication["phase"] != "pending":
+            raise ValueError("unknown Final Run Publication phase")
+        while True:
+            publication["publication_attempts"] = (
+                int(publication.get("publication_attempts", 0)) + 1
+            )
+            publication["phase"] = "publishing"
+            publication.pop("artifact", None)
+            self._save(state)
+            artifact = self._create_publication_artifact(state, publication)
+            if artifact is None:
+                return self._save(state)
+            self._save(state)
+            publication["artifact"] = {
+                "commit_message": artifact.commit_message,
+                "pr_title": artifact.pr_title,
+                "pr_body_markdown": artifact.pr_body_markdown,
+            }
+            try:
                 return self._publish_accepted_run(state, run, publication)
-            if publication["phase"] != "pending":
-                raise ValueError("unknown Final Run Publication phase")
-            while True:
-                publication["publication_attempts"] = (
-                    int(publication.get("publication_attempts", 0)) + 1
-                )
-                publication["phase"] = "publishing"
-                publication.pop("artifact", None)
-                self._save(state)
-                artifact = self._create_publication_artifact(state, publication)
-                if artifact is None:
-                    return self._save(state)
-                self._save(state)
-                publication["artifact"] = {
-                    "commit_message": artifact.commit_message,
-                    "pr_title": artifact.pr_title,
-                    "pr_body_markdown": artifact.pr_body_markdown,
-                }
-                try:
-                    return self._publish_accepted_run(state, run, publication)
-                except (GitError, GitHubReadError, OSError) as error:
-                    if self._publication_failed(state, publication, error):
-                        return state
+            except (GitError, GitHubReadError, OSError) as error:
+                if isinstance(error, GitHubReadError):
+                    if not self._is_reconcilable_github_read(error):
+                        raise
+                    return self._wait_for_github_convergence(state, publication, error)
+                if self._publication_failed(state, publication, error):
+                    return state
+
+    def _wait_for_github_convergence(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        error: GitHubReadError,
+    ) -> dict[str, Any]:
+        publication["phase"] = "waiting_external"
+        publication["last_publication_error"] = str(error)
+        state.update(
+            {
+                "status": "waiting_external",
+                "terminal_kind": "waiting_external",
+                "diagnostics": [
+                    {
+                        "code": error.code,
+                        "message": error.message,
+                        "waiting_for": "Final Run PR GitHub reconciliation",
+                    }
+                ],
+            }
+        )
+        return self._save(state)
+
+    @staticmethod
+    def _is_reconcilable_github_read(error: GitHubReadError) -> bool:
+        return error.code not in {
+            "ambiguous_run_pr",
+            "github_invalid_response",
+            "stale_run_pr",
+        }
 
     def _publication_failed(
         self,

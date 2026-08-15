@@ -190,44 +190,95 @@ class TicketDeliveryLoop:
         # Persist the integrated boundary before the external Issue mutation.
         job["phase"] = TicketPhase.MERGED.value
         self._save(state)
-        close_intent = job.get("ticket_close_intent")
-        if not isinstance(close_intent, dict):
-            close_intent = self.github.prepare_primary_ticket_close(
+        try:
+            close_intent = job.get("ticket_close_intent")
+            if not isinstance(close_intent, dict):
+                close_intent = self.github.prepare_primary_ticket_close(
+                    ticket_number=int(job["ticket_number"]),
+                    run_id=str(state["run_id"]),
+                    pr_number=int(job["pr_number"]),
+                    integrated_sha=integrated,
+                )
+                job["ticket_close_intent"] = close_intent
+                self._save(state)
+                if not isinstance(close_intent, dict):
+                    raise GitHubReadError(
+                        "ticket_close_intent_missing",
+                        "Ticket close preparation did not establish current ownership",
+                )
+            dispatch_intent = close_intent
+
+            def record_dispatch_boundary() -> None:
+                nonlocal dispatch_intent
+                if dispatch_intent.get("dispatch_attempted") is True:
+                    return
+                dispatch_intent = {**dispatch_intent, "dispatch_attempted": True}
+                job["ticket_close_intent"] = dispatch_intent
+                self._save(state)
+
+            close_ownership = self.github.close_primary_ticket(
                 ticket_number=int(job["ticket_number"]),
                 run_id=str(state["run_id"]),
                 pr_number=int(job["pr_number"]),
                 integrated_sha=integrated,
+                close_intent=dispatch_intent,
+                before_dispatch=record_dispatch_boundary,
             )
-            job["ticket_close_intent"] = close_intent
-            self._save(state)
-        if not isinstance(close_intent, dict):
-            raise GitHubReadError(
+            if close_ownership is None:
+                raise GitHubReadError(
+                    "ticket_close_ownership_missing",
+                    "Ticket close dispatch did not establish exact ownership",
+                )
+        except GitHubReadError as error:
+            if error.code in {
+                "ticket_close_external_conflict",
+                "ticket_close_intent_missing",
+                "ticket_close_ownership_missing",
+            }:
+                job.update(
+                    {
+                        "phase": TicketPhase.BLOCKED.value,
+                        "blocked_reason": "ticket_close_external_conflict",
+                    }
+                )
+                state.update(
+                    {
+                        "status": "ready_for_human",
+                        "terminal_kind": "waiting_human",
+                        "diagnostics": [
+                            {
+                                "code": error.code,
+                                "message": error.message,
+                                "ticket_number": job["ticket_number"],
+                            }
+                        ],
+                    }
+                )
+                self._save(state)
+                return False
+            if error.code not in {
                 "ticket_close_ownership_pending",
-                "Ticket close preparation did not establish current ownership",
+                "ticket_close_reconciliation_pending",
+                "ticket_close_dispatch_unobserved",
+                "ticket_close_intent_pending",
+                "github_read_failed",
+            }:
+                raise
+            state.update(
+                {
+                    "status": "waiting_external",
+                    "terminal_kind": "waiting_external",
+                    "diagnostics": [
+                        {
+                            "code": error.code,
+                            "message": error.message,
+                            "waiting_for": "Ticket close ownership",
+                        }
+                    ],
+                }
             )
-        dispatch_intent = close_intent
-
-        def record_dispatch_boundary() -> None:
-            nonlocal dispatch_intent
-            if dispatch_intent.get("dispatch_attempted") is True:
-                return
-            dispatch_intent = {**dispatch_intent, "dispatch_attempted": True}
-            job["ticket_close_intent"] = dispatch_intent
             self._save(state)
-
-        close_ownership = self.github.close_primary_ticket(
-            ticket_number=int(job["ticket_number"]),
-            run_id=str(state["run_id"]),
-            pr_number=int(job["pr_number"]),
-            integrated_sha=integrated,
-            close_intent=dispatch_intent,
-            before_dispatch=record_dispatch_boundary,
-        )
-        if close_ownership is None:
-            raise GitHubReadError(
-                "ticket_close_ownership_pending",
-                "Ticket close dispatch did not establish exact ownership",
-            )
+            return False
         job["ticket_close_ownership"] = close_ownership
         job["ticket_closed_by_run"] = close_ownership is not None
         job.pop("blocked_reason", None)
@@ -283,9 +334,11 @@ class TicketDeliveryLoop:
             "base_sha": job["base_sha"],
             "head_sha": self.git.checkout_head(checkout),
             "checkout": str(checkout),
-            "thread_id": None
-            if job.get("development_new_thread")
-            else job.get("development_thread_id"),
+            "thread_id": (
+                None
+                if job.get("development_new_thread")
+                else job.get("development_thread_id")
+            ),
         }
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
@@ -353,15 +406,17 @@ class TicketDeliveryLoop:
             "candidate_sha": job["candidate_sha"],
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
-            "thread_id": latest_reviewer_thread(job)
-            if (
-                (
-                    job.get("review_human_blocker_resume")
-                    or job.get("review_resume_thread_id")
+            "thread_id": (
+                latest_reviewer_thread(job)
+                if (
+                    (
+                        job.get("review_human_blocker_resume")
+                        or job.get("review_resume_thread_id")
+                    )
+                    and not job.get("review_new_thread")
                 )
-                and not job.get("review_new_thread")
-            )
-            else None,
+                else None
+            ),
             **(
                 {"prior_human_blockers": job["prior_human_blockers"]}
                 if job.get("prior_human_blockers")

@@ -988,13 +988,13 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
         error={"code": "github_read_failed", "message": "simulated outage"},
     )
 
-    failed = run_cli(git_repo, fixture, "start", "1")
+    waiting = run_cli(git_repo, fixture, "start", "1")
 
-    assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_external"
     state = load_only_run_state(git_repo)
-    assert state["status"] == "execution_failed"
-    assert state["terminal_kind"] == "execution_failed"
+    assert state["status"] == "waiting_external"
+    assert state["terminal_kind"] == "waiting_external"
     assert state["diagnostics"][0]["code"] == "github_read_failed"
 
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})

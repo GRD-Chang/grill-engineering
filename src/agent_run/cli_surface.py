@@ -5,31 +5,75 @@ import contextlib
 import io
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
+from agent_run.external_supervision import ExternalSupervisor, restore_supervision_wait
 from agent_run.state import StateStore
-from agent_run.state_contract import human_blocker_subject_count, require_current_run_state
+from agent_run.state_contract import (
+    human_blocker_subject_count,
+    require_current_run_state,
+)
 from agent_run.cli_presentation import _print_precondition_failure
+
 
 def _run_to_human_gate(
     parsed: argparse.Namespace, states: StateStore, controller: Controller
 ) -> tuple[dict[str, Any], bool]:
-    arguments = _nested_arguments(parsed)
     state, resumed = controller.start_or_resume_unfinished(parsed.parent)
     run_id = state.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("Delivery Run is missing its Run ID")
     state = _load_local_run(states, run_id)
+    return _advance_to_human_gate(parsed, states, state, resumed)
+
+
+def _resume_supervision(
+    parsed: argparse.Namespace, states: StateStore
+) -> tuple[dict[str, Any], bool]:
+    """Resume only a prior external-supervision timeout, not an Agent retry."""
+
+    state = _load_local_run(states, parsed.run_id)
+    restore_supervision_wait(state)
+    states.save_run(parsed.run_id, state)
+    return _advance_to_human_gate(parsed, states, state, True)
+
+
+def _advance_to_human_gate(
+    parsed: argparse.Namespace,
+    states: StateStore,
+    state: dict[str, Any],
+    resumed: bool,
+) -> tuple[dict[str, Any], bool]:
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str):
+        raise ValueError("Delivery Run is missing its Run ID")
+    arguments = _nested_arguments(parsed)
     previous_marker: tuple[object, ...] | None = None
+    if parsed.github_fixture:
+        fixture_clock = [0.0]
+
+        def advance_fixture_clock(seconds: float) -> None:
+            fixture_clock[0] += seconds
+
+        supervisor = ExternalSupervisor(
+            now=lambda: fixture_clock[0], sleeper=advance_fixture_clock
+        )
+    else:
+        supervisor = ExternalSupervisor(sleeper=time.sleep)
     while True:
         command = _next_automatic_command(state)
         if command is None:
             return state, resumed
         marker = _progress_marker(state, command)
         if marker == previous_marker:
-            return state, resumed
+            if not supervisor.before_retry(state):
+                states.save_run(run_id, state)
+                return state, resumed
+            previous_marker = None
+            continue
         previous_marker = marker
         print(f"推进: {state['status']} → {command}", file=sys.stderr)
         agent_arguments = _agent_fixture_arguments(parsed, command)
@@ -40,6 +84,8 @@ def _run_to_human_gate(
             # here enforces the one automatic replacement budget for this
             # top-level `run` command.
             return state, resumed
+
+
 def _nested_arguments(parsed: argparse.Namespace) -> list[str]:
     arguments: list[str] = []
     if parsed.repo:
@@ -54,9 +100,7 @@ def _nested_arguments(parsed: argparse.Namespace) -> list[str]:
     return arguments
 
 
-def _agent_fixture_arguments(
-    parsed: argparse.Namespace, command: str
-) -> list[str]:
+def _agent_fixture_arguments(parsed: argparse.Namespace, command: str) -> list[str]:
     agent_fixture = getattr(parsed, "agent_fixture", None)
     if agent_fixture and command in {
         "resume",
@@ -93,6 +137,7 @@ def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, 
         "execution_failed",
         "blocked",
         "waiting_merge",
+        "waiting_external",
         "requeue_required",
     }:
         raise ValueError(f"{command} failed without a recoverable Run state")
@@ -112,16 +157,20 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
         return "accept-run"
     publication = state.get("run_publication")
     if status == "run_publication_pending" or (
-        status in {"publication_pending", "waiting_checks"}
+        status in {"publication_pending", "waiting_checks", "waiting_external"}
         and isinstance(publication, dict)
-        and publication.get("phase") in {
+        and publication.get("phase")
+        in {
             "publication_pending",
             "waiting_checks",
+            "waiting_external",
             "ready_for_approval",
         }
     ):
         return "publish-run"
     if status in {"publication_pending", "waiting_checks"}:
+        return "deliver"
+    if status == "waiting_external":
         return "deliver"
     return None
 
@@ -143,7 +192,10 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
     invocation = state.get("active_agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
         return True
-    return human_blocker_subject_count(state) == 1
+    return (
+        state.get("status") == "supervision_timeout"
+        or human_blocker_subject_count(state) == 1
+    )
 
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:
@@ -173,7 +225,12 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
         return status == "run_publication_pending" or (
             isinstance(publication, dict)
             and status
-            in {"publication_pending", "waiting_checks", "run_approval_pending"}
+            in {
+                "publication_pending",
+                "waiting_checks",
+                "waiting_external",
+                "run_approval_pending",
+            }
         )
     if command == "approve":
         return (
@@ -191,7 +248,9 @@ def _progress_marker(state: dict[str, Any], command: str) -> tuple[object, ...]:
     acceptance = state.get("run_acceptance")
     acceptance_phase = acceptance.get("phase") if isinstance(acceptance, dict) else None
     publication = state.get("run_publication")
-    publication_phase = publication.get("phase") if isinstance(publication, dict) else None
+    publication_phase = (
+        publication.get("phase") if isinstance(publication, dict) else None
+    )
     return (
         command,
         state.get("status"),
@@ -203,7 +262,11 @@ def _progress_marker(state: dict[str, Any], command: str) -> tuple[object, ...]:
         acceptance_phase,
         acceptance.get("validation_attempts") if isinstance(acceptance, dict) else None,
         publication_phase,
-        publication.get("publication_attempts") if isinstance(publication, dict) else None,
+        (
+            publication.get("publication_attempts")
+            if isinstance(publication, dict)
+            else None
+        ),
         publication.get("pr_number") if isinstance(publication, dict) else None,
     )
 

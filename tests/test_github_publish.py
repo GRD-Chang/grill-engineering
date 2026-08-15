@@ -25,7 +25,10 @@ def test_supersession_status_renders_the_receipt_fields() -> None:
         }
     )
 
-    assert "## Superseded Change Generation\n\n- Scope: `superseded_generation`" in rendered
+    assert (
+        "## Superseded Change Generation\n\n- Scope: `superseded_generation`"
+        in rendered
+    )
     assert "- Generation: `2`" in rendered
     assert "- Retirement: `closed`" in rendered
     assert "- Close nonce: `nonce-123`" in rendered
@@ -47,7 +50,9 @@ def test_supersession_receipt_recognizes_its_rendered_comment(
         ),
         "user": {"login": "agent-run-bot"},
     }
-    monkeypatch.setattr(publisher, "live_pull_request", lambda _number: {"state": "CLOSED"})
+    monkeypatch.setattr(
+        publisher, "live_pull_request", lambda _number: {"state": "CLOSED"}
+    )
 
     def fake_json(*arguments: str, **_kwargs: object) -> object:
         if arguments == ("api", "user"):
@@ -55,7 +60,16 @@ def test_supersession_receipt_recognizes_its_rendered_comment(
         if "comments" in arguments[1]:
             return [[comment]]
         if "events" in arguments[1]:
-            return [[{"id": 10, "event": "closed", "created_at": "2026-01-01T00:00:00Z", "actor": {"login": "agent-run-bot"}}]]
+            return [
+                [
+                    {
+                        "id": 10,
+                        "event": "closed",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "actor": {"login": "agent-run-bot"},
+                    }
+                ]
+            ]
         raise AssertionError(arguments)
 
     monkeypatch.setattr(publisher, "_json", fake_json)
@@ -128,9 +142,7 @@ def test_publish_branch_refuses_remote_drift(
         check=True,
         capture_output=True,
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Updater"], cwd=updater, check=True
-    )
+    subprocess.run(["git", "config", "user.name", "Updater"], cwd=updater, check=True)
     subprocess.run(
         ["git", "config", "user.email", "updater@example.invalid"],
         cwd=updater,
@@ -156,9 +168,7 @@ def test_publish_branch_refuses_remote_drift(
     drift = _rev_parse(updater, "HEAD")
 
     with pytest.raises(GitError):
-        GhGitHubPublisher(
-            "example/project", GitRepository(git_repo)
-        ).publish_branch(
+        GhGitHubPublisher("example/project", GitRepository(git_repo)).publish_branch(
             "ticket",
             candidate,
             expected_remote_sha=base,
@@ -228,7 +238,7 @@ def test_ticket_close_ownership_requires_publisher_close_event(
                         "createdAt": "2026-08-11T10:00:00Z",
                         "author": {"login": intent_author},
                     }
-                ]
+                ],
             }
         if arguments[:2] == (
             "api",
@@ -266,6 +276,7 @@ def test_successful_close_waits_for_exact_event_before_completion(
     comments: list[dict[str, object]] = []
     events: list[dict[str, object]] = []
     closed = False
+    projection_lagged = False
 
     def fake_json(*arguments: str) -> object:
         if arguments[:2] == ("issue", "view"):
@@ -274,7 +285,11 @@ def test_successful_close_waits_for_exact_event_before_completion(
                 "updatedAt": (
                     "2026-08-11T10:00:01Z"
                     if closed
-                    else "2026-08-11T10:00:00Z"
+                    else (
+                        "2026-08-11T10:00:03Z"
+                        if projection_lagged
+                        else "2026-08-11T10:00:00Z"
+                    )
                 ),
                 "comments": comments,
             }
@@ -317,6 +332,7 @@ def test_successful_close_waits_for_exact_event_before_completion(
         "baseline_event_id": 0,
         "intent_binding": "pr-3:sha-abc123",
     }
+    projection_lagged = True
     with pytest.raises(GitHubReadError, match="close event"):
         publisher.close_primary_ticket(
             ticket_number=2,
@@ -760,11 +776,11 @@ def test_provisional_close_waits_for_post_intent_event(
 
     def fake_json(*arguments: str) -> object:
         if arguments[:2] == ("issue", "view"):
-                return {
-                    "state": "CLOSED",
-                    "updatedAt": "2026-08-11T10:00:00Z",
-                    "comments": [],
-                }
+            return {
+                "state": "CLOSED",
+                "updatedAt": "2026-08-11T10:00:00Z",
+                "comments": [],
+            }
         return [
             {
                 "id": 50,
@@ -923,17 +939,20 @@ def test_close_rejects_any_intervening_transition_after_watermark(
 
     monkeypatch.setattr(publisher, "_json", fake_json)
 
-    assert publisher.ticket_close_ownership(
-        ticket_number=2,
-        run_id="run-1",
-        recorded_ownership={
-            "actor": "agent-run-bot",
-            "event_id": None,
-            "intent_created_at": "2026-08-11T10:00:00Z",
-            "baseline_event_id": 100,
-            "intent_binding": "pr-3:sha-abc123",
-        },
-    ) is None
+    assert (
+        publisher.ticket_close_ownership(
+            ticket_number=2,
+            run_id="run-1",
+            recorded_ownership={
+                "actor": "agent-run-bot",
+                "event_id": None,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 100,
+                "intent_binding": "pr-3:sha-abc123",
+            },
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("event_id", [None, 99])
@@ -1064,17 +1083,20 @@ def test_open_ticket_without_post_intent_transition_is_not_owned(
 
     monkeypatch.setattr(publisher, "_json", fake_json)
 
-    assert publisher.ticket_close_ownership(
-        ticket_number=2,
-        run_id="run-1",
-        recorded_ownership={
-            "actor": "agent-run-bot",
-            "event_id": None,
-            "intent_created_at": "2026-08-11T10:00:00Z",
-            "baseline_event_id": 0,
-            "intent_binding": "pr-3:sha-abc123",
-        },
-    ) is None
+    assert (
+        publisher.ticket_close_ownership(
+            ticket_number=2,
+            run_id="run-1",
+            recorded_ownership={
+                "actor": "agent-run-bot",
+                "event_id": None,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 0,
+                "intent_binding": "pr-3:sha-abc123",
+            },
+        )
+        is None
+    )
 
 
 def test_dispatched_close_waits_for_open_ticket_timeline_to_converge(
@@ -1210,18 +1232,21 @@ def test_explicit_reopen_resolves_older_missing_close_actor(
 
     monkeypatch.setattr(publisher, "_json", fake_json)
 
-    assert publisher.ticket_close_ownership(
-        ticket_number=2,
-        run_id="run-1",
-        recorded_ownership={
-            "actor": "agent-run-bot",
-            "event_id": None,
-            "intent_created_at": "2026-08-11T10:00:00Z",
-            "baseline_event_id": 100,
-            "intent_binding": "pr-3:sha-abc123",
-            "dispatch_attempted": True,
-        },
-    ) is None
+    assert (
+        publisher.ticket_close_ownership(
+            ticket_number=2,
+            run_id="run-1",
+            recorded_ownership={
+                "actor": "agent-run-bot",
+                "event_id": None,
+                "intent_created_at": "2026-08-11T10:00:00Z",
+                "baseline_event_id": 100,
+                "intent_binding": "pr-3:sha-abc123",
+                "dispatch_attempted": True,
+            },
+        )
+        is None
+    )
 
 
 def test_latest_close_with_missing_actor_remains_pending(
@@ -1314,7 +1339,9 @@ def test_close_retry_does_not_overwrite_external_reopen(
         publisher, "_require", lambda *arguments: calls.append(arguments)
     )
 
-    with pytest.raises(GitHubReadError, match="changed after the Publisher close intent"):
+    with pytest.raises(
+        GitHubReadError, match="changed after the Publisher close intent"
+    ):
         publisher.close_primary_ticket(
             ticket_number=2,
             run_id="run-1",
@@ -1615,9 +1642,7 @@ def test_sync_run_branch_recovers_remote_integration_locally(
         check=True,
     )
     base = _rev_parse(git_repo, "HEAD")
-    subprocess.run(
-        ["git", "branch", "run", base], cwd=git_repo, check=True
-    )
+    subprocess.run(["git", "branch", "run", base], cwd=git_repo, check=True)
     (git_repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
     subprocess.run(["git", "add", "candidate.txt"], cwd=git_repo, check=True)
     subprocess.run(
@@ -1635,9 +1660,9 @@ def test_sync_run_branch_recovers_remote_integration_locally(
     )
     assert _rev_parse(git_repo, "run") == base
 
-    GhGitHubPublisher(
-        "example/project", GitRepository(git_repo)
-    ).sync_run_branch(run_branch="run", integrated_sha=integrated)
+    GhGitHubPublisher("example/project", GitRepository(git_repo)).sync_run_branch(
+        run_branch="run", integrated_sha=integrated
+    )
 
     assert _rev_parse(git_repo, "run") == integrated
 
@@ -1646,9 +1671,7 @@ def test_ticket_pr_recovery_only_reuses_open_prs(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    publisher = GhGitHubPublisher(
-        "example/project", GitRepository(git_repo)
-    )
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     reads: list[tuple[str, ...]] = []
     writes: list[tuple[str, ...]] = []
 
@@ -1688,7 +1711,9 @@ def test_agent_run_status_comment_is_updated_in_place(
             raise AssertionError(arguments)
         if "--paginate" in arguments:
             return comments
-        body = next(argument[5:] for argument in arguments if argument.startswith("body="))
+        body = next(
+            argument[5:] for argument in arguments if argument.startswith("body=")
+        )
         if "PATCH" in arguments:
             comments[0]["body"] = body
         else:
@@ -1721,9 +1746,7 @@ def test_squash_merge_uses_supported_pr_merge_and_live_result(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    publisher = GhGitHubPublisher(
-        "example/project", GitRepository(git_repo)
-    )
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     captured: list[str] = []
 
     def fake_run(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1766,9 +1789,7 @@ def test_squash_merge_recovers_when_command_response_is_lost(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    publisher = GhGitHubPublisher(
-        "example/project", GitRepository(git_repo)
-    )
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     monkeypatch.setattr(
         publisher,
         "_run",

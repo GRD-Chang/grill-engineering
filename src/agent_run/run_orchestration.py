@@ -39,7 +39,11 @@ class DeliveryRunEngine:
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)
                 return state
-            if result.get("status") in {"waiting_checks", "publication_pending"}:
+            if result.get("status") in {
+                "waiting_checks",
+                "waiting_external",
+                "publication_pending",
+            }:
                 return result
             state, _ = self.controller.resume(run_id)
             if state.get("status") == "requeue_required":

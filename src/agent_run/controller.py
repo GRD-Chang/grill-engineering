@@ -17,6 +17,13 @@ from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
+from agent_run.external_supervision import (
+    is_github_convergence_error,
+    is_github_refresh_wait,
+    restore_supervision_wait,
+    wait_for_github_convergence,
+    wait_for_github_refresh,
+)
 from agent_run.models import DeliveryGraph, Repository
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
 from agent_run.run_currentness import (
@@ -57,7 +64,12 @@ class Controller:
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
     ) -> tuple[dict[str, Any], bool]:
-        repository = self.github.repository()
+        try:
+            repository = self.github.repository()
+        except GitHubReadError as error:
+            return self._wait_for_initial_repository(
+                parent_number, error, unfinished_only=not reuse_existing
+            )
         with self.states.locked():
             existing = (
                 self.states.find_run(repository.name_with_owner, parent_number)
@@ -70,7 +82,12 @@ class Controller:
         self, parent_number: int
     ) -> tuple[dict[str, Any], bool]:
         """Atomically select the one live Run for the foreground `run` command."""
-        repository = self.github.repository()
+        try:
+            repository = self.github.repository()
+        except GitHubReadError as error:
+            return self._wait_for_initial_repository(
+                parent_number, error, unfinished_only=True
+            )
         with self.states.locked():
             unfinished = self.states.find_unfinished_runs(
                 repository.name_with_owner, parent_number
@@ -83,6 +100,60 @@ class Controller:
                 )
             existing = unfinished[0] if unfinished else None
             return self._start_locked(repository, parent_number, existing)
+
+    def _wait_for_initial_repository(
+        self,
+        parent_number: int,
+        error: GitHubReadError,
+        *,
+        unfinished_only: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist the first GitHub repository read as a resumable wait."""
+
+        if not is_github_convergence_error(error.code):
+            raise error
+        hint_reader = getattr(self.github, "repository_hint", None)
+        repository_hint = hint_reader() if callable(hint_reader) else None
+        if not isinstance(repository_hint, str) or not repository_hint:
+            raise error
+        with self.states.locked():
+            if unfinished_only:
+                candidates = self.states.find_unfinished_runs(
+                    repository_hint, parent_number
+                )
+                if len(candidates) > 1:
+                    run_ids = ", ".join(str(state["run_id"]) for state in candidates)
+                    raise ValueError(
+                        "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                        f"{run_ids}"
+                    )
+                existing = candidates[0] if candidates else None
+            else:
+                existing = self.states.find_run(repository_hint, parent_number)
+            resumed = existing is not None
+            if existing is None:
+                provisional = Repository(
+                    name_with_owner=repository_hint,
+                    default_branch="HEAD",
+                    default_head_sha=None,
+                )
+                run_id = self._available_run_id(
+                    repository_hint, parent_number, "repository-pending"
+                )
+                existing = self._initial_state(
+                    provisional, parent_number, run_id, "repository-pending"
+                )
+                existing["base_resolution_pending"] = True
+                existing["repository_binding_pending"] = True
+            wait_for_github_convergence(
+                existing,
+                code=error.code,
+                message=error.message,
+                waiting_for="GitHub repository binding",
+            )
+            existing["updated_at"] = _now()
+            self.states.save_run(str(existing["run_id"]), existing)
+            return existing, resumed
 
     def unfinished_runs(self, parent_number: int) -> list[dict[str, Any]]:
         repository = self.github.repository()
@@ -100,7 +171,21 @@ class Controller:
         message: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
-            existing = self._load_bound_run(run_id)
+            try:
+                existing = self._load_bound_run(run_id)
+            except GitHubReadError as error:
+                if not is_github_convergence_error(error.code):
+                    raise
+                existing = self._load_run(run_id)
+                wait_for_github_refresh(
+                    existing,
+                    code=error.code,
+                    message=error.message,
+                    waiting_for="GitHub repository binding",
+                )
+                existing["updated_at"] = _now()
+                self.states.save_run(run_id, existing)
+                return existing, True
             if existing.get("status") in {
                 "abandoned",
                 "abandonment_pending",
@@ -110,12 +195,27 @@ class Controller:
             parent = _state_mapping(existing, "parent")
             parent_number = int(parent["number"])
             if existing.get("base_resolution_pending") is True:
-                return self._start_locked(
-                    self.github.repository(), parent_number, existing
-                )
+                try:
+                    repository = self.github.repository()
+                except GitHubReadError as error:
+                    if not is_github_convergence_error(error.code):
+                        raise
+                    wait_for_github_refresh(
+                        existing,
+                        code=error.code,
+                        message=error.message,
+                        waiting_for="GitHub repository binding",
+                    )
+                    existing["updated_at"] = _now()
+                    self.states.save_run(run_id, existing)
+                    return existing, True
+                return self._start_locked(repository, parent_number, existing)
             base = _state_mapping(existing, "base")
             base_sha = str(base["sha"])
             state = self._refresh(existing, parent_number)
+            if is_github_refresh_wait(state):
+                self.states.save_run(run_id, state)
+                return state, True
             if state.get("status") == "unsupported_scope_change" or (
                 state.get("status") == "execution_failed"
                 and (
@@ -182,7 +282,9 @@ class Controller:
             transition = existing.get("requeue_transition")
             if isinstance(transition, dict):
                 retired = transition.get("retired")
-                if existing.get("status") == "requeue_required" and isinstance(retired, dict):
+                if existing.get("status") == "requeue_required" and isinstance(
+                    retired, dict
+                ):
                     refreshed = self._refresh_transition_facts(existing, parent_number)
                     if refreshed.get("status") != "requeue_required":
                         self.states.save_run(run_id, refreshed)
@@ -235,7 +337,9 @@ class Controller:
                 raise RequeueError("prepared requeue no longer matches current Job")
             if retired["work_subject"].startswith("parent-only:"):
                 generation = int(retired["generation"]) + 1
-                state["parent_branch"] = f"agent-run/{run_id}/parent-generation-{generation}"
+                state["parent_branch"] = (
+                    f"agent-run/{run_id}/parent-generation-{generation}"
+                )
             parent_number = int(_state_mapping(state, "parent")["number"])
             state.pop("requeue_transition", None)
             state = self._refresh(state, parent_number)
@@ -304,9 +408,7 @@ class Controller:
             )
         )
 
-    def record_execution_failure(
-        self, run_id: str, message: str
-    ) -> bool:
+    def record_execution_failure(self, run_id: str, message: str) -> bool:
         with self.states.locked():
             state = self.states.load_run(run_id)
             if state is None:
@@ -326,9 +428,8 @@ class Controller:
             # Publisher mutation. A lost response while retiring the old PR
             # must preserve the pending state for a fresh currentness decision,
             # never turn it into an ordinary failed invocation.
-            if (
-                state.get("status") == "requeue_required"
-                and isinstance(state.get("requeue_transition"), dict)
+            if state.get("status") == "requeue_required" and isinstance(
+                state.get("requeue_transition"), dict
             ):
                 return False
             if (
@@ -337,9 +438,7 @@ class Controller:
             ):
                 return False
             hint_reader = getattr(self.github, "repository_hint", None)
-            repository_hint = (
-                hint_reader() if callable(hint_reader) else None
-            )
+            repository_hint = hint_reader() if callable(hint_reader) else None
             if (
                 isinstance(repository_hint, str)
                 and repository_hint
@@ -372,15 +471,19 @@ class Controller:
             return True
 
     def _load_bound_run(self, run_id: str) -> dict[str, Any]:
-        state = self.states.load_run(run_id)
-        if state is None:
-            raise ValueError(f"unknown Delivery Run: {run_id}")
-        require_current_run_state(state)
+        state = self._load_run(run_id)
         repository = self.github.repository()
         if state.get("repository") != repository.name_with_owner:
             raise ValueError(
                 "configured GitHub repository does not match the Delivery Run"
             )
+        return state
+
+    def _load_run(self, run_id: str) -> dict[str, Any]:
+        state = self.states.load_run(run_id)
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        require_current_run_state(state)
         return state
 
     def _refresh(
@@ -403,21 +506,30 @@ class Controller:
                 refreshed, check_requeue_currentness=check_requeue_currentness
             )
             self._invalidate_stale_final_run(refreshed, default_head)
+            refreshed.pop("github_refresh_pending", None)
             return refreshed
         except GitHubReadError as error:
             failed = dict(state)
-            failed.update(
-                {
-                    "status": "execution_failed",
-                    "terminal_kind": "execution_failed",
-                    "frontier": [],
-                    "active_ticket_job": None,
-                    "diagnostics": [
-                        {"code": error.code, "message": error.message}
-                    ],
-                    "updated_at": _now(),
-                }
-            )
+            if is_github_convergence_error(error.code):
+                wait_for_github_refresh(
+                    failed,
+                    code=error.code,
+                    message=error.message,
+                    waiting_for="GitHub authority refresh",
+                )
+            else:
+                failed.update(
+                    {
+                        "status": "execution_failed",
+                        "terminal_kind": "execution_failed",
+                        "frontier": [],
+                        "active_ticket_job": None,
+                        "diagnostics": [
+                            {"code": error.code, "message": error.message}
+                        ],
+                    }
+                )
+            failed["updated_at"] = _now()
             return failed
 
     def _refresh_transition_facts(
@@ -464,10 +576,7 @@ class Controller:
             "completed",
         }:
             return
-        if (
-            state.get("status") == "requeue_required"
-            and not check_requeue_currentness
-        ):
+        if state.get("status") == "requeue_required" and not check_requeue_currentness:
             return
         subject, job, _ = current_change_job(state)
         if job is None or job.get("phase") in {
@@ -506,7 +615,12 @@ class Controller:
                 {
                     "status": "blocked",
                     "terminal_kind": "waiting_human",
-                    "diagnostics": [{"code": external, "message": "Change PR changed outside the current Generation"}],
+                    "diagnostics": [
+                        {
+                            "code": external,
+                            "message": "Change PR changed outside the current Generation",
+                        }
+                    ],
                 }
             )
             return
@@ -515,7 +629,12 @@ class Controller:
                 {
                     "status": "blocked",
                     "terminal_kind": "waiting_human",
-                    "diagnostics": [{"code": "candidate_or_acceptance_inconsistent", "message": "Candidate or Acceptance cannot be safely requeued"}],
+                    "diagnostics": [
+                        {
+                            "code": "candidate_or_acceptance_inconsistent",
+                            "message": "Candidate or Acceptance cannot be safely requeued",
+                        }
+                    ],
                 }
             )
             return
@@ -529,7 +648,12 @@ class Controller:
             {
                 "status": "requeue_required",
                 "terminal_kind": "requeue_required",
-                "diagnostics": [{"code": reason, "message": "Change Job Generation is stale; run requeue"}],
+                "diagnostics": [
+                    {
+                        "code": reason,
+                        "message": "Change Job Generation is stale; run requeue",
+                    }
+                ],
                 "requeue_required": {
                     "work_subject": subject,
                     "generation": _subject_generation(job),
@@ -545,10 +669,7 @@ class Controller:
         if state.get("status") == "unsupported_scope_change":
             return
         acceptance = state.get("run_acceptance")
-        if (
-            not isinstance(acceptance, dict)
-            or acceptance.get("phase") != "accepted"
-        ):
+        if not isinstance(acceptance, dict) or acceptance.get("phase") != "accepted":
             return
         record = acceptance.get("acceptance_record")
         if not isinstance(record, dict):
@@ -610,9 +731,7 @@ class Controller:
             "updated_at": now,
         }
 
-    def _ensure_delivery_branch(
-        self, state: dict[str, Any], base_sha: str
-    ) -> None:
+    def _ensure_delivery_branch(self, state: dict[str, Any], base_sha: str) -> None:
         if state.get("status") in {
             "execution_failed",
             "unsupported_scope_change",
@@ -663,9 +782,16 @@ class Controller:
             run_id = str(state["run_id"])
             if state.get("status") in {"abandoned", "abandonment_pending"}:
                 return state, True
+            if state.get("status") == "supervision_timeout":
+                restore_supervision_wait(state)
         base = _state_mapping(state, "base")
         base_sha = str(base["sha"])
         if state.get("base_resolution_pending") is True:
+            if state.pop("repository_binding_pending", None) is True:
+                base["branch"] = repository.default_branch
+                base["sha"] = repository.default_head_sha or (
+                    f"unresolved-{repository.default_branch}"
+                )
             try:
                 base_sha = self.publisher.resolve_base(
                     repository.default_branch, repository.default_head_sha
@@ -712,6 +838,7 @@ class Controller:
             sequence += 1
         return f"{original}-{sequence}"
 
+
 def _run_id(repository: str, parent_number: int, base_sha: str) -> str:
     identity = f"{repository}\0{parent_number}\0{base_sha}".encode()
     suffix = hashlib.sha256(identity).hexdigest()[:16]
@@ -725,6 +852,7 @@ def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:
         and state.get("terminal_kind") == "waiting_human"
     )
 
+
 def _state_mapping(state: dict[str, Any], key: str) -> dict[str, Any]:
     value = state.get(key)
     if not isinstance(value, dict):
@@ -734,9 +862,7 @@ def _state_mapping(state: dict[str, Any], key: str) -> dict[str, Any]:
 
 def _integer_list(state: dict[str, Any], key: str) -> list[int]:
     value = state.get(key)
-    if not isinstance(value, list) or not all(
-        isinstance(item, int) for item in value
-    ):
+    if not isinstance(value, list) or not all(isinstance(item, int) for item in value):
         raise ValueError(f"run state field {key!r} must contain integers")
     return list(value)
 
@@ -761,7 +887,9 @@ def _resume_agent_human_blocker(
     ticket_jobs = state.get("ticket_jobs")
     if isinstance(ticket_jobs, dict):
         for job in ticket_jobs.values():
-            if _resume_change_job(state, job, ticket=True, human_response=human_response):
+            if _resume_change_job(
+                state, job, ticket=True, human_response=human_response
+            ):
                 return True
     parent = state.get("parent_job")
     if _resume_change_job(state, parent, ticket=False, human_response=human_response):
@@ -780,13 +908,12 @@ def _resume_agent_human_blocker(
             }
         )
         return True
-    if (
-        acceptance.get("phase") == "ready_for_human"
-        and acceptance.get("blocked_reason") in {
-            "agent_requires_human",
-            "reviewer_requires_human",
-        }
-    ):
+    if acceptance.get("phase") == "ready_for_human" and acceptance.get(
+        "blocked_reason"
+    ) in {
+        "agent_requires_human",
+        "reviewer_requires_human",
+    }:
         blockers = _human_blockers(acceptance)
         append_human_response(
             acceptance,
@@ -886,7 +1013,8 @@ def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
     if (
         not isinstance(invocation, dict)
         or invocation.get("status") != "failed"
-        or invocation.get("role") not in {
+        or invocation.get("role")
+        not in {
             "development",
             "fresh_acceptance",
             "publication",
@@ -1042,9 +1170,7 @@ def _publication_job_for_invocation(
         job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
         if not isinstance(job, dict) or job.get("ticket_number") != ticket_number:
             raise ValueError("current Ticket Publication job is missing")
-        _require_invocation_generation(
-            generation, job.get("ticket_branch_generation")
-        )
+        _require_invocation_generation(generation, job.get("ticket_branch_generation"))
         active = state.get("active_ticket_job")
         mirror = (
             active
@@ -1064,11 +1190,7 @@ def _publication_job_for_invocation(
 
     if subject == f"run-repair:{run_id}":
         acceptance = state.get("run_acceptance")
-        repair = (
-            acceptance.get("repair_job")
-            if isinstance(acceptance, dict)
-            else None
-        )
+        repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
         if not isinstance(repair, dict):
             raise ValueError("current Run Repair Publication job is missing")
         _require_invocation_generation(generation, repair.get("repair_generation"))
@@ -1092,7 +1214,9 @@ def _change_job_for_invocation(
     if subject.startswith("ticket:"):
         ticket_text = subject.removeprefix("ticket:")
         if not ticket_text.isdigit() or str(int(ticket_text)) != ticket_text:
-            raise ValueError("current Ticket Change Job Invocation work_subject is invalid")
+            raise ValueError(
+                "current Ticket Change Job Invocation work_subject is invalid"
+            )
         jobs = state.get("ticket_jobs")
         job = jobs.get(ticket_text) if isinstance(jobs, dict) else None
         if not isinstance(job, dict) or job.get("ticket_number") != int(ticket_text):
@@ -1125,11 +1249,10 @@ def _resume_change_job(
 ) -> bool:
     if not isinstance(value, dict):
         return False
-    if (
-        value.get("phase") != "blocked"
-        or value.get("blocked_reason")
-        not in {"agent_requires_human", "reviewer_requires_human"}
-    ):
+    if value.get("phase") != "blocked" or value.get("blocked_reason") not in {
+        "agent_requires_human",
+        "reviewer_requires_human",
+    }:
         return False
     blockers = _human_blockers(value)
     reviewer_resume = (
@@ -1160,14 +1283,18 @@ def _resume_change_job(
         status = "active"
     else:
         status = "parent_delivery_pending"
-    state.update({"status": status, "terminal_kind": "waiting_human", "diagnostics": []})
+    state.update(
+        {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
+    )
     return True
 
 
 def _human_blockers(subject: dict[str, Any]) -> list[str]:
     value = subject.get("human_blockers")
-    if not isinstance(value, list) or not value or not all(
-        isinstance(item, str) and item for item in value
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item for item in value)
     ):
         raise ValueError("Agent Human Blocker is missing raw blocker strings")
     return list(value)

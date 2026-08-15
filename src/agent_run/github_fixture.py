@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.git import GitRepository, is_managed_delivery_branch
-from agent_run.github import GitHubReadError
+from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.github_retry import is_transient_message, retry_read_operation
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 from agent_run.revisions import effective_revision_from_graph
@@ -24,6 +24,19 @@ class FixtureGitHubReader:
 
     def repository(self) -> Repository:
         self.data = self._load()
+        failures = self.data.get("repository_read_failures")
+        if isinstance(failures, list) and failures:
+            configured_error = failures.pop(0)
+            self._save_reader_data()
+            if not isinstance(configured_error, dict):
+                raise GitHubReadError(
+                    "invalid_fixture",
+                    "repository_read_failures must contain objects",
+                )
+            raise GitHubReadError(
+                str(configured_error.get("code", "github_read_failed")),
+                str(configured_error.get("message", "GitHub read failed")),
+            )
         default_head = self.data.get("default_head_sha")
         return Repository(
             name_with_owner=_string(self.data, "repository"),
@@ -549,6 +562,19 @@ class FixtureGitHubPublisher:
 
     def required_checks(self, pr_number: int) -> str:
         delivery = self._delivery()
+        pull = self._pull(pr_number)
+        run_failures = delivery.get("run_required_checks_read_failures", [])
+        if "primary_ticket" not in pull and isinstance(run_failures, list) and run_failures:
+            configured = run_failures.pop(0)
+            self._save()
+            if not isinstance(configured, dict):
+                raise ValueError(
+                    "fixture run_required_checks_read_failures must contain objects"
+                )
+            raise GitHubReadError(
+                str(configured.get("code", "github_read_failed")),
+                str(configured.get("message", "Final Run Required Checks read failed")),
+            )
         sequence = delivery.get("required_checks", ["none"])
         if not isinstance(sequence, list) or not all(
             value in {"none", "pass", "pending", "fail"} for value in sequence
@@ -689,6 +715,16 @@ class FixtureGitHubPublisher:
         live = self.live_pull_request(pr_number)
         if live["head_sha"] != expected_head_sha:
             raise ValueError("fixture merge head does not match expected head")
+        outcomes = self._delivery().get("squash_merge_outcomes", [])
+        if not isinstance(outcomes, list) or not all(
+            outcome in {"unknown", "merge"} for outcome in outcomes
+        ):
+            raise ValueError("fixture squash_merge_outcomes is invalid")
+        if outcomes:
+            outcome = outcomes.pop(0)
+            self._save()
+            if outcome == "unknown":
+                raise MergeOutcomeUnknownError("fixture squash merge response is unknown")
         tree = self.git.resolve(f"{expected_head_sha}^{{tree}}")
         parent = self.git.resolve(run_branch)
         result = subprocess.run(

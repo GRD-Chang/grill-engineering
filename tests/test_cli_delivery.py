@@ -728,8 +728,8 @@ def test_parent_only_malformed_publication_is_execution_failed_and_resumes(
 
     unreadable = run_cli(git_repo, fixture, "resume", run_id)
 
-    assert unreadable.returncode == 2
-    assert stdout_json(unreadable)["status"] == "execution_failed"
+    assert unreadable.returncode == 0, unreadable.stderr
+    assert stdout_json(unreadable)["status"] == "waiting_external"
     assert load_only_run_state(git_repo)["parent_job"] == failed_job
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"] == []
 

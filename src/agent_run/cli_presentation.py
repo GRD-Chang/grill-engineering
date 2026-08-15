@@ -172,6 +172,8 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run abandon {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
         return f"agent-run requeue {run_id}"
+    if status == "supervision_timeout" and isinstance(run_id, str):
+        return f"agent-run run {parent_number} 或 agent-run resume {run_id}"
     invocation = state.get("active_agent_invocation")
     if (
         status == "execution_failed"
@@ -199,6 +201,7 @@ def _next_action(state: dict[str, Any]) -> str:
         "waiting_merge",
         "parent_closeout_pending",
         "execution_failed",
+        "supervision_timeout",
     }:
         return f"agent-run run {parent_number}"
     return "无"
@@ -325,6 +328,7 @@ def _display_term(value: object) -> object:
         "abandonment_pending": "等待放弃恢复",
         "progress_exhausted": "无可推进任务",
         "execution_failed": "执行失败，可恢复",
+        "supervision_timeout": "监督超时暂停，可恢复",
         "blocked": "已阻塞",
         "completed": "已完成",
         "abandoned": "已放弃",

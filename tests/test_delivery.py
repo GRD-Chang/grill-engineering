@@ -23,7 +23,7 @@ from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitError, GitRepository
-from agent_run.github import GitHubReadError
+from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.parent_delivery_loop import ParentDeliveryLoop
 from agent_run.revisions import effective_revision
@@ -439,32 +439,28 @@ class ScriptedPublisher:
             result.update(
                 {
                     "head_sha": self.merged_head,
-                    "base_sha": GitRepository(
-                        self.repo
-                    ).commit_parents(self.merged_sha)[0],
+                    "base_sha": GitRepository(self.repo).commit_parents(
+                        self.merged_sha
+                    )[0],
                     "mergeable": False,
                     "state": "MERGED",
                     "integrated_sha": self.merged_sha,
                     "head_tree": _tree(self.repo, self.merged_head),
                     "integrated_tree": _tree(self.repo, self.merged_sha),
-                    "integrated_message": GitRepository(
-                        self.repo
-                    ).commit_subject(self.merged_sha),
-                    "integrated_parents": GitRepository(
-                        self.repo
-                    ).commit_parents(self.merged_sha),
+                    "integrated_message": GitRepository(self.repo).commit_subject(
+                        self.merged_sha
+                    ),
+                    "integrated_parents": GitRepository(self.repo).commit_parents(
+                        self.merged_sha
+                    ),
                 }
             )
         return result
 
-    def record_acceptance(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None:
+    def record_acceptance(self, pr_number: int, record: dict[str, Any]) -> None:
         self.acceptance_records.append(record)
 
-    def record_agent_run_status(
-        self, pr_number: int, status: dict[str, Any]
-    ) -> None:
+    def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         self.agent_run_statuses[:] = [
             existing
             for existing in self.agent_run_statuses
@@ -517,9 +513,7 @@ class ScriptedPublisher:
         self.merged_head = expected_head_sha
         return integrated
 
-    def sync_run_branch(
-        self, *, run_branch: str, integrated_sha: str
-    ) -> None:
+    def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
         subprocess.run(
             ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha],
             cwd=self.repo,
@@ -606,9 +600,9 @@ class CrashAfterMergePublisher(ScriptedPublisher):
                     capture_output=True,
                     check=True,
                 ).stdout.strip(),
-                "integrated_parents": GitRepository(
-                    self.repo
-                ).commit_parents(self.merged_sha),
+                "integrated_parents": GitRepository(self.repo).commit_parents(
+                    self.merged_sha
+                ),
             }
         return super().live_pull_request(pr_number)
 
@@ -633,6 +627,30 @@ class CrashAfterMergePublisher(ScriptedPublisher):
             self.crash_once = False
             raise OSError("simulated crash after remote merge")
         return integrated
+
+
+class UnknownMergeOutcomePublisher(ScriptedPublisher):
+    def __init__(self, repo: Path) -> None:
+        super().__init__(repo)
+        self.merge_attempts = 0
+
+    def squash_merge(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        run_branch: str,
+        commit_message: str,
+    ) -> str:
+        self.merge_attempts += 1
+        if self.merge_attempts < 3:
+            raise MergeOutcomeUnknownError("simulated lost squash merge response")
+        return super().squash_merge(
+            pr_number=pr_number,
+            expected_head_sha=expected_head_sha,
+            run_branch=run_branch,
+            commit_message=commit_message,
+        )
 
 
 class MissingCloseIntentPublisher(ScriptedPublisher):
@@ -703,9 +721,7 @@ class RemoteMergeBeforeLocalSyncPublisher(CrashAfterMergePublisher):
 class SyncFailsOncePublisher(ScriptedPublisher):
     sync_attempts = 0
 
-    def sync_run_branch(
-        self, *, run_branch: str, integrated_sha: str
-    ) -> None:
+    def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
         self.sync_attempts += 1
         if self.sync_attempts == 1:
             raise GitError("simulated transient fetch failure")
@@ -735,20 +751,18 @@ class RevisionDriftsAfterMergePublisher(ScriptedPublisher):
             return {
                 "head_sha": head,
                 "base_branch": self.base_branch,
-                "base_sha": GitRepository(
-                    self.repo
-                ).commit_parents(integrated)[0],
+                "base_sha": GitRepository(self.repo).commit_parents(integrated)[0],
                 "mergeable": False,
                 "state": "MERGED",
                 "integrated_sha": integrated,
                 "head_tree": _tree(self.repo, head),
                 "integrated_tree": _tree(self.repo, integrated),
-                "integrated_message": GitRepository(
-                    self.repo
-                ).commit_subject(integrated),
-                "integrated_parents": GitRepository(
-                    self.repo
-                ).commit_parents(integrated),
+                "integrated_message": GitRepository(self.repo).commit_subject(
+                    integrated
+                ),
+                "integrated_parents": GitRepository(self.repo).commit_parents(
+                    integrated
+                ),
             }
         return super().live_pull_request(pr_number)
 
@@ -826,9 +840,9 @@ class ExternalMergePublisher(ScriptedPublisher):
                 capture_output=True,
                 check=True,
             ).stdout.strip(),
-            "integrated_parents": GitRepository(
-                self.repo
-            ).commit_parents(self.external_sha),
+            "integrated_parents": GitRepository(self.repo).commit_parents(
+                self.external_sha
+            ),
         }
 
 
@@ -1106,9 +1120,7 @@ class PublicationContextFailsUntilResumedPublisher(ScriptedPublisher):
 
 
 class PublicationReplacementAgents(PassAgents):
-    def publication(
-        self, request: dict[str, Any]
-    ) -> PublicationResult:
+    def publication(self, request: dict[str, Any]) -> PublicationResult:
         artifact = super().publication(request)
         return PublicationResult(
             thread_id="development-thread-2",
@@ -1373,9 +1385,7 @@ class BaseMovesDuringMergePublisher(ScriptedPublisher):
         run_branch: str,
         commit_message: str,
     ) -> str:
-        self.drift_sha = _advance_branch_with_same_tree(
-            self.repo, run_branch
-        )
+        self.drift_sha = _advance_branch_with_same_tree(self.repo, run_branch)
         return super().squash_merge(
             pr_number=pr_number,
             expected_head_sha=expected_head_sha,
@@ -1424,7 +1434,6 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
     assert agents.development_requests[0]["ticket"]["url"].endswith(
         "/example/project/issues/3"
     )
-
 
     assert agents.review_requests[0]["parent"]["url"].endswith(
         "/example/project/issues/1"
@@ -1494,12 +1503,14 @@ def test_ticket_delivery_requires_exact_close_evidence(
         agents=ScriptedAgents(checkout),
     )
 
-    with pytest.raises(GitHubReadError, match="exact ownership|current ownership"):
-        engine.deliver(state["run_id"])
+    blocked = engine.deliver(state["run_id"])
+
+    assert blocked["status"] == "ready_for_human"
+    assert blocked["active_ticket_job"]["phase"] == "blocked"
 
     persisted = states.load_run(state["run_id"])
     assert persisted is not None
-    assert persisted["active_ticket_job"]["phase"] == "merged"
+    assert persisted["active_ticket_job"]["phase"] == "blocked"
     assert persisted["status"] != "ticket_completed"
     assert "ticket_close_ownership" not in persisted["active_ticket_job"]
 
@@ -1509,7 +1520,9 @@ def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
-    controller = Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
     state, _ = controller.start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     agents = HumanBlockedDevelopmentAgents(checkout)
@@ -1530,9 +1543,7 @@ def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
     assert publisher.created_prs == 0
     assert blocked["diagnostics"][0]["message"] == job["human_blockers"][0]
 
-    resumed, _ = controller.resume(
-        str(state["run_id"]), resume_human_blocker=True
-    )
+    resumed, _ = controller.resume(str(state["run_id"]), resume_human_blocker=True)
     assert resumed["active_ticket_job"]["phase"] == "developing"
     assert resumed["active_ticket_job"]["prior_human_blockers"] == job["human_blockers"]
 
@@ -1541,7 +1552,12 @@ def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
     assert len(agents.development_requests) >= 2
     assert agents.development_requests[1]["thread_id"] == "blocked-development-thread"
     run_count = subprocess.run(
-        ["git", "rev-list", "--count", f"{state['base']['sha']}..{state['run_branch']}"],
+        [
+            "git",
+            "rev-list",
+            "--count",
+            f"{state['base']['sha']}..{state['run_branch']}",
+        ],
         cwd=git_repo,
         text=True,
         capture_output=True,
@@ -1558,12 +1574,9 @@ def test_development_human_blocker_preserves_workspace_and_resumes_same_thread(
     assert message == "feat(delivery): complete one ticket autonomously"
     assert not checkout.exists()
     persisted = json.loads(
-        (
-            git_repo
-            / ".agent-run"
-            / "runs"
-            / f"{state['run_id']}.json"
-        ).read_text(encoding="utf-8")
+        (git_repo / ".agent-run" / "runs" / f"{state['run_id']}.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert persisted["status"] == "ticket_completed"
     completed_job = persisted["ticket_jobs"]["3"]
@@ -1605,9 +1618,9 @@ def test_fresh_validation_human_resume_rejects_an_older_reviewer_thread(
     blocked["ticket_jobs"]["3"] = dict(job)
     states.save_run(str(state["run_id"]), blocked)
 
-    Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    ).resume(str(state["run_id"]), resume_human_blocker=True)
+    Controller(FixtureGitHubReader(fixture), GitRepository(git_repo), states).resume(
+        str(state["run_id"]), resume_human_blocker=True
+    )
 
     with pytest.raises(
         ValueError, match="Human Blocker resume requires the latest Reviewer Thread"
@@ -1673,9 +1686,7 @@ def test_no_change_attempt_does_not_consume_modification_budget(
     assert resumed["status"] == "progress_exhausted"
     assert resumed["active_ticket_job"] is None
     assert resumed["ticket_jobs"]["3"]["modification_attempts"] == 0
-    assert resumed["ticket_jobs"]["3"]["blocked_reason"] == (
-        "no_code_changes"
-    )
+    assert resumed["ticket_jobs"]["3"]["blocked_reason"] == ("no_code_changes")
     assert first_agents.calls == 1
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -1747,6 +1758,37 @@ def test_resume_reconciles_pr_merged_before_state_save(
     assert count == "1"
 
 
+def test_unknown_merge_outcome_retries_the_same_intent_at_most_three_times(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = UnknownMergeOutcomePublisher(git_repo)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher,
+        agents=ScriptedAgents(checkout),
+    )
+
+    first = engine.deliver(state["run_id"])
+    second = engine.deliver(state["run_id"])
+    completed = engine.deliver(state["run_id"])
+
+    assert first["status"] == "waiting_external"
+    assert second["status"] == "waiting_external"
+    assert completed["status"] == "ticket_completed"
+    job = completed["active_ticket_job"]
+    assert job["merge_intent"]["attempts"] == 3
+    assert [entry["attempt"] for entry in job["merge_reconciliation_history"]] == [1, 2]
+    assert publisher.merge_attempts == 3
+    assert publisher.closed_issues == [3]
+
+
 def test_live_effective_revision_drift_blocks_merge(
     git_repo: Path,
 ) -> None:
@@ -1795,9 +1837,7 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert agents.development_requests[1]["ci_evidence"] == (
         publisher.failed_check_evidence
     )
-    assert agents.development_requests[1]["repair_source"] == (
-        "required_checks"
-    )
+    assert agents.development_requests[1]["repair_source"] == ("required_checks")
     assert len(agents.publication_requests) == 2
     assert agents.publication_requests[1]["existing_pr"] == {
         "number": 11,
@@ -1884,9 +1924,7 @@ def test_fresh_reviewer_identity_is_persisted_before_artifact_parsing(
         engine.deliver(state["run_id"])
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
-    assert interrupted["active_ticket_job"]["reviewer_thread_ids"] == [
-        "reviewer-1"
-    ]
+    assert interrupted["active_ticket_job"]["reviewer_thread_ids"] == ["reviewer-1"]
 
     with pytest.raises(ValueError, match="new Reviewer Thread"):
         engine.deliver(state["run_id"])
@@ -2241,15 +2279,12 @@ def test_merged_recovery_syncs_local_run_branch_before_ticket_close(
         github=publisher,
         agents=PassAgents(checkout),
     )
-    original_run_head = GitRepository(git_repo).resolve(
-        str(state["run_branch"])
-    )
+    original_run_head = GitRepository(git_repo).resolve(str(state["run_branch"]))
 
     with pytest.raises(OSError, match="before local Run Branch sync"):
         engine.deliver(state["run_id"])
     assert (
-        GitRepository(git_repo).resolve(str(state["run_branch"]))
-        == original_run_head
+        GitRepository(git_repo).resolve(str(state["run_branch"])) == original_run_head
     )
     completed = engine.deliver(state["run_id"])
 
@@ -2284,24 +2319,20 @@ def test_post_merge_revision_drift_continues_same_job_with_new_pr(
         engine.deliver(state["run_id"])
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
-    old_effective_revision = str(
-        interrupted["active_ticket_job"]["effective_revision"]
-    )
+    old_effective_revision = str(interrupted["active_ticket_job"]["effective_revision"])
     first_integrated = str(publisher.merged_sha)
     assert old_run_head != first_integrated
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
-    fixture_data["issues"]["3"]["body"] += (
-        "\nNew authoritative requirement after merge."
-    )
+    fixture_data["issues"]["3"][
+        "body"
+    ] += "\nNew authoritative requirement after merge."
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     refreshed, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
     new_effective_revision = effective_revision(
         ticket_revision=str(
-            refreshed["ticket_graph"]["tickets"]["3"][
-                "content_revision"
-            ]
+            refreshed["ticket_graph"]["tickets"]["3"]["content_revision"]
         ),
         parent_revision=str(refreshed["parent"]["revision"]),
         graph_revision=str(refreshed["ticket_graph"]["revision"]),
@@ -2313,9 +2344,7 @@ def test_post_merge_revision_drift_continues_same_job_with_new_pr(
 
     assert drifted["status"] == "blocked"
     assert drifted["diagnostics"][0]["code"] == "merged_revision_mismatch"
-    assert GitRepository(git_repo).resolve(
-        str(state["run_branch"])
-    ) == first_integrated
+    assert GitRepository(git_repo).resolve(str(state["run_branch"])) == first_integrated
     assert drifted["active_ticket_job"]["pr_number"] == 11
     assert drifted["active_ticket_job"]["superseded_integrations"] == [
         {
@@ -2543,8 +2572,8 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
     waiting = engine.deliver(state["run_id"])
 
     job = waiting["active_ticket_job"]
-    assert waiting["status"] == "waiting_checks"
-    assert job["phase"] == "waiting_checks"
+    assert waiting["status"] == "waiting_external"
+    assert job["phase"] == "publishing"
     assert "repair_source" not in job
     assert job["modification_attempts"] == 1
     assert agents.development_thread_ids == [None]
@@ -2581,9 +2610,7 @@ def test_publication_worker_failure_rechecks_base_before_resume(
     failed = states.load_run(str(state["run_id"]))
     assert failed is not None
     old_candidate = str(failed["active_ticket_job"]["candidate_sha"])
-    new_base = _advance_branch_with_same_tree(
-        git_repo, str(state["run_branch"])
-    )
+    new_base = _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
     agents.fail = False
 
     completed = engine.deliver(state["run_id"])
@@ -2967,10 +2994,10 @@ def test_resume_switches_frontier_without_deleting_blocked_ticket_job(
     old_job = state["active_ticket_job"]
     old_job.update(
         {
-                "phase": "blocked",
-                "blocked_reason": "reviewer_requires_human",
-                "human_blockers": ["A maintainer must resolve the review block."],
-                "development_thread_id": "developer-3",
+            "phase": "blocked",
+            "blocked_reason": "reviewer_requires_human",
+            "human_blockers": ["A maintainer must resolve the review block."],
+            "development_thread_id": "developer-3",
             "reviewer_thread_ids": ["standards-3", "spec-3"],
             "pr_number": 33,
             "merge_intent": {"expected_head_sha": "a" * 40},
@@ -2994,12 +3021,8 @@ def test_resume_switches_frontier_without_deleting_blocked_ticket_job(
 
     assert resumed["active_ticket_job"]["ticket_number"] == 5
     assert resumed["ticket_jobs"]["3"] == old_job
-    assert resumed["ticket_jobs"]["3"]["blocked_reason"] == (
-        "reviewer_requires_human"
-    )
-    assert resumed["ticket_jobs"]["3"]["development_thread_id"] == (
-        "developer-3"
-    )
+    assert resumed["ticket_jobs"]["3"]["blocked_reason"] == ("reviewer_requires_human")
+    assert resumed["ticket_jobs"]["3"]["development_thread_id"] == ("developer-3")
     assert resumed["ticket_jobs"]["3"]["reviewer_thread_ids"] == [
         "standards-3",
         "spec-3",

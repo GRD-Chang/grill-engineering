@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from agent_run.github_retry import run_read_command
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
@@ -14,13 +17,25 @@ class GitHubReadError(RuntimeError):
         self.message = message
 
 
+class MergeOutcomeUnknownError(RuntimeError):
+    """A merge write may have succeeded, but GitHub has not converged yet."""
+
+
 class GhGitHubReader:
-    def __init__(self, repository_override: str | None = None) -> None:
+    def __init__(
+        self,
+        repository_override: str | None = None,
+        *,
+        working_directory: Path | None = None,
+    ) -> None:
         self.repository_override = repository_override
+        self.working_directory = working_directory
         self._repository: Repository | None = None
 
     def repository_hint(self) -> str | None:
-        return self.repository_override
+        return self.repository_override or _repository_hint_from_origin(
+            self.working_directory
+        )
 
     def repository(self) -> Repository:
         arguments = ["repo", "view"]
@@ -219,6 +234,34 @@ class GhGitHubReader:
                 "github_invalid_response", "gh response root must be an object"
             )
         return loaded
+
+
+def _repository_hint_from_origin(working_directory: Path | None) -> str | None:
+    """Read a local GitHub origin without turning a network failure into one."""
+
+    result = subprocess.run(
+        ["git", "config", "--get", "remote.origin.url"],
+        cwd=working_directory,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    remote = result.stdout.strip()
+    if remote.startswith("git@github.com:"):
+        path = remote.removeprefix("git@github.com:")
+    else:
+        parsed = urlparse(remote)
+        if parsed.hostname != "github.com":
+            return None
+        path = parsed.path.lstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    owner, separator, repository = path.partition("/")
+    if not separator or not owner or not repository or "/" in repository:
+        return None
+    return f"{owner}/{repository}"
 
 
 def _issue_from_graphql(data: dict[str, Any], number: int) -> dict[str, Any]:

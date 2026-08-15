@@ -38,6 +38,30 @@ def test_github_reader_retries_transient_timeout(
     assert attempts == 3
 
 
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ("git@github.com:example/project.git", "example/project"),
+        ("https://github.com/example/project.git", "example/project"),
+        ("https://gitlab.com/example/project.git", None),
+    ],
+)
+def test_github_reader_derives_repository_hint_from_origin(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote: str,
+    expected: str | None,
+) -> None:
+    monkeypatch.setattr(
+        "agent_run.github.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["git"], 0, f"{remote}\n", ""
+        ),
+    )
+
+    assert GhGitHubReader(working_directory=git_repo).repository_hint() == expected
+
+
 def test_git_fetch_retries_transient_timeout(
     git_repo: Path, monkeypatch
 ) -> None:

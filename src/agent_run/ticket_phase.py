@@ -27,6 +27,9 @@ BLOCKED_MESSAGES = {
     "modification_budget_exhausted": (
         "Ticket requires explicit human intervention"
     ),
+    "ticket_close_external_conflict": (
+        "Ticket close evidence conflicts with the Publisher intent"
+    ),
 }
 
 

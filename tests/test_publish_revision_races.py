@@ -546,7 +546,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     )
     assert recovered.returncode == 2, recovered.stderr
     interrupted_job = load_only_run_state(git_repo)["ticket_jobs"]["2"]
-    assert interrupted_job["phase"] == "merged"
+    assert interrupted_job["phase"] == "blocked"
     assert "ticket_closed_by_run" not in interrupted_job
 
     drifted = json.loads(fixture.read_text(encoding="utf-8"))

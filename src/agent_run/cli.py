@@ -22,6 +22,7 @@ from agent_run.run_publication import RunPublicationEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.error_safety import bounded_error
+from agent_run.external_supervision import is_github_refresh_wait
 from agent_run.runner_promotion import (
     codex_cli_version,
     current_immutable_runner,
@@ -33,6 +34,25 @@ from agent_run.runner_promotion import (
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.worker_sandbox import WorkerSandboxError
+
+_SUCCESSFUL_FOREGROUND_STATUSES = frozenset(
+    {
+        "active",
+        "ticket_completed",
+        "waiting_checks",
+        "parent_delivery_pending",
+        "parent_approval_pending",
+        "parent_closeout_pending",
+        "publication_pending",
+        "run_acceptance_pending",
+        "run_publication_pending",
+        "run_approval_pending",
+        "completed",
+        "abandoned",
+        "waiting_merge",
+        "waiting_external",
+    }
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,9 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--message",
         help="仅用于当前 Human Blocker 的未经改写人工响应（最多 8 KiB）",
     )
-    deliver = subcommands.add_parser(
-        "deliver", help="交付当前 Active Ticket Job"
-    )
+    deliver = subcommands.add_parser("deliver", help="交付当前 Active Ticket Job")
     deliver.add_argument("run_id", help="交付运行标识")
     _add_common_options(deliver)
     deliver.add_argument(
@@ -93,7 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
     publish_run.add_argument("run_id", help="交付运行标识")
     _add_common_options(publish_run)
     publish_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    approve = subcommands.add_parser("approve", help="显式批准并合并已通过门禁的最终 Run PR")
+    approve = subcommands.add_parser(
+        "approve", help="显式批准并合并已通过门禁的最终 Run PR"
+    )
     approve.add_argument("run_id", help="交付运行标识")
     _add_common_options(approve)
     revise = subcommands.add_parser("revise", help="以 Run 级人工反馈开启新的修复窗口")
@@ -115,7 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
         "promotion-handshake",
         help="从不可变 Runner 执行一次真实 Structured Outputs promotion handshake",
     )
-    promotion.add_argument("runner_sha", help="已合入 origin/main 的完整 40 位 commit SHA")
+    promotion.add_argument(
+        "runner_sha", help="已合入 origin/main 的完整 40 位 commit SHA"
+    )
     promotion.add_argument(
         "--audit-file", required=True, help="新建的脱敏 promotion 审计 JSON 路径"
     )
@@ -144,19 +166,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if parsed.state_dir
             else git.root / ".agent-run"
         )
-        fixture_path = (
-            Path(parsed.github_fixture) if parsed.github_fixture else None
-        )
+        fixture_path = Path(parsed.github_fixture) if parsed.github_fixture else None
         github = (
             FixtureGitHubReader(fixture_path)
             if fixture_path is not None
-            else GhGitHubReader(parsed.repo)
+            else GhGitHubReader(parsed.repo, working_directory=git.root)
         )
         crash_after_save = getattr(parsed, "crash_after_save", None)
         states = (
-            FaultInjectingStateStore(
-                state_root, crash_after_save=crash_after_save
-            )
+            FaultInjectingStateStore(state_root, crash_after_save=crash_after_save)
             if isinstance(crash_after_save, int)
             else StateStore(state_root)
         )
@@ -178,7 +196,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         else:
             active_codex_version = codex_cli_version()
             if active_codex_version is None:
-                raise ValueError("could not determine Codex CLI version for promotion audit")
+                raise ValueError(
+                    "could not determine Codex CLI version for promotion audit"
+                )
             require_promotion_audit(
                 runner_verification,
                 promotion_audit_file(runner_verification),
@@ -200,6 +220,36 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if not cli_surface._resume_is_ready(current):
                 cli_presentation._print_precondition_failure(current)
                 return 2
+            if current.get("status") == "supervision_timeout":
+                state, resumed = cli_surface._resume_supervision(parsed, states)
+                active_ticket_job = state.get("active_ticket_job")
+                diagnostics = state.get("diagnostics")
+                current_diagnostics = (
+                    diagnostics if isinstance(diagnostics, list) else []
+                )
+                print(
+                    json.dumps(
+                        {
+                            "result": "resumed",
+                            "run_id": state["run_id"],
+                            "status": state["status"],
+                            "run_branch": state.get(
+                                "run_branch", state.get("parent_branch")
+                            ),
+                            "active_ticket": (
+                                active_ticket_job.get("ticket_number")
+                                if isinstance(active_ticket_job, dict)
+                                else None
+                            ),
+                            "diagnostics": current_diagnostics,
+                            "scope_change": state.get("unsupported_scope_change"),
+                            "next_action": cli_presentation._next_action(state),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
             state, resumed = controller.resume(
                 parsed.run_id,
                 resume_human_blocker=True,
@@ -221,58 +271,62 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if _is_currentness_human_blocker(state):
                 cli_presentation._print_precondition_failure(state)
                 return 2
-            publisher = (
-                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                if parsed.github_fixture
-                else GhGitHubPublisher(github.repository().name_with_owner, git)
-            )
-            agent_fixture = getattr(parsed, "agent_fixture", None)
-            agents = (
-                FixtureAgentBackend(Path(agent_fixture))
-                if agent_fixture
-                else CodexCliBackend()
-            )
-            publication_retried = _has_resumed_agent_phase(state)
-            if publication_retried:
-                if state.get("delivery_type") == "parent_only":
-                    state = ParentDeliveryEngine(
-                        git=git, states=states, github=publisher, agents=agents
-                    ).deliver(parsed.run_id)
-                elif state.get("status") == "active":
-                    state = DeliveryRunEngine(
-                        controller=controller,
-                        tickets=TicketDeliveryEngine(
+            if not is_github_refresh_wait(state):
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(github.repository().name_with_owner, git)
+                )
+                agent_fixture = getattr(parsed, "agent_fixture", None)
+                agents = (
+                    FixtureAgentBackend(Path(agent_fixture))
+                    if agent_fixture
+                    else CodexCliBackend()
+                )
+                publication_retried = _has_resumed_agent_phase(state)
+                if publication_retried:
+                    if state.get("delivery_type") == "parent_only":
+                        state = ParentDeliveryEngine(
                             git=git,
                             states=states,
                             github=publisher,
                             agents=agents,
-                        ),
-                    ).deliver_from_state(parsed.run_id, state)
-                elif state.get("status") == "run_acceptance_pending":
-                    repository = github.repository()
-                    state = RunAcceptanceEngine(
-                        git=git,
-                        states=states,
-                        agents=agents,
-                        default_head_sha=git.resolve_base(
-                            repository.default_branch, repository.default_head_sha
-                        ),
-                        github=publisher,
-                        currentness_reader=github,
-                    ).accept(parsed.run_id)
-                elif state.get("status") == "run_publication_pending":
-                    repository = github.repository()
-                    state = RunPublicationEngine(
-                        git=git,
-                        states=states,
-                        agents=agents,
-                        github=publisher,
-                        default_branch=repository.default_branch,
-                        default_head_sha=git.resolve_base(
-                            repository.default_branch, repository.default_head_sha
-                        ),
-                        currentness_reader=github,
-                    ).publish(parsed.run_id)
+                        ).deliver(parsed.run_id)
+                    elif state.get("status") == "active":
+                        state = DeliveryRunEngine(
+                            controller=controller,
+                            tickets=TicketDeliveryEngine(
+                                git=git,
+                                states=states,
+                                github=publisher,
+                                agents=agents,
+                            ),
+                        ).deliver_from_state(parsed.run_id, state)
+                    elif state.get("status") == "run_acceptance_pending":
+                        repository = github.repository()
+                        state = RunAcceptanceEngine(
+                            git=git,
+                            states=states,
+                            agents=agents,
+                            default_head_sha=git.resolve_base(
+                                repository.default_branch, repository.default_head_sha
+                            ),
+                            github=publisher,
+                            currentness_reader=github,
+                        ).accept(parsed.run_id)
+                    elif state.get("status") == "run_publication_pending":
+                        repository = github.repository()
+                        state = RunPublicationEngine(
+                            git=git,
+                            states=states,
+                            agents=agents,
+                            github=publisher,
+                            default_branch=repository.default_branch,
+                            default_head_sha=git.resolve_base(
+                                repository.default_branch, repository.default_head_sha
+                            ),
+                            currentness_reader=github,
+                        ).publish(parsed.run_id)
         elif parsed.command == "requeue":
             state, retired = controller.requeue(parsed.run_id)
             transition = state.get("requeue_transition")
@@ -323,16 +377,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     git=git,
                     states=states,
                     agents=agents,
-                        default_head_sha=git.resolve_base(
-                            repository.default_branch, repository.default_head_sha
-                        ),
-                        github=publisher,
-                        currentness_reader=github,
+                    default_head_sha=git.resolve_base(
+                        repository.default_branch, repository.default_head_sha
+                    ),
+                    github=publisher,
+                    currentness_reader=github,
                 ).accept(parsed.run_id)
             resumed = True
         elif parsed.command == "deliver":
             refreshed, _ = controller.resume(parsed.run_id)
             if refreshed.get("status") in {"completed", "abandoned"}:
+                state = refreshed
+            elif is_github_refresh_wait(refreshed):
                 state = refreshed
             elif refreshed.get("status") == "requeue_required":
                 state = refreshed
@@ -361,9 +417,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 refreshed = DeliveryCleanupEngine(
                     git=git, states=states, github=publisher
                 ).resume(parsed.run_id)
-                if (
-                    refreshed.get("delivery_type") == "ticket_run"
-                    and isinstance(refreshed.get("parent_job"), dict)
+                if refreshed.get("delivery_type") == "ticket_run" and isinstance(
+                    refreshed.get("parent_job"), dict
                 ):
                     refreshed = ParentDeliveryEngine(
                         git=git,
@@ -403,6 +458,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             elif _is_currentness_human_blocker(refreshed):
                 state = refreshed
                 precondition_failed = True
+            elif is_github_refresh_wait(refreshed):
+                state = refreshed
             elif refreshed.get("status") not in {
                 "run_acceptance_pending",
                 "run_publication_pending",
@@ -429,6 +486,32 @@ def main(arguments: Sequence[str] | None = None) -> int:
             resumed = True
         else:
             refreshed, _ = controller.resume(parsed.run_id)
+            if is_github_refresh_wait(refreshed):
+                diagnostics = refreshed.get("diagnostics")
+                current_diagnostics = (
+                    diagnostics if isinstance(diagnostics, list) else []
+                )
+                print(
+                    json.dumps(
+                        {
+                            "result": "resumed",
+                            "run_id": refreshed["run_id"],
+                            "status": refreshed["status"],
+                            "run_branch": refreshed.get(
+                                "run_branch", refreshed.get("parent_branch")
+                            ),
+                            "active_ticket": None,
+                            "diagnostics": current_diagnostics,
+                            "scope_change": refreshed.get(
+                                "unsupported_scope_change"
+                            ),
+                            "next_action": cli_presentation._next_action(refreshed),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 0
             repository = github.repository()
             default_head = git.resolve_base(
                 repository.default_branch, repository.default_head_sha
@@ -462,8 +545,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 state = refreshed
                 precondition_failed = True
             elif (
-                _is_currentness_human_blocker(refreshed)
-                and parsed.command != "abandon"
+                _is_currentness_human_blocker(refreshed) and parsed.command != "abandon"
             ):
                 state = refreshed
                 precondition_failed = True
@@ -491,23 +573,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 state = ParentDeliveryEngine(
                     git=git, states=states, github=publisher, agents=agents
                 ).recover_closeout(parsed.run_id)
-            elif (
-                parsed.command == "publish-run"
-                and (
-                    refreshed.get("status") == "run_publication_pending"
-                    or (
-                        isinstance(refreshed.get("run_publication"), dict)
-                        and refreshed.get("status")
-                        in {
-                            "publication_pending",
-                            "waiting_checks",
-                            "run_approval_pending",
-                        }
-                    )
+            elif parsed.command == "publish-run" and (
+                refreshed.get("status") == "run_publication_pending"
+                or (
+                    isinstance(refreshed.get("run_publication"), dict)
+                    and refreshed.get("status")
+                    in {
+                        "publication_pending",
+                        "waiting_checks",
+                        "waiting_external",
+                        "run_approval_pending",
+                    }
                 )
             ):
                 state = publication.publish(parsed.run_id)
-            elif parsed.command == "approve" and refreshed.get("status") == "run_approval_pending":
+            elif (
+                parsed.command == "approve"
+                and refreshed.get("status") == "run_approval_pending"
+            ):
                 state = publication.approve(parsed.run_id)
             elif parsed.command == "revise" and refreshed.get("status") in {
                 "ready_for_human",
@@ -562,26 +645,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if precondition_failed:
             return 2
-        return (
-            0
-            if state["status"]
-            in {
-                "active",
-                "ticket_completed",
-                "waiting_checks",
-                "parent_delivery_pending",
-                "parent_approval_pending",
-                "parent_closeout_pending",
-                "publication_pending",
-                "run_acceptance_pending",
-                "run_publication_pending",
-                "run_approval_pending",
-                "completed",
-                "abandoned",
-                "waiting_merge",
-            }
-            else 2
-        )
+        return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
     except (
         CodexProcessError,
         GitError,
@@ -610,10 +674,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 diagnostics = durable.get("diagnostics")
                 if isinstance(diagnostics, list):
                     durable_diagnostics = diagnostics
-        diagnostic_code = "incompatible_run_state" if incompatible_state else (
-            "multiple_unfinished_runs"
-            if str(error).startswith("multiple unfinished Delivery Runs")
-            else "command_failed"
+        diagnostic_code = (
+            "incompatible_run_state"
+            if incompatible_state
+            else (
+                "multiple_unfinished_runs"
+                if str(error).startswith("multiple unfinished Delivery Runs")
+                else "command_failed"
+            )
         )
         diagnostic_message = (
             "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
@@ -649,23 +717,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             )
                         )
                     ),
-                    "diagnostics": [
-                        {
-                            "code": diagnostic_code,
-                            "message": diagnostic_message,
-                        }
-                    ]
-                    if incompatible_state
-                    or durable_status != "blocked"
-                    or durable_diagnostics is None
-                    else durable_diagnostics,
+                    "diagnostics": (
+                        [
+                            {
+                                "code": diagnostic_code,
+                                "message": diagnostic_message,
+                            }
+                        ]
+                        if incompatible_state
+                        or durable_status != "blocked"
+                        or durable_diagnostics is None
+                        else durable_diagnostics
+                    ),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
         )
     return 2
-
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:

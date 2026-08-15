@@ -11,6 +11,7 @@ from agent_run.agents import ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.codex import CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.github import GitHubReadError
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -73,6 +74,20 @@ class InterruptedRunPublisher(FixtureGitHubPublisher):
         raise OSError("simulated Publisher interruption")
 
 
+class DelayedChecksRunPublisher(FixtureGitHubPublisher):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.read_failures = 1
+
+    def required_checks(self, pr_number: int) -> str:
+        if self.read_failures:
+            self.read_failures -= 1
+            raise GitHubReadError(
+                "github_timeout", "final PR checks have not converged"
+            )
+        return super().required_checks(pr_number)
+
+
 class HumanThenRunPublicationAgents:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -118,13 +133,20 @@ class HumanThenRunPublicationAgents:
         }
 
 
-def _accepted_run(git_repo: Path) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
+def _accepted_run(
+    git_repo: Path,
+) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
     state, states, git = _completed_run(git_repo)
     tree = git.resolve(f"{state['run_branch']}^{{tree}}")
     integrated = subprocess.run(
         [
-            "git", "commit-tree", tree, "-p", str(state["run_branch"]),
-            "-m", "feat(ticket): integrated accepted ticket",
+            "git",
+            "commit-tree",
+            tree,
+            "-p",
+            str(state["run_branch"]),
+            "-m",
+            "feat(ticket): integrated accepted ticket",
         ],
         cwd=git_repo,
         text=True,
@@ -173,9 +195,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert final["record"]["default_head_sha"] == git.resolve("main")
     assert publisher.live_pull_request(int(final["pr_number"]))["state"] == "OPEN"
     pull = publisher.data["delivery"]["pull_requests"][0]
-    assert pull["body"].startswith(
-        "Parent Issue: #1\nDelivery Type: Final Run\n\n"
-    )
+    assert pull["body"].startswith("Parent Issue: #1\nDelivery Type: Final Run\n\n")
     assert publisher.data["delivery"]["agent_run_status"] == [
         {
             "pr_number": final["pr_number"],
@@ -201,6 +221,36 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert merged["integrated_tree"] == final["record"]["expected_merge_tree"]
     assert 1 in publisher.data["delivery"]["closed_issues"]
     assert publisher.data["parent"]["state"] == "CLOSED"
+
+
+def test_final_pr_read_lag_waits_without_recreating_publication(
+    git_repo: Path,
+) -> None:
+    state, states, git, _publisher = _accepted_run(git_repo)
+    publisher = DelayedChecksRunPublisher(git_repo / "github.json", git)
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert waiting["diagnostics"][0]["waiting_for"] == (
+        "Final Run PR GitHub reconciliation"
+    )
+    assert len(agents.requests) == 1
+
+    resumed = engine.publish(str(state["run_id"]))
+
+    assert resumed["status"] == "run_approval_pending"
+    assert len(agents.requests) == 1
 
 
 def test_final_publication_human_resume_clears_current_blocker(
@@ -289,8 +339,13 @@ def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
     engine.publish(str(state["run_id"]))
 
     body = publisher.data["delivery"]["pull_requests"][0]["body"]
-    assert "## Completed Tickets\n\n- [#2: Ticket 2](https://github.com/example/project/pull/42)" in body
-    assert body.index("## Completed Tickets") < body.index("## What Problem This Solves")
+    assert (
+        "## Completed Tickets\n\n- [#2: Ticket 2](https://github.com/example/project/pull/42)"
+        in body
+    )
+    assert body.index("## Completed Tickets") < body.index(
+        "## What Problem This Solves"
+    )
 
 
 def test_fresh_publication_refreshes_an_existing_final_run_pr(git_repo: Path) -> None:
@@ -320,6 +375,7 @@ def test_fresh_publication_refreshes_an_existing_final_run_pr(git_repo: Path) ->
     Controller(FixtureGitHubReader(git_repo / "github.json"), git, states).resume(
         str(state["run_id"])
     )
+
     class FreshRunReviewer:
         def review(self, request: dict[str, Any]) -> ReviewResult:
             del request
@@ -412,7 +468,12 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert pending is not None
     assert pending["run_publication"]["phase"] == "merged"
     assert pending["status"] == "parent_closeout_pending"
-    assert publisher.live_pull_request(int(published["run_publication"]["pr_number"]))["state"] == "MERGED"
+    assert (
+        publisher.live_pull_request(int(published["run_publication"]["pr_number"]))[
+            "state"
+        ]
+        == "MERGED"
+    )
     assert not Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
     ).record_execution_failure(str(state["run_id"]), "lost Parent closeout response")
@@ -481,9 +542,12 @@ def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) ->
 
     assert result["status"] == "run_acceptance_pending"
     assert result["run_acceptance"]["phase"] == "pending"
-    assert publisher.live_pull_request(
-        int(published["run_publication"]["pr_number"])
-    )["state"] == "OPEN"
+    assert (
+        publisher.live_pull_request(int(published["run_publication"]["pr_number"]))[
+            "state"
+        ]
+        == "OPEN"
+    )
 
 
 def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
@@ -515,9 +579,12 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
     assert abandoned["status"] == "abandoned"
     assert abandoned["run_publication"]["phase"] == "abandoned"
     assert not temporary.exists()
-    assert publisher.live_pull_request(
-        int(published["run_publication"]["pr_number"])
-    )["state"] == "CLOSED"
+    assert (
+        publisher.live_pull_request(int(published["run_publication"]["pr_number"]))[
+            "state"
+        ]
+        == "CLOSED"
+    )
     resumed = run_cli(
         git_repo, git_repo / "github.json", "accept-run", str(state["run_id"])
     )
@@ -568,9 +635,7 @@ def test_abandon_recovers_lost_final_run_pr_close_response(
         for mutation in publisher.data["delivery"]["mutations"]
         if mutation["action"] == "close_final_run_pr"
     ]
-    assert close_mutations == [
-        {"action": "close_final_run_pr", "pr_number": pr_number}
-    ]
+    assert close_mutations == [{"action": "close_final_run_pr", "pr_number": pr_number}]
 
     recovered = engine.abandon(str(state["run_id"]))
 
@@ -598,7 +663,10 @@ def test_final_check_failure_enters_shared_run_repair(git_repo: Path) -> None:
     failed_checks = engine.publish(str(state["run_id"]))
 
     assert failed_checks["status"] == "run_acceptance_pending"
-    assert failed_checks["run_acceptance"]["repair_request"]["repair_source"] == "required_checks"
+    assert (
+        failed_checks["run_acceptance"]["repair_request"]["repair_source"]
+        == "required_checks"
+    )
 
 
 def test_final_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
@@ -624,7 +692,10 @@ def test_final_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
     ).approve(str(state["run_id"]))
 
     assert conflicted["status"] == "run_acceptance_pending"
-    assert conflicted["run_acceptance"]["repair_request"]["repair_source"] == "merge_conflict"
+    assert (
+        conflicted["run_acceptance"]["repair_request"]["repair_source"]
+        == "merge_conflict"
+    )
 
 
 def test_approve_recovers_a_merge_that_succeeded_before_state_save(
@@ -669,7 +740,10 @@ def test_pending_check_that_later_fails_enters_shared_run_repair(
     repaired = engine.publish(str(state["run_id"]))
 
     assert repaired["status"] == "run_acceptance_pending"
-    assert repaired["run_acceptance"]["repair_request"]["repair_source"] == "required_checks"
+    assert (
+        repaired["run_acceptance"]["repair_request"]["repair_source"]
+        == "required_checks"
+    )
 
 
 def test_worker_failure_before_publication_artifact_is_not_retried(
@@ -808,7 +882,9 @@ def test_final_publication_discards_an_artifact_when_default_base_advances(
         def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
             result = super().run_publication(request)
             (git_repo / "default-branch.txt").write_text("advanced\n", encoding="utf-8")
-            subprocess.run(["git", "add", "default-branch.txt"], cwd=git_repo, check=True)
+            subprocess.run(
+                ["git", "add", "default-branch.txt"], cwd=git_repo, check=True
+            )
             subprocess.run(
                 ["git", "commit", "-m", "advance default during publication"],
                 cwd=git_repo,
@@ -1056,9 +1132,7 @@ def test_publish_run_retries_only_exhausted_final_run_publication(
     acceptance = pending["run_acceptance"]["acceptance_record"]
     agents = git_repo / "resume-publication-agents.json"
     agents.write_text(
-        json.dumps(
-            {"run_publications": [RunPublicationAgents().run_publication({})]}
-        ),
+        json.dumps({"run_publications": [RunPublicationAgents().run_publication({})]}),
         encoding="utf-8",
     )
 
@@ -1079,7 +1153,9 @@ def test_publish_run_retries_only_exhausted_final_run_publication(
     assert recovered["run_publication"]["publication_attempts"] == 1
 
 
-def test_recovered_publication_replaces_the_pending_terminal_kind(git_repo: Path) -> None:
+def test_recovered_publication_replaces_the_pending_terminal_kind(
+    git_repo: Path,
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
 
     pending = RunPublicationEngine(
@@ -1106,7 +1182,9 @@ def test_recovered_publication_replaces_the_pending_terminal_kind(git_repo: Path
     assert waiting["terminal_kind"] == "waiting_checks"
 
 
-def test_final_run_publication_receives_only_role_required_facts(git_repo: Path) -> None:
+def test_final_run_publication_receives_only_role_required_facts(
+    git_repo: Path,
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     agents = RunPublicationAgents()
 
@@ -1224,7 +1302,10 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
     ).publish(str(state["run_id"]))
 
     assert fresh["run_acceptance"]["phase"] == "accepted"
-    assert recovered["run_publication"]["pr_number"] != published["run_publication"]["pr_number"]
+    assert (
+        recovered["run_publication"]["pr_number"]
+        != published["run_publication"]["pr_number"]
+    )
     assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == [
         "CLOSED",
         "OPEN",
@@ -1268,4 +1349,9 @@ def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
     )
     assert approved.returncode == 0, approved.stderr
     assert stdout_json(approved)["status"] == "completed"
-    assert FixtureGitHubPublisher(git_repo / "github.json", _git).live_pull_request(1)["state"] == "MERGED"
+    assert (
+        FixtureGitHubPublisher(git_repo / "github.json", _git).live_pull_request(1)[
+            "state"
+        ]
+        == "MERGED"
+    )

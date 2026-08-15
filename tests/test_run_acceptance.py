@@ -1468,9 +1468,11 @@ def test_accept_run_does_not_review_after_a_github_refresh_failure(
         str(agents),
     )
 
-    assert result.returncode == 2
-    assert stdout_json(result)["status"] == "execution_failed"
-    assert states.load_run(str(state["run_id"])) is not None
+    assert result.returncode == 0, result.stderr
+    assert stdout_json(result)["status"] == "waiting_external"
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert "run_acceptance" not in persisted
 
 
 def test_interrupted_run_review_restarts_with_a_fresh_attempt(

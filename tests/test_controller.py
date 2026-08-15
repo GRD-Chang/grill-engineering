@@ -221,3 +221,24 @@ def test_repository_hint_guards_failure_record_when_remote_is_unavailable(
     assert recorded is not None
     assert recorded["status"] == "execution_failed"
     assert recorded["terminal_kind"] == "execution_failed"
+
+
+def test_resume_waits_for_repository_binding_to_recover(git_repo: Path) -> None:
+    store = StateStore(git_repo / ".agent-run")
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _issue(2)})
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    ).start(1)
+
+    waiting, resumed = Controller(
+        UnavailableRepositoryReader("example/project"),
+        GitRepository(git_repo),
+        store,
+    ).resume(str(state["run_id"]))
+
+    assert resumed
+    assert waiting["status"] == "waiting_external"
+    assert waiting["diagnostics"][0]["waiting_for"] == "GitHub repository binding"
+    persisted = store.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["status"] == "waiting_external"

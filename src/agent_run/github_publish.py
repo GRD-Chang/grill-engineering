@@ -7,14 +7,9 @@ from collections.abc import Callable
 from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
-from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.github import GhGitHubReader, GitHubReadError, MergeOutcomeUnknownError
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
-
-
-class MergeOutcomeUnknownError(RuntimeError):
-    pass
-
 
 _ACCEPTANCE_MARKER = "<!-- agent-run:acceptance-record -->"
 _RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
@@ -32,7 +27,12 @@ class GhGitHubPublisher:
         self, *, parent_number: int, branch: str, base_branch: str
     ) -> None:
         listed = self._run(
-            "issue", "develop", "--list", str(parent_number), "--repo", self.repository,
+            "issue",
+            "develop",
+            "--list",
+            str(parent_number),
+            "--repo",
+            self.repository,
         )
         if listed.returncode != 0:
             raise GitHubReadError(
@@ -132,25 +132,64 @@ class GhGitHubPublisher:
             cwd=self.git.root,
         )
         if pushed.returncode != 0:
-            raise GitError(pushed.stderr.strip() or "could not create Run Repair branch")
+            raise GitError(
+                pushed.stderr.strip() or "could not create Run Repair branch"
+            )
 
     def ensure_run_repair_pr(
         self, *, branch: str, base_branch: str, title: str, body: str
     ) -> int:
         pulls = self._json(
-            "pr", "list", "--repo", self.repository, "--state", "open",
-            "--head", branch, "--base", base_branch, "--json", "number"
+            "pr",
+            "list",
+            "--repo",
+            self.repository,
+            "--state",
+            "open",
+            "--head",
+            branch,
+            "--base",
+            base_branch,
+            "--json",
+            "number",
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         if len(pulls) > 1:
-            raise GitHubReadError("ambiguous_run_repair_pr", "more than one open Run Repair PR exists")
+            raise GitHubReadError(
+                "ambiguous_run_repair_pr", "more than one open Run Repair PR exists"
+            )
         if pulls:
             number = _integer(_mapping(pulls[0]), "number")
-            self._require("pr", "edit", str(number), "--repo", self.repository, "--title", title, "--body", body)
+            self._require(
+                "pr",
+                "edit",
+                str(number),
+                "--repo",
+                self.repository,
+                "--title",
+                title,
+                "--body",
+                body,
+            )
             return number
-        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
-        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        self._require(
+            "pr",
+            "create",
+            "--repo",
+            self.repository,
+            "--head",
+            branch,
+            "--base",
+            base_branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        )
+        created = self._json(
+            "pr", "view", branch, "--repo", self.repository, "--json", "number"
+        )
         return _integer(_mapping(created), "number")
 
     def ensure_run_pr(
@@ -160,8 +199,23 @@ class GhGitHubPublisher:
         existing = self.find_run_pr(branch=branch)
         if existing is not None:
             return existing
-        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
-        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        self._require(
+            "pr",
+            "create",
+            "--repo",
+            self.repository,
+            "--head",
+            branch,
+            "--base",
+            base_branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        )
+        created = self._json(
+            "pr", "view", branch, "--repo", self.repository, "--json", "number"
+        )
         return _integer(_mapping(created), "number")
 
     def refresh_run_pr_narrative(
@@ -183,19 +237,36 @@ class GhGitHubPublisher:
         ):
             raise GitHubReadError("stale_run_pr", "Final Run PR changed before refresh")
         self._require(
-            "pr", "edit", str(pr_number), "--repo", self.repository,
-            "--title", title, "--body", body,
+            "pr",
+            "edit",
+            str(pr_number),
+            "--repo",
+            self.repository,
+            "--title",
+            title,
+            "--body",
+            body,
         )
 
     def find_run_pr(self, *, branch: str) -> int | None:
         pulls = self._json(
-            "pr", "list", "--repo", self.repository, "--state", "open",
-            "--head", branch, "--json", "number,state"
+            "pr",
+            "list",
+            "--repo",
+            self.repository,
+            "--state",
+            "open",
+            "--head",
+            branch,
+            "--json",
+            "number,state",
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         if len(pulls) > 1:
-            raise GitHubReadError("ambiguous_run_pr", "more than one open final Run PR exists")
+            raise GitHubReadError(
+                "ambiguous_run_pr", "more than one open final Run PR exists"
+            )
         if not pulls:
             return None
         existing = _mapping(pulls[0])
@@ -206,22 +277,61 @@ class GhGitHubPublisher:
     ) -> int:
         self._ensure_remote_run_branch(branch)
         pulls = self._json(
-            "pr", "list", "--repo", self.repository, "--state", "all",
-            "--head", branch, "--base", base_branch, "--json", "number,state"
+            "pr",
+            "list",
+            "--repo",
+            self.repository,
+            "--state",
+            "all",
+            "--head",
+            branch,
+            "--base",
+            base_branch,
+            "--json",
+            "number,state",
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         if len(pulls) > 1:
-            raise GitHubReadError("ambiguous_parent_pr", "more than one Parent PR exists")
+            raise GitHubReadError(
+                "ambiguous_parent_pr", "more than one Parent PR exists"
+            )
         if pulls:
             existing = _mapping(pulls[0])
             number = _integer(existing, "number")
             if existing.get("state") != "OPEN":
-                raise GitHubReadError("parent_pr_not_open", "the existing Parent PR is not open")
-            self._require("pr", "edit", str(number), "--repo", self.repository, "--title", title, "--body", body)
+                raise GitHubReadError(
+                    "parent_pr_not_open", "the existing Parent PR is not open"
+                )
+            self._require(
+                "pr",
+                "edit",
+                str(number),
+                "--repo",
+                self.repository,
+                "--title",
+                title,
+                "--body",
+                body,
+            )
             return number
-        self._require("pr", "create", "--repo", self.repository, "--head", branch, "--base", base_branch, "--title", title, "--body", body)
-        created = self._json("pr", "view", branch, "--repo", self.repository, "--json", "number")
+        self._require(
+            "pr",
+            "create",
+            "--repo",
+            self.repository,
+            "--head",
+            branch,
+            "--base",
+            base_branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        )
+        created = self._json(
+            "pr", "view", branch, "--repo", self.repository, "--json", "number"
+        )
         return _integer(_mapping(created), "number")
 
     def abandon_parent_pr(self, pr_number: int) -> bool:
@@ -231,9 +341,7 @@ class GhGitHubPublisher:
         self._require("pr", "close", str(pr_number), "--repo", self.repository)
         return True
 
-    def record_run_publication(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None:
+    def record_run_publication(self, pr_number: int, record: dict[str, Any]) -> None:
         body = (
             f"{_RUN_PUBLICATION_MARKER}\n"
             "## Run Publication Record\n\n```json\n"
@@ -243,7 +351,9 @@ class GhGitHubPublisher:
             "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate"
         )
         if not isinstance(comments, list):
-            raise GitHubReadError("github_invalid_response", "comments must be an array")
+            raise GitHubReadError(
+                "github_invalid_response", "comments must be an array"
+            )
         existing = next(
             (
                 _mapping(comment)
@@ -253,23 +363,39 @@ class GhGitHubPublisher:
             None,
         )
         if existing is None:
-            self._json("api", f"repos/{self.repository}/issues/{pr_number}/comments", "-f", f"body={body}")
+            self._json(
+                "api",
+                f"repos/{self.repository}/issues/{pr_number}/comments",
+                "-f",
+                f"body={body}",
+            )
         else:
             self._json(
-                "api", "--method", "PATCH",
+                "api",
+                "--method",
+                "PATCH",
                 f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
-                "-f", f"body={body}",
+                "-f",
+                f"body={body}",
             )
 
     def normal_merge(self, *, pr_number: int, expected_head_sha: str) -> str:
         merged = self._run(
-            "pr", "merge", str(pr_number), "--repo", self.repository,
-            "--merge", "--match-head-commit", expected_head_sha,
+            "pr",
+            "merge",
+            str(pr_number),
+            "--repo",
+            self.repository,
+            "--merge",
+            "--match-head-commit",
+            expected_head_sha,
         )
         try:
             live = self.live_pull_request(pr_number)
         except GitHubReadError as error:
-            raise MergeOutcomeUnknownError("could not determine final merge outcome") from error
+            raise MergeOutcomeUnknownError(
+                "could not determine final merge outcome"
+            ) from error
         integrated = live.get("integrated_sha")
         if live.get("state") == "MERGED" and isinstance(integrated, str):
             return integrated
@@ -368,9 +494,7 @@ class GhGitHubPublisher:
         )
         if remote.returncode != 0:
             raise GitError(remote.stderr.strip() or "could not read ticket branch")
-        current_remote_sha = (
-            remote.stdout.split()[0] if remote.stdout.strip() else None
-        )
+        current_remote_sha = remote.stdout.split()[0] if remote.stdout.strip() else None
         if current_remote_sha == head_sha:
             return
         if current_remote_sha != expected_remote_sha:
@@ -473,9 +597,7 @@ class GhGitHubPublisher:
 
     def required_checks(self, pr_number: int) -> str:
         checks = self._checks(pr_number, "bucket")
-        buckets = {
-            str(_mapping(check).get("bucket", "")).lower() for check in checks
-        }
+        buckets = {str(_mapping(check).get("bucket", "")).lower() for check in checks}
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -489,8 +611,7 @@ class GhGitHubPublisher:
         failed = [
             dict(_mapping(check))
             for check in checks
-            if str(_mapping(check).get("bucket", "")).lower()
-            in {"fail", "cancel"}
+            if str(_mapping(check).get("bucket", "")).lower() in {"fail", "cancel"}
         ]
         return {"pr_number": pr_number, "checks": failed}
 
@@ -574,7 +695,9 @@ class GhGitHubPublisher:
         if not isinstance(pages, list) or not all(
             isinstance(page, list) for page in pages
         ):
-            raise GitHubReadError("github_invalid_response", "ruleset pages must be arrays")
+            raise GitHubReadError(
+                "github_invalid_response", "ruleset pages must be arrays"
+            )
         contexts: dict[str, int | None] = {}
         rulesets = [summary for page in pages for summary in page]
         for summary in rulesets:
@@ -592,7 +715,9 @@ class GhGitHubPublisher:
                 continue
             rules = ruleset.get("rules")
             if not isinstance(rules, list):
-                raise GitHubReadError("github_invalid_response", "ruleset rules must be an array")
+                raise GitHubReadError(
+                    "github_invalid_response", "ruleset rules must be an array"
+                )
             for rule in rules:
                 rule_data = _mapping(rule)
                 if rule_data.get("type") != "required_status_checks":
@@ -608,7 +733,9 @@ class GhGitHubPublisher:
                     check_data = _mapping(check)
                     context = _string(check_data, "context")
                     integration_id = check_data.get("integration_id")
-                    if integration_id is not None and not isinstance(integration_id, int):
+                    if integration_id is not None and not isinstance(
+                        integration_id, int
+                    ):
                         raise GitHubReadError(
                             "github_invalid_response",
                             "Ruleset integration_id must be an integer",
@@ -640,9 +767,9 @@ class GhGitHubPublisher:
                 "github_invalid_response", "ruleset ref conditions must be arrays"
             )
         return (
-            (not includes or any(_matches_ref(reference, pattern) for pattern in includes))
-            and not any(_matches_ref(reference, pattern) for pattern in excludes)
-        )
+            not includes
+            or any(_matches_ref(reference, pattern) for pattern in includes)
+        ) and not any(_matches_ref(reference, pattern) for pattern in excludes)
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         value = self._json(
@@ -657,9 +784,7 @@ class GhGitHubPublisher:
         data = _mapping(value)
         merge_commit = data.get("mergeCommit")
         integrated_sha = (
-            merge_commit.get("oid")
-            if isinstance(merge_commit, dict)
-            else None
+            merge_commit.get("oid") if isinstance(merge_commit, dict) else None
         )
         result = {
             "head_sha": data.get("headRefOid"),
@@ -685,9 +810,7 @@ class GhGitHubPublisher:
             )
         return result
 
-    def record_acceptance(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None:
+    def record_acceptance(self, pr_number: int, record: dict[str, Any]) -> None:
         body = (
             f"{_ACCEPTANCE_MARKER}\n"
             "## Fresh Acceptance Record\n\n"
@@ -701,7 +824,9 @@ class GhGitHubPublisher:
             "--paginate",
         )
         if not isinstance(comments, list):
-            raise GitHubReadError("github_invalid_response", "comments must be an array")
+            raise GitHubReadError(
+                "github_invalid_response", "comments must be an array"
+            )
         existing = next(
             (
                 _mapping(comment)
@@ -728,12 +853,13 @@ class GhGitHubPublisher:
                 f"body={body}",
             )
 
-    def record_agent_run_status(
-        self, pr_number: int, status: dict[str, Any]
-    ) -> None:
+    def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         body = _render_agent_run_status(status)
         comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
         )
         comments = _flatten_pages(comments, "comments")
         existing = next(
@@ -746,13 +872,19 @@ class GhGitHubPublisher:
         )
         if existing is None:
             self._json(
-                "api", f"repos/{self.repository}/issues/{pr_number}/comments", "-f", f"body={body}"
+                "api",
+                f"repos/{self.repository}/issues/{pr_number}/comments",
+                "-f",
+                f"body={body}",
             )
         else:
             self._json(
-                "api", "--method", "PATCH",
+                "api",
+                "--method",
+                "PATCH",
                 f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
-                "-f", f"body={body}",
+                "-f",
+                f"body={body}",
             )
 
     def has_supersession_close_receipt(
@@ -764,20 +896,24 @@ class GhGitHubPublisher:
         if live.get("state") != "CLOSED":
             return False
         comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
         )
         comments = _flatten_pages(comments, "comments")
         events = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/events", "--paginate", "--slurp"
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/events",
+            "--paginate",
+            "--slurp",
         )
         events = _flatten_pages(events, "events")
         viewer = self._json("api", "user")
         viewer_login = _mapping(viewer).get("login")
         if not isinstance(viewer_login, str) or not viewer_login:
             return False
-        if not self.has_supersession_close_intent(
-            pr_number, generation, close_nonce
-        ):
+        if not self.has_supersession_close_intent(pr_number, generation, close_nonce):
             return False
         lifecycle_events = [
             _mapping(event)
@@ -800,7 +936,10 @@ class GhGitHubPublisher:
         if type(generation) is not int or not isinstance(close_nonce, str):
             return False
         comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
         )
         viewer = self._json("api", "user")
         viewer_login = _mapping(viewer).get("login")
@@ -811,8 +950,7 @@ class GhGitHubPublisher:
             _supersession_status_matches(
                 str(_mapping(comment).get("body", "")), generation, close_nonce
             )
-            and _mapping(_mapping(comment).get("user", {})).get("login")
-            == viewer_login
+            and _mapping(_mapping(comment).get("user", {})).get("login") == viewer_login
             for comment in comments
         )
 
@@ -822,7 +960,10 @@ class GhGitHubPublisher:
         if type(generation) is not int or not isinstance(close_nonce, str):
             return False
         comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate", "--slurp"
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
         )
         viewer = self._json("api", "user")
         viewer_login = _mapping(viewer).get("login")
@@ -839,8 +980,7 @@ class GhGitHubPublisher:
         )
         return any(
             record in str(_mapping(comment).get("body", ""))
-            and _mapping(_mapping(comment).get("user", {})).get("login")
-            == viewer_login
+            and _mapping(_mapping(comment).get("user", {})).get("login") == viewer_login
             for comment in comments
         )
 
@@ -878,15 +1018,15 @@ class GhGitHubPublisher:
             merged.stderr.strip() or "could not determine squash merge outcome"
         )
 
-    def sync_run_branch(
-        self, *, run_branch: str, integrated_sha: str
-    ) -> None:
+    def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
         fetched = run_read_command(
             ["git", "fetch", "--no-tags", "origin", run_branch],
             cwd=self.git.root,
         )
         if fetched.returncode != 0:
-            raise GitError(fetched.stderr.strip() or "could not fetch merged Run Branch")
+            raise GitError(
+                fetched.stderr.strip() or "could not fetch merged Run Branch"
+            )
         fetched_sha = self.git.resolve("FETCH_HEAD")
         if fetched_sha != integrated_sha:
             raise GitError("remote Run Branch does not match integrated commit")
@@ -1043,7 +1183,7 @@ class GhGitHubPublisher:
         expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         if prepared.get("intent_binding") != expected_binding:
             raise GitHubReadError(
-                "ticket_close_reconciliation_pending",
+                "ticket_close_external_conflict",
                 "prepared Ticket close belongs to a different PR generation",
             )
         if prepared.get("event_id") is not None:
@@ -1054,7 +1194,7 @@ class GhGitHubPublisher:
             )
             if ownership is None:
                 raise GitHubReadError(
-                    "ticket_close_reconciliation_pending",
+                    "ticket_close_external_conflict",
                     "recorded Ticket close is no longer current",
                 )
             return ownership
@@ -1077,7 +1217,7 @@ class GhGitHubPublisher:
             )
             if ownership is None:
                 raise GitHubReadError(
-                    "ticket_close_reconciliation_pending",
+                    "ticket_close_external_conflict",
                     "Ticket close ownership conflicts with the prepared dispatch",
                 )
             return ownership
@@ -1096,19 +1236,12 @@ class GhGitHubPublisher:
                 recorded_ownership=prepared,
             )
             raise GitHubReadError(
-                "ticket_close_reconciliation_pending",
+                "ticket_close_external_conflict",
                 "Ticket changed after the Publisher close intent",
-            )
-        if issue.get("updatedAt") != prepared.get("intent_created_at"):
-            raise GitHubReadError(
-                "ticket_close_reconciliation_pending",
-                "Ticket currentness changed after the Publisher close intent",
             )
         if before_dispatch is not None:
             before_dispatch()
-        self._require(
-            "issue", "close", str(ticket_number), "--repo", self.repository
-        )
+        self._require("issue", "close", str(ticket_number), "--repo", self.repository)
         ownership = self._ticket_close_ownership(
             ticket_number=ticket_number,
             run_id=run_id,
@@ -1116,7 +1249,7 @@ class GhGitHubPublisher:
         )
         if ownership is None:
             raise GitHubReadError(
-                "ticket_close_reconciliation_pending",
+                "ticket_close_external_conflict",
                 "Ticket close ownership conflicts with the dispatched close",
             )
         return ownership
@@ -1128,11 +1261,14 @@ class GhGitHubPublisher:
         run_id: str,
         recorded_ownership: dict[str, Any] | None,
     ) -> bool:
-        return self.ticket_close_ownership(
-            ticket_number=ticket_number,
-            run_id=run_id,
-            recorded_ownership=recorded_ownership,
-        ) is not None
+        return (
+            self.ticket_close_ownership(
+                ticket_number=ticket_number,
+                run_id=run_id,
+                recorded_ownership=recorded_ownership,
+            )
+            is not None
+        )
 
     def ticket_close_ownership(
         self,
@@ -1153,6 +1289,7 @@ class GhGitHubPublisher:
         ticket_number: int,
         run_id: str,
         recorded_ownership: dict[str, Any] | None,
+        require_recovery_currentness: bool = False,
     ) -> dict[str, Any] | None:
         issue = _mapping(
             self._json(
@@ -1215,6 +1352,7 @@ class GhGitHubPublisher:
                     publisher_login=str(recorded_ownership.get("actor", "")),
                     run_id=run_id,
                     ticket_number=ticket_number,
+                    allow_recovery_marker=require_recovery_currentness,
                 ):
                     raise GitHubReadError(
                         "ticket_close_ownership_pending",
@@ -1290,10 +1428,7 @@ class GhGitHubPublisher:
             and actor.get("login") == publisher_login
             else None
         )
-        if (
-            owned is None
-            or latest_after_baseline["id"] != owned["id"]
-        ):
+        if owned is None or latest_after_baseline["id"] != owned["id"]:
             return None
         if not self._ticket_current_at_transition(
             issue,
@@ -1301,6 +1436,7 @@ class GhGitHubPublisher:
             publisher_login=publisher_login,
             run_id=run_id,
             ticket_number=ticket_number,
+            allow_recovery_marker=require_recovery_currentness,
         ):
             raise GitHubReadError(
                 "ticket_close_ownership_pending",
@@ -1325,19 +1461,21 @@ class GhGitHubPublisher:
         ticket_number: int,
         allow_recovery_marker: bool = False,
     ) -> bool:
+        # Issue.updatedAt and the timeline projection converge independently.
+        # Callers have already checked the close intent binding, baseline,
+        # transition type/actor and the live CLOSED state; timestamp equality
+        # would reject a valid Publisher-owned close during normal propagation.
+        if not allow_recovery_marker:
+            return True
         updated_at = issue.get("updatedAt")
         transition_time = transition.get("created_at")
         if not isinstance(updated_at, str) or not isinstance(transition_time, str):
             return False
         if updated_at == transition_time:
             return True
-        if not allow_recovery_marker:
-            return False
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:abandoned -->"
         comments = issue.get("comments")
-        if not isinstance(comments, list):
-            return False
-        return any(
+        return isinstance(comments, list) and any(
             isinstance(_mapping(comment).get("createdAt"), str)
             and _mapping(comment).get("createdAt") == updated_at
             and isinstance(_mapping(comment).get("author"), dict)
@@ -1508,6 +1646,7 @@ class GhGitHubPublisher:
             ticket_number=ticket_number,
             run_id=run_id,
             recorded_ownership=expected_ownership,
+            require_recovery_currentness=True,
         )
         if ownership is None:
             return False
@@ -1693,9 +1832,8 @@ def _is_read_command(arguments: tuple[str, ...]) -> bool:
         return False
     command = arguments[0]
     if command == "api":
-        return (
-            "--method" not in arguments
-            and not any(argument.startswith("body=") for argument in arguments)
+        return "--method" not in arguments and not any(
+            argument.startswith("body=") for argument in arguments
         )
     if command == "repo":
         return arguments[1:2] == ("view",)
@@ -1710,7 +1848,9 @@ def _is_read_command(arguments: tuple[str, ...]) -> bool:
 
 def _matches_ref(reference: str, pattern: object) -> bool:
     if not isinstance(pattern, str):
-        raise GitHubReadError("github_invalid_response", "ruleset ref pattern must be a string")
+        raise GitHubReadError(
+            "github_invalid_response", "ruleset ref pattern must be a string"
+        )
     if pattern == "~ALL":
         return True
     if pattern.startswith("~"):
@@ -1743,7 +1883,9 @@ def _render_agent_run_status(status: dict[str, Any]) -> str:
     if status.get("scope") == "superseded_generation":
         generation = status.get("generation")
         if type(generation) is not int or generation < 1:
-            raise GitHubReadError("github_invalid_response", "generation must be positive")
+            raise GitHubReadError(
+                "github_invalid_response", "generation must be positive"
+            )
         if status.get("retirement") not in {"closing", "closed"}:
             raise GitHubReadError(
                 "github_invalid_response", "superseded status has invalid retirement"
@@ -1795,9 +1937,7 @@ def _flatten_pages(value: object, label: str) -> list[object]:
     raise GitHubReadError("github_invalid_response", f"{label} pages must be arrays")
 
 
-def _supersession_status_matches(
-    body: str, generation: int, close_nonce: str
-) -> bool:
+def _supersession_status_matches(body: str, generation: int, close_nonce: str) -> bool:
     return (
         _AGENT_RUN_STATUS_MARKER in body
         and "## Superseded Change Generation" in body

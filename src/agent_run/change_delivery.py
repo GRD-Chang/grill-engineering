@@ -26,7 +26,7 @@ from agent_run.artifacts import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
-from agent_run.github import GitHubReadError
+from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.publication_pending import publication_pending_diagnostic
 
 MAX_MODIFICATION_ATTEMPTS = 10
@@ -71,9 +71,7 @@ class ChangeJobContract:
     acceptance_is_current: Callable[
         [dict[str, Any], dict[str, Any], dict[str, Any]], bool
     ]
-    invalidate_stale: Callable[
-        [dict[str, Any], dict[str, Any], Path], None
-    ]
+    invalidate_stale: Callable[[dict[str, Any], dict[str, Any], Path], None]
     stale_disposition: StaleDisposition
     revision_changed: Callable[[dict[str, Any], dict[str, Any]], bool]
     requires_explicit_approval: Callable[[dict[str, Any], dict[str, Any]], bool]
@@ -474,9 +472,11 @@ class ChangeDeliveryEngine:
                 next_action=(
                     "repair Fresh Validation findings"
                     if artifact.verdict == "request_changes"
-                    else "await human decision"
-                    if artifact.verdict == "human"
-                    else "generate publication narrative"
+                    else (
+                        "await human decision"
+                        if artifact.verdict == "human"
+                        else "generate publication narrative"
+                    )
                 ),
             )
         if artifact.verdict == "pass":
@@ -624,8 +624,19 @@ class ChangeDeliveryEngine:
                 "unavailable",
                 next_action="retry Required Checks observation",
             )
-            job["phase"] = "waiting_checks"
-            state["status"] = "waiting_checks"
+            state.update(
+                {
+                    "status": "waiting_external",
+                    "terminal_kind": "waiting_external",
+                    "diagnostics": [
+                        {
+                            "code": "github_checks_observation_pending",
+                            "message": "GitHub Required Checks read has not converged",
+                            "waiting_for": f"Ticket PR #{pr_number} Required Checks observation",
+                        }
+                    ],
+                }
+            )
             self.contract.save(state)
             return True
         self._reject_stale(
@@ -684,14 +695,27 @@ class ChangeDeliveryEngine:
                 "published_head_mismatch",
                 "Published-Head Gate rejected live PR state",
             )
-        job["merge_intent"] = {
+        merge_intent = job.get("merge_intent")
+        expected_intent = {
             "head_sha": str(job["publication_sha"]),
             "base_branch": self.contract.base_branch(state),
             "base_sha": str(acceptance["reviewed_base_sha"]),
             "commit_message": str(publication["commit_message"]),
         }
         if "effective_revision" in job:
-            job["merge_intent"]["effective_revision"] = str(job["effective_revision"])
+            expected_intent["effective_revision"] = str(job["effective_revision"])
+        if merge_intent is None:
+            merge_intent = {**expected_intent, "attempts": 0}
+            job["merge_intent"] = merge_intent
+        elif not isinstance(merge_intent, dict) or any(
+            merge_intent.get(key) != value for key, value in expected_intent.items()
+        ):
+            return self._block(
+                state,
+                job,
+                "merge_intent_mismatch",
+                "Persisted merge intent no longer matches the current PR boundary",
+            )
         if self.contract.requires_explicit_approval(state, job):
             job["phase"] = "ready_for_approval"
             state["status"] = "parent_approval_pending"
@@ -713,12 +737,34 @@ class ChangeDeliveryEngine:
             checks,
             next_action="squash merge into the Run Branch",
         )
-        integrated = self.github.squash_merge(
-            pr_number=pr_number,
-            expected_head_sha=str(job["publication_sha"]),
-            run_branch=self.contract.base_branch(state),
-            commit_message=str(publication["commit_message"]),
-        )
+        attempts = merge_intent.get("attempts", 0)
+        if type(attempts) is not int or attempts < 0:
+            raise ValueError("merge intent attempts must be a non-negative integer")
+        if attempts >= 3:
+            return self._wait_for_merge_reconciliation(state, job)
+        merge_intent["attempts"] = attempts + 1
+        self.contract.save(state)
+        try:
+            integrated = self.github.squash_merge(
+                pr_number=pr_number,
+                expected_head_sha=str(job["publication_sha"]),
+                run_branch=self.contract.base_branch(state),
+                commit_message=str(publication["commit_message"]),
+            )
+        except MergeOutcomeUnknownError as error:
+            history = job.setdefault("merge_reconciliation_history", [])
+            if not isinstance(history, list):
+                raise ValueError("merge reconciliation history must be an array")
+            history.append(
+                {
+                    "attempt": merge_intent["attempts"],
+                    "result": "outcome_unknown",
+                    "message": str(error),
+                }
+            )
+            del history[:-3]
+            self.contract.save(state)
+            return self._wait_for_merge_reconciliation(state, job, str(error))
         job["integrated_sha"] = integrated
         self.contract.save(state)
         self.github.sync_run_branch(
@@ -732,6 +778,26 @@ class ChangeDeliveryEngine:
         if not self.contract.after_merge(state, job, live_after_merge):
             return True
         job["phase"] = "completed"
+        self.contract.save(state)
+        return True
+
+    def _wait_for_merge_reconciliation(
+        self, state: dict[str, Any], job: dict[str, Any], message: str | None = None
+    ) -> bool:
+        state.update(
+            {
+                "status": "waiting_external",
+                "terminal_kind": "waiting_external",
+                "diagnostics": [
+                    {
+                        "code": "merge_reconciliation_pending",
+                        "message": message
+                        or "Merge intent reached its retry limit; waiting for GitHub reconciliation",
+                        "waiting_for": "squash merge outcome",
+                    }
+                ],
+            }
+        )
         self.contract.save(state)
         return True
 
@@ -784,10 +850,9 @@ class ChangeDeliveryEngine:
         )
 
     def _agent_is_current(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        return (
-            self.git.resolve(self.contract.base_branch(state)) == job.get("base_sha")
-            and not self.contract.revision_changed(state, job)
-        )
+        return self.git.resolve(self.contract.base_branch(state)) == job.get(
+            "base_sha"
+        ) and not self.contract.revision_changed(state, job)
 
     def _reject_stale(
         self,
@@ -856,9 +921,7 @@ def _record_reviewer(
         or job.get("review_resume_thread_id")
     )
     if resumed and not new_thread and thread_id != latest_reviewer_thread(job):
-        raise ValueError(
-            "Human Blocker resume requires the latest Reviewer Thread"
-        )
+        raise ValueError("Human Blocker resume requires the latest Reviewer Thread")
     if not thread_id.strip() or (thread_id in reviewers and not resumed):
         raise ValueError("Fresh Acceptance requires a new Reviewer Thread")
     if thread_id not in reviewers:
