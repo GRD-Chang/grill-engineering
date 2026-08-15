@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from agent_run.git import GitRepository
-from agent_run.github import GitHubReadError
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records
 
@@ -79,10 +78,7 @@ def unknown_pr_mutation(
     pr_number = job.get("pr_number")
     if not isinstance(pr_number, int):
         return None
-    try:
-        live = github.live_pull_request(pr_number)
-    except GitHubReadError:
-        return "change_pr_currentness_unknown"
+    live = github.live_pull_request(pr_number)
     if live.get("state") != "OPEN":
         return "change_pr_closed_or_merged_externally"
     if live.get("head_sha") != job.get("publication_sha"):

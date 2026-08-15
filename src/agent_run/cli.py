@@ -275,7 +275,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 publisher = (
                     FixtureGitHubPublisher(Path(parsed.github_fixture), git)
                     if parsed.github_fixture
-                    else GhGitHubPublisher(github.repository().name_with_owner, git)
+                    else GhGitHubPublisher(str(state["repository"]), git)
                 )
                 agent_fixture = getattr(parsed, "agent_fixture", None)
                 agents = (
@@ -329,60 +329,63 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         ).publish(parsed.run_id)
         elif parsed.command == "requeue":
             state, retired = controller.requeue(parsed.run_id)
-            transition = state.get("requeue_transition")
-            close_nonce = (
-                transition.get("close_nonce") if isinstance(transition, dict) else None
-            )
-            publisher = (
-                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                if parsed.github_fixture
-                else GhGitHubPublisher(github.repository().name_with_owner, git)
-            )
-            retired_cleanly = close_superseded_pull_request(
-                publisher, retired, close_nonce
-            )
-            if not retired_cleanly:
-                state = controller.reject_requeue_after_pr_race(parsed.run_id)
-                precondition_failed = True
-            else:
-                remove_superseded_worktree(git, states.root, parsed.run_id, retired)
-                state = controller.finalize_requeue(parsed.run_id)
-            subject = str(retired["work_subject"])
-            agent_fixture = getattr(parsed, "agent_fixture", None)
-            agents = (
-                FixtureAgentBackend(Path(agent_fixture))
-                if agent_fixture
-                else CodexCliBackend()
-            )
-            if subject.startswith("ticket:") and state.get("status") == "active":
-                state = DeliveryRunEngine(
-                    controller=controller,
-                    tickets=TicketDeliveryEngine(
+            if not is_github_refresh_wait(state):
+                transition = state.get("requeue_transition")
+                close_nonce = (
+                    transition.get("close_nonce")
+                    if isinstance(transition, dict)
+                    else None
+                )
+                publisher = (
+                    FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                    if parsed.github_fixture
+                    else GhGitHubPublisher(str(state["repository"]), git)
+                )
+                retired_cleanly = close_superseded_pull_request(
+                    publisher, retired, close_nonce
+                )
+                if not retired_cleanly:
+                    state = controller.reject_requeue_after_pr_race(parsed.run_id)
+                    precondition_failed = not is_github_refresh_wait(state)
+                else:
+                    remove_superseded_worktree(git, states.root, parsed.run_id, retired)
+                    state = controller.finalize_requeue(parsed.run_id)
+                subject = str(retired["work_subject"])
+                agent_fixture = getattr(parsed, "agent_fixture", None)
+                agents = (
+                    FixtureAgentBackend(Path(agent_fixture))
+                    if agent_fixture
+                    else CodexCliBackend()
+                )
+                if subject.startswith("ticket:") and state.get("status") == "active":
+                    state = DeliveryRunEngine(
+                        controller=controller,
+                        tickets=TicketDeliveryEngine(
+                            git=git, states=states, github=publisher, agents=agents
+                        ),
+                    ).deliver_from_state(parsed.run_id, state)
+                elif (
+                    subject.startswith("parent-only:")
+                    and state.get("status") == "parent_delivery_pending"
+                ):
+                    state = ParentDeliveryEngine(
                         git=git, states=states, github=publisher, agents=agents
-                    ),
-                ).deliver_from_state(parsed.run_id, state)
-            elif (
-                subject.startswith("parent-only:")
-                and state.get("status") == "parent_delivery_pending"
-            ):
-                state = ParentDeliveryEngine(
-                    git=git, states=states, github=publisher, agents=agents
-                ).deliver(parsed.run_id)
-            elif (
-                subject.startswith("run-repair:")
-                and state.get("status") == "run_acceptance_pending"
-            ):
-                repository = github.repository()
-                state = RunAcceptanceEngine(
-                    git=git,
-                    states=states,
-                    agents=agents,
-                    default_head_sha=git.resolve_base(
-                        repository.default_branch, repository.default_head_sha
-                    ),
-                    github=publisher,
-                    currentness_reader=github,
-                ).accept(parsed.run_id)
+                    ).deliver(parsed.run_id)
+                elif (
+                    subject.startswith("run-repair:")
+                    and state.get("status") == "run_acceptance_pending"
+                ):
+                    repository = github.repository()
+                    state = RunAcceptanceEngine(
+                        git=git,
+                        states=states,
+                        agents=agents,
+                        default_head_sha=git.resolve_base(
+                            repository.default_branch, repository.default_head_sha
+                        ),
+                        github=publisher,
+                        currentness_reader=github,
+                    ).accept(parsed.run_id)
             resumed = True
         elif parsed.command == "deliver":
             refreshed, _ = controller.resume(parsed.run_id)

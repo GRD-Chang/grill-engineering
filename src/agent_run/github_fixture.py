@@ -800,6 +800,9 @@ class FixtureGitHubPublisher:
         ):
             mutations.append({"action": "completion_comment", **marker})
         self._save()
+        if self._delivery().pop("ticket_close_intent_missing_once", False):
+            self._save()
+            return None
         return {
             "actor": "fixture-publisher",
             "event_id": None,
@@ -845,6 +848,16 @@ class FixtureGitHubPublisher:
         if self._delivery().pop("external_close_before_primary_ticket", False):
             if isinstance(issue, dict):
                 issue["state"] = "CLOSED"
+        if (
+            not publisher_closed
+            and isinstance(issue, dict)
+            and issue.get("state") == "CLOSED"
+        ):
+            self._save()
+            raise GitHubReadError(
+                "ticket_close_external_conflict",
+                "Ticket was closed outside the Publisher close intent",
+            )
         if (
             not publisher_closed
             and isinstance(issue, dict)
@@ -900,8 +913,11 @@ class FixtureGitHubPublisher:
             raise OSError(
                 "simulated lost response after Primary Ticket close"
             )
-        ownership = ownerships.get(str(ticket_number))
-        return dict(ownership) if isinstance(ownership, dict) else None
+        return self.ticket_close_ownership(
+            ticket_number=ticket_number,
+            run_id=run_id,
+            recorded_ownership=close_intent,
+        )
 
     def ticket_closed_by_run(
         self,
@@ -924,6 +940,21 @@ class FixtureGitHubPublisher:
         recorded_ownership: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         del run_id
+        configured_failures = self._delivery().get(
+            "ticket_close_ownership_read_failures"
+        )
+        if isinstance(configured_failures, list) and configured_failures:
+            configured_error = configured_failures.pop(0)
+            self._save()
+            if not isinstance(configured_error, dict):
+                raise GitHubReadError(
+                    "invalid_fixture",
+                    "ticket_close_ownership_read_failures must contain objects",
+                )
+            raise GitHubReadError(
+                str(configured_error.get("code", "github_read_failed")),
+                str(configured_error.get("message", "Ticket close ownership read failed")),
+            )
         issue = _mutable_mapping(self.data, "issues").get(str(ticket_number))
         raw_ownerships = self._delivery().get("ticket_close_ownership", {})
         if not isinstance(raw_ownerships, dict):

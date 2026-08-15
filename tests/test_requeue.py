@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 
 from agent_run.change_currentness import stale_change_job_reason, unknown_pr_mutation
+from agent_run.cli_presentation import _next_action
+from agent_run.cli_surface import _next_automatic_command
 from agent_run.controller import Controller
 from agent_run.cli_surface import _command_is_ready
 from agent_run.git import GitRepository
@@ -242,6 +244,67 @@ def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
     assert queued["retired_ticket_generations"] == {"7": 1}
 
 
+def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    git = GitRepository.discover(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    state, _ = controller.start(1)
+    active = state["active_ticket_job"]
+    assert isinstance(active, dict)
+    active.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
+            "phase": "developing",
+            "effective_revision": "stale",
+            "base_sha": git.resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": active}
+    states.save_run(str(state["run_id"]), state)
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["issues"]["7"]["body"] = "new requirements"
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    stale, _ = controller.resume(str(state["run_id"]))
+    assert stale["status"] == "requeue_required"
+    prepared, retired = controller.requeue(str(state["run_id"]))
+    assert prepared["requeue_transition"]["retired"] == retired
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery_graph_read_failures"] = [
+        {
+            "code": "github_invalid_response",
+            "message": "requeue graph JSON is incomplete",
+        }
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    waiting = run_cli(git_repo, fixture, "requeue", str(state["run_id"]))
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_external"
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["requeue_transition"]["retired"] == retired
+    assert persisted["diagnostics"][0]["code"] == "github_invalid_response"
+    assert persisted["diagnostics"][0]["waiting_for"] == (
+        "GitHub requeue transition refresh"
+    )
+    assert persisted["github_refresh_pending"] is True
+    assert _next_automatic_command(persisted) == "requeue"
+    assert _next_action(persisted) == "agent-run run 1"
+    assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get(
+        "mutations", []
+    ) == []
+
+    resumed, repeated_retired = controller.requeue(str(state["run_id"]))
+    assert resumed["status"] == "requeue_required"
+    assert repeated_retired == retired
+
+
 def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     git_repo: Path,
 ) -> None:
@@ -407,8 +470,12 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     assert states.load_run(run_id)["ticket_jobs"]["7"]["ticket_branch_generation"] == 1
 
 
-def test_requeue_blocks_when_the_persisted_pr_cannot_be_read(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"7": issue(7)},
+        delivery={"pull_requests": []},
+    )
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
     states = StateStore(git_repo / ".agent-run")
@@ -438,14 +505,44 @@ def test_requeue_blocks_when_the_persisted_pr_cannot_be_read(git_repo: Path) -> 
     }
     states.save_run(run_id, state)
 
-    rejected = run_cli(git_repo, fixture, "requeue", run_id)
+    waiting = run_cli(git_repo, fixture, "requeue", run_id)
 
-    assert rejected.returncode == 2
-    assert stdout_json(rejected)["status"] == "blocked"
-    blocked = states.load_run(run_id)
-    assert blocked is not None
-    assert blocked["terminal_kind"] == "waiting_human"
-    assert blocked["diagnostics"][0]["code"] == "change_pr_currentness_unknown"
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_external"
+    persisted = states.load_run(run_id)
+    assert persisted is not None
+    assert persisted["terminal_kind"] == "waiting_external"
+    assert persisted["diagnostics"][0]["code"] == "missing_pull_request"
+    assert persisted["diagnostics"][0]["waiting_for"] == "GitHub authority refresh"
+
+
+def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    state = states.load_run(run_id)
+    assert state is not None
+    state["status"] = "requeue_required"
+    state["terminal_kind"] = "requeue_required"
+    states.save_run(run_id, state)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["repository_read_failures"] = [
+        {"code": "github_read_failed", "message": "repository unavailable"}
+    ]
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    waiting = run_cli(git_repo, fixture, "requeue", run_id)
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_external"
+    persisted = states.load_run(run_id)
+    assert persisted is not None
+    assert persisted["github_refresh_pending"] is True
+    assert persisted["diagnostics"][0] == {
+        "code": "github_read_failed",
+        "message": "repository unavailable",
+        "waiting_for": "GitHub repository binding",
+    }
 
 
 def test_deliver_cannot_restart_a_stale_generation_without_requeue(

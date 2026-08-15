@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
-from agent_run.external_supervision import ExternalSupervisor, restore_supervision_wait
+from agent_run.external_supervision import (
+    ExternalSupervisor,
+    is_github_refresh_wait,
+    restore_supervision_wait,
+)
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     human_blocker_subject_count,
@@ -79,7 +83,7 @@ def _advance_to_human_gate(
         agent_arguments = _agent_fixture_arguments(parsed, command)
         _invoke_nested(command, run_id, *arguments, *agent_arguments)
         state = _load_local_run(states, run_id)
-        if command == "requeue":
+        if command == "requeue" and not is_github_refresh_wait(state):
             # `requeue` itself enters the replacement Job Loop. Returning
             # here enforces the one automatic replacement budget for this
             # top-level `run` command.
@@ -171,6 +175,8 @@ def _next_automatic_command(state: dict[str, Any]) -> str | None:
     if status in {"publication_pending", "waiting_checks"}:
         return "deliver"
     if status == "waiting_external":
+        if isinstance(state.get("requeue_transition"), dict):
+            return "requeue"
         return "deliver"
     return None
 

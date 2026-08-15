@@ -34,6 +34,10 @@ from agent_run.run_currentness import (
     ticket_completion_records_fingerprint,
 )
 from agent_run.run_locator import RunLocatorIndex
+from agent_run.requeue_supervision import (
+    refresh_requeue_transition_facts,
+    wait_for_recoverable_github_read,
+)
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
 from agent_run.state_contract import (
@@ -282,15 +286,25 @@ class Controller:
         attach an old Thread or retain candidate/acceptance state.
         """
         with self.states.locked():
-            existing = self._load_bound_run(run_id)
+            try:
+                existing = self._load_bound_run(run_id)
+            except GitHubReadError as error:
+                return self._wait_for_github_read(
+                    run_id,
+                    error,
+                    waiting_for="GitHub repository binding",
+                ), {}
             parent_number = int(_state_mapping(existing, "parent")["number"])
             transition = existing.get("requeue_transition")
             if isinstance(transition, dict):
                 retired = transition.get("retired")
-                if existing.get("status") == "requeue_required" and isinstance(
-                    retired, dict
-                ):
-                    refreshed = self._refresh_transition_facts(existing, parent_number)
+                if isinstance(retired, dict):
+                    refreshed = refresh_requeue_transition_facts(
+                        existing, parent_number, self.github, now=_now
+                    )
+                    if is_github_refresh_wait(refreshed):
+                        self.states.save_run(run_id, refreshed)
+                        return refreshed, retired
                     if refreshed.get("status") != "requeue_required":
                         self.states.save_run(run_id, refreshed)
                         raise RequeueError(
@@ -301,10 +315,21 @@ class Controller:
             state = self._refresh(
                 existing, parent_number, check_requeue_currentness=True
             )
+            if is_github_refresh_wait(state):
+                self.states.save_run(run_id, state)
+                return state, {}
             if state.get("status") != "requeue_required":
                 self.states.save_run(run_id, state)
                 raise RequeueError("requeue is only allowed in requeue_required state")
-            repository = self.github.repository()
+            try:
+                repository = self.github.repository()
+            except GitHubReadError as error:
+                return self._wait_for_github_read(
+                    run_id,
+                    error,
+                    state=state,
+                    waiting_for="GitHub requeue base refresh",
+                ), {}
             base = _state_mapping(state, "base")
             base["sha"] = self.publisher.resolve_base(
                 repository.default_branch, repository.default_head_sha
@@ -322,7 +347,14 @@ class Controller:
     def finalize_requeue(self, run_id: str) -> dict[str, Any]:
         """Commit a prepared replacement only after old assets are retired."""
         with self.states.locked():
-            state = self._load_bound_run(run_id)
+            try:
+                state = self._load_bound_run(run_id)
+            except GitHubReadError as error:
+                return self._wait_for_github_read(
+                    run_id,
+                    error,
+                    waiting_for="GitHub repository binding",
+                )
             transition = _state_mapping(state, "requeue_transition")
             retired = _state_mapping(transition, "retired")
             prepared_base_sha = transition.get("base_sha")
@@ -332,7 +364,15 @@ class Controller:
             # but the new Generation binds its base only after that retirement
             # completes. This prevents a response-loss retry from reviving an
             # already superseded default-branch snapshot.
-            repository = self.github.repository()
+            try:
+                repository = self.github.repository()
+            except GitHubReadError as error:
+                return self._wait_for_github_read(
+                    run_id,
+                    error,
+                    state=state,
+                    waiting_for="GitHub requeue finalization refresh",
+                )
             base_sha = self.publisher.resolve_base(
                 repository.default_branch, repository.default_head_sha
             )
@@ -355,15 +395,30 @@ class Controller:
     def reject_requeue_after_pr_race(self, run_id: str) -> dict[str, Any]:
         """Persist a Human Blocker when old-PR retirement lost its race."""
         with self.states.locked():
-            state = self._load_bound_run(run_id)
-            subject, job, _ = current_change_job(state)
-            reason = (
-                unknown_pr_mutation(
-                    state, subject, job, self.github, self.publisher.git
+            try:
+                state = self._load_bound_run(run_id)
+            except GitHubReadError as error:
+                return self._wait_for_github_read(
+                    run_id,
+                    error,
+                    waiting_for="GitHub repository binding",
                 )
-                if job is not None
-                else None
-            )
+            subject, job, _ = current_change_job(state)
+            try:
+                reason = (
+                    unknown_pr_mutation(
+                        state, subject, job, self.github, self.publisher.git
+                    )
+                    if job is not None
+                    else None
+                )
+            except GitHubReadError as error:
+                return self._wait_for_github_read(
+                    run_id,
+                    error,
+                    state=state,
+                    waiting_for="GitHub Change PR currentness refresh",
+                )
             state.pop("requeue_transition", None)
             state.update(
                 {
@@ -484,6 +539,21 @@ class Controller:
             )
         return state
 
+    def _wait_for_github_read(
+        self,
+        run_id: str,
+        error: GitHubReadError,
+        *,
+        waiting_for: str,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        waiting = self._load_run(run_id) if state is None else state
+        wait_for_recoverable_github_read(
+            waiting, error, waiting_for=waiting_for, now=_now
+        )
+        self.states.save_run(run_id, waiting)
+        return waiting
+
     def _load_run(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_run(run_id)
         if state is None:
@@ -525,49 +595,14 @@ class Controller:
             else:
                 failed.update(
                     {
-                        "status": "execution_failed",
-                        "terminal_kind": "execution_failed",
-                        "frontier": [],
-                        "active_ticket_job": None,
+                        "status": "blocked",
+                        "terminal_kind": "waiting_human",
                         "diagnostics": [
                             {"code": error.code, "message": error.message}
                         ],
                     }
                 )
             failed["updated_at"] = _now()
-            return failed
-
-    def _refresh_transition_facts(
-        self, state: dict[str, Any], parent_number: int
-    ) -> dict[str, Any]:
-        """Refresh authority before retrying a durable PR-retirement intent.
-
-        The old PR may already be closed by this Publisher, so its PR facts
-        are verified at the retirement seam. Graph/scope facts must still be
-        refreshed before that seam performs another mutation.
-        """
-        try:
-            graph = self.github.delivery_graph(parent_number)
-            projected = state_from_graph(state, graph)
-            refreshed = reconcile_structure(state, projected)
-            if refreshed.get("status") == "unsupported_scope_change":
-                return refreshed
-            # Preserve the durable replacement intent while binding its retry
-            # to the latest authoritative parent/graph facts.
-            state["parent"] = _state_mapping(refreshed, "parent")
-            state["ticket_graph"] = _state_mapping(refreshed, "ticket_graph")
-            state["updated_at"] = _now()
-            return state
-        except GitHubReadError as error:
-            failed = dict(state)
-            failed.update(
-                {
-                    "status": "execution_failed",
-                    "terminal_kind": "execution_failed",
-                    "diagnostics": [{"code": error.code, "message": error.message}],
-                    "updated_at": _now(),
-                }
-            )
             return failed
 
     def _mark_stale_change_job(

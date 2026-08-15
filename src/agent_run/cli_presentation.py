@@ -172,6 +172,11 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run abandon {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
         return f"agent-run requeue {run_id}"
+    if (
+        status == "waiting_external"
+        and isinstance(state.get("requeue_transition"), dict)
+    ):
+        return f"agent-run run {parent_number}"
     if status == "supervision_timeout" and isinstance(run_id, str):
         return f"agent-run run {parent_number} 或 agent-run resume {run_id}"
     invocation = state.get("active_agent_invocation")

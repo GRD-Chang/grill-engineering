@@ -18,6 +18,10 @@ from agent_run.change_delivery import (
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
+from agent_run.external_supervision import (
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
@@ -230,11 +234,7 @@ class TicketDeliveryLoop:
                     "Ticket close dispatch did not establish exact ownership",
                 )
         except GitHubReadError as error:
-            if error.code in {
-                "ticket_close_external_conflict",
-                "ticket_close_intent_missing",
-                "ticket_close_ownership_missing",
-            }:
+            if error.code == "ticket_close_external_conflict":
                 job.update(
                     {
                         "phase": TicketPhase.BLOCKED.value,
@@ -256,26 +256,13 @@ class TicketDeliveryLoop:
                 )
                 self._save(state)
                 return False
-            if error.code not in {
-                "ticket_close_ownership_pending",
-                "ticket_close_reconciliation_pending",
-                "ticket_close_dispatch_unobserved",
-                "ticket_close_intent_pending",
-                "github_read_failed",
-            }:
+            if not is_github_convergence_error(error.code):
                 raise
-            state.update(
-                {
-                    "status": "waiting_external",
-                    "terminal_kind": "waiting_external",
-                    "diagnostics": [
-                        {
-                            "code": error.code,
-                            "message": error.message,
-                            "waiting_for": "Ticket close ownership",
-                        }
-                    ],
-                }
+            wait_for_github_convergence(
+                state,
+                code=error.code,
+                message=error.message,
+                waiting_for="Ticket close ownership",
             )
             self._save(state)
             return False

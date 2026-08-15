@@ -1506,14 +1506,14 @@ def test_ticket_delivery_requires_exact_close_evidence(
         agents=ScriptedAgents(checkout),
     )
 
-    blocked = engine.deliver(state["run_id"])
+    waiting = engine.deliver(state["run_id"])
 
-    assert blocked["status"] == "ready_for_human"
-    assert blocked["active_ticket_job"]["phase"] == "blocked"
+    assert waiting["status"] == "waiting_external"
+    assert waiting["active_ticket_job"]["phase"] == "merged"
 
     persisted = states.load_run(state["run_id"])
     assert persisted is not None
-    assert persisted["active_ticket_job"]["phase"] == "blocked"
+    assert persisted["active_ticket_job"]["phase"] == "merged"
     assert persisted["status"] != "ticket_completed"
     assert "ticket_close_ownership" not in persisted["active_ticket_job"]
 
