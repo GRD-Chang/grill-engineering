@@ -11,6 +11,7 @@ from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.state import StateStore
 from conftest import write_fixture
@@ -59,6 +60,40 @@ def test_initial_state_failure_happens_before_branch_creation(
     ).stdout.splitlines()
     assert branches == []
     assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+
+
+def test_locator_registration_retries_only_for_new_pending_run(git_repo: Path) -> None:
+    fixture_path = write_fixture(
+        git_repo / "github.json", issues={"2": _issue(2)}
+    )
+    store = StateStore(git_repo / ".agent-run")
+
+    class FailingLocator:
+        def register(self, **_kwargs: object) -> None:
+            raise OSError("simulated locator write failure")
+
+    with pytest.raises(OSError, match="locator write failure"):
+        Controller(
+            FixtureGitHubReader(fixture_path),
+            GitRepository(git_repo),
+            store,
+            locator=FailingLocator(),  # type: ignore[arg-type]
+        ).start(1)
+
+    pending = store.find_run("example/project", 1)
+    assert pending is not None
+    assert pending["locator_registration_pending"] is True
+    locator = RunLocatorIndex(git_repo / "locator.json")
+    recovered, resumed = Controller(
+        FixtureGitHubReader(fixture_path),
+        GitRepository(git_repo),
+        store,
+        locator=locator,
+    ).start(1)
+
+    assert resumed
+    assert recovered.get("locator_registration_pending") is None
+    assert locator.resolve_state_dir(str(recovered["run_id"])) == store.root
 
 
 def test_base_fetch_failure_preserves_a_recoverable_run(

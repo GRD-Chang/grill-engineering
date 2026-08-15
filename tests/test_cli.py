@@ -112,6 +112,7 @@ def run_cli(
         if not environment.get("PYTHONPATH")
         else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
     )
+    environment.setdefault("XDG_STATE_HOME", str(repo / ".agent-run-test-state"))
     if extra_env:
         environment.update(extra_env)
     return subprocess.run(
@@ -238,6 +239,255 @@ def test_start_creates_one_run_branch_and_resume_is_idempotent(
     ).stdout.splitlines()
     assert branches == [state["run_branch"]]
     assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+
+
+def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    started = run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    run_id = stdout_json(started)["run_id"]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=elsewhere, check=True)
+
+    status = run_cli(
+        elsewhere, fixture, "status", run_id, "--json", extra_env=locator_env
+    )
+    history = run_cli(
+        elsewhere, fixture, "history", run_id, "--json", extra_env=locator_env
+    )
+
+    assert status.returncode == history.returncode == 0
+    assert stdout_json(status)["run_id"] == run_id
+    assert stdout_json(history)["run_id"] == run_id
+    assert not (elsewhere / ".agent-run").exists()
+    locator = json.loads(
+        (locator_home / "agent-run" / "run-locator.json").read_text(encoding="utf-8")
+    )
+    assert locator == {
+        "entries": [
+            {
+                "run_id": run_id,
+                "repository_root": str(git_repo.resolve()),
+                "state_dir": str((git_repo / ".agent-run").resolve()),
+                "updated_at": locator["entries"][0]["updated_at"],
+            }
+        ]
+    }
+
+
+def test_new_runs_from_separate_clones_have_distinct_locator_ids(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    first_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "--quiet", str(git_repo), str(clone)], check=True)
+    clone_fixture = write_fixture(clone / "github.json", issues={})
+
+    second = run_cli(clone, clone_fixture, "start", "1", extra_env=locator_env)
+
+    assert second.returncode == 0, second.stderr
+    second_id = stdout_json(second)["run_id"]
+    assert second_id != first_id
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    assert run_cli(
+        elsewhere, fixture, "status", first_id, "--json", extra_env=locator_env
+    ).returncode == 0
+    assert run_cli(
+        elsewhere, clone_fixture, "history", second_id, "--json", extra_env=locator_env
+    ).returncode == 0
+
+
+def test_status_prefers_current_directory_state_and_explicit_state_dir(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    local_repo = tmp_path / "local-repo"
+    local_repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=local_repo, check=True)
+    local_state_dir = local_repo / ".agent-run" / "runs"
+    local_state_dir.mkdir(parents=True)
+    local_state = load_only_run_state(git_repo)
+    local_state["diagnostics"] = [{"code": "local_priority", "message": "local"}]
+    (local_state_dir / f"{run_id}.json").write_text(
+        json.dumps(local_state), encoding="utf-8"
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    local = run_cli(
+        local_repo, fixture, "status", run_id, "--json", extra_env=locator_env
+    )
+    explicit = run_cli(
+        elsewhere,
+        fixture,
+        "status",
+        run_id,
+        "--state-dir",
+        str(git_repo / ".agent-run"),
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert stdout_json(local)["diagnostics"][0]["code"] == "local_priority"
+    assert stdout_json(explicit)["diagnostics"] == []
+
+
+@pytest.mark.parametrize("command", ["status", "history"])
+def test_read_only_locator_errors_are_actionable_and_do_not_mutate_run_history(
+    git_repo: Path, tmp_path: Path, command: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    before = state_path.read_text(encoding="utf-8")
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    locator_path.parent.mkdir(parents=True, exist_ok=True)
+    locator_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "run_id": run_id,
+                        "repository_root": str(git_repo.resolve()),
+                        "state_dir": str(tmp_path / "missing-state"),
+                        "updated_at": "2026-08-15T00:00:00+00:00",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    result = run_cli(
+        elsewhere, fixture, command, run_id, "--json", extra_env=locator_env
+    )
+
+    assert result.returncode == 2
+    output = stdout_json(result)
+    assert output["status"] == "blocked"
+    assert output["diagnostics"][0]["code"] == "run_locator_stale"
+    assert "--state-dir" in output["diagnostics"][0]["message"]
+    assert state_path.read_text(encoding="utf-8") == before
+
+
+def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    locator_path.unlink()
+
+    missing = run_cli(
+        elsewhere, fixture, "status", run_id, "--json", extra_env=locator_env
+    )
+
+    assert stdout_json(missing)["diagnostics"][0]["code"] == "run_locator_missing"
+    assert not locator_path.exists()
+    source_state = next((git_repo / ".agent-run" / "runs").glob("*.json")).read_text(
+        encoding="utf-8"
+    )
+    first_state_dir = tmp_path / "first-state"
+    second_state_dir = tmp_path / "second-state"
+    for state_dir in (first_state_dir, second_state_dir):
+        (state_dir / "runs").mkdir(parents=True)
+        (state_dir / "runs" / f"{run_id}.json").write_text(
+            source_state, encoding="utf-8"
+        )
+    locator_path.parent.mkdir(parents=True, exist_ok=True)
+    locator_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "run_id": run_id,
+                        "repository_root": str(git_repo.resolve()),
+                        "state_dir": str(first_state_dir),
+                        "updated_at": "2026-08-15T00:00:00+00:00",
+                    },
+                    {
+                        "run_id": run_id,
+                        "repository_root": str(git_repo.resolve()),
+                        "state_dir": str(second_state_dir),
+                        "updated_at": "2026-08-15T00:00:01+00:00",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    conflict = run_cli(
+        elsewhere, fixture, "history", run_id, "--json", extra_env=locator_env
+    )
+
+    assert conflict.returncode == 2
+    assert stdout_json(conflict)["diagnostics"][0]["code"] == "run_locator_conflict"
+
+
+@pytest.mark.parametrize(
+    ("command", "arguments"),
+    [
+        ("run", ("1",)),
+        ("resume", ("{run_id}",)),
+        ("deliver", ("{run_id}",)),
+        ("requeue", ("{run_id}",)),
+        ("accept-run", ("{run_id}",)),
+        ("publish-run", ("{run_id}",)),
+        ("approve", ("{run_id}",)),
+        ("revise", ("{run_id}", "--message", "feedback")),
+        ("abandon", ("{run_id}",)),
+    ],
+)
+def test_lifecycle_commands_do_not_use_cross_directory_locator(
+    git_repo: Path,
+    tmp_path: Path,
+    command: str,
+    arguments: tuple[str, ...],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    before = state_path.read_text(encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    command_arguments = tuple(argument.format(run_id=run_id) for argument in arguments)
+
+    result = run_cli(
+        elsewhere, fixture, command, *command_arguments, extra_env=locator_env
+    )
+
+    assert result.returncode == 2
+    assert stdout_json(result)["diagnostics"][0]["code"] == "command_failed"
+    assert state_path.read_text(encoding="utf-8") == before
 
 
 def test_frontier_uses_native_dependencies_labels_state_and_parent_order(

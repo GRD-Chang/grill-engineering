@@ -2,11 +2,83 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from agent_run.run_locator import MAX_LOCATOR_ENTRIES, RunLocatorIndex
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
+
+
+def test_run_locator_prunes_missing_directories_and_bounds_entries(tmp_path: Path) -> None:
+    times = iter(
+        datetime.fromisoformat(f"2026-08-15T00:00:{second:02d}+00:00")
+        for second in range(MAX_LOCATOR_ENTRIES + 3)
+    )
+    index = RunLocatorIndex(tmp_path / "locator.json", now=lambda: next(times))
+    for number in range(MAX_LOCATOR_ENTRIES + 1):
+        state_dir = tmp_path / f"state-{number}"
+        state_dir.mkdir()
+        index.register(
+            run_id=f"run-{number}",
+            repository_root=tmp_path / "repo",
+            state_dir=state_dir,
+        )
+
+    entries = json.loads(
+        (tmp_path / "locator.json").read_text(encoding="utf-8")
+    )["entries"]
+    assert len(entries) == MAX_LOCATOR_ENTRIES
+    assert {entry["run_id"] for entry in entries} == {
+        f"run-{number}" for number in range(1, MAX_LOCATOR_ENTRIES + 1)
+    }
+    stale = tmp_path / "state-1"
+    stale.rmdir()
+    fresh = tmp_path / "state-fresh"
+    fresh.mkdir()
+
+    index.register(
+        run_id="run-fresh", repository_root=tmp_path / "repo", state_dir=fresh
+    )
+
+    entries = json.loads(
+        (tmp_path / "locator.json").read_text(encoding="utf-8")
+    )["entries"]
+    assert len(entries) == MAX_LOCATOR_ENTRIES
+    assert "run-1" not in {entry["run_id"] for entry in entries}
+    assert "run-fresh" in {entry["run_id"] for entry in entries}
+
+
+def test_run_locator_atomic_replace_preserves_previous_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_path = tmp_path / "locator.json"
+    index = RunLocatorIndex(index_path)
+    first_state = tmp_path / "first-state"
+    second_state = tmp_path / "second-state"
+    first_state.mkdir()
+    second_state.mkdir()
+    index.register(
+        run_id="run-1", repository_root=tmp_path / "repo", state_dir=first_state
+    )
+    before = index_path.read_text(encoding="utf-8")
+    original_replace = os.replace
+
+    def fail_locator_replace(source: str | Path, destination: str | Path) -> None:
+        if Path(destination) == index_path:
+            raise OSError("simulated locator interruption")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_locator_replace)
+
+    with pytest.raises(OSError, match="simulated locator interruption"):
+        index.register(
+            run_id="run-2", repository_root=tmp_path / "repo", state_dir=second_state
+        )
+
+    assert index_path.read_text(encoding="utf-8") == before
+    assert not list(tmp_path.glob(".run-locator.*.tmp"))
 
 
 def test_interrupted_replace_preserves_previous_state(

@@ -4,6 +4,7 @@ import hashlib
 import secrets
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from agent_run.change_currentness import (
@@ -32,6 +33,7 @@ from agent_run.run_currentness import (
     ticket_completion_records,
     ticket_completion_records_fingerprint,
 )
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.scope_changes import reconcile_structure
 from agent_run.state import StateStore
 from agent_run.state_contract import (
@@ -55,11 +57,13 @@ class Controller:
         github: GitHubReader,
         git: GitRepository,
         states: StateStore,
+        locator: RunLocatorIndex | None = None,
     ) -> None:
         self.github = github
         self.states = states
         self.checkout = git.root
         self.publisher = Publisher(git)
+        self.locator = locator
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -153,6 +157,7 @@ class Controller:
             )
             existing["updated_at"] = _now()
             self.states.save_run(str(existing["run_id"]), existing)
+            self._register_pending_locator(existing)
             return existing, resumed
 
     def unfinished_runs(self, parent_number: int) -> list[dict[str, Any]]:
@@ -705,7 +710,7 @@ class Controller:
         base_sha: str,
     ) -> dict[str, Any]:
         now = _now()
-        return {
+        state: dict[str, Any] = {
             "run_id": run_id,
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
@@ -730,6 +735,9 @@ class Controller:
             "created_at": now,
             "updated_at": now,
         }
+        if self.locator is not None:
+            state["locator_registration_pending"] = True
+        return state
 
     def _ensure_delivery_branch(self, state: dict[str, Any], base_sha: str) -> None:
         if state.get("status") in {
@@ -780,6 +788,8 @@ class Controller:
             state = existing
             require_current_run_state(state)
             run_id = str(state["run_id"])
+        self._register_pending_locator(state)
+        if resumed:
             if state.get("status") in {"abandoned", "abandonment_pending"}:
                 return state, True
             if state.get("status") == "supervision_timeout":
@@ -827,10 +837,22 @@ class Controller:
         self.states.save_run(run_id, state)
         return state, resumed
 
+    def _register_pending_locator(self, state: dict[str, Any]) -> None:
+        if self.locator is None or state.get("locator_registration_pending") is not True:
+            return
+        run_id = str(state["run_id"])
+        self.locator.register(
+            run_id=run_id,
+            repository_root=self.checkout,
+            state_dir=self.states.root,
+        )
+        state.pop("locator_registration_pending")
+        self.states.save_run(run_id, state)
+
     def _available_run_id(
         self, repository: str, parent_number: int, base_sha: str
     ) -> str:
-        original = _run_id(repository, parent_number, base_sha)
+        original = _run_id(repository, parent_number, base_sha, self.checkout)
         if self.states.load_run(original) is None:
             return original
         sequence = 2
@@ -839,8 +861,10 @@ class Controller:
         return f"{original}-{sequence}"
 
 
-def _run_id(repository: str, parent_number: int, base_sha: str) -> str:
-    identity = f"{repository}\0{parent_number}\0{base_sha}".encode()
+def _run_id(
+    repository: str, parent_number: int, base_sha: str, checkout: Path
+) -> str:
+    identity = f"{repository}\0{parent_number}\0{base_sha}\0{checkout.resolve()}".encode()
     suffix = hashlib.sha256(identity).hexdigest()[:16]
     return f"run-{parent_number}-{suffix}"
 

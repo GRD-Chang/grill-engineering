@@ -31,6 +31,7 @@ from agent_run.runner_promotion import (
     run_promotion_handshake,
     verify_immutable_runner,
 )
+from agent_run.run_locator import RunLocatorError, RunLocatorIndex
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.worker_sandbox import WorkerSandboxError
@@ -151,6 +152,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
     states: StateStore | FaultInjectingStateStore | None = None
     precondition_failed = False
     try:
+        if parsed.command in {"status", "history"}:
+            state = _load_read_only_run(parsed)
+            if parsed.command == "status":
+                cli_presentation._print_status(state, as_json=parsed.as_json)
+            else:
+                cli_presentation._print_history(state, as_json=parsed.as_json)
+            return 0
         git = GitRepository.discover(Path.cwd())
         if parsed.command == "promotion-handshake":
             verification = verify_immutable_runner(git.root, parsed.runner_sha)
@@ -178,15 +186,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if isinstance(crash_after_save, int)
             else StateStore(state_root)
         )
-        controller = Controller(github, git, states)
-        if parsed.command == "status":
-            state = cli_surface._load_local_run(states, parsed.run_id)
-            cli_presentation._print_status(state, as_json=parsed.as_json)
-            return 0
-        if parsed.command == "history":
-            state = cli_surface._load_local_run(states, parsed.run_id)
-            cli_presentation._print_history(state, as_json=parsed.as_json)
-            return 0
+        controller = Controller(github, git, states, locator=RunLocatorIndex.default())
         runner_verification = current_immutable_runner()
         if runner_verification is None:
             if fixture_path is None:
@@ -674,24 +674,34 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 diagnostics = durable.get("diagnostics")
                 if isinstance(diagnostics, list):
                     durable_diagnostics = diagnostics
+        locator_code = error.code if isinstance(error, RunLocatorError) else None
+        locator_error = locator_code is not None
         diagnostic_code = (
-            "incompatible_run_state"
-            if incompatible_state
+            locator_code
+            if locator_code is not None
             else (
-                "multiple_unfinished_runs"
-                if str(error).startswith("multiple unfinished Delivery Runs")
-                else "command_failed"
+                "incompatible_run_state"
+                if incompatible_state
+                else (
+                    "multiple_unfinished_runs"
+                    if str(error).startswith("multiple unfinished Delivery Runs")
+                    else "command_failed"
+                )
             )
         )
         diagnostic_message = (
-            "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
-            "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run"
-            if diagnostic_code == "incompatible_run_state"
+            str(error)
+            if locator_error
             else (
-                "同一父 Issue 存在多个未终止交付运行；候选运行："
-                f"{str(error).partition(': ')[2]}。请先人工确定要保留的运行"
-                if diagnostic_code == "multiple_unfinished_runs"
-                else "命令执行失败；请通过 status 或 history 查看可恢复状态"
+                "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
+                "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run"
+                if diagnostic_code == "incompatible_run_state"
+                else (
+                    "同一父 Issue 存在多个未终止交付运行；候选运行："
+                    f"{str(error).partition(': ')[2]}。请先人工确定要保留的运行"
+                    if diagnostic_code == "multiple_unfinished_runs"
+                    else "命令执行失败；请通过 status 或 history 查看可恢复状态"
+                )
             )
         )
         print(
@@ -699,21 +709,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 {
                     "result": "error",
                     "status": (
-                        "incompatible_run_state"
-                        if incompatible_state
+                        "blocked"
+                        if locator_error
                         else (
-                            "execution_failed"
-                            if failure_recorded
+                            "incompatible_run_state"
+                            if incompatible_state
                             else (
-                                durable_status
-                                if durable_status
-                                in {
-                                    "abandonment_pending",
-                                    "completed",
-                                    "abandoned",
-                                    "requeue_required",
-                                }
-                                else "blocked"
+                                "execution_failed"
+                                if failure_recorded
+                                else (
+                                    durable_status
+                                    if durable_status
+                                    in {
+                                        "abandonment_pending",
+                                        "completed",
+                                        "abandoned",
+                                        "requeue_required",
+                                    }
+                                    else "blocked"
+                                )
                             )
                         )
                     ),
@@ -724,7 +738,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                                 "message": diagnostic_message,
                             }
                         ]
-                        if incompatible_state
+                        if locator_error
+                        or incompatible_state
                         or durable_status != "blocked"
                         or durable_diagnostics is None
                         else durable_diagnostics
@@ -735,6 +750,30 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
         )
     return 2
+
+
+def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
+    if parsed.state_dir:
+        states = StateStore(Path(parsed.state_dir).resolve())
+        return cli_surface._load_local_run(states, parsed.run_id)
+    try:
+        git = GitRepository.discover(Path.cwd())
+    except GitError:
+        git = None
+    if git is not None:
+        local = StateStore(git.root / ".agent-run").load_current_run(parsed.run_id)
+        if local is not None:
+            return local
+    locator = RunLocatorIndex.default()
+    state_dir = locator.resolve_state_dir(parsed.run_id)
+    state = StateStore(state_dir).load_current_run(parsed.run_id)
+    if state is None or state.get("run_id") != parsed.run_id:
+        raise RunLocatorError(
+            "run_locator_stale",
+            f"无法定位 Delivery Run {parsed.run_id!r}：定位索引指向的状态文件无效；"
+            "请显式提供 --state-dir <状态目录>。",
+        )
+    return state
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
