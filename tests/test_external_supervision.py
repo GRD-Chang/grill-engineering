@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 from agent_run.external_supervision import (
     CHECKS_BUDGET_SECONDS,
     ExternalSupervisor,
+    is_github_convergence_error,
     restore_supervision_wait,
+    wait_for_github_convergence,
     waiting_boundary,
 )
 
@@ -73,3 +77,54 @@ def test_restore_supervision_wait_resets_the_persisted_window() -> None:
     assert state["terminal_kind"] == "waiting_external"
     assert state["diagnostics"] == []
     assert "supervision_wait" not in state
+
+
+def test_supervision_timeout_preserves_bounded_last_read_error() -> None:
+    now = [0.0]
+    supervisor = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
+    )
+    state: dict[str, object] = {}
+    wait_for_github_convergence(
+        state,
+        code="github_read_failed",
+        message="authorization: Bearer ghp_secret " + "x" * 9_000,
+        waiting_for="GitHub repository binding",
+    )
+
+    assert supervisor.before_retry(state)
+    now[0] = 10 * 60
+    assert not supervisor.before_retry(state)
+
+    wait = state["supervision_wait"]  # type: ignore[index]
+    assert "last_error" not in wait  # type: ignore[operator]
+    diagnostic = state["diagnostics"][0]  # type: ignore[index]
+    error = diagnostic["last_error"]  # type: ignore[index]
+    assert error["code"] == "github_read_failed"  # type: ignore[index]
+    assert "ghp_secret" not in error["message"]  # type: ignore[index]
+    assert len(error["message"].encode("utf-8")) <= 8 * 1024  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "github_read_failed",
+        "github_invalid_response",
+        "missing_pull_request",
+        "ticket_close_ownership_pending",
+    ],
+)
+def test_unproven_github_read_failures_remain_reconcilable(code: str) -> None:
+    assert is_github_convergence_error(code)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "ambiguous_run_pr",
+        "invalid_parent",
+        "stale_run_pr",
+    ],
+)
+def test_proven_github_state_contradictions_do_not_enter_supervision(code: str) -> None:
+    assert not is_github_convergence_error(code)

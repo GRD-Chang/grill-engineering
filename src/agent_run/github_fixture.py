@@ -10,7 +10,6 @@ from typing import Any
 
 from agent_run.git import GitRepository, is_managed_delivery_branch
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
-from agent_run.github_retry import is_transient_message, retry_read_operation
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 from agent_run.revisions import effective_revision_from_graph
 
@@ -50,10 +49,7 @@ class FixtureGitHubReader:
         return repository if isinstance(repository, str) else None
 
     def delivery_graph(self, parent_number: int) -> DeliveryGraph:
-        return retry_read_operation(
-            lambda: self._delivery_graph_once(parent_number),
-            should_retry=_is_transient_read_error,
-        )
+        return self._delivery_graph_once(parent_number)
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         delivery = _mapping(self._load(), "delivery")
@@ -145,13 +141,6 @@ class FixtureGitHubReader:
 
     def _save_reader_data(self) -> None:
         self.path.write_text(json.dumps(self.data), encoding="utf-8")
-
-
-def _is_transient_read_error(error: Exception) -> bool:
-    return isinstance(error, GitHubReadError) and (
-        error.code in {"github_timeout", "github_transient"}
-        or is_transient_message(error.message)
-    )
 
 
 class FixtureGitHubPublisher:
@@ -632,6 +621,12 @@ class FixtureGitHubPublisher:
                 }
             )
         return result
+
+    def run_pr_narrative_matches(
+        self, pr_number: int, *, title: str, body: str
+    ) -> bool:
+        pull = self._pull(pr_number)
+        return pull.get("title") == title and pull.get("body") == body
 
     def record_acceptance(
         self, pr_number: int, record: dict[str, Any]

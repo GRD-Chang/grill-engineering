@@ -7,7 +7,7 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
-- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；维护者可用同一 `run` 或 `resume` 命令开始新的等待窗口，不需要另启 watcher；
+- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界监督。维护者可用同一 `run` 或 `resume` 命令开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -88,8 +88,8 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
-| `run` | 新 Run 或正常可推进状态 | 创建或继续正常 Job Loop，至 checks、Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式 Resume、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`，或当前唯一对象为 Human Blocker | 为同一 Generation 创建 successor Invocation；默认复用 Thread | 不处理 Publisher/check 恢复，不重置预算，不吸收 stale 边界 |
+| `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`，当前唯一对象为 Human Blocker，或监督超时暂停 | 对 Invocation 为同一 Generation 创建 successor Invocation；对监督超时恢复外部等待并开始新的预算窗口 | 不吸收 stale 边界，也不绕过 Publisher 的 currentness/写入门禁 |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 查看当前状态、允许的下一步与有界 Invocation 审计事实 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
