@@ -454,12 +454,12 @@ class ChangeDeliveryEngine:
         # already exists, update that PR's one status comment immediately so
         # it cannot keep advertising an obsolete passing Candidate.
         existing_pr = job.get("pr_number")
-        if artifact.verdict == "human":
+        if artifact.requires_human:
             self._wait_for_human(
                 state,
                 job,
                 phase="candidate",
-                blockers=artifact.human_blockers,
+                blockers=artifact.blocker_evidence,
                 code="reviewer_requires_human",
             )
             return
@@ -471,21 +471,21 @@ class ChangeDeliveryEngine:
                 "not_checked",
                 next_action=(
                     "repair Fresh Validation findings"
-                    if artifact.verdict == "request_changes"
+                    if artifact.has_failures
                     else (
                         "await human decision"
-                        if artifact.verdict == "human"
+                        if artifact.requires_human
                         else "generate publication narrative"
                     )
                 ),
             )
-        if artifact.verdict == "pass":
+        if artifact.is_accepted:
             job["phase"] = "accepted"
         elif int(job["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS:
             job["phase"] = "escalating"
             job["escalation_code"] = (
                 "reviewer_requires_human"
-                if artifact.verdict == "human"
+                if artifact.requires_human
                 else "modification_budget_exhausted"
             )
         else:
@@ -830,7 +830,7 @@ class ChangeDeliveryEngine:
                 "scope": self.contract.label(job),
                 "base_sha": str(job["base_sha"]),
                 "candidate_sha": str(job["candidate_sha"]),
-                "validation_verdict": str(artifact["verdict"]),
+                "validation_outcome": AcceptanceArtifact.parse(artifact).outcome,
                 "lane_statuses": lane_statuses,
                 "required_checks": checks,
                 "next_action": next_action,

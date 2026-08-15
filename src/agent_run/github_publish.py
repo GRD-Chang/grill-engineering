@@ -1911,7 +1911,7 @@ def _render_agent_run_status(status: dict[str, Any]) -> str:
         f"- Scope: `{_string(status, 'scope')}`\n"
         f"- Candidate/Base: `{_string(status, 'candidate_sha')}` / "
         f"`{_string(status, 'base_sha')}`\n"
-        f"- Fresh Validation: `{_string(status, 'validation_verdict')}` "
+        f"- Fresh Validation: `{_string(status, 'validation_outcome')}` "
         f"({lane_summary})\n"
         f"- Required Checks: `{required}`\n"
         f"- Next action: {_string(status, 'next_action')}"

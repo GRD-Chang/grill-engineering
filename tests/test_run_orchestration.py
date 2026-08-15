@@ -61,25 +61,23 @@ The end-to-end scripted DAG scenario passed.
 def _human_acceptance(thread_id: str) -> dict[str, object]:
     return {
         "thread_id": thread_id,
-        "verdict": "human",
         "checks": {
             "e2e": {
                 "status": "blocked",
-                "evidence": "A product decision is required.",
+                "evidence": "发生：产品决策缺失；尝试：已读取权威输入；人必须：作出产品决策。",
+                "findings": [],
             },
             "standards": {
                 "status": "pass",
-                "evidence": "The standards review passed.",
+                "evidence": "审查范围或基线：仓库编码规范与当前 diff；结论：未发现违反项。",
+                "findings": [],
             },
             "spec": {
                 "status": "pass",
-                "evidence": "The spec review passed.",
+                "evidence": "已核对的验收标准：当前 Ticket 的全部要求；覆盖结论：已覆盖。",
+                "findings": [],
             },
         },
-        "findings": [],
-        "human_blockers": [
-            "A product decision is absent from authoritative inputs."
-        ],
     }
 
 
@@ -473,11 +471,11 @@ def test_human_blocked_branch_does_not_stop_independent_work(
     remaining = state["diagnostics"][0]["remaining_tickets"]
     assert remaining == [
         {
-            "ticket_number": 2,
-            "reason": "reviewer_requires_human",
-            "human_blockers": [
-                "A product decision is absent from authoritative inputs."
-            ],
+                "ticket_number": 2,
+                "reason": "reviewer_requires_human",
+                "human_blockers": [
+                    "发生：产品决策缺失；尝试：已读取权威输入；人必须：作出产品决策。"
+                ],
         },
         {"ticket_number": 4, "reason": "blocked_by_open_issues"},
     ]

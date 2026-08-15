@@ -250,9 +250,12 @@ Controller 不解析 Codex 内部事件流来审计 subagent 身份或 skill 调
 Prompt 合同，并确定性校验 Fresh 父 Reviewer 不复用 Development/旧 Reviewer Thread、
 三个 lane 均有合法状态和证据，以及外层 SHA/Revision 绑定。
 
-Acceptance Artifact 只包含 `verdict`、`checks`、`findings` 和 `human_blockers`。
-base/head SHA、Effective Revision 和 Reviewer 身份由 Controller 写入外层 Acceptance
-Record。`findings` 直接回传同一 Development Thread，不再生成独立 Repair Brief。
+Acceptance Artifact 根对象只包含 `checks`，其中固定 `e2e`、`standards`、`spec` 三条
+lane；每条 lane 只含 `status`、`evidence` 和 `findings`。任何 lane 的 Finding 都随完整
+Artifact 原样回传同一 Development Thread，不再生成独立 Repair Brief；任一 `fail` 回到开发，
+无 `fail` 但有 `blocked` 才等待人工，三条 lane 全部 `pass` 才接受。完整 schema、Finding
+格式和各 lane 的最低证据要求见 [Acceptance Artifact Schema](acceptance-artifact-schema.md)。
+base/head SHA、Effective Revision 和 Reviewer 身份由 Controller 写入外层 Acceptance Record。
 
 Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 

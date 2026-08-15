@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
@@ -190,7 +191,7 @@ class RunPublicationShared:
                 "scope": "final-run",
                 "base_sha": self.default_head_sha,
                 "candidate_sha": run_head,
-                "validation_verdict": str(artifact["verdict"]),
+                "validation_outcome": AcceptanceArtifact.parse(artifact).outcome,
                 "lane_statuses": lane_statuses,
                 "required_checks": checks,
                 "next_action": next_action,

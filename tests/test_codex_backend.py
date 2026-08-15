@@ -36,6 +36,50 @@ from agent_run.worker_sandbox import (
 )
 
 
+PASS_EVIDENCE = {
+    "e2e": "操作或命令：运行候选公开流程；退出码：0；结果：候选通过端到端复验。",
+    "standards": "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。",
+    "spec": "已核对的验收标准：请求中的全部验收标准；覆盖结论：候选完整覆盖。",
+}
+
+
+def passing_acceptance_artifact() -> dict[str, object]:
+    return {
+        "checks": {
+            lane: {
+                "status": "pass",
+                "evidence": PASS_EVIDENCE[lane],
+                "findings": [],
+            }
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+
+
+def failed_acceptance_artifact(
+    evidence: str = "Repair this.",
+) -> dict[str, object]:
+    return {
+        "checks": {
+            "e2e": {
+                "status": "fail",
+                "evidence": evidence,
+                "findings": [
+                    f"问题：repair is required；证据：{evidence}；必须修复：repair the candidate；复验：run the affected check",
+                ],
+            },
+            **{
+                lane: {
+                    "status": "pass",
+                    "evidence": PASS_EVIDENCE[lane],
+                    "findings": [],
+                }
+                for lane in ("standards", "spec")
+            },
+        }
+    }
+
+
 def test_publication_repairs_invalid_output_in_same_thread(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -129,7 +173,7 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
         {
             "checkout": str(tmp_path),
             "parent_issue_url": "https://github.com/example/project/issues/1",
-            "acceptance_artifact": {"verdict": "pass"},
+            "acceptance_artifact": passing_acceptance_artifact(),
             "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
         }
     )
@@ -179,7 +223,7 @@ def test_run_publication_marks_exhausted_semantic_output_as_failed(
             {
                 "checkout": str(tmp_path),
                 "parent_issue_url": "https://github.com/example/project/issues/1",
-                "acceptance_artifact": {"verdict": "pass"},
+                "acceptance_artifact": passing_acceptance_artifact(),
                 "_invocation_event": lambda kind, **facts: events.append(
                     (kind, facts)
                 ),
@@ -541,21 +585,8 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
             schema_index = arguments.index("--output-schema") + 1
             schema = json.loads(Path(arguments[schema_index]).read_text(encoding="utf-8"))
             schemas.append(schema)
-            if "verdict" in schema["properties"]:
-                output = json.dumps(
-                    {
-                        "verdict": "pass",
-                        "checks": {
-                            lane: {
-                                "status": "pass",
-                                "evidence": f"{lane} independently passed.",
-                            }
-                            for lane in ("e2e", "standards", "spec")
-                        },
-                        "findings": [],
-                        "human_blockers": [],
-                    }
-                )
+            if "checks" in schema["properties"]:
+                output = json.dumps(passing_acceptance_artifact())
         Path(arguments[output_index]).write_text(output, encoding="utf-8")
         return subprocess.CompletedProcess(
             arguments,
@@ -591,7 +622,11 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert "E2E" in acceptance
     assert acceptance.count("skill:code-review") >= 2
     assert "不得替代" in acceptance
-    assert "findings 与 human_blockers 必须都是空数组" in acceptance
+    assert "每条 Finding 都必须写在最合适 lane 的 findings 中" in acceptance
+    assert "pass 与 blocked 的 findings 必须为空" in acceptance
+    assert "blocked 的 evidence 必须说明发生了什么" in acceptance
+    assert "\"verdict\"" not in acceptance
+    assert "\"human_blockers\"" not in acceptance
     assert len(schemas) == 2
     assert all("allOf" not in schema for schema in schemas)
     assert schemas[0]["required"] == ["result_kind", "summary", "human_blockers"]
@@ -654,7 +689,7 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "base_sha": "base-sha",
             "run_head_sha": "run-head-sha",
-            "acceptance_artifact": {"verdict": "pass"},
+            "acceptance_artifact": passing_acceptance_artifact(),
         }
     )
 
@@ -674,15 +709,9 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
         (
             {
                 "repair_source": "acceptance",
-                "acceptance_artifact": {
-                    "verdict": "request_changes",
-                    "findings": [
-                        {
-                            "id": "acceptance-finding-verbatim",
-                            "problem": "Preserve this exact acceptance evidence.",
-                        }
-                    ],
-                },
+                "acceptance_artifact": failed_acceptance_artifact(
+                    "Preserve this exact acceptance evidence."
+                ),
             },
             "Acceptance Repair",
             "Preserve this exact acceptance evidence.",
@@ -765,10 +794,7 @@ def test_development_prompt_matches_normal_and_repair_contracts(
 
 
 def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None:
-    artifact = {
-        "verdict": "request_changes",
-        "checks": {"e2e": {"status": "fail", "evidence": "original"}},
-    }
+    artifact = failed_acceptance_artifact("original")
     internal = {
         "checkout": "/private/checkout",
         "thread_id": "private-thread",
@@ -922,10 +948,7 @@ def test_development_resume_failure_stops_without_replacement_thread(
                 "thread_id": "developer-1",
                 "parent_issue_url": "https://github.com/example/project/issues/1",
                 "task_issue_url": "https://github.com/example/project/issues/3",
-                "acceptance_artifact": {
-                    "verdict": "request_changes",
-                    "findings": [{"id": "F1", "problem": "Repair this."}],
-                },
+                "acceptance_artifact": failed_acceptance_artifact(),
                 "repair_source": "acceptance",
             }
         )
@@ -1027,7 +1050,7 @@ def test_publication_resume_failure_does_not_replace_thread(
                 "thread_id": "developer-1",
                 "parent_issue_url": "https://github.com/example/project/issues/1",
                 "task_issue_url": "https://github.com/example/project/issues/3",
-                "acceptance_artifact": {"verdict": "pass"},
+                "acceptance_artifact": passing_acceptance_artifact(),
             }
         )
 

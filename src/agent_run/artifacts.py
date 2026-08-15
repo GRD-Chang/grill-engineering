@@ -34,6 +34,14 @@ _PUBLICATION_RESULT_FIELDS = {
     "human_blockers",
 }
 _DEVELOPMENT_RESULT_FIELDS = {"result_kind", "summary", "human_blockers"}
+_FINDING = re.compile(
+    r"^问题：\S(?:.*\S)?；证据：\S(?:.*\S)?；必须修复：\S(?:.*\S)?；复验：\S(?:.*\S)?$"
+)
+_PASS_EVIDENCE_MARKERS = {
+    "e2e": ("操作或命令：", "退出码：", "结果："),
+    "standards": ("审查范围或基线：", "结论："),
+    "spec": ("已核对的验收标准：", "覆盖结论："),
+}
 
 
 @dataclass(frozen=True)
@@ -108,10 +116,7 @@ class PublicationArtifact:
 
 @dataclass(frozen=True)
 class AcceptanceArtifact:
-    verdict: str
-    checks: dict[str, dict[str, str]]
-    findings: tuple[dict[str, Any], ...]
-    human_blockers: tuple[str, ...]
+    checks: dict[str, dict[str, Any]]
     raw: dict[str, Any]
 
     @classmethod
@@ -119,72 +124,83 @@ class AcceptanceArtifact:
         data = _mapping(value, "acceptance artifact")
         _exact_fields(
             data,
-            {"verdict", "checks", "findings", "human_blockers"},
+            {"checks"},
             "acceptance artifact",
         )
-        verdict = _nonempty_string(data, "verdict")
-        if verdict not in {"pass", "request_changes", "human"}:
-            raise ValueError("invalid acceptance verdict")
-
         checks_data = _mapping(data.get("checks"), "checks")
         _exact_fields(checks_data, {"e2e", "standards", "spec"}, "checks")
-        checks: dict[str, dict[str, str]] = {}
+        checks: dict[str, dict[str, Any]] = {}
         for lane in ("e2e", "standards", "spec"):
             result = _mapping(checks_data[lane], f"{lane} check")
-            _exact_fields(result, {"status", "evidence"}, f"{lane} check")
+            _exact_fields(
+                result, {"status", "evidence", "findings"}, f"{lane} check"
+            )
             status = _nonempty_string(result, "status")
             if status not in {"pass", "fail", "blocked"}:
                 raise ValueError(f"invalid {lane} check status")
             evidence = _nonempty_string(result, "evidence")
-            checks[lane] = {"status": status, "evidence": evidence}
-
-        findings = _mapping_list(data, "findings")
-        for finding in findings:
-            _exact_fields(
-                finding,
-                {
-                    "id",
-                    "problem",
-                    "evidence",
-                    "required_outcome",
-                    "verification",
-                },
-                "finding",
-            )
-            for key in (
-                "id",
-                "problem",
-                "evidence",
-                "required_outcome",
-                "verification",
+            findings = _string_list(result, "findings")
+            if any(_FINDING.fullmatch(finding) is None for finding in findings):
+                raise ValueError(
+                    f"{lane} findings must use 问题：…；证据：…；必须修复：…；复验：…"
+                )
+            if status == "pass" and findings:
+                raise ValueError(f"{lane} pass check must not contain findings")
+            if status == "pass" and not all(
+                _has_marker_value(evidence, marker)
+                for marker in _PASS_EVIDENCE_MARKERS[lane]
             ):
-                _nonempty_string(finding, key)
-        blockers = _string_list(data, "human_blockers")
-        statuses = {result["status"] for result in checks.values()}
-        if verdict == "pass" and (findings or blockers):
-            raise ValueError("passing acceptance must not contain repair work")
-        if verdict == "pass" and statuses != {"pass"}:
-            raise ValueError("passing acceptance requires every check to pass")
-        if verdict == "request_changes" and not findings:
-            raise ValueError("request_changes requires findings")
-        if verdict == "request_changes" and "fail" not in statuses:
-            raise ValueError("request_changes requires a failed check")
-        if verdict == "request_changes" and blockers:
-            raise ValueError("request_changes must not contain human blockers")
-        if verdict == "human" and findings:
-            raise ValueError("human acceptance must not contain repair findings")
-        if verdict == "human" and (
-            not blockers or "blocked" not in statuses or "fail" in statuses
-        ):
-            raise ValueError(
-                "human verdict requires human_blockers, a blocked check, and no failed check"
-            )
+                raise ValueError(
+                    f"{lane} pass evidence must contain its reviewable evidence markers"
+                )
+            if status == "fail" and not findings:
+                raise ValueError(f"{lane} fail check requires findings")
+            if status == "blocked" and findings:
+                raise ValueError(f"{lane} blocked check must not contain findings")
+            if status == "blocked" and not all(
+                marker in evidence for marker in ("发生", "尝试", "人必须")
+            ):
+                raise ValueError(
+                    f"{lane} blocked evidence must state what happened, was tried, and human action"
+                )
+            checks[lane] = {
+                "status": status,
+                "evidence": evidence,
+                "findings": findings,
+            }
         return cls(
-            verdict=verdict,
             checks=checks,
-            findings=tuple(findings),
-            human_blockers=tuple(blockers),
             raw=dict(data),
+        )
+
+    @property
+    def has_failures(self) -> bool:
+        return any(check["status"] == "fail" for check in self.checks.values())
+
+    @property
+    def requires_human(self) -> bool:
+        return not self.has_failures and any(
+            check["status"] == "blocked" for check in self.checks.values()
+        )
+
+    @property
+    def is_accepted(self) -> bool:
+        return not self.has_failures and not self.requires_human
+
+    @property
+    def outcome(self) -> str:
+        if self.has_failures:
+            return "findings"
+        if self.requires_human:
+            return "blocked"
+        return "pass"
+
+    @property
+    def blocker_evidence(self) -> tuple[str, ...]:
+        return tuple(
+            str(check["evidence"])
+            for check in self.checks.values()
+            if check["status"] == "blocked"
         )
 
 
@@ -343,11 +359,10 @@ def _nonempty_string(data: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
-def _mapping_list(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
-    value = data.get(key)
-    if not isinstance(value, list):
-        raise ValueError(f"{key} must be a list")
-    return [_mapping(item, f"{key} item") for item in value]
+def _has_marker_value(evidence: str, marker: str) -> bool:
+    """Require a non-empty value immediately after a documented evidence marker."""
+    _, separator, remainder = evidence.partition(marker)
+    return bool(separator and remainder.split("；", maxsplit=1)[0].strip())
 
 
 def _string_list(data: dict[str, Any], key: str) -> list[str]:

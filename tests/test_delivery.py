@@ -32,6 +32,12 @@ from agent_run.state import StateStore
 from conftest import write_fixture
 
 
+E2E_PASS_EVIDENCE = "操作或命令：执行公开候选流程；退出码：0；结果：候选通过端到端复验。"
+E2E_FAIL_EVIDENCE = "执行公开候选流程后，delivered.txt 缺少修复标记。"
+STANDARDS_PASS_EVIDENCE = "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。"
+SPEC_PASS_EVIDENCE = "已核对的验收标准：Ticket 的全部验收标准；覆盖结论：候选完整覆盖。"
+
+
 def issue(number: int) -> dict[str, Any]:
     return {
         "number": number,
@@ -255,39 +261,34 @@ The scripted end-to-end scenario passed.
             "checks": {
                 "e2e": {
                     "status": "pass" if self.review_count == 2 else "fail",
-                    "evidence": "Used the exact candidate through its public flow.",
+                    "evidence": (
+                        E2E_PASS_EVIDENCE
+                        if self.review_count == 2
+                        else E2E_FAIL_EVIDENCE
+                    ),
+                    "findings": [],
                 },
                 "standards": {
                     "status": "pass",
-                    "evidence": "A distinct code-review subagent found no violation.",
+                    "evidence": STANDARDS_PASS_EVIDENCE,
+                    "findings": [],
                 },
                 "spec": {
                     "status": "pass",
-                    "evidence": "A distinct code-review subagent checked the Ticket.",
+                    "evidence": SPEC_PASS_EVIDENCE,
+                    "findings": [],
                 },
             },
-            "human_blockers": [],
         }
         if self.review_count == 1:
             artifact = {
                 **common,
-                "verdict": "request_changes",
-                "findings": [
-                    {
-                        "id": "F1",
-                        "problem": "The repair marker is missing.",
-                        "evidence": "delivered.txt only contains the first attempt.",
-                        "required_outcome": "Apply the repair.",
-                        "verification": "Inspect delivered.txt.",
-                    }
-                ],
             }
+            artifact["checks"]["e2e"]["findings"] = [
+                "问题：修复标记缺失；证据：delivered.txt 只有第一次尝试内容；必须修复：应用修复；复验：检查 delivered.txt。"
+            ]
         else:
-            artifact = {
-                **common,
-                "verdict": "pass",
-                "findings": [],
-            }
+            artifact = common
         return ReviewResult(thread_id=reviewer_id, artifact=artifact)
 
 
@@ -875,31 +876,25 @@ class AlwaysRejectAgents(ScriptedAgents):
         return ReviewResult(
             thread_id=f"reviewer-{self.review_count}",
             artifact={
-                "verdict": "request_changes",
                 "checks": {
                     "e2e": {
                         "status": "fail",
                         "evidence": "The scripted reviewer rejects this attempt.",
+                        "findings": [
+                            "问题：脚本化缺陷仍然存在；证据：脚本化 reviewer 发现该缺陷；必须修复：解决该缺陷；复验：运行脚本化 reviewer。"
+                        ],
                     },
                     "standards": {
                         "status": "pass",
-                        "evidence": "The standards review passed.",
+                        "evidence": STANDARDS_PASS_EVIDENCE,
+                        "findings": [],
                     },
                     "spec": {
                         "status": "pass",
-                        "evidence": "The spec review passed.",
+                        "evidence": SPEC_PASS_EVIDENCE,
+                        "findings": [],
                     },
                 },
-                "findings": [
-                    {
-                        "id": "F1",
-                        "problem": "The scripted defect remains.",
-                        "evidence": "The scripted reviewer found it.",
-                        "required_outcome": "Resolve the defect.",
-                        "verification": "Run the scripted reviewer.",
-                    }
-                ],
-                "human_blockers": [],
             },
         )
 
@@ -935,23 +930,23 @@ class PassAgents(ScriptedAgents):
         return ReviewResult(
             thread_id=f"reviewer-{self.review_count}",
             artifact={
-                "verdict": "pass",
                 "checks": {
                     "e2e": {
                         "status": "pass",
-                        "evidence": "The exact candidate passed.",
+                        "evidence": E2E_PASS_EVIDENCE,
+                        "findings": [],
                     },
                     "standards": {
                         "status": "pass",
-                        "evidence": "The standards review passed.",
+                        "evidence": STANDARDS_PASS_EVIDENCE,
+                        "findings": [],
                     },
                     "spec": {
                         "status": "pass",
-                        "evidence": "The spec review passed.",
+                        "evidence": SPEC_PASS_EVIDENCE,
+                        "findings": [],
                     },
                 },
-                "findings": [],
-                "human_blockers": [],
             },
         )
 
@@ -961,14 +956,11 @@ class HumanThenHistoricalReviewerAgents(PassAgents):
         result = super().review(request)
         if self.review_count == 1:
             artifact = result.artifact
-            artifact["verdict"] = "human"
             artifact["checks"]["e2e"] = {
                 "status": "blocked",
-                "evidence": "GitHub access requires a maintainer.",
+                "evidence": "发生：GitHub Issue 读取权限被拒绝；尝试：执行 gh issue view；人必须：授予 Issue 读取权限。",
+                "findings": [],
             }
-            artifact["human_blockers"] = [
-                "GitHub denied access; tried gh issue view; grant Issue read access."
-            ]
             return ReviewResult("blocked-latest-reviewer", artifact)
         return ReviewResult("older-reviewer", result.artifact)
 
@@ -998,7 +990,7 @@ class MalformedThenDuplicateReviewer(PassAgents):
     def review(self, request: dict[str, Any]) -> ReviewResult:
         return ReviewResult(
             thread_id="reviewer-1",
-            artifact={"verdict": "pass"},
+            artifact={"checks": {}},
         )
 
 
@@ -1439,17 +1431,28 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         "/example/project/issues/1"
     )
     assert "development_summary" not in agents.review_requests[0]
-    repair_artifact = agents.development_requests[1]["acceptance_artifact"]
     assert agents.development_requests[1]["repair_source"] == "acceptance"
-    assert repair_artifact["findings"] == [
-        {
-            "id": "F1",
-            "problem": "The repair marker is missing.",
-            "evidence": "delivered.txt only contains the first attempt.",
-            "required_outcome": "Apply the repair.",
-            "verification": "Inspect delivered.txt.",
+    assert agents.development_requests[1]["acceptance_artifact"] == {
+        "checks": {
+            "e2e": {
+                "status": "fail",
+                "evidence": E2E_FAIL_EVIDENCE,
+                "findings": [
+                    "问题：修复标记缺失；证据：delivered.txt 只有第一次尝试内容；必须修复：应用修复；复验：检查 delivered.txt。"
+                ],
+            },
+            "standards": {
+                "status": "pass",
+                "evidence": STANDARDS_PASS_EVIDENCE,
+                "findings": [],
+            },
+            "spec": {
+                "status": "pass",
+                "evidence": SPEC_PASS_EVIDENCE,
+                "findings": [],
+            },
         }
-    ]
+    }
     assert (
         agents.development_requests[1]["head_sha"]
         == agents.review_requests[0]["candidate_sha"]
@@ -1474,7 +1477,7 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
             "scope": "ticket-3",
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
-            "validation_verdict": "pass",
+            "validation_outcome": "pass",
             "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
             "required_checks": "pass",
             "next_action": "squash merge into the Run Branch",
@@ -1848,7 +1851,7 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert publisher.created_prs == 2
     assert len(publisher.pr_bodies) == 2
     assert len(publisher.agent_run_statuses) == 1
-    assert publisher.agent_run_statuses[0]["validation_verdict"] == "pass"
+    assert publisher.agent_run_statuses[0]["validation_outcome"] == "pass"
 
 
 def test_parent_publication_reads_existing_pr_context_once(git_repo: Path) -> None:
@@ -1920,7 +1923,7 @@ def test_fresh_reviewer_identity_is_persisted_before_artifact_parsing(
         agents=agents,
     )
 
-    with pytest.raises(ValueError, match="acceptance artifact"):
+    with pytest.raises(ValueError, match="checks has missing fields"):
         engine.deliver(state["run_id"])
     interrupted = states.load_run(state["run_id"])
     assert interrupted is not None
@@ -2542,7 +2545,23 @@ def test_publication_worker_failure_is_not_retried_or_marked_pending(
     assert job["phase"] == "accepted"
     assert job["publication_attempts"] == 1
     assert job["modification_attempts"] == 1
-    assert job["acceptance_artifact"]["verdict"] == "pass"
+    assert job["acceptance_artifact"]["checks"] == {
+        "e2e": {
+            "status": "pass",
+            "evidence": E2E_PASS_EVIDENCE,
+            "findings": [],
+        },
+        "standards": {
+            "status": "pass",
+            "evidence": STANDARDS_PASS_EVIDENCE,
+            "findings": [],
+        },
+        "spec": {
+            "status": "pass",
+            "evidence": SPEC_PASS_EVIDENCE,
+            "findings": [],
+        },
+    }
     assert agents.development_thread_ids == [None]
     assert agents.review_count == 1
     assert agents.publication_calls == 1

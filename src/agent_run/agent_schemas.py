@@ -100,71 +100,33 @@ def publication_or_human_blocker_schema() -> dict[str, Any]:
 
 
 def acceptance_schema() -> dict[str, Any]:
-    finding = {
+    lane = {
         "type": "object",
         "additionalProperties": False,
-        "required": [
-            "id",
-            "problem",
-            "evidence",
-            "required_outcome",
-            "verification",
-        ],
-        "properties": {
-            key: {"type": "string"}
-            for key in (
-                "id",
-                "problem",
-                "evidence",
-                "required_outcome",
-                "verification",
-            )
-        },
-    }
-    check = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["status", "evidence"],
+        "required": ["status", "evidence", "findings"],
         "properties": {
             "status": {
                 "type": "string",
                 "enum": ["pass", "fail", "blocked"],
             },
-            "evidence": {"type": "string", "minLength": 1},
+            "evidence": {"type": "string"},
+            "findings": {"type": "array", "items": {"type": "string"}},
         },
     }
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": [
-            "verdict",
-            "checks",
-            "findings",
-            "human_blockers",
-        ],
+        "required": ["checks"],
         "properties": {
-            "verdict": {
-                "type": "string",
-                "enum": ["pass", "request_changes", "human"],
-            },
             "checks": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["e2e", "standards", "spec"],
                 "properties": {
-                    lane: check for lane in ("e2e", "standards", "spec")
-                },
-            },
-            "findings": {"type": "array", "items": finding},
-            "human_blockers": {
-                "type": "array",
-                "maxItems": MAX_HUMAN_BLOCKERS,
-                "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": MAX_HUMAN_BLOCKER_LENGTH,
-                    "pattern": r"\S",
+                    name: {"$ref": "#/$defs/lane"}
+                    for name in ("e2e", "standards", "spec")
                 },
             },
         },
+        "$defs": {"lane": lane},
     }

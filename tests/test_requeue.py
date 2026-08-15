@@ -28,7 +28,7 @@ def _ticket_state() -> dict[str, Any]:
         "effective_revision": "old-revision",
         "base_sha": "old-base",
         "candidate_sha": "candidate",
-        "acceptance_record": {"artifact": {"verdict": "pass"}},
+        "acceptance_record": {"artifact": {"checks": {}}},
         "pr_number": 12,
         "development_thread_id": "thread-old",
         "development_thread_history": ["thread-old", "development-earlier"],

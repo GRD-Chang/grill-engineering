@@ -209,18 +209,18 @@ class RunAcceptanceEngine:
                 "acceptance_record": record,
             }
         )
-        if artifact.verdict == "pass":
+        if artifact.is_accepted:
             clear_current_human_blocker(run)
             run["phase"] = "accepted"
-        elif artifact.verdict == "human":
+        elif artifact.requires_human:
             append_human_blocker_history(
-                run, phase="pending", blockers=artifact.human_blockers
+                run, phase="pending", blockers=artifact.blocker_evidence
             )
             run.update(
                 {
                     "phase": "ready_for_human",
                     "blocked_reason": "reviewer_requires_human",
-                    "human_blockers": list(artifact.human_blockers),
+                    "human_blockers": list(artifact.blocker_evidence),
                     "human_blocker_phase": "pending",
                 }
             )
@@ -230,7 +230,7 @@ class RunAcceptanceEngine:
                     "terminal_kind": "waiting_human",
                     "diagnostics": [
                         {"code": "reviewer_requires_human", "message": blocker}
-                        for blocker in artifact.human_blockers
+                        for blocker in artifact.blocker_evidence
                     ],
                 }
             )
@@ -241,7 +241,7 @@ class RunAcceptanceEngine:
         else:
             clear_current_human_blocker(run)
             run["phase"] = "repairing"
-        if artifact.verdict != "human":
+        if not artifact.requires_human:
             self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
         return True
@@ -270,14 +270,14 @@ class RunAcceptanceEngine:
         if not isinstance(pr_number, int):
             return
         checks = self._mapping(artifact, "checks")
-        verdict = str(artifact["verdict"])
+        outcome = AcceptanceArtifact.parse(artifact).outcome
         self.github.record_agent_run_status(
             pr_number,
             {
                 "scope": "final-run",
                 "base_sha": self._default_head(state),
                 "candidate_sha": run_head,
-                "validation_verdict": verdict,
+                "validation_outcome": outcome,
                 "lane_statuses": {
                     lane: str(self._mapping(checks, lane)["status"])
                     for lane in ("e2e", "standards", "spec")
@@ -285,9 +285,9 @@ class RunAcceptanceEngine:
                 "required_checks": "not_checked",
                 "next_action": {
                     "pass": "generate refreshed final Run publication",
-                    "request_changes": "repair Fresh Validation findings",
-                    "human": "await human decision",
-                }[verdict],
+                    "findings": "repair Fresh Validation findings",
+                    "blocked": "await human decision",
+                }[outcome],
             },
         )
 

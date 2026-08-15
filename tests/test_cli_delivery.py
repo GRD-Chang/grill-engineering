@@ -14,6 +14,8 @@ from test_cli import load_only_run_state, run_cli, stdout_json
 HUMAN_BLOCKER = (
     "GitHub denied access; tried gh issue view; grant Issue read access."
 )
+STANDARDS_PASS_EVIDENCE = "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。"
+SPEC_PASS_EVIDENCE = "已核对的验收标准：当前交付的全部验收标准；覆盖结论：候选完整覆盖。"
 
 
 def ticket() -> dict[str, Any]:
@@ -54,51 +56,48 @@ The scripted CLI scenario passed.
 def passing_acceptance(thread_id: str, evidence: str) -> dict[str, object]:
     return {
         "thread_id": thread_id,
-        "verdict": "pass",
         "checks": {
-            "e2e": {"status": "pass", "evidence": evidence},
+            "e2e": {
+                "status": "pass",
+                "evidence": f"操作或命令：执行 CLI 公开验收流程；退出码：0；结果：{evidence}",
+                "findings": [],
+            },
             "standards": {
                 "status": "pass",
-                "evidence": "The standards review passed.",
+                "evidence": STANDARDS_PASS_EVIDENCE,
+                "findings": [],
             },
             "spec": {
                 "status": "pass",
-                "evidence": "The spec review passed.",
+                "evidence": SPEC_PASS_EVIDENCE,
+                "findings": [],
             },
         },
-        "findings": [],
-        "human_blockers": [],
     }
 
 
 def repair_acceptance(thread_id: str) -> dict[str, object]:
     return {
         "thread_id": thread_id,
-        "verdict": "request_changes",
         "checks": {
             "e2e": {
                 "status": "fail",
                 "evidence": "The first candidate lacks the repair.",
+                "findings": [
+                    "问题：修复缺失；证据：feature.txt 只有一行；必须修复：添加修复；复验：检查 feature.txt。"
+                ],
             },
             "standards": {
                 "status": "pass",
-                "evidence": "The standards review passed.",
+                "evidence": STANDARDS_PASS_EVIDENCE,
+                "findings": [],
             },
             "spec": {
                 "status": "pass",
-                "evidence": "The spec review passed.",
+                "evidence": SPEC_PASS_EVIDENCE,
+                "findings": [],
             },
         },
-        "findings": [
-            {
-                "id": "F1",
-                "problem": "The repair is missing.",
-                "evidence": "feature.txt has one line.",
-                "required_outcome": "Add the repair.",
-                "verification": "Inspect feature.txt.",
-            }
-        ],
-        "human_blockers": [],
     }
 
 
@@ -293,7 +292,7 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
                     {
                         "expected_thread_id": None,
                         "thread_id": "ticket-reviewer-1",
-                        "artifact": {"verdict": "pass"},
+                        "artifact": {"checks": {}},
                     }
                 ],
             }
@@ -1655,7 +1654,7 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
             "scope": "ticket-3",
             "base_sha": load_only_run_state(git_repo)["ticket_jobs"]["3"]["base_sha"],
             "candidate_sha": load_only_run_state(git_repo)["ticket_jobs"]["3"]["candidate_sha"],
-            "validation_verdict": "pass",
+            "validation_outcome": "pass",
             "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
             "required_checks": "pending",
             "next_action": "wait for Required Checks",

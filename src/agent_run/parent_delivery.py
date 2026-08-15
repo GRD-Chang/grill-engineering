@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -391,7 +392,7 @@ class ParentDeliveryEngine:
                 "scope": "parent-only",
                 "base_sha": str(job["base_sha"]),
                 "candidate_sha": str(job["candidate_sha"]),
-                "validation_verdict": str(artifact["verdict"]),
+                "validation_outcome": AcceptanceArtifact.parse(artifact).outcome,
                 "lane_statuses": {
                     lane: str(_mapping(raw_checks, lane)["status"])
                     for lane in ("e2e", "standards", "spec")

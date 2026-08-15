@@ -1725,7 +1725,7 @@ def test_agent_run_status_comment_is_updated_in_place(
         "scope": "ticket-3",
         "base_sha": "a" * 40,
         "candidate_sha": "b" * 40,
-        "validation_verdict": "pass",
+        "validation_outcome": "pass",
         "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
         "required_checks": "pending",
         "next_action": "wait for Required Checks",

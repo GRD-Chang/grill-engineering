@@ -19,6 +19,11 @@ DEVELOPMENT_BLOCKER_SHAPE = (
     '`{"result_kind":"human_blocker","summary":null,'
     '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
 )
+PASS_EVIDENCE = {
+    "e2e": "操作或命令：运行候选公开流程；退出码：0；结果：候选通过端到端复验。",
+    "standards": "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。",
+    "spec": "已核对的验收标准：请求中的全部验收标准；覆盖结论：候选完整覆盖。",
+}
 
 
 def test_publication_prompts_use_flat_human_blocker_wire_shape() -> None:
@@ -77,13 +82,14 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
         "human_blockers": None,
     }
     acceptance_result = {
-        "verdict": "pass",
         "checks": {
-            lane: {"status": "pass", "evidence": f"{lane} passed."}
+            lane: {
+                "status": "pass",
+                "evidence": PASS_EVIDENCE[lane],
+                "findings": [],
+            }
             for lane in ("e2e", "standards", "spec")
         },
-        "findings": [],
-        "human_blockers": [],
     }
     development_result = {
         "result_kind": "development",
@@ -118,7 +124,25 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
     parent_url = "https://github.com/example/project/issues/101"
     task_url = "https://github.com/example/project/issues/102"
-    artifact = {"verdict": "request_changes", "marker": "ARTIFACT_SENTINEL"}
+    artifact = {
+        "checks": {
+            "e2e": {
+                "status": "fail",
+                "evidence": "ARTIFACT_SENTINEL",
+                "findings": [
+                    "问题：the scenario failed；证据：ARTIFACT_SENTINEL；必须修复：repair the scenario；复验：run the scenario",
+                ],
+            },
+            **{
+                lane: {
+                    "status": "pass",
+                    "evidence": PASS_EVIDENCE[lane],
+                    "findings": [],
+                }
+                for lane in ("standards", "spec")
+            },
+        }
+    }
     ci_evidence = {"check": "CI_EVIDENCE_SENTINEL"}
     private = {
         "run_id": "PRIVATE_RUN_SENTINEL",

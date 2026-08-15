@@ -54,7 +54,7 @@
 
 JSON Schema 只定义形状；以下跨字段规则由本地 parser 强制：
 
-- `pass`：`findings` 必须为空，`evidence` 必须是非空、可复核的事实。
+- `pass`：`findings` 必须为空，`evidence` 必须使用当前 lane 的可复核标记：E2E 为“操作或命令：…；退出码：…；结果：…”，Standards 为“审查范围或基线：…；结论：…”，Spec 为“已核对的验收标准：…；覆盖结论：…”。
 - `fail`：`findings` 必须非空。
 - `blocked`：`findings` 必须为空；`evidence` 必须写明发生了什么、已尝试什么、以及人必须做什么。
 - 任一 lane 为 `fail`，Controller 将完整 Artifact 原样交给 Development。
@@ -69,8 +69,8 @@ Finding 是一条自包含字符串，采用：`问题：…；证据：…；�
 
 每个 lane 的 `evidence` 最低应包含：
 
-- E2E：实际操作或命令、退出码和可观察结果；
-- Standards：审查范围或基线，以及实际审查结论；
-- Spec：已核对的 Acceptance Criteria 及其覆盖结论。
+- E2E：`操作或命令：…；退出码：…；结果：…`；
+- Standards：`审查范围或基线：…；结论：…`；
+- Spec：`已核对的验收标准：…；覆盖结论：…`。
 
 不得因为问题是提示、风格、低优先级或未来改进而隐瞒一个有证据且当前范围必须修复的问题；纯主观偏好或与当前范围无关的未来想法不构成 Finding。

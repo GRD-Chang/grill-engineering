@@ -20,15 +20,22 @@ from conftest import write_fixture
 from test_cli import run_cli, stdout_json
 
 
+_BLOCKED_EVIDENCE = (
+    "发生：GitHub 拒绝访问 Parent Issue；尝试：执行 gh issue view；人必须：授予 Issue 读取权限。"
+)
+_PASS_EVIDENCE = {
+    "e2e": "操作或命令：执行完整 Run 验收流程；退出码：0；结果：完整 Run 通过。",
+    "standards": "审查范围或基线：仓库编码规范与完整 Run diff；结论：未发现违反项。",
+    "spec": "已核对的验收标准：Parent Issue 的全部验收标准；覆盖结论：完整 Run 已覆盖。",
+}
+
+
 def _passing_artifact() -> dict[str, object]:
     return {
-        "verdict": "pass",
         "checks": {
-            name: {"status": "pass", "evidence": f"{name} passed."}
+            name: {"status": "pass", "evidence": _PASS_EVIDENCE[name], "findings": []}
             for name in ("e2e", "standards", "spec")
         },
-        "findings": [],
-        "human_blockers": [],
     }
 
 
@@ -39,17 +46,10 @@ def _repair_artifact() -> dict[str, object]:
     checks["e2e"] = {
         "status": "fail",
         "evidence": "The accumulated flow loses the first Ticket behavior.",
+        "findings": [
+            "问题：集成流程不完整；证据：两个 Ticket 组合后端到端场景失败；必须修复：恢复完整组合流程；复验：运行完整累计场景。"
+        ],
     }
-    artifact["verdict"] = "request_changes"
-    artifact["findings"] = [
-        {
-            "id": "RUN-1",
-            "problem": "The integrated flow is incomplete.",
-            "evidence": "The end-to-end scenario fails after both Tickets combine.",
-            "required_outcome": "Restore the complete combined flow.",
-            "verification": "Run the full accumulated scenario.",
-        }
-    ]
     return artifact
 
 
@@ -59,12 +59,9 @@ def _human_artifact() -> dict[str, object]:
     assert isinstance(checks, dict)
     checks["e2e"] = {
         "status": "blocked",
-        "evidence": "GitHub denied access to the Parent Issue.",
+        "evidence": _BLOCKED_EVIDENCE,
+        "findings": [],
     }
-    artifact["verdict"] = "human"
-    artifact["human_blockers"] = [
-        "GitHub denied access; tried gh issue view; grant Issue read access."
-    ]
     return artifact
 
 
@@ -217,6 +214,8 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert run["reviewed_head_sha"] == git.resolve(str(state["run_branch"]))
     assert result["ticket_jobs"]["2"]["modification_attempts"] == 1
     assert len(agents.development_requests) == 1
+    assert agents.development_requests[0]["repair_source"] == "acceptance"
+    assert agents.development_requests[0]["acceptance_artifact"] == _repair_artifact()
     assert len(agents.review_requests) == 3
     fixture_data = json.loads((git_repo / "github.json").read_text(encoding="utf-8"))
     repair_prs = fixture_data["delivery"]["pull_requests"]
@@ -756,14 +755,12 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
             if len(self.requests) == 1:
                 return ReviewResult("blocked-run-reviewer", _human_artifact())
             assert request["thread_id"] == "blocked-run-reviewer"
-            assert request["prior_human_blockers"] == [
-                "GitHub denied access; tried gh issue view; grant Issue read access."
-            ]
+            assert request["prior_human_blockers"] == [_BLOCKED_EVIDENCE]
             assert request["human_response_history"] == [
                 {
                     "generation": 1,
                     "human_blockers": [
-                        "GitHub denied access; tried gh issue view; grant Issue read access."
+                        _BLOCKED_EVIDENCE
                     ],
                     "response": "Issue read access has been granted.",
                 }
@@ -790,13 +787,13 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
         human_response="Issue read access has been granted.",
     )
     assert resumed["run_acceptance"]["prior_human_blockers"] == [
-        "GitHub denied access; tried gh issue view; grant Issue read access."
+        _BLOCKED_EVIDENCE
     ]
     assert resumed["run_acceptance"]["human_response_history"] == [
         {
             "generation": 1,
             "human_blockers": [
-                "GitHub denied access; tried gh issue view; grant Issue read access."
+                _BLOCKED_EVIDENCE
             ],
             "response": "Issue read access has been granted.",
         }
@@ -813,7 +810,7 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
         {
             "phase": "pending",
             "human_blockers": [
-                "GitHub denied access; tried gh issue view; grant Issue read access."
+                _BLOCKED_EVIDENCE
             ],
         }
     ]

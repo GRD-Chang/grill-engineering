@@ -202,7 +202,7 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
             "scope": "final-run",
             "base_sha": git.resolve("main"),
             "candidate_sha": git.resolve(str(state["run_branch"])),
-            "validation_verdict": "pass",
+            "validation_outcome": "pass",
             "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
             "required_checks": "none",
             "next_action": "await explicit maintainer approval",

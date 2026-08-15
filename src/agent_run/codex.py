@@ -495,10 +495,15 @@ class CodexCliBackend:
             + _acceptance_contract(context)
             + "\n\n"
             + "汇总三条 lane 的实际证据后，只输出符合 schema 的 Acceptance Artifact。"
-            "可修复问题写入自包含 findings。human 必须克制，仅限确实需要产品决策、"
-            "外部权限、敏感凭证或不可替代外部操作的阻塞。若 verdict 为 pass，三个 check 都必须是 pass，"
-            "findings 与 human_blockers 必须都是空数组 `[]`；不要输出提示、风格建议、"
-            "未来改进或其他非阻塞观察。\n\n"
+            "每条 Finding 都必须写在最合适 lane 的 findings 中，并严格采用“问题：…；证据：…；"
+            "必须修复：…；复验：…”这一条自包含字符串格式。同一问题不得跨 lane 重复。"
+            "任何当前范围内、有证据且必须修复的 Finding 都使该 lane 为 fail；有 Finding 时绝不能"
+            "写 pass。pass 与 blocked 的 findings 必须为空；blocked 的 evidence 必须说明发生了什么、"
+            "已经尝试什么、以及人必须做什么。任一 fail 将回到 Development；没有 fail 但存在 blocked"
+            "才是 Human Blocker；只有三个 lane 都 pass 才接受。纯主观偏好或当前范围外的未来想法"
+            "不构成 Finding。pass evidence 必须严格使用以下可复核标记：E2E 使用“操作或命令：…；"
+            "退出码：…；结果：…”，Standards 使用“审查范围或基线：…；结论：…”，Spec 使用“已核对"
+            "的验收标准：…；覆盖结论：…”。\n\n"
             f"{scope_instruction}\n\n"
             f"Acceptance Context:\n{_pretty(context)}"
         )
@@ -819,7 +824,9 @@ def _development_contract(context: dict[str, Any]) -> str:
         "maintainability 问题；Spec Review Subagent 检查 Acceptance Criteria 是否完整实现、"
         "是否错误实现或存在有实际影响的 scope creep。你不得自行宣布必要审查通过。发现"
         "blocking finding 后必须修复、重跑受影响测试和真实路径，并重新取得受影响 subagent"
-        "的有效复查。开发侧预审不是正式独立验收。\n\n"
+        "的有效复查。开发侧预审不是正式独立验收。Acceptance Artifact 中任一 lane 的 Finding"
+        "都是下一轮修复的原始输入；逐项处理所属 lane 的自包含 Finding，不得压缩、改写、"
+        "弱化或以开发者判断跳过。只有三个 lane 都 pass 才会由独立验收接受。\n\n"
         "不得 commit、push、merge、关闭或修改 GitHub。"
     )
 
