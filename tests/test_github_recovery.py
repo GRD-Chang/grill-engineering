@@ -12,6 +12,7 @@ from agent_run.git import GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
+from agent_run.github_retry import run_read_command
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
 
 
@@ -35,6 +36,26 @@ def test_github_reader_retries_transient_timeout(
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
+    assert attempts == 3
+
+
+@pytest.mark.parametrize("stderr", ["permission denied", "unexpected response"])
+def test_github_read_retries_do_not_classify_stderr(
+    monkeypatch: pytest.MonkeyPatch, stderr: str
+) -> None:
+    attempts = 0
+
+    def fake_run(arguments, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return subprocess.CompletedProcess(arguments, 1, "", stderr)
+
+    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+
+    result = run_read_command(["gh", "api", "repos/example/project"])
+
+    assert result.stderr == stderr
     assert attempts == 3
 
 

@@ -150,6 +150,26 @@ def test_run_supervises_initial_repository_read_lag_in_one_call(
     assert state["base"]["branch"] == "main"
 
 
+def test_deliver_routes_a_structured_graph_contradiction_to_human(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery_graph_read_failures"] = [
+        {"code": "invalid_parent", "message": "parent graph contradicts itself"}
+    ]
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    blocked = run_cli(git_repo, fixture, "deliver", run_id)
+
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "blocked"
+    state = load_only_run_state(git_repo)
+    assert state["terminal_kind"] == "waiting_human"
+    assert state["diagnostics"][0]["code"] == "invalid_parent"
+
+
 def test_run_reconciles_ticket_close_visibility_in_one_call(
     git_repo: Path,
 ) -> None:
@@ -167,6 +187,53 @@ def test_run_reconciles_ticket_close_visibility_in_one_call(
     state = load_only_run_state(git_repo)
     assert state["ticket_jobs"]["3"]["ticket_closed_by_run"] is True
     assert state["run_publication"]["phase"] == "ready_for_approval"
+
+
+def test_run_supervises_unparseable_ticket_close_ownership_in_one_call(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={
+            "ticket_close_ownership_read_failures": [
+                {
+                    "code": "github_invalid_response",
+                    "message": "Ticket timeline JSON is incomplete",
+                }
+            ]
+        },
+    )
+    agents = _run_agents(git_repo / "agents.json")
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "run_approval_pending"
+    state = load_only_run_state(git_repo)
+    assert state["ticket_jobs"]["3"]["ticket_closed_by_run"] is True
+    mutations = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["mutations"]
+    assert [entry["action"] for entry in mutations].count("close_issue") == 1
+
+
+def test_run_supervises_unobserved_ticket_close_intent_in_one_call(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"ticket_close_intent_missing_once": True},
+    )
+    agents = _run_agents(git_repo / "agents.json")
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "run_approval_pending"
+    state = load_only_run_state(git_repo)
+    assert state["ticket_jobs"]["3"]["ticket_closed_by_run"] is True
+    mutations = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["mutations"]
+    assert [entry["action"] for entry in mutations].count("close_issue") == 1
 
 
 def test_run_reconciles_unknown_ticket_merge_outcomes_in_one_call(

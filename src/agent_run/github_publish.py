@@ -810,6 +810,16 @@ class GhGitHubPublisher:
             )
         return result
 
+    def run_pr_narrative_matches(
+        self, pr_number: int, *, title: str, body: str
+    ) -> bool:
+        value = self._json(
+            "pr", "view", str(pr_number), "--repo", self.repository,
+            "--json", "title,body",
+        )
+        data = _mapping(value)
+        return data.get("title") == title and data.get("body") == body
+
     def record_acceptance(self, pr_number: int, record: dict[str, Any]) -> None:
         body = (
             f"{_ACCEPTANCE_MARKER}\n"
@@ -1795,7 +1805,9 @@ class GhGitHubPublisher:
         allowed = allowed_exit_codes or {0}
         if result.returncode not in allowed:
             raise GitHubReadError(
-                "github_write_failed",
+                "github_read_failed"
+                if _is_read_command(arguments)
+                else "github_write_failed",
                 result.stderr.strip() or "gh command failed",
             )
         try:

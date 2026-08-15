@@ -88,6 +88,19 @@ class DelayedChecksRunPublisher(FixtureGitHubPublisher):
         return super().required_checks(pr_number)
 
 
+class UnknownNarrativeWritePublisher(FixtureGitHubPublisher):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.refresh_attempts = 0
+
+    def refresh_run_pr_narrative(self, **kwargs: Any) -> None:
+        self.refresh_attempts += 1
+        super().refresh_run_pr_narrative(**kwargs)
+        raise GitHubReadError(
+            "github_write_failed", "final PR narrative write outcome is unknown"
+        )
+
+
 class HumanThenRunPublicationAgents:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -251,6 +264,40 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
 
     assert resumed["status"] == "run_approval_pending"
     assert len(agents.requests) == 1
+
+
+def test_unknown_final_pr_narrative_write_does_not_replay(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    agents = RunPublicationAgents()
+    initial = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+    uncertain_publisher = UnknownNarrativeWritePublisher(
+        git_repo / "github.json", git
+    )
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=uncertain_publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+    resumed = engine.publish(str(state["run_id"]))
+
+    assert initial["status"] == "run_approval_pending"
+    assert waiting["status"] == "waiting_external"
+    assert resumed["status"] == "run_approval_pending"
+    assert uncertain_publisher.refresh_attempts == 1
 
 
 def test_final_publication_human_resume_clears_current_blocker(

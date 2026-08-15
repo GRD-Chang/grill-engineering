@@ -87,7 +87,7 @@ _Avoid_: Controller 内部 Agent 编排器、subagent provenance ledger、父 Ag
 _Avoid_: Codex Worker、独立 daemon、GitHub Mutation Authority
 
 **Run 内部监督（In-Run Supervision）**:
-一次由维护者显式启动或恢复的 `agent-run run`，在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。真正需要产品决策、权限、凭据或不可替代外部操作时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
+一次由维护者显式启动或恢复的 `agent-run run`，在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。GitHub 读取或对账的未知非零退出默认进入有界监督，Controller 只保存经脱敏、有界的错误证据，不从 `gh` stderr 推断网络、认证、权限、代理或其他具体原因。只有结构化远端事实已证明 Publisher intent、身份、head/base、检查、状态或关闭证据矛盾时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
 _Avoid_: 维护者轮询 CI、常驻的第二套控制器、自动越过 Final Human Acceptance
 
 **监督截止时间（Supervision Deadline）**:

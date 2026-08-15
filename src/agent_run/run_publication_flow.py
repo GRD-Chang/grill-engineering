@@ -13,6 +13,11 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
+from agent_run.error_safety import bounded_error
+from agent_run.external_supervision import (
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError
 from agent_run.publication_pending import publication_pending_diagnostic
@@ -30,9 +35,7 @@ class RunPublicationFlow(RunPublicationShared):
             try:
                 return self._publish_locked(state, publication)
             except GitHubReadError as error:
-                if not self._is_reconcilable_github_read(error):
-                    raise
-                return self._wait_for_github_convergence(state, publication, error)
+                return self._handle_github_error(state, publication, error)
 
     def _publish_locked(
         self, state: dict[str, Any], publication: dict[str, Any]
@@ -41,6 +44,8 @@ class RunPublicationFlow(RunPublicationShared):
             return self._save(state)
         run = self._mapping(state, "run_acceptance")
         if publication["phase"] in {"merged", "abandoned"}:
+            return state
+        if publication["phase"] == "ready_for_human":
             return state
         if publication["phase"] == "stale":
             publication.clear()
@@ -88,11 +93,25 @@ class RunPublicationFlow(RunPublicationShared):
                 return self._publish_accepted_run(state, run, publication)
             except (GitError, GitHubReadError, OSError) as error:
                 if isinstance(error, GitHubReadError):
-                    if not self._is_reconcilable_github_read(error):
-                        raise
-                    return self._wait_for_github_convergence(state, publication, error)
+                    return self._handle_github_error(state, publication, error)
                 if self._publication_failed(state, publication, error):
                     return state
+
+    def _handle_github_error(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        error: GitHubReadError,
+    ) -> dict[str, Any]:
+        if error.code == "github_write_failed" and isinstance(
+            publication.get("write_intent"), dict
+        ):
+            return self._wait_for_github_convergence(state, publication, error)
+        if error.code == "github_write_failed":
+            return self._hold_unknown_write_outcome(state, publication, error)
+        if not is_github_convergence_error(error.code):
+            raise error
+        return self._wait_for_github_convergence(state, publication, error)
 
     def _wait_for_github_convergence(
         self,
@@ -101,29 +120,62 @@ class RunPublicationFlow(RunPublicationShared):
         error: GitHubReadError,
     ) -> dict[str, Any]:
         publication["phase"] = "waiting_external"
-        publication["last_publication_error"] = str(error)
+        wait_for_github_convergence(
+            state,
+            code=error.code,
+            message=error.message,
+            waiting_for="Final Run PR GitHub reconciliation",
+        )
+        return self._save(state)
+
+    def _hold_unknown_write_outcome(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        error: GitHubReadError,
+    ) -> dict[str, Any]:
+        publication["phase"] = "ready_for_human"
         state.update(
             {
-                "status": "waiting_external",
-                "terminal_kind": "waiting_external",
+                "status": "ready_for_human",
+                "terminal_kind": "waiting_human",
                 "diagnostics": [
                     {
-                        "code": error.code,
-                        "message": error.message,
-                        "waiting_for": "Final Run PR GitHub reconciliation",
+                        "code": "github_write_outcome_unknown",
+                        "message": bounded_error(error.message),
                     }
                 ],
             }
         )
         return self._save(state)
 
-    @staticmethod
-    def _is_reconcilable_github_read(error: GitHubReadError) -> bool:
-        return error.code not in {
-            "ambiguous_run_pr",
-            "github_invalid_response",
-            "stale_run_pr",
-        }
+    def _persist_write_intent(
+        self, state: dict[str, Any], publication: dict[str, Any], action: str
+    ) -> None:
+        publication["write_intent"] = {"action": action}
+        publication["phase"] = "waiting_external"
+        state.update(
+            {
+                "status": "waiting_external",
+                "terminal_kind": "waiting_external",
+                "diagnostics": [
+                    {
+                        "code": "github_write_pending",
+                        "message": "正在确认 Final Run PR 写入结果",
+                    }
+                ],
+            }
+        )
+        self._save(state)
+
+    def _write_intent_matches(
+        self, pr_number: int | None, expected_title: str, expected_body: str
+    ) -> bool:
+        if pr_number is None:
+            return False
+        return self.github.run_pr_narrative_matches(
+            pr_number, title=expected_title, body=expected_body
+        )
 
     def _publication_failed(
         self,
@@ -133,6 +185,7 @@ class RunPublicationFlow(RunPublicationShared):
     ) -> bool:
         if int(publication["publication_attempts"]) >= MAX_PUBLICATION_ATTEMPTS:
             publication["phase"] = "publication_pending"
+            publication.pop("write_intent", None)
             publication["last_publication_error"] = str(error)
             state.update(
                 {
@@ -148,6 +201,7 @@ class RunPublicationFlow(RunPublicationShared):
             self._save(state)
             return True
         publication.pop("artifact", None)
+        publication.pop("write_intent", None)
         publication["last_publication_error"] = str(error)
         publication["phase"] = "pending"
         self._save(state)
@@ -256,6 +310,7 @@ class RunPublicationFlow(RunPublicationShared):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")
         run_head = self.git.resolve(str(state["run_branch"]))
+        narrative = self._render_final_run_pr_body(state, artifact.pr_body_markdown)
         known_pr = publication.get("pr_number")
         existing = (
             known_pr
@@ -268,23 +323,33 @@ class RunPublicationFlow(RunPublicationShared):
         run_head = self.git.resolve(str(state["run_branch"]))
         if existing is not None and not self._final_pr_is_current(existing, run_head):
             return self._invalidate_for_fresh_acceptance(state)
+        write_intent_resolved = False
+        if isinstance(publication.get("write_intent"), dict):
+            if not self._write_intent_matches(existing, artifact.pr_title, narrative):
+                return self._save(state)
+            publication.pop("write_intent", None)
+            write_intent_resolved = True
         pr_number = existing
         if pr_number is None:
+            self._persist_write_intent(state, publication, "create_final_pr")
             pr_number = self.github.ensure_run_pr(
                 branch=str(state["run_branch"]),
                 base_branch=self.default_branch,
                 title=artifact.pr_title,
-                body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+                body=narrative,
             )
-        else:
+            publication.pop("write_intent", None)
+        elif not write_intent_resolved:
+            self._persist_write_intent(state, publication, "refresh_final_pr_narrative")
             self.github.refresh_run_pr_narrative(
                 pr_number=pr_number,
                 expected_head_sha=run_head,
                 expected_base_branch=self.default_branch,
                 expected_base_sha=self.default_head_sha,
                 title=artifact.pr_title,
-                body=self._render_final_run_pr_body(state, artifact.pr_body_markdown),
+                body=narrative,
             )
+            publication.pop("write_intent", None)
         live = self.github.live_pull_request(pr_number)
         if not self._final_pr_is_current(pr_number, run_head):
             return self._invalidate_for_fresh_acceptance(state)

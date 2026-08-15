@@ -6,18 +6,18 @@ from dataclasses import dataclass
 from time import monotonic, sleep
 from typing import Any, Callable
 
+from agent_run.error_safety import bounded_error
+
 CHECKS_BUDGET_SECONDS = 45 * 60
 GITHUB_CONVERGENCE_BUDGET_SECONDS = 10 * 60
 POLL_INTERVAL_SECONDS = 5
 _RESUMABLE_STATUSES = frozenset({"waiting_checks", "waiting_merge", "waiting_external"})
-_NON_CONVERGING_GITHUB_ERRORS = frozenset(
+_PROVEN_GITHUB_STATE_CONTRADICTIONS = frozenset(
     {
         "ambiguous_run_pr",
-        "github_invalid_response",
         "invalid_fixture",
         "invalid_parent",
         "missing_parent",
-        "missing_pull_request",
         "stale_run_pr",
     }
 )
@@ -76,29 +76,32 @@ class ExternalSupervisor:
         elapsed = max(0, int(self.now() - started))
         if elapsed >= boundary.budget_seconds:
             resume_status = state.get("status")
+            last_error = _last_external_error(state)
+            supervision_wait: dict[str, Any] = {
+                "resume_status": resume_status,
+                "kind": boundary.kind,
+                "waiting_for": boundary.waiting_for,
+                "phase": _phase(state),
+                "elapsed_seconds": elapsed,
+                "budget_seconds": boundary.budget_seconds,
+            }
+            diagnostic: dict[str, Any] = {
+                "code": "supervision_timeout",
+                "message": "外部状态在本次监督窗口内未收敛",
+                "waiting_for": boundary.waiting_for,
+                "phase": _phase(state),
+                "elapsed_seconds": elapsed,
+                "budget_seconds": boundary.budget_seconds,
+                "next_action": "重新执行 agent-run run 或 agent-run resume 以开始新的等待窗口",
+            }
+            if last_error is not None:
+                diagnostic["last_error"] = last_error
             state.update(
                 {
                     "status": "supervision_timeout",
                     "terminal_kind": "supervision_timeout",
-                    "supervision_wait": {
-                        "resume_status": resume_status,
-                        "kind": boundary.kind,
-                        "waiting_for": boundary.waiting_for,
-                        "phase": _phase(state),
-                        "elapsed_seconds": elapsed,
-                        "budget_seconds": boundary.budget_seconds,
-                    },
-                    "diagnostics": [
-                        {
-                            "code": "supervision_timeout",
-                            "message": "外部状态在本次监督窗口内未收敛",
-                            "waiting_for": boundary.waiting_for,
-                            "phase": _phase(state),
-                            "elapsed_seconds": elapsed,
-                            "budget_seconds": boundary.budget_seconds,
-                            "next_action": "重新执行 agent-run run 或 agent-run resume 以开始新的等待窗口",
-                        }
-                    ],
+                    "supervision_wait": supervision_wait,
+                    "diagnostics": [diagnostic],
                 }
             )
             return False
@@ -130,9 +133,15 @@ def is_supervised_wait(state: dict[str, Any]) -> bool:
 
 
 def is_github_convergence_error(code: str) -> bool:
-    """Whether a GitHub read error can reasonably resolve by polling."""
+    """Whether a GitHub read failure remains safe to reconcile by polling.
 
-    return code not in _NON_CONVERGING_GITHUB_ERRORS
+    GitHub adapters preserve structured contradictions in ``code``. Every
+    other read failure is deliberately treated as an unknown external state:
+    the Harness records it and retries bounded reads, rather than inferring a
+    network, authentication, permission, or proxy cause from command output.
+    """
+
+    return code not in _PROVEN_GITHUB_STATE_CONTRADICTIONS
 
 
 def is_github_refresh_wait(state: dict[str, Any]) -> bool:
@@ -153,12 +162,26 @@ def wait_for_github_convergence(
             "diagnostics": [
                 {
                     "code": code,
-                    "message": message,
+                    "message": bounded_error(message),
                     "waiting_for": waiting_for,
                 }
             ],
         }
     )
+
+
+def _last_external_error(state: dict[str, Any]) -> dict[str, str] | None:
+    diagnostics = state.get("diagnostics")
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return None
+    latest = diagnostics[0]
+    if not isinstance(latest, dict):
+        return None
+    code = latest.get("code")
+    message = latest.get("message")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return None
+    return {"code": code, "message": bounded_error(message)}
 
 
 def wait_for_github_refresh(

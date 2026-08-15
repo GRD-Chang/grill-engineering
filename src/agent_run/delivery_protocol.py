@@ -110,6 +110,10 @@ class GitHubPublisher(Protocol):
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]: ...
 
+    def run_pr_narrative_matches(
+        self, pr_number: int, *, title: str, body: str
+    ) -> bool: ...
+
     def record_acceptance(
         self, pr_number: int, record: dict[str, Any]
     ) -> None: ...
