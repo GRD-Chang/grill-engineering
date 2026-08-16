@@ -520,7 +520,11 @@ class Controller:
                     "terminal_kind": "execution_failed",
                     "diagnostics": [
                         {
-                            "code": "command_failed",
+                            "code": (
+                                "worker_credential_renewal_failed"
+                                if "worker_credential_renewal_failed:" in message
+                                else "command_failed"
+                            ),
                             "message": bounded_error(message),
                         }
                     ],

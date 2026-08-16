@@ -258,6 +258,34 @@ def test_repository_hint_guards_failure_record_when_remote_is_unavailable(
     assert recorded["terminal_kind"] == "execution_failed"
 
 
+def test_credential_renewal_failure_uses_a_recoverable_diagnostic(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _issue(2)})
+    store = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    ).start(1)
+    run_id = str(state["run_id"])
+
+    assert Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    ).record_execution_failure(
+        run_id,
+        "Worker GitHub read credential error: worker_credential_renewal_failed: retries exhausted; token=[REDACTED]",
+    )
+
+    recorded = store.load_run(run_id)
+    assert recorded is not None
+    assert recorded["terminal_kind"] == "execution_failed"
+    assert recorded["diagnostics"] == [
+        {
+            "code": "worker_credential_renewal_failed",
+            "message": "Worker GitHub read credential error: worker_credential_renewal_failed: retries exhausted; token=[REDACTED]",
+        }
+    ]
+
+
 def test_resume_waits_for_repository_binding_to_recover(git_repo: Path) -> None:
     store = StateStore(git_repo / ".agent-run")
     fixture = write_fixture(git_repo / "github.json", issues={"2": _issue(2)})

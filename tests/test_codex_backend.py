@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -33,6 +34,11 @@ from agent_run.worker_sandbox import (
     bubblewrap_command,
     run_worker_process,
     worker_environment,
+)
+from agent_run.worker_credentials import (
+    ReadCredential,
+    WorkerCredentialChannel,
+    _is_allowed_gh_read,
 )
 
 
@@ -543,7 +549,7 @@ def test_codex_worker_environment_excludes_publisher_credentials(
     )
 
     assert result.thread_id == "thread-1"
-    assert captured["GH_TOKEN"] == "reader-secret"
+    assert "GH_TOKEN" not in captured
     assert "GITHUB_TOKEN" not in captured
     assert "GH_ENTERPRISE_TOKEN" not in captured
     assert "GITHUB_ENTERPRISE_TOKEN" not in captured
@@ -553,10 +559,48 @@ def test_codex_worker_environment_excludes_publisher_credentials(
     assert "AGENT_RUN_GITHUB_READ_PERMISSIONS" not in captured
     assert captured["GIT_TERMINAL_PROMPT"] == "0"
     assert captured["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert captured["PATH"].split(os.pathsep)[0].endswith("gh-adapter")
     assert "--dangerously-bypass-approvals-and-sandbox" in captured_arguments
     assert "--sandbox" not in captured_arguments
     assert gh_config is not None and not gh_config.exists()
     assert os.environ["GH_TOKEN"] == "publisher-secret"
+
+
+def test_codex_worker_uses_three_hour_wall_clock_limit(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    timeouts: list[int] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        timeouts.append(options["timeout"])
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Implemented and tested.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"thread-1"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {"checkout": str(checkout), "ticket": {"number": 3}}
+    )
+
+    assert timeouts == [3 * 60 * 60]
 
 
 def test_codex_prompts_require_independent_development_and_acceptance_lanes(
@@ -1147,7 +1191,13 @@ def test_controller_mints_token_with_exact_read_permissions(
         "statuses": "read",
     }
     response = io.BytesIO(
-        json.dumps({"token": "minted-reader", "permissions": permissions}).encode()
+        json.dumps(
+            {
+                "token": "minted-reader",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": permissions,
+            }
+        ).encode()
     )
     captured: dict[str, Any] = {}
 
@@ -1212,6 +1262,7 @@ def test_controller_rejects_minted_token_with_different_permissions(
         json.dumps(
             {
                 "token": "over-scoped",
+                "expires_at": "2030-01-01T00:00:00Z",
                 "permissions": permissions,
             }
         ).encode()
@@ -1816,6 +1867,206 @@ def test_worker_uses_gh_for_authenticated_remote_read(
         "path": "/api/v3/repos/example/project/issues/3",
         "authorization": "token reader-secret",
     }
+
+
+def test_worker_gh_adapter_retries_one_expired_read_with_a_renewed_token(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    certificate = tmp_path / "localhost.crt"
+    private_key = tmp_path / "localhost.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(private_key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    authorizations: list[str] = []
+
+    class IssueHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            authorization = self.headers.get("Authorization", "")
+            authorizations.append(authorization)
+            if authorization == "token reader-one" and len(authorizations) > 1:
+                body = json.dumps({"message": "Bad credentials"}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if authorization not in {"token reader-one", "token reader-two"}:
+                self.send_response(403)
+                self.end_headers()
+                return
+            body = json.dumps({"number": 3}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), IssueHandler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(certificate, private_key)
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    issued = iter(
+        (
+            ReadCredential("reader-one", time.time() + 3600),
+            ReadCredential("reader-two", time.time() + 3600),
+        )
+    )
+    worker = tmp_path / "codex-worker"
+    worker.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+
+output = sys.argv[sys.argv.index("--output-last-message") + 1]
+if os.path.exists("/proc/" + os.environ["AGENT_RUN_TEST_HOST_PID"]):
+    raise RuntimeError("Worker can inspect the Controller process")
+for _ in range(2):
+    subprocess.run(
+        ["gh", "api", "repos/example/project/issues/3", "--jq", ".number"],
+        check=True,
+    )
+with open(output, "w", encoding="utf-8") as result:
+    json.dump({"result_kind": "development", "summary": "ok", "human_blockers": None}, result)
+print('{"type":"thread.started","thread_id":"credential-e2e-thread"}')
+""",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    monkeypatch.setenv("GH_HOST", f"localhost:{server.server_port}")
+    monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
+    monkeypatch.setenv("AGENT_RUN_TEST_HOST_PID", str(os.getpid()))
+    try:
+        output, thread_id = CodexCliBackend(
+            executable=str(worker), credential_provider=lambda: next(issued)
+        )._invoke(
+            prompt="controlled credential-renewal E2E",
+            checkout=git_repo,
+            thread_id=None,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert json.loads(output)["result_kind"] == "development"
+    assert thread_id == "credential-e2e-thread"
+    assert authorizations == [
+        "token reader-one",
+        "token reader-one",
+        "token reader-two",
+    ]
+
+
+def test_worker_credential_channel_reports_a_recoverable_renewal_pause(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    attempts = 0
+
+    def provider() -> ReadCredential:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return ReadCredential("reader-one", now[0] + 60)
+        raise RuntimeError("token=renewal-secret unavailable")
+
+    socket_path = tmp_path / "credential.sock"
+    with WorkerCredentialChannel(
+        provider,
+        clock=lambda: now[0],
+        renewal_window=0,
+    ) as credentials:
+        credentials.start(socket_path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(str(socket_path))
+            connection.sendall(b"get")
+            size = int.from_bytes(connection.recv(4), "big")
+            response = json.loads(connection.recv(size))
+
+    assert "error" in response
+    assert "reader-one" not in response["error"]
+    assert "renewal-secret" not in response["error"]
+
+
+def test_worker_credential_channel_renews_proactively_and_recovers_transient_failure(
+    tmp_path: Path,
+) -> None:
+    renewed = threading.Event()
+    failed_once = threading.Event()
+    calls = 0
+
+    def provider() -> ReadCredential:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReadCredential("reader-one", time.time() + 5)
+        if calls == 2:
+            failed_once.set()
+            raise RuntimeError("temporary issuer outage")
+        renewed.set()
+        return ReadCredential("reader-two", time.time() + 3600)
+
+    socket_path = tmp_path / "credential.sock"
+    with WorkerCredentialChannel(provider, renewal_margin=10) as credentials:
+        credentials.start(socket_path)
+        assert failed_once.wait(timeout=2)
+        assert renewed.wait(timeout=2)
+
+    assert calls == 3
+
+
+def test_worker_gh_adapter_rejects_token_and_write_commands() -> None:
+    for arguments in (
+        ["auth", "token"],
+        ["issue", "edit", "1", "--title", "changed"],
+        ["pr", "merge", "1", "--merge"],
+        ["workflow", "run", "build.yml"],
+        ["api", "repos/example/project/issues/1", "--method=POST"],
+        ["api", "repos/example/project/issues/1", "-f", "title=changed"],
+        ["api", "repos/example/project/issues/1", "--input", "body.json"],
+        ["api", "repos/example/project/issues/1", "-X=POST"],
+        ["api", "repos/example/project/issues/1", "-XPOST"],
+        ["api", "repos/example/project/issues/1", "--hostname", "outside.example"],
+        ["api", "repos/example/project/issues/1", "--hostname=outside.example"],
+    ):
+        assert not _is_allowed_gh_read(arguments)
+    for arguments in (
+        ["issue", "view", "1"],
+        ["pr", "checks", "1"],
+        ["run", "view", "1"],
+        ["api", "repos/example/project/issues/1"],
+        ["api", "repos/example/project/issues/1", "--method=GET"],
+    ):
+        assert _is_allowed_gh_read(arguments)
 
 
 def test_sigint_terminates_worker_process_group(

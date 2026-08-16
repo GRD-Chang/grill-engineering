@@ -4,12 +4,13 @@ import base64
 import json
 import os
 import subprocess
-import tempfile
 import time
+from datetime import datetime
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any
+
+from agent_run.worker_credentials import ReadCredential
 
 
 class GitHubCredentialError(RuntimeError):
@@ -28,6 +29,10 @@ _REQUIRED_READ_PERMISSIONS = {
 
 
 def mint_read_only_installation_token() -> str:
+    return mint_read_only_installation_credential().token
+
+
+def mint_read_only_installation_credential() -> ReadCredential:
     app_id = os.environ.get("AGENT_RUN_GITHUB_APP_ID", "").strip()
     installation_id = os.environ.get(
         "AGENT_RUN_GITHUB_APP_INSTALLATION_ID", ""
@@ -67,14 +72,23 @@ def mint_read_only_installation_token() -> str:
     if not isinstance(loaded, dict):
         raise GitHubCredentialError("GitHub token response is invalid")
     token = loaded.get("token")
+    expires_at = loaded.get("expires_at")
     permissions = loaded.get("permissions")
     if not isinstance(token, str) or not token.strip():
         raise GitHubCredentialError("GitHub token response has no token")
+    if not isinstance(expires_at, str):
+        raise GitHubCredentialError("GitHub token response has no expiry")
     if permissions != _REQUIRED_READ_PERMISSIONS:
         raise GitHubCredentialError(
             "GitHub did not grant the exact worker read permissions"
         )
-    return token
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+    except ValueError as error:
+        raise GitHubCredentialError("GitHub token response has an invalid expiry") from error
+    if expiry <= time.time():
+        raise GitHubCredentialError("GitHub token response has an expired token")
+    return ReadCredential(token=token, expires_at=expiry)
 
 
 def _create_app_jwt(app_id: str, private_key: str) -> str:
@@ -82,22 +96,17 @@ def _create_app_jwt(app_id: str, private_key: str) -> str:
     header = _base64url({"alg": "RS256", "typ": "JWT"})
     payload = _base64url({"iat": now - 60, "exp": now + 540, "iss": app_id})
     signing_input = f"{header}.{payload}"
-    key_path: Path | None = None
+    key_fd: int | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix="agent-run-app-key-",
-            delete=False,
-        ) as key_file:
-            key_file.write(private_key)
-            key_path = Path(key_file.name)
-        key_path.chmod(0o600)
+        key_fd = os.memfd_create("agent-run-app-key", os.MFD_CLOEXEC)
+        os.write(key_fd, private_key.encode())
+        os.lseek(key_fd, 0, os.SEEK_SET)
         signed = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", str(key_path)],
+            ["openssl", "dgst", "-sha256", "-sign", f"/proc/self/fd/{key_fd}"],
             input=signing_input.encode(),
             capture_output=True,
             check=False,
+            pass_fds=(key_fd,),
         )
         if signed.returncode != 0:
             raise GitHubCredentialError("could not sign GitHub App JWT")
@@ -106,8 +115,8 @@ def _create_app_jwt(app_id: str, private_key: str) -> str:
     except OSError as error:
         raise GitHubCredentialError("OpenSSL is required to sign App JWTs") from error
     finally:
-        if key_path is not None:
-            key_path.unlink(missing_ok=True)
+        if key_fd is not None:
+            os.close(key_fd)
 
 
 def _base64url(value: dict[str, Any]) -> str:

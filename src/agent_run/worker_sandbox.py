@@ -57,6 +57,78 @@ def worker_environment(
     return environment
 
 
+def worker_credential_environment(
+    gh_config: Path, adapter_directory: Path
+) -> dict[str, str]:
+    """Create a Worker environment whose `gh` obtains credentials on demand."""
+
+    environment = worker_environment(gh_config, "placeholder")
+    environment.pop("GH_TOKEN", None)
+    adapter_directory.mkdir(parents=True, exist_ok=True)
+    environment["PATH"] = str(adapter_directory) + os.pathsep + environment.get(
+        "PATH", os.defpath
+    )
+    return environment
+
+
+def create_gh_access_adapter(
+    adapter_directory: Path, socket_path: Path, environment: dict[str, str]
+) -> Path:
+    """Write the temporary Worker-local `gh` adapter without persisting a token."""
+
+    real_gh = shutil.which("gh", path=environment.get("PATH"))
+    if real_gh is None:
+        raise WorkerSandboxError("gh is required for Worker GitHub reads")
+    adapter = adapter_directory / "gh"
+    adapter.write_text(
+        _gh_adapter_script(real_gh, socket_path), encoding="utf-8"
+    )
+    adapter.chmod(0o700)
+    return adapter
+
+
+def _gh_adapter_script(real_gh: str, socket_path: Path) -> str:
+    return f'''#!/usr/bin/env python3
+import json
+import socket
+import sys
+
+SOCKET_PATH = {str(socket_path)!r}
+
+def channel(arguments):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.connect(SOCKET_PATH)
+        connection.sendall(json.dumps({{"kind": "run", "arguments": arguments}}).encode())
+        size = int.from_bytes(read_exact(connection, 4), "big")
+        if size > 16 * 1024 * 1024:
+            raise RuntimeError("Worker GitHub read response exceeded the size limit")
+        response = json.loads(read_exact(connection, size))
+    if "error" in response:
+        raise RuntimeError(response["error"])
+    return response
+
+def read_exact(connection, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            raise RuntimeError("Worker GitHub credential channel closed early")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+try:
+    result = channel(sys.argv[1:])
+    sys.stdout.write(result["stdout"])
+    sys.stderr.write(result["stderr"])
+    raise SystemExit(result["returncode"])
+except (OSError, ValueError, RuntimeError) as error:
+    sys.stderr.write("Worker GitHub read credential error: " + str(error) + "\\n")
+    raise SystemExit(1)
+'''
+
+
 def bubblewrap_command(
     command: list[str],
     *,
@@ -79,6 +151,7 @@ def bubblewrap_command(
         "/",
         "--dev",
         "/dev",
+        "--unshare-pid",
         "--proc",
         "/proc",
         "--bind",
@@ -240,6 +313,9 @@ def run_worker_process(
     environment: dict[str, str],
     timeout: int,
     on_stdout_line: Callable[[str], None] | None = None,
+    abort_event: threading.Event | None = None,
+    abort_reason: Callable[[], str] | None = None,
+    on_process_started: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         arguments,
@@ -251,6 +327,8 @@ def run_worker_process(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    if on_process_started is not None:
+        on_process_started(process.pid)
     if on_stdout_line is None:
         try:
             stdout, stderr = process.communicate(input=prompt, timeout=timeout)
@@ -308,7 +386,14 @@ def run_worker_process(
     try:
         stdin.write(prompt)
         stdin.close()
-        process.wait(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if abort_event is not None and abort_event.is_set():
+                wait_error = WorkerSandboxError(
+                    abort_reason() if abort_reason is not None else "Worker read credential renewal expired"
+                )
+                break
+            process.wait(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
     except subprocess.TimeoutExpired as error:
         wait_error = WorkerSandboxError("Codex worker timed out")
         wait_error.__cause__ = error
