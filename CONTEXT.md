@@ -8,6 +8,10 @@
 在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。它不持有 GitHub 写凭证，也不具备外部交付状态的变更权限。
 _Avoid_: GitHub Bot、Publisher、Mutation Authority
 
+**Worker 只读凭据续签（Worker Read Credential Renewal）**:
+一个最长三小时的 Codex Worker 在读取 GitHub 前获得短期、只读的 GitHub App installation token。Controller 在 token 即将失效时自动换发；换发出现短暂失败时在十分钟内有界重试。只有旧 token 已失效且重试仍失败，Worker 才以可恢复的凭据失败暂停。Worker 不获得 App 私钥或 Publisher 写凭据。
+_Avoid_: 延长 installation token 的有效期、向 Worker 暴露 App 私钥、无限重试、直接中断
+
 **Agent Artifact（Agent 产物）**:
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
 _Avoid_: GitHub 状态、完成证明、自由文本交接
