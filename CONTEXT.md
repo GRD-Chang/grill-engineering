@@ -9,7 +9,7 @@
 _Avoid_: GitHub Bot、Publisher、Mutation Authority
 
 **Worker 只读凭据续签（Worker Read Credential Renewal）**:
-一个最长三小时的 Codex Worker 在读取 GitHub 前获得短期、只读的 GitHub App installation token。Controller 在 token 即将失效时自动换发；换发出现短暂失败时在十分钟内有界重试。只有旧 token 已失效且重试仍失败，Worker 才以可恢复的凭据失败暂停。Worker 不获得 App 私钥或 Publisher 写凭据。
+一个最长三小时的 Codex Worker 通过临时 `gh` adapter 请求 GitHub 读取；Controller 以短期、只读的 GitHub App installation token 执行经过固定读取规则校验的请求。每次读取有界超时，Worker 结束或凭据续签耗尽时 Controller 会清理仍在执行的读取进程。Controller 在 token 即将失效时自动换发；换发出现短暂失败时在十分钟内有界重试。只有旧 token 已失效且重试仍失败，Worker 才以可恢复的凭据失败暂停。Worker 不获得 token、App 私钥或 Publisher 写凭据。
 _Avoid_: 延长 installation token 的有效期、向 Worker 暴露 App 私钥、无限重试、直接中断
 
 **Agent Artifact（Agent 产物）**:
@@ -79,7 +79,7 @@ mutation 则是 Human Blocker。
 _Avoid_: Agent 判断是否 stale、Thread 连续性、自动 rebase
 
 **Execution Guard（执行约束）**:
-Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用完整真实 Git/`gh` CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。它只通过只读权威 Git metadata 和不向 Worker 注入 Publisher 写凭据保留 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回不含 URL 或凭据的固定错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
+Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用真实 Git CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。Worker 的 `gh` 是临时 adapter：只把固定的只读 GitHub 请求交给 Controller，token 不进入 Worker；这是一条凭据边界，不是对 Worker 其他命令或网络的 allowlist。Execution Guard 还通过只读权威 Git metadata 和不向 Worker 注入 Publisher 写凭据保留 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回不含 URL 或凭据的固定错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:

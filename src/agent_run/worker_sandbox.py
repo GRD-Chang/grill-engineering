@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+from agent_run.worker_credentials import WORKER_GH_RESPONSE_TIMEOUT_SECONDS
+
 
 class WorkerSandboxError(RuntimeError):
     pass
@@ -76,18 +78,15 @@ def create_gh_access_adapter(
 ) -> Path:
     """Write the temporary Worker-local `gh` adapter without persisting a token."""
 
-    real_gh = shutil.which("gh", path=environment.get("PATH"))
-    if real_gh is None:
-        raise WorkerSandboxError("gh is required for Worker GitHub reads")
     adapter = adapter_directory / "gh"
     adapter.write_text(
-        _gh_adapter_script(real_gh, socket_path), encoding="utf-8"
+        _gh_adapter_script(socket_path), encoding="utf-8"
     )
     adapter.chmod(0o700)
     return adapter
 
 
-def _gh_adapter_script(real_gh: str, socket_path: Path) -> str:
+def _gh_adapter_script(socket_path: Path) -> str:
     return f'''#!/usr/bin/env python3
 import json
 import socket
@@ -97,8 +96,13 @@ SOCKET_PATH = {str(socket_path)!r}
 
 def channel(arguments):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
         connection.connect(SOCKET_PATH)
-        connection.sendall(json.dumps({{"kind": "run", "arguments": arguments}}).encode())
+        payload = json.dumps({{"kind": "run", "arguments": arguments}}).encode()
+        if len(payload) > 16 * 1024 * 1024:
+            raise RuntimeError("Worker GitHub read request exceeded the size limit")
+        connection.sendall(len(payload).to_bytes(4, "big") + payload)
+        connection.settimeout({WORKER_GH_RESPONSE_TIMEOUT_SECONDS!r})
         size = int.from_bytes(read_exact(connection, 4), "big")
         if size > 16 * 1024 * 1024:
             raise RuntimeError("Worker GitHub read response exceeded the size limit")
@@ -329,20 +333,6 @@ def run_worker_process(
     )
     if on_process_started is not None:
         on_process_started(process.pid)
-    if on_stdout_line is None:
-        try:
-            stdout, stderr = process.communicate(input=prompt, timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            _terminate_process_group(process)
-            raise WorkerSandboxError("Codex worker timed out") from error
-        except BaseException:
-            _terminate_process_group(process)
-            raise
-        _terminate_process_group(process)
-        return subprocess.CompletedProcess(
-            arguments, process.returncode, stdout, stderr
-        )
-
     stdin = process.stdin
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr
@@ -353,12 +343,13 @@ def run_worker_process(
     stderr_parts: list[str] = []
     callback_errors: list[BaseException] = []
     reader_errors: list[BaseException] = []
+    writer_errors: list[BaseException] = []
 
     def read_stdout() -> None:
         try:
             for line in stdout_pipe:
                 stdout_lines.append(line)
-                if not callback_errors:
+                if on_stdout_line is not None and not callback_errors:
                     try:
                         on_stdout_line(line)
                     except BaseException as error:
@@ -370,6 +361,15 @@ def run_worker_process(
     def read_stderr() -> None:
         stderr_parts.append(stderr_pipe.read())
 
+    def write_stdin() -> None:
+        try:
+            stdin.write(prompt)
+            stdin.close()
+        except BrokenPipeError:
+            return
+        except BaseException as error:
+            writer_errors.append(error)
+
     stdout_reader = threading.Thread(
         target=read_stdout,
         daemon=True,
@@ -380,12 +380,16 @@ def run_worker_process(
         daemon=True,
         name=f"agent-run-worker-{process.pid}-stderr",
     )
+    stdin_writer = threading.Thread(
+        target=write_stdin,
+        daemon=True,
+        name=f"agent-run-worker-{process.pid}-stdin",
+    )
     stdout_reader.start()
     stderr_reader.start()
+    stdin_writer.start()
     wait_error: BaseException | None = None
     try:
-        stdin.write(prompt)
-        stdin.close()
         deadline = time.monotonic() + timeout
         while process.poll() is None:
             if abort_event is not None and abort_event.is_set():
@@ -393,14 +397,19 @@ def run_worker_process(
                     abort_reason() if abort_reason is not None else "Worker read credential renewal expired"
                 )
                 break
-            process.wait(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
-    except subprocess.TimeoutExpired as error:
-        wait_error = WorkerSandboxError("Codex worker timed out")
-        wait_error.__cause__ = error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                wait_error = WorkerSandboxError("Codex worker timed out")
+                break
+            try:
+                process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
     except BaseException as error:
         wait_error = error
     finally:
         _terminate_process_group(process)
+        stdin_writer.join(timeout=1)
         stdout_reader.join(timeout=1)
         stderr_reader.join(timeout=1)
         if stdout_reader.is_alive():
@@ -415,6 +424,8 @@ def run_worker_process(
         raise wait_error
     if reader_errors:
         raise reader_errors[0]
+    if writer_errors:
+        raise writer_errors[0]
     return subprocess.CompletedProcess(
         arguments,
         process.returncode,

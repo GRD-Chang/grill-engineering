@@ -281,6 +281,66 @@ def test_parent_only_resume_accepts_generation_one(
     assert store.load_run(run_id) == resumed
 
 
+def test_resume_reopens_a_development_invocation_after_credential_failure(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": _ticket(3)})
+    store = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    )
+    state, _ = controller.start(1)
+    run_id = str(state["run_id"])
+    job = state["ticket_jobs"]["3"]
+    job.update(
+        {
+            "phase": "developing",
+            "ticket_branch_generation": 1,
+            "development_thread_id": "development-thread",
+        }
+    )
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "diagnostics": [
+                {
+                    "code": "worker_credential_renewal_failed",
+                    "message": "worker credential renewal failed",
+                }
+            ],
+            "active_agent_invocation": {
+                "role": "development",
+                "work_subject": "ticket:3",
+                "generation": 1,
+                "phase": "developing",
+                "mode": "fresh",
+                "input_fingerprint": "sha256:" + "0" * 64,
+                "currentness_boundary": {},
+                "status": "failed",
+                "requested_thread_id": "development-thread",
+                "reported_thread_id": "development-thread",
+                "attempt_count": 1,
+                "started_at": "2026-08-17T00:00:00+00:00",
+                "ended_at": "2026-08-17T00:01:00+00:00",
+                "error": "worker credential renewal failed",
+                "return_code": 1,
+                "signal": None,
+            },
+        }
+    )
+    store.save_run(run_id, state)
+
+    resumed, reused = controller.resume(run_id)
+
+    assert reused
+    assert resumed["status"] == "active"
+    assert resumed["terminal_kind"] is None
+    assert resumed["diagnostics"] == []
+    assert resumed["active_agent_invocation"]["status"] == "resuming"
+    assert resumed["ticket_jobs"]["3"]["development_failure_resume"] is True
+
+
 @pytest.mark.parametrize(
     ("subject_kind", "invocation_generation"),
     [

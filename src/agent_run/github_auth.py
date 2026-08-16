@@ -10,7 +10,10 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from agent_run.worker_credentials import ReadCredential
+from agent_run.worker_credentials import (
+    ReadCredential,
+    WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS,
+)
 
 
 class GitHubCredentialError(RuntimeError):
@@ -63,7 +66,9 @@ def mint_read_only_installation_credential() -> ReadCredential:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(
+            request, timeout=WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS
+        ) as response:
             loaded: object = json.load(response)
     except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as error:
         raise GitHubCredentialError(
@@ -107,12 +112,13 @@ def _create_app_jwt(app_id: str, private_key: str) -> str:
             capture_output=True,
             check=False,
             pass_fds=(key_fd,),
+            timeout=WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS,
         )
         if signed.returncode != 0:
             raise GitHubCredentialError("could not sign GitHub App JWT")
         signature = base64.urlsafe_b64encode(signed.stdout).rstrip(b"=").decode()
         return f"{signing_input}.{signature}"
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise GitHubCredentialError("OpenSSL is required to sign App JWTs") from error
     finally:
         if key_fd is not None:
