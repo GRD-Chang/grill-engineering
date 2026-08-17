@@ -827,6 +827,12 @@ def _development_contract(context: dict[str, Any]) -> str:
     return (
         _issue_context_instruction(context)
         + "\n\n"
+        + "Controller 负责编排、校验和 CI 监督；Controller 完成校验和调度后，Publisher 创建 append-only "
+        "Candidate，执行发布、PR 以及全部 Git/GitHub 写入；"
+        "Codex 只能编辑当前受管工作树，不得进行 Git 历史操作、暂存、提交、推送、合并或 "
+        "GitHub 写入。修复可以删除、恢复或改写先前 Candidate 引入的内容；较小的最终 diff "
+        "仍是正常修复。Controller 不判断任何 Finding 是否可由工作树修复。"
+        + "\n\n"
         + _human_blocker_instruction()
         + "\n\n阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置尽量"
         "采用 TDD。运行相关单测、typecheck、lint 和完整测试套件，并从真实用户入口"

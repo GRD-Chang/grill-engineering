@@ -101,6 +101,31 @@ def repair_acceptance(thread_id: str) -> dict[str, object]:
     }
 
 
+def out_of_scope_repair_acceptance(thread_id: str) -> dict[str, object]:
+    return {
+        "thread_id": thread_id,
+        "checks": {
+            "e2e": {
+                "status": "fail",
+                "evidence": "out-of-scope.txt exists in the first candidate.",
+                "findings": [
+                    "问题：Candidate 包含范围外文件 out-of-scope.txt；证据：文件存在；必须修复：删除 out-of-scope.txt；复验：确认文件不存在。"
+                ],
+            },
+            "standards": {
+                "status": "pass",
+                "evidence": STANDARDS_PASS_EVIDENCE,
+                "findings": [],
+            },
+            "spec": {
+                "status": "pass",
+                "evidence": SPEC_PASS_EVIDENCE,
+                "findings": [],
+            },
+        },
+    }
+
+
 def human_blocker_step(thread_id: str) -> dict[str, object]:
     return {
         "expected_thread_id": None,
@@ -1383,6 +1408,101 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     replay_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(replay_fixture["delivery"]["pull_requests"]) == 1
     assert replay_fixture["delivery"]["closed_issues"] == [3]
+
+
+def test_forward_candidate_repair_removes_prior_out_of_scope_file(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = git_repo / "forward-candidate-repair.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-1",
+                        "summary": "Created the initial candidate.",
+                        "write_files": {
+                            "feature.txt": "intended\n",
+                            "out-of-scope.txt": "remove me\n",
+                        },
+                    },
+                    {
+                        "expected_thread_id": "developer-1",
+                        "thread_id": "developer-1",
+                        "expected_files": {
+                            "feature.txt": "intended\n",
+                            "out-of-scope.txt": "remove me\n",
+                        },
+                        "delete_files": ["out-of-scope.txt"],
+                        "summary": "Removed the out-of-scope file.",
+                    },
+                ],
+                "publications": [publication(), publication()],
+                "reviews": [
+                    out_of_scope_repair_acceptance("reviewer-1"),
+                    passing_acceptance(
+                        "reviewer-2", "The reduced candidate contains only feature.txt."
+                    ),
+                ],
+                "run_reviews": [
+                    passing_acceptance("run-reviewer-1", "The repaired Run passed.")
+                ],
+                "run_publications": [
+                    {
+                        "commit_message": "feat(run): publish the repaired delivery",
+                        "pr_title": "feat(run): publish the repaired delivery",
+                        "pr_body_markdown": "## What Problem This Solves\n\nRepair removed an out-of-scope file.\n\n## Why This Change Was Made\n\nCandidate repair keeps only requested content.\n\n## User Impact\n\nThe Run is ready for approval.\n\n## Evidence\n\nThe public Run flow passed.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    delivered = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
+
+    assert delivered.returncode == 0, delivered.stderr
+    assert stdout_json(delivered)["status"] == "run_approval_pending"
+    run_id = stdout_json(delivered)["run_id"]
+    job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    candidate_sha = str(job["candidate_sha"])
+    assert job["modification_attempts"] == 2
+    assert "human_blockers" not in job
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{candidate_sha}:feature.txt"],
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "cat-file", "-e", f"{candidate_sha}:out-of-scope.txt"],
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+    ).returncode != 0
+    assert subprocess.run(
+        ["git", "diff", "--name-status", str(job["base_sha"]), candidate_sha],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines() == ["A\tfeature.txt"]
+    assert subprocess.run(
+        ["git", "log", "--format=%s", "-2", candidate_sha],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines() == [
+        "chore(ticket-3): candidate 2",
+        "chore(ticket-3): candidate 1",
+    ]
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]
 
 
 @pytest.mark.parametrize(
