@@ -28,6 +28,10 @@ class GitHubPublisher(Protocol):
         recovery_remote_sha: str,
     ) -> None: ...
 
+    def link_issue_branch_display(
+        self, *, issue_number: int, branch: str, head_sha: str
+    ) -> str: ...
+
     def ensure_run_pr(
         self, *, branch: str, base_branch: str, title: str, body: str
     ) -> int: ...

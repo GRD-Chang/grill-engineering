@@ -94,6 +94,47 @@ class GhGitHubPublisher:
             recovery_remote_sha=recovery_remote_sha,
         )
 
+    def link_issue_branch_display(
+        self, *, issue_number: int, branch: str, head_sha: str
+    ) -> str:
+        """Create and exactly read back the optional Issue Linked Branch.
+
+        This uses GitHub's GraphQL API directly instead of ``gh issue develop``;
+        it neither reads nor writes local Git configuration.  The caller owns
+        the once-only intent and treats every API or readback failure as a
+        display-only unavailable result.
+        """
+        try:
+            issue = _mapping(
+                self._json(
+                    "issue", "view", str(issue_number), "--repo", self.repository, "--json", "id"
+                )
+            )
+            issue_id = _string(issue, "id")
+            mutation = (
+                "mutation($issueId: ID!, $name: String!, $oid: GitObjectID!) "
+                "{ createLinkedBranch(input: {issueId: $issueId, name: $name, oid: $oid}) "
+                "{ linkedBranch { ref { name target { oid } } } } }"
+            )
+            result = self._run(
+                "api", "graphql", "-f", f"query={mutation}",
+                "-F", f"issueId={issue_id}", "-F", f"name={branch}", "-F", f"oid={head_sha}",
+                retry=False,
+            )
+            if result.returncode != 0:
+                return "unavailable"
+            payload = _mapping(json.loads(result.stdout or "null"))
+            data = _mapping(payload.get("data"))
+            created = _mapping(data.get("createLinkedBranch"))
+            linked = _mapping(created.get("linkedBranch"))
+            ref = _mapping(linked.get("ref"))
+            target = _mapping(ref.get("target"))
+            if ref.get("name") == branch and target.get("oid") == head_sha:
+                return "linked"
+        except (GitHubReadError, OSError, json.JSONDecodeError):
+            pass
+        return "unavailable"
+
     def ensure_parent_branch(self, **authority: str) -> None:
         self.ensure_change_branch(**authority)
 

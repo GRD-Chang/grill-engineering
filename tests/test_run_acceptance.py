@@ -185,8 +185,17 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
     return state, states, git
 
 
+@pytest.mark.parametrize(
+    ("display_outcome", "expected_display_status"),
+    [
+        ("linked", "linked"),
+        ("api_error", "unavailable"),
+        ("empty", "unavailable"),
+        ("missing_readback", "unavailable"),
+    ],
+)
 def test_run_acceptance_repairs_then_rechecks_the_whole_run(
-    git_repo: Path,
+    git_repo: Path, display_outcome: str, expected_display_status: str
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
@@ -195,6 +204,7 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     data.setdefault("delivery", {}).setdefault("published_branches", {})[
         repair_branch
     ] = git.resolve(str(state["run_branch"]))
+    data["delivery"]["linked_branch_display_outcomes"] = display_outcome
     fixture.write_text(json.dumps(data), encoding="utf-8")
     agents = ScriptedRunAgents()
 
@@ -241,6 +251,13 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
         states.root / "worktrees" / str(state["run_id"]) / "run-repair"
     ).exists()
     repair_branch = run["completed_repair_jobs"][0]["repair_branch"]
+    assert run["completed_repair_jobs"][0]["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": expected_display_status,
+    }
+    assert fixture_data["delivery"]["linked_branches"] == (
+        {"1": repair_branch} if expected_display_status == "linked" else {}
+    )
     assert repair_branch not in fixture_data["delivery"]["published_branches"]
     with pytest.raises(GitError):
         git.resolve(repair_branch)
@@ -248,7 +265,11 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
 
 @pytest.mark.parametrize(
     "crash_key",
-    ["crash_after_ensure_change_branch_once", "crash_after_ensure_change_pr_once"],
+    [
+        "crash_after_ensure_change_branch_once",
+        "crash_after_ensure_change_pr_once",
+        "crash_after_link_issue_branch_display_once",
+    ],
 )
 def test_run_repair_recovers_lost_change_response_without_duplicate_worker(
     git_repo: Path, crash_key: str
@@ -273,8 +294,16 @@ def test_run_repair_recovers_lost_change_response_without_duplicate_worker(
 
     assert recovered["status"] == "run_publication_pending"
     assert len(agents.development_requests) == 1
-    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    pulls = delivery["pull_requests"]
     assert len(pulls) == 1
+    assert len(delivery.get("linked_branch_display_attempts", [])) == 1
+    expected_display_status = (
+        "indeterminate" if crash_key.endswith("display_once") else "linked"
+    )
+    assert recovered["run_acceptance"]["completed_repair_jobs"][0][
+        "linked_branch_display"
+    ] == {"display_attempted": True, "status": expected_display_status}
 
 
 def test_run_repair_rejects_a_same_named_foreign_ref_before_development(

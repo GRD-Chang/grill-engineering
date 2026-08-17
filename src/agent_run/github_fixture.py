@@ -157,6 +157,8 @@ class FixtureGitHubPublisher:
         if not isinstance(delivery, dict):
             raise ValueError("fixture delivery must be an object")
         delivery.setdefault("linked_branches", {})
+        delivery.setdefault("linked_branch_display_attempts", [])
+        delivery.setdefault("linked_branch_display_outcomes", "linked")
         delivery.setdefault("published_branches", {})
         delivery.setdefault("pull_requests", [])
         delivery.setdefault("closed_issues", [])
@@ -217,6 +219,27 @@ class FixtureGitHubPublisher:
             raise ValueError("fixture Ticket ref has a foreign identity")
         self._save()
         self._crash_once("ensure_ticket_branch")
+
+    def link_issue_branch_display(
+        self, *, issue_number: int, branch: str, head_sha: str
+    ) -> str:
+        delivery = self._delivery()
+        attempts = _mutable_list(delivery, "linked_branch_display_attempts")
+        attempts.append(
+            {"issue_number": issue_number, "branch": branch, "head_sha": head_sha}
+        )
+        configured = delivery.get("linked_branch_display_outcomes", "linked")
+        if isinstance(configured, list):
+            outcome = configured.pop(0) if configured else "linked"
+        else:
+            outcome = configured
+        if outcome == "linked":
+            _mutable_mapping(delivery, "linked_branches")[str(issue_number)] = branch
+        elif outcome not in {"api_error", "empty", "missing_readback"}:
+            raise ValueError("fixture linked branch display outcome is invalid")
+        self._save()
+        self._crash_once("link_issue_branch_display")
+        return "linked" if outcome == "linked" else "unavailable"
 
     def ensure_change_branch(
         self,

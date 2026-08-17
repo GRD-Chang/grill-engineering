@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -2071,6 +2072,80 @@ def test_ruleset_branch_globs_do_not_cross_path_segments() -> None:
     assert _matches_ref("refs/heads/release/v1", "refs/heads/release/*")
     assert not _matches_ref("refs/heads/release/v1/patch", "refs/heads/release/*")
     assert _matches_ref("refs/heads/release/v1/patch", "refs/heads/release/**")
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            {
+                "data": {
+                    "createLinkedBranch": {
+                        "linkedBranch": {
+                            "ref": {
+                                "name": "agent-run/run-1/ticket-3",
+                                "target": {"oid": "head"},
+                            }
+                        }
+                    }
+                }
+            },
+            "linked",
+        ),
+        ({"data": {"createLinkedBranch": {"linkedBranch": None}}}, "unavailable"),
+        (
+            {
+                "data": {
+                    "createLinkedBranch": {
+                        "linkedBranch": {
+                            "ref": {"name": "wrong", "target": {"oid": "head"}}
+                        }
+                    }
+                }
+            },
+            "unavailable",
+        ),
+    ],
+)
+def test_linked_branch_display_uses_graphql_and_requires_exact_readback(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+    expected: str,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    commands: list[tuple[str, ...]] = []
+    options: list[dict[str, object]] = []
+    before_config = subprocess.run(
+        ["git", "config", "--local", "--list"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    monkeypatch.setattr(publisher, "_json", lambda *_arguments: {"id": "I_1"})
+
+    def fake_run(*arguments: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        options.append(_kwargs)
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(response), "")
+
+    monkeypatch.setattr(publisher, "_run", fake_run)
+
+    assert publisher.link_issue_branch_display(
+        issue_number=3, branch="agent-run/run-1/ticket-3", head_sha="head"
+    ) == expected
+    assert commands and commands[0][:2] == ("api", "graphql")
+    assert all("develop" not in command for command in commands)
+    assert options == [{"retry": False}]
+    after_config = subprocess.run(
+        ["git", "config", "--local", "--list"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert after_config == before_config
 
 
 def _rev_parse(repository: Path, reference: str) -> str:

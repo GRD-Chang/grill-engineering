@@ -381,6 +381,7 @@ class RunAcceptanceEngine:
                 after_merge=self._after_repair_merge,
                 escalate=self._escalate_repair,
                 save=self._save,
+                linked_issue_number=lambda state, _job: int(self._mapping(state, "parent")["number"]),
             ),
         )
 
@@ -851,13 +852,15 @@ class RunAcceptanceEngine:
         completed_repairs = run.setdefault("completed_repair_jobs", [])
         if not isinstance(completed_repairs, list):
             raise ValueError("completed_repair_jobs must be a list")
-        completed_repairs.append(
-            {
-                "phase": "completed",
-                "repair_branch": job["repair_branch"],
-                "integrated_sha": integrated,
-            }
-        )
+        completed = {
+            "phase": "completed",
+            "repair_branch": job["repair_branch"],
+            "integrated_sha": integrated,
+        }
+        display = job.get("linked_branch_display")
+        if isinstance(display, dict):
+            completed["linked_branch_display"] = dict(display)
+        completed_repairs.append(completed)
         run.pop("repair_job", None)
         state["status"] = "run_acceptance_pending"
         state["diagnostics"] = []

@@ -68,6 +68,7 @@ class ParentDeliveryLoop:
                 after_merge=lambda _state, _job, _live: True,
                 escalate=self._escalate,
                 save=self._save,
+                linked_issue_number=lambda state, _job: int(_mapping(state, "parent")["number"]),
             ),
         )
 

@@ -748,6 +748,31 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
     assert fixture_data["delivery"]["closed_issues"] == [3]
 
 
+def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"crash_after_link_issue_branch_display_once": True},
+    )
+    agents = _run_agents(git_repo / "linked-branch-agents.json")
+
+    interrupted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert interrupted.returncode == 2
+
+    recovered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert recovered.returncode == 0, recovered.stdout
+    assert stdout_json(recovered)["status"] == "run_approval_pending"
+    job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert job["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": "indeterminate",
+    }
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert len(delivery["linked_branch_display_attempts"]) == 1
+
+
 def test_completed_run_is_not_reopened_by_run_command(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")

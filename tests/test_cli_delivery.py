@@ -429,10 +429,23 @@ Parent-only 流程复用候选与独立验收门禁，并保持普通合并边�
     }
 
 
+@pytest.mark.parametrize(
+    ("display_outcome", "expected_display_status"),
+    [
+        ("linked", "linked"),
+        ("api_error", "unavailable"),
+        ("empty", "unavailable"),
+        ("missing_readback", "unavailable"),
+    ],
+)
 def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
-    git_repo: Path,
+    git_repo: Path, display_outcome: str, expected_display_status: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={})
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={},
+        delivery={"linked_branch_display_outcomes": display_outcome},
+    )
     agent_fixture = git_repo / "parent-only-agents.json"
     agent_fixture.write_text(
         json.dumps(
@@ -484,7 +497,15 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     parent_job = load_only_run_state(git_repo)["parent_job"]
     assert parent_job["phase"] == "ready_for_approval"
-    assert mutable_fixture["delivery"]["linked_branches"] == {}
+    assert mutable_fixture["delivery"]["linked_branches"] == (
+        {"1": parent_job["parent_branch"]}
+        if expected_display_status == "linked"
+        else {}
+    )
+    assert parent_job["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": expected_display_status,
+    }
     assert len(mutable_fixture["delivery"]["pull_requests"]) == 1
     pull = mutable_fixture["delivery"]["pull_requests"][0]
     assert pull["scope"] == "parent_only"
@@ -533,7 +554,11 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
 
 @pytest.mark.parametrize(
     "crash_key",
-    ["crash_after_ensure_change_branch_once", "crash_after_ensure_change_pr_once"],
+    [
+        "crash_after_ensure_change_branch_once",
+        "crash_after_ensure_change_pr_once",
+        "crash_after_link_issue_branch_display_once",
+    ],
 )
 def test_parent_only_cli_recovers_lost_change_response_without_duplicate_worker(
     git_repo: Path, crash_key: str
@@ -575,6 +600,11 @@ def test_parent_only_cli_recovers_lost_change_response_without_duplicate_worker(
     assert stdout_json(recovered)["status"] == "parent_approval_pending"
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert len(delivery["pull_requests"]) == 1
+    assert len(delivery["linked_branch_display_attempts"]) == 1
+    assert load_only_run_state(git_repo)["parent_job"]["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": "indeterminate" if crash_key.endswith("display_once") else "linked",
+    }
 
 
 def test_parent_only_cli_rejects_same_named_foreign_ref_before_development(
@@ -1440,10 +1470,23 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
 
 
+@pytest.mark.parametrize(
+    ("display_outcome", "expected_status"),
+    [
+        ("linked", "linked"),
+        ("api_error", "unavailable"),
+        ("empty", "unavailable"),
+        ("missing_readback", "unavailable"),
+    ],
+)
 def test_scripted_cli_delivers_active_ticket_end_to_end(
-    git_repo: Path,
+    git_repo: Path, display_outcome: str, expected_status: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"linked_branch_display_outcomes": display_outcome},
+    )
     agent_fixture = git_repo / "agents.json"
     agent_fixture.write_text(
         json.dumps(
@@ -1494,7 +1537,20 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert job["modification_attempts"] == 2
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = mutable_fixture["delivery"]
-    assert delivery["linked_branches"] == {}
+    assert delivery["linked_branch_display_attempts"] == [
+        {
+            "issue_number": 3,
+            "branch": job["ticket_branch"],
+            "head_sha": job["publication_sha"],
+        }
+    ]
+    assert job["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": expected_status,
+    }
+    assert delivery["linked_branches"] == (
+        {"3": job["ticket_branch"]} if expected_status == "linked" else {}
+    )
     assert len(delivery["pull_requests"]) == 1
     assert delivery["closed_issues"] == [3]
     assert [

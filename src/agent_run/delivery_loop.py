@@ -95,6 +95,7 @@ class TicketDeliveryLoop:
                 after_merge=self._after_merge,
                 escalate=self._escalate,
                 save=self._save,
+                linked_issue_number=lambda _state, job: int(job["ticket_number"]),
             ),
         )
 

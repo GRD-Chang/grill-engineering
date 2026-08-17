@@ -78,6 +78,43 @@ class ChangeJobContract:
     after_merge: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], bool]
     escalate: Callable[[dict[str, Any], dict[str, Any], str], None]
     save: Callable[[dict[str, Any]], dict[str, Any]]
+    linked_issue_number: Callable[[dict[str, Any], dict[str, Any]], int] | None = None
+
+
+def ensure_linked_branch_display(
+    *,
+    github: GitHubPublisher,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    issue_number: int,
+    branch: str,
+    head_sha: str,
+    save: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
+    """Make the one optional Linked Branch display attempt durable.
+
+    The ref and PR are already authoritative when this function is reached.
+    A crash after recording the attempt deliberately becomes indeterminate on
+    recovery instead of replaying a potentially successful GitHub mutation.
+    """
+    existing = job.get("linked_branch_display")
+    if isinstance(existing, dict) and existing.get("display_attempted") is True:
+        if existing.get("status") not in {"linked", "unavailable", "indeterminate"}:
+            existing["status"] = "indeterminate"
+            save(state)
+        return
+
+    display: dict[str, Any] = {
+        "display_attempted": True,
+        "status": "indeterminate",
+    }
+    job["linked_branch_display"] = display
+    save(state)
+    status = github.link_issue_branch_display(
+        issue_number=issue_number, branch=branch, head_sha=head_sha
+    )
+    display["status"] = status if status in {"linked", "unavailable"} else "unavailable"
+    save(state)
 
 
 def ensure_change_branch_authority(
@@ -701,6 +738,17 @@ class ChangeDeliveryEngine:
                 job,
                 "ticket_pr_closed_unmerged",
                 "Current Change Job PR was closed without merging",
+            )
+        link_display = getattr(self.github, "link_issue_branch_display", None)
+        if self.contract.linked_issue_number is not None and callable(link_display):
+            ensure_linked_branch_display(
+                github=self.github,
+                state=state,
+                job=job,
+                issue_number=self.contract.linked_issue_number(state, job),
+                branch=branch,
+                head_sha=str(job["publication_sha"]),
+                save=self.contract.save,
             )
         try:
             checks = self.github.required_checks(pr_number)
