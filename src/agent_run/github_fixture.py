@@ -218,6 +218,28 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("ensure_ticket_branch")
 
+    def ensure_change_branch(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
+    ) -> None:
+        del base_branch
+        published = _mutable_mapping(self._delivery(), "published_branches")
+        current = published.get(branch)
+        if current is None:
+            if expected_remote_sha != expected_base_sha:
+                raise ValueError("fixture Change ref is missing after publication")
+            published[branch] = expected_base_sha
+        elif current not in {expected_remote_sha, recovery_remote_sha}:
+            raise ValueError("fixture Change ref has a foreign identity")
+        self._save()
+        self._crash_once("ensure_change_branch")
+        self._crash_once("ensure_ticket_branch")
+
     def ensure_run_repair_branch(self, *, branch: str, base_branch: str) -> None:
         published = _mutable_mapping(self._delivery(), "published_branches")
         published.setdefault(branch, self.git.resolve(base_branch))
@@ -541,8 +563,79 @@ class FixtureGitHubPublisher:
                 pull.get("head_sha") != expected_head_sha
                 or pull.get("base_sha") != expected_base_sha
                 or pull.get("base_branch") != base_branch
+                or pull.get("head_repository", self.data["repository"])
+                != self.data["repository"]
+                or pull.get("base_repository", self.data["repository"])
+                != self.data["repository"]
             ):
                 raise ValueError("fixture Ticket PR has a foreign identity")
+
+    def verify_change_pr_before_publish(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> None:
+        self.verify_ticket_pr_before_publish(
+            branch=branch,
+            base_branch=base_branch,
+            expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+        )
+
+    def ensure_change_pr(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> int:
+        pulls = _mutable_list(self._delivery(), "pull_requests")
+        matching = [
+            pull for pull in pulls
+            if isinstance(pull, dict) and pull.get("branch") == branch
+            and pull.get("state") == "OPEN"
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate Change PRs")
+        if matching:
+            pull = matching[0]
+            if (
+                pull.get("head_sha") != expected_head_sha
+                or pull.get("base_sha") != expected_base_sha
+                or pull.get("base_branch") != base_branch
+                or pull.get("head_repository", self.data["repository"])
+                != self.data["repository"]
+                or pull.get("base_repository", self.data["repository"])
+                != self.data["repository"]
+            ):
+                raise ValueError("fixture Change PR has a foreign identity")
+        else:
+            pull = {
+                "number": len(pulls) + 1,
+                "branch": branch,
+                "base_branch": base_branch,
+                "state": "OPEN",
+                "head_sha": expected_head_sha,
+                "base_sha": expected_base_sha,
+                "scope": (
+                    "run_repair"
+                    if branch.startswith("agent-run-repair/")
+                    else "parent_only" if branch.endswith("/parent") else "ticket"
+                ),
+            }
+            pulls.append(pull)
+        pull.update({"title": title, "body": body})
+        self._save()
+        self._inject_revision_drift("ensure_ticket_pr")
+        self._crash_once("ensure_change_pr")
+        self._crash_once("ensure_ticket_pr")
+        return int(pull["number"])
 
     def ensure_ticket_pr(
         self,

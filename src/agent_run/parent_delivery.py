@@ -7,6 +7,7 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -56,10 +57,13 @@ class ParentDeliveryEngine:
                 checkout, str(job["parent_branch"])
             )
             try:
-                self.github.ensure_parent_branch(
-                    parent_number=int(_mapping(state, "parent")["number"]),
+                ensure_change_branch_authority(
+                    github=self.github,
+                    state=state,
+                    job=job,
                     branch=str(job["parent_branch"]),
                     base_branch=str(_mapping(state, "base")["branch"]),
+                    save=self._save,
                 )
                 self.git.prepare_ticket_checkout(
                     branch=str(job["parent_branch"]),

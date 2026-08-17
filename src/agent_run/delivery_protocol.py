@@ -7,8 +7,25 @@ from typing import Any, Protocol
 class GitHubPublisher(Protocol):
     def delete_managed_branch(self, branch: str) -> None: ...
 
-    def ensure_parent_branch(
-        self, *, parent_number: int, branch: str, base_branch: str
+    def ensure_change_branch(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
+    ) -> None: ...
+
+    def ensure_ticket_branch(
+        self,
+        *,
+        ticket_number: int,
+        branch: str,
+        base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
     ) -> None: ...
 
     def ensure_run_pr(
@@ -50,31 +67,21 @@ class GitHubPublisher(Protocol):
 
     def abandon_change_pr(self, pr_number: int) -> bool: ...
 
-    def ensure_run_repair_branch(
-        self, *, branch: str, base_branch: str
-    ) -> None: ...
-
-    def ensure_run_repair_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
-    ) -> int: ...
-
-    def ensure_ticket_branch(
-        self,
-        *,
-        ticket_number: int,
-        branch: str,
-        base_branch: str,
-        expected_base_sha: str,
-        expected_remote_sha: str,
-        recovery_remote_sha: str,
-    ) -> None: ...
-
     def publish_branch(
         self,
         branch: str,
         head_sha: str,
         *,
         expected_remote_sha: str,
+    ) -> None: ...
+
+    def verify_change_pr_before_publish(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
     ) -> None: ...
 
     def verify_ticket_pr_before_publish(
@@ -86,6 +93,17 @@ class GitHubPublisher(Protocol):
         expected_base_sha: str,
     ) -> None: ...
 
+    def ensure_change_pr(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> int: ...
+
     def ensure_ticket_pr(
         self,
         *,
@@ -96,10 +114,6 @@ class GitHubPublisher(Protocol):
         primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
-    ) -> int: ...
-
-    def ensure_parent_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
     ) -> int: ...
 
     def abandon_parent_pr(self, pr_number: int) -> bool: ...

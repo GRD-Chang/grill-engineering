@@ -80,6 +80,66 @@ class ChangeJobContract:
     save: Callable[[dict[str, Any]], dict[str, Any]]
 
 
+def ensure_change_branch_authority(
+    *,
+    github: GitHubPublisher,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    branch: str,
+    base_branch: str,
+    save: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
+    """Persist exact ref intent before creating or recovering a Change ref."""
+    pending = job.get("ticket_write_intent")
+    expected_remote_sha = str(job.get("published_sha", job["base_sha"]))
+    recovery_remote_sha = expected_remote_sha
+    if isinstance(pending, dict) and pending.get("action") == "publish_ticket_ref":
+        expected = pending.get("expected_remote_sha")
+        head = pending.get("head_sha")
+        if not isinstance(expected, str) or not isinstance(head, str):
+            raise ValueError("Change publish intent has invalid ref identity")
+        expected_remote_sha = expected
+        recovery_remote_sha = head
+    authority = {
+        "branch": branch,
+        "base_branch": base_branch,
+        "base_sha": str(job["base_sha"]),
+        "expected_remote_sha": expected_remote_sha,
+        "recovery_remote_sha": recovery_remote_sha,
+    }
+    created_intent = pending is None
+    pending_action: str | None = None
+    if created_intent:
+        job["ticket_write_intent"] = {
+            "action": "ensure_change_branch",
+            "authority": authority,
+        }
+        pending_action = "ensure_change_branch"
+        save(state)
+    elif not isinstance(pending, dict):
+        raise ValueError("Change ref has an invalid write intent")
+    elif pending.get("action") == "ensure_change_branch":
+        pending_action = "ensure_change_branch"
+        if pending.get("authority") != authority:
+            raise ValueError("Change branch intent does not match durable authority")
+    elif pending.get("action") == "ensure_ticket_pr":
+        # The ref is already published.  Preserve the durable PR intent so
+        # the shared delivery loop can recover it by exact PR readback.
+        pass
+    elif pending.get("action") != "publish_ticket_ref":
+        raise ValueError("Change ref has an unknown write intent")
+    github.ensure_change_branch(
+        branch=branch,
+        base_branch=base_branch,
+        expected_base_sha=authority["base_sha"],
+        expected_remote_sha=expected_remote_sha,
+        recovery_remote_sha=recovery_remote_sha,
+    )
+    if created_intent or pending_action == "ensure_change_branch":
+        job.pop("ticket_write_intent", None)
+        save(state)
+
+
 class ChangeDeliveryEngine:
     """One Development -> Candidate -> Review -> Publication -> Merge loop.
 

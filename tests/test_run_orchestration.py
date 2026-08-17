@@ -34,6 +34,37 @@ def _ticket(
     }
 
 
+@pytest.mark.parametrize("legacy_protocol", [None, 1, 2.0, "2"])
+def test_legacy_branch_authority_state_is_rejected_before_reuse(
+    git_repo: Path, legacy_protocol: object
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    state, _ = controller.start(1)
+    if legacy_protocol is None:
+        state.pop("branch_authority_protocol")
+    else:
+        state["branch_authority_protocol"] = legacy_protocol
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="branch authority"):
+        controller.resume(str(state["run_id"]))
+
+    archive = states.root / "archived-runs"
+    archive.mkdir()
+    (states.runs_directory / f"{state['run_id']}.json").rename(
+        archive / f"{state['run_id']}.json"
+    )
+    replacement, resumed = controller.start_or_resume_unfinished(1)
+
+    assert not resumed
+    assert replacement["branch_authority_protocol"] == 2
+    assert states.load_current_run(str(replacement["run_id"])) is not None
+
+
 def _publication(number: int) -> dict[str, str]:
     return {
         "commit_message": f"feat(delivery): complete ticket {number}",

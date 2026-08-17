@@ -23,40 +23,39 @@ class GhGitHubPublisher:
         self.repository = repository
         self.git = git
 
-    def ensure_parent_branch(
-        self, *, parent_number: int, branch: str, base_branch: str
+    def ensure_change_branch(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
     ) -> None:
-        listed = self._run(
-            "issue",
-            "develop",
-            "--list",
-            str(parent_number),
-            "--repo",
-            self.repository,
-        )
-        if listed.returncode != 0:
-            raise GitHubReadError(
-                "github_read_failed",
-                listed.stderr.strip() or "could not inspect linked Parent branch",
-            )
-        if branch in listed.stdout:
+        self._ensure_remote_run_branch(base_branch)
+        remote_sha = self._remote_branch_sha(branch)
+        if remote_sha in {expected_remote_sha, recovery_remote_sha}:
             return
-        created = self._run(
-            "issue",
-            "develop",
-            str(parent_number),
-            "--repo",
-            self.repository,
-            "--name",
-            branch,
-            "--base",
-            base_branch,
+        if remote_sha is not None:
+            raise GitError("Change ref has a foreign identity")
+        if expected_remote_sha != expected_base_sha:
+            raise GitError("Change ref is missing after publication")
+        created = run_write_command(
+            [
+                "git",
+                "push",
+                "origin",
+                f"{expected_base_sha}:refs/heads/{branch}",
+                f"--force-with-lease=refs/heads/{branch}:",
+            ],
+            cwd=self.git.root,
         )
         if created.returncode != 0:
-            raise GitHubReadError(
-                "github_write_failed",
-                created.stderr.strip() or "could not create linked Parent branch",
-            )
+            if self._remote_branch_sha(branch) == expected_base_sha:
+                return
+            raise GitError(created.stderr.strip() or "could not create Change ref")
+        if self._remote_branch_sha(branch) != expected_base_sha:
+            raise GitError("Change ref creation readback did not match intent")
 
     def delete_managed_branch(self, branch: str) -> None:
         if not is_managed_delivery_branch(branch):
@@ -86,108 +85,23 @@ class GhGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
-        self._ensure_remote_run_branch(base_branch)
         del ticket_number
-        remote_sha = self._remote_branch_sha(branch)
-        if remote_sha in {expected_remote_sha, recovery_remote_sha}:
-            return
-        if remote_sha is not None:
-            raise GitError("Ticket ref has a foreign identity")
-        if expected_remote_sha != expected_base_sha:
-            raise GitError("Ticket ref is missing after publication")
-        created = run_write_command(
-            [
-                "git",
-                "push",
-                "origin",
-                f"{expected_base_sha}:refs/heads/{branch}",
-                f"--force-with-lease=refs/heads/{branch}:",
-            ],
-            cwd=self.git.root,
+        self.ensure_change_branch(
+            branch=branch,
+            base_branch=base_branch,
+            expected_base_sha=expected_base_sha,
+            expected_remote_sha=expected_remote_sha,
+            recovery_remote_sha=recovery_remote_sha,
         )
-        if created.returncode != 0:
-            recovered = self._remote_branch_sha(branch)
-            if recovered == expected_base_sha:
-                return
-            raise GitError(created.stderr.strip() or "could not create Ticket ref")
-        if self._remote_branch_sha(branch) != expected_base_sha:
-            raise GitError("Ticket ref creation readback did not match intent")
 
-    def ensure_run_repair_branch(self, *, branch: str, base_branch: str) -> None:
-        self._ensure_remote_run_branch(base_branch)
-        remote = run_read_command(
-            ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
-            cwd=self.git.root,
-        )
-        if remote.returncode != 0:
-            raise GitError(remote.stderr.strip() or "could not read Run Repair branch")
-        if remote.stdout.strip():
-            return
-        base_sha = self.git.resolve(base_branch)
-        pushed = run_write_command(
-            ["git", "push", "origin", f"{base_sha}:refs/heads/{branch}"],
-            cwd=self.git.root,
-        )
-        if pushed.returncode != 0:
-            raise GitError(
-                pushed.stderr.strip() or "could not create Run Repair branch"
-            )
+    def ensure_parent_branch(self, **authority: str) -> None:
+        self.ensure_change_branch(**authority)
 
-    def ensure_run_repair_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
-    ) -> int:
-        pulls = self._json(
-            "pr",
-            "list",
-            "--repo",
-            self.repository,
-            "--state",
-            "open",
-            "--head",
-            branch,
-            "--base",
-            base_branch,
-            "--json",
-            "number",
-        )
-        if not isinstance(pulls, list):
-            raise GitHubReadError("github_invalid_response", "PR list must be an array")
-        if len(pulls) > 1:
-            raise GitHubReadError(
-                "ambiguous_run_repair_pr", "more than one open Run Repair PR exists"
-            )
-        if pulls:
-            number = _integer(_mapping(pulls[0]), "number")
-            self._require(
-                "pr",
-                "edit",
-                str(number),
-                "--repo",
-                self.repository,
-                "--title",
-                title,
-                "--body",
-                body,
-            )
-            return number
-        self._require(
-            "pr",
-            "create",
-            "--repo",
-            self.repository,
-            "--head",
-            branch,
-            "--base",
-            base_branch,
-            "--title",
-            title,
-            "--body",
-            body,
-        )
-        created = self._json(
-            "pr", "view", branch, "--repo", self.repository, "--json", "number"
-        )
-        return _integer(_mapping(created), "number")
+    def ensure_run_repair_branch(self, **authority: str) -> None:
+        self.ensure_change_branch(**authority)
+
+    def ensure_run_repair_pr(self, **authority: str) -> int:
+        return self.ensure_change_pr(**authority)
 
     def ensure_run_pr(
         self, *, branch: str, base_branch: str, title: str, body: str
@@ -269,67 +183,8 @@ class GhGitHubPublisher:
         existing = _mapping(pulls[0])
         return _integer(existing, "number")
 
-    def ensure_parent_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
-    ) -> int:
-        self._ensure_remote_run_branch(branch)
-        pulls = self._json(
-            "pr",
-            "list",
-            "--repo",
-            self.repository,
-            "--state",
-            "all",
-            "--head",
-            branch,
-            "--base",
-            base_branch,
-            "--json",
-            "number,state",
-        )
-        if not isinstance(pulls, list):
-            raise GitHubReadError("github_invalid_response", "PR list must be an array")
-        if len(pulls) > 1:
-            raise GitHubReadError(
-                "ambiguous_parent_pr", "more than one Parent PR exists"
-            )
-        if pulls:
-            existing = _mapping(pulls[0])
-            number = _integer(existing, "number")
-            if existing.get("state") != "OPEN":
-                raise GitHubReadError(
-                    "parent_pr_not_open", "the existing Parent PR is not open"
-                )
-            self._require(
-                "pr",
-                "edit",
-                str(number),
-                "--repo",
-                self.repository,
-                "--title",
-                title,
-                "--body",
-                body,
-            )
-            return number
-        self._require(
-            "pr",
-            "create",
-            "--repo",
-            self.repository,
-            "--head",
-            branch,
-            "--base",
-            base_branch,
-            "--title",
-            title,
-            "--body",
-            body,
-        )
-        created = self._json(
-            "pr", "view", branch, "--repo", self.repository, "--json", "number"
-        )
-        return _integer(_mapping(created), "number")
+    def ensure_parent_pr(self, **authority: str) -> int:
+        return self.ensure_change_pr(**authority)
 
     def abandon_parent_pr(self, pr_number: int) -> bool:
         live = self.live_pull_request(pr_number)
@@ -505,6 +360,28 @@ class GhGitHubPublisher:
         if self._remote_branch_sha(branch) != head_sha:
             raise GitError("Ticket ref publication readback did not match intent")
 
+    def verify_change_pr_before_publish(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> None:
+        pulls = self._change_prs(branch)
+        if len(pulls) > 1:
+            raise GitHubReadError(
+                "ambiguous_change_pr", "more than one open Change PR exists"
+            )
+        if pulls:
+            self._require_change_pr_identity(
+                _mapping(pulls[0]),
+                branch=branch,
+                base_branch=base_branch,
+                expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha,
+            )
+
     def verify_ticket_pr_before_publish(
         self,
         *,
@@ -513,40 +390,31 @@ class GhGitHubPublisher:
         expected_head_sha: str,
         expected_base_sha: str,
     ) -> None:
-        pulls = self._ticket_prs(branch)
-        if len(pulls) > 1:
-            raise GitHubReadError(
-                "ambiguous_ticket_pr", "more than one open Ticket PR exists"
-            )
-        if pulls:
-            self._require_ticket_pr_identity(
-                _mapping(pulls[0]),
-                branch=branch,
-                base_branch=base_branch,
-                expected_head_sha=expected_head_sha,
-                expected_base_sha=expected_base_sha,
-            )
+        self.verify_change_pr_before_publish(
+            branch=branch,
+            base_branch=base_branch,
+            expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+        )
 
-    def ensure_ticket_pr(
+    def ensure_change_pr(
         self,
         *,
         branch: str,
         base_branch: str,
         title: str,
         body: str,
-        primary_ticket: int,
         expected_head_sha: str,
         expected_base_sha: str,
     ) -> int:
-        del primary_ticket
-        pulls = self._ticket_prs(branch)
+        pulls = self._change_prs(branch)
         if len(pulls) > 1:
             raise GitHubReadError(
-                "ambiguous_ticket_pr", "more than one open Ticket PR exists"
+                "ambiguous_change_pr", "more than one open Change PR exists"
             )
         if pulls:
             number = _integer(_mapping(pulls[0]), "number")
-            self._require_ticket_pr_identity(
+            self._require_change_pr_identity(
                 _mapping(pulls[0]),
                 branch=branch,
                 base_branch=base_branch,
@@ -568,14 +436,14 @@ class GhGitHubPublisher:
             "--body",
             body,
         )
-        recovered = self._ticket_prs(branch)
+        recovered = self._change_prs(branch)
         if len(recovered) != 1:
             raise GitHubReadError(
-                "ticket_pr_readback_missing",
-                "Ticket PR creation did not produce one exact PR",
+                "change_pr_readback_missing",
+                "Change PR creation did not produce one exact PR",
             )
         created = _mapping(recovered[0])
-        self._require_ticket_pr_identity(
+        self._require_change_pr_identity(
             created,
             branch=branch,
             base_branch=base_branch,
@@ -583,6 +451,15 @@ class GhGitHubPublisher:
             expected_base_sha=expected_base_sha,
         )
         return _integer(created, "number")
+
+    def ensure_ticket_pr(
+        self,
+        *,
+        primary_ticket: int,
+        **authority: str,
+    ) -> int:
+        del primary_ticket
+        return self.ensure_change_pr(**authority)
 
     def _remote_branch_sha(self, branch: str) -> str | None:
         remote = run_read_command(
@@ -593,7 +470,7 @@ class GhGitHubPublisher:
             raise GitError(remote.stderr.strip() or "could not read Ticket ref")
         return remote.stdout.split()[0] if remote.stdout.strip() else None
 
-    def _ticket_prs(self, branch: str) -> list[object]:
+    def _change_prs(self, branch: str) -> list[object]:
         owner = self.repository.split("/", 1)[0]
         pulls = self._json(
             "api",
@@ -611,7 +488,7 @@ class GhGitHubPublisher:
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
         return pulls
 
-    def _require_ticket_pr_identity(
+    def _require_change_pr_identity(
         self,
         pull: dict[str, Any],
         *,
@@ -633,8 +510,8 @@ class GhGitHubPublisher:
             or base_repo.get("full_name") != self.repository
         ):
             raise GitHubReadError(
-                "ticket_pr_identity_mismatch",
-                "Ticket PR does not match the durable ref and base identity",
+                "change_pr_identity_mismatch",
+                "Change PR does not match the durable ref and base identity",
             )
 
     def publication_context(self, pr_number: int) -> dict[str, object]:

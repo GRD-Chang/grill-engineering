@@ -21,6 +21,7 @@ from agent_run.change_delivery import (
     ChangeDeliveryEngine,
     ChangeJobContract,
     StaleDisposition,
+    ensure_change_branch_authority,
     latest_reviewer_thread,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
@@ -304,8 +305,13 @@ class RunAcceptanceEngine:
             raise ValueError("Run Repair requires the Publisher")
         job = self._repair_job(state, run)
         branch = str(job["repair_branch"])
-        self.github.ensure_run_repair_branch(
-            branch=branch, base_branch=str(state["run_branch"])
+        ensure_change_branch_authority(
+            github=self.github,
+            state=state,
+            job=job,
+            branch=branch,
+            base_branch=str(state["run_branch"]),
+            save=self._save,
         )
         checkout = self._repair_checkout(state)
         preserve_checkout = False
@@ -358,11 +364,13 @@ class RunAcceptanceEngine:
                 publication_request=self._publication_request,
                 review_request=self._repair_review_request,
                 prepare_validation=self._prepare_repair_validation,
-                ensure_pr=lambda state, job, publication: github.ensure_run_repair_pr(
+                ensure_pr=lambda state, job, publication: github.ensure_change_pr(
                     branch=str(job["repair_branch"]),
                     base_branch=str(state["run_branch"]),
                     title=str(publication["pr_title"]),
                     body=self._render_run_repair_pr_body(state, publication),
+                    expected_head_sha=str(job["publication_sha"]),
+                    expected_base_sha=str(job["base_sha"]),
                 ),
                 acceptance_record=self._repair_acceptance_record,
                 acceptance_is_current=self._repair_acceptance_is_current,

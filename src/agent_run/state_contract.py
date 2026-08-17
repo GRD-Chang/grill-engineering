@@ -20,6 +20,12 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state is incompatible with the Invocation/Generation contract"
         )
+    if type(state.get("branch_authority_protocol")) is not int or state.get(
+        "branch_authority_protocol"
+    ) != 2:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible branch authority protocol"
+        )
     for key, expected in (
         ("run_id", str),
         ("repository", str),

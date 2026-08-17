@@ -1654,6 +1654,37 @@ def test_ticket_ref_creation_is_expected_absent_cas_with_exact_readback(
     assert _remote_head(git_repo, "agent-run/run-1/ticket-3") == base
 
 
+@pytest.mark.parametrize(
+    "branch",
+    ["agent-run/run-1/parent", "agent-run-repair/run-1/1"],
+)
+def test_change_ref_authority_recovers_exact_existing_ref(
+    git_repo: Path, tmp_path: Path, branch: str
+) -> None:
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(git_repo), str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=git_repo,
+        check=True,
+    )
+    base = _rev_parse(git_repo, "HEAD")
+
+    GhGitHubPublisher("example/project", GitRepository(git_repo)).ensure_change_branch(
+        branch=branch,
+        base_branch="main",
+        expected_base_sha=base,
+        expected_remote_sha=base,
+        recovery_remote_sha=base,
+    )
+
+    assert _remote_head(git_repo, branch) == base
+
+
 def test_ticket_pr_wrong_base_fails_closed_without_pr_write(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

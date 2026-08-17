@@ -189,13 +189,20 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    repair_branch = f"agent-run-repair/{state['run_id']}/1"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data.setdefault("delivery", {}).setdefault("published_branches", {})[
+        repair_branch
+    ] = git.resolve(str(state["run_branch"]))
+    fixture.write_text(json.dumps(data), encoding="utf-8")
     agents = ScriptedRunAgents()
 
     result = RunAcceptanceEngine(
         git=git,
         states=states,
         agents=agents,
-        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        github=FixtureGitHubPublisher(fixture, git),
     ).accept(
         str(state["run_id"])
     )
@@ -237,6 +244,109 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert repair_branch not in fixture_data["delivery"]["published_branches"]
     with pytest.raises(GitError):
         git.resolve(repair_branch)
+
+
+@pytest.mark.parametrize(
+    "crash_key",
+    ["crash_after_ensure_change_branch_once", "crash_after_ensure_change_pr_once"],
+)
+def test_run_repair_recovers_lost_change_response_without_duplicate_worker(
+    git_repo: Path, crash_key: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data.setdefault("delivery", {})[crash_key] = True
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    publisher = FixtureGitHubPublisher(fixture, git)
+    agents = ScriptedRunAgents()
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+    )
+
+    with pytest.raises(OSError, match="simulated lost response"):
+        engine.accept(str(state["run_id"]))
+    recovered = engine.accept(str(state["run_id"]))
+
+    assert recovered["status"] == "run_publication_pending"
+    assert len(agents.development_requests) == 1
+    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
+    assert len(pulls) == 1
+
+
+def test_run_repair_rejects_a_same_named_foreign_ref_before_development(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    repair_branch = f"agent-run-repair/{state['run_id']}/1"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data.setdefault("delivery", {}).setdefault("published_branches", {})[
+        repair_branch
+    ] = "foreign"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    agents = ScriptedRunAgents()
+
+    with pytest.raises(ValueError, match="foreign identity"):
+        RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=agents,
+            github=FixtureGitHubPublisher(fixture, git),
+        ).accept(str(state["run_id"]))
+
+    assert agents.development_requests == []
+
+
+@pytest.mark.parametrize(
+    "identity_error",
+    [
+        {"head_sha": "foreign"},
+        {"base_sha": "foreign"},
+        {"base_branch": "foreign"},
+        {"head_repository": "foreign/project"},
+        {"base_repository": "foreign/project"},
+    ],
+)
+def test_run_repair_recovery_rejects_a_foreign_pr_identity_without_new_effects(
+    git_repo: Path, identity_error: dict[str, str]
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    delivery = data.setdefault("delivery", {})
+    delivery["crash_after_ensure_change_pr_once"] = True
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    agents = ScriptedRunAgents()
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    )
+
+    with pytest.raises(OSError, match="lost response"):
+        engine.accept(str(state["run_id"]))
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    pull = data["delivery"]["pull_requests"][0]
+    pull.update(identity_error)
+    expected_delivery = json.loads(json.dumps(data["delivery"]))
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    requests_before = len(agents.development_requests)
+
+    with pytest.raises(ValueError, match="foreign identity"):
+        RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=agents,
+            github=FixtureGitHubPublisher(fixture, git),
+        ).accept(str(state["run_id"]))
+
+    assert len(agents.development_requests) == requests_before
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery
 
 
 def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
