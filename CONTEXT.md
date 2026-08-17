@@ -94,6 +94,10 @@ _Avoid_: Codex Worker、独立 daemon、GitHub Mutation Authority
 一次由维护者显式启动或恢复的 `agent-run run`，在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。GitHub 读取或对账的未知非零退出默认进入有界监督，Controller 只保存经脱敏、有界的错误证据，不从 `gh` stderr 推断网络、认证、权限、代理或其他具体原因。只有结构化远端事实已证明 Publisher intent、身份、head/base、检查、状态或关闭证据矛盾时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
 _Avoid_: 维护者轮询 CI、常驻的第二套控制器、自动越过 Final Human Acceptance
 
+**公开生命周期命令（Public Lifecycle Command）**:
+维护者用于创建或推进 Delivery Run 的稳定交互入口。`run` 是唯一的自动生命周期入口；Development、Acceptance、Publication 与内部等待只是 Controller 的阶段，不要求也不允许维护者把它们作为独立流程手工串接。`resume`、`approve`、`revise`、`requeue` 与 `abandon` 只在各自明确的失败、授权或恢复边界执行。
+_Avoid_: 手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
+
 **监督截止时间（Supervision Deadline）**:
 Run 内部监督按远端状态类别采用有限等待预算。预算内保持自动轮询与重对账；到期时保存最后的权威证据并进入监督超时暂停，而不是执行失败或假装通过。GitHub 只读状态或事件收敛的默认预算为 10 分钟，Required Checks 的默认预算为 45 分钟；其他类别须有自己的明确预算。
 _Avoid_: 无限占用进程、把超时吞成 pass、把正常 pending 伪装成需要外部授权的 Human Blocker
@@ -188,11 +192,11 @@ _Avoid_: 复用旧 Reviewer、直接修改 Run Branch、仅修复局部 Ticket d
 _Avoid_: PR 普通评论、Parent Spec Revision、Controller 摘要
 
 **Final Human Acceptance（最终人工验收）**:
-Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向维护者请求的 Delivery Run 整体确认。维护者通过本地 `agent-run approve <run-id>` 显式批准；Controller 随后重新核对默认分支 live base、Run PR live head、Run Acceptance、Required Checks、Parent Spec Revision 与 Ticket Graph Revision，完全一致时 Publisher 才可使用普通 merge commit 和 `--match-head-commit` 合入默认分支。此前各 Ticket 的自动完成不触发逐票人工验收。
+Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向维护者请求的 Delivery Run 整体确认。维护者通过本地 `agent-run approve <run-id>` 显式批准；Controller 随后重新核对默认分支 live base、Run PR live head、Run Acceptance、Required Checks、Parent Spec Revision 与 Ticket Graph Revision，完全一致时 Publisher 才可使用普通 merge commit 和 `--match-head-commit` 合入默认分支。批准只绑定这一准确 head/base 与验收结果：同一 head/base 的 GitHub 收敛延迟由 Controller 自动监督，新 head 或 base 则使批准失效并要求新的最终人工验收。此前各 Ticket 的自动完成不触发逐票人工验收。
 _Avoid_: Ticket 级确认、自动 merge 默认分支、Agent 语义范围判断
 
 **Final Approval Command（最终批准命令）**:
-维护者对一个已通过全部自动门禁的 Delivery Run 授予默认分支合并权限的本地显式命令 `agent-run approve <run-id>`。该授权只对命令执行时重新验证的 Run PR head 和有效 Revision 生效；状态漂移时命令拒绝合并并恢复自动处理或重新请求验收。
+维护者对一个已通过全部自动门禁的 Delivery Run 授予默认分支合并权限的本地显式命令 `agent-run approve <run-id>`。该授权只对命令执行时重新验证的 Run PR head、base 和有效 Revision 生效；同一事实集合的收敛延迟继续自动处理，新 head 或 base 则令授权失效并重新请求验收。
 _Avoid_: GitHub Approve、标签触发、永久授权
 
 **Final Revision Command（最终修改命令）**:
@@ -243,9 +247,17 @@ _Avoid_: Agent 自主排序、依赖边、人工逐票选择
 一个 Ticket Job 独有并在其整个生命周期中复用的开发分支。通常只对应一张持续更新的 active Ticket PR；post-merge、pre-completion Revision 漂移时分支身份保持不变，但已合并 PR 仅作为 superseded integration 历史，新 Revision 使用新的 active PR。
 _Avoid_: Run Branch、Attempt Branch、临时 worktree
 
+**Linked Branch（关联展示分支）**:
+GitHub Issue 页面上可选显示的开发分支关联。它只帮助人阅读 Issue 与开发分支的关系，不证明远端 ref、PR 或 Delivery Run 的存在性；缺失或不可用不影响分支、PR、恢复或交付。
+_Avoid_: 远端分支身份、PR 身份、恢复门禁
+
 **Candidate Commit（候选提交）**:
 Publisher 在每轮 Development Codex 编辑返回后，于 Change Job working branch 创建的不可变候选快照。Git 完整性检查和修复边界必须绑定其 SHA；每轮修复产生新的 Candidate Commit。它使用程序生成的临时 commit message，例如 `chore(ticket-12): candidate 2`，首次推送前会被压缩，不进入公开历史。
 _Avoid_: Publication Commit、远端 PR head、Agent 自行提交
+
+**Forward Candidate Repair（前进式候选修复）**:
+对已创建 Candidate 的验收或 CI Finding，Development Codex 只在受管开发工作区修改当前文件树，可以恢复、删除或重写旧 Candidate 已引入的内容；它不得执行 `git commit`、`git reset`、`git rebase`、强推或任何 GitHub 写入。Controller 随后从该工作区创建一个新的不可变 Candidate Commit。因而 Git 历史只前进，而最终 diff 可以比先前 Candidate 更小。
+_Avoid_: 改写 Candidate 历史、要求人工先还原文件、把可自动修复的 diff 收缩误报为 Human Blocker
 
 **Publication Commit（发布提交）**:
 Candidate Commit 通过 Fresh Acceptance 后，Publisher 根据 Publication Artifact 保持已验收候选 tree 不变，以 Run Branch 的有效 base 为父提交并使用 Agent 编写的语义 commit message 创建待发布提交。Publisher 必须验证 Publication Commit 与已验收 Candidate Commit 的 tree 相同；随后 Published-Head Gate 将远端 PR head 绑定其准确 SHA。
