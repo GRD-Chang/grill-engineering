@@ -82,12 +82,8 @@ class WorkerCredentialChannel:
         self._socket_path: Path | None = None
         self._server_thread: threading.Thread | None = None
         self._renewal_thread: threading.Thread | None = None
-        self._process_group_id: int | None = None
         self._active_gh_processes: set[subprocess.Popen[str]] = set()
         self._renewing = False
-
-    def allow_process_group(self, process_id: int) -> None:
-        self._process_group_id = os.getpgid(process_id)
 
     def start(self, socket_path: Path) -> None:
         """Mint the initial credential and start the temporary channel."""
@@ -149,8 +145,6 @@ class WorkerCredentialChannel:
                 connection.settimeout(CHANNEL_SOCKET_TIMEOUT_SECONDS)
                 try:
                     request = _receive_message(connection)
-                    if not self._is_current_worker(connection):
-                        raise WorkerCredentialError("credential channel belongs to another Worker")
                     response = self._request(request)
                 except (
                     WorkerCredentialError,
@@ -169,16 +163,6 @@ class WorkerCredentialChannel:
                         continue
                 except OSError:
                     continue
-
-    def _is_current_worker(self, connection: socket.socket) -> bool:
-        if self._process_group_id is None:
-            return False
-        credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-        peer_process_id = int.from_bytes(credentials[:4], "little")
-        try:
-            return os.getpgid(peer_process_id) == self._process_group_id
-        except ProcessLookupError:
-            return False
 
     def _request(self, request: object) -> dict[str, object]:
         if not isinstance(request, dict) or request.get("kind") != "run":

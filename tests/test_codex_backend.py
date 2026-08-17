@@ -1954,10 +1954,13 @@ import sys
 output = sys.argv[sys.argv.index("--output-last-message") + 1]
 if os.path.exists("/proc/" + os.environ["AGENT_RUN_TEST_HOST_PID"]):
     raise RuntimeError("Worker can inspect the Controller process")
+if "GH_TOKEN" in os.environ or "GH_ENTERPRISE_TOKEN" in os.environ:
+    raise RuntimeError("Worker received a GitHub token")
 for _ in range(2):
     subprocess.run(
         ["gh", "api", "repos/example/project/issues/3", "--jq", ".number"],
         check=True,
+        start_new_session=True,
     )
 with open(output, "w", encoding="utf-8") as result:
     json.dump({"result_kind": "development", "summary": "ok", "human_blockers": None}, result)
@@ -2032,7 +2035,6 @@ def test_worker_credential_channel_keeps_serving_after_a_bad_framed_request(
         gh_executable="/bin/true",
     ) as credentials:
         credentials.start(socket_path)
-        credentials.allow_process_group(os.getpid())
         for request in (
             (16 * 1024 * 1024 + 1).to_bytes(4, "big"),
             (1).to_bytes(4, "big") + b"\xff",

@@ -592,7 +592,6 @@ class CodexCliBackend:
                         "timeout": 3 * 60 * 60,
                         "abort_event": credential_exhausted,
                         "abort_reason": lambda: credential_failure[0],
-                        "on_process_started": credentials.allow_process_group,
                     }
                     if on_thread is not None and "on_stdout_line" in inspect.signature(
                         run_worker_process
