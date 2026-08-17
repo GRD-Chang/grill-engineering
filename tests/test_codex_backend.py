@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -33,6 +34,16 @@ from agent_run.worker_sandbox import (
     bubblewrap_command,
     run_worker_process,
     worker_environment,
+)
+from agent_run.worker_credentials import (
+    ReadCredential,
+    WorkerCredentialChannel,
+    WorkerCredentialError,
+    WORKER_CREDENTIAL_PROVIDER_TIMEOUT_SECONDS,
+    WORKER_GH_READ_TIMEOUT_SECONDS,
+    WORKER_GH_RESPONSE_TIMEOUT_SECONDS,
+    WORKER_RENEWAL_WINDOW_SECONDS,
+    _is_allowed_gh_read,
 )
 
 
@@ -543,7 +554,7 @@ def test_codex_worker_environment_excludes_publisher_credentials(
     )
 
     assert result.thread_id == "thread-1"
-    assert captured["GH_TOKEN"] == "reader-secret"
+    assert "GH_TOKEN" not in captured
     assert "GITHUB_TOKEN" not in captured
     assert "GH_ENTERPRISE_TOKEN" not in captured
     assert "GITHUB_ENTERPRISE_TOKEN" not in captured
@@ -553,10 +564,48 @@ def test_codex_worker_environment_excludes_publisher_credentials(
     assert "AGENT_RUN_GITHUB_READ_PERMISSIONS" not in captured
     assert captured["GIT_TERMINAL_PROMPT"] == "0"
     assert captured["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert captured["PATH"].split(os.pathsep)[0].endswith("gh-adapter")
     assert "--dangerously-bypass-approvals-and-sandbox" in captured_arguments
     assert "--sandbox" not in captured_arguments
     assert gh_config is not None and not gh_config.exists()
     assert os.environ["GH_TOKEN"] == "publisher-secret"
+
+
+def test_codex_worker_uses_three_hour_wall_clock_limit(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    timeouts: list[int] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        timeouts.append(options["timeout"])
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Implemented and tested.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"thread-1"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {"checkout": str(checkout), "ticket": {"number": 3}}
+    )
+
+    assert timeouts == [3 * 60 * 60]
 
 
 def test_codex_prompts_require_independent_development_and_acceptance_lanes(
@@ -1147,7 +1196,13 @@ def test_controller_mints_token_with_exact_read_permissions(
         "statuses": "read",
     }
     response = io.BytesIO(
-        json.dumps({"token": "minted-reader", "permissions": permissions}).encode()
+        json.dumps(
+            {
+                "token": "minted-reader",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": permissions,
+            }
+        ).encode()
     )
     captured: dict[str, Any] = {}
 
@@ -1212,6 +1267,7 @@ def test_controller_rejects_minted_token_with_different_permissions(
         json.dumps(
             {
                 "token": "over-scoped",
+                "expires_at": "2030-01-01T00:00:00Z",
                 "permissions": permissions,
             }
         ).encode()
@@ -1818,6 +1874,360 @@ def test_worker_uses_gh_for_authenticated_remote_read(
     }
 
 
+def test_worker_gh_adapter_retries_one_expired_read_with_a_renewed_token(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    certificate = tmp_path / "localhost.crt"
+    private_key = tmp_path / "localhost.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(private_key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    authorizations: list[str] = []
+
+    class IssueHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            authorization = self.headers.get("Authorization", "")
+            authorizations.append(authorization)
+            if authorization == "token reader-one" and len(authorizations) > 1:
+                body = json.dumps({"message": "Bad credentials"}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if authorization not in {"token reader-one", "token reader-two"}:
+                self.send_response(403)
+                self.end_headers()
+                return
+            body = json.dumps({"number": 3}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), IssueHandler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(certificate, private_key)
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    issued = iter(
+        (
+            ReadCredential("reader-one", time.time() + 3600),
+            ReadCredential("reader-two", time.time() + 3600),
+        )
+    )
+    worker = tmp_path / "codex-worker"
+    worker.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+
+output = sys.argv[sys.argv.index("--output-last-message") + 1]
+if os.path.exists("/proc/" + os.environ["AGENT_RUN_TEST_HOST_PID"]):
+    raise RuntimeError("Worker can inspect the Controller process")
+for _ in range(2):
+    subprocess.run(
+        ["gh", "api", "repos/example/project/issues/3", "--jq", ".number"],
+        check=True,
+    )
+with open(output, "w", encoding="utf-8") as result:
+    json.dump({"result_kind": "development", "summary": "ok", "human_blockers": None}, result)
+print('{"type":"thread.started","thread_id":"credential-e2e-thread"}')
+""",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    monkeypatch.setenv("GH_HOST", f"localhost:{server.server_port}")
+    monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
+    monkeypatch.setenv("AGENT_RUN_TEST_HOST_PID", str(os.getpid()))
+    try:
+        output, thread_id = CodexCliBackend(
+            executable=str(worker), credential_provider=lambda: next(issued)
+        )._invoke(
+            prompt="controlled credential-renewal E2E",
+            checkout=git_repo,
+            thread_id=None,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert json.loads(output)["result_kind"] == "development"
+    assert thread_id == "credential-e2e-thread"
+    assert authorizations == [
+        "token reader-one",
+        "token reader-one",
+        "token reader-two",
+    ]
+
+
+def test_worker_credential_channel_reports_a_recoverable_renewal_pause(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    attempts = 0
+
+    def provider() -> ReadCredential:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return ReadCredential("reader-one", now[0] + 60)
+        raise RuntimeError("token=renewal-secret unavailable")
+
+    socket_path = tmp_path / "credential.sock"
+    with WorkerCredentialChannel(
+        provider,
+        clock=lambda: now[0],
+        renewal_window=0,
+    ) as credentials:
+        credentials.start(socket_path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(str(socket_path))
+            request = b"get"
+            connection.sendall(len(request).to_bytes(4, "big") + request)
+            size = int.from_bytes(connection.recv(4), "big")
+            response = json.loads(connection.recv(size))
+
+    assert "error" in response
+    assert "reader-one" not in response["error"]
+    assert "renewal-secret" not in response["error"]
+
+
+def test_worker_credential_channel_keeps_serving_after_a_bad_framed_request(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "credential.sock"
+    with WorkerCredentialChannel(
+        lambda: ReadCredential("reader", time.time() + 3600),
+        gh_executable="/bin/true",
+    ) as credentials:
+        credentials.start(socket_path)
+        credentials.allow_process_group(os.getpid())
+        for request in (
+            (16 * 1024 * 1024 + 1).to_bytes(4, "big"),
+            (1).to_bytes(4, "big") + b"\xff",
+        ):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bad:
+                bad.connect(str(socket_path))
+                bad.sendall(request)
+                error_size = int.from_bytes(bad.recv(4), "big")
+                assert "error" in json.loads(bad.recv(error_size))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as good:
+            good.connect(str(socket_path))
+            request = json.dumps(
+                {"kind": "run", "arguments": ["issue", "view", "1"]}
+            ).encode()
+            good.sendall(len(request).to_bytes(4, "big"))
+            good.sendall(request)
+            result_size = int.from_bytes(good.recv(4), "big")
+            result = json.loads(good.recv(result_size))
+
+    assert result == {"returncode": 0, "stdout": "", "stderr": ""}
+
+
+def test_closing_credential_channel_terminates_active_gh_read(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "hanging-gh"
+    process_id_path = tmp_path / "gh.pid"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import pathlib\n"
+        "import time\n"
+        "pathlib.Path(os.environ['GH_TEST_PID_PATH']).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    credentials = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", time.time() + 3600),
+        gh_executable=str(executable),
+        gh_environment={"GH_TEST_PID_PATH": str(process_id_path), "PATH": os.environ["PATH"]},
+    )
+    credentials.start(tmp_path / "credential.sock")
+    worker = threading.Thread(
+        target=lambda: credentials._request(  # noqa: SLF001 - lifecycle seam
+            {"kind": "run", "arguments": ["issue", "view", "1"]}
+        ),
+        daemon=True,
+    )
+    worker.start()
+    for _ in range(100):
+        if process_id_path.exists():
+            break
+        time.sleep(0.02)
+    assert process_id_path.exists()
+    process_id = int(process_id_path.read_text(encoding="utf-8"))
+
+    credentials.close()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)
+
+
+def test_worker_credential_channel_renews_proactively_and_recovers_transient_failure(
+    tmp_path: Path,
+) -> None:
+    renewed = threading.Event()
+    failed_once = threading.Event()
+    calls = 0
+
+    def provider() -> ReadCredential:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReadCredential("reader-one", time.time() + 5)
+        if calls == 2:
+            failed_once.set()
+            raise RuntimeError("temporary issuer outage")
+        renewed.set()
+        return ReadCredential("reader-two", time.time() + 3600)
+
+    socket_path = tmp_path / "credential.sock"
+    with WorkerCredentialChannel(provider, renewal_margin=10) as credentials:
+        credentials.start(socket_path)
+        assert failed_once.wait(timeout=2)
+        assert renewed.wait(timeout=2)
+
+    assert calls == 3
+
+
+def test_closing_channel_does_not_wait_for_a_blocked_renewal_provider(
+    tmp_path: Path,
+) -> None:
+    renewal_started = threading.Event()
+    release_renewal = threading.Event()
+    calls = 0
+
+    def provider() -> ReadCredential:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReadCredential("reader-one", time.time() + 5)
+        renewal_started.set()
+        release_renewal.wait(timeout=5)
+        raise RuntimeError("issuer stopped")
+
+    credentials = WorkerCredentialChannel(provider, renewal_margin=10)
+    credentials.start(tmp_path / "credential.sock")
+    assert renewal_started.wait(timeout=2)
+    closed = threading.Event()
+    closer = threading.Thread(
+        target=lambda: (credentials.close(), closed.set()), daemon=True
+    )
+    closer.start()
+
+    assert closed.wait(timeout=0.5)
+    release_renewal.set()
+    closer.join(timeout=2)
+    assert not closer.is_alive()
+
+
+def test_worker_gh_adapter_rejects_token_and_write_commands() -> None:
+    for arguments in (
+        ["auth", "token"],
+        ["issue", "edit", "1", "--title", "changed"],
+        ["pr", "merge", "1", "--merge"],
+        ["workflow", "run", "build.yml"],
+        ["api", "repos/example/project/issues/1", "--method=POST"],
+        ["api", "repos/example/project/issues/1", "-f", "title=changed"],
+        ["api", "repos/example/project/issues/1", "--input", "body.json"],
+        ["api", "repos/example/project/issues/1", "-X=POST"],
+        ["api", "repos/example/project/issues/1", "-XPOST"],
+        ["api", "repos/example/project/issues/1", "--hostname", "outside.example"],
+        ["api", "repos/example/project/issues/1", "--hostname=outside.example"],
+        ["api", "https://outside.example/collect"],
+        ["api", "https:outside.example/collect"],
+        ["api", "//outside.example/collect"],
+        ["issue", "list", "--repo", "outside.example/owner/repository"],
+        ["issue", "list", "--repo=outside.example/owner/repository"],
+        ["pr", "view", "-Routside.example/owner/repository"],
+    ):
+        assert not _is_allowed_gh_read(arguments)
+    for arguments in (
+        ["issue", "view", "1"],
+        ["pr", "checks", "1"],
+        ["run", "view", "1"],
+        ["api", "repos/example/project/issues/1"],
+        ["api", "repos/example/project/issues/1", "--method=GET"],
+    ):
+        assert _is_allowed_gh_read(arguments)
+
+
+def test_worker_gh_adapter_allows_github_repository_selector() -> None:
+    assert _is_allowed_gh_read(
+        ["issue", "list", "--repo", "owner/repository"]
+    )
+
+
+def test_worker_gh_response_timeout_covers_a_renewal_and_retry() -> None:
+    assert WORKER_GH_RESPONSE_TIMEOUT_SECONDS >= (
+        2 * WORKER_GH_READ_TIMEOUT_SECONDS
+        + WORKER_RENEWAL_WINDOW_SECONDS
+        + 2 * WORKER_CREDENTIAL_PROVIDER_TIMEOUT_SECONDS
+    )
+
+
+def test_credential_channel_does_not_invoke_gh_for_external_host_request(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-gh"
+    invoked = tmp_path / "invoked"
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"touch {invoked}\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    credentials = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", time.time() + 3600),
+        gh_executable=str(executable),
+    )
+    credentials.start(tmp_path / "credential.sock")
+    try:
+        with pytest.raises(WorkerCredentialError, match="only permits read commands"):
+            credentials._request(  # noqa: SLF001 - credential boundary seam
+                {"kind": "run", "arguments": ["api", "https://outside.example"]}
+            )
+    finally:
+        credentials.close()
+
+    assert not invoked.exists()
+
+
 def test_sigint_terminates_worker_process_group(
     tmp_path: Path,
 ) -> None:
@@ -1881,8 +2291,14 @@ def test_successful_worker_cleans_background_processes(
 
     assert result.returncode == 0
     child_pid = int(child_path.read_text(encoding="utf-8").strip())
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("background Worker process survived cleanup")
 
 
 def test_stdout_callback_error_does_not_stop_pipe_drain(tmp_path: Path) -> None:
@@ -1960,3 +2376,29 @@ def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
         if thread.name.startswith("agent-run-worker-")
     }
     assert after == before
+
+
+def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    abort_event = threading.Event()
+
+    def exhaust_credentials() -> None:
+        time.sleep(0.1)
+        abort_event.set()
+
+    threading.Thread(target=exhaust_credentials, daemon=True).start()
+    started = time.monotonic()
+
+    with pytest.raises(WorkerSandboxError, match="credential renewal failed"):
+        run_worker_process(
+            ["sh", "-c", "sleep 60"],
+            cwd=tmp_path,
+            prompt="",
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout=5,
+            abort_event=abort_event,
+            abort_reason=lambda: "Worker credential renewal failed",
+        )
+
+    assert time.monotonic() - started < 2

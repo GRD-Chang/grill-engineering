@@ -225,9 +225,15 @@ Controller 使用专属 GitHub App 的 ID、installation ID 与私钥，按 work
 权限使独立验收可以通过 `gh pr checks` 读取 GitHub Actions 产生的远端 Checks 与 commit
 statuses，确认 Hosted CI 结果。
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
-Publisher GitHub token、SSH agent 和交互式凭据入口，只向 worker 注入该短期只读 token，
-并要求系统安装 `bubblewrap`。Codex 使用 YOLO 模式，可以读写宿主文件系统、联网以及
-使用完整真实的 Git/`gh` CLI。Controller 只向 Brief 提供适用的 Parent/Ticket URL 和
+Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个最长三小时的 Worker 通过仅在本次 invocation 存活的
+临时 Controller-owned `gh` adapter 按读取请求获取 token；token、App 私钥和 Publisher
+凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
+请求，拒绝外部 hostname、写入参数和携带请求体的 API 调用；单次 Controller 读取有界超时，
+Worker 结束或凭据续签耗尽时会清理尚未结束的读取进程。adapter 在到期认证读取失败时仅
+续签并重试该读取一次；续签使用十分钟有界退避，耗尽后以
+`worker_credential_renewal_failed` 的可恢复诊断保留 checkout 与 Thread，供 `resume` 创建
+新 Worker。Codex 使用 YOLO 模式，可以读写宿主文件系统、联网以及
+使用真实 Git CLI 与上述受限的临时 `gh` adapter。Controller 只向 Brief 提供适用的 Parent/Ticket URL 和
 不可重建的原始失败证据；Revision、SHA、Run/Thread/Attempt 等身份只留在确定性账本中。
 Development、Publication 与 Fresh Validation Codex 使用 Git/`gh` 自行读取 diff、
 历史、Issue 和 PR 事实。

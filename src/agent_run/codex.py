@@ -4,6 +4,8 @@ import inspect
 import json
 import math
 import re
+import shutil
+import threading
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -26,16 +28,19 @@ from agent_run.artifacts import (
     parse_human_blockers,
     parse_publication_wire_result,
 )
-from agent_run.github_auth import (
-    GitHubCredentialError,
-    mint_read_only_installation_token,
-)
+from agent_run.github_auth import mint_read_only_installation_credential
 from agent_run.error_safety import bounded_error
 from agent_run.worker_sandbox import (
     WorkerSandboxError,
     bubblewrap_command,
+    create_gh_access_adapter,
     run_worker_process,
-    worker_environment,
+    worker_credential_environment,
+)
+from agent_run.worker_credentials import (
+    CredentialProvider,
+    WorkerCredentialChannel,
+    WorkerCredentialError,
 )
 
 
@@ -62,7 +67,7 @@ class CodexCliBackend:
     def __init__(
         self,
         executable: str = "codex",
-        credential_provider: Callable[[], str] = mint_read_only_installation_token,
+        credential_provider: CredentialProvider = mint_read_only_installation_credential,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
@@ -551,38 +556,52 @@ class CodexCliBackend:
                 ["--output-last-message", str(output_path), "-"]
             )
             try:
-                github_read_token = self.credential_provider()
-            except GitHubCredentialError as error:
-                raise CodexProcessError(str(error)) from error
-            if not github_read_token:
-                raise CodexProcessError(
-                    "GitHub credential provider returned an empty token"
+                adapter_directory = temporary / "gh-adapter"
+                environment = worker_credential_environment(
+                    temporary / "gh", adapter_directory
                 )
-            environment = worker_environment(
-                temporary / "gh", github_read_token
-            )
-            try:
-                arguments = bubblewrap_command(
-                    codex_arguments,
-                    checkout=checkout,
-                    temporary=temporary,
-                    writable_checkout=writable_checkout,
-                    environment=environment,
-                )
-                worker_options: dict[str, Any] = {
-                    "cwd": checkout,
-                    "prompt": prompt,
-                    "environment": environment,
-                    "timeout": 3600,
-                }
-                if on_thread is not None and "on_stdout_line" in inspect.signature(
-                    run_worker_process
-                ).parameters:
-                    worker_options["on_stdout_line"] = _thread_line_callback(
-                        expected=thread_id, callback=on_thread
+                real_gh = shutil.which("gh", path=environment.get("PATH"))
+                if real_gh is None:
+                    raise WorkerSandboxError("gh is required for Worker GitHub reads")
+                credential_exhausted = threading.Event()
+                credential_failure: list[str] = []
+                def report_credential_exhausted(message: str) -> None:
+                    credential_failure.append(message)
+                    credential_exhausted.set()
+                with WorkerCredentialChannel(
+                    self.credential_provider,
+                    gh_executable=real_gh,
+                    gh_environment=environment,
+                    on_exhausted=report_credential_exhausted,
+                ) as credentials:
+                    credentials.start(temporary / "credential.sock")
+                    create_gh_access_adapter(
+                        adapter_directory, temporary / "credential.sock", environment
                     )
-                result = run_worker_process(arguments, **worker_options)
-            except WorkerSandboxError as error:
+                    arguments = bubblewrap_command(
+                        codex_arguments,
+                        checkout=checkout,
+                        temporary=temporary,
+                        writable_checkout=writable_checkout,
+                        environment=environment,
+                    )
+                    worker_options: dict[str, Any] = {
+                        "cwd": checkout,
+                        "prompt": prompt,
+                        "environment": environment,
+                        "timeout": 3 * 60 * 60,
+                        "abort_event": credential_exhausted,
+                        "abort_reason": lambda: credential_failure[0],
+                        "on_process_started": credentials.allow_process_group,
+                    }
+                    if on_thread is not None and "on_stdout_line" in inspect.signature(
+                        run_worker_process
+                    ).parameters:
+                        worker_options["on_stdout_line"] = _thread_line_callback(
+                            expected=thread_id, callback=on_thread
+                        )
+                    result = run_worker_process(arguments, **worker_options)
+            except (WorkerSandboxError, WorkerCredentialError) as error:
                 raise CodexProcessError(str(error)) from error
             if result.returncode != 0:
                 message = _terminal_error(result.stdout, result.stderr)
