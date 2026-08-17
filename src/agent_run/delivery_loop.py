@@ -83,6 +83,8 @@ class TicketDeliveryLoop:
                     title=str(publication["pr_title"]),
                     body=self._render_ticket_pr_body(state, job, publication),
                     primary_ticket=int(job["ticket_number"]),
+                    expected_head_sha=str(job["publication_sha"]),
+                    expected_base_sha=str(job["base_sha"]),
                 ),
                 acceptance_record=self._acceptance_record,
                 acceptance_is_current=self._acceptance_is_current,

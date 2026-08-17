@@ -370,8 +370,14 @@ class ScriptedPublisher:
         ticket_number: int,
         branch: str,
         base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
     ) -> None:
-        return None
+        del (
+            ticket_number, branch, base_branch, expected_base_sha,
+            expected_remote_sha, recovery_remote_sha,
+        )
 
     def publish_branch(
         self,
@@ -386,6 +392,16 @@ class ScriptedPublisher:
             raise ValueError("scripted remote ticket branch drifted")
         self.live_head = head_sha
 
+    def verify_ticket_pr_before_publish(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> None:
+        del branch, base_branch, expected_head_sha, expected_base_sha
+
     def ensure_ticket_pr(
         self,
         *,
@@ -394,7 +410,10 @@ class ScriptedPublisher:
         title: str,
         body: str,
         primary_ticket: int,
+        expected_head_sha: str,
+        expected_base_sha: str,
     ) -> int:
+        del expected_head_sha, expected_base_sha
         self.created_prs += 1
         self.base_branch = base_branch
         self.pr_bodies.append(body)
@@ -1215,6 +1234,8 @@ class ClosesAfterEnsurePublisher(ClosedUnmergedPublisher):
         title: str,
         body: str,
         primary_ticket: int,
+        expected_head_sha: str,
+        expected_base_sha: str,
     ) -> int:
         number = super().ensure_ticket_pr(
             branch=branch,
@@ -1222,6 +1243,8 @@ class ClosesAfterEnsurePublisher(ClosedUnmergedPublisher):
             title=title,
             body=body,
             primary_ticket=primary_ticket,
+            expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
         )
         self.closed = True
         return number

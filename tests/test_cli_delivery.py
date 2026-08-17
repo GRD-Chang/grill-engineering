@@ -1362,7 +1362,7 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert job["modification_attempts"] == 2
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = mutable_fixture["delivery"]
-    assert delivery["linked_branches"]["parent"] == state["run_branch"]
+    assert delivery["linked_branches"] == {}
     assert len(delivery["pull_requests"]) == 1
     assert delivery["closed_issues"] == [3]
     assert [

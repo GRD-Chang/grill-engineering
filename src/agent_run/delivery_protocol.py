@@ -64,6 +64,9 @@ class GitHubPublisher(Protocol):
         ticket_number: int,
         branch: str,
         base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
     ) -> None: ...
 
     def publish_branch(
@@ -74,6 +77,15 @@ class GitHubPublisher(Protocol):
         expected_remote_sha: str,
     ) -> None: ...
 
+    def verify_ticket_pr_before_publish(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> None: ...
+
     def ensure_ticket_pr(
         self,
         *,
@@ -82,6 +94,8 @@ class GitHubPublisher(Protocol):
         title: str,
         body: str,
         primary_ticket: int,
+        expected_head_sha: str,
+        expected_base_sha: str,
     ) -> int: ...
 
     def ensure_parent_pr(

@@ -1626,6 +1626,114 @@ def test_publish_branch_accepts_retry_after_successful_push(
     assert _remote_head(git_repo, "ticket") == candidate
 
 
+def test_ticket_ref_creation_is_expected_absent_cas_with_exact_readback(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(git_repo), str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=git_repo,
+        check=True,
+    )
+    base = _rev_parse(git_repo, "HEAD")
+
+    GhGitHubPublisher("example/project", GitRepository(git_repo)).ensure_ticket_branch(
+        ticket_number=3,
+        branch="agent-run/run-1/ticket-3",
+        base_branch="main",
+        expected_base_sha=base,
+        expected_remote_sha=base,
+        recovery_remote_sha=base,
+    )
+
+    assert _remote_head(git_repo, "agent-run/run-1/ticket-3") == base
+
+
+def test_ticket_pr_wrong_base_fails_closed_without_pr_write(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    writes: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *_arguments: [
+            {
+                "number": 12,
+                "head": {
+                    "ref": "ticket-3",
+                    "sha": "expected-head",
+                    "repo": {"full_name": "example/project"},
+                },
+                "base": {
+                    "ref": "wrong-base",
+                    "sha": "base",
+                    "repo": {"full_name": "example/project"},
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(publisher, "_require", lambda *args: writes.append(args))
+
+    with pytest.raises(GitHubReadError, match="durable ref and base identity"):
+        publisher.ensure_ticket_pr(
+            branch="ticket-3",
+            base_branch="agent-run/run-1",
+            title="title",
+            body="body",
+            primary_ticket=3,
+            expected_head_sha="expected-head",
+            expected_base_sha="base",
+        )
+
+    assert writes == []
+
+
+def test_ticket_pr_wrong_base_is_rejected_before_ref_publication(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    writes: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *_arguments: [
+            {
+                "number": 12,
+                "head": {
+                    "ref": "ticket-3",
+                    "sha": "expected-head",
+                    "repo": {"full_name": "example/project"},
+                },
+                "base": {
+                    "ref": "wrong-base",
+                    "sha": "base",
+                    "repo": {"full_name": "example/project"},
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "agent_run.github_publish.run_write_command",
+        lambda arguments, **_kwargs: writes.append(tuple(arguments)),
+    )
+
+    with pytest.raises(GitHubReadError, match="durable ref and base identity"):
+        publisher.verify_ticket_pr_before_publish(
+            branch="ticket-3",
+            base_branch="agent-run/run-1",
+            expected_head_sha="expected-head",
+            expected_base_sha="base",
+        )
+
+    assert writes == []
+
+
 def test_sync_run_branch_recovers_remote_integration_locally(
     git_repo: Path,
     tmp_path: Path,
@@ -1674,10 +1782,23 @@ def test_ticket_pr_recovery_only_reuses_open_prs(
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     reads: list[tuple[str, ...]] = []
     writes: list[tuple[str, ...]] = []
+    exact_pull = {
+        "number": 12,
+        "head": {
+            "ref": "ticket-3",
+            "sha": "a" * 40,
+            "repo": {"full_name": "example/project"},
+        },
+        "base": {
+            "ref": "agent-run/run-1",
+            "sha": "b" * 40,
+            "repo": {"full_name": "example/project"},
+        },
+    }
 
     def fake_json(*arguments: str) -> object:
         reads.append(arguments)
-        return [] if arguments[:2] == ("pr", "list") else {"number": 12}
+        return [] if len(reads) == 1 else [exact_pull]
 
     def fake_require(*arguments: str) -> None:
         writes.append(arguments)
@@ -1691,10 +1812,12 @@ def test_ticket_pr_recovery_only_reuses_open_prs(
         title="fix(delivery): handle a later revision",
         body="Primary Ticket: #3",
         primary_ticket=3,
+        expected_head_sha="a" * 40,
+        expected_base_sha="b" * 40,
     )
 
-    assert "--state" in reads[0]
-    assert reads[0][reads[0].index("--state") + 1] == "open"
+    assert reads[0][:2] == ("api", "repos/example/project/pulls")
+    assert "state=open" in reads[0]
     assert writes[0][:2] == ("pr", "create")
     assert number == 12
 

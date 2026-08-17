@@ -177,7 +177,7 @@ class FixtureGitHubPublisher:
         if _integer(parent, "number") != parent_number:
             raise ValueError("fixture parent is missing")
         linked = _mutable_mapping(self._delivery(), "linked_branches")
-        linked["parent"] = branch
+        linked[str(parent_number)] = branch
         published = _mutable_mapping(self._delivery(), "published_branches")
         published.setdefault(branch, self.git.resolve(base_branch))
         self._save()
@@ -203,11 +203,18 @@ class FixtureGitHubPublisher:
         ticket_number: int,
         branch: str,
         base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
     ) -> None:
-        linked = _mutable_mapping(self._delivery(), "linked_branches")
-        linked[str(ticket_number)] = branch
         published = _mutable_mapping(self._delivery(), "published_branches")
-        published.setdefault(branch, self.git.resolve(base_branch))
+        current = published.get(branch)
+        if current is None:
+            if expected_remote_sha != expected_base_sha:
+                raise ValueError("fixture Ticket ref is missing after publication")
+            published[branch] = expected_base_sha
+        elif current not in {expected_remote_sha, recovery_remote_sha}:
+            raise ValueError("fixture Ticket ref has a foreign identity")
         self._save()
         self._crash_once("ensure_ticket_branch")
 
@@ -498,9 +505,44 @@ class FixtureGitHubPublisher:
         if published.get(branch) != expected_remote_sha:
             raise ValueError("fixture remote ticket branch drifted")
         published[branch] = head_sha
+        for pull in _mutable_list(self._delivery(), "pull_requests"):
+            if (
+                isinstance(pull, dict)
+                and pull.get("branch") == branch
+                and pull.get("state") == "OPEN"
+            ):
+                pull["head_sha"] = head_sha
         self._save()
         self._inject_revision_drift("publish_branch")
         self._crash_once("publish_branch")
+
+    def verify_ticket_pr_before_publish(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+    ) -> None:
+        matching = [
+            pull
+            for pull in _mutable_list(self._delivery(), "pull_requests")
+            if (
+                isinstance(pull, dict)
+                and pull.get("branch") == branch
+                and pull.get("state") == "OPEN"
+            )
+        ]
+        if len(matching) > 1:
+            raise ValueError("fixture contains duplicate Ticket PRs")
+        if matching:
+            pull = matching[0]
+            if (
+                pull.get("head_sha") != expected_head_sha
+                or pull.get("base_sha") != expected_base_sha
+                or pull.get("base_branch") != base_branch
+            ):
+                raise ValueError("fixture Ticket PR has a foreign identity")
 
     def ensure_ticket_pr(
         self,
@@ -510,6 +552,8 @@ class FixtureGitHubPublisher:
         title: str,
         body: str,
         primary_ticket: int,
+        expected_head_sha: str,
+        expected_base_sha: str,
     ) -> int:
         pulls = _mutable_list(self._delivery(), "pull_requests")
         matching = [
@@ -517,12 +561,19 @@ class FixtureGitHubPublisher:
             for pr in pulls
             if isinstance(pr, dict)
             and pr.get("branch") == branch
-            and pr.get("base_branch") == base_branch
+            and pr.get("state") == "OPEN"
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Ticket PRs")
         if matching:
             pull = matching[0]
+            if (
+                pull.get("head_sha") != expected_head_sha
+                or pull.get("base_sha") != expected_base_sha
+                or pull.get("primary_ticket") != primary_ticket
+                or pull.get("base_branch") != base_branch
+            ):
+                raise ValueError("fixture Ticket PR has a foreign identity")
         else:
             pull = {
                 "number": len(pulls) + 1,
@@ -530,6 +581,8 @@ class FixtureGitHubPublisher:
                 "base_branch": base_branch,
                 "primary_ticket": primary_ticket,
                 "state": "OPEN",
+                "head_sha": expected_head_sha,
+                "base_sha": expected_base_sha,
             }
             pulls.append(pull)
         pull.update({"title": title, "body": body})

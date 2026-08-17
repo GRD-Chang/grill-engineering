@@ -578,11 +578,27 @@ class ChangeDeliveryEngine:
         self._reject_stale(
             state, job, checkout, "Published-Head Gate rejected stale requirements"
         )
+        self.github.verify_ticket_pr_before_publish(
+            branch=branch,
+            base_branch=self.contract.base_branch(state),
+            expected_head_sha=str(job.get("published_sha", job["base_sha"])),
+            expected_base_sha=str(job["base_sha"]),
+        )
+        publish_intent = {
+            "action": "publish_ticket_ref",
+            "branch": branch,
+            "expected_remote_sha": str(job.get("published_sha", job["base_sha"])),
+            "head_sha": str(job["publication_sha"]),
+        }
+        if job.get("ticket_write_intent") != publish_intent:
+            job["ticket_write_intent"] = publish_intent
+            self.contract.save(state)
         self.github.publish_branch(
             branch,
             str(job["publication_sha"]),
             expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
         )
+        job.pop("ticket_write_intent", None)
         job["published_sha"] = str(job["publication_sha"])
         self.contract.save(state)
         self._reject_stale(
@@ -591,7 +607,18 @@ class ChangeDeliveryEngine:
             checkout,
             "Published-Head Gate rejected requirements changed during publish",
         )
+        pr_intent = {
+            "action": "ensure_ticket_pr",
+            "branch": branch,
+            "base_branch": self.contract.base_branch(state),
+            "base_sha": str(job["base_sha"]),
+            "head_sha": str(job["publication_sha"]),
+        }
+        if job.get("ticket_write_intent") != pr_intent:
+            job["ticket_write_intent"] = pr_intent
+            self.contract.save(state)
         pr_number = self.contract.ensure_pr(state, job, publication)
+        job.pop("ticket_write_intent", None)
         job["pr_number"] = pr_number
         self.contract.save(state)
         self._reject_stale(

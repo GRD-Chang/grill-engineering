@@ -353,7 +353,7 @@ def test_status_and_history_show_started_development_attempt(
         "--agent-fixture",
         str(agents),
         "--crash-after-save",
-        "3",
+        "5",
     )
 
     assert interrupted.returncode == 2
