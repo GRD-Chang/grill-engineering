@@ -68,9 +68,16 @@ class PassingRunReviewer:
 
 class InterruptedRunPublisher(FixtureGitHubPublisher):
     def ensure_run_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+        title: str,
+        body: str,
     ) -> int:
-        del branch, base_branch, title, body
+        del branch, base_branch, expected_head_sha, expected_base_sha, title, body
         raise OSError("simulated Publisher interruption")
 
 
@@ -473,8 +480,8 @@ def test_publication_does_not_create_a_final_pr_after_parent_drifts(
     fixture = git_repo / "github.json"
 
     class ParentDriftingLookupPublisher(FixtureGitHubPublisher):
-        def find_run_pr(self, *, branch: str) -> int | None:
-            result = super().find_run_pr(branch=branch)
+        def find_run_pr(self, **authority: str) -> int | None:
+            result = super().find_run_pr(**authority)
             self.data["parent"]["body"] = "Changed after publication agent completed."
             self._save()
             return result
@@ -766,6 +773,29 @@ def test_approve_recovers_a_merge_that_succeeded_before_state_save(
     recovered = engine.approve(str(state["run_id"]))
     assert recovered["status"] == "completed"
     assert recovered["run_publication"]["phase"] == "merged"
+    assert recovered["run_publication"]["merge_intent"]["attempts"] == 1
+
+
+def test_approve_rejects_external_merge_without_persisted_final_run_intent(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+    published = engine.publish(str(state["run_id"]))
+    pr_number = int(published["run_publication"]["pr_number"])
+    publisher.normal_merge(pr_number=pr_number, expected_head_sha=git.resolve(str(state["run_branch"])))
+
+    with pytest.raises(GitHubReadError, match="persisted merge intent"):
+        engine.approve(str(state["run_id"]))
+
+    assert publisher.data["parent"].get("state") != "CLOSED"
 
 
 def test_pending_check_that_later_fails_enters_shared_run_repair(

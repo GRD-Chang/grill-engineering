@@ -7,6 +7,7 @@ from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import (
@@ -211,6 +212,54 @@ class RunPublicationShared:
             ],
             "ticket_completion_records": ticket_completion_records(state),
         }
+
+    def _final_pr_has_expected_identity(
+        self,
+        *,
+        live: dict[str, Any],
+        run_head: str,
+        branch: str,
+        repository: str,
+        expected_base_sha: str | None,
+    ) -> bool:
+        return (
+            live.get("head_branch") == branch
+            and live.get("head_sha") == run_head
+            and live.get("head_repository") == repository
+            and live.get("base_branch") == self.default_branch
+            and (
+                expected_base_sha is None
+                or live.get("base_sha") == expected_base_sha
+            )
+            and live.get("base_repository") == repository
+        )
+
+    def _require_final_pr_identity(
+        self,
+        *,
+        live: dict[str, Any],
+        run_head: str,
+        branch: str,
+        repository: str,
+        expected_base_sha: str | None,
+    ) -> None:
+        """Reject a Final Run PR whose durable authority has drifted.
+
+        Callers separately decide how to handle a closed but otherwise
+        identical PR.  A different repository/ref/SHA is a foreign object and
+        must always fail closed.
+        """
+        if self._final_pr_has_expected_identity(
+            live=live,
+            run_head=run_head,
+            branch=branch,
+            repository=repository,
+            expected_base_sha=expected_base_sha,
+        ):
+            return
+        raise GitHubReadError(
+            "foreign_run_pr", "Final Run PR does not match durable identity"
+        )
 
     def _publication_state(self, state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("run_publication")

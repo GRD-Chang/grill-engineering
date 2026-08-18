@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from conftest import write_fixture
 from test_cli import (
     git_fetch_failure_wrapper,
@@ -148,6 +150,82 @@ def test_run_supervises_initial_repository_read_lag_in_one_call(
     state = load_only_run_state(git_repo)
     assert state.get("repository_binding_pending") is None
     assert state["base"]["branch"] == "main"
+
+
+@pytest.mark.parametrize("command", ["start", "run"])
+@pytest.mark.parametrize("legacy_protocol", [None, 1, 2.0, "2"])
+def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
+    git_repo: Path,
+    tmp_path: Path,
+    command: str,
+    legacy_protocol: object,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = _run_agents(git_repo / "agents.json")
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    started = run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    assert started.returncode == 0, started.stderr
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    legacy = json.loads(state_path.read_text(encoding="utf-8"))
+    if legacy_protocol is None:
+        legacy.pop("branch_authority_protocol")
+    else:
+        legacy["branch_authority_protocol"] = legacy_protocol
+    legacy["locator_registration_pending"] = True
+    state_path.write_text(json.dumps(legacy), encoding="utf-8")
+    state_before = state_path.read_text(encoding="utf-8")
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    delivery_before = fixture_data.get("delivery")
+    fixture_data["repository_read_failures"] = [
+        {"code": "github_timeout", "message": "repository still converging"}
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    locator_path.unlink()
+    head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    branches_before = subprocess.run(
+        ["git", "branch", "--format=%(refname:short)"],
+        cwd=git_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    git_config_before = (git_repo / ".git" / "config").read_bytes()
+    agent_before = agents.read_text(encoding="utf-8")
+
+    arguments = (command, "1")
+    if command == "run":
+        arguments += ("--agent-fixture", str(agents))
+    rejected = run_cli(git_repo, fixture, *arguments, extra_env=locator_env)
+
+    assert rejected.returncode == 2
+    assert stdout_json(rejected)["status"] == "incompatible_run_state"
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert not locator_path.exists()
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout == head_before
+    assert subprocess.run(
+        ["git", "branch", "--format=%(refname:short)"],
+        cwd=git_repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout == branches_before
+    assert (git_repo / ".git" / "config").read_bytes() == git_config_before
+    assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery") == delivery_before
+    assert agents.read_text(encoding="utf-8") == agent_before
 
 
 def test_deliver_routes_a_structured_graph_contradiction_to_human(
@@ -353,7 +431,7 @@ def test_status_and_history_show_started_development_attempt(
         "--agent-fixture",
         str(agents),
         "--crash-after-save",
-        "3",
+        "5",
     )
 
     assert interrupted.returncode == 2
@@ -668,6 +746,37 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(fixture_data["delivery"]["pull_requests"]) == 2
     assert fixture_data["delivery"]["closed_issues"] == [3]
+
+
+def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"crash_after_link_issue_branch_display_once": True},
+    )
+    agents = _run_agents(git_repo / "linked-branch-agents.json")
+
+    interrupted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert interrupted.returncode == 2
+
+    recovered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert recovered.returncode == 0, recovered.stdout
+    assert stdout_json(recovered)["status"] == "run_approval_pending"
+    job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert job["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": "indeterminate",
+    }
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert len(
+        [
+            attempt
+            for attempt in delivery["linked_branch_display_attempts"]
+            if attempt["issue_number"] == 3
+        ]
+    ) == 1
 
 
 def test_completed_run_is_not_reopened_by_run_command(git_repo: Path) -> None:

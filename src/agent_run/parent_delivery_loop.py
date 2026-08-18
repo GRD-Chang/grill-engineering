@@ -51,11 +51,13 @@ class ParentDeliveryLoop:
                 prepare_validation=lambda _checkout, job, validation: self.git.prepare_validation_checkout(
                     head_sha=str(job["candidate_sha"]), checkout=validation
                 ),
-                ensure_pr=lambda state, job, publication: self.github.ensure_parent_pr(
+                ensure_pr=lambda state, job, publication: self.github.ensure_change_pr(
                     branch=str(job["parent_branch"]),
                     base_branch=str(_mapping(state, "base")["branch"]),
                     title=str(publication["pr_title"]),
                     body=self._render_pr_body(state, publication),
+                    expected_head_sha=str(job["publication_sha"]),
+                    expected_base_sha=str(job["base_sha"]),
                 ),
                 acceptance_record=self._acceptance_record,
                 acceptance_is_current=self._acceptance_is_current,
@@ -66,6 +68,7 @@ class ParentDeliveryLoop:
                 after_merge=lambda _state, _job, _live: True,
                 escalate=self._escalate,
                 save=self._save,
+                linked_issue_number=lambda state, _job: int(_mapping(state, "parent")["number"]),
             ),
         )
 

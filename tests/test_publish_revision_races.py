@@ -571,9 +571,9 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
 @pytest.mark.parametrize(
         ("action", "mismatch_save"),
         [
-            ("publish_branch", 21),
-            ("ensure_ticket_pr", 22),
-            ("required_checks", 22),
+            ("publish_branch", 24),
+            ("ensure_ticket_pr", 26),
+            ("required_checks", 28),
         ],
 )
 def test_aba_revision_after_crash_still_forces_fresh_rebuild(

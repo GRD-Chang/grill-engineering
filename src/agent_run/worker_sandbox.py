@@ -39,6 +39,9 @@ def worker_environment(
             "AGENT_RUN_GITHUB_READ_TOKEN",
         }
     }
+    environment["PATH"] = _without_inherited_gh_adapters(
+        environment.get("PATH", os.defpath)
+    )
     gh_config.mkdir(parents=True, exist_ok=True)
     environment.update(
         {
@@ -57,6 +60,19 @@ def worker_environment(
         }
     )
     return environment
+
+
+def _without_inherited_gh_adapters(path: str) -> str:
+    """Keep a previous Worker-local `gh` adapter out of a new Worker PATH."""
+
+    return os.pathsep.join(
+        entry
+        for entry in path.split(os.pathsep)
+        if not (
+            Path(entry).name == "gh-adapter"
+            and Path(entry).parent.name.startswith("agent-run-codex-")
+        )
+    )
 
 
 def worker_credential_environment(

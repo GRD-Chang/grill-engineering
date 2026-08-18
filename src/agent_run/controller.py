@@ -138,6 +138,8 @@ class Controller:
                 existing = candidates[0] if candidates else None
             else:
                 existing = self.states.find_run(repository_hint, parent_number)
+            if existing is not None:
+                require_current_run_state(existing)
             resumed = existing is not None
             if existing is None:
                 provisional = Repository(
@@ -751,6 +753,7 @@ class Controller:
         now = _now()
         state: dict[str, Any] = {
             "run_id": run_id,
+            "branch_authority_protocol": 2,
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
             "base": {"branch": repository.default_branch, "sha": base_sha},
