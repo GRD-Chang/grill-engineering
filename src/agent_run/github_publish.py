@@ -840,7 +840,7 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
             "--json",
-            "headRefName,headRefOid,headRepository,baseRefName,baseRefOid,baseRepository,mergeable,state,mergeCommit",
+            "headRefName,headRefOid,headRepository,baseRefName,baseRefOid,mergeable,state,mergeCommit",
         )
         data = _mapping(value)
         merge_commit = data.get("mergeCommit")
@@ -853,7 +853,11 @@ class GhGitHubPublisher:
             "head_repository": _repository_name(data.get("headRepository")),
             "base_branch": data.get("baseRefName"),
             "base_sha": data.get("baseRefOid"),
-            "base_repository": _repository_name(data.get("baseRepository")),
+            # `gh pr view --repo` addresses the base repository directly.
+            # Its JSON field allowlist does not expose GraphQL's
+            # `baseRepository`, so querying it would make every read fail
+            # before GitHub receives the request.
+            "base_repository": self.repository,
             "mergeable": (
                 data.get("mergeable") == "MERGEABLE" and data.get("state") == "OPEN"
             ),

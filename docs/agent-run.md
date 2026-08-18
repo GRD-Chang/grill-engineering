@@ -281,8 +281,9 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 
 使用 `agent-run` 开发本仓库时，运行中的 Controller 必须来自已验证且固定的 commit，
 不得从正在被 Worker 修改的 editable checkout 导入代码。推荐把 Runner 安装到按 commit
-SHA 命名的独立 Python 环境，并从专用干净 clone 启动；同一 Delivery Run 从开始到完成始终
-使用同一个 Runner。最终 PR 合入默认分支并完成全量验证后，才创建下一版 Runner。#34–#39 是
+SHA 命名的独立 Python 环境，并从专用干净 clone 启动。每次 Invocation 使用当前已 promotion 的
+Runner；Run 的连续性由持久化状态和 GitHub 的精确 head/base 事实保证，而不由 Runner 版本锁定。
+`main` 合入修复后可立即创建下一版 Runner，并由新版继续未完成 Run。#34–#39 是
 已废弃的执行序列，不得作为 Runner 的来源、行为基线、验收证据或恢复对象；只以 #42 及其原生
 Sub-issues 的最终 merged commit 为准。
 

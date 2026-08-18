@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from agent_run import runner_promotion
 from agent_run.runner_promotion import (
     PromotionVerification,
     require_promotion_audit,
     run_promotion_handshake,
+    verify_immutable_runner,
 )
 from agent_run.error_safety import bounded_error
 from agent_run.state import StateStore
@@ -37,6 +40,67 @@ def verification() -> PromotionVerification:
         runner_module="/runner/lib/python/site-packages/agent_run/__init__.py",
         runner_package_sha256="sha256:runner-package",
     )
+
+
+def test_verify_immutable_runner_accepts_a_merged_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = verification()
+    monkeypatch.setattr(runner_promotion, "current_immutable_runner", lambda: expected)
+    monkeypatch.setattr(
+        runner_promotion, "_package_sha256", lambda _path: expected.runner_package_sha256
+    )
+
+    def fake_git(_checkout: Path, *arguments: str) -> str:
+        if arguments == ("rev-parse", "HEAD"):
+            return expected.runner_commit_sha
+        if arguments == ("status", "--porcelain"):
+            return ""
+        raise AssertionError(arguments)
+
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[-4:] == [
+            "merge-base",
+            "--is-ancestor",
+            expected.runner_commit_sha,
+            "origin/main",
+        ]:
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        if arguments[-3:] == ["symbolic-ref", "--quiet", "HEAD"]:
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(runner_promotion, "_git", fake_git)
+    monkeypatch.setattr(runner_promotion.subprocess, "run", fake_run)
+
+    assert verify_immutable_runner(tmp_path, expected.runner_commit_sha) == expected
+    assert any("merge-base" in call for call in calls)
+
+
+def test_verify_immutable_runner_rejects_an_unmerged_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = verification()
+    monkeypatch.setattr(runner_promotion, "current_immutable_runner", lambda: expected)
+    monkeypatch.setattr(
+        runner_promotion, "_package_sha256", lambda _path: expected.runner_package_sha256
+    )
+    monkeypatch.setattr(
+        runner_promotion,
+        "_git",
+        lambda _checkout, *arguments: (
+            expected.runner_commit_sha
+            if arguments == ("rev-parse", "HEAD")
+            else ""
+        ),
+    )
+    monkeypatch.setattr(runner_promotion, "_git_succeeds", lambda *_arguments: False)
+
+    with pytest.raises(ValueError, match="reachable from origin/main"):
+        verify_immutable_runner(tmp_path, expected.runner_commit_sha)
 
 
 def test_promotion_handshake_writes_a_bounded_pass_record(tmp_path: Path) -> None:
