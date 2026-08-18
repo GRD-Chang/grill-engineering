@@ -9,7 +9,10 @@ from agent_run.approval_grant import (
     grant_matches,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
-from agent_run.external_supervision import wait_for_github_convergence
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    wait_for_github_convergence,
+)
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.run_currentness import ticket_completion_records
@@ -133,6 +136,7 @@ class RunPublicationApproval(RunPublicationShared):
             if checks == "pending":
                 publication["phase"] = "waiting_checks"
                 state["status"] = "waiting_checks"
+                ensure_supervision_window(state)
                 return self._save(state)
             if not grant_matches(publication.get("approval_grant"), authority):
                 return self._invalidate_for_fresh_acceptance(state)
@@ -209,6 +213,7 @@ class RunPublicationApproval(RunPublicationShared):
             message=message,
             waiting_for="Final Run merge/readback reconciliation",
         )
+        ensure_supervision_window(state)
         return self._save(state)
 
     def recover_closeout(self, run_id: str) -> dict[str, Any]:

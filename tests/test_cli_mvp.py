@@ -155,7 +155,7 @@ def test_run_recovers_a_persisted_check_deadline_without_duplicate_delivery(
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
     recovered = run_cli(
-        git_repo, fixture, "resume", paused_state["run_id"], "--agent-fixture", str(agents)
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -163,6 +163,35 @@ def test_run_recovers_a_persisted_check_deadline_without_duplicate_delivery(
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert len(delivery["pull_requests"]) == 2
     assert delivery["closed_issues"] == [3]
+
+
+def test_supervision_timeout_reports_its_only_recovery_operation(git_repo: Path) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"required_checks": ["pending"]},
+        supervision_clock_multiplier=540,
+    )
+    agents = _run_agents(git_repo / "agents.json")
+
+    paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert paused.returncode == 2
+    run_id = str(stdout_json(paused)["run_id"])
+    expected_action = "agent-run run 1"
+    for command in ("status", "history"):
+        output = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+        wait = output["supervision"]
+        assert wait["kind"] == "required_checks"
+        assert wait["remaining_seconds"] == 0
+        assert wait["timeout_resume_action"] == expected_action
+
+    for command in ("status", "history"):
+        text = run_cli(git_repo, fixture, command, run_id).stdout
+        assert f"超时恢复: {expected_action}" in text
+    rejected = run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents))
+    assert rejected.returncode == 2
+    assert stdout_json(rejected)["status"] == "supervision_timeout"
 
 
 def test_run_routes_a_pending_ticket_check_failure_through_repair(
@@ -361,8 +390,8 @@ def test_final_worker_credential_timeout_is_recoverable_without_duplicates(
     recovered = run_cli(
         git_repo,
         fixture,
-        "resume",
-        state["run_id"],
+        "run",
+        "1",
         "--agent-fixture",
         str(agents),
     )
@@ -823,7 +852,7 @@ def test_publish_run_retries_final_pr_after_external_wait(git_repo: Path) -> Non
     assert stdout_json(retried)["status"] == "run_approval_pending"
 
 
-def test_resume_supervises_read_failures_after_supervision_timeout(
+def test_run_supervises_read_failures_after_supervision_timeout(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
@@ -848,16 +877,14 @@ def test_resume_supervises_read_failures_after_supervision_timeout(
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
-    resumed = run_cli(
-        git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents)
-    )
+    resumed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert resumed.returncode == 0, resumed.stderr
     assert stdout_json(resumed)["status"] == "run_approval_pending"
     assert load_only_run_state(git_repo)["status"] == "run_approval_pending"
 
 
-def test_resume_repauses_after_a_fresh_external_wait_window(
+def test_run_repauses_after_a_fresh_external_wait_window(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
@@ -881,9 +908,7 @@ def test_resume_repauses_after_a_fresh_external_wait_window(
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
-    resumed = run_cli(
-        git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents)
-    )
+    resumed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert resumed.returncode == 2
     assert stdout_json(resumed)["status"] == "supervision_timeout"

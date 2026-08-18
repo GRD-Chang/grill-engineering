@@ -16,7 +16,10 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery_protocol import GitHubPublisher
-from agent_run.external_supervision import wait_for_github_convergence
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    wait_for_github_convergence,
+)
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.parent_delivery_loop import ParentDeliveryLoop
@@ -152,6 +155,7 @@ class ParentDeliveryEngine:
                     job["phase"] = "waiting_checks"
                     state["status"] = "waiting_checks"
                     state["diagnostics"] = []
+                    ensure_supervision_window(state)
                     self._save(state)
                     self._record_status(pr_number, job, checks, "wait for Required Checks")
                     return state
@@ -482,6 +486,7 @@ class ParentDeliveryEngine:
             message=message,
             waiting_for="Parent-only merge/readback reconciliation",
         )
+        ensure_supervision_window(state)
         return self._save(state)
 
     def _save(self, state: dict[str, Any]) -> dict[str, Any]:

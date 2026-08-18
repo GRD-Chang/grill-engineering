@@ -5,9 +5,12 @@ import pytest
 from agent_run.external_supervision import (
     CHECKS_BUDGET_SECONDS,
     ExternalSupervisor,
+    ensure_supervision_window,
     is_github_convergence_error,
+    public_supervision_snapshot,
     restore_supervision_wait,
     wait_for_github_convergence,
+    wait_for_github_refresh,
     waiting_boundary,
 )
 
@@ -260,6 +263,60 @@ def test_restore_supervision_wait_resets_the_persisted_window() -> None:
     assert state["terminal_kind"] == "waiting_external"
     assert state["diagnostics"] == []
     assert "supervision_wait" not in state
+
+
+def test_timed_out_snapshot_reports_no_remaining_time_from_persisted_state() -> None:
+    state: dict[str, object] = {
+        "status": "supervision_timeout",
+        "supervision_wait": {
+            "deadline": CHECKS_BUDGET_SECONDS,
+            "elapsed_seconds": CHECKS_BUDGET_SECONDS,
+            "budget_seconds": CHECKS_BUDGET_SECONDS,
+        },
+    }
+
+    snapshot = public_supervision_snapshot(state, now=204)
+
+    assert snapshot is not None
+    assert snapshot["remaining_seconds"] == 0
+
+
+def test_direct_wait_persists_a_window_before_foreground_supervision() -> None:
+    state: dict[str, object] = {
+        "status": "waiting_checks",
+        "parent": {"number": 1},
+        "parent_job": {"pr_number": 1, "base_sha": "base-a"},
+        "base": {"sha": "base-a"},
+    }
+
+    window = ensure_supervision_window(state, now=lambda: 100.0)
+    snapshot = public_supervision_snapshot(state, now=101.0)
+
+    assert window is not None
+    assert snapshot is not None
+    assert snapshot["kind"] == "required_checks"
+    assert snapshot["started_at"] == 100.0
+    assert snapshot["deadline"] == 100.0 + CHECKS_BUDGET_SECONDS
+
+
+def test_refresh_wait_persists_a_window_before_requeue_or_resume_returns() -> None:
+    state: dict[str, object] = {
+        "parent": {"number": 1},
+        "base": {"sha": "base-a"},
+    }
+
+    wait_for_github_refresh(
+        state,
+        code="github_timeout",
+        message="authority refresh unavailable",
+        waiting_for="GitHub authority refresh",
+    )
+    snapshot = public_supervision_snapshot(state)
+
+    assert state["github_refresh_pending"] is True
+    assert snapshot is not None
+    assert snapshot["kind"] == "github_convergence"
+    assert snapshot["timeout_resume_action"] == "agent-run run 1"
 
 
 def test_supervision_timeout_preserves_bounded_last_read_error() -> None:

@@ -20,6 +20,52 @@ from test_cli_delivery import (
     ticket,
 )
 
+
+_WAIT_FIELDS = {
+    "kind",
+    "subject",
+    "head_sha",
+    "base_sha",
+    "started_at",
+    "deadline",
+    "remaining_seconds",
+    "retry_count",
+    "latest_observation",
+    "next_action",
+    "timeout_resume_action",
+}
+
+
+def _assert_public_wait_projection(
+    repo: Path, fixture: Path, run_id: str, *, secret: str | None = None
+) -> None:
+    for command in ("status", "history"):
+        json_result = run_cli(repo, fixture, command, run_id, "--json")
+        text_result = run_cli(repo, fixture, command, run_id)
+
+        assert json_result.returncode == text_result.returncode == 0
+        wait = stdout_json(json_result)["supervision"]
+        assert isinstance(wait, dict)
+        assert _WAIT_FIELDS <= wait.keys()
+        assert wait["kind"] in {"github_convergence", "required_checks"}
+        assert wait["started_at"] is not None
+        assert wait["deadline"] is not None
+        assert wait["timeout_resume_action"] == "agent-run run 1"
+        for label in (
+            "等待种类:",
+            "等待对象:",
+            "等待 head/base:",
+            "等待窗口:",
+            "重试次数:",
+            "最新观测:",
+            "超时恢复: agent-run run 1",
+        ):
+            assert label in text_result.stdout
+        if secret is not None:
+            assert secret not in json_result.stdout
+            assert secret not in text_result.stdout
+
+
 def _parent_only_agents(path: Path) -> Path:
     path.write_text(
         json.dumps(
@@ -92,7 +138,7 @@ def _run_until_pending_window(
                     return process, state
                 assert process.stderr is not None
                 ready, _, _ = select.select([process.stderr], [], [], 0)
-                if ready and "推进: waiting_checks" in process.stderr.readline():
+                if ready and "等待进度: kind=required_checks" in process.stderr.readline():
                     persisted = load_only_run_state(repo)
                     persisted_window = persisted.get("supervision_window")
                     if (
@@ -142,6 +188,46 @@ def test_run_supervises_pending_parent_only_checks_in_one_call(
     state = load_only_run_state(git_repo)
     assert state["parent_job"]["phase"] == "ready_for_approval"
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
+
+
+def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={},
+        delivery={"required_checks": ["pending"]},
+    )
+    agents = _parent_only_agents(git_repo / "parent-only-agents.json")
+    process, state = _run_until_pending_window(git_repo, fixture, agents)
+    try:
+        run_id = str(state["run_id"])
+        status = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+        history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))
+
+        for output in (status, history):
+            wait = output["supervision"]
+            assert wait["kind"] == "required_checks"
+            assert wait["subject"] == "Parent PR #1 的 GitHub 对账 的 GitHub Required Checks"
+            assert wait["head_sha"] is not None
+            assert wait["base_sha"] is not None
+            assert wait["started_at"] is not None
+            assert wait["deadline"] is not None
+            assert wait["remaining_seconds"] >= 0
+            assert wait["retry_count"] >= 1
+            assert "latest_observation" in wait
+            assert wait["next_action"] == "agent-run run 1"
+            assert wait["timeout_resume_action"] == "agent-run run 1"
+
+        for command in ("status", "history"):
+            text = run_cli(git_repo, fixture, command, run_id).stdout
+            assert "等待对象: Parent PR #1 的 GitHub 对账 的 GitHub Required Checks" in text
+            assert "等待窗口:" in text
+            assert "重试次数:" in text
+            assert "最新观测: 无" in text
+            assert "超时恢复: agent-run run 1" in text
+    finally:
+        _interrupt_run(process)
 
 
 def test_parent_only_approval_survives_pending_checks_until_the_same_pr_merges(
@@ -530,6 +616,70 @@ def test_run_recovers_parent_only_check_timeout_without_duplicate_pr(
     assert recovered.returncode == 0, recovered.stderr
     assert stdout_json(recovered)["status"] == "parent_approval_pending"
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
+
+
+def test_start_repository_read_wait_is_immediately_observable_without_run(
+    git_repo: Path,
+) -> None:
+    secret = "ghp_start_wait_secret"
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        repository_read_failures=[
+            {
+                "code": "github_timeout",
+                "message": f"repository read failed with token {secret}",
+            }
+        ],
+    )
+
+    started = run_cli(git_repo, fixture, "start", "1")
+
+    assert started.returncode == 0, started.stderr
+    assert stdout_json(started)["status"] == "waiting_external"
+    _assert_public_wait_projection(
+        git_repo, fixture, str(stdout_json(started)["run_id"]), secret=secret
+    )
+
+
+def test_parent_approval_wait_is_immediately_observable_without_run(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={},
+        delivery={"required_checks": ["none", "pending"]},
+    )
+    agents = _parent_only_agents(git_repo / "parent-only-agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert awaiting.returncode == 0, awaiting.stderr
+    assert stdout_json(awaiting)["status"] == "parent_approval_pending"
+    waiting = run_cli(git_repo, fixture, "approve", str(stdout_json(awaiting)["run_id"]))
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_checks"
+    _assert_public_wait_projection(git_repo, fixture, str(stdout_json(waiting)["run_id"]))
+
+
+def test_final_approval_wait_is_immediately_observable_without_run(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"required_checks": ["none", "none", "pending"]},
+    )
+    agents = run_agents(git_repo / "agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert awaiting.returncode == 0, awaiting.stderr
+    assert stdout_json(awaiting)["status"] == "run_approval_pending"
+    waiting = run_cli(git_repo, fixture, "approve", str(stdout_json(awaiting)["run_id"]))
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_checks"
+    _assert_public_wait_projection(git_repo, fixture, str(stdout_json(waiting)["run_id"]))
 
 
 def test_parent_only_pending_window_survives_process_restart(

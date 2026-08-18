@@ -15,6 +15,7 @@ from agent_run.external_supervision import (
     clear_supervision_window,
     is_github_refresh_wait,
     is_supervised_wait,
+    public_supervision_snapshot,
 )
 from agent_run.github import GitHubReadError
 from agent_run.parent_delivery import ParentDeliveryEngine
@@ -332,15 +333,24 @@ class RunDriver:
                     if not self.supervisor.before_retry(state):
                         self.states.save_run(run_id, state)
                         return state
-                    if credential_wait:
-                        # Credential availability publishes its retry count
-                        # alongside the durable deadline.  Saving every
-                        # bounded retry also lets a restarted CLI report the
-                        # same sanitized state it would have observed in this
-                        # foreground invocation.
-                        self.states.save_run(run_id, state)
+                    # Persist each throttled retry so concurrent status/history
+                    # reads observe the same durable wait contract.
+                    self.states.save_run(run_id, state)
                 previous_marker = marker
-                print(f"推进: {state['status']} → {step.value}", file=sys.stderr)
+                wait = public_supervision_snapshot(state, now=self.supervisor.now())
+                if wait is None:  # pragma: no cover - external waits always create one
+                    print(f"推进: {state['status']} → {step.value}", file=sys.stderr)
+                else:
+                    print(
+                        "等待进度: "
+                        f"kind={wait['kind']} subject={wait['subject']} "
+                        f"started_at={wait['started_at']} deadline={wait['deadline']} "
+                        f"remaining_seconds={wait['remaining_seconds']} "
+                        f"retries={wait['retry_count']} "
+                        f"observation={wait['latest_observation']} "
+                        f"next_action={wait['next_action']}",
+                        file=sys.stderr,
+                    )
         except (CodexProcessError, GitHubReadError, OSError, ValueError) as error:
             if not self.operations.controller.record_execution_failure(run_id, str(error)):
                 raise

@@ -13,7 +13,6 @@ from agent_run.controller import Controller
 from agent_run.external_supervision import (
     ExternalSupervisor,
     is_github_refresh_wait,
-    restore_supervision_wait,
 )
 from agent_run.state import StateStore
 from agent_run.state_contract import (
@@ -37,19 +36,6 @@ def _run_to_human_gate(
     if driver is not None:
         return driver.advance(state), resumed
     return _advance_to_human_gate(parsed, states, state, resumed)
-
-
-def _resume_supervision(
-    parsed: argparse.Namespace, states: StateStore, driver: Any | None = None
-) -> tuple[dict[str, Any], bool]:
-    """Resume only a prior external-supervision timeout, not an Agent retry."""
-
-    state = _load_local_run(states, parsed.run_id)
-    restore_supervision_wait(state)
-    states.save_run(parsed.run_id, state)
-    if driver is not None:
-        return driver.advance(state), True
-    return _advance_to_human_gate(parsed, states, state, True)
 
 
 def _advance_to_human_gate(
@@ -206,8 +192,7 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
         return True
     return (
-        state.get("status") == "supervision_timeout"
-        or human_blocker_subject_count(state) == 1
+        human_blocker_subject_count(state) == 1
     )
 
 

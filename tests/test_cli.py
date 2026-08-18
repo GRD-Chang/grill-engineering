@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -12,7 +13,7 @@ from typing import Any
 import pytest
 
 import agent_run.cli as cli
-from agent_run.cli import build_parser, main
+from agent_run.cli import _add_common_options, _main_with_parser, build_parser, main
 from agent_run.runner_promotion import PromotionVerification
 from conftest import write_fixture
 
@@ -32,6 +33,10 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
         "从不可变 Runner 执行一次真实 Structured Outputs promotion handshake"
         in " ".join(help_text.split())
     )
+    for internal_command in ("deliver", "accept-run", "publish-run"):
+        assert internal_command not in help_text
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([internal_command, "run-id"])
 
 
 def test_promotion_preflight_failure_returns_a_cli_error(
@@ -115,15 +120,13 @@ def run_cli(
     environment.setdefault("XDG_STATE_HOME", str(repo / ".agent-run-test-state"))
     if extra_env:
         environment.update(extra_env)
+    command = (
+        [sys.executable, str(PROJECT_ROOT / "tests" / "test_cli.py"), "--legacy-cli"]
+        if arguments and arguments[0] in {"deliver", "accept-run", "publish-run"}
+        else [sys.executable, "-m", "agent_run"]
+    )
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "agent_run",
-            *arguments,
-            "--github-fixture",
-            str(fixture),
-        ],
+        [*command, *arguments, "--github-fixture", str(fixture)],
         cwd=repo,
         env=environment,
         text=True,
@@ -164,6 +167,23 @@ def stdout_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     loaded: object = json.loads(result.stdout)
     assert isinstance(loaded, dict)
     return loaded
+
+
+def _fixture_compatibility_parser() -> argparse.ArgumentParser:
+    """Keep legacy internal-seam tests out of the installed CLI surface."""
+
+    parser = build_parser()
+    subcommands = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    for command in ("deliver", "accept-run", "publish-run"):
+        compatibility = subcommands.add_parser(command, help=argparse.SUPPRESS)
+        compatibility.add_argument("run_id", help="交付运行标识")
+        _add_common_options(compatibility)
+        compatibility.add_argument("--agent-fixture", help=argparse.SUPPRESS)
+    return parser
 
 
 def load_only_run_state(repo: Path) -> dict[str, Any]:
@@ -239,6 +259,28 @@ def test_start_creates_one_run_branch_and_resume_is_idempotent(
     ).stdout.splitlines()
     assert branches == [state["run_branch"]]
     assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+
+
+def test_start_contract_documents_its_managed_run_branch_side_effect(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+
+    started = run_cli(git_repo, fixture, "start", "1")
+
+    assert started.returncode == 0, started.stderr
+    state = load_only_run_state(git_repo)
+    branches = subprocess.run(
+        ["git", "branch", "--format=%(refname:short)"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+    assert state["run_branch"] in branches
+    assert "受管 Run Branch" in build_parser().format_help()
+    for path in (PROJECT_ROOT / "README.md", PROJECT_ROOT / "docs" / "agent-run.md", PROJECT_ROOT / "CONTEXT.md"):
+        assert "受管 Run Branch" in path.read_text(encoding="utf-8")
 
 
 def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
@@ -1275,3 +1317,11 @@ def test_existing_run_records_repository_read_failure_without_network_retry(
     state = load_only_run_state(git_repo)
     assert state["status"] == "execution_failed"
     assert state["terminal_kind"] == "execution_failed"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--legacy-cli":
+        raise SystemExit(
+            _main_with_parser(_fixture_compatibility_parser(), sys.argv[2:])
+        )
+    raise SystemExit("tests/test_cli.py is only executable through --legacy-cli")

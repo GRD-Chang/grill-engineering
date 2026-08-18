@@ -19,6 +19,7 @@ from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
 from agent_run.external_supervision import (
+    ensure_supervision_window,
     is_github_convergence_error,
     is_github_refresh_wait,
     restore_supervision_wait,
@@ -161,6 +162,7 @@ class Controller:
                 message=error.message,
                 waiting_for="GitHub repository binding",
             )
+            ensure_supervision_window(existing)
             existing["updated_at"] = _now()
             self.states.save_run(str(existing["run_id"]), existing)
             self._register_pending_locator(existing)

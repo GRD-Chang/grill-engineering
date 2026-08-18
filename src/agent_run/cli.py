@@ -63,8 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agent-run",
         description="从 GitHub 父 Issue 启动或恢复本地交付运行",
     )
-    subcommands = parser.add_subparsers(dest="command", required=True)
-    start = subcommands.add_parser("start", help="启动或幂等恢复交付运行")
+    subcommands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,promotion-handshake}",
+    )
+    start = subcommands.add_parser(
+        "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
+    )
     start.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(start)
     start.add_argument("--new-run", action="store_true", help=argparse.SUPPRESS)
@@ -95,25 +101,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--message",
         help="仅用于当前 Human Blocker 的未经改写人工响应（最多 8 KiB）",
     )
-    deliver = subcommands.add_parser("deliver", help="交付当前 Active Ticket Job")
-    deliver.add_argument("run_id", help="交付运行标识")
-    _add_common_options(deliver)
-    deliver.add_argument(
-        "--agent-fixture",
-        help=argparse.SUPPRESS,
-    )
-    accept_run = subcommands.add_parser(
-        "accept-run", help="对完成的交付运行执行独立整体验收"
-    )
-    accept_run.add_argument("run_id", help="交付运行标识")
-    _add_common_options(accept_run)
-    accept_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    publish_run = subcommands.add_parser(
-        "publish-run", help="发布已通过整体验收的最终 Run PR"
-    )
-    publish_run.add_argument("run_id", help="交付运行标识")
-    _add_common_options(publish_run)
-    publish_run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     approve = subcommands.add_parser(
         "approve", help="显式批准并合并已通过门禁的最终 Run PR"
     )
@@ -148,8 +135,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    parsed = parser.parse_args(arguments)
+    return _main_with_parser(build_parser(), arguments)
+
+
+def _main_with_parser(
+    parser: argparse.ArgumentParser, arguments: Sequence[str] | None = None
+) -> int:
+    supplied_arguments = list(arguments) if arguments is not None else sys.argv[1:]
+    parsed = parser.parse_args(supplied_arguments)
     controller: Controller | None = None
     states: StateStore | FaultInjectingStateStore | None = None
     precondition_failed = False
@@ -225,40 +218,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if not cli_surface._resume_is_ready(current):
                 cli_presentation._print_precondition_failure(current)
                 return 2
-            if current.get("status") == "supervision_timeout":
-                state, resumed = cli_surface._resume_supervision(
-                    parsed,
-                    states,
-                    _run_driver(parsed, states, controller, git, github),
-                )
-                active_ticket_job = state.get("active_ticket_job")
-                diagnostics = state.get("diagnostics")
-                current_diagnostics = (
-                    diagnostics if isinstance(diagnostics, list) else []
-                )
-                print(
-                    json.dumps(
-                        {
-                            "result": "resumed",
-                            "run_id": state["run_id"],
-                            "status": state["status"],
-                            "run_branch": state.get(
-                                "run_branch", state.get("parent_branch")
-                            ),
-                            "active_ticket": (
-                                active_ticket_job.get("ticket_number")
-                                if isinstance(active_ticket_job, dict)
-                                else None
-                            ),
-                            "diagnostics": current_diagnostics,
-                            "scope_change": state.get("unsupported_scope_change"),
-                            "next_action": cli_presentation._next_action(state),
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                )
-                return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
             state, resumed = controller.resume(
                 parsed.run_id,
                 resume_human_blocker=True,

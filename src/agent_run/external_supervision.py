@@ -65,7 +65,6 @@ class ExternalSupervisor:
         self.now = now
         self.sleeper = sleeper
         self.poll_interval_seconds = poll_interval_seconds
-        self._credential_retries: dict[str, int] = {}
 
     def before_retry(self, state: dict[str, Any]) -> bool:
         """Sleep until a retry or persist a recoverable supervision timeout."""
@@ -73,17 +72,17 @@ class ExternalSupervisor:
         boundary = waiting_boundary(state)
         if boundary is None:
             return True
-        availability = state.get("credential_availability")
-        if isinstance(availability, dict) and boundary.kind == "github_convergence":
-            key = f"{boundary.kind}:{boundary.waiting_for}"
-            retries = self._credential_retries.get(
-                key, int(availability.get("retry_count", 0))
-            ) + 1
-            self._credential_retries[key] = retries
-            availability["retry_count"] = retries
         window = self.observe(state)
         if window is None:  # pragma: no cover - guarded by waiting_boundary above
             return True
+        prior_retries = window.get("retry_count")
+        retries = (prior_retries if isinstance(prior_retries, int) else 0) + 1
+        window["retry_count"] = retries
+        observation = _last_external_error(state)
+        window["latest_observation"] = observation
+        availability = state.get("credential_availability")
+        if isinstance(availability, dict) and boundary.kind == "github_convergence":
+            availability["retry_count"] = retries
         started_at = window["started_at"]
         if not isinstance(started_at, (int, float)):
             raise ValueError("supervision window is missing its start time")
@@ -101,6 +100,8 @@ class ExternalSupervisor:
                 "deadline": window["deadline"],
                 "elapsed_seconds": elapsed,
                 "budget_seconds": boundary.budget_seconds,
+                "retry_count": retries,
+                "latest_observation": observation,
             }
             diagnostic: dict[str, Any] = {
                 "code": "supervision_timeout",
@@ -109,7 +110,7 @@ class ExternalSupervisor:
                 "phase": _phase(state),
                 "elapsed_seconds": elapsed,
                 "budget_seconds": boundary.budget_seconds,
-                "next_action": "重新执行 agent-run run 或 agent-run resume 以开始新的等待窗口",
+                "next_action": _run_recovery_action(state),
             }
             if last_error is not None:
                 diagnostic["last_error"] = last_error
@@ -147,7 +148,7 @@ class ExternalSupervisor:
         boundary = waiting_boundary(state)
         if boundary is None:
             return None
-        return _supervision_window(state, boundary, now=self.now())
+        return ensure_supervision_window(state, now=self.now)
 
 
 def restore_supervision_wait(state: dict[str, Any]) -> None:
@@ -212,6 +213,22 @@ def wait_for_github_convergence(
     )
 
 
+def ensure_supervision_window(
+    state: dict[str, Any], *, now: Callable[[], float] = monotonic
+) -> dict[str, object] | None:
+    """Save an observable window whenever a public path enters a wait.
+
+    The normal ``run`` loop observes a wait before it retries it.  ``start``
+    and ``approve`` can instead return immediately after recording a wait, so
+    they establish the same durable window themselves for status/history.
+    """
+
+    boundary = waiting_boundary(state)
+    if boundary is None:
+        return None
+    return _supervision_window(state, boundary, now=now())
+
+
 def _last_external_error(state: dict[str, Any]) -> dict[str, str] | None:
     diagnostics = state.get("diagnostics")
     if not isinstance(diagnostics, list) or not diagnostics:
@@ -235,6 +252,7 @@ def wait_for_github_refresh(
         state, code=code, message=message, waiting_for=waiting_for
     )
     state["github_refresh_pending"] = True
+    ensure_supervision_window(state)
 
 
 def _waiting_object(state: dict[str, Any]) -> str:
@@ -285,7 +303,11 @@ def _supervision_window(
     if isinstance(existing, dict) and existing.get("identity") == identity:
         started_at = existing.get("started_at")
         deadline = existing.get("deadline")
-        if isinstance(started_at, (int, float)) and isinstance(deadline, (int, float)):
+        if (
+            isinstance(started_at, (int, float))
+            and isinstance(deadline, (int, float))
+            and now >= started_at
+        ):
             return existing
     window: dict[str, object] = {
         "identity": identity,
@@ -295,10 +317,95 @@ def _supervision_window(
         "started_at": now,
         "deadline": now + boundary.budget_seconds,
         "budget_seconds": boundary.budget_seconds,
-        "resume_action": "run_or_resume",
+        "resume_action": "run",
+        "retry_count": 0,
+        "latest_observation": _last_external_error(state),
     }
+    head_sha, base_sha = _waiting_ref_facts(state)
+    if head_sha is not None:
+        window["head_sha"] = head_sha
+    if base_sha is not None:
+        window["base_sha"] = base_sha
     state["supervision_window"] = window
     return window
+
+
+def public_supervision_snapshot(
+    state: dict[str, Any], *, now: float | None = None
+) -> dict[str, object] | None:
+    """Return the stable, credential-safe wait projection for CLI readers."""
+
+    wait = state.get("supervision_wait")
+    timed_out = isinstance(wait, dict)
+    if not timed_out:
+        wait = state.get("supervision_window")
+    if not isinstance(wait, dict):
+        return None
+    if now is None:
+        now = monotonic()
+    deadline = wait.get("deadline")
+    remaining = (
+        0
+        if timed_out
+        else max(0, int(deadline - now))
+        if isinstance(deadline, (int, float))
+        else None
+    )
+    head_sha = wait.get("head_sha")
+    base_sha = wait.get("base_sha")
+    if not isinstance(head_sha, str) or not isinstance(base_sha, str):
+        inferred_head, inferred_base = _waiting_ref_facts(state)
+        head_sha = head_sha if isinstance(head_sha, str) else inferred_head
+        base_sha = base_sha if isinstance(base_sha, str) else inferred_base
+    observation = wait.get("latest_observation")
+    if not isinstance(observation, dict):
+        observation = _last_external_error(state)
+    next_action = _run_recovery_action(state)
+    return {
+        "kind": wait.get("kind"),
+        "subject": wait.get("waiting_for"),
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "started_at": wait.get("started_at"),
+        "deadline": deadline,
+        "remaining_seconds": remaining,
+        "retry_count": wait.get("retry_count", 0),
+        "latest_observation": observation,
+        "next_action": next_action,
+        # Operators need the recovery instruction before an active foreground
+        # window expires too.  It is not the current action while that
+        # foreground process is still supervising the wait.
+        "timeout_resume_action": next_action,
+    }
+
+
+def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
+    for key in ("active_ticket_job", "parent_job", "run_publication"):
+        job = state.get(key)
+        if not isinstance(job, dict):
+            continue
+        head_sha = next(
+            (
+                value
+                for name in ("head_sha", "publication_sha", "candidate_sha")
+                if isinstance((value := job.get(name)), str)
+            ),
+            None,
+        )
+        base_sha = job.get("base_sha")
+        if isinstance(head_sha, str) or isinstance(base_sha, str):
+            return (
+                head_sha if isinstance(head_sha, str) else None,
+                base_sha if isinstance(base_sha, str) else None,
+            )
+    base = state.get("base")
+    return None, base.get("sha") if isinstance(base, dict) and isinstance(base.get("sha"), str) else None
+
+
+def _run_recovery_action(state: dict[str, Any]) -> str | None:
+    parent = state.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, dict) else None
+    return f"agent-run run {parent_number}" if isinstance(parent_number, int) else None
 
 
 def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
