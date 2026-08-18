@@ -767,8 +767,9 @@ def test_approve_recovers_a_merge_that_succeeded_before_state_save(
     engine.publish(str(state["run_id"]))
     publisher.data["delivery"]["crash_after_normal_merge_once"] = True
 
-    with pytest.raises(OSError, match="lost response"):
-        engine.approve(str(state["run_id"]))
+    waiting = engine.approve(str(state["run_id"]))
+    assert waiting["status"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
 
     recovered = engine.approve(str(state["run_id"]))
     assert recovered["status"] == "completed"

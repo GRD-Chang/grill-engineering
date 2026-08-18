@@ -403,13 +403,20 @@ class RunPublicationFlow(RunPublicationShared):
         narrative = self._render_final_run_pr_body(state, artifact.pr_body_markdown)
         known_pr = publication.get("pr_number")
         if isinstance(known_pr, int):
-            self._require_final_pr_identity(
-                live=self.github.live_pull_request(known_pr),
-                run_head=run_head,
-                branch=str(state["run_branch"]),
-                repository=str(state["repository"]),
-                expected_base_sha=self.default_head_sha,
-            )
+            try:
+                self._require_final_pr_identity(
+                    live=self.github.live_pull_request(known_pr),
+                    run_head=run_head,
+                    branch=str(state["run_branch"]),
+                    repository=str(state["repository"]),
+                    expected_base_sha=self.default_head_sha,
+                )
+            except GitHubReadError as error:
+                if error.code == "foreign_run_pr" and isinstance(
+                    publication.get("approval_grant"), dict
+                ):
+                    return self._invalidate_for_fresh_acceptance(state)
+                raise
         initial_existing = (
             known_pr
             if isinstance(known_pr, int)
@@ -472,13 +479,20 @@ class RunPublicationFlow(RunPublicationShared):
             )
         )
         if isinstance(known_pr, int):
-            self._require_final_pr_identity(
-                live=self.github.live_pull_request(known_pr),
-                run_head=run_head,
-                branch=str(state["run_branch"]),
-                repository=str(state["repository"]),
-                expected_base_sha=self.default_head_sha,
-            )
+            try:
+                self._require_final_pr_identity(
+                    live=self.github.live_pull_request(known_pr),
+                    run_head=run_head,
+                    branch=str(state["run_branch"]),
+                    repository=str(state["repository"]),
+                    expected_base_sha=self.default_head_sha,
+                )
+            except GitHubReadError as error:
+                if error.code == "foreign_run_pr" and isinstance(
+                    publication.get("approval_grant"), dict
+                ):
+                    return self._invalidate_for_fresh_acceptance(state)
+                raise
         if not self._publication_is_current(state):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")

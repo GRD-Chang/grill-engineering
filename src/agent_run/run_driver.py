@@ -106,12 +106,36 @@ class DirectRunOperations:
                 agents=self.agents,
             ).retire_for_child_flow(run_id)
         if refreshed.get("delivery_type") == "parent_only":
-            state = ParentDeliveryEngine(
+            parent_engine = ParentDeliveryEngine(
                 git=self.git,
                 states=self.states,
                 github=self.publisher,
                 agents=self.agents,
-            ).deliver(run_id)
+            )
+            state = parent_engine.deliver(run_id)
+            if state.get("status") == "parent_closeout_pending":
+                state = parent_engine.recover_closeout(run_id)
+            if (
+                state.get("status") == "parent_approval_pending"
+                and parent_engine.has_current_approval_grant(run_id)
+            ):
+                state = parent_engine.approve(run_id)
+        elif (
+            refreshed.get("status") == "parent_closeout_pending"
+            and isinstance(refreshed.get("run_publication"), dict)
+        ):
+            repository = self.github_reader.repository()
+            state = RunPublicationEngine(
+                git=self.git,
+                states=self.states,
+                agents=self.agents,
+                github=self.publisher,
+                default_branch=repository.default_branch,
+                default_head_sha=self.git.resolve_base(
+                    repository.default_branch, repository.default_head_sha
+                ),
+                currentness_reader=self.github_reader,
+            ).recover_closeout(run_id)
         else:
             state = DeliveryRunEngine(
                 controller=self.controller,
@@ -163,7 +187,7 @@ class DirectRunOperations:
         if not eligible:
             return self.classify(refreshed)
         repository = self.github_reader.repository()
-        state = RunPublicationEngine(
+        publication_engine = RunPublicationEngine(
             git=self.git,
             states=self.states,
             agents=self.agents,
@@ -173,7 +197,19 @@ class DirectRunOperations:
                 repository.default_branch, repository.default_head_sha
             ),
             currentness_reader=self.github_reader,
-        ).publish(run_id)
+        )
+        if (
+            isinstance(publication, dict)
+            and publication.get("phase") == "waiting_external"
+            and publication_engine.has_current_approval_grant(run_id)
+        ):
+            return self.classify(publication_engine.approve(run_id))
+        state = publication_engine.publish(run_id)
+        if (
+            state.get("status") == "run_approval_pending"
+            and publication_engine.has_current_approval_grant(run_id)
+        ):
+            state = publication_engine.approve(run_id)
         return self.classify(state)
 
     def requeue(self, run_id: str) -> RunOutcome:
@@ -318,7 +354,13 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
     """Select the following step while translating persistent state to a result."""
 
     status = str(state.get("status"))
-    if status in {"active", "ticket_completed", "parent_delivery_pending", "waiting_merge"}:
+    if status in {
+        "active",
+        "ticket_completed",
+        "parent_delivery_pending",
+        "parent_closeout_pending",
+        "waiting_merge",
+    }:
         return RunStep.DELIVER
     if status == "run_acceptance_pending":
         return RunStep.ACCEPT

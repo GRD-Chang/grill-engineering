@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_run.approval_grant import (
+    acceptance_fingerprint,
+    create_grant,
+    grant_authority,
+    grant_matches,
+)
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
+from agent_run.external_supervision import wait_for_github_convergence
 from agent_run.git import GitError
-from agent_run.github import GitHubReadError
+from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_publication_shared import RunPublicationShared
 
@@ -18,14 +25,22 @@ class RunPublicationApproval(RunPublicationShared):
             if not self._refresh_currentness(state):
                 return self._save(state)
             publication = self._publication_state(state)
+            recovering_merge = publication["phase"] == "waiting_external"
             if publication["phase"] == "merged":
                 return self._complete_parent_closeout(state)
-            if publication["phase"] != "ready_for_approval":
+            if publication["phase"] not in {"ready_for_approval", "waiting_external"}:
                 raise ValueError("Run Publication is not ready for explicit approval")
             run = self._mapping(state, "run_acceptance")
             record = self._mapping(publication, "record")
             pr_number = self._integer(publication, "pr_number")
-            live = self.github.live_pull_request(pr_number)
+            try:
+                live = self.github.live_pull_request(pr_number)
+            except (GitHubReadError, OSError) as error:
+                if recovering_merge:
+                    return self._wait_for_merge_convergence(
+                        state, publication, str(error)
+                    )
+                raise
             run_head = self.git.resolve(str(state["run_branch"]))
             if live.get("state") == "MERGED":
                 self._require_persisted_merge_intent(
@@ -55,13 +70,22 @@ class RunPublicationApproval(RunPublicationShared):
                 )
             if not self._acceptance_is_current(state, run):
                 return self._invalidate_for_fresh_acceptance(state)
-            self._require_final_pr_identity(
-                live=live,
-                run_head=run_head,
-                branch=str(state["run_branch"]),
-                repository=str(state["repository"]),
-                expected_base_sha=self.default_head_sha,
-            )
+            try:
+                self._require_final_pr_identity(
+                    live=live,
+                    run_head=run_head,
+                    branch=str(state["run_branch"]),
+                    repository=str(state["repository"]),
+                    expected_base_sha=self.default_head_sha,
+                )
+            except GitHubReadError as error:
+                if (
+                    recovering_merge
+                    and error.code == "foreign_run_pr"
+                    and isinstance(publication.get("approval_grant"), dict)
+                ):
+                    return self._invalidate_for_fresh_acceptance(state)
+                raise
             if (
                 record.get("pr_head_sha") != live.get("head_sha")
                 or record.get("run_head_sha") != run_head
@@ -74,6 +98,18 @@ class RunPublicationApproval(RunPublicationShared):
                 if record.get("default_head_sha") != self.default_head_sha:
                     return self._handle_default_drift(state)
                 return self._invalidate_for_fresh_acceptance(state)
+            authority = self._approval_grant_authority(
+                state, run, pr_number, run_head
+            )
+            if recovering_merge and not grant_matches(
+                publication.get("approval_grant"), authority
+            ):
+                return self._invalidate_for_fresh_acceptance(state)
+            if not recovering_merge and not grant_matches(
+                publication.get("approval_grant"), authority
+            ):
+                publication["approval_grant"] = create_grant(authority)
+                self._save(state)
             if live.get("state") != "OPEN" or not live.get("mergeable"):
                 return self._save(
                     self._queue_repair(
@@ -98,21 +134,27 @@ class RunPublicationApproval(RunPublicationShared):
                 publication["phase"] = "waiting_checks"
                 state["status"] = "waiting_checks"
                 return self._save(state)
+            if not grant_matches(publication.get("approval_grant"), authority):
+                return self._invalidate_for_fresh_acceptance(state)
             merge_intent = self._prepare_merge_intent(
                 publication, state, record, pr_number, run_head
             )
             attempts = merge_intent["attempts"]
             if attempts >= 3:
-                raise GitHubReadError(
-                    "merge_outcome_unknown",
+                return self._wait_for_merge_convergence(
+                    state,
+                    publication,
                     "Final Run merge intent exhausted exact reconciliation attempts",
                 )
             merge_intent["attempts"] = attempts + 1
             self._save(state)
-            integrated = self.github.normal_merge(
-                pr_number=pr_number, expected_head_sha=str(live["head_sha"])
-            )
-            merged = self.github.live_pull_request(pr_number)
+            try:
+                integrated = self.github.normal_merge(
+                    pr_number=pr_number, expected_head_sha=str(live["head_sha"])
+                )
+                merged = self.github.live_pull_request(pr_number)
+            except (MergeOutcomeUnknownError, OSError, GitHubReadError) as error:
+                return self._wait_for_merge_convergence(state, publication, str(error))
             # The merge has advanced the live base ref; its original SHA is
             # still verified as the first parent below.
             self._require_final_pr_identity(
@@ -134,6 +176,40 @@ class RunPublicationApproval(RunPublicationShared):
                     "final Run merge result does not preserve the reviewed boundary",
                 )
             return self._mark_merged_and_close_parent(state, integrated)
+
+    def has_current_approval_grant(self, run_id: str) -> bool:
+        """Check whether an earlier human approval still binds this final PR."""
+        with self.states.locked():
+            state = self._load(run_id)
+            publication = self._publication_state(state)
+            run = state.get("run_acceptance")
+            pr_number = publication.get("pr_number")
+            if not isinstance(run, dict) or not isinstance(pr_number, int):
+                return False
+            if publication.get("phase") == "waiting_external":
+                return isinstance(publication.get("approval_grant"), dict)
+            try:
+                authority = self._approval_grant_authority(
+                    state,
+                    run,
+                    pr_number,
+                    self.git.resolve(str(state["run_branch"])),
+                )
+            except (KeyError, TypeError, ValueError):
+                return False
+        return grant_matches(publication.get("approval_grant"), authority)
+
+    def _wait_for_merge_convergence(
+        self, state: dict[str, Any], publication: dict[str, Any], message: str
+    ) -> dict[str, Any]:
+        publication["phase"] = "waiting_external"
+        wait_for_github_convergence(
+            state,
+            code="merge_outcome_unknown",
+            message=message,
+            waiting_for="Final Run merge/readback reconciliation",
+        )
+        return self._save(state)
 
     def recover_closeout(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
@@ -349,6 +425,26 @@ class RunPublicationApproval(RunPublicationShared):
             "base_sha": base_sha,
             "acceptance_boundary": dict(record),
         }
+
+    def _approval_grant_authority(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        pr_number: int,
+        run_head: str,
+    ) -> dict[str, object]:
+        return grant_authority(
+            repository=str(state["repository"]),
+            pr_number=pr_number,
+            head_branch=str(state["run_branch"]),
+            head_sha=run_head,
+            base_branch=self.default_branch,
+            base_sha=self.default_head_sha,
+            acceptance_fingerprint=acceptance_fingerprint(
+                self._mapping(run, "acceptance_record"),
+                self._mapping(run, "acceptance_artifact"),
+            ),
+        )
 
     def _complete_parent_closeout(self, state: dict[str, Any]) -> dict[str, Any]:
         publication = self._publication_state(state)

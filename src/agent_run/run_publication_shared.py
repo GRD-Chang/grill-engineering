@@ -110,6 +110,7 @@ class RunPublicationShared:
             "abandoned",
         }:
             publication["phase"] = "stale"
+            publication.pop("approval_grant", None)
         state.update(
             {
                 "status": "run_acceptance_pending",

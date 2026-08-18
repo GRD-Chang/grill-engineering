@@ -95,6 +95,7 @@ def invalidate_run_acceptance(state: dict[str, Any]) -> dict[str, Any]:
         "abandoned",
     }:
         publication["phase"] = "stale"
+        publication.pop("approval_grant", None)
     return run
 
 

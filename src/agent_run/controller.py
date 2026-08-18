@@ -672,6 +672,7 @@ class Controller:
             )
         )
         if external is not None:
+            job.pop("approval_grant", None)
             state.update(
                 {
                     "status": "blocked",
@@ -686,6 +687,7 @@ class Controller:
             )
             return
         if candidate_or_acceptance_is_inconsistent(job):
+            job.pop("approval_grant", None)
             state.update(
                 {
                     "status": "blocked",
@@ -702,6 +704,7 @@ class Controller:
         reason = stale_change_job_reason(state, subject, job, self.publisher.git)
         if reason is None:
             return
+        job.pop("approval_grant", None)
         if subject.startswith("run-repair:"):
             invalidate_stale_run_repair(state)
             return
@@ -731,6 +734,15 @@ class Controller:
             return
         acceptance = state.get("run_acceptance")
         if not isinstance(acceptance, dict) or acceptance.get("phase") != "accepted":
+            return
+        publication = state.get("run_publication")
+        if (
+            isinstance(publication, dict)
+            and publication.get("phase") == "waiting_external"
+            and isinstance(publication.get("merge_intent"), dict)
+        ):
+            # A merge may have succeeded before GitHub's response or readback
+            # converged. The approval path owns exact merge-intent recovery.
             return
         record = acceptance.get("acceptance_record")
         if not isinstance(record, dict):

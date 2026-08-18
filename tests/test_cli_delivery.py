@@ -2113,7 +2113,8 @@ def test_merged_final_run_recovery_rejects_foreign_identity_without_writes(
     data["delivery"]["crash_after_normal_merge_once"] = True
     fixture.write_text(json.dumps(data), encoding="utf-8")
     interrupted = run_cli(git_repo, fixture, "approve", str(before_merge["run_id"]))
-    assert interrupted.returncode == 2
+    assert interrupted.returncode == 0
+    assert stdout_json(interrupted)["status"] == "waiting_external"
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     final = next(
@@ -2126,7 +2127,14 @@ def test_merged_final_run_recovery_rejects_foreign_identity_without_writes(
     before_recovery = load_only_run_state(git_repo)
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    failed = run_cli(git_repo, fixture, "approve", str(before_merge["run_id"]))
+    failed = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
 
     assert failed.returncode == 2
     assert stdout_json(failed)["status"] == "execution_failed"

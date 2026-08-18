@@ -188,6 +188,7 @@ class ParentDeliveryLoop:
             "publication_attempts",
             "publication_thread_id",
             "last_publication_error",
+            "approval_grant",
             "repair_source",
             "ci_evidence",
         ):
