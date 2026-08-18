@@ -36,6 +36,7 @@ from agent_run.worker_sandbox import (
     worker_environment,
 )
 from agent_run.worker_credentials import (
+    InitialCredentialUnavailable,
     ReadCredential,
     WorkerCredentialChannel,
     WorkerCredentialError,
@@ -65,6 +66,32 @@ def passing_acceptance_artifact() -> dict[str, object]:
             for lane in ("e2e", "standards", "spec")
         }
     }
+
+
+def test_initial_credential_failure_does_not_start_a_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = False
+
+    def unavailable() -> ReadCredential:
+        raise RuntimeError("token=provider-secret temporarily unavailable")
+
+    def worker_must_not_start(*_args: object, **_kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("Worker must not start before the first credential exists")
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", worker_must_not_start)
+    backend = CodexCliBackend(credential_provider=unavailable)
+
+    with pytest.raises(InitialCredentialUnavailable, match="credential_unavailable"):
+        backend._invoke(  # noqa: SLF001 - initial credential boundary seam
+            prompt="controlled initial credential failure",
+            checkout=tmp_path,
+            thread_id=None,
+        )
+
+    assert not started
 
 
 def failed_acceptance_artifact(

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Bounded supervision of eventually-consistent GitHub lifecycle state."""
 
 from dataclasses import dataclass
+import json
 from time import monotonic, sleep
 from typing import Any, Callable
 
@@ -63,7 +64,7 @@ class ExternalSupervisor:
         self.now = now
         self.sleeper = sleeper
         self.poll_interval_seconds = poll_interval_seconds
-        self._started: dict[str, float] = {}
+        self._credential_retries: dict[str, int] = {}
 
     def before_retry(self, state: dict[str, Any]) -> bool:
         """Sleep until a retry or persist a recoverable supervision timeout."""
@@ -71,10 +72,21 @@ class ExternalSupervisor:
         boundary = waiting_boundary(state)
         if boundary is None:
             return True
-        started = self._started.setdefault(
-            f"{boundary.kind}:{boundary.waiting_for}", self.now()
-        )
-        elapsed = max(0, int(self.now() - started))
+        availability = state.get("credential_availability")
+        if isinstance(availability, dict) and boundary.kind == "github_convergence":
+            key = f"{boundary.kind}:{boundary.waiting_for}"
+            retries = self._credential_retries.get(
+                key, int(availability.get("retry_count", 0))
+            ) + 1
+            self._credential_retries[key] = retries
+            availability["retry_count"] = retries
+        window = self.observe(state)
+        if window is None:  # pragma: no cover - guarded by waiting_boundary above
+            return True
+        started_at = window["started_at"]
+        if not isinstance(started_at, (int, float)):
+            raise ValueError("supervision window is missing its start time")
+        elapsed = max(0, int(self.now() - started_at))
         if elapsed >= boundary.budget_seconds:
             resume_status = state.get("status")
             last_error = _last_external_error(state)
@@ -82,7 +94,10 @@ class ExternalSupervisor:
                 "resume_status": resume_status,
                 "kind": boundary.kind,
                 "waiting_for": boundary.waiting_for,
+                "identity": window["identity"],
                 "phase": _phase(state),
+                "started_at": window["started_at"],
+                "deadline": window["deadline"],
                 "elapsed_seconds": elapsed,
                 "budget_seconds": boundary.budget_seconds,
             }
@@ -97,6 +112,16 @@ class ExternalSupervisor:
             }
             if last_error is not None:
                 diagnostic["last_error"] = last_error
+            availability = state.get("credential_availability")
+            if isinstance(availability, dict):
+                failure_class = availability.get("failure_class")
+                retry_count = availability.get("retry_count")
+                if isinstance(failure_class, str):
+                    supervision_wait["credential_failure_class"] = failure_class
+                    diagnostic["credential_failure_class"] = failure_class
+                if isinstance(retry_count, int):
+                    supervision_wait["retry_count"] = retry_count
+                    diagnostic["retry_count"] = retry_count
             state.update(
                 {
                     "status": "supervision_timeout",
@@ -108,6 +133,20 @@ class ExternalSupervisor:
             return False
         self.sleeper(min(self.poll_interval_seconds, boundary.budget_seconds - elapsed))
         return True
+
+    def observe(self, state: dict[str, Any]) -> dict[str, object] | None:
+        """Create or recover the durable window as soon as a wait is observed.
+
+        The Driver persists the changed state before its first retry.  This
+        makes an abrupt process exit indistinguishable from an ordinary
+        restart: both continue to use the same deadline for the same waiting
+        identity.
+        """
+
+        boundary = waiting_boundary(state)
+        if boundary is None:
+            return None
+        return _supervision_window(state, boundary, now=self.now())
 
 
 def restore_supervision_wait(state: dict[str, Any]) -> None:
@@ -125,6 +164,7 @@ def restore_supervision_wait(state: dict[str, Any]) -> None:
         }
     )
     state.pop("supervision_wait", None)
+    state.pop("supervision_window", None)
 
 
 def is_supervised_wait(state: dict[str, Any]) -> bool:
@@ -197,6 +237,11 @@ def wait_for_github_refresh(
 
 
 def _waiting_object(state: dict[str, Any]) -> str:
+    availability = state.get("credential_availability")
+    if isinstance(availability, dict):
+        change_job = availability.get("change_job")
+        if isinstance(change_job, str) and change_job:
+            return f"{change_job} Worker credential availability"
     active = state.get("active_ticket_job")
     if isinstance(active, dict) and isinstance(active.get("pr_number"), int):
         return f"Ticket PR #{active['pr_number']} 的 GitHub 对账"
@@ -217,3 +262,85 @@ def _phase(state: dict[str, Any]) -> str:
             return phase
     status = state.get("status")
     return status if isinstance(status, str) else "unknown"
+
+
+def clear_supervision_window(state: dict[str, Any]) -> bool:
+    """Discard a completed window only after its subject reaches progress."""
+
+    # A refresh can temporarily classify the enclosing Run as progress while
+    # its Worker is still waiting for the first credential. Availability is
+    # the authoritative boundary in that interval, so only a successful
+    # Worker start may clear the shared window.
+    if isinstance(state.get("credential_availability"), dict):
+        return False
+    return state.pop("supervision_window", None) is not None
+
+
+def _supervision_window(
+    state: dict[str, Any], boundary: WaitingBoundary, *, now: float
+) -> dict[str, object]:
+    identity = _window_identity(state, boundary)
+    existing = state.get("supervision_window")
+    if isinstance(existing, dict) and existing.get("identity") == identity:
+        started_at = existing.get("started_at")
+        deadline = existing.get("deadline")
+        if isinstance(started_at, (int, float)) and isinstance(deadline, (int, float)):
+            return existing
+    window: dict[str, object] = {
+        "identity": identity,
+        "kind": boundary.kind,
+        "waiting_for": boundary.waiting_for,
+        "phase": _phase(state),
+        "started_at": now,
+        "deadline": now + boundary.budget_seconds,
+        "budget_seconds": boundary.budget_seconds,
+        "resume_action": "run_or_resume",
+    }
+    state["supervision_window"] = window
+    return window
+
+
+def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
+    availability = state.get("credential_availability")
+    if isinstance(availability, dict):
+        # A first-mint outage belongs to one pending Worker, not to whichever
+        # mutable Run phase the authority projection happens to expose while
+        # that Worker is retried.  Keep this identity deliberately narrow so
+        # a normal refresh cannot silently open a new ten-minute window.
+        credential_subject = {
+            "run_id": state.get("run_id"),
+            "kind": boundary.kind,
+            "credential_availability": {
+                item: availability.get(item)
+                for item in ("change_job", "phase", "failure_class")
+                if availability.get(item) is not None
+            },
+        }
+        return json.dumps(
+            credential_subject,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    subject: dict[str, object] = {
+        "run_id": state.get("run_id"),
+        "kind": boundary.kind,
+        "phase": _phase(state),
+    }
+    for key in ("active_ticket_job", "parent_job", "run_publication"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            subject[key] = {
+                item: value.get(item)
+                for item in (
+                    "ticket_number",
+                    "pr_number",
+                    "ticket_branch",
+                    "parent_branch",
+                    "head_sha",
+                    "base_sha",
+                    "publication_sha",
+                )
+                if value.get(item) is not None
+            }
+    return json.dumps(subject, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

@@ -16,6 +16,11 @@ from agent_run.change_delivery import (
     MAX_PUBLICATION_ATTEMPTS,
     ensure_linked_branch_display,
 )
+from agent_run.credential_availability import (
+    clear_initial_credential_wait,
+    resume_initial_credential_wait,
+    wait_for_initial_credential,
+)
 from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import (
     is_github_convergence_error,
@@ -26,6 +31,10 @@ from agent_run.github import GitHubReadError
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_currentness import run_currentness_boundary
+from agent_run.worker_credentials import InitialCredentialUnavailable
+
+
+_RUN_PUBLICATION_CREDENTIAL_SUBJECT = "run-publication"
 
 
 class RunPublicationFlow(RunPublicationShared):
@@ -268,6 +277,9 @@ class RunPublicationFlow(RunPublicationShared):
     def _create_publication_artifact(
         self, state: dict[str, Any], publication: dict[str, Any]
     ) -> PublicationArtifact | None:
+        resume_initial_credential_wait(
+            state, work_subject=_RUN_PUBLICATION_CREDENTIAL_SUBJECT
+        )
         checkout = self._publication_checkout(state)
         try:
             self.git.prepare_validation_checkout(
@@ -285,7 +297,27 @@ class RunPublicationFlow(RunPublicationShared):
                 request["_invocation_mode"] = "new-thread"
             elif publication.get("publication_failure_resume") is True:
                 request["_invocation_mode"] = "resume"
-            raw = self.agents.run_publication(request)
+            try:
+                raw = self.agents.run_publication(request)
+            except InitialCredentialUnavailable:
+                # No final-publication Worker started, so this does not spend
+                # a publication attempt or turn an availability outage into
+                # an execution failure.
+                publication["phase"] = "pending"
+                publication["publication_attempts"] = max(
+                    0, int(publication["publication_attempts"]) - 1
+                )
+                wait_for_initial_credential(
+                    state,
+                    work_subject=_RUN_PUBLICATION_CREDENTIAL_SUBJECT,
+                    phase="run_publication",
+                    resume_status="run_publication_pending",
+                )
+                self._save(state)
+                return None
+            clear_initial_credential_wait(
+                state, work_subject=_RUN_PUBLICATION_CREDENTIAL_SUBJECT
+            )
             publication.pop("publication_failure_resume", None)
             publication.pop("publication_new_thread", None)
             if not self._refresh_currentness(state) or not self._acceptance_is_current(

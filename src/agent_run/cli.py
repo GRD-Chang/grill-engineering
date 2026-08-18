@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -22,7 +23,8 @@ from agent_run.run_publication import RunPublicationEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.error_safety import bounded_error
-from agent_run.external_supervision import is_github_refresh_wait
+from agent_run.external_supervision import ExternalSupervisor, is_github_refresh_wait
+from agent_run.run_driver import DirectRunOperations, RunDriver
 from agent_run.runner_promotion import (
     codex_cli_version,
     current_immutable_runner,
@@ -210,7 +212,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 cli_presentation._print_precondition_failure(local_state)
                 return 2
         if parsed.command == "run":
-            state, resumed = cli_surface._run_to_human_gate(parsed, states, controller)
+            driver = _run_driver(parsed, states, controller, git, github)
+            state, resumed = cli_surface._run_to_human_gate(
+                parsed, states, controller, driver
+            )
         elif parsed.command == "start":
             state, resumed = controller.start(
                 parsed.parent, reuse_existing=not parsed.new_run
@@ -221,7 +226,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 cli_presentation._print_precondition_failure(current)
                 return 2
             if current.get("status") == "supervision_timeout":
-                state, resumed = cli_surface._resume_supervision(parsed, states)
+                state, resumed = cli_surface._resume_supervision(
+                    parsed,
+                    states,
+                    _run_driver(parsed, states, controller, git, github),
+                )
                 active_ticket_job = state.get("active_ticket_job")
                 diagnostics = state.get("diagnostics")
                 current_diagnostics = (
@@ -753,6 +762,62 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
         )
     return 2
+
+
+def _foreground_supervisor(parsed: argparse.Namespace) -> ExternalSupervisor:
+    if not parsed.github_fixture:
+        return ExternalSupervisor(sleeper=time.sleep)
+    fixture_path = Path(parsed.github_fixture)
+
+    def advance_fixture_clock(seconds: float) -> None:
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        current = fixture.get("supervision_clock", 0.0)
+        if not isinstance(current, (int, float)):
+            current = 0.0
+        multiplier = fixture.get("supervision_clock_multiplier", 1)
+        if not isinstance(multiplier, (int, float)) or multiplier <= 0:
+            multiplier = 1
+        fixture["supervision_clock"] = float(current) + seconds * multiplier
+        fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    def fixture_now() -> float:
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        current = fixture.get("supervision_clock", 0.0)
+        return float(current) if isinstance(current, (int, float)) else 0.0
+
+    return ExternalSupervisor(
+        now=fixture_now, sleeper=advance_fixture_clock
+    )
+
+
+def _run_driver(
+    parsed: argparse.Namespace,
+    states: StateStore | FaultInjectingStateStore,
+    controller: Controller,
+    git: GitRepository,
+    github: FixtureGitHubReader | GhGitHubReader,
+) -> RunDriver:
+    agents = (
+        FixtureAgentBackend(Path(parsed.agent_fixture))
+        if parsed.agent_fixture
+        else CodexCliBackend()
+    )
+    return RunDriver(
+        operations=DirectRunOperations(
+            controller=controller,
+            states=states,
+            git=git,
+            github_reader=github,
+            publisher_factory=lambda: (
+                FixtureGitHubPublisher(Path(parsed.github_fixture), git)
+                if parsed.github_fixture
+                else GhGitHubPublisher(github.repository().name_with_owner, git)
+            ),
+            agents=agents,
+        ),
+        states=states,
+        supervisor=_foreground_supervisor(parsed),
+    )
 
 
 def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:

@@ -38,6 +38,10 @@ class WorkerCredentialError(RuntimeError):
     """A Worker cannot currently obtain a read-only GitHub credential."""
 
 
+class InitialCredentialUnavailable(WorkerCredentialError):
+    """The first credential mint failed before a Worker process started."""
+
+
 @dataclass(frozen=True)
 class ReadCredential:
     token: str

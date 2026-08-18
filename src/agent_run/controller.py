@@ -582,6 +582,21 @@ class Controller:
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
+            supervision_window = state.get("supervision_window")
+            if isinstance(supervision_window, dict):
+                # Graph reconciliation is deliberately about GitHub-owned
+                # delivery facts.  A foreground wait deadline is local Run
+                # ownership and must survive a refresh that temporarily
+                # projects the lifecycle back to ``active``.
+                refreshed["supervision_window"] = deepcopy(supervision_window)
+            credential_availability = state.get("credential_availability")
+            if isinstance(credential_availability, dict):
+                # The first-mint retry record is also Controller-owned local
+                # state, not a GitHub graph fact.  Retain it while a refresh
+                # temporarily projects the Run back to its normal phase.
+                refreshed["credential_availability"] = deepcopy(
+                    credential_availability
+                )
             refreshed.pop("currentness_resolution_pending", None)
             self._mark_stale_change_job(
                 refreshed, check_requeue_currentness=check_requeue_currentness

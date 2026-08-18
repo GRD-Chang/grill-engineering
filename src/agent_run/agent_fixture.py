@@ -12,6 +12,7 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.worker_sandbox import WorkerSandboxError
+from agent_run.worker_credentials import InitialCredentialUnavailable
 
 
 class FixtureAgentBackend:
@@ -29,10 +30,30 @@ class FixtureAgentBackend:
             "run_reviews": 0,
             "run_publications": 0,
         }
+        failures = value.get("initial_credential_failures", [])
+        if not isinstance(failures, list) or not all(
+            isinstance(message, str) for message in failures
+        ):
+            raise ValueError("initial_credential_failures must contain strings")
+        self.initial_credential_failures = list(failures)
+        by_role = value.get("initial_credential_failures_by_role", {})
+        if not isinstance(by_role, dict) or not all(
+            isinstance(role, str)
+            and isinstance(messages, list)
+            and all(isinstance(message, str) for message in messages)
+            for role, messages in by_role.items()
+        ):
+            raise ValueError(
+                "initial_credential_failures_by_role must map roles to strings"
+            )
+        self.initial_credential_failures_by_role = {
+            role: list(messages) for role, messages in by_role.items()
+        }
 
     def develop(
         self, request: dict[str, Any]
     ) -> DevelopmentResult | HumanBlockerResult:
+        self._maybe_fail_initial_credential("developments")
         step = self._next("developments")
         event = request.get("_invocation_event")
         notify = event if callable(event) else None
@@ -221,6 +242,7 @@ class FixtureAgentBackend:
             and isinstance(self.data.get("run_reviews"), list)
             else "reviews"
         )
+        self._maybe_fail_initial_credential(name)
         if request.get("acceptance_scope") != "run" or request.get(
             "repair_scope"
         ) == "run_repair":
@@ -294,6 +316,7 @@ class FixtureAgentBackend:
         return ReviewResult(thread_id=thread_id, artifact=artifact)
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._maybe_fail_initial_credential("run_publications")
         result, thread_id = self._output_attempts(
             "run_publications",
             request,
@@ -403,6 +426,15 @@ class FixtureAgentBackend:
             )
             return result, current_thread
         raise AssertionError("unreachable")
+
+    def _maybe_fail_initial_credential(self, role: str) -> None:
+        failures = self.initial_credential_failures_by_role.get(role)
+        if failures:
+            failures.pop(0)
+            raise InitialCredentialUnavailable("credential_unavailable")
+        if self.initial_credential_failures:
+            self.initial_credential_failures.pop(0)
+            raise InitialCredentialUnavailable("credential_unavailable")
 
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)

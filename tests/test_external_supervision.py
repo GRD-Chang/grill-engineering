@@ -63,6 +63,34 @@ def test_each_waiting_object_gets_its_own_budget_window() -> None:
     assert supervisor.before_retry(second)
 
 
+def test_observed_wait_window_survives_a_new_supervisor_until_explicit_resume() -> None:
+    now = [0.0]
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "waiting_checks",
+        "active_ticket_job": {"pr_number": 11, "phase": "waiting_checks"},
+    }
+    first = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
+    )
+
+    window = first.observe(state)
+
+    assert window is not None
+    assert window["started_at"] == 0
+    assert window["deadline"] == CHECKS_BUDGET_SECONDS
+
+    now[0] = CHECKS_BUDGET_SECONDS
+    restarted = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
+    )
+    assert not restarted.before_retry(state)
+    assert state["supervision_wait"]["deadline"] == CHECKS_BUDGET_SECONDS  # type: ignore[index]
+
+    restore_supervision_wait(state)
+    assert restarted.observe(state)["started_at"] == CHECKS_BUDGET_SECONDS  # type: ignore[index]
+
+
 def test_restore_supervision_wait_resets_the_persisted_window() -> None:
     state: dict[str, object] = {
         "status": "supervision_timeout",

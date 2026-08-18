@@ -39,6 +39,7 @@ from agent_run.worker_sandbox import (
 )
 from agent_run.worker_credentials import (
     CredentialProvider,
+    InitialCredentialUnavailable,
     WorkerCredentialChannel,
     WorkerCredentialError,
 )
@@ -436,6 +437,8 @@ class CodexCliBackend:
                         attempt_count=attempt,
                     ),
                 )
+            except InitialCredentialUnavailable:
+                raise
             except BaseException as error:
                 notify(
                     "failed",
@@ -574,7 +577,14 @@ class CodexCliBackend:
                     gh_environment=environment,
                     on_exhausted=report_credential_exhausted,
                 ) as credentials:
-                    credentials.start(temporary / "credential.sock")
+                    try:
+                        credentials.start(temporary / "credential.sock")
+                    except WorkerCredentialError as error:
+                        if _is_retryable_initial_credential_error(error):
+                            raise InitialCredentialUnavailable(
+                                "credential_unavailable"
+                            ) from error
+                        raise
                     create_gh_access_adapter(
                         adapter_directory, temporary / "credential.sock", environment
                     )
@@ -600,6 +610,8 @@ class CodexCliBackend:
                             expected=thread_id, callback=on_thread
                         )
                     result = run_worker_process(arguments, **worker_options)
+            except InitialCredentialUnavailable:
+                raise
             except (WorkerSandboxError, WorkerCredentialError) as error:
                 raise CodexProcessError(str(error)) from error
             if result.returncode != 0:
@@ -643,6 +655,30 @@ def _thread_id(output: str) -> str | None:
         if found is not None:
             return found
     return None
+
+
+def _is_retryable_initial_credential_error(error: WorkerCredentialError) -> bool:
+    """Keep invalid credential configuration fail-closed before Worker launch.
+
+    The Supervisor may retry unavailable token minting, but retrying a
+    malformed token or a permissions/configuration rejection would turn a
+    deterministic execution error into an endless wait.
+    """
+
+    permanent_markers = (
+        "empty token",
+        "invalid credential",
+        "exact permissions",
+        "github app id, installation id, and private key are required",
+        "token response is invalid",
+        "token response has no",
+        "token response has an invalid expiry",
+        "token response has an expired token",
+        "could not sign github app jwt",
+        "openssl is required",
+    )
+    message = str(error).lower()
+    return not any(marker in message for marker in permanent_markers)
 
 
 def _terminal_error(stdout: str, stderr: str) -> str:

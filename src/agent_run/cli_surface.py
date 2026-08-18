@@ -24,24 +24,31 @@ from agent_run.cli_presentation import _print_precondition_failure
 
 
 def _run_to_human_gate(
-    parsed: argparse.Namespace, states: StateStore, controller: Controller
+    parsed: argparse.Namespace,
+    states: StateStore,
+    controller: Controller,
+    driver: Any | None = None,
 ) -> tuple[dict[str, Any], bool]:
     state, resumed = controller.start_or_resume_unfinished(parsed.parent)
     run_id = state.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("Delivery Run is missing its Run ID")
     state = _load_local_run(states, run_id)
+    if driver is not None:
+        return driver.advance(state), resumed
     return _advance_to_human_gate(parsed, states, state, resumed)
 
 
 def _resume_supervision(
-    parsed: argparse.Namespace, states: StateStore
+    parsed: argparse.Namespace, states: StateStore, driver: Any | None = None
 ) -> tuple[dict[str, Any], bool]:
     """Resume only a prior external-supervision timeout, not an Agent retry."""
 
     state = _load_local_run(states, parsed.run_id)
     restore_supervision_wait(state)
     states.save_run(parsed.run_id, state)
+    if driver is not None:
+        return driver.advance(state), True
     return _advance_to_human_gate(parsed, states, state, True)
 
 

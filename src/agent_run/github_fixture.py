@@ -1400,6 +1400,15 @@ class FixtureGitHubPublisher:
         raise ValueError(f"fixture PR #{pr_number} is missing")
 
     def _save(self) -> None:
+        # The foreground-supervision fixture clock is advanced by the CLI,
+        # while this publisher intentionally retains one in-memory fixture
+        # view for a lifecycle command.  Preserve the newer clock value so a
+        # later publisher mutation cannot reset a persisted wait deadline.
+        live: object = json.loads(self.path.read_text(encoding="utf-8"))
+        if isinstance(live, dict) and isinstance(
+            live.get("supervision_clock"), (int, float)
+        ):
+            self.data["supervision_clock"] = live["supervision_clock"]
         descriptor, name = tempfile.mkstemp(
             dir=self.path.parent,
             prefix=f".{self.path.name}.",

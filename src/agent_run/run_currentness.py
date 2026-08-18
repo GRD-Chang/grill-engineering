@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Protocol
 
 from agent_run.agent_invocation import canonical_fingerprint
@@ -29,7 +30,16 @@ def refresh_run_currentness(
     projected = state_from_graph(
         state, reader.delivery_graph(int(parent["number"]))
     )
+    supervision_window = state.get("supervision_window")
+    credential_availability = state.get("credential_availability")
     state.update(reconcile_structure(state, projected))
+    # Currentness reconciliation owns GitHub-derived Run facts.  Foreground
+    # supervision and initial credential availability are local Controller
+    # facts, so never let a projection erase their in-flight deadline.
+    if isinstance(supervision_window, dict):
+        state["supervision_window"] = deepcopy(supervision_window)
+    if isinstance(credential_availability, dict):
+        state["credential_availability"] = deepcopy(credential_availability)
     return None if state.get("status") == "unsupported_scope_change" else default_head
 
 
