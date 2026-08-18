@@ -15,7 +15,9 @@ currentness。
 一次 `execution_failed`，不自动重试或替换 Thread。Controller 在启动前保存 active Invocation，
 收到 `thread.started` 时立即保存 reported Thread。操作者后续 `resume` 默认恢复该 Thread，只有
 显式 `--new-thread` 或没有可恢复 Thread 时才以标准阶段 Prompt 新开。Resume 是同一 Job Generation
-内的 Invocation successor，不迁移或重置 Candidate、Acceptance、Human Response、branch/PR 或修复预算。
+内的 Invocation successor，不迁移或重置 Candidate、Acceptance、Human Response 或 branch/PR。唯一的
+领域例外是 `modification_budget_exhausted`：维护者显式执行 Ticket Resume 会新建有编号的十次
+Ticket Repair Budget Window，并保留已耗尽窗口的记录；它不是旧窗口的第十一轮自动开发。
 
 当机械 Currentness Boundary 已经漂移，Controller 不让 Resume 猜测新事实或继续旧 checkout。Ticket 与
 Parent-only Change Job 停在 `requeue_required`，只能由操作者显式 `requeue`：旧 Generation 只保留有界
@@ -30,6 +32,6 @@ Output Repair 不增加 Development、Fresh Acceptance 或领域 Publication att
 仍 current 的 Acceptance 可在 Invocation 失败后保留。`status`/`history` 可展示有界错误与
 Invocation 事实，而无需保存 stdout、Prompt、transcript 或 tool events。
 
-这个分层使三种动作互不替代：Output Repair 只修复零退出后的格式问题；Resume 只继续当前失败或
-Human Blocker Invocation；Requeue 只替换已经 stale 的 Generation。任何一层都不授予 Publisher
+这个分层使三种动作互不替代：Output Repair 只修复零退出后的格式问题；Resume 继续当前失败或
+Human Blocker Invocation，并在唯一预算耗尽边界依据维护者的显式命令创建新的审计窗口；Requeue 只替换已经 stale 的 Generation。任何一层都不授予 Publisher
 Mutation Authority，也不能绕过 Required Checks 或 Published-Head Gate。

@@ -17,7 +17,7 @@ Codex Worker 返回的结构化意图、判断与证据。它可以包含代码�
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **验收 Finding（Acceptance Finding）**:
-独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 由 Agent 用一段自包含文本写明问题、可观察证据、必须达到的结果和复验方式；不另分 P1/P2 或建议类别。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。只有纯主观偏好或与当前 Ticket 无关的未来想法不构成 Finding；不得因问题优先级较低而省略有事实依据的 Finding。
+独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是含 `severity`、`summary`、`evidence`、`required_fix` 与 `verification` 的自包含对象；`severity` 仅用于排序，不改变任一 Finding 使 lane `fail` 的语义。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才构成 Finding。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他非阻塞建议不进入 Acceptance Artifact；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
 _Avoid_: 非空 Finding 的 pass、无行动依据的泛泛建议、Controller 解释或重写 Finding、重复写入多个 lane
 
 **验收 Lane 状态（Acceptance Lane Status）**:
@@ -311,7 +311,7 @@ Feedback Revision。替换 Generation 从空序列开始。
 _Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
 
 **Review Finding（审查发现）**:
-Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以一条自包含文本说明具体问题、代码或行为证据、必须达到的结果以及验证方式；人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
+Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以 `severity`、具体 `summary`、代码或行为 `evidence`、`required_fix` 与 `verification` 组成的对象表达；所有严重度都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
 _Avoid_: 风格意见、无证据猜测、实现方案命令
 
 **Acceptance Repair Loop（验收修复循环）**:
@@ -354,21 +354,29 @@ _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
 维护者以 `agent-run resume <run-id>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
-successor Invocation。存在可恢复 Thread 时默认复用它；`--new-thread` 或无可恢复 Thread 时才以该阶段
-完整标准 Prompt 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness
-Boundary 已 stale 时不启动 Codex，只进入 `requeue_required`。
+successor Invocation。对 `modification_budget_exhausted`，维护者显式执行 Resume 即可
+创建新的 Ticket Repair Budget Window；它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
+但不把新 Attempt 伪装成旧窗口的第十一轮。`--new-thread` 或无可恢复 Thread 时才以该阶段完整标准 Prompt
+新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale
+时不启动 Codex，只进入 `requeue_required`。
 _Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
 
 **Ticket Repair Budget（Ticket 修复预算）**:
-一个 Ticket Job 在 Fresh Acceptance 或 CI 失败后最多可触发十次自动修复 Development Attempt。等待 CI、重复读取状态或对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的修复 Attempt 才计数。预算耗尽、Git 完整性检查无法通过或 CI 无法自动修复时，Ticket 转为 `ready-for-human`；Controller 继续推进不依赖该 Ticket 的其他任务。
+一个 Ticket Job 的每个 Ticket Repair Budget Window 在 Fresh Acceptance 或 CI 失败后最多可触发十次自动修复 Development Attempt。等待 CI、重复读取状态或对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的修复 Attempt 才计数。窗口耗尽时 Ticket 转为 `ready-for-human`，保留 Candidate、PR、findings 与历史；只有维护者显式执行 Resume 才能创建有编号的新窗口。Git 完整性无法通过或 CI 无法自动修复仍按各自失败语义处理；Controller 继续推进不依赖该 Ticket 的其他任务。
 _Avoid_: CI 等待次数、同一 SHA 重复审查、无限重试
 
+**Ticket Repair Budget Window（Ticket 修复预算窗口）**:
+同一 Ticket Job Generation 内一次明确授权的、最多十次实际代码修复 Attempt 的审计单元。它由持久的窗口编号和当前窗口消耗次数表达；预算耗尽不会创建第十一轮自动开发。新的窗口只能由维护者显式执行 `agent-run resume <run-id>` 在 `modification_budget_exhausted` 边界创建，并复用仍 current 的 Job、PR、branch、Candidate、findings 和历史；Currentness Boundary 已 stale 时只允许 `requeue` 创建新 Generation。
+_Avoid_: Job Generation、CI 等待窗口、隐式自动续期
+
 **Ticket Resume Command（Ticket 恢复命令）**:
-维护者通过 `agent-run resume <run-id>` 恢复当前 failed 或 Human Blocker Invocation。若 preflight
+维护者通过 `agent-run resume <run-id>` 恢复当前 failed 或 Human Blocker Invocation；在唯一的
+`modification_budget_exhausted` 边界，该显式命令会新建有编号的 Ticket Repair Budget Window。
+若 preflight
 发现 Ticket Content Revision、Parent Revision 或适用 base 已变化，Controller 不启动 Codex，也不
 复用原 Ticket Job、Ticket Branch 或 Development Thread；它停在 `requeue_required`，维护者需执行
 `agent-run requeue <run-id>` 创建新的 generation。内容未变化时 Resume 仍可复用当前 Invocation 的
-Thread；它不重置修复预算。
+Thread；它不重置既有窗口的消耗记录。
 _Avoid_: 隐式 Requeue、无内容变化重试、Run Feedback Revision
 
 **Progress Exhaustion（推进耗尽）**:

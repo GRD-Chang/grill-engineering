@@ -40,8 +40,29 @@
         "evidence": { "type": "string" },
         "findings": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "$ref": "#/$defs/finding" }
         }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "summary",
+        "evidence",
+        "required_fix",
+        "verification"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"]
+        },
+        "summary": { "type": "string" },
+        "evidence": { "type": "string" },
+        "required_fix": { "type": "string" },
+        "verification": { "type": "string" }
       }
     }
   }
@@ -61,7 +82,7 @@ JSON Schema 只定义形状；以下跨字段规则由本地 parser 强制：
 - 没有 `fail` 但至少一个 lane 为 `blocked`，Controller 进入 Human Blocker。
 - 三个 lane 均为 `pass`，才构成验收通过。
 
-Finding 是一条自包含字符串，采用：`问题：…；证据：…；必须修复：…；复验：…`。同一问题只进入最合适的一个 lane；有证据且当前 Ticket 或 Run 必须处理的问题不得因优先级低而省略。
+Finding 是一个自包含对象：`severity`、`summary`、`evidence`、`required_fix`、`verification` 均为非空字符串；`severity` 仅用于排序，任意严重度的 Finding 均使所属 lane `fail`。同一问题只进入最合适的一个 lane。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才进入 Finding。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他非阻塞建议不得进入 Acceptance Artifact；需要产品决定、权限、凭据或不可替代外部操作时使用 `blocked` evidence。
 
 ## Reviewer Prompt Contract
 
@@ -73,4 +94,4 @@ Finding 是一条自包含字符串，采用：`问题：…；证据：…；�
 - Standards：`审查范围或基线：…；结论：…`；
 - Spec：`已核对的验收标准：…；覆盖结论：…`。
 
-不得因为问题是提示、风格、低优先级或未来改进而隐瞒一个有证据且当前范围必须修复的问题；纯主观偏好或与当前范围无关的未来想法不构成 Finding。
+不得因为问题严重度低而隐瞒一个有证据且当前范围必须修复的问题；纯主观偏好、风格偏好、未来改进、基线问题和其他非阻塞建议不构成 Finding。
