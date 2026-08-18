@@ -99,10 +99,10 @@ agent-run approve <run-id> --repo OWNER/REPO
 
 1. 从已验证的 commit 创建一个非 editable、按 commit SHA 命名的独立 Python 环境；
 2. 从专用干净 clone 启动 Delivery Run，不使用日常脏工作区；
-3. 整个 Run 始终使用同一个 Runner 环境；
-4. Run 完成并合入 `main` 后，才从新 commit 创建下一版 Runner；
+3. 每次 Invocation 使用当前已 promotion 的 Runner；持久化 Run 状态和 GitHub 的精确 head/base 事实，而非 Runner 版本，保证连续性；
+4. `main` 合入修复后可立即创建下一版 Runner，未完成 Run 可由新版继续；
 5. 新版必须先通过一次真实 Structured Outputs promotion handshake；API schema rejection 为 failed，认证、网络或 rate limit 只算 inconclusive，均不得启动新的 self-hosting Run；
-6. 新版完成 promotion 后，只保留当前版和上一版，清理更旧环境。
+6. 新版完成 promotion 后，保留当前版和上一版用于回滚，再清理确认不再需要的更旧环境。
 
 必须遵循 `docs/agent-run.md` 的 promotion gate：从干净 detached checkout 的完整 40 位 SHA 安装，
 再运行一次 `promotion-handshake` 并保存新的 audit 文件。只有 audit verdict 为 `passed`，才允许在
