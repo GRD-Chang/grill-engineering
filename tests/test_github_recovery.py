@@ -8,7 +8,7 @@ import pytest
 
 from conftest import write_fixture
 from agent_run.controller import Controller
-from agent_run.git import GitRepository
+from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
@@ -108,28 +108,29 @@ def test_git_fetch_retries_transient_timeout(
 def test_publisher_does_not_blindly_retry_a_write(
     git_repo: Path, monkeypatch
 ) -> None:
-    attempts = 0
-
-    def fake_run(arguments, **_kwargs):
-        nonlocal attempts
-        if "--list" in arguments:
-            return subprocess.CompletedProcess(arguments, 0, "", "")
-        attempts += 1
-        return subprocess.CompletedProcess(
-            arguments, 1, "", "dial tcp: i/o timeout"
-        )
-
-    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    writes = 0
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher, "_ensure_remote_run_branch", lambda _branch, _sha: None
+    )
+    monkeypatch.setattr(publisher, "_remote_branch_sha", lambda _branch: None)
 
-    with pytest.raises(GitHubReadError, match="dial tcp: i/o timeout"):
-        publisher.ensure_parent_branch(
-            parent_number=1,
+    def fail_write(_arguments, **_kwargs):
+        nonlocal writes
+        writes += 1
+        return subprocess.CompletedProcess([], 1, "", "dial tcp: i/o timeout")
+
+    monkeypatch.setattr("agent_run.github_publish.run_write_command", fail_write)
+
+    with pytest.raises(GitError, match="dial tcp: i/o timeout"):
+        publisher.ensure_change_branch(
             branch="agent-run/run-1/example",
             base_branch="main",
+            expected_base_sha="a" * 40,
+            expected_remote_sha="a" * 40,
+            recovery_remote_sha="a" * 40,
         )
-    assert attempts == 1
+    assert writes == 1
 
 
 def test_publisher_does_not_write_after_branch_read_exhaustion(
@@ -140,23 +141,25 @@ def test_publisher_does_not_write_after_branch_read_exhaustion(
 
     def fake_run(arguments, **_kwargs):
         nonlocal reads
-        if "--list" in arguments:
-            reads += 1
-            return subprocess.CompletedProcess(
-                arguments, 1, "", "HTTP 503: upstream unavailable"
-            )
-        writes.append(arguments)
-        return subprocess.CompletedProcess(arguments, 0, "", "")
+        reads += 1
+        return subprocess.CompletedProcess(
+            arguments, 1, "", "HTTP 503: upstream unavailable"
+        )
 
     monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher, "_ensure_remote_run_branch", lambda _branch, _sha: None
+    )
 
-    with pytest.raises(GitHubReadError, match="HTTP 503"):
-        publisher.ensure_parent_branch(
-            parent_number=1,
+    with pytest.raises(GitError, match="HTTP 503"):
+        publisher.ensure_change_branch(
             branch="agent-run/run-1/example",
             base_branch="main",
+            expected_base_sha="a" * 40,
+            expected_remote_sha="a" * 40,
+            recovery_remote_sha="a" * 40,
         )
 
     assert reads == 3

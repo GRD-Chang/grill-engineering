@@ -11,6 +11,7 @@ from agent_run.change_currentness import stale_change_job_reason, unknown_pr_mut
 from agent_run.cli_presentation import _next_action
 from agent_run.cli_surface import _next_automatic_command
 from agent_run.controller import Controller
+from agent_run.delivery import TicketDeliveryEngine
 from agent_run.cli_surface import _command_is_ready
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -19,6 +20,135 @@ from agent_run.requeue import close_superseded_pull_request, remove_superseded_w
 from agent_run.state import StateStore
 from conftest import write_fixture
 from test_cli import issue, run_cli, stdout_json
+
+
+def test_fixture_ticket_pr_rejects_same_sha_on_wrong_base_branch(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    git = GitRepository(git_repo)
+    publisher = FixtureGitHubPublisher(fixture, git)
+    base_sha = git.resolve("HEAD")
+    publisher.ensure_ticket_branch(
+        ticket_number=7,
+        branch="agent-run/run-1/ticket-7",
+        base_branch="main",
+        expected_base_sha=base_sha,
+        expected_remote_sha=base_sha,
+        recovery_remote_sha=base_sha,
+    )
+    publisher.ensure_ticket_pr(
+        branch="agent-run/run-1/ticket-7",
+        base_branch="main",
+        title="title",
+        body="body",
+        primary_ticket=7,
+        expected_head_sha=base_sha,
+        expected_base_sha=base_sha,
+    )
+    data = publisher.data
+    data["delivery"]["pull_requests"][0]["base_branch"] = "foreign"
+
+    with pytest.raises(ValueError, match="foreign identity"):
+        publisher.ensure_ticket_pr(
+            branch="agent-run/run-1/ticket-7",
+            base_branch="main",
+            title="title",
+            body="body",
+            primary_ticket=7,
+            expected_head_sha=base_sha,
+            expected_base_sha=base_sha,
+        )
+
+
+def test_fixture_closed_ticket_pr_does_not_block_new_publication(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    git = GitRepository(git_repo)
+    publisher = FixtureGitHubPublisher(fixture, git)
+    base_sha = git.resolve("HEAD")
+    branch = "agent-run/run-1/ticket-7"
+    publisher.ensure_ticket_branch(
+        ticket_number=7,
+        branch=branch,
+        base_branch="main",
+        expected_base_sha=base_sha,
+        expected_remote_sha=base_sha,
+        recovery_remote_sha=base_sha,
+    )
+    publisher.ensure_ticket_pr(
+        branch=branch,
+        base_branch="main",
+        title="old title",
+        body="old body",
+        primary_ticket=7,
+        expected_head_sha=base_sha,
+        expected_base_sha=base_sha,
+    )
+    publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
+    publisher.verify_ticket_pr_before_publish(
+        branch=branch,
+        base_branch="main",
+        expected_head_sha=base_sha,
+        expected_base_sha=base_sha,
+    )
+    publisher.publish_branch(
+        branch, "new-publication-sha", expected_remote_sha=base_sha
+    )
+    publisher.ensure_ticket_pr(
+        branch=branch,
+        base_branch="main",
+        title="new title",
+        body="new body",
+        primary_ticket=7,
+        expected_head_sha="new-publication-sha",
+        expected_base_sha=base_sha,
+    )
+
+    pulls = publisher.data["delivery"]["pull_requests"]
+    assert [(pull["state"], pull["head_sha"]) for pull in pulls] == [
+        ("CLOSED", base_sha),
+        ("OPEN", "new-publication-sha"),
+    ]
+
+
+def test_ticket_ref_recovery_preserves_a_publish_intent_before_its_push(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    git = GitRepository(git_repo)
+    publisher = FixtureGitHubPublisher(fixture, git)
+    with states.locked():
+        current = states.load_current_run(str(state["run_id"]))
+        assert current is not None
+        engine = TicketDeliveryEngine(
+            git=git, states=states, github=publisher, agents=object()  # type: ignore[arg-type]
+        )
+        job = engine._job(current)
+        base_sha = str(job["base_sha"])
+        publisher.ensure_ticket_branch(
+            ticket_number=7,
+            branch=str(job["ticket_branch"]),
+            base_branch=str(current["run_branch"]),
+            expected_base_sha=base_sha,
+            expected_remote_sha=base_sha,
+            recovery_remote_sha=base_sha,
+        )
+        job["ticket_write_intent"] = {
+            "action": "publish_ticket_ref",
+            "branch": str(job["ticket_branch"]),
+            "expected_remote_sha": base_sha,
+            "head_sha": "pending-publication-sha",
+        }
+        engine._ensure_ticket_branch(current, job)
+
+    assert job["ticket_write_intent"]["expected_remote_sha"] == base_sha
+    assert job["ticket_write_intent"]["head_sha"] == "pending-publication-sha"
 
 
 def _ticket_state() -> dict[str, Any]:
@@ -320,7 +450,10 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     branch = f"agent-run/{run_id}/ticket-7"
     publisher = FixtureGitHubPublisher(fixture, git)
     publisher.ensure_ticket_branch(
-        branch=branch, base_branch=str(state["run_branch"]), ticket_number=7
+        branch=branch, base_branch=str(state["run_branch"]), ticket_number=7,
+        expected_base_sha=git.resolve(str(state["run_branch"])),
+        expected_remote_sha=git.resolve(str(state["run_branch"])),
+        recovery_remote_sha=git.resolve(str(state["run_branch"])),
     )
     pr_number = publisher.ensure_ticket_pr(
         branch=branch,
@@ -328,6 +461,8 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
         title="old change",
         body="old change",
         primary_ticket=7,
+        expected_head_sha=git.resolve(str(state["run_branch"])),
+        expected_base_sha=git.resolve(str(state["run_branch"])),
     )
     job.update(
         {
@@ -393,7 +528,10 @@ def test_requeue_blocks_an_external_close_during_retirement(
     branch = f"agent-run/{run_id}/ticket-7"
     publisher = FixtureGitHubPublisher(fixture, git)
     publisher.ensure_ticket_branch(
-        branch=branch, base_branch=str(state["run_branch"]), ticket_number=7
+        branch=branch, base_branch=str(state["run_branch"]), ticket_number=7,
+        expected_base_sha=git.resolve(str(state["run_branch"])),
+        expected_remote_sha=git.resolve(str(state["run_branch"])),
+        recovery_remote_sha=git.resolve(str(state["run_branch"])),
     )
     pr_number = publisher.ensure_ticket_pr(
         branch=branch,
@@ -401,6 +539,8 @@ def test_requeue_blocks_an_external_close_during_retirement(
         title="old change",
         body="old change",
         primary_ticket=7,
+        expected_head_sha=git.resolve(str(state["run_branch"])),
+        expected_base_sha=git.resolve(str(state["run_branch"])),
     )
     job.update(
         {
@@ -453,8 +593,9 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     assert isinstance(job, dict)
     branch = f"agent-run/{run_id}/ticket-7"
     publisher = FixtureGitHubPublisher(fixture, git)
-    publisher.ensure_ticket_branch(branch=branch, base_branch=str(state["run_branch"]), ticket_number=7)
-    pr_number = publisher.ensure_ticket_pr(branch=branch, base_branch=str(state["run_branch"]), title="old", body="old", primary_ticket=7)
+    base_sha = git.resolve(str(state["run_branch"]))
+    publisher.ensure_ticket_branch(branch=branch, base_branch=str(state["run_branch"]), ticket_number=7, expected_base_sha=base_sha, expected_remote_sha=base_sha, recovery_remote_sha=base_sha)
+    pr_number = publisher.ensure_ticket_pr(branch=branch, base_branch=str(state["run_branch"]), title="old", body="old", primary_ticket=7, expected_head_sha=base_sha, expected_base_sha=base_sha)
     job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)

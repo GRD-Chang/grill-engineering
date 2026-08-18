@@ -19,6 +19,7 @@ _PROVEN_GITHUB_STATE_CONTRADICTIONS = frozenset(
         "invalid_parent",
         "missing_parent",
         "stale_run_pr",
+        "foreign_run_pr",
     }
 )
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_loop import (
     TicketDeliveryLoop,
@@ -54,16 +55,7 @@ class TicketDeliveryEngine:
                 checkout, str(job["ticket_branch"])
             )
             try:
-                self.github.ensure_parent_branch(
-                    parent_number=int(_mapping(state, "parent")["number"]),
-                    branch=str(state["run_branch"]),
-                    base_branch=str(_mapping(state, "base")["branch"]),
-                )
-                self.github.ensure_ticket_branch(
-                    ticket_number=ticket_number,
-                    branch=str(job["ticket_branch"]),
-                    base_branch=str(state["run_branch"]),
-                )
+                self._ensure_ticket_branch(state, job)
                 self.git.prepare_ticket_checkout(
                     branch=str(job["ticket_branch"]),
                     base_sha=str(job["base_sha"]),
@@ -106,6 +98,15 @@ class TicketDeliveryEngine:
                 if not preserve_checkout:
                     self.git.remove_worktree(checkout)
                     self._remove_empty_worktree_directories(checkout)
+
+    def _ensure_ticket_branch(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        ensure_change_branch_authority(
+            github=self.github, state=state, job=job,
+            branch=str(job["ticket_branch"]), base_branch=str(state["run_branch"]),
+            save=self._save, ticket_number=int(job["ticket_number"]),
+        )
 
     def _job(self, state: dict[str, Any]) -> dict[str, Any]:
         active = _mapping(state, "active_ticket_job")

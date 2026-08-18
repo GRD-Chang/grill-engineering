@@ -571,6 +571,21 @@ def test_codex_worker_environment_excludes_publisher_credentials(
     assert os.environ["GH_TOKEN"] == "publisher-secret"
 
 
+def test_worker_environment_ignores_inherited_agent_run_gh_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale_adapter = tmp_path / "agent-run-codex-stale" / "gh-adapter"
+    stale_adapter.mkdir(parents=True)
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(stale_adapter), "/usr/local/bin", "/usr/bin"))
+    )
+
+    environment = worker_environment(tmp_path / "worker-gh", "reader-secret")
+
+    assert str(stale_adapter) not in environment["PATH"].split(os.pathsep)
+    assert environment["GH_TOKEN"] == "reader-secret"
+
+
 def test_codex_worker_uses_three_hour_wall_clock_limit(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

@@ -116,6 +116,19 @@ class FixtureAgentBackend:
                 raise ValueError("scripted file write escapes checkout")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+        deletions = step.get("delete_files", [])
+        if not isinstance(deletions, list) or not all(
+            isinstance(item, str) for item in deletions
+        ):
+            raise ValueError("delete_files must contain paths")
+        for relative in deletions:
+            target = (checkout / relative).resolve()
+            if checkout not in target.parents:
+                raise ValueError("scripted file deletion escapes checkout")
+            if target.exists():
+                if not target.is_file():
+                    raise ValueError("scripted file deletion requires a file")
+                target.unlink()
         configured_error = step.get("error_after_writes")
         if isinstance(configured_error, str):
             if notify is not None:
