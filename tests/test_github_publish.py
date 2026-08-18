@@ -15,6 +15,33 @@ from agent_run.github_publish import (
 )
 
 
+def test_live_pull_request_uses_the_requested_repository_as_its_base(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    calls: list[tuple[str, ...]] = []
+
+    def fake_json(*arguments: str, **_kwargs: object) -> object:
+        calls.append(arguments)
+        return {
+            "headRefName": "ticket-1",
+            "headRefOid": "a" * 40,
+            "headRepository": {"nameWithOwner": "example/project"},
+            "baseRefName": "main",
+            "baseRefOid": "b" * 40,
+            "mergeable": "MERGEABLE",
+            "state": "OPEN",
+            "mergeCommit": None,
+        }
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    live = publisher.live_pull_request(12)
+
+    assert live["base_repository"] == "example/project"
+    assert "baseRepository" not in calls[0][-1]
+
+
 def test_supersession_status_renders_the_receipt_fields() -> None:
     rendered = _render_agent_run_status(
         {
