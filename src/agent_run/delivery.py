@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
+from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_loop import (
     TicketDeliveryLoop,
@@ -101,59 +102,11 @@ class TicketDeliveryEngine:
     def _ensure_ticket_branch(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None:
-        """Create or recover the Ticket ref from its durable exact identity."""
-        pending_publish = self._pending_ticket_publish(job)
-        authority = {
-            "branch": str(job["ticket_branch"]),
-            "base_branch": str(state["run_branch"]),
-            "base_sha": str(job["base_sha"]),
-            "expected_remote_sha": (
-                str(pending_publish["expected_remote_sha"])
-                if pending_publish is not None
-                else self._expected_ticket_ref_sha(job)
-            ),
-            "recovery_remote_sha": (
-                str(pending_publish["head_sha"])
-                if pending_publish is not None
-                else self._expected_ticket_ref_sha(job)
-            ),
-        }
-        intent = job.get("ticket_write_intent")
-        if pending_publish is None and intent != {
-            "action": "ensure_ticket_branch", "authority": authority
-        }:
-            job["ticket_write_intent"] = {
-                "action": "ensure_ticket_branch",
-                "authority": authority,
-            }
-            self._save(state)
-        self.github.ensure_ticket_branch(
-            ticket_number=int(job["ticket_number"]),
-            branch=authority["branch"],
-            base_branch=authority["base_branch"],
-            expected_base_sha=authority["base_sha"],
-            expected_remote_sha=authority["expected_remote_sha"],
-            recovery_remote_sha=authority["recovery_remote_sha"],
+        ensure_change_branch_authority(
+            github=self.github, state=state, job=job,
+            branch=str(job["ticket_branch"]), base_branch=str(state["run_branch"]),
+            save=self._save, ticket_number=int(job["ticket_number"]),
         )
-        if pending_publish is None:
-            job.pop("ticket_write_intent", None)
-            self._save(state)
-
-    @staticmethod
-    def _expected_ticket_ref_sha(job: dict[str, Any]) -> str:
-        published = job.get("published_sha")
-        return published if isinstance(published, str) else str(job["base_sha"])
-
-    @staticmethod
-    def _pending_ticket_publish(job: dict[str, Any]) -> dict[str, str] | None:
-        intent = job.get("ticket_write_intent")
-        if not isinstance(intent, dict) or intent.get("action") != "publish_ticket_ref":
-            return None
-        expected = intent.get("expected_remote_sha")
-        head = intent.get("head_sha")
-        if isinstance(expected, str) and isinstance(head, str):
-            return {"expected_remote_sha": expected, "head_sha": head}
-        raise ValueError("Ticket publish intent has invalid ref identity")
 
     def _job(self, state: dict[str, Any]) -> dict[str, Any]:
         active = _mapping(state, "active_ticket_job")

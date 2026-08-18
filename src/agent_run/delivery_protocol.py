@@ -32,14 +32,30 @@ class GitHubPublisher(Protocol):
         self, *, issue_number: int, branch: str, head_sha: str
     ) -> str: ...
 
+    def ensure_final_run_ref(
+        self, *, branch: str, expected_head_sha: str
+    ) -> None: ...
+
+    def final_run_ref_matches(
+        self, *, branch: str, expected_head_sha: str
+    ) -> bool: ...
+
     def ensure_run_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+        title: str,
+        body: str,
     ) -> int: ...
 
     def refresh_run_pr_narrative(
         self,
         *,
         pr_number: int,
+        expected_head_branch: str,
         expected_head_sha: str,
         expected_base_branch: str,
         expected_base_sha: str,
@@ -47,7 +63,14 @@ class GitHubPublisher(Protocol):
         body: str,
     ) -> None: ...
 
-    def find_run_pr(self, *, branch: str) -> int | None: ...
+    def find_run_pr(
+        self,
+        *,
+        branch: str,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+    ) -> int | None: ...
 
     def record_run_publication(
         self, pr_number: int, record: dict[str, Any]

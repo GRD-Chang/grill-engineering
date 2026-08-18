@@ -770,7 +770,13 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
         "status": "indeterminate",
     }
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
-    assert len(delivery["linked_branch_display_attempts"]) == 1
+    assert len(
+        [
+            attempt
+            for attempt in delivery["linked_branch_display_attempts"]
+            if attempt["issue_number"] == 3
+        ]
+    ) == 1
 
 
 def test_completed_run_is_not_reopened_by_run_command(git_repo: Path) -> None:

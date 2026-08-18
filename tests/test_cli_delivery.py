@@ -53,6 +53,47 @@ The scripted CLI scenario passed.
     }
 
 
+def final_run_publication() -> dict[str, str]:
+    return {
+        "commit_message": "feat(run): publish the completed delivery",
+        "pr_title": "feat(run): publish the completed delivery",
+        "pr_body_markdown": """
+## What Problem This Solves
+
+The completed Ticket needs one review boundary.
+
+## Why This Change Was Made
+
+The Run branch keeps the standard delivery route.
+
+## User Impact
+
+Maintainers can approve the complete Parent delivery.
+
+## Evidence
+
+The independent expected-merge review passed.
+""".strip(),
+    }
+
+
+def final_run_agents() -> dict[str, object]:
+    return {
+        "developments": [
+            {
+                "expected_thread_id": None,
+                "thread_id": "ticket-developer",
+                "summary": "Delivered the Ticket.",
+                "write_files": {"feature.txt": "done\n"},
+            }
+        ],
+        "publications": [publication()],
+        "reviews": [passing_acceptance("ticket-reviewer", "Ticket passed.")],
+        "run_reviews": [passing_acceptance("run-reviewer", "Run passed.")],
+        "run_publications": [final_run_publication()],
+    }
+
+
 def passing_acceptance(thread_id: str, evidence: str) -> dict[str, object]:
     return {
         "thread_id": thread_id,
@@ -1694,14 +1735,189 @@ def test_forward_candidate_repair_removes_prior_out_of_scope_file(
 
 
 @pytest.mark.parametrize(
-    ("base_branch", "head_sha"),
-    [("main", "f" * 40), ("release", None)],
-    ids=("head", "base"),
+    ("display_outcome", "expected_status"),
+    [
+        ("linked", "linked"),
+        ("api_error", "unavailable"),
+        ("empty", "unavailable"),
+        ("missing_readback", "unavailable"),
+    ],
+)
+def test_run_cli_records_one_final_parent_linked_branch_display(
+    git_repo: Path, display_outcome: str, expected_status: str
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"linked_branch_display_outcomes": display_outcome},
+    )
+    agents = git_repo / "final-run-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+    before_config = subprocess.run(
+        ["git", "config", "--local", "--list"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    delivered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert delivered.returncode == 0, delivered.stderr
+    assert stdout_json(delivered)["status"] == "run_approval_pending"
+    state = load_only_run_state(git_repo)
+    final = state["run_publication"]
+    assert final["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": expected_status,
+    }
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    parent_attempts = [
+        attempt
+        for attempt in delivery["linked_branch_display_attempts"]
+        if attempt["issue_number"] == 1
+    ]
+    assert parent_attempts == [
+        {
+            "issue_number": 1,
+            "branch": state["run_branch"],
+            "head_sha": state["run_acceptance"]["acceptance_record"]["reviewed_head_sha"],
+        }
+    ]
+    after_config = subprocess.run(
+        ["git", "config", "--local", "--list"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert after_config == before_config
+
+
+def test_run_cli_recovers_post_display_crash_without_replaying_parent_display(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"crash_after_final_link_issue_branch_display_once": True},
+    )
+    agents = git_repo / "final-run-display-crash-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    delivered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert delivered.returncode == 0, delivered.stderr
+    assert stdout_json(delivered)["status"] == "run_approval_pending"
+    state = load_only_run_state(git_repo)
+    assert state["run_publication"]["linked_branch_display"] == {
+        "display_attempted": True,
+        "status": "indeterminate",
+    }
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert len(
+        [
+            attempt
+            for attempt in delivery["linked_branch_display_attempts"]
+            if attempt["issue_number"] == 1
+        ]
+    ) == 1
+
+
+def test_run_cli_fails_closed_when_run_ref_expected_absent_cas_loses_race(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"expected_absent_ref_races": ["*"]},
+    )
+    agents = git_repo / "empty-run-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [],
+                "publications": [],
+                "reviews": [],
+                "run_reviews": [],
+                "run_publications": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert delivery.get("pull_requests", []) == []
+    assert len(delivery["published_branches"]) == 1
+
+
+@pytest.mark.parametrize("outcome", ["foreign", "cas_race"])
+def test_run_cli_fails_closed_before_final_pr_on_final_run_ref_authority_error(
+    git_repo: Path, outcome: str
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"final_run_ref_outcomes": [outcome]},
+    )
+    agents = git_repo / "final-run-ref-authority-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "ready_for_human"
+    state = load_only_run_state(git_repo)
+    assert state["run_publication"]["phase"] == "ready_for_human"
+    assert state["run_publication"]["publication_attempts"] == 1
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert not [
+        pull for pull in delivery["pull_requests"] if pull.get("scope") == "final_run"
+    ]
+
+
+def test_run_cli_recovers_lost_final_run_ref_response_by_exact_readback(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"final_run_ref_outcomes": ["lost_response"]},
+    )
+    agents = git_repo / "lost-final-run-ref-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    waiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "run_approval_pending"
+    final = load_only_run_state(git_repo)["run_publication"]
+    assert final["publication_attempts"] == 1
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert len(
+        [pull for pull in delivery["pull_requests"] if pull.get("scope") == "final_run"]
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("base_branch", "head_sha", "identity_error"),
+    [
+        ("main", "f" * 40, {}),
+        ("release", None, {}),
+        ("main", None, {"head_repository": "foreign/project"}),
+        ("main", None, {"head_ref": "foreign-run-ref"}),
+    ],
+    ids=("head", "base", "head-repository", "head-ref"),
 )
 def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
     git_repo: Path,
     base_branch: str,
     head_sha: str | None,
+    identity_error: dict[str, str],
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     ticket_agents = git_repo / "ticket-agents.json"
@@ -1754,6 +1970,7 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
             "title": "preserve this title",
             "body": "preserve this body",
             "head_sha": head_sha or actual_head,
+            **identity_error,
         }
     )
     data["delivery"].setdefault("published_branches", {})[state["run_branch"]] = (
@@ -1785,9 +2002,8 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
         git_repo, fixture, "publish-run", run_id, "--agent-fixture", str(final_agents)
     )
 
-    assert stale.returncode == 0, stale.stderr
-    assert stdout_json(stale)["status"] == "run_acceptance_pending"
-    assert load_only_run_state(git_repo)["run_acceptance"]["phase"] == "pending"
+    assert stale.returncode == 2
+    assert stdout_json(stale)["status"] == "execution_failed"
     preserved = next(
         pull
         for pull in json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
@@ -1795,6 +2011,168 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
     )
     assert preserved["title"] == "preserve this title"
     assert preserved["body"] == "preserve this body"
+
+
+@pytest.mark.parametrize(
+    "identity_error",
+    [
+        {"head_repository": "foreign/project"},
+        {"head_ref": "foreign-run-ref"},
+    ],
+    ids=("head-repository", "head-ref"),
+)
+def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effects(
+    git_repo: Path, identity_error: dict[str, str]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = git_repo / "final-run-identity-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "run_approval_pending"
+    before_state = load_only_run_state(git_repo)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    final = next(
+        pull for pull in data["delivery"]["pull_requests"] if pull.get("scope") == "final_run"
+    )
+    final.update(identity_error)
+    expected_delivery = json.loads(json.dumps(data["delivery"]))
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "publish-run", str(before_state["run_id"]))
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery
+    after_state = load_only_run_state(git_repo)
+    assert after_state["run_publication"]["pr_number"] == before_state["run_publication"]["pr_number"]
+    assert after_state["agent_invocation_history"] == before_state["agent_invocation_history"]
+
+
+@pytest.mark.parametrize(
+    "identity_error",
+    [
+        {"head_repository": "foreign/project"},
+        {"head_ref": "foreign-run-ref"},
+    ],
+    ids=("head-repository", "head-ref"),
+)
+def test_explicit_approval_rejects_foreign_final_run_pr_identity_without_writes(
+    git_repo: Path, identity_error: dict[str, str]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = git_repo / "final-run-approval-identity-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    published = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert published.returncode == 0, published.stderr
+    assert stdout_json(published)["status"] == "run_approval_pending"
+    before_state = load_only_run_state(git_repo)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    final = next(
+        pull for pull in data["delivery"]["pull_requests"] if pull.get("scope") == "final_run"
+    )
+    final.update(identity_error)
+    expected_delivery = json.loads(json.dumps(data["delivery"]))
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "approve", str(before_state["run_id"]))
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery
+    after_state = load_only_run_state(git_repo)
+    assert after_state["run_publication"] == before_state["run_publication"]
+    assert after_state["agent_invocation_history"] == before_state["agent_invocation_history"]
+
+
+@pytest.mark.parametrize(
+    "identity_error",
+    [
+        {"head_repository": "foreign/project"},
+        {"head_ref": "foreign-run-ref"},
+        {"base_repository": "foreign/project"},
+    ],
+    ids=("head-repository", "head-ref", "base-repository"),
+)
+def test_merged_final_run_recovery_rejects_foreign_identity_without_writes(
+    git_repo: Path, identity_error: dict[str, str]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = git_repo / "merged-final-run-identity-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    published = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert published.returncode == 0, published.stderr
+    before_merge = load_only_run_state(git_repo)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["crash_after_normal_merge_once"] = True
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    interrupted = run_cli(git_repo, fixture, "approve", str(before_merge["run_id"]))
+    assert interrupted.returncode == 2
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    final = next(
+        pull for pull in data["delivery"]["pull_requests"] if pull.get("scope") == "final_run"
+    )
+    assert final["state"] == "MERGED"
+    final.update(identity_error)
+    expected_delivery = json.loads(json.dumps(data["delivery"]))
+    expected_parent = json.loads(json.dumps(data["parent"]))
+    before_recovery = load_only_run_state(git_repo)
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "approve", str(before_merge["run_id"]))
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    recovered_data = json.loads(fixture.read_text(encoding="utf-8"))
+    assert recovered_data["delivery"] == expected_delivery
+    assert recovered_data["parent"] == expected_parent
+    after_state = load_only_run_state(git_repo)
+    assert after_state["run_publication"] == before_recovery["run_publication"]
+    assert after_state["agent_invocation_history"] == before_recovery["agent_invocation_history"]
+
+
+@pytest.mark.parametrize(
+    "identity_error",
+    [
+        {"head_repository": "foreign/project"},
+        {"head_ref": "foreign-run-ref"},
+        {"base_repository": "foreign/project"},
+    ],
+    ids=("head-repository", "head-ref", "base-repository"),
+)
+def test_post_merge_readback_rejects_foreign_identity_before_parent_closeout(
+    git_repo: Path, identity_error: dict[str, str]
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"normal_merge_readback_identity_error": identity_error},
+    )
+    agents = git_repo / "post-merge-final-run-identity-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    published = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert published.returncode == 0, published.stderr
+    run_id = stdout_json(published)["run_id"]
+    failed = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "execution_failed"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    final = next(
+        pull for pull in data["delivery"]["pull_requests"] if pull.get("scope") == "final_run"
+    )
+    assert final["state"] == "MERGED"
+    assert data["parent"].get("state") != "CLOSED"
+    assert data["delivery"].get("closed_issues", []) == [3]
 
 
 def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:

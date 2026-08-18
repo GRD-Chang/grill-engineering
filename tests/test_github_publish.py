@@ -1655,6 +1655,91 @@ def test_ticket_ref_creation_is_expected_absent_cas_with_exact_readback(
     assert _remote_head(git_repo, "agent-run/run-1/ticket-3") == base
 
 
+def test_run_ref_authority_uses_expected_absent_cas_and_rejects_foreign_ref(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(git_repo), str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=git_repo,
+        check=True,
+    )
+    base = _rev_parse(git_repo, "HEAD")
+    branch = "agent-run/run-1/run"
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    publisher._ensure_remote_run_branch(branch, base)
+
+    assert _remote_head(git_repo, branch) == base
+    (git_repo / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+    subprocess.run(["git", "add", "foreign.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "foreign ref"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    foreign = _rev_parse(git_repo, "HEAD")
+    subprocess.run(
+        ["git", "push", "--force", "origin", f"{foreign}:refs/heads/{branch}"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(GitError, match="Run ref has a foreign identity"):
+        publisher._ensure_remote_run_branch(branch, base)
+
+    assert _remote_head(git_repo, branch) == foreign
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"head_repository": "foreign/project"},
+        {"head_branch": "foreign-run-ref"},
+    ],
+)
+def test_final_run_pr_foreign_identity_is_not_reused_or_edited(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, identity: dict[str, str]
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    writes: list[tuple[str, ...]] = []
+    monkeypatch.setattr(publisher, "_json", lambda *_arguments: [{"number": 12}])
+    monkeypatch.setattr(
+        publisher,
+        "live_pull_request",
+        lambda _number: {
+            "state": "OPEN",
+            "head_branch": "agent-run/run-1/run",
+            "head_sha": "a" * 40,
+            "head_repository": "example/project",
+            "base_branch": "main",
+            "base_sha": "b" * 40,
+            "base_repository": "example/project",
+            **identity,
+        },
+    )
+    monkeypatch.setattr(publisher, "_require", lambda *args: writes.append(args))
+
+    with pytest.raises(GitHubReadError, match="durable identity"):
+        publisher.ensure_run_pr(
+            branch="agent-run/run-1/run",
+            base_branch="main",
+            expected_head_sha="a" * 40,
+            expected_base_sha="b" * 40,
+            title="current title",
+            body="current body",
+        )
+
+    assert writes == []
+
+
 @pytest.mark.parametrize(
     "branch",
     ["agent-run/run-1/parent", "agent-run-repair/run-1/1"],
@@ -1724,6 +1809,65 @@ def test_ticket_pr_wrong_base_fails_closed_without_pr_write(
         )
 
     assert writes == []
+
+
+def test_existing_change_pr_refreshes_current_narrative_after_identity_readback(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    pulls = [
+        {
+            "number": 12,
+            "title": "old candidate title",
+            "body": "old candidate body",
+            "head": {
+                "ref": "agent-run-repair/run-1/1",
+                "sha": "a" * 40,
+                "repo": {"full_name": "example/project"},
+            },
+            "base": {
+                "ref": "agent-run/run-1/run",
+                "sha": "b" * 40,
+                "repo": {"full_name": "example/project"},
+            },
+        }
+    ]
+    writes: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(publisher, "_json", lambda *_arguments: pulls)
+
+    def fake_require(*arguments: str) -> None:
+        writes.append(arguments)
+        assert arguments[:2] == ("pr", "edit")
+        pulls[0]["title"] = arguments[arguments.index("--title") + 1]
+        pulls[0]["body"] = arguments[arguments.index("--body") + 1]
+
+    monkeypatch.setattr(publisher, "_require", fake_require)
+
+    assert publisher.ensure_change_pr(
+        branch="agent-run-repair/run-1/1",
+        base_branch="agent-run/run-1/run",
+        title="fix(run): repair required checks",
+        body="Delivery Type: Run Repair\n\nsecond publication evidence",
+        expected_head_sha="a" * 40,
+        expected_base_sha="b" * 40,
+    ) == 12
+
+    assert writes == [
+        (
+            "pr",
+            "edit",
+            "12",
+            "--repo",
+            "example/project",
+            "--title",
+            "fix(run): repair required checks",
+            "--body",
+            "Delivery Type: Run Repair\n\nsecond publication evidence",
+        )
+    ]
+    assert pulls[0]["title"] == "fix(run): repair required checks"
+    assert pulls[0]["body"] == "Delivery Type: Run Repair\n\nsecond publication evidence"
 
 
 def test_ticket_pr_wrong_base_is_rejected_before_ref_publication(

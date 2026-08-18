@@ -110,7 +110,9 @@ def test_publisher_does_not_blindly_retry_a_write(
 ) -> None:
     writes = 0
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
-    monkeypatch.setattr(publisher, "_ensure_remote_run_branch", lambda _branch: None)
+    monkeypatch.setattr(
+        publisher, "_ensure_remote_run_branch", lambda _branch, _sha: None
+    )
     monkeypatch.setattr(publisher, "_remote_branch_sha", lambda _branch: None)
 
     def fail_write(_arguments, **_kwargs):
@@ -147,7 +149,9 @@ def test_publisher_does_not_write_after_branch_read_exhaustion(
     monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
-    monkeypatch.setattr(publisher, "_ensure_remote_run_branch", lambda _branch: None)
+    monkeypatch.setattr(
+        publisher, "_ensure_remote_run_branch", lambda _branch, _sha: None
+    )
 
     with pytest.raises(GitError, match="HTTP 503"):
         publisher.ensure_change_branch(

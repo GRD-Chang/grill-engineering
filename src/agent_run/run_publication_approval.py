@@ -4,6 +4,7 @@ from typing import Any
 
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.git import GitError
+from agent_run.github import GitHubReadError
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_publication_shared import RunPublicationShared
 
@@ -22,12 +23,23 @@ class RunPublicationApproval(RunPublicationShared):
             if publication["phase"] != "ready_for_approval":
                 raise ValueError("Run Publication is not ready for explicit approval")
             run = self._mapping(state, "run_acceptance")
-            if not self._acceptance_is_current(state, run):
-                return self._invalidate_for_fresh_acceptance(state)
             record = self._mapping(publication, "record")
             pr_number = self._integer(publication, "pr_number")
             live = self.github.live_pull_request(pr_number)
+            run_head = self.git.resolve(str(state["run_branch"]))
             if live.get("state") == "MERGED":
+                self._require_persisted_merge_intent(
+                    publication, state, record, pr_number, run_head
+                )
+                # A merged PR's live base SHA is now the advanced default ref;
+                # the original base SHA is verified below as the first parent.
+                self._require_final_pr_identity(
+                    live=live,
+                    run_head=run_head,
+                    branch=str(state["run_branch"]),
+                    repository=str(state["repository"]),
+                    expected_base_sha=None,
+                )
                 integrated = live.get("integrated_sha")
                 if (
                     isinstance(integrated, str)
@@ -41,9 +53,18 @@ class RunPublicationApproval(RunPublicationShared):
                     state,
                     "merged final Run PR does not match its reviewed publication boundary",
                 )
+            if not self._acceptance_is_current(state, run):
+                return self._invalidate_for_fresh_acceptance(state)
+            self._require_final_pr_identity(
+                live=live,
+                run_head=run_head,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=self.default_head_sha,
+            )
             if (
                 record.get("pr_head_sha") != live.get("head_sha")
-                or record.get("run_head_sha") != self.git.resolve(str(state["run_branch"]))
+                or record.get("run_head_sha") != run_head
                 or record.get("default_head_sha") != self.default_head_sha
                 or record.get("ticket_completion_records")
                 != ticket_completion_records(state)
@@ -77,10 +98,30 @@ class RunPublicationApproval(RunPublicationShared):
                 publication["phase"] = "waiting_checks"
                 state["status"] = "waiting_checks"
                 return self._save(state)
+            merge_intent = self._prepare_merge_intent(
+                publication, state, record, pr_number, run_head
+            )
+            attempts = merge_intent["attempts"]
+            if attempts >= 3:
+                raise GitHubReadError(
+                    "merge_outcome_unknown",
+                    "Final Run merge intent exhausted exact reconciliation attempts",
+                )
+            merge_intent["attempts"] = attempts + 1
+            self._save(state)
             integrated = self.github.normal_merge(
                 pr_number=pr_number, expected_head_sha=str(live["head_sha"])
             )
             merged = self.github.live_pull_request(pr_number)
+            # The merge has advanced the live base ref; its original SHA is
+            # still verified as the first parent below.
+            self._require_final_pr_identity(
+                live=merged,
+                run_head=run_head,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=None,
+            )
             if (
                 merged.get("state") != "MERGED"
                 or merged.get("integrated_sha") != integrated
@@ -241,6 +282,73 @@ class RunPublicationApproval(RunPublicationShared):
         )
         self._save(state)
         return self._complete_parent_closeout(state)
+
+    def _prepare_merge_intent(
+        self,
+        publication: dict[str, Any],
+        state: dict[str, Any],
+        record: dict[str, Any],
+        pr_number: int,
+        run_head: str,
+    ) -> dict[str, Any]:
+        expected = self._merge_intent_boundary(
+            state, record, pr_number, run_head, self.default_head_sha
+        )
+        existing = publication.get("merge_intent")
+        if existing is None:
+            intent = {**expected, "attempts": 0}
+            publication["merge_intent"] = intent
+            self._save(state)
+            return intent
+        if not isinstance(existing, dict) or any(
+            existing.get(key) != value for key, value in expected.items()
+        ) or type(existing.get("attempts")) is not int or existing["attempts"] < 0:
+            raise GitHubReadError(
+                "merge_intent_mismatch",
+                "Persisted Final Run merge intent does not match the approved boundary",
+            )
+        return existing
+
+    def _require_persisted_merge_intent(
+        self,
+        publication: dict[str, Any],
+        state: dict[str, Any],
+        record: dict[str, Any],
+        pr_number: int,
+        run_head: str,
+    ) -> None:
+        intent = publication.get("merge_intent")
+        base_sha = record.get("default_head_sha")
+        if not isinstance(base_sha, str):
+            raise ValueError("Final Run publication record is missing default head")
+        expected = self._merge_intent_boundary(
+            state, record, pr_number, run_head, base_sha
+        )
+        if not isinstance(intent, dict) or type(intent.get("attempts")) is not int or intent["attempts"] < 1 or any(
+            intent.get(key) != value for key, value in expected.items()
+        ):
+            raise GitHubReadError(
+                "merge_intent_mismatch",
+                "Merged Final Run PR has no matching persisted merge intent",
+            )
+
+    def _merge_intent_boundary(
+        self,
+        state: dict[str, Any],
+        record: dict[str, Any],
+        pr_number: int,
+        run_head: str,
+        base_sha: str,
+    ) -> dict[str, Any]:
+        return {
+            "pr_number": pr_number,
+            "repository": str(state["repository"]),
+            "head_branch": str(state["run_branch"]),
+            "head_sha": run_head,
+            "base_branch": self.default_branch,
+            "base_sha": base_sha,
+            "acceptance_boundary": dict(record),
+        }
 
     def _complete_parent_closeout(self, state: dict[str, Any]) -> dict[str, Any]:
         publication = self._publication_state(state)

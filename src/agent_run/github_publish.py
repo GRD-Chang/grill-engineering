@@ -32,7 +32,8 @@ class GhGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
-        self._ensure_remote_run_branch(base_branch)
+        if is_managed_delivery_branch(base_branch):
+            self._ensure_remote_run_branch(base_branch, expected_base_sha)
         remote_sha = self._remote_branch_sha(branch)
         if remote_sha in {expected_remote_sha, recovery_remote_sha}:
             return
@@ -144,11 +145,28 @@ class GhGitHubPublisher:
     def ensure_run_repair_pr(self, **authority: str) -> int:
         return self.ensure_change_pr(**authority)
 
+    def ensure_final_run_ref(self, *, branch: str, expected_head_sha: str) -> None:
+        self._ensure_remote_run_branch(branch, expected_head_sha)
+
+    def final_run_ref_matches(self, *, branch: str, expected_head_sha: str) -> bool:
+        return self._remote_branch_sha(branch) == expected_head_sha
+
     def ensure_run_pr(
-        self, *, branch: str, base_branch: str, title: str, body: str
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+        expected_base_sha: str,
+        title: str,
+        body: str,
     ) -> int:
-        self._ensure_remote_run_branch(branch)
-        existing = self.find_run_pr(branch=branch)
+        existing = self.find_run_pr(
+            branch=branch,
+            expected_head_sha=expected_head_sha,
+            expected_base_branch=base_branch,
+            expected_base_sha=expected_base_sha,
+        )
         if existing is not None:
             return existing
         self._require(
@@ -168,12 +186,21 @@ class GhGitHubPublisher:
         created = self._json(
             "pr", "view", branch, "--repo", self.repository, "--json", "number"
         )
-        return _integer(_mapping(created), "number")
+        pr_number = _integer(_mapping(created), "number")
+        self._require_final_run_pr_identity(
+            self.live_pull_request(pr_number),
+            branch=branch,
+            expected_head_sha=expected_head_sha,
+            expected_base_branch=base_branch,
+            expected_base_sha=expected_base_sha,
+        )
+        return pr_number
 
     def refresh_run_pr_narrative(
         self,
         *,
         pr_number: int,
+        expected_head_branch: str,
         expected_head_sha: str,
         expected_base_branch: str,
         expected_base_sha: str,
@@ -181,13 +208,13 @@ class GhGitHubPublisher:
         body: str,
     ) -> None:
         live = self.live_pull_request(pr_number)
-        if (
-            live.get("state") != "OPEN"
-            or live.get("head_sha") != expected_head_sha
-            or live.get("base_branch") != expected_base_branch
-            or live.get("base_sha") != expected_base_sha
-        ):
-            raise GitHubReadError("stale_run_pr", "Final Run PR changed before refresh")
+        self._require_final_run_pr_identity(
+            live,
+            branch=expected_head_branch,
+            expected_head_sha=expected_head_sha,
+            expected_base_branch=expected_base_branch,
+            expected_base_sha=expected_base_sha,
+        )
         self._require(
             "pr",
             "edit",
@@ -200,7 +227,14 @@ class GhGitHubPublisher:
             body,
         )
 
-    def find_run_pr(self, *, branch: str) -> int | None:
+    def find_run_pr(
+        self,
+        *,
+        branch: str,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+    ) -> int | None:
         pulls = self._json(
             "pr",
             "list",
@@ -211,7 +245,7 @@ class GhGitHubPublisher:
             "--head",
             branch,
             "--json",
-            "number,state",
+            "number",
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")
@@ -221,8 +255,15 @@ class GhGitHubPublisher:
             )
         if not pulls:
             return None
-        existing = _mapping(pulls[0])
-        return _integer(existing, "number")
+        pr_number = _integer(_mapping(pulls[0]), "number")
+        self._require_final_run_pr_identity(
+            self.live_pull_request(pr_number),
+            branch=branch,
+            expected_head_sha=expected_head_sha,
+            expected_base_branch=expected_base_branch,
+            expected_base_sha=expected_base_sha,
+        )
+        return pr_number
 
     def ensure_parent_pr(self, **authority: str) -> int:
         return self.ensure_change_pr(**authority)
@@ -357,22 +398,33 @@ class GhGitHubPublisher:
         self._require("pr", "close", str(pr_number), "--repo", self.repository)
         return True
 
-    def _ensure_remote_run_branch(self, branch: str) -> None:
-        remote = run_read_command(
-            ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
-            cwd=self.git.root,
-        )
-        if remote.returncode != 0:
-            raise GitError(remote.stderr.strip() or "could not read remote Run Branch")
-        if remote.stdout.strip():
+    def _ensure_remote_run_branch(self, branch: str, expected_sha: str) -> None:
+        """Create or recover one Run/Parent ref by its durable exact SHA.
+
+        A same-named ref is not ownership evidence: it is usable only when its
+        readback is the exact SHA recorded by the Controller before publication.
+        """
+        remote_sha = self._remote_branch_sha(branch)
+        if remote_sha == expected_sha:
             return
-        head = self.git.resolve(branch)
+        if remote_sha is not None:
+            raise GitError("Run ref has a foreign identity")
         pushed = run_write_command(
-            ["git", "push", "origin", f"{head}:refs/heads/{branch}"],
+            [
+                "git",
+                "push",
+                "origin",
+                f"{expected_sha}:refs/heads/{branch}",
+                f"--force-with-lease=refs/heads/{branch}:",
+            ],
             cwd=self.git.root,
         )
         if pushed.returncode != 0:
-            raise GitError(pushed.stderr.strip() or "could not publish Run Branch")
+            if self._remote_branch_sha(branch) == expected_sha:
+                return
+            raise GitError(pushed.stderr.strip() or "could not create Run ref")
+        if self._remote_branch_sha(branch) != expected_sha:
+            raise GitError("Run ref creation readback did not match intent")
 
     def publish_branch(
         self,
@@ -454,14 +506,46 @@ class GhGitHubPublisher:
                 "ambiguous_change_pr", "more than one open Change PR exists"
             )
         if pulls:
-            number = _integer(_mapping(pulls[0]), "number")
+            existing = _mapping(pulls[0])
+            number = _integer(existing, "number")
             self._require_change_pr_identity(
-                _mapping(pulls[0]),
+                existing,
                 branch=branch,
                 base_branch=base_branch,
                 expected_head_sha=expected_head_sha,
                 expected_base_sha=expected_base_sha,
             )
+            if existing.get("title") != title or existing.get("body") != body:
+                self._require(
+                    "pr",
+                    "edit",
+                    str(number),
+                    "--repo",
+                    self.repository,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                )
+            refreshed = self._change_prs(branch)
+            if len(refreshed) != 1:
+                raise GitHubReadError(
+                    "change_pr_readback_missing",
+                    "Change PR refresh did not produce one exact PR",
+                )
+            current = _mapping(refreshed[0])
+            self._require_change_pr_identity(
+                current,
+                branch=branch,
+                base_branch=base_branch,
+                expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha,
+            )
+            if current.get("title") != title or current.get("body") != body:
+                raise GitHubReadError(
+                    "change_pr_narrative_readback_mismatch",
+                    "Change PR narrative readback did not match publication artifact",
+                )
             return number
         self._require(
             "pr",
@@ -756,7 +840,7 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
             "--json",
-            "headRefOid,baseRefName,baseRefOid,mergeable,state,mergeCommit",
+            "headRefName,headRefOid,headRepository,baseRefName,baseRefOid,baseRepository,mergeable,state,mergeCommit",
         )
         data = _mapping(value)
         merge_commit = data.get("mergeCommit")
@@ -764,9 +848,12 @@ class GhGitHubPublisher:
             merge_commit.get("oid") if isinstance(merge_commit, dict) else None
         )
         result = {
+            "head_branch": data.get("headRefName"),
             "head_sha": data.get("headRefOid"),
+            "head_repository": _repository_name(data.get("headRepository")),
             "base_branch": data.get("baseRefName"),
             "base_sha": data.get("baseRefOid"),
+            "base_repository": _repository_name(data.get("baseRepository")),
             "mergeable": (
                 data.get("mergeable") == "MERGEABLE" and data.get("state") == "OPEN"
             ),
@@ -786,6 +873,29 @@ class GhGitHubPublisher:
                 }
             )
         return result
+
+    def _require_final_run_pr_identity(
+        self,
+        live: dict[str, Any],
+        *,
+        branch: str,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+    ) -> None:
+        if (
+            live.get("state") == "OPEN"
+            and live.get("head_branch") == branch
+            and live.get("head_sha") == expected_head_sha
+            and live.get("head_repository") == self.repository
+            and live.get("base_branch") == expected_base_branch
+            and live.get("base_sha") == expected_base_sha
+            and live.get("base_repository") == self.repository
+        ):
+            return
+        raise GitHubReadError(
+            "foreign_run_pr", "Final Run PR does not match durable identity"
+        )
 
     def run_pr_narrative_matches(
         self, pr_number: int, *, title: str, body: str
@@ -1814,6 +1924,13 @@ def _integer(data: dict[str, Any], key: str) -> int:
     if not isinstance(value, int):
         raise GitHubReadError("github_invalid_response", f"{key} must be an integer")
     return value
+
+
+def _repository_name(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    name = value.get("nameWithOwner")
+    return name if isinstance(name, str) else None
 
 
 def _is_read_command(arguments: tuple[str, ...]) -> bool:

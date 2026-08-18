@@ -89,7 +89,7 @@ def ensure_linked_branch_display(
     issue_number: int,
     branch: str,
     head_sha: str,
-    save: Callable[[dict[str, Any]], dict[str, Any]],
+    save: Callable[[dict[str, Any]], Any],
 ) -> None:
     """Make the one optional Linked Branch display attempt durable.
 
@@ -124,7 +124,8 @@ def ensure_change_branch_authority(
     job: dict[str, Any],
     branch: str,
     base_branch: str,
-    save: Callable[[dict[str, Any]], dict[str, Any]],
+    save: Callable[[dict[str, Any]], Any],
+    ticket_number: int | None = None,
 ) -> None:
     """Persist exact ref intent before creating or recovering a Change ref."""
     pending = job.get("ticket_write_intent")
@@ -165,13 +166,20 @@ def ensure_change_branch_authority(
         pass
     elif pending.get("action") != "publish_ticket_ref":
         raise ValueError("Change ref has an unknown write intent")
-    github.ensure_change_branch(
-        branch=branch,
-        base_branch=base_branch,
-        expected_base_sha=authority["base_sha"],
-        expected_remote_sha=expected_remote_sha,
-        recovery_remote_sha=recovery_remote_sha,
-    )
+    if ticket_number is None:
+        github.ensure_change_branch(
+            branch=branch, base_branch=base_branch,
+            expected_base_sha=authority["base_sha"],
+            expected_remote_sha=expected_remote_sha,
+            recovery_remote_sha=recovery_remote_sha,
+        )
+    else:
+        github.ensure_ticket_branch(
+            ticket_number=ticket_number, branch=branch, base_branch=base_branch,
+            expected_base_sha=authority["base_sha"],
+            expected_remote_sha=expected_remote_sha,
+            recovery_remote_sha=recovery_remote_sha,
+        )
     if created_intent or pending_action == "ensure_change_branch":
         job.pop("ticket_write_intent", None)
         save(state)

@@ -12,7 +12,10 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
     parse_publication_wire_result,
 )
-from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
+from agent_run.change_delivery import (
+    MAX_PUBLICATION_ATTEMPTS,
+    ensure_linked_branch_display,
+)
 from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import (
     is_github_convergence_error,
@@ -94,6 +97,10 @@ class RunPublicationFlow(RunPublicationShared):
             except (GitError, GitHubReadError, OSError) as error:
                 if isinstance(error, GitHubReadError):
                     return self._handle_github_error(state, publication, error)
+                if self._final_run_ref_write_is_pending(publication):
+                    return self._handle_final_run_ref_error(
+                        state, publication, error
+                    )
                 if self._publication_failed(state, publication, error):
                     return state
 
@@ -150,9 +157,16 @@ class RunPublicationFlow(RunPublicationShared):
         return self._save(state)
 
     def _persist_write_intent(
-        self, state: dict[str, Any], publication: dict[str, Any], action: str
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        action: str,
+        authority: dict[str, str] | None = None,
     ) -> None:
-        publication["write_intent"] = {"action": action}
+        intent: dict[str, object] = {"action": action}
+        if authority is not None:
+            intent["authority"] = authority
+        publication["write_intent"] = intent
         publication["phase"] = "waiting_external"
         state.update(
             {
@@ -167,6 +181,50 @@ class RunPublicationFlow(RunPublicationShared):
             }
         )
         self._save(state)
+
+    def _final_run_ref_write_is_pending(self, publication: dict[str, Any]) -> bool:
+        intent = publication.get("write_intent")
+        return isinstance(intent, dict) and intent.get("action") == "ensure_final_run_ref"
+
+    def _handle_final_run_ref_error(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        error: Exception,
+    ) -> dict[str, Any]:
+        if isinstance(error, OSError):
+            # The ref may have been created after the response was lost.  Keep
+            # its durable intent so the next call performs readback only.
+            publication["phase"] = "waiting_external"
+            state.update(
+                {
+                    "status": "waiting_external",
+                    "terminal_kind": "waiting_external",
+                    "diagnostics": [
+                        {
+                            "code": "final_run_ref_readback_pending",
+                            "message": "正在确认 Final Run ref 写入结果",
+                        }
+                    ],
+                }
+            )
+        else:
+            # A known foreign ref or failed CAS must not trigger another
+            # Publication Agent invocation or a PR write.
+            publication["phase"] = "ready_for_human"
+            state.update(
+                {
+                    "status": "ready_for_human",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [
+                        {
+                            "code": "final_run_ref_authority_failed",
+                            "message": bounded_error(str(error)),
+                        }
+                    ],
+                }
+            )
+        return self._save(state)
 
     def _write_intent_matches(
         self, pr_number: int | None, expected_title: str, expected_body: str
@@ -312,16 +370,90 @@ class RunPublicationFlow(RunPublicationShared):
         run_head = self.git.resolve(str(state["run_branch"]))
         narrative = self._render_final_run_pr_body(state, artifact.pr_body_markdown)
         known_pr = publication.get("pr_number")
-        existing = (
+        if isinstance(known_pr, int):
+            self._require_final_pr_identity(
+                live=self.github.live_pull_request(known_pr),
+                run_head=run_head,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=self.default_head_sha,
+            )
+        initial_existing = (
             known_pr
             if isinstance(known_pr, int)
-            else self.github.find_run_pr(branch=str(state["run_branch"]))
+            else self.github.find_run_pr(
+                branch=str(state["run_branch"]),
+                expected_head_sha=run_head,
+                expected_base_branch=self.default_branch,
+                expected_base_sha=self.default_head_sha,
+            )
         )
         if not self._publication_is_current(state):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")
         run_head = self.git.resolve(str(state["run_branch"]))
-        if existing is not None and not self._final_pr_is_current(existing, run_head):
+        if initial_existing is not None and not self._final_pr_is_current(
+            initial_existing, run_head, str(state["run_branch"]), str(state["repository"])
+        ):
+            return self._invalidate_for_fresh_acceptance(state)
+        ref_authority = {
+            "branch": str(state["run_branch"]),
+            "base_branch": self.default_branch,
+            "head_sha": run_head,
+            "base_sha": self.default_head_sha,
+        }
+        pending_intent = publication.get("write_intent")
+        if self._final_run_ref_write_is_pending(publication):
+            assert isinstance(pending_intent, dict)
+            if self._mapping(pending_intent, "authority") != ref_authority:
+                raise ValueError("Final Run ref intent does not match durable authority")
+            if not self.github.final_run_ref_matches(
+                branch=ref_authority["branch"], expected_head_sha=run_head
+            ):
+                raise GitError("Final Run ref recovery did not match durable intent")
+            publication.pop("write_intent", None)
+            self._save(state)
+        elif not isinstance(pending_intent, dict):
+            self._persist_write_intent(
+                state, publication, "ensure_final_run_ref", ref_authority
+            )
+            self.github.ensure_final_run_ref(
+                branch=ref_authority["branch"], expected_head_sha=run_head
+            )
+            publication.pop("write_intent", None)
+            self._save(state)
+        elif pending_intent.get("action") == "create_final_pr":
+            if pending_intent.get("authority") != ref_authority:
+                raise ValueError("Final Run ref intent does not match durable authority")
+            if not self.github.final_run_ref_matches(
+                branch=ref_authority["branch"], expected_head_sha=run_head
+            ):
+                raise GitError("Final Run ref recovery did not match durable intent")
+        existing = (
+            known_pr
+            if isinstance(known_pr, int)
+            else self.github.find_run_pr(
+                branch=str(state["run_branch"]),
+                expected_head_sha=run_head,
+                expected_base_branch=self.default_branch,
+                expected_base_sha=self.default_head_sha,
+            )
+        )
+        if isinstance(known_pr, int):
+            self._require_final_pr_identity(
+                live=self.github.live_pull_request(known_pr),
+                run_head=run_head,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=self.default_head_sha,
+            )
+        if not self._publication_is_current(state):
+            return self._invalidate_for_fresh_acceptance(state)
+        run = self._mapping(state, "run_acceptance")
+        run_head = self.git.resolve(str(state["run_branch"]))
+        if existing is not None and not self._final_pr_is_current(
+            existing, run_head, str(state["run_branch"]), str(state["repository"])
+        ):
             return self._invalidate_for_fresh_acceptance(state)
         write_intent_resolved = False
         if isinstance(publication.get("write_intent"), dict):
@@ -331,10 +463,14 @@ class RunPublicationFlow(RunPublicationShared):
             write_intent_resolved = True
         pr_number = existing
         if pr_number is None:
-            self._persist_write_intent(state, publication, "create_final_pr")
+            self._persist_write_intent(
+                state, publication, "create_final_pr", ref_authority
+            )
             pr_number = self.github.ensure_run_pr(
                 branch=str(state["run_branch"]),
                 base_branch=self.default_branch,
+                expected_head_sha=run_head,
+                expected_base_sha=self.default_head_sha,
                 title=artifact.pr_title,
                 body=narrative,
             )
@@ -343,6 +479,7 @@ class RunPublicationFlow(RunPublicationShared):
             self._persist_write_intent(state, publication, "refresh_final_pr_narrative")
             self.github.refresh_run_pr_narrative(
                 pr_number=pr_number,
+                expected_head_branch=str(state["run_branch"]),
                 expected_head_sha=run_head,
                 expected_base_branch=self.default_branch,
                 expected_base_sha=self.default_head_sha,
@@ -351,8 +488,25 @@ class RunPublicationFlow(RunPublicationShared):
             )
             publication.pop("write_intent", None)
         live = self.github.live_pull_request(pr_number)
-        if not self._final_pr_is_current(pr_number, run_head):
+        if not self._final_pr_is_current(
+            pr_number, run_head, str(state["run_branch"]), str(state["repository"])
+        ):
             return self._invalidate_for_fresh_acceptance(state)
+        try:
+            ensure_linked_branch_display(
+                github=self.github,
+                state=state,
+                job=publication,
+                issue_number=int(self._mapping(state, "parent")["number"]),
+                branch=str(state["run_branch"]),
+                head_sha=run_head,
+                save=self._save,
+            )
+        except (GitHubReadError, OSError, TimeoutError):
+            # Display is intentionally outside the core ref/PR lifecycle.  Its
+            # durable pre-call intent makes an interrupted call indeterminate
+            # and prevents any recovery replay.
+            self._save(state)
         record = self._record(state, run_head, str(live["head_sha"]))
         self.github.record_run_publication(pr_number, record)
         publication.update({"pr_number": pr_number, "record": record})
@@ -384,11 +538,17 @@ class RunPublicationFlow(RunPublicationShared):
             state, self._mapping(state, "run_acceptance")
         )
 
-    def _final_pr_is_current(self, pr_number: int, run_head: str) -> bool:
+    def _final_pr_is_current(
+        self, pr_number: int, run_head: str, branch: str, repository: str
+    ) -> bool:
         live = self.github.live_pull_request(pr_number)
         return (
             live.get("state") == "OPEN"
-            and live.get("head_sha") == run_head
-            and live.get("base_branch") == self.default_branch
-            and live.get("base_sha") == self.default_head_sha
+            and self._final_pr_has_expected_identity(
+                live=live,
+                run_head=run_head,
+                branch=branch,
+                repository=repository,
+                expected_base_sha=self.default_head_sha,
+            )
         )

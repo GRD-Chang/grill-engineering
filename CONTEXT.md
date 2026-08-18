@@ -252,7 +252,7 @@ GitHub Issue 页面上可选显示的开发分支关联。它只帮助人阅读 
 _Avoid_: 远端分支身份、PR 身份、恢复门禁
 
 **Candidate Commit（候选提交）**:
-Publisher 在每轮 Development Codex 编辑返回后，于 Change Job working branch 创建的不可变候选快照。Git 完整性检查和修复边界必须绑定其 SHA；每轮修复产生新的 Candidate Commit。它使用程序生成的临时 commit message，例如 `chore(ticket-12): candidate 2`，首次推送前会被压缩，不进入公开历史。
+Controller 在每轮 Development Codex 编辑返回后，于 Change Job working branch 创建的不可变候选快照。Git 完整性检查和修复边界必须绑定其 SHA；每轮修复产生新的 Candidate Commit。它使用程序生成的临时 commit message，例如 `chore(ticket-12): candidate 2`，首次推送前会被压缩，不进入公开历史。
 _Avoid_: Publication Commit、远端 PR head、Agent 自行提交
 
 **Forward Candidate Repair（前进式候选修复）**:

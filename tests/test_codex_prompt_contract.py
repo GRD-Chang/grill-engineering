@@ -59,7 +59,7 @@ def test_non_publication_prompt_keeps_exact_human_blocker_result() -> None:
     assert PUBLICATION_BLOCKER_SHAPE not in development
 
 
-def test_development_prompt_assigns_mutation_authority_to_publisher() -> None:
+def test_development_prompt_assigns_candidate_and_publication_authority() -> None:
     prompt = CodexCliBackend._development_prompt(
         {
             "acceptance_scope": "ticket",
@@ -68,9 +68,9 @@ def test_development_prompt_assigns_mutation_authority_to_publisher() -> None:
         }
     )
 
-    assert "Controller 负责编排、校验和 CI 监督" in prompt
-    assert "Controller 完成校验和调度后，Publisher 创建 append-only Candidate，执行发布、PR 以及全部 Git/GitHub 写入" in prompt
-    assert "Controller 负责创建 append-only Candidate、发布、PR、CI 监督和全部 GitHub 写入" not in prompt
+    assert "Controller 负责创建 append-only Candidate、编排、校验和 CI 监督" in prompt
+    assert "Publisher 执行后续 ref、发布、PR 以及全部 Git/GitHub 写入" in prompt
+    assert "Publisher 创建 append-only Candidate" not in prompt
     assert "Codex 只能编辑当前受管工作树" in prompt
     assert "不得进行 Git 历史操作、暂存、提交、推送、合并或 GitHub 写入" in prompt
 
@@ -435,7 +435,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
-                assert "Controller 完成校验和调度后，Publisher 创建 append-only Candidate" in prompt
+                assert "Controller 负责创建 append-only Candidate" in prompt
             else:
                 assert "Controller" not in prompt, active_case
                 assert "Publisher" not in prompt, active_case

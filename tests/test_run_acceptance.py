@@ -1480,9 +1480,15 @@ def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.ensure_final_run_ref(
+        branch=str(state["run_branch"]),
+        expected_head_sha=git.resolve(str(state["run_branch"])),
+    )
     pr_number = publisher.ensure_run_pr(
         branch=str(state["run_branch"]),
         base_branch="main",
+        expected_head_sha=git.resolve(str(state["run_branch"])),
+        expected_base_sha=git.resolve("main"),
         title="Final Run",
         body="Original final Run narrative.",
     )
