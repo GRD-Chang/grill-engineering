@@ -3,6 +3,7 @@ from __future__ import annotations
 """Bounded supervision of eventually-consistent GitHub lifecycle state."""
 
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 from time import monotonic, sleep
 from typing import Any, Callable
@@ -326,11 +327,19 @@ def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
         "run_id": state.get("run_id"),
         "kind": boundary.kind,
         "phase": _phase(state),
+        "run_branch": state.get("run_branch"),
     }
+    base = state.get("base")
+    if isinstance(base, dict):
+        subject["run_base"] = {
+            item: base.get(item)
+            for item in ("branch", "sha")
+            if base.get(item) is not None
+        }
     for key in ("active_ticket_job", "parent_job", "run_publication"):
         value = state.get(key)
         if isinstance(value, dict):
-            subject[key] = {
+            identity = {
                 item: value.get(item)
                 for item in (
                     "ticket_number",
@@ -343,4 +352,54 @@ def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
                 )
                 if value.get(item) is not None
             }
+            if review_facts := _review_boundary_facts(value):
+                identity["review_boundary"] = review_facts
+            subject[key] = identity
     return json.dumps(subject, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _review_boundary_facts(value: dict[str, Any]) -> dict[str, object]:
+    """Keep a compact fingerprint of facts that bind a reviewed delivery."""
+
+    facts: dict[str, object] = {
+        item: value[item]
+        for item in ("candidate_sha", "effective_revision")
+        if value.get(item) is not None
+    }
+    for name, keys in (
+        (
+            "acceptance_record",
+            (
+                "reviewed_base_sha",
+                "reviewed_candidate_sha",
+                "reviewed_candidate_tree",
+                "effective_revision",
+            ),
+        ),
+        (
+            "record",
+            (
+                "pr_head_sha",
+                "run_head_sha",
+                "default_head_sha",
+                "expected_merge_tree",
+                "parent_revision",
+                "ticket_graph_revision",
+            ),
+        ),
+    ):
+        nested = value.get(name)
+        if not isinstance(nested, dict):
+            continue
+        nested_facts = {
+            item: nested[item] for item in keys if nested.get(item) is not None
+        }
+        completions = nested.get("ticket_completion_records")
+        if isinstance(completions, list):
+            encoded = json.dumps(
+                completions, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            nested_facts["ticket_completion_records_sha256"] = sha256(encoded).hexdigest()
+        if nested_facts:
+            facts[name] = nested_facts
+    return facts

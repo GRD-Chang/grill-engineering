@@ -63,12 +63,22 @@ def test_each_waiting_object_gets_its_own_budget_window() -> None:
     assert supervisor.before_retry(second)
 
 
-def test_observed_wait_window_survives_a_new_supervisor_until_explicit_resume() -> None:
+@pytest.mark.parametrize(
+    ("job_key", "job"),
+    [
+        ("active_ticket_job", {"pr_number": 11, "phase": "waiting_checks"}),
+        ("parent_job", {"pr_number": 12, "phase": "waiting_checks"}),
+        ("run_publication", {"pr_number": 13, "phase": "waiting_checks"}),
+    ],
+)
+def test_observed_wait_window_survives_a_new_supervisor_until_explicit_resume(
+    job_key: str, job: dict[str, object]
+) -> None:
     now = [0.0]
     state: dict[str, object] = {
         "run_id": "run-1",
         "status": "waiting_checks",
-        "active_ticket_job": {"pr_number": 11, "phase": "waiting_checks"},
+        job_key: job,
     }
     first = ExternalSupervisor(
         now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
@@ -89,6 +99,151 @@ def test_observed_wait_window_survives_a_new_supervisor_until_explicit_resume() 
 
     restore_supervision_wait(state)
     assert restarted.observe(state)["started_at"] == CHECKS_BUDGET_SECONDS  # type: ignore[index]
+
+
+@pytest.mark.parametrize("job_key", ["parent_job", "run_publication"])
+def test_changed_parent_or_final_pr_facts_open_a_new_window(job_key: str) -> None:
+    now = [0.0]
+    supervisor = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
+    )
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "waiting_checks",
+        job_key: {
+            "pr_number": 11,
+            "phase": "waiting_checks",
+            "head_sha": "head-a",
+            "base_sha": "base-a",
+        },
+    }
+
+    first = supervisor.observe(state)
+    assert first is not None
+    now[0] = 120
+    changed = state[job_key]
+    assert isinstance(changed, dict)
+    changed["head_sha"] = "head-b"
+
+    replacement = supervisor.observe(state)
+
+    assert replacement is not None
+    assert replacement["identity"] != first["identity"]
+    assert replacement["started_at"] == 120
+
+
+@pytest.mark.parametrize(
+    ("job_key", "changed_path"),
+    [
+        ("parent_job", ("pr_number",)),
+        ("parent_job", ("parent_branch",)),
+        ("parent_job", ("head_sha",)),
+        ("parent_job", ("base_sha",)),
+        ("parent_job", ("acceptance_record", "effective_revision")),
+        ("run_publication", ("pr_number",)),
+        ("run_publication", ("head_sha",)),
+        ("run_publication", ("base_sha",)),
+        ("run_publication", ("record", "run_head_sha")),
+        ("run_publication", ("record", "default_head_sha")),
+        ("run_publication", ("record", "parent_revision")),
+    ],
+)
+def test_changed_parent_or_final_review_boundary_opens_a_new_window(
+    job_key: str, changed_path: tuple[str, ...]
+) -> None:
+    now = [0.0]
+    supervisor = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
+    )
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "run_branch": "agent-run/run-1/run",
+        "status": "waiting_checks",
+        job_key: {
+            "pr_number": 11,
+            "phase": "waiting_checks",
+            "parent_branch": "agent-run/run-1/parent",
+            "head_sha": "head-a",
+            "base_sha": "base-a",
+            "acceptance_record": {"effective_revision": "parent-revision-a"},
+            "record": {
+                "run_head_sha": "run-head-a",
+                "default_head_sha": "default-head-a",
+                "parent_revision": "parent-revision-a",
+            },
+        },
+    }
+
+    first = supervisor.observe(state)
+    assert first is not None
+    now[0] = 120
+    boundary: object = state[job_key]
+    for key in changed_path[:-1]:
+        assert isinstance(boundary, dict)
+        boundary = boundary[key]
+    assert isinstance(boundary, dict)
+    boundary[changed_path[-1]] = "changed"
+
+    replacement = supervisor.observe(state)
+
+    assert replacement is not None
+    assert replacement["identity"] != first["identity"]
+    assert replacement["started_at"] == 120
+
+
+@pytest.mark.parametrize(
+    ("job_key", "changed_path", "replacement_value"),
+    [
+        ("parent_job", ("base", "branch"), "release"),
+        ("parent_job", ("base", "sha"), "base-b"),
+        ("run_publication", ("run_branch",), "agent-run/run-1/replacement"),
+        ("run_publication", ("base", "branch"), "release"),
+        ("run_publication", ("base", "sha"), "base-b"),
+        (
+            "run_publication",
+            ("run_publication", "record", "ticket_completion_records"),
+            [{"ticket_number": 3, "integrated_sha": "changed"}],
+        ),
+    ],
+)
+def test_changed_root_or_completion_review_facts_open_a_new_window(
+    job_key: str, changed_path: tuple[str, ...], replacement_value: object
+) -> None:
+    now = [0.0]
+    supervisor = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda _seconds: None, poll_interval_seconds=60
+    )
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "run_branch": "agent-run/run-1/run",
+        "base": {"branch": "main", "sha": "base-a"},
+        "status": "waiting_checks",
+        job_key: {
+            "pr_number": 11,
+            "phase": "waiting_checks",
+            "record": {
+                "ticket_completion_records": [
+                    {"ticket_number": 3, "integrated_sha": "integrated-a"}
+                ]
+            },
+        },
+    }
+
+    first = supervisor.observe(state)
+    assert first is not None
+    now[0] = 120
+    boundary: object = state
+    for key in changed_path[:-1]:
+        assert isinstance(boundary, dict)
+        boundary = boundary[key]
+    assert isinstance(boundary, dict)
+    boundary[changed_path[-1]] = replacement_value
+
+    replacement = supervisor.observe(state)
+
+    assert replacement is not None
+    assert replacement["identity"] != first["identity"]
+    assert replacement["started_at"] == 120
 
 
 def test_restore_supervision_wait_resets_the_persisted_window() -> None:

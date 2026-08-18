@@ -339,6 +339,7 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
 
 def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
     active = state.get("active_ticket_job")
+    parent = state.get("parent_job")
     acceptance = state.get("run_acceptance")
     publication = state.get("run_publication")
     return (
@@ -348,6 +349,11 @@ def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
         active.get("validation_attempts") if isinstance(active, dict) else None,
         active.get("publication_attempts") if isinstance(active, dict) else None,
         active.get("pull_number") if isinstance(active, dict) else None,
+        parent.get("phase") if isinstance(parent, dict) else None,
+        parent.get("modification_attempts") if isinstance(parent, dict) else None,
+        parent.get("validation_attempts") if isinstance(parent, dict) else None,
+        parent.get("publication_attempts") if isinstance(parent, dict) else None,
+        parent.get("pr_number") if isinstance(parent, dict) else None,
         acceptance.get("phase") if isinstance(acceptance, dict) else None,
         acceptance.get("validation_attempts") if isinstance(acceptance, dict) else None,
         publication.get("phase") if isinstance(publication, dict) else None,
