@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
+from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import passing_acceptance
 
 
@@ -113,7 +113,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -139,7 +139,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         expected_thread_id=expected_thread,
     )
 
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -179,7 +179,7 @@ def test_public_cli_recovers_after_external_response_loss(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -202,7 +202,7 @@ def test_public_cli_recovers_after_external_response_loss(
         expected_thread_id=expected_thread,
     )
 
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -227,7 +227,7 @@ def test_abandon_recovers_ticket_after_close_response_loss(
         git_repo / "agents.json", reviewer="reviewer-first"
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -299,7 +299,7 @@ def test_ready_for_human_remainder_is_reported_after_independent_work(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    result = run_cli(
+    result = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -355,7 +355,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -431,7 +431,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         encoding="utf-8"
     ) == "survives worker error\n"
 
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",

@@ -87,6 +87,10 @@ agent-run status <run-id>
 agent-run history <run-id>
 ```
 
+`start` 也是稳定的公开初始化命令：它创建或幂等返回本地 Run 记录及其受管 Run Branch，不推进生命周期；正常交付仍应从
+`run` 开始。监督超时的 `status` / `history` 会显示恢复操作
+`agent-run resume <run-id>`；`resume` 也用于失败的 Agent Invocation 或 Human Blocker。
+
 检查最终 Run PR 后，只有下面的命令会把结果合入默认分支：
 
 ```bash

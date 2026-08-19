@@ -7,8 +7,9 @@ from typing import Any
 
 import pytest
 
+from agent_run.state import StateStore
 from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
+from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 
 
 HUMAN_BLOCKER = (
@@ -191,7 +192,7 @@ def test_resume_human_blocker_records_bounded_response_and_reuses_development_th
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -267,7 +268,7 @@ def test_ticket_human_response_reaches_fresh_acceptance(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -366,7 +367,7 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -524,7 +525,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     ] = state["base"]["sha"]
     fixture.write_text(json.dumps(seeded), encoding="utf-8")
 
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -629,11 +630,11 @@ def test_parent_only_cli_recovers_lost_change_response_without_duplicate_worker(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert interrupted.returncode == 2
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
 
@@ -666,7 +667,7 @@ def test_parent_only_cli_rejects_same_named_foreign_ref_before_development(
     ] = "foreign"
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
 
@@ -711,7 +712,7 @@ def test_parent_only_cli_recovery_rejects_foreign_pr_identity_without_new_effect
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert interrupted.returncode == 2
@@ -720,7 +721,7 @@ def test_parent_only_cli_recovery_rejects_foreign_pr_identity_without_new_effect
     data["delivery"]["pull_requests"][0].update(identity_error)
     expected_delivery = json.loads(json.dumps(data["delivery"]))
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
 
@@ -750,7 +751,7 @@ def test_parent_only_development_human_blocker_stops_before_candidate(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -802,7 +803,7 @@ def test_parent_only_repair_human_blocker_stops_before_new_candidate(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -854,7 +855,7 @@ def test_parent_only_publication_human_blocker_stops_before_pr_mutation(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -926,7 +927,7 @@ def test_parent_only_malformed_publication_is_execution_failed_and_resumes(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1018,7 +1019,7 @@ def test_parent_only_approve_recovers_after_closeout_response_loss(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agent_fixture)
     )
     assert delivered.returncode == 0, delivered.stderr
@@ -1074,7 +1075,7 @@ def test_resume_freezes_parent_closeout_assets_after_graph_drift(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1166,7 +1167,7 @@ def test_parent_only_approve_rechecks_required_checks_before_merge(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert delivered.returncode == 0, delivered.stderr
@@ -1206,7 +1207,7 @@ def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert delivered.returncode == 0, delivered.stderr
@@ -1245,7 +1246,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    first = run_cli(
+    first = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
     )
     assert stdout_json(first)["status"] == "parent_approval_pending"
@@ -1314,7 +1315,7 @@ def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
     assert stdout_json(
-        run_cli(git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents))
+        run_internal_stage(git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents))
     )["status"] == "parent_approval_pending"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["body"] = "Changed parent requirement."
@@ -1347,7 +1348,7 @@ def test_child_addition_cannot_continue_parent_only_delivery(
     agents = git_repo / "agents.json"
     agents.write_text(json.dumps({"developments": []}), encoding="utf-8")
 
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
 
@@ -1370,7 +1371,11 @@ def test_child_addition_cannot_continue_parent_only_delivery(
         ("approve", run_id, ()),
         ("revise", run_id, ("--message", "do not absorb drift")),
     ):
-        result = run_cli(git_repo, fixture, command, identifier, *extra)
+        result = (
+            run_internal_stage(git_repo, fixture, command, identifier, *extra)
+            if command in {"accept-run", "publish-run"}
+            else run_cli(git_repo, fixture, command, identifier, *extra)
+        )
         assert result.returncode == 2, (command, result.stdout, result.stderr)
         assert stdout_json(result)["status"] == "unsupported_scope_change"
 
@@ -1431,7 +1436,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1460,7 +1465,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     frozen_pending = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
         "mutations"
     ]
-    blocked_replay = run_cli(
+    blocked_replay = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1495,7 +1500,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     ).stdout
     frozen_mutations = after["delivery"]["mutations"]
 
-    replayed = run_cli(
+    replayed = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1560,7 +1565,7 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1620,7 +1625,7 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert count == "1"
     assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
 
-    replayed = run_cli(
+    replayed = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -1939,7 +1944,7 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
     )
     assert stdout_json(delivered)["status"] == "run_acceptance_pending"
@@ -1950,7 +1955,7 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
         ),
         encoding="utf-8",
     )
-    accepted = run_cli(
+    accepted = run_internal_stage(
         git_repo, fixture, "accept-run", run_id, "--agent-fixture", str(run_agents)
     )
     assert stdout_json(accepted)["status"] == "run_publication_pending"
@@ -1998,7 +2003,7 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
         encoding="utf-8",
     )
 
-    stale = run_cli(
+    stale = run_internal_stage(
         git_repo, fixture, "publish-run", run_id, "--agent-fixture", str(final_agents)
     )
 
@@ -2041,13 +2046,62 @@ def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effect
     expected_delivery = json.loads(json.dumps(data["delivery"]))
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    failed = run_cli(git_repo, fixture, "publish-run", str(before_state["run_id"]))
+    resumed_publication = json.loads(json.dumps(before_state))
+    resumed_publication["status"] = "waiting_external"
+    resumed_publication["terminal_kind"] = "waiting_external"
+    resumed_publication["run_publication"]["phase"] = "waiting_external"
+    StateStore(git_repo / ".agent-run").save_run(
+        str(before_state["run_id"]), resumed_publication
+    )
+
+    failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery
     after_state = load_only_run_state(git_repo)
+    assert after_state["terminal_kind"] == "deterministic_contradiction"
+    assert after_state["diagnostics"][0]["code"] == "foreign_run_pr"
     assert after_state["run_publication"]["pr_number"] == before_state["run_publication"]["pr_number"]
+    assert after_state["agent_invocation_history"] == before_state["agent_invocation_history"]
+    status = run_cli(git_repo, fixture, "status", str(before_state["run_id"]), "--json")
+    history = run_cli(git_repo, fixture, "history", str(before_state["run_id"]), "--json")
+    assert stdout_json(status)["status"] == "deterministic_contradiction"
+    assert "agent-run run" not in stdout_json(status)["next_action"]
+    assert "agent-run resume" not in stdout_json(history)["next_action"]
+
+
+def test_public_run_fails_closed_for_an_ambiguous_final_pr_read(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = git_repo / "ambiguous-final-run-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    before_state = load_only_run_state(git_repo)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["run_required_checks_read_failures"] = [
+        {"code": "ambiguous_run_pr", "message": "multiple current Final Run PRs"}
+    ]
+    expected_delivery = json.loads(json.dumps(data["delivery"]))
+    expected_delivery["run_required_checks_read_failures"] = []
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    resumed_publication = json.loads(json.dumps(before_state))
+    resumed_publication["status"] = "waiting_external"
+    resumed_publication["terminal_kind"] = "waiting_external"
+    resumed_publication["run_publication"]["phase"] = "waiting_external"
+    StateStore(git_repo / ".agent-run").save_run(
+        str(before_state["run_id"]), resumed_publication
+    )
+
+    failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery
+    after_state = load_only_run_state(git_repo)
+    assert after_state["diagnostics"][0]["code"] == "ambiguous_run_pr"
     assert after_state["agent_invocation_history"] == before_state["agent_invocation_history"]
 
 
@@ -2082,7 +2136,9 @@ def test_explicit_approval_rejects_foreign_final_run_pr_identity_without_writes(
     failed = run_cli(git_repo, fixture, "approve", str(before_state["run_id"]))
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
+    state = load_only_run_state(git_repo)
+    assert state["diagnostics"][0]["code"] == "foreign_run_pr"
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == expected_delivery
     after_state = load_only_run_state(git_repo)
     assert after_state["run_publication"] == before_state["run_publication"]
@@ -2113,7 +2169,8 @@ def test_merged_final_run_recovery_rejects_foreign_identity_without_writes(
     data["delivery"]["crash_after_normal_merge_once"] = True
     fixture.write_text(json.dumps(data), encoding="utf-8")
     interrupted = run_cli(git_repo, fixture, "approve", str(before_merge["run_id"]))
-    assert interrupted.returncode == 2
+    assert interrupted.returncode == 0
+    assert stdout_json(interrupted)["status"] == "waiting_external"
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     final = next(
@@ -2126,10 +2183,17 @@ def test_merged_final_run_recovery_rejects_foreign_identity_without_writes(
     before_recovery = load_only_run_state(git_repo)
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    failed = run_cli(git_repo, fixture, "approve", str(before_merge["run_id"]))
+    failed = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
     recovered_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert recovered_data["delivery"] == expected_delivery
     assert recovered_data["parent"] == expected_parent
@@ -2165,7 +2229,9 @@ def test_post_merge_readback_rejects_foreign_identity_before_parent_closeout(
     failed = run_cli(git_repo, fixture, "approve", run_id)
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
+    state = load_only_run_state(git_repo)
+    assert state["diagnostics"][0]["code"] == "foreign_run_pr"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     final = next(
         pull for pull in data["delivery"]["pull_requests"] if pull.get("scope") == "final_run"
@@ -2197,7 +2263,7 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
     )
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
     )
     assert stdout_json(delivered)["status"] == "run_acceptance_pending"
@@ -2209,7 +2275,7 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
         ),
         encoding="utf-8",
     )
-    accepted = run_cli(
+    accepted = run_internal_stage(
         git_repo, fixture, "accept-run", run_id, "--agent-fixture", str(run_agents)
     )
     assert stdout_json(accepted)["status"] == "run_publication_pending"
@@ -2234,7 +2300,7 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
         ),
         encoding="utf-8",
     )
-    published = run_cli(
+    published = run_internal_stage(
         git_repo, fixture, "publish-run", run_id, "--agent-fixture", str(final_agents)
     )
     assert stdout_json(published)["status"] == "run_approval_pending"
@@ -2274,14 +2340,12 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
     frozen_mutations = completed_fixture["delivery"]["mutations"]
 
     for command in ("resume", "deliver", "abandon"):
-        replayed = run_cli(
-            git_repo,
-            fixture,
-            command,
-            run_id,
-            *("--agent-fixture", str(ticket_agents))
+        replayed = (
+            run_internal_stage(
+                git_repo, fixture, command, run_id, "--agent-fixture", str(ticket_agents)
+            )
             if command == "deliver"
-            else (),
+            else run_cli(git_repo, fixture, command, run_id)
         )
         assert replayed.returncode == (2 if command == "resume" else 0), replayed.stderr
         assert stdout_json(replayed)["status"] == "completed"
@@ -2323,7 +2387,7 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    waiting = run_cli(
+    waiting = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2350,7 +2414,7 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
     assert checkout.is_dir()
     git_link = (checkout / ".git").read_text(encoding="utf-8")
 
-    completed = run_cli(
+    completed = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2399,7 +2463,7 @@ def test_ticket_repair_human_blocker_stops_before_new_candidate(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2456,7 +2520,7 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    blocked = run_cli(
+    blocked = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2548,7 +2612,7 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2593,7 +2657,7 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
         json.dumps(failed_state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    bypass = run_cli(
+    bypass = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2694,7 +2758,7 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2733,7 +2797,7 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
         ),
         encoding="utf-8",
     )
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         fixture,
         "accept-run",
@@ -2854,7 +2918,7 @@ def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    result = run_cli(
+    result = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2907,7 +2971,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
     )
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
-    waiting = run_cli(
+    waiting = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -2944,7 +3008,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
         encoding="utf-8",
     )
 
-    rejected = run_cli(
+    rejected = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -3027,7 +3091,7 @@ def test_run_stops_for_an_operator_to_requeue_a_stale_generation(
         encoding="utf-8",
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    waiting = run_cli(
+    waiting = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
     )
     assert stdout_json(waiting)["status"] == "waiting_checks"
@@ -3090,7 +3154,7 @@ def test_run_stops_when_a_replacement_generation_drifts_again(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
     assert stdout_json(
-        run_cli(
+        run_internal_stage(
             git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
         )
     )["status"] == "waiting_checks"

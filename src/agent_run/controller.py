@@ -19,6 +19,7 @@ from agent_run.human_responses import append_human_response
 from agent_run.git import GitError, GitRepository, Publisher
 from agent_run.github import GitHubReadError
 from agent_run.external_supervision import (
+    ensure_supervision_window,
     is_github_convergence_error,
     is_github_refresh_wait,
     restore_supervision_wait,
@@ -161,6 +162,7 @@ class Controller:
                 message=error.message,
                 waiting_for="GitHub repository binding",
             )
+            ensure_supervision_window(existing)
             existing["updated_at"] = _now()
             self.states.save_run(str(existing["run_id"]), existing)
             self._register_pending_locator(existing)
@@ -201,8 +203,16 @@ class Controller:
                 "abandoned",
                 "abandonment_pending",
                 "completed",
+                "deterministic_contradiction",
             }:
                 return existing, True
+            resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
+            if resuming_supervision_timeout:
+                if new_thread or human_response is not None or message is not None:
+                    raise ValueError(
+                        "supervision timeout resume does not accept Agent or Human Blocker options"
+                    )
+                restore_supervision_wait(existing)
             parent = _state_mapping(existing, "parent")
             parent_number = int(parent["number"])
             if existing.get("base_resolution_pending") is True:
@@ -227,7 +237,10 @@ class Controller:
             if is_github_refresh_wait(state):
                 self.states.save_run(run_id, state)
                 return state, True
-            if state.get("status") == "unsupported_scope_change" or (
+            if state.get("status") in {
+                "unsupported_scope_change",
+                "deterministic_contradiction",
+            } or (
                 state.get("status") == "execution_failed"
                 and (
                     existing.get("status") != "execution_failed"
@@ -536,6 +549,50 @@ class Controller:
             self.states.save_run(run_id, state)
             return True
 
+    def record_deterministic_contradiction(
+        self, run_id: str, code: str, message: str
+    ) -> bool:
+        """Persist a proven GitHub fact without treating it as retryable."""
+
+        with self.states.locked():
+            state = self.states.load_run(run_id)
+            if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
+                return False
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+                "parent_closeout_pending",
+                "deterministic_contradiction",
+            }:
+                return False
+            hint_reader = getattr(self.github, "repository_hint", None)
+            repository_hint = hint_reader() if callable(hint_reader) else None
+            if (
+                isinstance(repository_hint, str)
+                and repository_hint
+                and state.get("repository") != repository_hint
+            ):
+                return False
+            state.pop("supervision_window", None)
+            state.pop("supervision_wait", None)
+            state.update(
+                {
+                    "status": "deterministic_contradiction",
+                    "terminal_kind": "deterministic_contradiction",
+                    "diagnostics": [
+                        {"code": code, "message": bounded_error(message)}
+                    ],
+                    "updated_at": _now(),
+                }
+            )
+            self.states.save_run(run_id, state)
+            return True
+
     def _load_bound_run(self, run_id: str) -> dict[str, Any]:
         state = self._load_run(run_id)
         repository = self.github.repository()
@@ -582,6 +639,21 @@ class Controller:
             graph = self.github.delivery_graph(parent_number)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
+            supervision_window = state.get("supervision_window")
+            if isinstance(supervision_window, dict):
+                # Graph reconciliation is deliberately about GitHub-owned
+                # delivery facts.  A foreground wait deadline is local Run
+                # ownership and must survive a refresh that temporarily
+                # projects the lifecycle back to ``active``.
+                refreshed["supervision_window"] = deepcopy(supervision_window)
+            credential_availability = state.get("credential_availability")
+            if isinstance(credential_availability, dict):
+                # The first-mint retry record is also Controller-owned local
+                # state, not a GitHub graph fact.  Retain it while a refresh
+                # temporarily projects the Run back to its normal phase.
+                refreshed["credential_availability"] = deepcopy(
+                    credential_availability
+                )
             refreshed.pop("currentness_resolution_pending", None)
             self._mark_stale_change_job(
                 refreshed, check_requeue_currentness=check_requeue_currentness
@@ -599,12 +671,17 @@ class Controller:
                     waiting_for="GitHub authority refresh",
                 )
             else:
+                failed.pop("supervision_window", None)
+                failed.pop("supervision_wait", None)
                 failed.update(
                     {
-                        "status": "blocked",
-                        "terminal_kind": "waiting_human",
+                        "status": "deterministic_contradiction",
+                        "terminal_kind": "deterministic_contradiction",
                         "diagnostics": [
-                            {"code": error.code, "message": error.message}
+                            {
+                                "code": error.code,
+                                "message": bounded_error(error.message),
+                            }
                         ],
                     }
                 )
@@ -657,6 +734,7 @@ class Controller:
             )
         )
         if external is not None:
+            job.pop("approval_grant", None)
             state.update(
                 {
                     "status": "blocked",
@@ -671,6 +749,7 @@ class Controller:
             )
             return
         if candidate_or_acceptance_is_inconsistent(job):
+            job.pop("approval_grant", None)
             state.update(
                 {
                     "status": "blocked",
@@ -687,6 +766,7 @@ class Controller:
         reason = stale_change_job_reason(state, subject, job, self.publisher.git)
         if reason is None:
             return
+        job.pop("approval_grant", None)
         if subject.startswith("run-repair:"):
             invalidate_stale_run_repair(state)
             return
@@ -712,10 +792,22 @@ class Controller:
         self, state: dict[str, Any], default_head: str
     ) -> None:
         """Route completed-Run boundary drift back to fresh Run Acceptance."""
-        if state.get("status") == "unsupported_scope_change":
+        if state.get("status") in {
+            "unsupported_scope_change",
+            "deterministic_contradiction",
+        }:
             return
         acceptance = state.get("run_acceptance")
         if not isinstance(acceptance, dict) or acceptance.get("phase") != "accepted":
+            return
+        publication = state.get("run_publication")
+        if (
+            isinstance(publication, dict)
+            and publication.get("phase") == "waiting_external"
+            and isinstance(publication.get("merge_intent"), dict)
+        ):
+            # A merge may have succeeded before GitHub's response or readback
+            # converged. The approval path owns exact merge-intent recovery.
             return
         record = acceptance.get("acceptance_record")
         if not isinstance(record, dict):
@@ -785,6 +877,7 @@ class Controller:
         if state.get("status") in {
             "execution_failed",
             "unsupported_scope_change",
+            "deterministic_contradiction",
             "abandoned",
             "completed",
             "requeue_required",
@@ -832,7 +925,11 @@ class Controller:
             run_id = str(state["run_id"])
         self._register_pending_locator(state)
         if resumed:
-            if state.get("status") in {"abandoned", "abandonment_pending"}:
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "deterministic_contradiction",
+            }:
                 return state, True
             if state.get("status") == "supervision_timeout":
                 restore_supervision_wait(state)
@@ -870,9 +967,10 @@ class Controller:
             state["terminal_kind"] = None
             state["diagnostics"] = []
         state = self._refresh(state, parent_number)
-        if state.get("status") == "requeue_required" or _is_currentness_human_blocker(
-            state
-        ):
+        if state.get("status") in {
+            "requeue_required",
+            "deterministic_contradiction",
+        } or _is_currentness_human_blocker(state):
             self.states.save_run(run_id, state)
             return state, resumed
         self._ensure_delivery_branch(state, base_sha)

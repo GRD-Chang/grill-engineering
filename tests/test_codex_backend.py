@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from agent_run.agents import PublicationResult
 from agent_run.github_auth import (
     GitHubCredentialError,
     _create_app_jwt,
+    mint_read_only_installation_credential,
     mint_read_only_installation_token,
 )
 from agent_run.worker_sandbox import (
@@ -36,6 +38,7 @@ from agent_run.worker_sandbox import (
     worker_environment,
 )
 from agent_run.worker_credentials import (
+    InitialCredentialUnavailable,
     ReadCredential,
     WorkerCredentialChannel,
     WorkerCredentialError,
@@ -65,6 +68,86 @@ def passing_acceptance_artifact() -> dict[str, object]:
             for lane in ("e2e", "standards", "spec")
         }
     }
+
+
+def test_initial_credential_failure_does_not_start_a_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = False
+
+    def unavailable() -> ReadCredential:
+        raise RuntimeError("token=provider-secret temporarily unavailable")
+
+    def worker_must_not_start(*_args: object, **_kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("Worker must not start before the first credential exists")
+
+    monkeypatch.setattr(
+        "agent_run.codex.run_worker_process", worker_must_not_start
+    )
+    backend = CodexCliBackend(credential_provider=unavailable)
+
+    with pytest.raises(InitialCredentialUnavailable, match="credential_unavailable"):
+        backend._invoke(  # noqa: SLF001 - initial credential boundary seam
+            prompt="controlled initial credential failure",
+            checkout=tmp_path,
+            thread_id=None,
+        )
+
+    assert not started
+
+
+def test_initial_credential_failure_preserves_only_a_safe_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = False
+
+    def unavailable() -> ReadCredential:
+        raise GitHubCredentialError(
+            "GitHub refused the token mint", http_status=503
+        )
+
+    def worker_must_not_start(*_args: object, **_kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("Worker must not start before the first credential exists")
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", worker_must_not_start)
+    with pytest.raises(InitialCredentialUnavailable) as raised:
+        CodexCliBackend(credential_provider=unavailable)._invoke(  # noqa: SLF001
+            prompt="controlled HTTP credential failure",
+            checkout=tmp_path,
+            thread_id=None,
+        )
+
+    assert raised.value.http_status == 503
+    assert not started
+
+
+def test_github_app_token_mint_extracts_only_the_http_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_ID", "123")
+    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_INSTALLATION_ID", "456")
+    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_PRIVATE_KEY", "private-key")
+    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *_: "jwt")
+
+    def reject(*_args: object, **_kwargs: object) -> object:
+        raise urllib.error.HTTPError(
+            "https://api.github.com/private-response",
+            429,
+            "rate limited",
+            {},
+            None,
+        )
+
+    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", reject)
+    with pytest.raises(GitHubCredentialError) as raised:
+        mint_read_only_installation_credential()
+
+    assert raised.value.http_status == 429
+    assert "private-response" not in str(raised.value)
 
 
 def failed_acceptance_artifact(

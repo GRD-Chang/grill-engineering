@@ -850,6 +850,24 @@ class FixtureGitHubPublisher:
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         pull = self._pull(pr_number)
+        failure_key = (
+            "merged_live_pull_request_failures"
+            if pull.get("state") == "MERGED"
+            else "open_live_pull_request_failures"
+        )
+        failures = self._delivery().get(failure_key)
+        if isinstance(failures, list) and failures:
+            configured = failures.pop(0)
+            self._save()
+            if not isinstance(configured, dict):
+                raise GitHubReadError(
+                    "invalid_fixture",
+                    f"{failure_key} must contain objects",
+                )
+            raise GitHubReadError(
+                str(configured.get("code", "github_read_failed")),
+                str(configured.get("message", "GitHub read failed")),
+            )
         published = _mutable_mapping(self._delivery(), "published_branches")
         live_head = published.get(str(pull["branch"])) or pull.get("head_sha")
         override = self._delivery().get("live_head_override")
@@ -1400,6 +1418,15 @@ class FixtureGitHubPublisher:
         raise ValueError(f"fixture PR #{pr_number} is missing")
 
     def _save(self) -> None:
+        # The foreground-supervision fixture clock is advanced by the CLI,
+        # while this publisher intentionally retains one in-memory fixture
+        # view for a lifecycle command.  Preserve the newer clock value so a
+        # later publisher mutation cannot reset a persisted wait deadline.
+        live: object = json.loads(self.path.read_text(encoding="utf-8"))
+        if isinstance(live, dict) and isinstance(
+            live.get("supervision_clock"), (int, float)
+        ):
+            self.data["supervision_clock"] = live["supervision_clock"]
         descriptor, name = tempfile.mkstemp(
             dir=self.path.parent,
             prefix=f".{self.path.name}.",

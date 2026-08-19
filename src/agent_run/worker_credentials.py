@@ -37,6 +37,20 @@ WORKER_GH_RESPONSE_TIMEOUT_SECONDS = (
 class WorkerCredentialError(RuntimeError):
     """A Worker cannot currently obtain a read-only GitHub credential."""
 
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = safe_http_status(http_status)
+
+
+class InitialCredentialUnavailable(WorkerCredentialError):
+    """The first credential mint failed before a Worker process started."""
+
+
+def safe_http_status(value: object) -> int | None:
+    """Return the only HTTP detail safe to retain outside a credential call."""
+
+    return value if type(value) is int and 100 <= value <= 599 else None
+
 
 @dataclass(frozen=True)
 class ReadCredential:
@@ -344,7 +358,8 @@ class WorkerCredentialChannel:
             if require_credential:
                 raise WorkerCredentialError(
                     "Could not create initial Worker read credential: "
-                    f"{self._last_error}"
+                    f"{self._last_error}",
+                    http_status=getattr(renewal_error, "http_status", None),
                 ) from renewal_error
             self._condition.notify_all()
             return
