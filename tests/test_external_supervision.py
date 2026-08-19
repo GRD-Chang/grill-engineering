@@ -42,6 +42,59 @@ def test_pending_required_checks_wait_with_a_bounded_fake_clock() -> None:
     assert diagnostic["budget_seconds"] == CHECKS_BUDGET_SECONDS  # type: ignore[index]
 
 
+def test_retries_use_persistent_capped_backoff_without_crossing_deadline() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    supervisor = ExternalSupervisor(
+        now=lambda: now[0], sleeper=advance, poll_interval_seconds=5
+    )
+    state: dict[str, object] = {"status": "waiting_external"}
+
+    for _ in range(5):
+        assert supervisor.before_retry(state)
+
+    window = state["supervision_window"]  # type: ignore[index]
+    assert sleeps == [5, 10, 20, 40, 60]
+    assert window["retry_count"] == 5  # type: ignore[index]
+    assert window["last_retry_delay_seconds"] == 60  # type: ignore[index]
+
+    now[0] = 10 * 60 - 3
+    assert supervisor.before_retry(state)
+    assert sleeps[-1] == 3
+    assert not supervisor.before_retry(state)
+    assert state["status"] == "supervision_timeout"
+
+
+def test_restarted_supervisor_reuses_the_window_and_backoff_count() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    state: dict[str, object] = {"status": "waiting_external"}
+    first = ExternalSupervisor(
+        now=lambda: now[0], sleeper=advance, poll_interval_seconds=5
+    )
+    assert first.before_retry(state)
+    original_window = state["supervision_window"]  # type: ignore[index]
+
+    restarted = ExternalSupervisor(
+        now=lambda: now[0], sleeper=advance, poll_interval_seconds=5
+    )
+    assert restarted.before_retry(state)
+
+    assert state["supervision_window"] is original_window  # type: ignore[index]
+    assert state["supervision_window"]["retry_count"] == 2  # type: ignore[index]
+    assert sleeps == [5, 10]
+
+
 def test_only_external_wait_states_are_supervised() -> None:
     assert waiting_boundary({"status": "active"}) is None
     assert waiting_boundary({"status": "execution_failed"}) is None
@@ -349,7 +402,6 @@ def test_supervision_timeout_preserves_bounded_last_read_error() -> None:
     "code",
     [
         "github_read_failed",
-        "github_invalid_response",
         "missing_pull_request",
         "ticket_close_ownership_pending",
     ],

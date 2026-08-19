@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shutil
@@ -13,8 +12,16 @@ from typing import Any
 import pytest
 
 import agent_run.cli as cli
-from agent_run.cli import _add_common_options, _main_with_parser, build_parser, main
+from agent_run.agent_fixture import FixtureAgentBackend
+from agent_run.cli import build_parser, main
+from agent_run.controller import Controller
+from agent_run.codex import CodexProcessError
+from agent_run.git import GitRepository
+from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
+from agent_run.run_driver import DirectRunOperations, RunStep
 from agent_run.runner_promotion import PromotionVerification
+from agent_run.state import FaultInjectingStateStore, StateStore
+from agent_run.worker_sandbox import WorkerSandboxError
 from conftest import write_fixture
 
 
@@ -25,7 +32,7 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
     help_text = build_parser().format_help()
 
     assert "推进正常 Job Loop，停在需要操作者处理的边界" in help_text
-    assert "仅恢复当前失败或 Human Blocker 的 Agent Invocation" in help_text
+    assert "恢复失败/Human Blocker Invocation 或监督超时窗口" in help_text
     assert "仅从 requeue_required 创建新的 Change Job Generation" in help_text
     assert "显示当前状态与下一条允许的操作" in help_text
     assert "显示有界 Invocation 与状态时间线" in help_text
@@ -37,6 +44,28 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
         assert internal_command not in help_text
         with pytest.raises(SystemExit):
             build_parser().parse_args([internal_command, "run-id"])
+
+
+@pytest.mark.parametrize("command", ["deliver", "accept-run", "publish-run"])
+def test_removed_stage_commands_are_rejected_by_the_real_cli(command: str) -> None:
+    environment = os.environ.copy()
+    source_path = str(PROJECT_ROOT / "src")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not environment.get("PYTHONPATH")
+        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "agent_run", command, "run-id"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "invalid choice" in result.stderr
 
 
 def test_promotion_preflight_failure_returns_a_cli_error(
@@ -120,18 +149,96 @@ def run_cli(
     environment.setdefault("XDG_STATE_HOME", str(repo / ".agent-run-test-state"))
     if extra_env:
         environment.update(extra_env)
-    command = (
-        [sys.executable, str(PROJECT_ROOT / "tests" / "test_cli.py"), "--legacy-cli"]
-        if arguments and arguments[0] in {"deliver", "accept-run", "publish-run"}
-        else [sys.executable, "-m", "agent_run"]
-    )
     return subprocess.run(
-        [*command, *arguments, "--github-fixture", str(fixture)],
+        [sys.executable, "-m", "agent_run", *arguments, "--github-fixture", str(fixture)],
         cwd=repo,
         env=environment,
         text=True,
         capture_output=True,
         check=False,
+    )
+
+
+def run_internal_stage(
+    repo: Path, fixture: Path, stage: str, run_id: str, *arguments: str
+) -> subprocess.CompletedProcess[str]:
+    """Exercise a legacy stage's engine seam without reviving its CLI command."""
+
+    agent_fixture = (
+        Path(arguments[arguments.index("--agent-fixture") + 1])
+        if "--agent-fixture" in arguments
+        else fixture
+    )
+    crash_after_save = (
+        int(arguments[arguments.index("--crash-after-save") + 1])
+        if "--crash-after-save" in arguments
+        else None
+    )
+    git = GitRepository.discover(repo)
+    states = (
+        FaultInjectingStateStore(
+            repo / ".agent-run", crash_after_save=crash_after_save
+        )
+        if crash_after_save is not None
+        else StateStore(repo / ".agent-run")
+    )
+    reader = FixtureGitHubReader(fixture)
+    controller = Controller(reader, git, states)
+    operations = DirectRunOperations(
+        controller=controller,
+        states=states,
+        git=git,
+        github_reader=reader,
+        publisher_factory=lambda: FixtureGitHubPublisher(fixture, git),
+        agents=FixtureAgentBackend(agent_fixture),
+    )
+    step = {
+        "deliver": RunStep.DELIVER,
+        "accept-run": RunStep.ACCEPT,
+        "publish-run": RunStep.PUBLISH,
+    }[stage]
+    current = states.load_current_run(run_id)
+    invocation = current.get("active_agent_invocation") if isinstance(current, dict) else None
+    if (
+        isinstance(current, dict)
+        and current.get("status") == "execution_failed"
+        and isinstance(invocation, dict)
+        and invocation.get("status") == "failed"
+    ):
+        state = current
+    else:
+        try:
+            state = operations.dispatch(step, run_id).state
+        except (
+            CodexProcessError,
+            GitHubReadError,
+            OSError,
+            ValueError,
+            WorkerSandboxError,
+        ) as error:
+            assert controller.record_execution_failure(run_id, str(error))
+            state = states.load_current_run(run_id)
+            assert state is not None
+    active_ticket = state.get("active_ticket_job")
+    output = {
+        "result": "resumed",
+        "run_id": state["run_id"],
+        "status": state["status"],
+        "run_branch": state.get("run_branch", state.get("parent_branch")),
+        "active_ticket": (
+            active_ticket.get("ticket_number")
+            if isinstance(active_ticket, dict)
+            else None
+        ),
+        "diagnostics": state.get("diagnostics", []),
+        "scope_change": state.get("unsupported_scope_change"),
+        "next_action": cli.cli_presentation._next_action(state),
+    }
+    return subprocess.CompletedProcess(
+        args=["internal-stage", stage, run_id],
+        returncode=0 if state.get("status") in cli._SUCCESSFUL_FOREGROUND_STATUSES else 2,
+        stdout=json.dumps(output, ensure_ascii=False),
+        stderr="",
     )
 
 
@@ -167,23 +274,6 @@ def stdout_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     loaded: object = json.loads(result.stdout)
     assert isinstance(loaded, dict)
     return loaded
-
-
-def _fixture_compatibility_parser() -> argparse.ArgumentParser:
-    """Keep legacy internal-seam tests out of the installed CLI surface."""
-
-    parser = build_parser()
-    subcommands = next(
-        action
-        for action in parser._actions
-        if isinstance(action, argparse._SubParsersAction)
-    )
-    for command in ("deliver", "accept-run", "publish-run"):
-        compatibility = subcommands.add_parser(command, help=argparse.SUPPRESS)
-        compatibility.add_argument("run_id", help="交付运行标识")
-        _add_common_options(compatibility)
-        compatibility.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    return parser
 
 
 def load_only_run_state(repo: Path) -> dict[str, Any]:
@@ -497,10 +587,7 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
     [
         ("run", ("1",)),
         ("resume", ("{run_id}",)),
-        ("deliver", ("{run_id}",)),
         ("requeue", ("{run_id}",)),
-        ("accept-run", ("{run_id}",)),
-        ("publish-run", ("{run_id}",)),
         ("approve", ("{run_id}",)),
         ("revise", ("{run_id}", "--message", "feedback")),
         ("abandon", ("{run_id}",)),
@@ -1295,33 +1382,3 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
     assert retried.returncode == 0, retried.stderr
     assert stdout_json(retried)["result"] == "resumed"
     assert load_only_run_state(git_repo)["status"] == "active"
-
-
-def test_existing_run_records_repository_read_failure_without_network_retry(
-    git_repo: Path,
-) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json", issues={"2": issue(2)}
-    )
-    run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
-    )["run_id"]
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["repository"] = 42
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-
-    failed = run_cli(git_repo, fixture, "deliver", run_id)
-
-    assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
-    state = load_only_run_state(git_repo)
-    assert state["status"] == "execution_failed"
-    assert state["terminal_kind"] == "execution_failed"
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--legacy-cli":
-        raise SystemExit(
-            _main_with_parser(_fixture_compatibility_parser(), sys.argv[2:])
-        )
-    raise SystemExit("tests/test_cli.py is only executable through --legacy-cli")

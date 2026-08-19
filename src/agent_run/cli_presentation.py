@@ -182,6 +182,12 @@ def _print_supervision(wait: object) -> None:
         )
     else:
         print("最新观测: 无")
+    failure_class = wait.get("credential_failure_class")
+    if isinstance(failure_class, str):
+        print(f"凭据失败类别: {failure_class}")
+    http_status = wait.get("credential_http_status")
+    if type(http_status) is int:
+        print(f"凭据 HTTP 状态: {http_status}")
     if wait.get("timeout_resume_action") is not None:
         print(f"超时恢复: {wait['timeout_resume_action']}")
 
@@ -197,6 +203,8 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run approve {run_id}"
     if status == "unsupported_scope_change":
         return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
+    if status == "deterministic_contradiction":
+        return "处理诊断中的确定性矛盾；如需终止执行 agent-run abandon"
     if status == "abandonment_pending" and isinstance(run_id, str):
         return f"agent-run abandon {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
@@ -206,8 +214,10 @@ def _next_action(state: dict[str, Any]) -> str:
         and isinstance(state.get("requeue_transition"), dict)
     ):
         return f"agent-run run {parent_number}"
-    if status == "supervision_timeout" and isinstance(run_id, str):
+    if status == "waiting_external":
         return f"agent-run run {parent_number}"
+    if status == "supervision_timeout" and isinstance(run_id, str):
+        return f"agent-run resume {run_id}"
     invocation = state.get("active_agent_invocation")
     if (
         status == "execution_failed"
@@ -359,6 +369,7 @@ def _display_term(value: object) -> object:
         "run_approval_pending": "等待人工批准",
         "ready_for_human": "等待人工处理",
         "unsupported_scope_change": "不支持的范围变化",
+        "deterministic_contradiction": "确定性矛盾，需人工处理",
         "abandonment_pending": "等待放弃恢复",
         "progress_exhausted": "无可推进任务",
         "execution_failed": "执行失败，可恢复",

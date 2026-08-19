@@ -11,8 +11,10 @@ from agent_run.approval_grant import (
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.external_supervision import (
     ensure_supervision_window,
+    is_github_convergence_error,
     wait_for_github_convergence,
 )
+from agent_run.error_safety import bounded_error
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.run_currentness import ticket_completion_records
@@ -31,7 +33,11 @@ class RunPublicationApproval(RunPublicationShared):
             recovering_merge = publication["phase"] == "waiting_external"
             if publication["phase"] == "merged":
                 return self._complete_parent_closeout(state)
-            if publication["phase"] not in {"ready_for_approval", "waiting_external"}:
+            if publication["phase"] not in {
+                "ready_for_approval",
+                "waiting_checks",
+                "waiting_external",
+            }:
                 raise ValueError("Run Publication is not ready for explicit approval")
             run = self._mapping(state, "run_acceptance")
             record = self._mapping(publication, "record")
@@ -124,7 +130,28 @@ class RunPublicationApproval(RunPublicationShared):
                         ),
                     )
                 )
-            checks = self.github.required_checks(pr_number)
+            try:
+                checks = self.github.required_checks(pr_number)
+            except GitHubReadError as error:
+                if not is_github_convergence_error(error.code):
+                    raise
+                return self._wait_for_required_checks_convergence(
+                    state,
+                    publication,
+                    pr_number=pr_number,
+                    run_head=run_head,
+                    code=error.code,
+                    message=error.message,
+                )
+            except OSError as error:
+                return self._wait_for_required_checks_convergence(
+                    state,
+                    publication,
+                    pr_number=pr_number,
+                    run_head=run_head,
+                    code="github_read_failed",
+                    message=str(error),
+                )
             if checks == "fail":
                 return self._save(
                     self._queue_repair(
@@ -212,6 +239,45 @@ class RunPublicationApproval(RunPublicationShared):
             code="merge_outcome_unknown",
             message=message,
             waiting_for="Final Run merge/readback reconciliation",
+        )
+        ensure_supervision_window(state)
+        return self._save(state)
+
+    def _wait_for_required_checks_convergence(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        *,
+        pr_number: int,
+        run_head: str,
+        code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """Keep an approved Final Run PR in its 45-minute checks window."""
+
+        publication.update(
+            {
+                "phase": "waiting_checks",
+                "head_sha": run_head,
+                "base_sha": self.default_head_sha,
+            }
+        )
+        waiting_for = (
+            f"Final Run PR #{pr_number} Required Checks "
+            f"(head={run_head}, base={self.default_head_sha})"
+        )
+        state.update(
+            {
+                "status": "waiting_checks",
+                "terminal_kind": "waiting_checks",
+                "diagnostics": [
+                    {
+                        "code": code,
+                        "message": bounded_error(message),
+                        "waiting_for": waiting_for,
+                    }
+                ],
+            }
         )
         ensure_supervision_window(state)
         return self._save(state)

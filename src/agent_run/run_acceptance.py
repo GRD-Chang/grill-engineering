@@ -197,7 +197,7 @@ class RunAcceptanceEngine:
             )
             try:
                 review = self.agents.review(request)
-            except InitialCredentialUnavailable:
+            except InitialCredentialUnavailable as error:
                 # This reviewer has not started: keep the same Acceptance
                 # generation and make the next Driver pass retry only its
                 # first read credential, not an interrupted Worker attempt.
@@ -208,6 +208,7 @@ class RunAcceptanceEngine:
                     work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT,
                     phase="run_acceptance",
                     resume_status="run_acceptance_pending",
+                    http_status=error.http_status,
                 )
                 self._save(state)
                 return False

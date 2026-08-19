@@ -9,7 +9,6 @@ import pytest
 
 from agent_run.change_currentness import stale_change_job_reason, unknown_pr_mutation
 from agent_run.cli_presentation import _next_action
-from agent_run.cli_surface import _next_automatic_command
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.cli_surface import _command_is_ready
@@ -258,9 +257,6 @@ def test_only_requeue_is_a_lifecycle_action_at_the_stale_generation_boundary() -
     state: dict[str, object] = {"status": "requeue_required"}
 
     assert _command_is_ready(state, "requeue") is True
-    assert _command_is_ready(state, "deliver") is False
-    assert _command_is_ready(state, "accept-run") is False
-    assert _command_is_ready(state, "publish-run") is False
     assert _command_is_ready(state, "approve") is False
     assert _command_is_ready(state, "revise") is False
 
@@ -412,27 +408,20 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
         }
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    waiting = run_cli(git_repo, fixture, "requeue", str(state["run_id"]))
+    blocked = run_cli(git_repo, fixture, "requeue", str(state["run_id"]))
 
-    assert waiting.returncode == 0, waiting.stderr
-    assert stdout_json(waiting)["status"] == "waiting_external"
+    assert blocked.returncode == 2
+    assert stdout_json(blocked)["status"] == "deterministic_contradiction"
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
     assert persisted["requeue_transition"]["retired"] == retired
     assert persisted["diagnostics"][0]["code"] == "github_invalid_response"
-    assert persisted["diagnostics"][0]["waiting_for"] == (
-        "GitHub requeue transition refresh"
-    )
-    assert persisted["github_refresh_pending"] is True
-    assert _next_automatic_command(persisted) == "requeue"
-    assert _next_action(persisted) == "agent-run run 1"
+    assert persisted.get("github_refresh_pending") is None
+    assert "agent-run run" not in _next_action(persisted)
     assert json.loads(fixture.read_text(encoding="utf-8")).get("delivery", {}).get(
         "mutations", []
     ) == []
 
-    resumed, repeated_retired = controller.requeue(str(state["run_id"]))
-    assert resumed["status"] == "requeue_required"
-    assert repeated_retired == retired
 
 
 def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
@@ -478,7 +467,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)
 
-    stale = run_cli(git_repo, fixture, "deliver", run_id)
+    stale = run_cli(git_repo, fixture, "run", "1")
     assert stdout_json(stale)["status"] == "requeue_required"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
@@ -505,7 +494,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
         "crash_after_ensure_run_branch_once"
     ] is True
-    blocked_delivery = run_cli(git_repo, fixture, "deliver", run_id)
+    blocked_delivery = run_cli(git_repo, fixture, "run", "1")
 
     assert blocked_delivery.returncode == 2
     assert stdout_json(blocked_delivery)["status"] == "blocked"
@@ -556,7 +545,7 @@ def test_requeue_blocks_an_external_close_during_retirement(
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)
 
-    assert stdout_json(run_cli(git_repo, fixture, "deliver", run_id))["status"] == (
+    assert stdout_json(run_cli(git_repo, fixture, "run", "1"))["status"] == (
         "requeue_required"
     )
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -599,7 +588,7 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)
-    assert stdout_json(run_cli(git_repo, fixture, "deliver", run_id))["status"] == "requeue_required"
+    assert stdout_json(run_cli(git_repo, fixture, "run", "1"))["status"] == "requeue_required"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["external_reopen_after_supersession_receipt_once"] = True
     fixture.write_text(json.dumps(data), encoding="utf-8")
@@ -709,7 +698,7 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)
 
-    blocked = run_cli(git_repo, fixture, "deliver", run_id)
+    blocked = run_cli(git_repo, fixture, "run", "1")
 
     assert blocked.returncode == 2
     assert stdout_json(blocked)["status"] == "requeue_required"

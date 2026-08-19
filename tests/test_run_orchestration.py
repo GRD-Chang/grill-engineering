@@ -17,7 +17,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import StateStore
 from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
+from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import passing_acceptance
 
 
@@ -250,7 +250,7 @@ def test_deliver_advances_the_complete_dag_and_enters_run_acceptance(
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -482,7 +482,7 @@ def test_human_blocked_branch_does_not_stop_independent_work(
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    result = run_cli(
+    result = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -573,7 +573,7 @@ def test_run_recovers_after_process_failure_between_tickets(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -611,7 +611,7 @@ def test_run_recovers_after_process_failure_between_tickets(
         ),
         encoding="utf-8",
     )
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -691,7 +691,7 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -706,7 +706,7 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     data = json.loads(fixture.read_text(encoding="utf-8"))
     assert data["issues"]["2"]["state"] == "CLOSED"
 
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -772,7 +772,7 @@ def test_provisional_close_intent_can_abandon(
     )
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",

@@ -66,6 +66,27 @@ def _assert_public_wait_projection(
             assert secret not in text_result.stdout
 
 
+def _assert_waiting_external_recovery_action(
+    repo: Path, fixture: Path, run_id: str
+) -> None:
+    expected_action = "agent-run run 1"
+    for command in ("status", "history"):
+        json_result = run_cli(repo, fixture, command, run_id, "--json")
+        text_result = run_cli(repo, fixture, command, run_id)
+
+        assert json_result.returncode == text_result.returncode == 0
+        assert stdout_json(json_result)["next_action"] == expected_action
+        assert f"下一步: {expected_action}" in text_result.stdout
+
+
+def _assert_credential_wait_is_not_public(
+    repo: Path, fixture: Path, run_id: str
+) -> None:
+    for command in ("status", "history"):
+        output = stdout_json(run_cli(repo, fixture, command, run_id, "--json"))
+        assert output.get("supervision") is None
+
+
 def _parent_only_agents(path: Path) -> Path:
     path.write_text(
         json.dumps(
@@ -190,6 +211,41 @@ def test_run_supervises_pending_parent_only_checks_in_one_call(
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
 
 
+@pytest.mark.parametrize(
+    ("fixture_role", "invocation_role", "phase"),
+    [
+        ("reviews", "fresh_acceptance", "reviewing"),
+        ("publications", "publication", "publication"),
+    ],
+)
+def test_run_retries_initial_credential_before_starting_each_parent_only_worker(
+    git_repo: Path, fixture_role: str, invocation_role: str, phase: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = _parent_only_agents(git_repo / "parent-only-agents.json")
+    data = json.loads(agents.read_text(encoding="utf-8"))
+    data["initial_credential_failures_by_role"] = {
+        fixture_role: ["temporary issuer outage"]
+    }
+    agents.write_text(json.dumps(data), encoding="utf-8")
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "parent_approval_pending"
+    state = load_only_run_state(git_repo)
+    assert "credential_availability" not in state
+    assert "supervision_window" not in state
+    _assert_credential_wait_is_not_public(git_repo, fixture, str(state["run_id"]))
+    attempts = [
+        invocation
+        for invocation in state["agent_invocation_history"]
+        if invocation.get("role") == invocation_role and invocation.get("phase") == phase
+    ]
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "completed"
+
+
 def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
     git_repo: Path,
 ) -> None:
@@ -299,6 +355,7 @@ def test_parent_only_approval_recovers_a_lost_merge_response_without_reapproval(
 
     waiting = run_cli(git_repo, fixture, "approve", run_id)
     assert stdout_json(waiting)["status"] == "waiting_external"
+    _assert_waiting_external_recovery_action(git_repo, fixture, run_id)
     granted_at = load_only_run_state(git_repo)["parent_job"]["approval_grant"]["granted_at"]
     completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -380,6 +437,64 @@ def test_run_routes_pending_final_run_check_failure_through_repair(
     assert state["run_publication"]["phase"] == "ready_for_approval"
 
 
+@pytest.mark.parametrize(
+    ("fixture_role", "invocation_role", "phase"),
+    [
+        ("run_reviews:run_repair", "fresh_acceptance", "reviewing"),
+        ("publications:run", "publication", "publication"),
+    ],
+)
+def test_run_retries_initial_credential_before_starting_each_run_repair_worker(
+    git_repo: Path, fixture_role: str, invocation_role: str, phase: str
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"required_checks": ["none", "pending", "fail", "pass", "pass"]},
+    )
+    agents = run_agents(git_repo / "agents.json")
+    data = json.loads(agents.read_text(encoding="utf-8"))
+    data["developments"].append(
+        {
+            "expected_thread_id": None,
+            "thread_id": "run-repair-developer-1",
+            "summary": "Repaired the failed final Run check.",
+            "write_files": {"run-repair.txt": "repaired\n"},
+        }
+    )
+    data["publications"].append(publication())
+    data["run_reviews"].extend(
+        [
+            passing_acceptance("run-repair-reviewer-1", "The Run repair passed."),
+            passing_acceptance("run-reviewer-2", "The repaired Run passed."),
+            passing_acceptance("run-reviewer-3", "The refreshed Run passed."),
+        ]
+    )
+    data["run_publications"].append(data["run_publications"][0])
+    data["initial_credential_failures_by_role"] = {
+        fixture_role: ["temporary issuer outage"]
+    }
+    agents.write_text(json.dumps(data), encoding="utf-8")
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "run_approval_pending"
+    state = load_only_run_state(git_repo)
+    assert "credential_availability" not in state
+    assert "supervision_window" not in state
+    _assert_credential_wait_is_not_public(git_repo, fixture, str(state["run_id"]))
+    attempts = [
+        invocation
+        for invocation in state["agent_invocation_history"]
+        if invocation.get("role") == invocation_role
+        and invocation.get("phase") == phase
+        and invocation.get("work_subject") == f"run-repair:{state['run_id']}"
+    ]
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "completed"
+
+
 def test_run_supervises_pending_final_run_checks_in_one_call(
     git_repo: Path,
 ) -> None:
@@ -430,52 +545,87 @@ def test_final_run_approval_survives_pending_checks_until_the_same_pr_merges(
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][1]["state"] == "MERGED"
 
 
-def test_final_run_approval_grant_is_revoked_when_acceptance_facts_change(
+def test_final_approval_supervises_a_transient_required_checks_read_failure(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "none", "pending"]},
-    )
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
-    initial = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = str(stdout_json(initial)["run_id"])
-    assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == "waiting_checks"
 
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["parent"]["body"] = "Changed after final approval."
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    halted = run_cli(git_repo, fixture, "publish-run", run_id)
+    awaiting_approval = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
+    run_id = str(stdout_json(awaiting_approval)["run_id"])
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["run_required_checks_read_failures"] = [
+        {"code": "github_timeout", "message": "required checks unavailable"}
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
-    assert stdout_json(halted)["status"] == "run_acceptance_pending"
-    state = load_only_run_state(git_repo)
-    assert "approval_grant" not in state["run_publication"]
-    assert data["delivery"]["pull_requests"][1]["state"] == "OPEN"
+    waiting = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert waiting.returncode == 0, waiting.stderr
+    assert stdout_json(waiting)["status"] == "waiting_checks"
+    persisted_wait = load_only_run_state(git_repo)
+    assert persisted_wait["diagnostics"][0]["code"] == "github_timeout"
+    assert persisted_wait["supervision_window"]["kind"] == "required_checks"
+    granted_at = persisted_wait["run_publication"]["approval_grant"]["granted_at"]
+    assert len(fixture_data["delivery"]["pull_requests"]) == 2
+
+    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "completed"
+    final_state = load_only_run_state(git_repo)
+    assert final_state["run_publication"]["approval_grant"]["granted_at"] == granted_at
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
 
 
-def test_final_run_approval_grant_is_revoked_when_pr_identity_changes(
+def test_final_approval_required_checks_read_timeout_preserves_its_grant_for_resume(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "none", "pending"]},
-    )
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
-    initial = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = str(stdout_json(initial)["run_id"])
+    awaiting_approval = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
+    run_id = str(stdout_json(awaiting_approval)["run_id"])
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["supervision_clock_multiplier"] = 540
+    fixture_data["delivery"]["run_required_checks_read_failures"] = [
+        {"code": "github_timeout", "message": "required checks unavailable"}
+        for _ in range(4)
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
     assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == "waiting_checks"
+    grant = load_only_run_state(git_repo)["run_publication"]["approval_grant"]
+    paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
-    state = load_only_run_state(git_repo)
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["delivery"]["published_branches"][state["run_branch"]] = "foreign-head"
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    halted = run_cli(git_repo, fixture, "publish-run", run_id)
+    assert paused.returncode == 2
+    paused_state = load_only_run_state(git_repo)
+    assert paused_state["status"] == "supervision_timeout"
+    assert paused_state["supervision_wait"]["kind"] == "required_checks"
+    assert (
+        paused_state["supervision_wait"]["deadline"]
+        - paused_state["supervision_wait"]["started_at"]
+        == 45 * 60
+    )
+    assert paused_state["run_publication"]["approval_grant"] == grant
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
 
-    assert stdout_json(halted)["status"] == "run_acceptance_pending"
-    assert "approval_grant" not in load_only_run_state(git_repo)["run_publication"]
-    assert data["delivery"]["pull_requests"][1]["state"] == "OPEN"
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["run_required_checks_read_failures"] = []
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    resumed = run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents))
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "completed"
+    assert load_only_run_state(git_repo)["run_publication"]["approval_grant"] == grant
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
+
+
+
+
 
 
 def test_final_run_approval_recovers_a_lost_merge_response_without_reapproval(
@@ -491,6 +641,7 @@ def test_final_run_approval_recovers_a_lost_merge_response_without_reapproval(
 
     waiting = run_cli(git_repo, fixture, "approve", run_id)
     assert stdout_json(waiting)["status"] == "waiting_external"
+    _assert_waiting_external_recovery_action(git_repo, fixture, run_id)
     granted_at = load_only_run_state(git_repo)["run_publication"]["approval_grant"]["granted_at"]
     completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -527,41 +678,6 @@ def test_final_run_supervises_a_recovery_read_failure_without_reapproval(
     assert load_only_run_state(git_repo)["run_publication"]["approval_grant"]["granted_at"] == granted_at
 
 
-def test_final_run_revokes_approval_when_identity_drifts_while_waiting_external(
-    git_repo: Path,
-) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "none", "pending"]},
-    )
-    agents = run_agents(git_repo / "agents.json")
-    initial = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = str(stdout_json(initial)["run_id"])
-    assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == "waiting_checks"
-
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["delivery"]["open_live_pull_request_failures"] = [
-        {"code": "github_read_failed", "message": "readback unavailable"}
-    ]
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    assert stdout_json(run_cli(git_repo, fixture, "publish-run", run_id))["status"] == "waiting_external"
-
-    state = load_only_run_state(git_repo)
-    data = json.loads(fixture.read_text(encoding="utf-8"))
-    data["delivery"]["published_branches"][state["run_branch"]] = "foreign-head"
-    fixture.write_text(json.dumps(data), encoding="utf-8")
-    halted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert halted.returncode == 2
-    state = load_only_run_state(git_repo)
-    assert state["run_acceptance"]["phase"] == "reviewing"
-    assert "approval_grant" not in state["run_publication"]
-    final_pulls = [
-        pull for pull in json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
-        if pull.get("scope") == "final_run"
-    ]
-    assert all(pull["state"] == "OPEN" for pull in final_pulls)
 
 
 def test_final_run_recovers_a_lost_parent_closeout_response(

@@ -18,7 +18,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 
 from test_run_acceptance import _completed_run, _passing_artifact
-from test_cli import run_cli, stdout_json
+from test_cli import run_internal_stage, run_cli, stdout_json
 
 
 class RunPublicationAgents:
@@ -639,7 +639,7 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
         ]
         == "CLOSED"
     )
-    resumed = run_cli(
+    resumed = run_internal_stage(
         git_repo, git_repo / "github.json", "accept-run", str(state["run_id"])
     )
     assert resumed.returncode == 0, resumed.stderr
@@ -1002,7 +1002,7 @@ def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
         encoding="utf-8",
     )
 
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",
@@ -1034,7 +1034,7 @@ def test_final_publication_fixture_missing_thread_marks_invocation_failed(
         encoding="utf-8",
     )
 
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",
@@ -1075,7 +1075,7 @@ def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
         encoding="utf-8",
     )
 
-    published = run_cli(
+    published = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",
@@ -1103,7 +1103,7 @@ def test_final_publication_fixture_records_a_fresh_thread_without_expectation(
         encoding="utf-8",
     )
 
-    published = run_cli(
+    published = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",
@@ -1150,7 +1150,7 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
         ),
         encoding="utf-8",
     )
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",
@@ -1214,7 +1214,7 @@ def test_publish_run_retries_only_exhausted_final_run_publication(
         encoding="utf-8",
     )
 
-    resumed = run_cli(
+    resumed = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",
@@ -1411,7 +1411,7 @@ def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
     artifact = RunPublicationAgents().run_publication({"run_id": state["run_id"]})
     agents.write_text(json.dumps({"run_publications": [artifact]}), encoding="utf-8")
 
-    published = run_cli(
+    published = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "publish-run",

@@ -95,7 +95,7 @@ _Avoid_: Codex Worker、独立 daemon、GitHub Mutation Authority
 _Avoid_: 维护者轮询 CI、常驻的第二套控制器、自动越过 Final Human Acceptance
 
 **公开生命周期命令（Public Lifecycle Command）**:
-维护者用于创建或推进 Delivery Run 的稳定交互入口。`start` 仅创建或返回本地 Run 记录及其受管 Run Branch，不推进生命周期；`run` 是唯一的自动生命周期入口。Development、Acceptance、Publication 与内部等待只是 Controller 的阶段，不要求也不允许维护者把它们作为独立流程手工串接。`resume`、`approve`、`revise`、`requeue` 与 `abandon` 只在各自明确的失败、授权或恢复边界执行；监督超时只由 `run` 恢复。
+维护者用于创建或推进 Delivery Run 的稳定交互入口。`start` 仅创建或返回本地 Run 记录及其受管 Run Branch，不推进生命周期；`run` 是唯一的自动生命周期入口。Development、Acceptance、Publication 与内部等待只是 Controller 的阶段，不要求也不允许维护者把它们作为独立流程手工串接。`resume`、`approve`、`revise`、`requeue` 与 `abandon` 只在各自明确的失败、授权或恢复边界执行；监督超时可由同一 Parent 的显式 `run` 或 `resume` 恢复。
 _Avoid_: 手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
 
 **监督截止时间（Supervision Deadline）**:
@@ -103,7 +103,7 @@ Run 内部监督按远端状态类别采用有限等待预算。预算内保持�
 _Avoid_: 无限占用进程、把超时吞成 pass、把正常 pending 伪装成需要外部授权的 Human Blocker
 
 **监督超时暂停（Supervision Timeout Pause）**:
-可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据并退出，等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在活跃等待和超时暂停时都显示未来的 `agent-run run <parent>` 恢复操作；活跃前台进程仍自行监督，维护者不应据此重复输入命令。窗口到期或进程中断后，后续该命令重新读取权威状态并开始新的对应等待窗口，`resume` 不适用于此边界。
+可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据并退出，等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在超时暂停时显示 `agent-run resume <run-id>`；同一 Parent 的显式 `run` 也可重新读取权威状态并开始新的对应等待窗口。活跃前台进程仍自行监督，维护者不应据此重复输入命令。超时 `resume` 不接受 Human Response 或新的 Agent Thread，且不会创建 Worker、PR 或 merge。
 _Avoid_: execution_failed、Human Blocker、常驻 watcher、无界单次进程
 
 **Ticket 关闭归属（Ticket Close Ownership）**:

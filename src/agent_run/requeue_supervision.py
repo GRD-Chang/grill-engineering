@@ -68,23 +68,12 @@ def refresh_requeue_transition_facts(
         state["updated_at"] = now()
         return state
     except GitHubReadError as error:
-        failed = dict(state)
-        if is_github_convergence_error(error.code):
-            return wait_for_recoverable_github_read(
-                failed,
-                error,
-                waiting_for="GitHub requeue transition refresh",
-                now=now,
-            )
-        failed.update(
-            {
-                "status": "blocked",
-                "terminal_kind": "waiting_human",
-                "diagnostics": [{"code": error.code, "message": error.message}],
-                "updated_at": now(),
-            }
+        return wait_for_recoverable_github_read(
+            dict(state),
+            error,
+            waiting_for="GitHub requeue transition refresh",
+            now=now,
         )
-        return failed
 
 
 def _mapping(state: dict[str, Any], key: str) -> dict[str, Any]:

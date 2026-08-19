@@ -1,19 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
-import json
-import sys
-import time
-from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
-from agent_run.external_supervision import (
-    ExternalSupervisor,
-    is_github_refresh_wait,
-)
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     human_blocker_subject_count,
@@ -26,159 +16,18 @@ def _run_to_human_gate(
     parsed: argparse.Namespace,
     states: StateStore,
     controller: Controller,
-    driver: Any | None = None,
+    driver: Any,
 ) -> tuple[dict[str, Any], bool]:
     state, resumed = controller.start_or_resume_unfinished(parsed.parent)
     run_id = state.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("Delivery Run is missing its Run ID")
     state = _load_local_run(states, run_id)
-    if driver is not None:
-        return driver.advance(state), resumed
-    return _advance_to_human_gate(parsed, states, state, resumed)
-
-
-def _advance_to_human_gate(
-    parsed: argparse.Namespace,
-    states: StateStore,
-    state: dict[str, Any],
-    resumed: bool,
-) -> tuple[dict[str, Any], bool]:
-    run_id = state.get("run_id")
-    if not isinstance(run_id, str):
-        raise ValueError("Delivery Run is missing its Run ID")
-    arguments = _nested_arguments(parsed)
-    previous_marker: tuple[object, ...] | None = None
-    if parsed.github_fixture:
-        fixture_clock = [0.0]
-
-        def advance_fixture_clock(seconds: float) -> None:
-            fixture_clock[0] += seconds
-
-        supervisor = ExternalSupervisor(
-            now=lambda: fixture_clock[0], sleeper=advance_fixture_clock
-        )
-    else:
-        supervisor = ExternalSupervisor(sleeper=time.sleep)
-    while True:
-        command = _next_automatic_command(state)
-        if command is None:
-            return state, resumed
-        marker = _progress_marker(state, command)
-        if marker == previous_marker:
-            if not supervisor.before_retry(state):
-                states.save_run(run_id, state)
-                return state, resumed
-            previous_marker = None
-            continue
-        previous_marker = marker
-        print(f"推进: {state['status']} → {command}", file=sys.stderr)
-        agent_arguments = _agent_fixture_arguments(parsed, command)
-        _invoke_nested(command, run_id, *arguments, *agent_arguments)
-        state = _load_local_run(states, run_id)
-        if command == "requeue" and not is_github_refresh_wait(state):
-            # `requeue` itself enters the replacement Job Loop. Returning
-            # here enforces the one automatic replacement budget for this
-            # top-level `run` command.
-            return state, resumed
-
-
-def _nested_arguments(parsed: argparse.Namespace) -> list[str]:
-    arguments: list[str] = []
-    if parsed.repo:
-        arguments.extend(["--repo", parsed.repo])
-    if parsed.state_dir:
-        arguments.extend(["--state-dir", parsed.state_dir])
-    if parsed.github_fixture:
-        arguments.extend(["--github-fixture", parsed.github_fixture])
-    crash_after_save = getattr(parsed, "crash_after_save", None)
-    if isinstance(crash_after_save, int):
-        arguments.extend(["--crash-after-save", str(crash_after_save)])
-    return arguments
-
-
-def _agent_fixture_arguments(parsed: argparse.Namespace, command: str) -> list[str]:
-    agent_fixture = getattr(parsed, "agent_fixture", None)
-    if agent_fixture and command in {
-        "resume",
-        "deliver",
-        "accept-run",
-        "publish-run",
-        "requeue",
-    }:
-        return ["--agent-fixture", agent_fixture]
-    return []
-
-
-def _invoke_nested(command: str, identifier: str, *arguments: str) -> dict[str, object]:
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        from agent_run.cli import main
-
-        exit_code = main([command, identifier, *arguments])
-    lines = [line for line in output.getvalue().splitlines() if line.strip()]
-    if not lines:
-        raise ValueError(f"{command} did not return a Delivery Run result")
-    try:
-        result: object = json.loads(lines[-1])
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{command} returned invalid Delivery Run JSON") from error
-    if not isinstance(result, dict):
-        raise ValueError(f"{command} returned invalid Delivery Run result")
-    if exit_code != 0 and result.get("status") not in {
-        "waiting_checks",
-        "ready_for_human",
-        "unsupported_scope_change",
-        "abandonment_pending",
-        "progress_exhausted",
-        "execution_failed",
-        "blocked",
-        "waiting_merge",
-        "waiting_external",
-        "requeue_required",
-    }:
-        raise ValueError(f"{command} failed without a recoverable Run state")
-    return result
-
-
-def _next_automatic_command(state: dict[str, Any]) -> str | None:
-    status = str(state.get("status"))
-    if status in {
-        "active",
-        "ticket_completed",
-        "parent_delivery_pending",
-        "waiting_merge",
-    }:
-        return "deliver"
-    if status == "run_acceptance_pending":
-        return "accept-run"
-    publication = state.get("run_publication")
-    if status == "run_publication_pending" or (
-        status in {"publication_pending", "waiting_checks", "waiting_external"}
-        and isinstance(publication, dict)
-        and publication.get("phase")
-        in {
-            "publication_pending",
-            "waiting_checks",
-            "waiting_external",
-            "ready_for_approval",
-        }
-    ):
-        return "publish-run"
-    if status in {"publication_pending", "waiting_checks"}:
-        return "deliver"
-    if status == "waiting_external":
-        if isinstance(state.get("requeue_transition"), dict):
-            return "requeue"
-        return "deliver"
-    return None
+    return driver.advance(state), resumed
 
 
 def _is_lifecycle_action(command: str) -> bool:
     return command in {
-        "deliver",
-        "accept-run",
-        "publish-run",
         "approve",
         "revise",
         "requeue",
@@ -186,7 +35,15 @@ def _is_lifecycle_action(command: str) -> bool:
 
 
 def _resume_is_ready(state: dict[str, object]) -> bool:
-    """Whether `resume` has a current failed or Human Blocker Invocation."""
+    """Whether `resume` has a supported, bounded recovery boundary."""
+
+    if state.get("status") == "supervision_timeout":
+        wait = state.get("supervision_wait")
+        return isinstance(wait, dict) and wait.get("resume_status") in {
+            "waiting_checks",
+            "waiting_merge",
+            "waiting_external",
+        }
 
     invocation = state.get("active_agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
@@ -208,28 +65,16 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
         return not (
             isinstance(invocation, dict) and invocation.get("status") == "failed"
         )
-    if status in {"unsupported_scope_change", "abandonment_pending"}:
+    if status in {
+        "unsupported_scope_change",
+        "deterministic_contradiction",
+        "abandonment_pending",
+    }:
         return False
     if command == "requeue":
         return status == "requeue_required"
     if status == "requeue_required":
         return False
-    if command == "deliver":
-        return True
-    if command == "accept-run":
-        return status in {"run_acceptance_pending", "run_publication_pending"}
-    if command == "publish-run":
-        publication = state.get("run_publication")
-        return status == "run_publication_pending" or (
-            isinstance(publication, dict)
-            and status
-            in {
-                "publication_pending",
-                "waiting_checks",
-                "waiting_external",
-                "run_approval_pending",
-            }
-        )
     if command == "approve":
         return (
             state.get("delivery_type") == "parent_only"

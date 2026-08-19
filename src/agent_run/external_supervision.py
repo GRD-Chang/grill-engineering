@@ -13,6 +13,7 @@ from agent_run.error_safety import bounded_error
 CHECKS_BUDGET_SECONDS = 45 * 60
 GITHUB_CONVERGENCE_BUDGET_SECONDS = 10 * 60
 POLL_INTERVAL_SECONDS = 5
+MAX_BACKOFF_SECONDS = 60
 _RESUMABLE_STATUSES = frozenset({"waiting_checks", "waiting_merge", "waiting_external"})
 _PROVEN_GITHUB_STATE_CONTRADICTIONS = frozenset(
     {
@@ -22,6 +23,7 @@ _PROVEN_GITHUB_STATE_CONTRADICTIONS = frozenset(
         "missing_parent",
         "stale_run_pr",
         "foreign_run_pr",
+        "github_invalid_response",
     }
 )
 
@@ -66,7 +68,12 @@ class ExternalSupervisor:
         self.sleeper = sleeper
         self.poll_interval_seconds = poll_interval_seconds
 
-    def before_retry(self, state: dict[str, Any]) -> bool:
+    def before_retry(
+        self,
+        state: dict[str, Any],
+        *,
+        persist_before_sleep: Callable[[], None] | None = None,
+    ) -> bool:
         """Sleep until a retry or persist a recoverable supervision timeout."""
 
         boundary = waiting_boundary(state)
@@ -124,6 +131,10 @@ class ExternalSupervisor:
                 if isinstance(retry_count, int):
                     supervision_wait["retry_count"] = retry_count
                     diagnostic["retry_count"] = retry_count
+                http_status = availability.get("http_status")
+                if type(http_status) is int and 100 <= http_status <= 599:
+                    supervision_wait["credential_http_status"] = http_status
+                    diagnostic["credential_http_status"] = http_status
             state.update(
                 {
                     "status": "supervision_timeout",
@@ -133,7 +144,14 @@ class ExternalSupervisor:
                 }
             )
             return False
-        self.sleeper(min(self.poll_interval_seconds, boundary.budget_seconds - elapsed))
+        delay = min(
+            _retry_delay_seconds(retries, self.poll_interval_seconds),
+            boundary.budget_seconds - elapsed,
+        )
+        window["last_retry_delay_seconds"] = delay
+        if persist_before_sleep is not None:
+            persist_before_sleep()
+        self.sleeper(delay)
         return True
 
     def observe(self, state: dict[str, Any]) -> dict[str, object] | None:
@@ -184,7 +202,13 @@ def is_github_convergence_error(code: str) -> bool:
     network, authentication, permission, or proxy cause from command output.
     """
 
-    return code not in _PROVEN_GITHUB_STATE_CONTRADICTIONS
+    return not is_proven_github_state_contradiction(code)
+
+
+def is_proven_github_state_contradiction(code: str) -> bool:
+    """Whether GitHub returned a fact that cannot safely be retried."""
+
+    return code in _PROVEN_GITHUB_STATE_CONTRADICTIONS
 
 
 def is_github_refresh_wait(state: dict[str, Any]) -> bool:
@@ -241,6 +265,17 @@ def _last_external_error(state: dict[str, Any]) -> dict[str, str] | None:
     if not isinstance(code, str) or not isinstance(message, str):
         return None
     return {"code": code, "message": bounded_error(message)}
+
+
+def _retry_delay_seconds(retry_count: int, base_delay_seconds: int) -> int:
+    """Return the deterministic capped delay for one persisted retry count."""
+
+    if retry_count < 1:
+        raise ValueError("retry count must be positive")
+    if base_delay_seconds < 1:
+        raise ValueError("poll interval must be positive")
+    delay = base_delay_seconds * 2 ** (retry_count - 1)
+    return delay if delay < MAX_BACKOFF_SECONDS else MAX_BACKOFF_SECONDS
 
 
 def wait_for_github_refresh(
@@ -319,6 +354,7 @@ def _supervision_window(
         "budget_seconds": boundary.budget_seconds,
         "resume_action": "run",
         "retry_count": 0,
+        "last_retry_delay_seconds": None,
         "latest_observation": _last_external_error(state),
     }
     head_sha, base_sha = _waiting_ref_facts(state)
@@ -361,7 +397,14 @@ def public_supervision_snapshot(
     if not isinstance(observation, dict):
         observation = _last_external_error(state)
     next_action = _run_recovery_action(state)
-    return {
+    retry_count = wait.get("retry_count", 0)
+    # Entering a wait follows one completed external observation (the read
+    # that produced ``waiting_*``).  A public reader may race the Driver's
+    # first delayed retry, so project that initial observation as retry one
+    # instead of briefly exposing a contradictory zero-retry snapshot.
+    if not timed_out and type(retry_count) is int and retry_count < 1:
+        retry_count = 1
+    snapshot: dict[str, object] = {
         "kind": wait.get("kind"),
         "subject": wait.get("waiting_for"),
         "head_sha": head_sha,
@@ -369,7 +412,7 @@ def public_supervision_snapshot(
         "started_at": wait.get("started_at"),
         "deadline": deadline,
         "remaining_seconds": remaining,
-        "retry_count": wait.get("retry_count", 0),
+        "retry_count": retry_count,
         "latest_observation": observation,
         "next_action": next_action,
         # Operators need the recovery instruction before an active foreground
@@ -377,6 +420,13 @@ def public_supervision_snapshot(
         # foreground process is still supervising the wait.
         "timeout_resume_action": next_action,
     }
+    failure_class = wait.get("credential_failure_class")
+    if isinstance(failure_class, str):
+        snapshot["credential_failure_class"] = failure_class
+    http_status = wait.get("credential_http_status")
+    if type(http_status) is int and 100 <= http_status <= 599:
+        snapshot["credential_http_status"] = http_status
+    return snapshot
 
 
 def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -403,6 +453,9 @@ def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
 
 
 def _run_recovery_action(state: dict[str, Any]) -> str | None:
+    run_id = state.get("run_id")
+    if state.get("status") == "supervision_timeout" and isinstance(run_id, str):
+        return f"agent-run resume {run_id}"
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, dict) else None
     return f"agent-run run {parent_number}" if isinstance(parent_number, int) else None

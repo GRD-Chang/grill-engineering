@@ -121,8 +121,10 @@ def verify_immutable_runner(checkout: Path, runner_sha: str) -> PromotionVerific
         raise ValueError("checkout HEAD does not match the requested Runner SHA")
     if _git(checkout, "status", "--porcelain"):
         raise ValueError("Runner checkout must be clean")
-    if _git(checkout, "rev-parse", "origin/main") != runner_sha:
-        raise ValueError("Runner SHA must match the current origin/main")
+    if not _git_succeeds(
+        checkout, "merge-base", "--is-ancestor", runner_sha, "origin/main"
+    ):
+        raise ValueError("Runner SHA must be reachable from origin/main")
     attached = subprocess.run(
         ["git", "-C", str(checkout), "symbolic-ref", "--quiet", "HEAD"],
         stdout=subprocess.DEVNULL,
@@ -217,6 +219,16 @@ def _git(checkout: Path, *arguments: str) -> str:
     if result.returncode != 0:
         raise ValueError("could not verify immutable Runner checkout")
     return result.stdout.strip()
+
+
+def _git_succeeds(checkout: Path, *arguments: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(checkout), *arguments],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def _record_identity(

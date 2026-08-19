@@ -299,7 +299,7 @@ class RunPublicationFlow(RunPublicationShared):
                 request["_invocation_mode"] = "resume"
             try:
                 raw = self.agents.run_publication(request)
-            except InitialCredentialUnavailable:
+            except InitialCredentialUnavailable as error:
                 # No final-publication Worker started, so this does not spend
                 # a publication attempt or turn an availability outage into
                 # an execution failure.
@@ -312,6 +312,7 @@ class RunPublicationFlow(RunPublicationShared):
                     work_subject=_RUN_PUBLICATION_CREDENTIAL_SUBJECT,
                     phase="run_publication",
                     resume_status="run_publication_pending",
+                    http_status=error.http_status,
                 )
                 self._save(state)
                 return None
@@ -402,21 +403,8 @@ class RunPublicationFlow(RunPublicationShared):
         run_head = self.git.resolve(str(state["run_branch"]))
         narrative = self._render_final_run_pr_body(state, artifact.pr_body_markdown)
         known_pr = publication.get("pr_number")
-        if isinstance(known_pr, int):
-            try:
-                self._require_final_pr_identity(
-                    live=self.github.live_pull_request(known_pr),
-                    run_head=run_head,
-                    branch=str(state["run_branch"]),
-                    repository=str(state["repository"]),
-                    expected_base_sha=self.default_head_sha,
-                )
-            except GitHubReadError as error:
-                if error.code == "foreign_run_pr" and isinstance(
-                    publication.get("approval_grant"), dict
-                ):
-                    return self._invalidate_for_fresh_acceptance(state)
-                raise
+        if not self._known_final_pr_is_authorized(state, publication, run_head):
+            return self._invalidate_for_fresh_acceptance(state)
         initial_existing = (
             known_pr
             if isinstance(known_pr, int)
@@ -478,21 +466,8 @@ class RunPublicationFlow(RunPublicationShared):
                 expected_base_sha=self.default_head_sha,
             )
         )
-        if isinstance(known_pr, int):
-            try:
-                self._require_final_pr_identity(
-                    live=self.github.live_pull_request(known_pr),
-                    run_head=run_head,
-                    branch=str(state["run_branch"]),
-                    repository=str(state["repository"]),
-                    expected_base_sha=self.default_head_sha,
-                )
-            except GitHubReadError as error:
-                if error.code == "foreign_run_pr" and isinstance(
-                    publication.get("approval_grant"), dict
-                ):
-                    return self._invalidate_for_fresh_acceptance(state)
-                raise
+        if not self._known_final_pr_is_authorized(state, publication, run_head):
+            return self._invalidate_for_fresh_acceptance(state)
         if not self._publication_is_current(state):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")
@@ -583,6 +558,35 @@ class RunPublicationFlow(RunPublicationShared):
         return self._acceptance_is_current(
             state, self._mapping(state, "run_acceptance")
         )
+
+    def _known_final_pr_is_authorized(
+        self, state: dict[str, Any], publication: dict[str, Any], run_head: str
+    ) -> bool:
+        """Validate a persisted Final Run PR before any recovery write.
+
+        A replacement PR after an approval grant belongs to a fresh Acceptance
+        generation.  Other identity failures remain hard read errors, exactly
+        as they did at each recovery boundary before this helper was shared.
+        """
+
+        known_pr = publication.get("pr_number")
+        if not isinstance(known_pr, int):
+            return True
+        try:
+            self._require_final_pr_identity(
+                live=self.github.live_pull_request(known_pr),
+                run_head=run_head,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=self.default_head_sha,
+            )
+        except GitHubReadError as error:
+            if error.code == "foreign_run_pr" and isinstance(
+                publication.get("approval_grant"), dict
+            ):
+                return False
+            raise
+        return True
 
     def _final_pr_is_current(
         self, pr_number: int, run_head: str, branch: str, repository: str

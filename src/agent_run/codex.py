@@ -582,7 +582,8 @@ class CodexCliBackend:
                     except WorkerCredentialError as error:
                         if _is_retryable_initial_credential_error(error):
                             raise InitialCredentialUnavailable(
-                                "credential_unavailable"
+                                "credential_unavailable",
+                                http_status=error.http_status,
                             ) from error
                         raise
                     create_gh_access_adapter(

@@ -203,8 +203,16 @@ class Controller:
                 "abandoned",
                 "abandonment_pending",
                 "completed",
+                "deterministic_contradiction",
             }:
                 return existing, True
+            resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
+            if resuming_supervision_timeout:
+                if new_thread or human_response is not None or message is not None:
+                    raise ValueError(
+                        "supervision timeout resume does not accept Agent or Human Blocker options"
+                    )
+                restore_supervision_wait(existing)
             parent = _state_mapping(existing, "parent")
             parent_number = int(parent["number"])
             if existing.get("base_resolution_pending") is True:
@@ -229,7 +237,10 @@ class Controller:
             if is_github_refresh_wait(state):
                 self.states.save_run(run_id, state)
                 return state, True
-            if state.get("status") == "unsupported_scope_change" or (
+            if state.get("status") in {
+                "unsupported_scope_change",
+                "deterministic_contradiction",
+            } or (
                 state.get("status") == "execution_failed"
                 and (
                     existing.get("status") != "execution_failed"
@@ -538,6 +549,50 @@ class Controller:
             self.states.save_run(run_id, state)
             return True
 
+    def record_deterministic_contradiction(
+        self, run_id: str, code: str, message: str
+    ) -> bool:
+        """Persist a proven GitHub fact without treating it as retryable."""
+
+        with self.states.locked():
+            state = self.states.load_run(run_id)
+            if state is None:
+                return False
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError:
+                return False
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "completed",
+                "parent_closeout_pending",
+                "deterministic_contradiction",
+            }:
+                return False
+            hint_reader = getattr(self.github, "repository_hint", None)
+            repository_hint = hint_reader() if callable(hint_reader) else None
+            if (
+                isinstance(repository_hint, str)
+                and repository_hint
+                and state.get("repository") != repository_hint
+            ):
+                return False
+            state.pop("supervision_window", None)
+            state.pop("supervision_wait", None)
+            state.update(
+                {
+                    "status": "deterministic_contradiction",
+                    "terminal_kind": "deterministic_contradiction",
+                    "diagnostics": [
+                        {"code": code, "message": bounded_error(message)}
+                    ],
+                    "updated_at": _now(),
+                }
+            )
+            self.states.save_run(run_id, state)
+            return True
+
     def _load_bound_run(self, run_id: str) -> dict[str, Any]:
         state = self._load_run(run_id)
         repository = self.github.repository()
@@ -616,12 +671,17 @@ class Controller:
                     waiting_for="GitHub authority refresh",
                 )
             else:
+                failed.pop("supervision_window", None)
+                failed.pop("supervision_wait", None)
                 failed.update(
                     {
-                        "status": "blocked",
-                        "terminal_kind": "waiting_human",
+                        "status": "deterministic_contradiction",
+                        "terminal_kind": "deterministic_contradiction",
                         "diagnostics": [
-                            {"code": error.code, "message": error.message}
+                            {
+                                "code": error.code,
+                                "message": bounded_error(error.message),
+                            }
                         ],
                     }
                 )
@@ -732,7 +792,10 @@ class Controller:
         self, state: dict[str, Any], default_head: str
     ) -> None:
         """Route completed-Run boundary drift back to fresh Run Acceptance."""
-        if state.get("status") == "unsupported_scope_change":
+        if state.get("status") in {
+            "unsupported_scope_change",
+            "deterministic_contradiction",
+        }:
             return
         acceptance = state.get("run_acceptance")
         if not isinstance(acceptance, dict) or acceptance.get("phase") != "accepted":
@@ -814,6 +877,7 @@ class Controller:
         if state.get("status") in {
             "execution_failed",
             "unsupported_scope_change",
+            "deterministic_contradiction",
             "abandoned",
             "completed",
             "requeue_required",
@@ -861,7 +925,11 @@ class Controller:
             run_id = str(state["run_id"])
         self._register_pending_locator(state)
         if resumed:
-            if state.get("status") in {"abandoned", "abandonment_pending"}:
+            if state.get("status") in {
+                "abandoned",
+                "abandonment_pending",
+                "deterministic_contradiction",
+            }:
                 return state, True
             if state.get("status") == "supervision_timeout":
                 restore_supervision_wait(state)
@@ -899,9 +967,10 @@ class Controller:
             state["terminal_kind"] = None
             state["diagnostics"] = []
         state = self._refresh(state, parent_number)
-        if state.get("status") == "requeue_required" or _is_currentness_human_blocker(
-            state
-        ):
+        if state.get("status") in {
+            "requeue_required",
+            "deterministic_contradiction",
+        } or _is_currentness_human_blocker(state):
             self.states.save_run(run_id, state)
             return state, resumed
         self._ensure_delivery_branch(state, base_sha)

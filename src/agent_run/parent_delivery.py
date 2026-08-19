@@ -17,6 +17,7 @@ from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.external_supervision import (
+    is_github_convergence_error,
     ensure_supervision_window,
     wait_for_github_convergence,
 )
@@ -55,6 +56,10 @@ class ParentDeliveryEngine:
                 try:
                     live = self.github.live_pull_request(int(job["pr_number"]))
                 except (OSError, GitHubReadError) as error:
+                    if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                        error.code
+                    ):
+                        raise
                     return self._wait_for_merge_convergence(state, job, str(error))
                 if live.get("state") == "MERGED":
                     return self._complete_after_merge(state, job, live)
@@ -190,12 +195,20 @@ class ParentDeliveryEngine:
                         expected_head_sha=str(job["publication_sha"]),
                     )
                 except (MergeOutcomeUnknownError, OSError, GitHubReadError) as error:
+                    if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                        error.code
+                    ):
+                        raise
                     return self._wait_for_merge_convergence(state, job, str(error))
                 job["integrated_sha"] = integrated
                 self._save(state)
                 try:
                     live = self.github.live_pull_request(pr_number)
                 except (OSError, GitHubReadError) as error:
+                    if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                        error.code
+                    ):
+                        raise
                     return self._wait_for_merge_convergence(state, job, str(error))
             if live.get("state") != "MERGED":
                 raise ValueError("Parent PR was not merged after explicit approval")

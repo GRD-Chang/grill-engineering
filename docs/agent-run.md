@@ -7,7 +7,7 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
-- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界监督。维护者再次执行同一 `run` 命令开始新的等待窗口，不需要另启 watcher；
+- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run` 或 `resume <run-id>` 开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -63,7 +63,7 @@ Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许�
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
 也不等同于 `revise` 的 Run Feedback。
-`resume` 只恢复当前 failed 或 Human Blocker Invocation。Ticket 与 Parent-only Change Job 的
+`resume` 恢复当前 failed 或 Human Blocker Invocation，也可以从 `supervision_timeout` 为同一等待身份开启新窗口；后者不接受 `--new-thread` 或 `--message`，不会创建 Worker、PR 或 merge。Ticket 与 Parent-only Change Job 的
 preflight 若发现 requirements 或 base/head 已 stale，绝不启动 Codex，而是进入
 `requeue_required`。此状态下只允许 `status`、`history`、`requeue` 与 `abandon`。Run Repair 的
 Parent、Graph、Ticket Completion 或 Run Branch 边界发生漂移时，不创建 replacement generation；
@@ -90,7 +90,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | --- | --- | --- | --- |
 | `start` | 新 Run 或同一 Parent 的现有 Run | 创建或幂等返回本地 Run 记录及其受管 Run Branch，供集成或排障检查身份与状态 | 不推进自动生命周期；日常交付不以它替代 `run` |
 | `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`，或当前唯一对象为 Human Blocker | 为同一 Generation 创建 successor Invocation | 不恢复监督超时；不吸收 stale 边界，也不绕过 Publisher 的 currentness/写入门禁 |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 为同一 Generation 创建 successor Invocation；或为同一等待身份开启新监督窗口 | 超时恢复不创建 Worker、PR 或 merge；不吸收 stale 边界，也不绕过 Publisher 的 currentness/写入门禁 |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 查看当前状态、允许的下一步与有界 Invocation 审计事实 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
@@ -141,7 +141,7 @@ agent-run requeue <run-id> --repo OWNER/REPO
 `run` 创建或恢复 Run、Run Branch 和工作前沿，并在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
 重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
 Required Checks 仍为 pending 时，`run` 在有限窗口内监督；窗口到期后保存
-`supervision_timeout`，状态提示的唯一恢复操作是再次执行 `run`；该操作不会重复创建 PR 或消耗修改预算。
+`supervision_timeout`，状态提示的恢复操作是 `resume`（同一 Parent 的显式 `run` 同样允许）；两者均不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
 原始 CI Evidence 交回同一 Development Thread。
 
@@ -281,8 +281,9 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 
 使用 `agent-run` 开发本仓库时，运行中的 Controller 必须来自已验证且固定的 commit，
 不得从正在被 Worker 修改的 editable checkout 导入代码。推荐把 Runner 安装到按 commit
-SHA 命名的独立 Python 环境，并从专用干净 clone 启动；同一 Delivery Run 从开始到完成始终
-使用同一个 Runner。最终 PR 合入默认分支并完成全量验证后，才创建下一版 Runner。#34–#39 是
+SHA 命名的独立 Python 环境，并从专用干净 clone 启动。每次 Invocation 使用当前已 promotion 的
+Runner；Run 的连续性由持久化状态和 GitHub 的精确 head/base 事实保证，而不由 Runner 版本锁定。
+`main` 合入修复后可立即创建下一版 Runner，并由新版继续未完成 Run。#34–#39 是
 已废弃的执行序列，不得作为 Runner 的来源、行为基线、验收证据或恢复对象；只以 #42 及其原生
 Sub-issues 的最终 merged commit 为准。
 

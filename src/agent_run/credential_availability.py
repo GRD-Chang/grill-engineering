@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.external_supervision import wait_for_github_convergence
+from agent_run.worker_credentials import safe_http_status
 
 
 def wait_for_initial_credential(
@@ -13,6 +14,7 @@ def wait_for_initial_credential(
     work_subject: str,
     phase: str,
     resume_status: str,
+    http_status: int | None = None,
 ) -> None:
     """Persist a sanitized ten-minute credential-availability wait.
 
@@ -29,13 +31,16 @@ def wait_for_initial_credential(
         if isinstance(previous, dict) and previous.get("change_job") == work_subject
         else 0
     )
-    state["credential_availability"] = {
+    availability: dict[str, Any] = {
         "change_job": work_subject,
         "phase": phase,
         "resume_status": resume_status,
         "failure_class": "credential_unavailable",
         "retry_count": retries,
     }
+    if safe_status := safe_http_status(http_status):
+        availability["http_status"] = safe_status
+    state["credential_availability"] = availability
     wait_for_github_convergence(
         state,
         code="credential_availability",
