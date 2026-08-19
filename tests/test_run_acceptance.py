@@ -17,7 +17,7 @@ from agent_run.run_currentness import invalidate_stale_run_repair, ticket_comple
 from agent_run.state import StateStore
 
 from conftest import write_fixture
-from test_cli import run_cli, stdout_json
+from test_cli import run_internal_stage, run_cli, stdout_json
 
 
 _BLOCKED_EVIDENCE = (
@@ -1171,7 +1171,7 @@ def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
         encoding="utf-8",
     )
 
-    accepted = run_cli(
+    accepted = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "accept-run",
@@ -1201,7 +1201,7 @@ def test_run_acceptance_fixture_missing_thread_marks_invocation_failed(
         encoding="utf-8",
     )
 
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "accept-run",
@@ -1228,7 +1228,7 @@ def test_run_acceptance_fixture_records_a_fresh_thread_without_expectation(
         encoding="utf-8",
     )
 
-    accepted = run_cli(
+    accepted = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "accept-run",
@@ -1275,7 +1275,7 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
         ),
         encoding="utf-8",
     )
-    failed = run_cli(
+    failed = run_internal_stage(
         git_repo,
         git_repo / "github.json",
         "accept-run",
@@ -1366,7 +1366,7 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     )
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
     )
     assert stdout_json(delivered)["status"] == "run_acceptance_pending"
@@ -1378,7 +1378,7 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
         encoding="utf-8",
     )
 
-    accepted = run_cli(
+    accepted = run_internal_stage(
         git_repo, fixture, "accept-run", run_id, "--agent-fixture", str(run_agents)
     )
 
@@ -1601,7 +1601,7 @@ def test_accept_run_does_not_review_after_a_github_refresh_failure(
     agents = git_repo / "run-agents.json"
     agents.write_text(json.dumps({"reviews": []}), encoding="utf-8")
 
-    result = run_cli(
+    result = run_internal_stage(
         git_repo,
         fixture,
         "accept-run",

@@ -24,10 +24,17 @@ from agent_run.artifacts import (
     append_human_blocker_history,
     clear_current_human_blocker,
 )
+from agent_run.credential_availability import (
+    clear_initial_credential_wait,
+    resume_initial_credential_wait,
+    wait_for_initial_credential,
+)
 from agent_run.delivery_protocol import GitHubPublisher
+from agent_run.external_supervision import is_github_convergence_error
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.worker_credentials import InitialCredentialUnavailable
 
 MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
@@ -270,10 +277,16 @@ class ChangeDeliveryEngine:
                 raise ValueError(f"unknown Ticket phase: {job['phase']}")
         except _TerminalChangeJob:
             return state
+        except InitialCredentialUnavailable as error:
+            self._wait_for_initial_credential(
+                state, job, http_status=error.http_status
+            )
+            return state
 
     def _develop(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
+        self._resume_after_initial_credential(state, job)
         self._reject_stale(
             state,
             job,
@@ -302,6 +315,9 @@ class ChangeDeliveryEngine:
         elif job.get("development_failure_resume") is True:
             request["_invocation_mode"] = "resume"
         result = self.agents.develop(request)
+        clear_initial_credential_wait(
+            state, work_subject=self.contract.label(job)
+        )
         if isinstance(result, HumanBlockerResult):
             if not self.contract.development_thread_is_allowed(state, result.thread_id):
                 raise ValueError("Change Job Development Thread is not independent")
@@ -329,6 +345,30 @@ class ChangeDeliveryEngine:
             checkout,
             "Development result was discarded after requirements changed",
         )
+
+    def _wait_for_initial_credential(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        *,
+        http_status: int | None,
+    ) -> None:
+        wait_for_initial_credential(
+            state,
+            work_subject=self.contract.label(job),
+            phase=str(job["phase"]),
+            resume_status=str(state.get("status", "active")),
+            http_status=http_status,
+        )
+        self.contract.save(state)
+
+    def _resume_after_initial_credential(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        if resume_initial_credential_wait(
+            state, work_subject=self.contract.label(job)
+        ):
+            self.contract.save(state)
 
     def _commit_candidate(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -365,6 +405,8 @@ class ChangeDeliveryEngine:
             try:
                 request = self.contract.publication_request(state, job, checkout)
             except GitHubReadError as error:
+                if not is_github_convergence_error(error.code):
+                    raise
                 attempts = int(job.get("publication_attempts", 0)) + 1
                 job["publication_attempts"] = attempts
                 job["last_publication_error"] = str(error)
@@ -394,6 +436,9 @@ class ChangeDeliveryEngine:
             elif job.get("publication_failure_resume") is True:
                 request["_invocation_mode"] = "resume"
             raw = self.agents.publication(request)
+            clear_initial_credential_wait(
+                state, work_subject=self.contract.label(job)
+            )
             job.pop("publication_failure_resume", None)
             if isinstance(raw, HumanBlockerResult):
                 job["publication_thread_id"] = raw.thread_id
@@ -533,6 +578,7 @@ class ChangeDeliveryEngine:
             review = self.agents.review(request)
         finally:
             self.git.remove_worktree(validation)
+        clear_initial_credential_wait(state, work_subject=self.contract.label(job))
         _record_reviewer(
             job, review.thread_id, new_thread=job.get("review_new_thread") is True
         )
@@ -760,7 +806,11 @@ class ChangeDeliveryEngine:
             )
         try:
             checks = self.github.required_checks(pr_number)
-        except (GitHubReadError, OSError, TimeoutError):
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
             self._record_agent_run_status(
                 pr_number,
                 job,

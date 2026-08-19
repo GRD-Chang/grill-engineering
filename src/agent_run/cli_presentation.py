@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
 
 def _print_precondition_failure(state: dict[str, object]) -> None:
@@ -53,6 +54,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
         "agent_invocation": state.get("active_agent_invocation"),
+        "supervision": public_supervision_snapshot(state),
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -71,6 +73,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     print(f"已运行: {output['elapsed_seconds']} 秒")
     if output["gate"]:
         print("当前门禁: 必需检查")
+    _print_supervision(output["supervision"])
     scope_change = output["scope_change"]
     if isinstance(scope_change, dict):
         print(
@@ -100,11 +103,13 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         "next_action": _next_action(state),
         "abandonment": state.get("run_abandonment"),
         "agent_invocations": invocations,
+        "supervision": public_supervision_snapshot(state),
     }
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
     print(f"交付运行: {output['run_id']}")
+    _print_supervision(output["supervision"])
     for invocation in invocations:
         if not isinstance(invocation, dict):
             continue
@@ -157,6 +162,36 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     print(f"下一步: {output['next_action']}")
 
 
+def _print_supervision(wait: object) -> None:
+    if not isinstance(wait, dict):
+        return
+    print(f"等待种类: {wait.get('kind')}")
+    print(f"等待对象: {wait.get('subject')}")
+    print(f"等待 head/base: {wait.get('head_sha')} / {wait.get('base_sha')}")
+    print(
+        "等待窗口: "
+        f"开始={wait.get('started_at')} 截止={wait.get('deadline')} "
+        f"剩余={wait.get('remaining_seconds')} 秒"
+    )
+    print(f"重试次数: {wait.get('retry_count')}")
+    observation = wait.get("latest_observation")
+    if isinstance(observation, dict):
+        print(
+            "最新观测: "
+            f"{observation.get('code')} {observation.get('message')}"
+        )
+    else:
+        print("最新观测: 无")
+    failure_class = wait.get("credential_failure_class")
+    if isinstance(failure_class, str):
+        print(f"凭据失败类别: {failure_class}")
+    http_status = wait.get("credential_http_status")
+    if type(http_status) is int:
+        print(f"凭据 HTTP 状态: {http_status}")
+    if wait.get("timeout_resume_action") is not None:
+        print(f"超时恢复: {wait['timeout_resume_action']}")
+
+
 def _next_action(state: dict[str, Any]) -> str:
     status = str(state.get("status"))
     run_id = state.get("run_id")
@@ -168,6 +203,8 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run approve {run_id}"
     if status == "unsupported_scope_change":
         return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
+    if status == "deterministic_contradiction":
+        return "处理诊断中的确定性矛盾；如需终止执行 agent-run abandon"
     if status == "abandonment_pending" and isinstance(run_id, str):
         return f"agent-run abandon {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
@@ -177,8 +214,10 @@ def _next_action(state: dict[str, Any]) -> str:
         and isinstance(state.get("requeue_transition"), dict)
     ):
         return f"agent-run run {parent_number}"
+    if status == "waiting_external":
+        return f"agent-run run {parent_number}"
     if status == "supervision_timeout" and isinstance(run_id, str):
-        return f"agent-run run {parent_number} 或 agent-run resume {run_id}"
+        return f"agent-run resume {run_id}"
     invocation = state.get("active_agent_invocation")
     if (
         status == "execution_failed"
@@ -330,6 +369,7 @@ def _display_term(value: object) -> object:
         "run_approval_pending": "等待人工批准",
         "ready_for_human": "等待人工处理",
         "unsupported_scope_change": "不支持的范围变化",
+        "deterministic_contradiction": "确定性矛盾，需人工处理",
         "abandonment_pending": "等待放弃恢复",
         "progress_exhausted": "无可推进任务",
         "execution_failed": "执行失败，可恢复",

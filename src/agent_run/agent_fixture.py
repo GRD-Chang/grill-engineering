@@ -12,6 +12,7 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.worker_sandbox import WorkerSandboxError
+from agent_run.worker_credentials import InitialCredentialUnavailable
 
 
 class FixtureAgentBackend:
@@ -29,10 +30,30 @@ class FixtureAgentBackend:
             "run_reviews": 0,
             "run_publications": 0,
         }
+        failures = value.get("initial_credential_failures", [])
+        if not isinstance(failures, list) or not all(
+            _is_initial_credential_failure(message) for message in failures
+        ):
+            raise ValueError("initial_credential_failures must contain safe failures")
+        self.initial_credential_failures = list(failures)
+        by_role = value.get("initial_credential_failures_by_role", {})
+        if not isinstance(by_role, dict) or not all(
+            isinstance(role, str)
+            and isinstance(messages, list)
+            and all(_is_initial_credential_failure(message) for message in messages)
+            for role, messages in by_role.items()
+        ):
+            raise ValueError(
+                "initial_credential_failures_by_role must map roles to safe failures"
+            )
+        self.initial_credential_failures_by_role = {
+            role: list(messages) for role, messages in by_role.items()
+        }
 
     def develop(
         self, request: dict[str, Any]
     ) -> DevelopmentResult | HumanBlockerResult:
+        self._maybe_fail_initial_credential("developments")
         step = self._next("developments")
         event = request.get("_invocation_event")
         notify = event if callable(event) else None
@@ -160,6 +181,7 @@ class FixtureAgentBackend:
     def publication(
         self, request: dict[str, Any]
     ) -> dict[str, Any] | HumanBlockerResult:
+        self._maybe_fail_initial_credential("publications", request)
         step = self._next("publications")
         expected_history = step.pop("expected_human_response_history", None)
         if expected_history is not None and expected_history != request.get(
@@ -221,6 +243,7 @@ class FixtureAgentBackend:
             and isinstance(self.data.get("run_reviews"), list)
             else "reviews"
         )
+        self._maybe_fail_initial_credential(name, request)
         if request.get("acceptance_scope") != "run" or request.get(
             "repair_scope"
         ) == "run_repair":
@@ -294,6 +317,7 @@ class FixtureAgentBackend:
         return ReviewResult(thread_id=thread_id, artifact=artifact)
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._maybe_fail_initial_credential("run_publications")
         result, thread_id = self._output_attempts(
             "run_publications",
             request,
@@ -404,6 +428,27 @@ class FixtureAgentBackend:
             return result, current_thread
         raise AssertionError("unreachable")
 
+    def _maybe_fail_initial_credential(
+        self, role: str, request: dict[str, Any] | None = None
+    ) -> None:
+        scope = (
+            None
+            if request is None
+            else request.get("repair_scope", request.get("acceptance_scope"))
+        )
+        scoped_role = f"{role}:{scope}" if isinstance(scope, str) else None
+        failures = (
+            self.initial_credential_failures_by_role.get(scoped_role)
+            if scoped_role is not None
+            else None
+        )
+        if failures is None:
+            failures = self.initial_credential_failures_by_role.get(role)
+        if failures:
+            _raise_initial_credential_failure(failures.pop(0))
+        if self.initial_credential_failures:
+            _raise_initial_credential_failure(self.initial_credential_failures.pop(0))
+
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)
         if not isinstance(values, list):
@@ -416,6 +461,26 @@ class FixtureAgentBackend:
         if not isinstance(value, dict):
             raise ValueError(f"agent fixture {name} item must be an object")
         return dict(value)
+
+
+def _is_initial_credential_failure(value: object) -> bool:
+    if isinstance(value, str):
+        return True
+    if not isinstance(value, dict) or not isinstance(value.get("message"), str):
+        return False
+    http_status = value.get("http_status")
+    return http_status is None or (
+        type(http_status) is int and 100 <= http_status <= 599
+    )
+
+
+def _raise_initial_credential_failure(value: object) -> None:
+    if isinstance(value, str):
+        raise InitialCredentialUnavailable("credential_unavailable")
+    assert isinstance(value, dict)
+    raise InitialCredentialUnavailable(
+        "credential_unavailable", http_status=value.get("http_status")
+    )
 
 
 def _string(data: dict[str, Any], key: str) -> str:

@@ -39,6 +39,9 @@ class RunPublicationEngine:
     def approve(self, run_id: str) -> dict[str, Any]:
         return self._approval().approve(run_id)
 
+    def has_current_approval_grant(self, run_id: str) -> bool:
+        return self._approval().has_current_approval_grant(run_id)
+
     def recover_closeout(self, run_id: str) -> dict[str, Any]:
         return self._approval().recover_closeout(run_id)
 

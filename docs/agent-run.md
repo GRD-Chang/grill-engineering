@@ -7,7 +7,7 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
-- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界监督。维护者可用同一 `run` 或 `resume` 命令开始新的等待窗口，不需要另启 watcher；
+- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run` 或 `resume <run-id>` 开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -31,15 +31,11 @@ agent-run status <run-id> --repo OWNER/REPO
 agent-run history <run-id> --repo OWNER/REPO
 ```
 
-需要逐阶段排障或控制时，使用底层生命周期命令：
+在人工边界使用对应的公开命令：
 
 ```bash
-agent-run start <parent-issue> --repo OWNER/REPO
-agent-run deliver <run-id> --repo OWNER/REPO
 agent-run resume <run-id> [--new-thread] [--message "..."] --repo OWNER/REPO
 agent-run requeue <run-id> --repo OWNER/REPO
-agent-run accept-run <run-id> --repo OWNER/REPO
-agent-run publish-run <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
 agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
 agent-run abandon <run-id> --repo OWNER/REPO
@@ -49,7 +45,12 @@ AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
   agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
-`status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。
+`status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。处于
+外部等待或监督超时时，两种格式均显示等待种类、对象、head/base、窗口开始与截止、剩余时间、
+重试次数、脱敏的最新观测，以及超时后的唯一恢复操作。前台等待每个轮询间隔至多输出一次同样
+脱敏的进度记录，不会打印凭据或原始响应体。
+在前台窗口仍运行时，这个恢复操作仅说明窗口到期或进程中断后的下一步，不要求维护者重复输入
+`run`；当前进程会继续自行监督。
 Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.started` 会在进程仍运行时
 立即保存。`history --json` 的 `agent_invocations` 保留每次调用的 Work Subject、Generation、
 输入指纹、Currentness Boundary、模式、requested/reported Thread、Output Attempt 数量、时间和
@@ -62,7 +63,7 @@ Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许�
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
 也不等同于 `revise` 的 Run Feedback。
-`resume` 只恢复当前 failed 或 Human Blocker Invocation。Ticket 与 Parent-only Change Job 的
+`resume` 恢复当前 failed 或 Human Blocker Invocation，也可以从 `supervision_timeout` 为同一等待身份开启新窗口；后者不接受 `--new-thread` 或 `--message`，不会创建 Worker、PR 或 merge。Ticket 与 Parent-only Change Job 的
 preflight 若发现 requirements 或 base/head 已 stale，绝不启动 Codex，而是进入
 `requeue_required`。此状态下只允许 `status`、`history`、`requeue` 与 `abandon`。Run Repair 的
 Parent、Graph、Ticket Completion 或 Run Branch 边界发生漂移时，不创建 replacement generation；
@@ -82,14 +83,14 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 
 ### 命令边界与状态轮转
 
-下表是 `run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。底层
-`start`、`deliver`、`accept-run` 和 `publish-run` 只用于逐阶段排障；它们不能越过下表中的
-人工边界。
+下表是 `start/run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。Controller
+内部阶段不是维护者操作；它们不能越过下表中的人工边界。
 
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
+| `start` | 新 Run 或同一 Parent 的现有 Run | 创建或幂等返回本地 Run 记录及其受管 Run Branch，供集成或排障检查身份与状态 | 不推进自动生命周期；日常交付不以它替代 `run` |
 | `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`，当前唯一对象为 Human Blocker，或监督超时暂停 | 对 Invocation 为同一 Generation 创建 successor Invocation；对监督超时恢复外部等待并开始新的预算窗口 | 不吸收 stale 边界，也不绕过 Publisher 的 currentness/写入门禁 |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 为同一 Generation 创建 successor Invocation；或为同一等待身份开启新监督窗口 | 超时恢复不创建 Worker、PR 或 merge；不吸收 stale 边界，也不绕过 Publisher 的 currentness/写入门禁 |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 查看当前状态、允许的下一步与有界 Invocation 审计事实 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
@@ -137,11 +138,10 @@ agent-run status <run-id> --repo OWNER/REPO
 agent-run requeue <run-id> --repo OWNER/REPO
 ```
 
-`start` 只创建 Run、Run Branch 和工作前沿；`deliver` 从当前 Active Ticket 开始，
-在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
+`run` 创建或恢复 Run、Run Branch 和工作前沿，并在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
 重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
-Required Checks 仍为 pending 时，命令保存 `waiting_checks` 状态并退出；稍后再次
-执行同一个 `deliver` 命令即可继续，不会重复创建 PR 或消耗修改预算。
+Required Checks 仍为 pending 时，`run` 在有限窗口内监督；窗口到期后保存
+`supervision_timeout`，状态提示的恢复操作是 `resume`（同一 Parent 的显式 `run` 同样允许）；两者均不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
 原始 CI Evidence 交回同一 Development Thread。
 
@@ -154,8 +154,8 @@ Required Check 失败时，Controller 将失败 check 的名称、workflow、描
 合并即恢复成功；PR 仍 OPEN 且 live head/base、Required Checks 与 mergeability 均保持当前时，最多重试
 同一个带精确 head 绑定的 merge intent 三次；任一状态矛盾则停止等待人工处理。
 
-当 `deliver` 返回 `run_acceptance_pending` 后，执行 `accept-run`。正常 Run Acceptance
-Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
+当所有 Ticket 完成后，`run` 自动进入 `run_acceptance_pending` 并推进 Run Acceptance。
+正常 Run Acceptance Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
 复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
 最终 Ticket 集合和依赖，
 检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条独立验证 lane，后两条使用
@@ -170,8 +170,8 @@ Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每�
 仅当 Run Reviewer 报告 Human Blocker 后执行 `resume` 时，Controller 复用刚刚被阻塞的
 Reviewer Thread，但仍创建新的 Validation Checkout，并要求它重新读取权威状态和重新验收。
 无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
-通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。随后执行
-`publish-run`：正常 Run Publication Attempt 由新的、只读的 Run Publication Codex 根据
+通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。`run` 随后推进
+正常 Run Publication Attempt：由新的、只读的 Run Publication Codex 根据
 Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；仅 Human Blocker resume
 复用刚刚被阻塞的 Run Publication Thread，并要求它重新读取权威状态。Publisher 维护同一个
 Run Branch → 默认分支的最终 PR，并渲染 Parent Issue、Delivery Type 及每张已完成 Ticket 的链接；它将
@@ -205,7 +205,7 @@ Scope Impact Assessment Codex。
 Graph revision、`graph_change_summary` 与 observed graph；纯执行顺序调整不会改变 Ticket
 Graph Revision。`status --json` 与 `history --json` 可审计这些事实。
 
-该状态不允许 `run`、`resume`、`deliver`、`accept-run`、`publish-run`、`approve` 或
+该状态不允许 `run`、`resume`、`approve` 或
 `revise` 越过边界，不自动 Requeue，不创建 Codex Thread，也不执行 Git/GitHub Publisher
 mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原图后重新核验，或执行
 `abandon` 停止 Run。
@@ -398,5 +398,5 @@ Run state 以 `ticket_jobs` 按 Ticket 编号保留 Job-local thread、reviewer�
 未变化时，Controller 才会在既定 Ticket Set 内把 active 切到新的可执行 Ticket；它不会删除
 已经 blocked 或 completed 的 Job。Graph revision 变化按上文进入
 `unsupported_scope_change`，不更新 active。进程在两张 Ticket 之间退出或失败时，下一次
-`deliver` 会从耐久状态与 GitHub live 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭
+`run` 会从耐久状态与 GitHub live 事实对账恢复；已完成 Ticket 的 PR、merge、评论和关闭
 动作不会重复。没有可执行 Ticket 时，顶层 diagnostics 会汇总全部剩余 Job 与 GitHub blocker。

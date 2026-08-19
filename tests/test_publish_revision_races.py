@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
+from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import passing_acceptance
 
 
@@ -173,7 +173,7 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -250,7 +250,7 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -288,7 +288,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    delivered = run_cli(
+    delivered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -332,7 +332,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     before_fixture["issues"]["4"] = added
     fixture.write_text(json.dumps(before_fixture), encoding="utf-8")
 
-    resumed = run_cli(git_repo, fixture, "deliver", run_id)
+    resumed = run_internal_stage(git_repo, fixture, "deliver", run_id)
 
     assert resumed.returncode == 2
     assert stdout_json(resumed)["status"] == "unsupported_scope_change"
@@ -374,12 +374,10 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     interrupted_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     frozen_pending_mutations = interrupted_fixture["delivery"]["mutations"]
     for command in ("resume", "deliver", "approve"):
-        blocked = run_cli(
-            git_repo,
-            fixture,
-            command,
-            run_id,
-            *("--agent-fixture", str(agents)) if command == "deliver" else (),
+        blocked = (
+            run_internal_stage(git_repo, fixture, command, run_id, "--agent-fixture", str(agents))
+            if command == "deliver"
+            else run_cli(git_repo, fixture, command, run_id)
         )
         assert blocked.returncode == 2
         assert stdout_json(blocked)["status"] == "abandonment_pending"
@@ -412,12 +410,10 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     frozen_after_abandon = abandoned_fixture["delivery"]["mutations"]
 
     for command in ("resume", "deliver"):
-        replayed = run_cli(
-            git_repo,
-            fixture,
-            command,
-            run_id,
-            *("--agent-fixture", str(agents)) if command == "deliver" else (),
+        replayed = (
+            run_internal_stage(git_repo, fixture, command, run_id, "--agent-fixture", str(agents))
+            if command == "deliver"
+            else run_cli(git_repo, fixture, command, run_id)
         )
         assert replayed.returncode == (2 if command == "resume" else 0), (
             replayed.stderr
@@ -437,7 +433,7 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    waiting = run_cli(
+    waiting = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -454,7 +450,7 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
     before_drift["parent"]["sub_issues"] = [2, 4]
     before_drift["issues"]["4"] = added
     fixture.write_text(json.dumps(before_drift), encoding="utf-8")
-    blocked = run_cli(git_repo, fixture, "deliver", run_id)
+    blocked = run_internal_stage(git_repo, fixture, "deliver", run_id)
     assert blocked.returncode == 2
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
@@ -488,7 +484,7 @@ def test_abandon_recovers_lost_change_pr_close_response(
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    waiting = run_cli(
+    waiting = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -536,7 +532,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -555,7 +551,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     drifted["parent"]["sub_issues"] = [2, 4]
     drifted["issues"]["4"] = added
     fixture.write_text(json.dumps(drifted), encoding="utf-8")
-    assert run_cli(git_repo, fixture, "deliver", run_id).returncode == 2
+    assert run_internal_stage(git_repo, fixture, "deliver", run_id).returncode == 2
 
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
@@ -602,7 +598,7 @@ def test_aba_revision_after_crash_still_forces_fresh_rebuild(
         run_cli(git_repo, fixture, "start", "1")
     )["run_id"]
 
-    interrupted = run_cli(
+    interrupted = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
@@ -626,7 +622,7 @@ def test_aba_revision_after_crash_still_forces_fresh_rebuild(
         git_repo / "agents-recovery.json"
     )
 
-    recovered = run_cli(
+    recovered = run_internal_stage(
         git_repo,
         fixture,
         "deliver",

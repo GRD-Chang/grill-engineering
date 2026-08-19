@@ -24,6 +24,11 @@ from agent_run.change_delivery import (
     ensure_change_branch_authority,
     latest_reviewer_thread,
 )
+from agent_run.credential_availability import (
+    clear_initial_credential_wait,
+    resume_initial_credential_wait,
+    wait_for_initial_credential,
+)
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
@@ -38,6 +43,10 @@ from agent_run.run_currentness import (
     ticket_completion_records,
 )
 from agent_run.state import StateStore
+from agent_run.worker_credentials import InitialCredentialUnavailable
+
+
+_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT = "run-acceptance"
 
 
 def _reviewer_resume_thread(run: dict[str, Any]) -> str | None:
@@ -134,6 +143,9 @@ class RunAcceptanceEngine:
                     return self._save(state)
 
     def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
+        resume_initial_credential_wait(
+            state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
+        )
         run_head = self.git.resolve(str(state["run_branch"]))
         validation_attempt = int(run.get("validation_attempts", 0)) + 1
         run["validation_attempts"] = validation_attempt
@@ -154,7 +166,7 @@ class RunAcceptanceEngine:
             request = self._review_request(
                 state, run, checkout, run_head, default_head
             )
-            if run.pop("reviewer_new_thread", None) is True:
+            if run.get("reviewer_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
             request["_invocation_event"] = invocation_event_recorder(
                 state,
@@ -183,7 +195,27 @@ class RunAcceptanceEngine:
                 and ticket_completion_records(state)
                 == request["ticket_completion_records"]
             )
-            review = self.agents.review(request)
+            try:
+                review = self.agents.review(request)
+            except InitialCredentialUnavailable as error:
+                # This reviewer has not started: keep the same Acceptance
+                # generation and make the next Driver pass retry only its
+                # first read credential, not an interrupted Worker attempt.
+                run["phase"] = "pending"
+                run["validation_attempts"] = validation_attempt - 1
+                wait_for_initial_credential(
+                    state,
+                    work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT,
+                    phase="run_acceptance",
+                    resume_status="run_acceptance_pending",
+                    http_status=error.http_status,
+                )
+                self._save(state)
+                return False
+            clear_initial_credential_wait(
+                state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
+            )
+            run.pop("reviewer_new_thread", None)
             # The reviewer has already consumed this identity even if a live
             # authority refresh discards its verdict.  Keep it unavailable to
             # the fresh Acceptance that follows a drift.

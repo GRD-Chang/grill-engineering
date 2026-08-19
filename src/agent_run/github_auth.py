@@ -13,11 +13,14 @@ from typing import Any
 from agent_run.worker_credentials import (
     ReadCredential,
     WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS,
+    safe_http_status,
 )
 
 
 class GitHubCredentialError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = safe_http_status(http_status)
 
 
 _REQUIRED_READ_PERMISSIONS = {
@@ -70,7 +73,12 @@ def mint_read_only_installation_credential() -> ReadCredential:
             request, timeout=WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS
         ) as response:
             loaded: object = json.load(response)
-    except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+    except urllib.error.HTTPError as error:
+        raise GitHubCredentialError(
+            "could not create a GitHub App installation token",
+            http_status=error.code,
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
         raise GitHubCredentialError(
             "could not create a GitHub App installation token"
         ) from error
