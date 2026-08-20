@@ -70,13 +70,20 @@ class GhGitHubReader:
         repository = self.repository()
         data = self._gh_json(
             "pr", "view", str(pr_number), "--repo", repository.name_with_owner,
-            "--json", "state,headRefOid,baseRefName,baseRefOid",
+            "--json", "state,headRefOid,baseRefName,baseRefOid,mergeCommit",
+        )
+        merge_commit = data.get("mergeCommit")
+        integrated_sha = (
+            merge_commit.get("oid")
+            if isinstance(merge_commit, dict)
+            else None
         )
         return {
             "state": _string(data, "state"),
             "head_sha": _string(data, "headRefOid"),
             "base_branch": _string(data, "baseRefName"),
             "base_sha": _string(data, "baseRefOid"),
+            "integrated_sha": integrated_sha,
         }
 
     def _read_parent(

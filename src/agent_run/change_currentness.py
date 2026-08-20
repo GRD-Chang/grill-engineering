@@ -49,8 +49,9 @@ def stale_change_job_reason(
     if job.get("ticket_completion_records") != ticket_completion_records(state):
         return "run_repair_ticket_completion_changed"
     run_branch = state.get("run_branch")
-    if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
-        return "run_repair_base_changed"
+    if isinstance(run_branch, str):
+        if job.get("base_sha") != git.resolve(run_branch):
+            return "run_repair_base_changed"
     return None
 
 

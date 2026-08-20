@@ -160,10 +160,19 @@ class DirectRunOperations:
 
     def accept(self, run_id: str) -> RunOutcome:
         refreshed, _ = self.controller.resume(run_id)
-        if self._cannot_advance(refreshed) or refreshed.get("status") not in {
-            "run_acceptance_pending",
-            "run_publication_pending",
-        }:
+        acceptance = refreshed.get("run_acceptance")
+        repair_wait = (
+            isinstance(acceptance, dict)
+            and acceptance.get("phase") == "repairing"
+            and isinstance(acceptance.get("repair_job"), dict)
+            and refreshed.get("status")
+            in {"waiting_checks", "waiting_external", "waiting_merge"}
+        )
+        if self._cannot_advance(refreshed) or (
+            refreshed.get("status")
+            not in {"run_acceptance_pending", "run_publication_pending"}
+            and not repair_wait
+        ):
             return self.classify(refreshed)
         return self._accept_current_run(run_id)
 
@@ -413,11 +422,20 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
         "ticket_completed",
         "parent_delivery_pending",
         "parent_closeout_pending",
-        "waiting_merge",
     }:
         return RunStep.DELIVER
     if status == "run_acceptance_pending":
         return RunStep.ACCEPT
+    acceptance = state.get("run_acceptance")
+    if (
+        status in {"waiting_checks", "waiting_external", "waiting_merge"}
+        and isinstance(acceptance, dict)
+        and acceptance.get("phase") == "repairing"
+        and isinstance(acceptance.get("repair_job"), dict)
+    ):
+        return RunStep.ACCEPT
+    if status == "waiting_merge":
+        return RunStep.DELIVER
     publication = state.get("run_publication")
     if status == "run_publication_pending" or (
         status in {"publication_pending", "waiting_checks", "waiting_external"}
@@ -438,6 +456,7 @@ def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
     parent = state.get("parent_job")
     acceptance = state.get("run_acceptance")
     publication = state.get("run_publication")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
     return (
         state.get("status"),
         active.get("phase") if isinstance(active, dict) else None,
@@ -452,6 +471,11 @@ def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
         parent.get("pr_number") if isinstance(parent, dict) else None,
         acceptance.get("phase") if isinstance(acceptance, dict) else None,
         acceptance.get("validation_attempts") if isinstance(acceptance, dict) else None,
+        repair.get("phase") if isinstance(repair, dict) else None,
+        repair.get("modification_attempts") if isinstance(repair, dict) else None,
+        repair.get("validation_attempts") if isinstance(repair, dict) else None,
+        repair.get("publication_attempts") if isinstance(repair, dict) else None,
+        repair.get("pr_number") if isinstance(repair, dict) else None,
         publication.get("phase") if isinstance(publication, dict) else None,
         publication.get("publication_attempts") if isinstance(publication, dict) else None,
         publication.get("pr_number") if isinstance(publication, dict) else None,

@@ -121,6 +121,34 @@ class GitRepository:
                 added.stderr.strip() or "could not create Run Repair checkout"
             )
 
+    def rotate_run_repair_checkout(
+        self,
+        *,
+        checkout: Path,
+        current_branch: str,
+        next_branch: str,
+        candidate_sha: str,
+    ) -> None:
+        """Move one persistent repair checkout onto a fresh managed Job branch."""
+
+        if self.ticket_checkout_matches(checkout, next_branch):
+            if self.checkout_head(checkout) != candidate_sha:
+                raise GitError("rotated Run Repair checkout has a foreign Candidate")
+            return
+        if not self.ticket_checkout_matches(checkout, current_branch):
+            raise GitError("existing Run Repair checkout does not match its Job branch")
+        if not is_managed_delivery_branch(next_branch):
+            raise GitError(f"refusing to create unmanaged branch {next_branch!r}")
+        if self._resolve(f"refs/heads/{next_branch}") is not None:
+            raise GitError(f"Run Repair Job branch {next_branch!r} already exists")
+        switched = self._run_in(
+            checkout, "switch", "-c", next_branch, candidate_sha
+        )
+        if switched.returncode != 0:
+            raise GitError(
+                switched.stderr.strip() or "could not rotate Run Repair Job branch"
+            )
+
     def ticket_checkout_matches(self, checkout: Path, branch: str) -> bool:
         if not checkout.exists():
             return False
@@ -282,6 +310,19 @@ class GitRepository:
         message: str,
     ) -> str:
         tree = self._resolve_in(checkout, f"{candidate_sha}^{{tree}}")
+        current = self._resolve_in(checkout, "HEAD")
+        if (
+            self._resolve_in(checkout, "HEAD^{tree}") == tree
+            and self.commit_parents(current) == [base_sha]
+        ):
+            current_message = self._run_in(
+                checkout, "show", "-s", "--format=%B", current
+            )
+            if (
+                current_message.returncode == 0
+                and current_message.stdout.strip() == message.strip()
+            ):
+                return current
         created = self._run_in(
             checkout,
             "commit-tree",

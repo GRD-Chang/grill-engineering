@@ -9,7 +9,10 @@ from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
     MAX_MODIFICATION_ATTEMPTS,
+    ChangeDeliveryAdapter,
     ChangeDeliveryEngine,
+    ChangeDeliveryPublisher,
+    ChangeDeliveryStateStore,
     ChangeJobContract,
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     latest_reviewer_thread,
@@ -44,69 +47,132 @@ def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> 
     job["superseded_integrations"] = records
 
 
-class TicketDeliveryLoop:
-    """Run a Ticket Change Job through the shared delivery lifecycle."""
+class TicketDeliveryAdapter(ChangeDeliveryAdapter):
+    """Semantic Adapter for the Ticket delivery consumer."""
 
-    def __init__(
-        self,
-        *,
-        git: GitRepository,
-        states: StateStore,
-        github: GitHubPublisher,
-        agents: AgentBackend,
-    ) -> None:
+    stale_disposition = StaleDisposition.BLOCK
+
+    def __init__(self, git: GitRepository, github: GitHubPublisher) -> None:
         self.git = git
-        self.states = states
         self.github = github
-        self.agents = agents
-        self.engine = ChangeDeliveryEngine(
-            git=git,
-            github=github,
-            agents=agents,
-            contract=ChangeJobContract(
-                label=lambda job: f"ticket-{job['ticket_number']}",
-                branch=lambda job: str(job["ticket_branch"]),
-                base_branch=lambda state: str(state["run_branch"]),
-                candidate=lambda checkout, job, attempt: self.git.commit_candidate(
-                    checkout, ticket_number=int(job["ticket_number"]), attempt=attempt
-                ),
-                development_thread_is_allowed=lambda _state, _thread_id: True,
-                development_request=self._development_request,
-                publication_request=self._publication_request,
-                review_request=self._review_request,
-                prepare_validation=lambda _checkout, job, validation: self.git.prepare_validation_checkout(
-                    head_sha=str(job["candidate_sha"]), checkout=validation
-                ),
-                ensure_pr=lambda state, job, publication: self.github.ensure_ticket_pr(
-                    branch=str(job["ticket_branch"]),
-                    base_branch=str(state["run_branch"]),
-                    title=str(publication["pr_title"]),
-                    body=self._render_ticket_pr_body(state, job, publication),
-                    primary_ticket=int(job["ticket_number"]),
-                    expected_head_sha=str(job["publication_sha"]),
-                    expected_base_sha=str(job["base_sha"]),
-                ),
-                acceptance_record=self._acceptance_record,
-                acceptance_is_current=self._acceptance_is_current,
-                invalidate_stale=self._invalidate_stale,
-                stale_disposition=StaleDisposition.BLOCK,
-                revision_changed=self._live_revision_changed,
-                requires_explicit_approval=lambda _state, _job: False,
-                after_merge=self._after_merge,
-                escalate=self._escalate,
-                save=self._save,
-                linked_issue_number=lambda _state, job: int(job["ticket_number"]),
-            ),
-        )
 
-    def run(
+    def development_thread_is_allowed(
+        self, _state: dict[str, Any], _thread_id: str
+    ) -> bool:
+        return True
+
+    def base_is_current(self, current_base: str, job: dict[str, Any]) -> bool:
+        return current_base == job.get("base_sha")
+
+    def development_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
-        return self.engine.run(state, job, checkout)
+        request = {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": _parent(state)["url"],
+            "task_issue_url": _ticket(state, job)["url"],
+            "run_id": state["run_id"],
+            "parent": _parent(state),
+            "ticket": _ticket(state, job),
+            "effective_revision": job["effective_revision"],
+            "base_sha": job["base_sha"],
+            "head_sha": self.git.checkout_head(checkout),
+            "checkout": str(checkout),
+            "thread_id": (
+                None
+                if job.get("development_new_thread")
+                else job.get("development_thread_id")
+            ),
+        }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("ticket_branch_generation", 1))
+        ):
+            request["human_response_history"] = history
+        if job.get("development_summary"):
+            request["development_summary"] = str(job["development_summary"])
+        if job.get("repair_source") == "acceptance":
+            request["repair_source"] = "acceptance"
+            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
+        elif job.get("repair_source") == "required_checks":
+            request["repair_source"] = "required_checks"
+            request["ci_evidence"] = _mapping(job, "ci_evidence")
+        return request
 
-    def _acceptance_record(
+    def publication_request(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]:
+        request = {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": _parent(state)["url"],
+            "task_issue_url": _ticket(state, job)["url"],
+            "run_id": state["run_id"],
+            "parent": _parent(state),
+            "ticket": _ticket(state, job),
+            "effective_revision": job["effective_revision"],
+            "base_sha": job["base_sha"],
+            "candidate_sha": job["candidate_sha"],
+            "checkout": str(checkout),
+            "thread_id": select_publication_thread(
+                job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
+            ),
+            "acceptance_artifact": _mapping(job, "acceptance_artifact"),
+        }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("ticket_branch_generation", 1))
+        ):
+            request["human_response_history"] = history
+        if job.get("development_summary"):
+            request["development_summary"] = str(job["development_summary"])
+        existing_pr = job.get("pr_number")
+        if isinstance(existing_pr, int):
+            request["existing_pr"] = self.github.publication_context(existing_pr)
+        if job.get("repair_source") == "acceptance":
+            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
+        elif job.get("repair_source") == "required_checks":
+            request["ci_evidence"] = _mapping(job, "ci_evidence")
+        return request
+
+    def review_request(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]:
+        request = {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": _parent(state)["url"],
+            "task_issue_url": _ticket(state, job)["url"],
+            "run_id": state["run_id"],
+            "parent": _parent(state),
+            "ticket": _ticket(state, job),
+            "base_sha": job["base_sha"],
+            "candidate_sha": job["candidate_sha"],
+            "effective_revision": job["effective_revision"],
+            "checkout": str(checkout),
+            "thread_id": (
+                latest_reviewer_thread(job)
+                if (
+                    (
+                        job.get("review_human_blocker_resume")
+                        or job.get("review_resume_thread_id")
+                    )
+                    and not job.get("review_new_thread")
+                )
+                else None
+            ),
+        }
+        if job.get("prior_human_blockers"):
+            request["prior_human_blockers"] = job["prior_human_blockers"]
+        if history := current_human_response_history(
+            job, generation=int(job.get("ticket_branch_generation", 1))
+        ):
+            request["human_response_history"] = history
+        return request
+
+    def acceptance_record(
         self,
-        _state: dict[str, Any],
+        state: dict[str, Any],
         job: dict[str, Any],
         reviewer_thread_id: str,
         artifact: dict[str, Any],
@@ -123,8 +189,8 @@ class TicketDeliveryLoop:
             "artifact": artifact,
         }
 
-    def _acceptance_is_current(
-        self, _state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
+    def acceptance_is_current(
+        self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
     ) -> bool:
         return (
             acceptance.get("reviewed_base_sha") == job.get("base_sha")
@@ -132,6 +198,130 @@ class TicketDeliveryLoop:
             and acceptance.get("reviewed_candidate_tree")
             == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
             and acceptance.get("effective_revision") == job.get("effective_revision")
+        )
+
+    def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+        current = self.github.current_effective_revision(
+            parent_number=int(_mapping(state, "parent")["number"]),
+            ticket_number=int(job["ticket_number"]),
+            expected_revision=str(job["effective_revision"]),
+        )
+        return current != str(job["effective_revision"])
+
+    def requires_explicit_approval(
+        self, _state: dict[str, Any], _job: dict[str, Any]
+    ) -> bool:
+        return False
+
+    def linked_issue_number(
+        self, _state: dict[str, Any], job: dict[str, Any]
+    ) -> int:
+        return int(job["ticket_number"])
+
+    def invocation_identity(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> tuple[str, int]:
+        return ChangeDeliveryEngine._invocation_identity(state, job)
+
+
+class TicketDeliveryPublisher(ChangeDeliveryPublisher):
+    """Ticket mutations behind the shared Publisher seam."""
+
+    def __init__(self, owner: TicketDeliveryLoop) -> None:
+        self.owner = owner
+
+    def commit_candidate(
+        self, checkout: Path, job: dict[str, Any], attempt: int
+    ) -> str | None:
+        return self.owner.git.commit_candidate(
+            checkout, ticket_number=int(job["ticket_number"]), attempt=attempt
+        )
+
+    def prepare_validation(
+        self, _checkout: Path, job: dict[str, Any], validation: Path
+    ) -> None:
+        self.owner.git.prepare_validation_checkout(
+            head_sha=str(job["candidate_sha"]), checkout=validation
+        )
+
+    def ensure_pr(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        publication: dict[str, Any],
+    ) -> int:
+        return self.owner.github.ensure_ticket_pr(
+            branch=str(job["ticket_branch"]),
+            base_branch=str(state["run_branch"]),
+            title=str(publication["pr_title"]),
+            body=self.owner._render_ticket_pr_body(state, job, publication),
+            primary_ticket=int(job["ticket_number"]),
+            expected_head_sha=str(job["publication_sha"]),
+            expected_base_sha=str(job["base_sha"]),
+        )
+
+    def live_pull_request(
+        self, _state: dict[str, Any], _job: dict[str, Any], pr_number: int
+    ) -> dict[str, Any]:
+        return self.owner.github.live_pull_request(pr_number)
+
+    def invalidate_stale(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        self.owner._invalidate_stale(state, job, checkout)
+
+    def after_merge(
+        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
+    ) -> bool:
+        return self.owner._after_merge(state, job, live)
+
+    def escalate(
+        self, state: dict[str, Any], job: dict[str, Any], code: str
+    ) -> None:
+        self.owner._escalate(state, job, code)
+
+    def sync_attempts(self, _state: dict[str, Any], _job: dict[str, Any]) -> None:
+        return None
+
+
+class TicketDeliveryLoop:
+    """Run a Ticket Change Job through the shared delivery lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        git: GitRepository,
+        states: StateStore,
+        github: GitHubPublisher,
+        agents: AgentBackend,
+    ) -> None:
+        self.git = git
+        self.states = states
+        self.github = github
+        self.agents = agents
+        self.adapter = TicketDeliveryAdapter(git, github)
+        self.publisher = TicketDeliveryPublisher(self)
+
+    def run(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]:
+        return self._engine(state, job).run(state, job, checkout)
+
+    def _engine(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> ChangeDeliveryEngine:
+        return ChangeDeliveryEngine(
+            git=self.git,
+            github=self.github,
+            agents=self.agents,
+            contract=ChangeJobContract(
+                label=f"ticket-{int(job['ticket_number'])}",
+                branch=str(job["ticket_branch"]),
+                base_branch=str(state["run_branch"]),
+            ),
+            adapter=self.adapter,
+            publisher=self.publisher,
+            state_store=ChangeDeliveryStateStore(self.states, str(state["run_id"])),
         )
 
     def _invalidate_stale(
@@ -186,7 +376,7 @@ class TicketDeliveryLoop:
                 "merged_result_mismatch",
                 "Merged Ticket PR does not match Publisher merge intent",
             )
-        if self._live_revision_changed(state, job):
+        if self.adapter.revision_changed(state, job):
             _record_superseded_integration(job, integrated)
             return self._block(
                 state,
@@ -300,130 +490,6 @@ class TicketDeliveryLoop:
             }
         ]
 
-    def _live_revision_changed(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> bool:
-        current = self.github.current_effective_revision(
-            parent_number=int(_mapping(state, "parent")["number"]),
-            ticket_number=int(job["ticket_number"]),
-            expected_revision=str(job["effective_revision"]),
-        )
-        return current != str(job["effective_revision"])
-
-    def _development_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "ticket",
-            "parent_issue_url": self._parent(state)["url"],
-            "task_issue_url": self._ticket(state, job)["url"],
-            "run_id": state["run_id"],
-            "parent": self._parent(state),
-            "ticket": self._ticket(state, job),
-            "effective_revision": job["effective_revision"],
-            "base_sha": job["base_sha"],
-            "head_sha": self.git.checkout_head(checkout),
-            "checkout": str(checkout),
-            "thread_id": (
-                None
-                if job.get("development_new_thread")
-                else job.get("development_thread_id")
-            ),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("ticket_branch_generation", 1))
-        ):
-            request["human_response_history"] = history
-        if job.get("development_summary"):
-            request["development_summary"] = str(job["development_summary"])
-        if job.get("repair_source") == "acceptance":
-            request["repair_source"] = "acceptance"
-            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
-        elif job.get("repair_source") == "required_checks":
-            request["repair_source"] = "required_checks"
-            request["ci_evidence"] = _mapping(job, "ci_evidence")
-        return request
-
-    def _publication_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "ticket",
-            "parent_issue_url": self._parent(state)["url"],
-            "task_issue_url": self._ticket(state, job)["url"],
-            "run_id": state["run_id"],
-            "parent": self._parent(state),
-            "ticket": self._ticket(state, job),
-            "effective_revision": job["effective_revision"],
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "checkout": str(checkout),
-            "thread_id": select_publication_thread(
-                job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
-            ),
-            "acceptance_artifact": _mapping(job, "acceptance_artifact"),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("ticket_branch_generation", 1))
-        ):
-            request["human_response_history"] = history
-        if job.get("development_summary"):
-            request["development_summary"] = str(job["development_summary"])
-        existing_pr = job.get("pr_number")
-        if isinstance(existing_pr, int):
-            request["existing_pr"] = self.github.publication_context(existing_pr)
-        if job.get("repair_source") == "acceptance":
-            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
-        elif job.get("repair_source") == "required_checks":
-            request["ci_evidence"] = _mapping(job, "ci_evidence")
-        return request
-
-    def _review_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "ticket",
-            "parent_issue_url": self._parent(state)["url"],
-            "task_issue_url": self._ticket(state, job)["url"],
-            "run_id": state["run_id"],
-            "parent": self._parent(state),
-            "ticket": self._ticket(state, job),
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "effective_revision": job["effective_revision"],
-            "checkout": str(checkout),
-            "thread_id": (
-                latest_reviewer_thread(job)
-                if (
-                    (
-                        job.get("review_human_blocker_resume")
-                        or job.get("review_resume_thread_id")
-                    )
-                    and not job.get("review_new_thread")
-                )
-                else None
-            ),
-            **(
-                {"prior_human_blockers": job["prior_human_blockers"]}
-                if job.get("prior_human_blockers")
-                else {}
-            ),
-            **(
-                {"human_response_history": history}
-                if (
-                    history := current_human_response_history(
-                        job,
-                        generation=int(job.get("ticket_branch_generation", 1)),
-                    )
-                )
-                else {}
-            ),
-        }
-
     @staticmethod
     def _render_ticket_pr_body(
         state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
@@ -436,23 +502,6 @@ class TicketDeliveryLoop:
             "Delivery Type: Ticket\n\n"
             f"{narrative}"
         )
-
-    @staticmethod
-    def _parent(state: dict[str, Any]) -> dict[str, Any]:
-        parent = dict(_mapping(state, "parent"))
-        parent["url"] = _issue_url(state, int(parent["number"]))
-        return parent
-
-    @staticmethod
-    def _ticket(state: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
-        ticket = dict(
-            _mapping(
-                _mapping(_mapping(state, "ticket_graph"), "tickets"),
-                str(job["ticket_number"]),
-            )
-        )
-        ticket["url"] = _issue_url(state, int(job["ticket_number"]))
-        return ticket
 
     def _save(self, state: dict[str, Any]) -> dict[str, Any]:
         sync_active_ticket_job(state)
@@ -472,3 +521,20 @@ def _issue_url(state: dict[str, Any], number: int) -> str:
     if not isinstance(repository, str) or not repository:
         raise ValueError("repository must be a non-empty string")
     return f"https://github.com/{repository}/issues/{number}"
+
+
+def _parent(state: dict[str, Any]) -> dict[str, Any]:
+    parent = dict(_mapping(state, "parent"))
+    parent["url"] = _issue_url(state, int(parent["number"]))
+    return parent
+
+
+def _ticket(state: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    ticket = dict(
+        _mapping(
+            _mapping(_mapping(state, "ticket_graph"), "tickets"),
+            str(job["ticket_number"]),
+        )
+    )
+    ticket["url"] = _issue_url(state, int(job["ticket_number"]))
+    return ticket

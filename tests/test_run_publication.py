@@ -824,6 +824,46 @@ def test_pending_check_that_later_fails_enters_shared_run_repair(
     )
 
 
+def test_unknown_final_required_checks_enters_supervised_wait(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["unknown"]
+
+    waiting = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["terminal_kind"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert waiting["supervision_window"]["kind"] == "github_convergence"
+
+
+@pytest.mark.parametrize("bucket", ["skipping", "neutral"])
+def test_fixture_non_failure_required_check_buckets_are_pass(
+    git_repo: Path, bucket: str
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = [bucket]
+
+    result = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    assert result["status"] == "run_approval_pending"
+
+
 def test_worker_failure_before_publication_artifact_is_not_retried(
     git_repo: Path,
 ) -> None:

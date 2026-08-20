@@ -23,6 +23,7 @@ from agent_run.credential_availability import (
 )
 from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import (
+    ensure_supervision_window,
     is_github_convergence_error,
     wait_for_github_convergence,
 )
@@ -532,19 +533,42 @@ class RunPublicationFlow(RunPublicationShared):
         self.github.record_run_publication(pr_number, record)
         publication.update({"pr_number": pr_number, "record": record})
         publication.pop("last_publication_error", None)
-        checks = self.github.required_checks(pr_number)
+        try:
+            checks = self.github.required_checks(pr_number)
+        except (OSError, TimeoutError) as error:
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_failed",
+                message=str(error),
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+            return self._save(state)
         self._record_agent_run_status(pr_number, run, run_head, checks)
         if checks == "fail":
+            evidence = self._required_check_evidence(state, publication, pr_number)
+            if evidence is None:
+                return state
             self._queue_repair(
                 state,
                 repair_source="required_checks",
-                ci_evidence=self.github.required_check_evidence(pr_number),
+                ci_evidence=evidence,
             )
         elif checks == "pending":
             publication["phase"] = "waiting_checks"
             state["status"] = "waiting_checks"
             state["terminal_kind"] = "waiting_checks"
             state["diagnostics"] = []
+        elif checks == "unknown":
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_unknown",
+                message="GitHub Required Checks returned an unknown state",
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
         else:
             publication["phase"] = "ready_for_approval"
             state["status"] = "run_approval_pending"

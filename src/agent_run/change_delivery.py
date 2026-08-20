@@ -2,16 +2,17 @@ from __future__ import annotations
 
 """Shared, deterministic delivery lifecycle for a change job.
 
-The controller owns this lifecycle.  A job-specific contract supplies only
-identity, request construction, and the one completion side effect (closing a
-Ticket or returning control to Run Acceptance).  In particular, contracts do
-not get a shortcut from development to a Run Branch write.
+The controller owns this lifecycle.  A typed job descriptor supplies only
+deterministic identity and branch facts; a semantic adapter supplies request
+construction and currentness decisions.  Controller/Publisher side effects
+and StateStore persistence are kept in their own seam.  In particular,
+neither layer gets a shortcut from development to a Run Branch write.
 """
 
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from agent_run.agents import AgentBackend, HumanBlockerResult, PublicationResult
 from agent_run.agent_invocation import (
@@ -30,10 +31,15 @@ from agent_run.credential_availability import (
     wait_for_initial_credential,
 )
 from agent_run.delivery_protocol import GitHubPublisher
-from agent_run.external_supervision import is_github_convergence_error
-from agent_run.git import GitRepository
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
+from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.state import StateStore
 from agent_run.worker_credentials import InitialCredentialUnavailable
 
 MAX_MODIFICATION_ATTEMPTS = 10
@@ -50,42 +56,110 @@ class StaleDisposition(str, Enum):
 
 @dataclass(frozen=True)
 class ChangeJobContract:
-    """The job-local behaviour which is intentionally outside the pipeline.
+    """Typed, deterministic descriptor for a Change Delivery consumer."""
 
-    All callbacks receive the durable run state and job record.  The pipeline
-    retains ownership of phase transitions, candidate/publication commits,
-    reviewer identity, Required Checks, exact-head verification, and squash
-    completion.  This keeps Ticket and Run Repair jobs from diverging.
-    """
+    label: str
+    branch: str
+    base_branch: str
 
-    label: Callable[[dict[str, Any]], str]
-    branch: Callable[[dict[str, Any]], str]
-    base_branch: Callable[[dict[str, Any]], str]
-    candidate: Callable[[Path, dict[str, Any], int], str | None]
-    development_thread_is_allowed: Callable[[dict[str, Any], str], bool]
-    development_request: Callable[
-        [dict[str, Any], dict[str, Any], Path], dict[str, Any]
-    ]
-    publication_request: Callable[
-        [dict[str, Any], dict[str, Any], Path], dict[str, Any]
-    ]
-    review_request: Callable[[dict[str, Any], dict[str, Any], Path], dict[str, Any]]
-    prepare_validation: Callable[[Path, dict[str, Any], Path], None]
-    ensure_pr: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], int]
-    acceptance_record: Callable[
-        [dict[str, Any], dict[str, Any], str, dict[str, Any]], dict[str, Any]
-    ]
-    acceptance_is_current: Callable[
-        [dict[str, Any], dict[str, Any], dict[str, Any]], bool
-    ]
-    invalidate_stale: Callable[[dict[str, Any], dict[str, Any], Path], None]
+
+class ChangeDeliveryAdapter(Protocol):
+    """Consumer semantics only; concrete adapters live beside each consumer."""
+
     stale_disposition: StaleDisposition
-    revision_changed: Callable[[dict[str, Any], dict[str, Any]], bool]
-    requires_explicit_approval: Callable[[dict[str, Any], dict[str, Any]], bool]
-    after_merge: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], bool]
-    escalate: Callable[[dict[str, Any], dict[str, Any], str], None]
-    save: Callable[[dict[str, Any]], dict[str, Any]]
-    linked_issue_number: Callable[[dict[str, Any], dict[str, Any]], int] | None = None
+
+    def development_thread_is_allowed(
+        self, state: dict[str, Any], thread_id: str
+    ) -> bool: ...
+
+    def development_request(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]: ...
+
+    def publication_request(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]: ...
+
+    def review_request(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]: ...
+
+    def acceptance_record(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        reviewer_thread_id: str,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def acceptance_is_current(
+        self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
+    ) -> bool: ...
+
+    def revision_changed(self, state: dict[str, Any], job: dict[str, Any]) -> bool: ...
+
+    def base_is_current(self, current_base: str, job: dict[str, Any]) -> bool: ...
+
+    def requires_explicit_approval(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool: ...
+
+    def linked_issue_number(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> int | None: ...
+
+    def invocation_identity(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> tuple[str, int]: ...
+
+
+class ChangeDeliveryPublisher(Protocol):
+    """Consumer-specific mutations executed through the Publisher seam."""
+
+    def commit_candidate(
+        self, checkout: Path, job: dict[str, Any], attempt: int
+    ) -> str | None: ...
+
+    def prepare_validation(
+        self, checkout: Path, job: dict[str, Any], validation: Path
+    ) -> None: ...
+
+    def ensure_pr(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        publication: dict[str, Any],
+    ) -> int: ...
+
+    def live_pull_request(
+        self, state: dict[str, Any], job: dict[str, Any], pr_number: int
+    ) -> dict[str, Any]: ...
+
+    def invalidate_stale(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None: ...
+
+    def after_merge(
+        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
+    ) -> bool: ...
+
+    def escalate(
+        self, state: dict[str, Any], job: dict[str, Any], code: str
+    ) -> None: ...
+
+    def sync_attempts(self, state: dict[str, Any], job: dict[str, Any]) -> None: ...
+
+
+@dataclass(frozen=True)
+class ChangeDeliveryStateStore:
+    """Persist one Run through the existing atomic StateStore seam."""
+
+    states: StateStore
+    run_id: str
+
+    def save(self, state: dict[str, Any]) -> dict[str, Any]:
+        self.states.save_run(self.run_id, state)
+        return state
 
 
 def ensure_linked_branch_display(
@@ -207,11 +281,20 @@ class ChangeDeliveryEngine:
         github: GitHubPublisher,
         agents: AgentBackend,
         contract: ChangeJobContract,
+        adapter: ChangeDeliveryAdapter,
+        publisher: ChangeDeliveryPublisher,
+        state_store: ChangeDeliveryStateStore,
     ) -> None:
         self.git = git
         self.github = github
         self.agents = agents
         self.contract = contract
+        self.adapter = adapter
+        self.publisher = publisher
+        self.state_store = state_store
+
+    def save(self, state: dict[str, Any]) -> dict[str, Any]:
+        return self.state_store.save(state)
 
     def run(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -230,18 +313,20 @@ class ChangeDeliveryEngine:
                     job.pop("last_publication_error", None)
                     state["status"] = "active"
                     state["diagnostics"] = []
-                    self.contract.save(state)
+                    self.save(state)
                     continue
                 if phase == "merged":
-                    live = self.github.live_pull_request(int(job["pr_number"]))
-                    if not self.contract.after_merge(state, job, live):
+                    live = self.publisher.live_pull_request(
+                        state, job, int(job["pr_number"])
+                    )
+                    if not self.publisher.after_merge(state, job, live):
                         return state
                     job["phase"] = "completed"
-                    return self.contract.save(state)
+                    return self.save(state)
                 if phase == "escalating":
-                    self.contract.escalate(state, job, str(job["escalation_code"]))
+                    self.publisher.escalate(state, job, str(job["escalation_code"]))
                     job["phase"] = "blocked"
-                    return self.contract.save(state)
+                    return self.save(state)
                 if phase in {"developing", "repairing"}:
                     self._develop(state, job, checkout)
                 if job["phase"] == "committing_candidate":
@@ -249,19 +334,44 @@ class ChangeDeliveryEngine:
                         return state
                 if job["phase"] == "candidate":
                     self._review(state, job, checkout)
+                    if job["phase"] == "escalating":
+                        # Budget exhaustion is a durable terminal boundary;
+                        # process it before the Run Repair adapter asks the
+                        # outer Run Acceptance loop to re-enter.
+                        continue
                 if job["phase"] == "reviewing":
-                    # The reviewer may have been interrupted after its attempt
-                    # was durably announced but before its result was saved.
-                    # Keep that attempt in the timeline, then request a fresh
-                    # independent reviewer on resume.
-                    job["phase"] = "candidate"
-                    self.contract.save(state)
+                    if isinstance(job.get("pending_review_result"), dict):
+                        self._complete_review(state, job, checkout)
+                    else:
+                        # The reviewer may have been interrupted before returning
+                        # a result. Keep that attempt in the timeline, then request
+                        # a fresh independent reviewer on resume.
+                        job["phase"] = "candidate"
+                        self.save(state)
                     continue
                 if job["phase"] == "accepted":
+                    if self._can_resume_integrated_publication(job):
+                        job["phase"] = "merged"
+                        self.save(state)
+                        continue
                     self._publication(state, job, checkout)
+                    # Publication can discover a moving base and let the
+                    # consumer's stale boundary choose the next phase.
+                    # Continue with an active phase instead of falling
+                    # through to the unknown-phase guard.
+                    if job["phase"] in {"candidate", "developing", "repairing"}:
+                        continue
                 if job["phase"] == "escalating":
                     continue
-                if job["phase"] in {"publishing", "waiting_checks", "merging"}:
+                if job["phase"] in {
+                    "publishing",
+                    "waiting_checks",
+                    "waiting_merge",
+                    "merging",
+                }:
+                    if job["phase"] == "waiting_merge":
+                        job["phase"] = "merging"
+                        self.save(state)
                     terminal = self._publish_and_merge(state, job, checkout)
                     if terminal:
                         return state
@@ -282,6 +392,29 @@ class ChangeDeliveryEngine:
                 state, job, http_status=error.http_status
             )
             return state
+
+    def _can_resume_integrated_publication(self, job: dict[str, Any]) -> bool:
+        """Return whether an already merged publication can resume closeout."""
+
+        publication = job.get("publication")
+        candidate_sha = job.get("candidate_sha")
+        publication_sha = job.get("publication_sha")
+        if not (
+            isinstance(job.get("integrated_sha"), str)
+            and isinstance(job.get("pr_number"), int)
+            and isinstance(publication, dict)
+            and isinstance(candidate_sha, str)
+            and isinstance(publication_sha, str)
+            and job.get("published_sha") == publication_sha
+            and job.get("integrated_publication_sha") == publication_sha
+        ):
+            return False
+        try:
+            return self.git.resolve(f"{candidate_sha}^{{tree}}") == self.git.resolve(
+                f"{publication_sha}^{{tree}}"
+            )
+        except (GitError, ValueError):
+            return False
 
     def _develop(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -304,8 +437,8 @@ class ChangeDeliveryEngine:
         # makes a foreground status query truthful even while Codex is still
         # running, and leaves an observable recovery boundary on interruption.
         job["pending_attempt"] = attempt
-        self.contract.save(state)
-        request = self.contract.development_request(state, job, checkout)
+        self.save(state)
+        request = self.adapter.development_request(state, job, checkout)
         request["_invocation_event"] = self._invocation_events(
             state, job, request, role="development", phase=str(job["phase"])
         )
@@ -316,10 +449,10 @@ class ChangeDeliveryEngine:
             request["_invocation_mode"] = "resume"
         result = self.agents.develop(request)
         clear_initial_credential_wait(
-            state, work_subject=self.contract.label(job)
+            state, work_subject=self.contract.label
         )
         if isinstance(result, HumanBlockerResult):
-            if not self.contract.development_thread_is_allowed(state, result.thread_id):
+            if not self.adapter.development_thread_is_allowed(state, result.thread_id):
                 raise ValueError("Change Job Development Thread is not independent")
             _record_development_thread(job, result.thread_id, result.replaced_thread_id)
             job.pop("development_new_thread", None)
@@ -330,7 +463,7 @@ class ChangeDeliveryEngine:
             return
         if not result.thread_id.strip() or not result.summary.strip():
             raise ValueError("Development result is incomplete")
-        if not self.contract.development_thread_is_allowed(state, result.thread_id):
+        if not self.adapter.development_thread_is_allowed(state, result.thread_id):
             raise ValueError("Change Job Development Thread is not independent")
         _record_development_thread(job, result.thread_id, result.replaced_thread_id)
         job.pop("development_new_thread", None)
@@ -338,7 +471,7 @@ class ChangeDeliveryEngine:
         job["development_summary"] = result.summary
         clear_current_human_blocker(job)
         job["phase"] = "committing_candidate"
-        self.contract.save(state)
+        self.save(state)
         self._reject_stale(
             state,
             job,
@@ -355,26 +488,26 @@ class ChangeDeliveryEngine:
     ) -> None:
         wait_for_initial_credential(
             state,
-            work_subject=self.contract.label(job),
+            work_subject=self.contract.label,
             phase=str(job["phase"]),
             resume_status=str(state.get("status", "active")),
             http_status=http_status,
         )
-        self.contract.save(state)
+        self.save(state)
 
     def _resume_after_initial_credential(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None:
         if resume_initial_credential_wait(
-            state, work_subject=self.contract.label(job)
+            state, work_subject=self.contract.label
         ):
-            self.contract.save(state)
+            self.save(state)
 
     def _commit_candidate(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> bool:
         attempt = int(job["pending_attempt"])
-        candidate = self.contract.candidate(checkout, job, attempt)
+        candidate = self.publisher.commit_candidate(checkout, job, attempt)
         if candidate is None:
             job.pop("pending_attempt", None)
             return self._block(
@@ -387,11 +520,13 @@ class ChangeDeliveryEngine:
             {
                 "candidate_sha": candidate,
                 "modification_attempts": attempt,
+                "code_modification_attempts": attempt,
                 "phase": "candidate",
             }
         )
+        self._sync_attempts(state, job)
         job.pop("pending_attempt", None)
-        self.contract.save(state)
+        self.save(state)
         return True
 
     def _publication(
@@ -400,10 +535,10 @@ class ChangeDeliveryEngine:
         while True:
             if not self._publication_is_current(state, job):
                 self._invalidate_stale(state, job, checkout)
-                self.contract.save(state)
+                self.save(state)
                 return
             try:
-                request = self.contract.publication_request(state, job, checkout)
+                request = self.adapter.publication_request(state, job, checkout)
             except GitHubReadError as error:
                 if not is_github_convergence_error(error.code):
                     raise
@@ -416,15 +551,15 @@ class ChangeDeliveryEngine:
                     state["terminal_kind"] = "publication_pending"
                     state["diagnostics"] = [
                         publication_pending_diagnostic(
-                            subject_key="change_job", subject=self.contract.label(job)
+                            subject_key="change_job", subject=self.contract.label
                         )
                     ]
-                    self.contract.save(state)
+                    self.save(state)
                     return
-                self.contract.save(state)
+                self.save(state)
                 continue
             job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
-            self.contract.save(state)
+            self.save(state)
             request["_invocation_event"] = self._invocation_events(
                 state, job, request, role="publication", phase="publication"
             )
@@ -437,7 +572,7 @@ class ChangeDeliveryEngine:
                 request["_invocation_mode"] = "resume"
             raw = self.agents.publication(request)
             clear_initial_credential_wait(
-                state, work_subject=self.contract.label(job)
+                state, work_subject=self.contract.label
             )
             job.pop("publication_failure_resume", None)
             if isinstance(raw, HumanBlockerResult):
@@ -480,7 +615,7 @@ class ChangeDeliveryEngine:
         clear_current_human_blocker(job)
         if not self._publication_is_current(state, job):
             self._invalidate_stale(state, job, checkout)
-            self.contract.save(state)
+            self.save(state)
             return
         sha = self.git.create_publication_commit(
             checkout,
@@ -500,7 +635,7 @@ class ChangeDeliveryEngine:
             }
         )
         job.pop("last_publication_error", None)
-        self.contract.save(state)
+        self.save(state)
         self._reject_stale(
             state, job, checkout, "Publication was discarded after requirements changed"
         )
@@ -514,7 +649,7 @@ class ChangeDeliveryEngine:
         role: str = "publication",
         phase: str,
     ) -> Callable[..., None]:
-        work_subject, generation = self._invocation_identity(state, job)
+        work_subject, generation = self.adapter.invocation_identity(state, job)
         boundary: dict[str, Any] = {
             "base_sha": str(job["base_sha"]),
         }
@@ -524,6 +659,9 @@ class ChangeDeliveryEngine:
         if isinstance(acceptance, dict) and "reviewed_candidate_tree" in acceptance:
             boundary["candidate_tree"] = str(acceptance["reviewed_candidate_tree"])
         for key in ("effective_revision", "parent_revision", "ticket_graph_revision"):
+            if key in job:
+                boundary[key] = job[key]
+        for key in ("default_base_sha", "repair_base_run_head_sha"):
             if key in job:
                 boundary[key] = job[key]
         if "ticket_completion_records" in job:
@@ -538,7 +676,7 @@ class ChangeDeliveryEngine:
             generation=generation,
             invocation_input=request,
             currentness_boundary=boundary,
-            save=self.contract.save,
+            save=self.save,
         )
 
     @staticmethod
@@ -550,23 +688,26 @@ class ChangeDeliveryEngine:
                 f"ticket:{int(job['ticket_number'])}",
                 int(job.get("ticket_branch_generation", 1)),
             )
-        if isinstance(job.get("repair_generation"), int):
-            return f"run-repair:{state['run_id']}", int(job["repair_generation"])
         return f"parent-only:{state['run_id']}", int(job.get("parent_generation", 1))
 
     def _review(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
+        # A new Reviewer always starts from the current Candidate boundary.
+        # Any result retained for a prior base/candidate must not survive into
+        # an interrupted fresh attempt.
+        job.pop("pending_review_result", None)
         attempt = int(job.get("validation_attempts", 0)) + 1
         job["validation_attempts"] = attempt
+        self._sync_attempts(state, job)
         job["phase"] = "reviewing"
-        self.contract.save(state)
+        self.save(state)
         validation = (
-            checkout.parent / f"validation-{self.contract.label(job)}-{attempt}"
+            checkout.parent / f"validation-{self.contract.label}-{attempt}"
         )
         try:
-            self.contract.prepare_validation(checkout, job, validation)
-            request = self.contract.review_request(state, job, validation)
+            self.publisher.prepare_validation(checkout, job, validation)
+            request = self.adapter.review_request(state, job, validation)
             request["_invocation_event"] = self._invocation_events(
                 state, job, request, role="fresh_acceptance", phase="reviewing"
             )
@@ -578,7 +719,7 @@ class ChangeDeliveryEngine:
             review = self.agents.review(request)
         finally:
             self.git.remove_worktree(validation)
-        clear_initial_credential_wait(state, work_subject=self.contract.label(job))
+        clear_initial_credential_wait(state, work_subject=self.contract.label)
         _record_reviewer(
             job, review.thread_id, new_thread=job.get("review_new_thread") is True
         )
@@ -586,21 +727,42 @@ class ChangeDeliveryEngine:
         job.pop("review_failure_resume", None)
         job.pop("review_resume_thread_id", None)
         job.pop("review_human_blocker_resume", None)
-        # Persist the identity before parsing the Artifact.  A malformed
-        # reviewer response must not make the same Reviewer appear fresh on
-        # resume.
-        self.contract.save(state)
+        try:
+            artifact = AcceptanceArtifact.parse(review.artifact)
+        except ValueError:
+            # A malformed Artifact has no resumable result, but its Reviewer
+            # identity must remain durable before a fresh output attempt.
+            self.save(state)
+            raise
+        job["pending_review_result"] = {
+            "reviewer_thread_id": review.thread_id,
+            "artifact": artifact.raw,
+        }
+        # Persist the returned result and Reviewer identity atomically.  This
+        # keeps the successful lifecycle's existing save cadence while making
+        # a later currentness observation retryable without another Reviewer.
+        self.save(state)
+        self._complete_review(state, job, checkout)
+
+    def _complete_review(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        pending = _mapping(job, "pending_review_result")
+        reviewer_thread_id = pending.get("reviewer_thread_id")
+        if not isinstance(reviewer_thread_id, str) or not reviewer_thread_id.strip():
+            raise ValueError("pending review result is missing its Reviewer Thread")
+        artifact = AcceptanceArtifact.parse(pending.get("artifact"))
         self._reject_stale(
             state,
             job,
             checkout,
             "Fresh Acceptance was discarded after requirements changed",
         )
-        artifact = AcceptanceArtifact.parse(review.artifact)
         job["acceptance_artifact"] = artifact.raw
-        job["acceptance_record"] = self.contract.acceptance_record(
-            state, job, review.thread_id, artifact.raw
+        job["acceptance_record"] = self.adapter.acceptance_record(
+            state, job, reviewer_thread_id, artifact.raw
         )
+        job.pop("pending_review_result", None)
         # A first rejection has no PR to expose.  For a repair after a PR
         # already exists, update that PR's one status comment immediately so
         # it cannot keep advertising an obsolete passing Candidate.
@@ -642,7 +804,7 @@ class ChangeDeliveryEngine:
         else:
             job["repair_source"] = "acceptance"
             job["phase"] = "repairing"
-        self.contract.save(state)
+        self.save(state)
 
     def _wait_for_human(
         self,
@@ -675,7 +837,7 @@ class ChangeDeliveryEngine:
                 ],
             }
         )
-        self.contract.save(state)
+        self.save(state)
 
     def _publish_and_merge(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -688,30 +850,37 @@ class ChangeDeliveryEngine:
                 "Published-Head Gate rejected stale requirements",
             )
         publication = _mapping(job, "publication")
-        branch = self.contract.branch(job)
+        branch = self.contract.branch
         existing_pr = job.get("pr_number")
         if isinstance(existing_pr, int):
-            existing_live = self.github.live_pull_request(existing_pr)
+            existing_live = self.publisher.live_pull_request(
+                state, job, existing_pr
+            )
             if existing_live.get("state") == "MERGED":
-                if job.get("phase") != "merging":
+                integrated = existing_live.get("integrated_sha")
+                if job.get("phase") != "merging" and job.get(
+                    "integrated_sha"
+                ) != integrated:
                     return self._block(
                         state,
                         job,
                         "unexpected_external_merge",
                         "Change Job PR merged without a persisted Publisher merge intent",
                     )
-                integrated = existing_live.get("integrated_sha")
                 if not isinstance(integrated, str) or not integrated:
                     raise ValueError("merged Change Job PR is missing integrated SHA")
                 job["integrated_sha"] = integrated
+                live_head = existing_live.get("head_sha")
+                if isinstance(live_head, str):
+                    job["integrated_publication_sha"] = live_head
                 self.github.sync_run_branch(
-                    run_branch=self.contract.base_branch(state),
+                    run_branch=self.contract.base_branch,
                     integrated_sha=integrated,
                 )
-                if not self.contract.after_merge(state, job, existing_live):
+                if not self.publisher.after_merge(state, job, existing_live):
                     return True
                 job["phase"] = "completed"
-                self.contract.save(state)
+                self.save(state)
                 return True
             if existing_live.get("state") not in {None, "OPEN"}:
                 return self._block(
@@ -724,14 +893,14 @@ class ChangeDeliveryEngine:
                 job.get("integrated_sha"), str
             ):
                 state["status"] = "waiting_merge"
-                self.contract.save(state)
+                self.save(state)
                 return True
         self._reject_stale(
             state, job, checkout, "Published-Head Gate rejected stale requirements"
         )
         self.github.verify_ticket_pr_before_publish(
             branch=branch,
-            base_branch=self.contract.base_branch(state),
+            base_branch=self.contract.base_branch,
             expected_head_sha=str(job.get("published_sha", job["base_sha"])),
             expected_base_sha=str(job["base_sha"]),
         )
@@ -743,7 +912,7 @@ class ChangeDeliveryEngine:
         }
         if job.get("ticket_write_intent") != publish_intent:
             job["ticket_write_intent"] = publish_intent
-            self.contract.save(state)
+            self.save(state)
         self.github.publish_branch(
             branch,
             str(job["publication_sha"]),
@@ -751,7 +920,7 @@ class ChangeDeliveryEngine:
         )
         job.pop("ticket_write_intent", None)
         job["published_sha"] = str(job["publication_sha"])
-        self.contract.save(state)
+        self.save(state)
         self._reject_stale(
             state,
             job,
@@ -761,24 +930,24 @@ class ChangeDeliveryEngine:
         pr_intent = {
             "action": "ensure_ticket_pr",
             "branch": branch,
-            "base_branch": self.contract.base_branch(state),
+            "base_branch": self.contract.base_branch,
             "base_sha": str(job["base_sha"]),
             "head_sha": str(job["publication_sha"]),
         }
         if job.get("ticket_write_intent") != pr_intent:
             job["ticket_write_intent"] = pr_intent
-            self.contract.save(state)
-        pr_number = self.contract.ensure_pr(state, job, publication)
+            self.save(state)
+        pr_number = self.publisher.ensure_pr(state, job, publication)
         job.pop("ticket_write_intent", None)
         job["pr_number"] = pr_number
-        self.contract.save(state)
+        self.save(state)
         self._reject_stale(
             state,
             job,
             checkout,
             "Published-Head Gate rejected requirements changed while creating PR",
         )
-        created_live = self.github.live_pull_request(pr_number)
+        created_live = self.publisher.live_pull_request(state, job, pr_number)
         if created_live.get("state") == "MERGED":
             return self._block(
                 state,
@@ -794,15 +963,16 @@ class ChangeDeliveryEngine:
                 "Current Change Job PR was closed without merging",
             )
         link_display = getattr(self.github, "link_issue_branch_display", None)
-        if self.contract.linked_issue_number is not None and callable(link_display):
+        linked_issue_number = self.adapter.linked_issue_number(state, job)
+        if linked_issue_number is not None and callable(link_display):
             ensure_linked_branch_display(
                 github=self.github,
                 state=state,
                 job=job,
-                issue_number=self.contract.linked_issue_number(state, job),
+                issue_number=linked_issue_number,
                 branch=branch,
                 head_sha=str(job["publication_sha"]),
-                save=self.contract.save,
+                save=self.save,
             )
         try:
             checks = self.github.required_checks(pr_number)
@@ -830,7 +1000,7 @@ class ChangeDeliveryEngine:
                     ],
                 }
             )
-            self.contract.save(state)
+            self.save(state)
             return True
         self._reject_stale(
             state,
@@ -838,11 +1008,29 @@ class ChangeDeliveryEngine:
             checkout,
             "Published-Head Gate rejected requirements changed while reading checks",
         )
-        self._record_agent_run_status(pr_number, job, checks)
+        self._record_agent_run_status(
+            pr_number,
+            job,
+            checks,
+            next_action=(
+                "retry Required Checks observation" if checks == "unknown" else None
+            ),
+        )
         if checks == "pending":
             job["phase"] = "waiting_checks"
             state["status"] = "waiting_checks"
-            self.contract.save(state)
+            self.save(state)
+            return True
+        if checks == "unknown":
+            job["phase"] = "waiting_checks"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_unknown",
+                message="GitHub Required Checks returned an unknown state",
+                waiting_for=f"Ticket PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+            self.save(state)
             return True
         if checks == "fail":
             if int(job["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS:
@@ -853,28 +1041,52 @@ class ChangeDeliveryEngine:
                     }
                 )
             else:
+                try:
+                    evidence = self.github.required_check_evidence(pr_number)
+                except (GitHubReadError, OSError, TimeoutError) as error:
+                    if isinstance(
+                        error, GitHubReadError
+                    ) and not is_github_convergence_error(error.code):
+                        raise
+                    self._record_agent_run_status(
+                        pr_number,
+                        job,
+                        "unavailable",
+                        next_action="retry failed Required Check evidence observation",
+                    )
+                    wait_for_github_convergence(
+                        state,
+                        code="github_check_evidence_observation_pending",
+                        message="GitHub Required Check failure evidence has not converged",
+                        waiting_for=(
+                            f"Ticket PR #{pr_number} failed Required Check evidence"
+                        ),
+                    )
+                    ensure_supervision_window(state)
+                    self.save(state)
+                    return True
                 job.update(
                     {
                         "phase": "repairing",
                         "repair_source": "required_checks",
-                        "ci_evidence": self.github.required_check_evidence(pr_number),
+                        "ci_evidence": evidence,
                     }
                 )
-            self.contract.save(state)
+            self.save(state)
             return False
         if checks not in {"none", "pass"}:
             raise ValueError(f"unknown Required Checks state: {checks}")
-        live = self.github.live_pull_request(pr_number)
+        live = self.publisher.live_pull_request(state, job, pr_number)
         acceptance = _mapping(job, "acceptance_record")
         if (
             live.get("head_sha") != job["publication_sha"]
-            or live.get("base_branch") != self.contract.base_branch(state)
+            or live.get("base_branch") != self.contract.base_branch
             or live.get("base_sha") != acceptance.get("reviewed_base_sha")
             or live.get("mergeable") is not True
             or acceptance.get("reviewed_candidate_sha") != job["candidate_sha"]
             or acceptance.get("reviewed_candidate_tree")
             != self.git.resolve(f"{job['publication_sha']}^{{tree}}")
-            or not self.contract.acceptance_is_current(state, job, acceptance)
+            or not self.adapter.acceptance_is_current(state, job, acceptance)
         ):
             self._record_agent_run_status(
                 pr_number,
@@ -891,7 +1103,7 @@ class ChangeDeliveryEngine:
         merge_intent = job.get("merge_intent")
         expected_intent = {
             "head_sha": str(job["publication_sha"]),
-            "base_branch": self.contract.base_branch(state),
+            "base_branch": self.contract.base_branch,
             "base_sha": str(acceptance["reviewed_base_sha"]),
             "commit_message": str(publication["commit_message"]),
         }
@@ -909,12 +1121,12 @@ class ChangeDeliveryEngine:
                 "merge_intent_mismatch",
                 "Persisted merge intent no longer matches the current PR boundary",
             )
-        if self.contract.requires_explicit_approval(state, job):
+        if self.adapter.requires_explicit_approval(state, job):
             job["phase"] = "ready_for_approval"
             state["status"] = "parent_approval_pending"
             state["terminal_kind"] = "waiting_human"
             state["diagnostics"] = []
-            self.contract.save(state)
+            self.save(state)
             self._record_agent_run_status(
                 pr_number,
                 job,
@@ -923,7 +1135,7 @@ class ChangeDeliveryEngine:
             )
             return True
         job["phase"] = "merging"
-        self.contract.save(state)
+        self.save(state)
         self._record_agent_run_status(
             pr_number,
             job,
@@ -936,12 +1148,12 @@ class ChangeDeliveryEngine:
         if attempts >= 3:
             return self._wait_for_merge_reconciliation(state, job)
         merge_intent["attempts"] = attempts + 1
-        self.contract.save(state)
+        self.save(state)
         try:
             integrated = self.github.squash_merge(
                 pr_number=pr_number,
                 expected_head_sha=str(job["publication_sha"]),
-                run_branch=self.contract.base_branch(state),
+                run_branch=self.contract.base_branch,
                 commit_message=str(publication["commit_message"]),
             )
         except MergeOutcomeUnknownError as error:
@@ -956,22 +1168,23 @@ class ChangeDeliveryEngine:
                 }
             )
             del history[:-3]
-            self.contract.save(state)
+            self.save(state)
             return self._wait_for_merge_reconciliation(state, job, str(error))
         job["integrated_sha"] = integrated
-        self.contract.save(state)
+        job["integrated_publication_sha"] = str(job["publication_sha"])
+        self.save(state)
         self.github.sync_run_branch(
-            run_branch=self.contract.base_branch(state), integrated_sha=integrated
+            run_branch=self.contract.base_branch, integrated_sha=integrated
         )
-        live_after_merge = self.github.live_pull_request(pr_number)
+        live_after_merge = self.publisher.live_pull_request(state, job, pr_number)
         if live_after_merge.get("state") != "MERGED":
             state["status"] = "waiting_merge"
-            self.contract.save(state)
+            self.save(state)
             return True
-        if not self.contract.after_merge(state, job, live_after_merge):
+        if not self.publisher.after_merge(state, job, live_after_merge):
             return True
         job["phase"] = "completed"
-        self.contract.save(state)
+        self.save(state)
         return True
 
     def _wait_for_merge_reconciliation(
@@ -991,7 +1204,7 @@ class ChangeDeliveryEngine:
                 ],
             }
         )
-        self.contract.save(state)
+        self.save(state)
         return True
 
     def _record_agent_run_status(
@@ -1020,7 +1233,7 @@ class ChangeDeliveryEngine:
         self.github.record_agent_run_status(
             pr_number,
             {
-                "scope": self.contract.label(job),
+                "scope": self.contract.label,
                 "base_sha": str(job["base_sha"]),
                 "candidate_sha": str(job["candidate_sha"]),
                 "validation_outcome": AcceptanceArtifact.parse(artifact).outcome,
@@ -1036,16 +1249,18 @@ class ChangeDeliveryEngine:
         acceptance = job.get("acceptance_record")
         return (
             isinstance(acceptance, dict)
-            and self.git.resolve(self.contract.base_branch(state))
-            == job.get("base_sha")
-            and self.contract.acceptance_is_current(state, job, acceptance)
-            and not self.contract.revision_changed(state, job)
+            and self.adapter.base_is_current(
+                self.git.resolve(self.contract.base_branch), job
+            )
+            and self.adapter.acceptance_is_current(state, job, acceptance)
+            and not self.adapter.revision_changed(state, job)
         )
 
     def _agent_is_current(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
-        return self.git.resolve(self.contract.base_branch(state)) == job.get(
-            "base_sha"
-        ) and not self.contract.revision_changed(state, job)
+        current_base = self.git.resolve(self.contract.base_branch)
+        return self.adapter.base_is_current(
+            current_base, job
+        ) and not self.adapter.revision_changed(state, job)
 
     def _reject_stale(
         self,
@@ -1055,9 +1270,9 @@ class ChangeDeliveryEngine:
         message: str,
     ) -> None:
         if not self._agent_is_current(state, job):
-            if self.contract.stale_disposition is StaleDisposition.FRESH_RUN_ACCEPTANCE:
+            if self.adapter.stale_disposition is StaleDisposition.FRESH_RUN_ACCEPTANCE:
                 self._invalidate_stale(state, job, checkout)
-                self.contract.save(state)
+                self.save(state)
                 raise _TerminalChangeJob()
             self._block(state, job, "effective_revision_mismatch", message)
             raise _TerminalChangeJob()
@@ -1065,7 +1280,7 @@ class ChangeDeliveryEngine:
     def _invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
-        self.contract.invalidate_stale(state, job, checkout)
+        self.publisher.invalidate_stale(state, job, checkout)
 
     def _block(
         self, state: dict[str, Any], job: dict[str, Any], code: str, message: str
@@ -1073,10 +1288,15 @@ class ChangeDeliveryEngine:
         job.update({"phase": "blocked", "blocked_reason": code})
         state["status"] = "blocked"
         state["diagnostics"] = [
-            {"code": code, "message": message, "change_job": self.contract.label(job)}
+            {"code": code, "message": message, "change_job": self.contract.label}
         ]
-        self.contract.save(state)
+        self.save(state)
         return False
+
+    def _sync_attempts(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        self.publisher.sync_attempts(state, job)
 
 
 class _TerminalChangeJob(Exception):

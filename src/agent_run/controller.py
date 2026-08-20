@@ -768,6 +768,18 @@ class Controller:
             return
         job.pop("approval_grant", None)
         if subject.startswith("run-repair:"):
+            checkout = (
+                self.states.root
+                / "worktrees"
+                / str(state["run_id"])
+                / "run-repair"
+            )
+            self.publisher.git.remove_worktree(checkout)
+            for directory in (checkout.parent, checkout.parent.parent):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
             invalidate_stale_run_repair(state)
             return
         state.update(

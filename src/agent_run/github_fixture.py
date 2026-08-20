@@ -821,7 +821,16 @@ class FixtureGitHubPublisher:
             )
         sequence = delivery.get("required_checks", ["none"])
         if not isinstance(sequence, list) or not all(
-            value in {"none", "pass", "pending", "fail"} for value in sequence
+            value in {
+                "none",
+                "pass",
+                "pending",
+                "fail",
+                "unknown",
+                "skipping",
+                "neutral",
+            }
+            for value in sequence
         ):
             raise ValueError("fixture required_checks is invalid")
         position = int(delivery.get("check_position", 0))
@@ -829,10 +838,45 @@ class FixtureGitHubPublisher:
         delivery["check_position"] = position + 1
         self._save()
         self._inject_revision_drift("required_checks")
+        if value in {"skipping", "neutral"}:
+            return "pass"
         return value
 
     def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
-        configured = self._delivery().get("required_check_evidence")
+        delivery = self._delivery()
+        pull = self._pull(pr_number)
+        failures = delivery.get("required_check_evidence_failures")
+        if isinstance(failures, list) and failures:
+            failure = failures[0]
+            if not isinstance(failure, dict):
+                raise ValueError(
+                    "fixture required_check_evidence_failures must contain objects"
+                )
+            scope = failure.get("scope")
+            if scope is None or scope == pull.get("scope"):
+                remaining = failure.get("remaining_successes", 0)
+                if type(remaining) is not int or remaining < 0:
+                    raise ValueError(
+                        "fixture evidence failure remaining_successes is invalid"
+                    )
+                if remaining > 0:
+                    failure["remaining_successes"] = remaining - 1
+                    self._save()
+                else:
+                    failures.pop(0)
+                    self._save()
+                    error_type = failure.get("type", "github")
+                    message = str(failure.get("message", "evidence read failed"))
+                    if error_type == "github":
+                        raise GitHubReadError(
+                            str(failure.get("code", "github_timeout")), message
+                        )
+                    if error_type == "os":
+                        raise OSError(message)
+                    if error_type == "timeout":
+                        raise TimeoutError(message)
+                    raise ValueError("fixture evidence failure type is invalid")
+        configured = delivery.get("required_check_evidence")
         if isinstance(configured, dict):
             return dict(configured)
         return {
@@ -850,24 +894,57 @@ class FixtureGitHubPublisher:
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         pull = self._pull(pr_number)
+        reported_state = pull.get("state")
+        if reported_state == "MERGED":
+            configured_overrides = self._delivery().get(
+                "merged_live_pull_request_state_overrides"
+            )
+            if isinstance(configured_overrides, dict):
+                scoped_overrides = configured_overrides.get(str(pull.get("scope")))
+                if isinstance(scoped_overrides, list) and scoped_overrides:
+                    reported_state = scoped_overrides.pop(0)
+                    if reported_state not in {"OPEN", "MERGED"}:
+                        raise GitHubReadError(
+                            "invalid_fixture",
+                            "merged live PR state override must be OPEN or MERGED",
+                        )
+                    self._save()
         failure_key = (
             "merged_live_pull_request_failures"
             if pull.get("state") == "MERGED"
             else "open_live_pull_request_failures"
         )
         failures = self._delivery().get(failure_key)
-        if isinstance(failures, list) and failures:
-            configured = failures.pop(0)
+        failure_position = None
+        if isinstance(failures, list):
+            failure_position = next(
+                (
+                    position
+                    for position, failure in enumerate(failures)
+                    if not isinstance(failure, dict)
+                    or failure.get("scope", pull.get("scope")) == pull.get("scope")
+                ),
+                None,
+            )
+        if isinstance(failures, list) and failure_position is not None:
+            configured = failures.pop(failure_position)
             self._save()
             if not isinstance(configured, dict):
                 raise GitHubReadError(
                     "invalid_fixture",
                     f"{failure_key} must contain objects",
                 )
-            raise GitHubReadError(
-                str(configured.get("code", "github_read_failed")),
-                str(configured.get("message", "GitHub read failed")),
-            )
+            message = str(configured.get("message", "GitHub read failed"))
+            error_type = configured.get("type", "github")
+            if error_type == "github":
+                raise GitHubReadError(
+                    str(configured.get("code", "github_read_failed")), message
+                )
+            if error_type == "os":
+                raise OSError(message)
+            if error_type == "timeout":
+                raise TimeoutError(message)
+            raise ValueError(f"{failure_key} failure type is invalid")
         published = _mutable_mapping(self._delivery(), "published_branches")
         live_head = published.get(str(pull["branch"])) or pull.get("head_sha")
         override = self._delivery().get("live_head_override")
@@ -879,7 +956,7 @@ class FixtureGitHubPublisher:
             "base_sha": self.git.resolve(str(pull["base_branch"])),
             "base_repository": pull.get("base_repository", self.data["repository"]),
             "mergeable": bool(self._delivery().get("mergeable", True)),
-            "state": pull.get("state"),
+            "state": reported_state,
             "integrated_sha": pull.get("integrated_sha"),
         }
         integrated = pull.get("integrated_sha")

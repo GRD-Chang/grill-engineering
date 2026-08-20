@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError, fields
+from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,15 +21,21 @@ from agent_run.agent_invocation import (
     canonical_fingerprint,
     select_publication_thread,
 )
-from agent_run.change_delivery import ChangeDeliveryEngine
+from agent_run.change_delivery import (
+    ChangeDeliveryAdapter,
+    ChangeDeliveryEngine,
+    ChangeJobContract,
+)
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.delivery_loop import TicketDeliveryAdapter
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.github_fixture import FixtureGitHubReader
-from agent_run.parent_delivery_loop import ParentDeliveryLoop
+from agent_run.parent_delivery_loop import ParentDeliveryAdapter, ParentDeliveryLoop
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
+from agent_run.run_repair_delivery import RunRepairAdapter
 
 from conftest import write_fixture
 
@@ -36,6 +44,49 @@ E2E_PASS_EVIDENCE = "操作或命令：执行公开候选流程；退出码：0�
 E2E_FAIL_EVIDENCE = "执行公开候选流程后，delivered.txt 缺少修复标记。"
 STANDARDS_PASS_EVIDENCE = "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。"
 SPEC_PASS_EVIDENCE = "已核对的验收标准：Ticket 的全部验收标准；覆盖结论：候选完整覆盖。"
+
+
+def test_change_delivery_seams_keep_facts_and_semantics_separate() -> None:
+    contract = ChangeJobContract(
+        label="ticket-1",
+        branch="ticket/1",
+        base_branch="run/main",
+    )
+    assert (contract.label, contract.branch, contract.base_branch) == (
+        "ticket-1",
+        "ticket/1",
+        "run/main",
+    )
+    with pytest.raises(FrozenInstanceError):
+        contract.label = "mutated"  # type: ignore[misc]
+
+    assert not hasattr(ChangeDeliveryAdapter, "__dataclass_fields__")
+    assert {
+        "development_request",
+        "publication_request",
+        "review_request",
+        "acceptance_record",
+        "acceptance_is_current",
+    } <= set(vars(ChangeDeliveryAdapter))
+    assert set(signature(ChangeDeliveryEngine.__init__).parameters) == {
+        "self",
+        "git",
+        "github",
+        "agents",
+        "contract",
+        "adapter",
+        "publisher",
+        "state_store",
+    }
+    for concrete in (
+        TicketDeliveryAdapter,
+        ParentDeliveryAdapter,
+        RunRepairAdapter,
+    ):
+        assert "owner" not in signature(concrete.__init__).parameters
+        assert concrete.development_request is not ChangeDeliveryAdapter.development_request
+        assert concrete.publication_request is not ChangeDeliveryAdapter.publication_request
+        assert concrete.review_request is not ChangeDeliveryAdapter.review_request
 
 
 def issue(number: int) -> dict[str, Any]:
@@ -145,7 +196,23 @@ def test_change_publication_invocation_binds_subject_generation_and_currentness(
 ) -> None:
     state: dict[str, Any] = {"run_id": "run-1"}
     engine = object.__new__(ChangeDeliveryEngine)
-    engine.contract = SimpleNamespace(save=lambda value: value)
+    engine.save = lambda value: value
+    invocation_identity = None
+    if isinstance(job.get("repair_generation"), int):
+        invocation_identity = lambda state, job: (
+            f"run-repair:{state['run_id']}",
+            int(job["repair_generation"]),
+        )
+    engine.contract = SimpleNamespace()
+    engine.adapter = SimpleNamespace(
+        save=lambda value: value,
+        invocation_identity=(
+            invocation_identity or ChangeDeliveryEngine._invocation_identity
+        ),
+        sync_attempts=lambda _state, _job: None,
+        stop_after_review=lambda _state, _job: False,
+        additional_agent_base_shas=lambda _state, _job: set(),
+    )
     request = {"acceptance_scope": "test", "_callback": object()}
 
     event = engine._invocation_events(state, job, request, phase="publication")
@@ -1111,6 +1178,20 @@ class CheckReadFailsOncePublisher(ScriptedPublisher):
         return super().required_checks(pr_number)
 
 
+class CheckEvidenceFailsOncePublisher(ScriptedPublisher):
+    def __init__(self, repo: Path, error: BaseException) -> None:
+        super().__init__(repo)
+        self.checks = ["fail", "fail", "pass"]
+        self.evidence_error: BaseException | None = error
+
+    def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
+        if self.evidence_error is not None:
+            error = self.evidence_error
+            self.evidence_error = None
+            raise error
+        return super().required_check_evidence(pr_number)
+
+
 class PublicationContextFailsUntilResumedPublisher(ScriptedPublisher):
     def __init__(self, repo: Path) -> None:
         super().__init__(repo)
@@ -1877,6 +1958,47 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert publisher.agent_run_statuses[0]["validation_outcome"] == "pass"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubReadError("github_timeout", "evidence read timed out"),
+        OSError("evidence transport unavailable"),
+        TimeoutError("evidence read timed out"),
+    ],
+)
+def test_failed_required_check_evidence_read_is_supervised_without_budget_use(
+    git_repo: Path, error: BaseException
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = CheckEvidenceFailsOncePublisher(git_repo, error)
+    agents = CheckRepairAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    )
+
+    waiting = engine.deliver(state["run_id"])
+
+    job = waiting["active_ticket_job"]
+    assert waiting["status"] == "waiting_external"
+    assert waiting["terminal_kind"] == "waiting_external"
+    assert waiting["supervision_window"]["kind"] == "github_convergence"
+    assert job["phase"] == "publishing"
+    assert job["modification_attempts"] == 1
+    assert "ci_evidence" not in job
+    assert agents.development_thread_ids == [None]
+
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert completed["active_ticket_job"]["modification_attempts"] == 2
+    assert agents.development_thread_ids == [None, "development-thread-1"]
+
+
 def test_parent_publication_reads_existing_pr_context_once(git_repo: Path) -> None:
     publisher = ScriptedPublisher(git_repo)
     publisher.pr_titles.append("feat(parent): deliver parent scope")
@@ -1887,7 +2009,7 @@ def test_parent_publication_reads_existing_pr_context_once(git_repo: Path) -> No
         agents=ScriptedAgents(git_repo),
     )
 
-    request = loop._publication_request(
+    request = loop.adapter.publication_request(
         {
             "repository": "example/project",
             "run_id": "run-1",
@@ -2177,6 +2299,8 @@ def test_integrated_branch_waits_for_pr_merged_state_without_remerging(
 
     waiting = engine.deliver(state["run_id"])
     assert waiting["status"] == "waiting_merge"
+    waiting["active_ticket_job"]["phase"] = "waiting_merge"
+    states.save_run(state["run_id"], waiting)
     still_waiting = engine.deliver(state["run_id"])
     assert still_waiting["status"] == "waiting_merge"
     completed = engine.deliver(state["run_id"])

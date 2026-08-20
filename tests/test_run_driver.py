@@ -21,6 +21,33 @@ from agent_run.state import StateStore
             RunOutcomeKind.EXTERNAL_WAIT,
             RunStep.DELIVER,
         ),
+        (
+            {
+                "status": "waiting_external",
+                "run_acceptance": {
+                    "phase": "repairing",
+                    "repair_job": {"phase": "waiting_checks"},
+                },
+            },
+            RunOutcomeKind.EXTERNAL_WAIT,
+            RunStep.ACCEPT,
+        ),
+        (
+            {
+                "status": "waiting_merge",
+                "run_acceptance": {
+                    "phase": "repairing",
+                    "repair_job": {"phase": "merging"},
+                },
+            },
+            RunOutcomeKind.EXTERNAL_WAIT,
+            RunStep.ACCEPT,
+        ),
+        (
+            {"status": "waiting_merge"},
+            RunOutcomeKind.EXTERNAL_WAIT,
+            RunStep.DELIVER,
+        ),
         ({"status": "ready_for_human"}, RunOutcomeKind.HUMAN_GATE, None),
         ({"status": "execution_failed"}, RunOutcomeKind.EXECUTION_FAILURE, None),
         (

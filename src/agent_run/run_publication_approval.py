@@ -143,7 +143,7 @@ class RunPublicationApproval(RunPublicationShared):
                     code=error.code,
                     message=error.message,
                 )
-            except OSError as error:
+            except (OSError, TimeoutError) as error:
                 return self._wait_for_required_checks_convergence(
                     state,
                     publication,
@@ -153,16 +153,29 @@ class RunPublicationApproval(RunPublicationShared):
                     message=str(error),
                 )
             if checks == "fail":
+                evidence = self._required_check_evidence(state, publication, pr_number)
+                if evidence is None:
+                    return state
                 return self._save(
                     self._queue_repair(
                         state,
                         repair_source="required_checks",
-                        ci_evidence=self.github.required_check_evidence(pr_number),
+                        ci_evidence=evidence,
                     )
                 )
             if checks == "pending":
                 publication["phase"] = "waiting_checks"
                 state["status"] = "waiting_checks"
+                ensure_supervision_window(state)
+                return self._save(state)
+            if checks == "unknown":
+                publication["phase"] = "waiting_external"
+                wait_for_github_convergence(
+                    state,
+                    code="github_checks_observation_unknown",
+                    message="GitHub Required Checks returned an unknown state",
+                    waiting_for=f"Run PR #{pr_number} Required Checks observation",
+                )
                 ensure_supervision_window(state)
                 return self._save(state)
             if not grant_matches(publication.get("approval_grant"), authority):

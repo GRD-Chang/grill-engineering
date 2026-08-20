@@ -43,6 +43,7 @@ class TicketPhase(StrEnum):
     PUBLICATION_PENDING = "publication_pending"
     PUBLISHING = "publishing"
     WAITING_CHECKS = "waiting_checks"
+    WAITING_MERGE = "waiting_merge"
     ESCALATING = "escalating"
     MERGING = "merging"
     MERGED = "merged"

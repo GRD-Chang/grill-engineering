@@ -6,7 +6,28 @@ from typing import Any
 from agent_run.ticket_phase import TicketPhase
 
 
+MAX_CANDIDATE_ACCEPTANCE_HISTORY = 32
+
+
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
+_CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
+    {
+        "candidate_sha",
+        "repair_base_run_head_sha",
+        "default_base_sha",
+        "candidate_tree",
+        "expected_merge_tree",
+        "parent_revision",
+        "ticket_graph_revision",
+        "ticket_completion_records_fingerprint",
+        "reviewer_thread_id",
+        "development_thread_id",
+        "pr_number",
+        "integrated_sha",
+        "repair_source",
+        "outcome",
+    }
+)
 
 
 class IncompatibleRunStateError(ValueError):
@@ -49,6 +70,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
     _require_human_blocker_containers(state)
+    _require_candidate_acceptance_histories(state)
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -109,6 +131,79 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid ticket_graph.revision"
         )
+
+
+def require_candidate_acceptance_history(
+    value: object, location: str
+) -> list[dict[str, Any]]:
+    """Validate the bounded, non-nested Candidate Acceptance audit shape."""
+
+    if not isinstance(value, list):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location} history"
+        )
+    if len(value) > MAX_CANDIDATE_ACCEPTANCE_HISTORY:
+        raise IncompatibleRunStateError(
+            f"legacy state has an overlong {location} history"
+        )
+    validated: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != _CANDIDATE_ACCEPTANCE_HISTORY_KEYS:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}[{index}] audit snapshot"
+            )
+        for key in (
+            "candidate_sha",
+            "repair_base_run_head_sha",
+            "default_base_sha",
+            "candidate_tree",
+            "expected_merge_tree",
+            "parent_revision",
+            "ticket_graph_revision",
+            "ticket_completion_records_fingerprint",
+            "reviewer_thread_id",
+            "repair_source",
+            "outcome",
+        ):
+            if not isinstance(item[key], str):
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}[{index}].{key}"
+                )
+        for key in ("development_thread_id", "integrated_sha"):
+            if item[key] is not None and not isinstance(item[key], str):
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}[{index}].{key}"
+                )
+        if item["pr_number"] is not None and (
+            type(item["pr_number"]) is not int or item["pr_number"] < 1
+        ):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}[{index}].pr_number"
+            )
+        if item["outcome"] not in {"accepted", "finding", "blocked"}:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}[{index}].outcome"
+            )
+        validated.append(dict(item))
+    return validated
+
+
+def _require_candidate_acceptance_histories(state: dict[str, Any]) -> None:
+    acceptance = state.get("run_acceptance")
+    if not isinstance(acceptance, dict):
+        return
+    history = acceptance.get("candidate_acceptance_history")
+    if history is not None:
+        require_candidate_acceptance_history(
+            history, "run_acceptance.candidate_acceptance"
+        )
+    repair = acceptance.get("repair_job")
+    if isinstance(repair, dict):
+        repair_history = repair.get("candidate_acceptance_history")
+        if repair_history is not None:
+            require_candidate_acceptance_history(
+                repair_history, "run_acceptance.repair_job.candidate_acceptance"
+            )
 
 
 def human_blocker_subject_count(state: dict[str, Any]) -> int:

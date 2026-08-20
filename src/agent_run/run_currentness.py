@@ -8,6 +8,13 @@ from agent_run.git import GitRepository
 from agent_run.graph import state_from_graph
 from agent_run.models import Repository
 from agent_run.scope_changes import reconcile_structure
+from agent_run.state_contract import (
+    MAX_CANDIDATE_ACCEPTANCE_HISTORY as _MAX_CANDIDATE_ACCEPTANCE_HISTORY,
+    require_candidate_acceptance_history,
+)
+
+
+MAX_CANDIDATE_ACCEPTANCE_HISTORY = _MAX_CANDIDATE_ACCEPTANCE_HISTORY
 
 
 class RunCurrentnessReader(Protocol):
@@ -103,7 +110,25 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
     """Discard a stale Repair so a fresh Run Acceptance chooses the next step."""
     run = _mapping(state.get("run_acceptance"), "run_acceptance")
     repair_job = run.get("repair_job")
+    candidate_history: list[dict[str, Any]] = []
+    run_history: list[dict[str, Any]] = []
     if isinstance(repair_job, dict):
+        candidate_history = require_candidate_acceptance_history(
+            repair_job.get("candidate_acceptance_history", []),
+            "run_acceptance.repair_job.candidate_acceptance",
+        )
+        run_history = require_candidate_acceptance_history(
+            run.get("candidate_acceptance_history", []),
+            "run_acceptance.candidate_acceptance",
+        )
+    cycle = run.get("repair_cycle")
+    if isinstance(cycle, dict):
+        cycle["status"] = "discarded"
+    if isinstance(repair_job, dict):
+        run["candidate_acceptance_history"] = [
+            *run_history,
+            *deepcopy(candidate_history),
+        ][-MAX_CANDIDATE_ACCEPTANCE_HISTORY:]
         discarded = _string_list(run, "discarded_repair_thread_ids")
         for key in ("development_thread_id",):
             value = repair_job.get(key)

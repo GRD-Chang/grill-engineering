@@ -13,6 +13,7 @@ from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_retry import run_read_command
+from agent_run.models import Repository
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
 
 
@@ -81,6 +82,35 @@ def test_github_reader_derives_repository_hint_from_origin(
     )
 
     assert GhGitHubReader(working_directory=git_repo).repository_hint() == expected
+
+
+def test_github_reader_live_pull_request_returns_integrated_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = GhGitHubReader("example/project")
+    monkeypatch.setattr(
+        reader,
+        "repository",
+        lambda: Repository("example/project", "main", "default-sha"),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def fake_json(*arguments: str) -> dict[str, object]:
+        calls.append(arguments)
+        return {
+            "state": "MERGED",
+            "headRefOid": "head-sha",
+            "baseRefName": "agent-run/run-1",
+            "baseRefOid": "integrated-sha",
+            "mergeCommit": {"oid": "integrated-sha"},
+        }
+
+    monkeypatch.setattr(reader, "_gh_json", fake_json)
+
+    live = reader.live_pull_request(12)
+
+    assert live["integrated_sha"] == "integrated-sha"
+    assert "mergeCommit" in calls[0][-1]
 
 
 def test_git_fetch_retries_transient_timeout(

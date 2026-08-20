@@ -2239,6 +2239,20 @@ def test_ruleset_required_check_not_yet_reported_is_pending(
     ]
 
 
+def test_unrecognized_required_check_bucket_is_supervised_as_unknown(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher,
+        "_checks",
+        lambda _pr_number, _fields: [{"name": "test", "bucket": "mystery"}],
+    )
+
+    assert publisher.required_checks(12) == "unknown"
+
+
 def test_ruleset_branch_globs_do_not_cross_path_segments() -> None:
     assert _matches_ref("refs/heads/release/v1", "refs/heads/release/*")
     assert not _matches_ref("refs/heads/release/v1/patch", "refs/heads/release/*")

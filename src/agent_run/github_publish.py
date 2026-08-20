@@ -661,6 +661,8 @@ class GhGitHubPublisher:
         buckets = {str(_mapping(check).get("bucket", "")).lower() for check in checks}
         if not buckets:
             return "none"
+        if buckets - {"fail", "cancel", "pending", "pass", "skipping", "neutral"}:
+            return "unknown"
         if buckets & {"fail", "cancel"}:
             return "fail"
         if "pending" in buckets:
