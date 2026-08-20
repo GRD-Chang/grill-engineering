@@ -752,6 +752,14 @@ class RunAcceptanceEngine:
         run = self._run_state(state)
         run["phase"] = "repairing"
         self._sync_repair_cycle_counters(run, job)
+        publication = state.get("run_publication")
+        if isinstance(publication, dict) and publication.get("phase") not in {
+            "merged",
+            "abandoned",
+        }:
+            publication["phase"] = "stale"
+            for key in ("artifact", "write_intent", "approval_grant"):
+                publication.pop(key, None)
         state.update(
             {
                 "status": "run_acceptance_pending",

@@ -977,7 +977,13 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
         title="Final Run",
         body="Original final Run narrative.",
     )
-    state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
+    state["run_publication"] = {
+        "phase": "ready_for_approval",
+        "pr_number": final_pr,
+        "artifact": {"pr_body_markdown": "Original final Run narrative."},
+        "write_intent": {"action": "refresh_run_pr_narrative"},
+        "approval_grant": {"fingerprint": "stale-default-boundary"},
+    }
     state["run_acceptance"] = {
         "phase": "repairing",
         "modification_attempts": 0,
@@ -1027,6 +1033,10 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
 
     run = first["run_acceptance"]
     assert first["status"] == "run_acceptance_pending"
+    assert first["run_publication"]["phase"] == "stale"
+    assert {"artifact", "write_intent", "approval_grant"}.isdisjoint(
+        first["run_publication"]
+    )
     job = run["repair_job"]
     generation = run["repair_generation"]
     thread_id = job["development_thread_id"]
