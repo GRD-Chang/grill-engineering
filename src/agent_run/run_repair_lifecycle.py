@@ -16,6 +16,7 @@ from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.git import MergeConflictError
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import (
+    end_human_blocked_repair_cycle,
     repair_checkout_is_active,
     rotate_repair_job,
     start_repair_cycle,
@@ -129,6 +130,8 @@ class RunRepairLifecycle:
                     preserve_checkout = True
                     continue
                 self._sync_repair_cycle_counters(run, job)
+                end_human_blocked_repair_cycle(run, job)
+                self.owner._save(state)
                 preserve_checkout = self._repair_checkout_is_active(job)
                 break
         except RunRepairObservationPending:
@@ -320,6 +323,13 @@ class RunRepairLifecycle:
             "candidate_acceptance_history": [],
             "repair_checkout": str(self.owner._repair_checkout(state)),
         }
+        for key in (
+            "prior_human_blockers",
+            "human_response_history",
+            "human_response_generation",
+        ):
+            if key in repair_request:
+                job[key] = deepcopy(repair_request[key])
         if repair_source == "acceptance":
             artifact = self.owner._mapping(run, "acceptance_artifact")
             job["repair_input_artifact"] = artifact

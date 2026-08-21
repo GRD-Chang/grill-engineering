@@ -859,6 +859,22 @@ class FixtureGitHubPublisher:
         self, pr_number: int, *, expected_head_sha: str | None = None
     ) -> dict[str, Any]:
         delivery = self._delivery()
+        configured = delivery.get("required_check_evidence")
+        if expected_head_sha is None:
+            if isinstance(configured, dict):
+                return dict(configured)
+            return {
+                "pr_number": pr_number,
+                "checks": [
+                    {
+                        "name": "fixture-required-check",
+                        "workflow": "fixture-ci",
+                        "bucket": "fail",
+                        "description": "The fixture required check failed.",
+                        "link": "https://example.invalid/checks/fixture",
+                    }
+                ],
+            }
         pull = self._pull(pr_number)
         failures = delivery.get("required_check_evidence_failures")
         if isinstance(failures, list) and failures:
@@ -891,7 +907,6 @@ class FixtureGitHubPublisher:
                     if error_type == "timeout":
                         raise TimeoutError(message)
                     raise ValueError("fixture evidence failure type is invalid")
-        configured = delivery.get("required_check_evidence")
         actual_head_sha = str(self.live_pull_request(pr_number)["head_sha"])
         if isinstance(configured, dict):
             evidence = dict(configured)
@@ -926,7 +941,9 @@ class FixtureGitHubPublisher:
                 ],
             }
         checks = evidence.get("checks")
-        if isinstance(checks, list) and all(isinstance(check, dict) for check in checks):
+        if isinstance(checks, list) and all(
+            isinstance(check, dict) for check in checks
+        ):
             normalized_checks: list[dict[str, Any]] = []
             for raw in checks:
                 check = dict(raw)

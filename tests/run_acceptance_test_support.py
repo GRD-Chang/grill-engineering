@@ -156,6 +156,24 @@ class ScriptedRunAgents:
             ),
         }
 
+
+class FreshCycleRunAgents(ScriptedRunAgents):
+    """Use identities that cannot belong to an archived Repair Cycle."""
+
+    def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+        result = super().develop(request)
+        return DevelopmentResult(
+            thread_id="fresh-run-repair-developer",
+            summary=result.summary,
+        )
+
+    def review(self, request: dict[str, Any]) -> ReviewResult:
+        result = super().review(request)
+        return ReviewResult(
+            thread_id=f"fresh-run-reviewer-{len(self.review_requests)}",
+            artifact=result.artifact,
+        )
+
 def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepository]:
     fixture = write_fixture(
         git_repo / "github.json",

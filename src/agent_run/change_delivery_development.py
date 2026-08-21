@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+"""Development and Candidate commit stage for Change Delivery."""
+
+from pathlib import Path
+from typing import Any
+
+from agent_run.agents import HumanBlockerResult
+from agent_run.artifacts import clear_current_human_blocker
+from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.change_delivery_threads import (
+    record_development_thread as _record_development_thread,
+)
+from agent_run.credential_availability import (
+    clear_initial_credential_wait,
+    resume_initial_credential_wait,
+    wait_for_initial_credential as wait_for_initial_credential_state,
+)
+
+
+def develop(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    checkout: Path,
+) -> None:
+    resume_after_initial_credential(stage, state, job)
+    stage._reject_stale(
+        state,
+        job,
+        checkout,
+        "Development did not start after requirements changed",
+    )
+    pending = job.get("pending_attempt")
+    attempt = (
+        pending
+        if isinstance(pending, int)
+        and pending > int(job.get("modification_attempts", 0))
+        else int(job.get("modification_attempts", 0)) + 1
+    )
+    # Persist the actual Worker attempt before invoking Codex.  This
+    # makes a foreground status query truthful even while Codex is still
+    # running, and leaves an observable recovery boundary on interruption.
+    job["pending_attempt"] = attempt
+    stage.save(state)
+    request = stage.adapter.development_request(state, job, checkout)
+    request["_invocation_event"] = stage._invocation_events(
+        state, job, request, role="development", phase=str(job["phase"])
+    )
+    request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
+    if job.get("development_new_thread") is True:
+        request["_invocation_mode"] = "new-thread"
+    elif job.get("development_failure_resume") is True:
+        request["_invocation_mode"] = "resume"
+    result = stage.agents.develop(request)
+    clear_initial_credential_wait(state, work_subject=stage.contract.label)
+    if isinstance(result, HumanBlockerResult):
+        if not stage.adapter.development_thread_is_allowed(state, result.thread_id):
+            raise ValueError("Change Job Development Thread is not independent")
+        _record_development_thread(job, result.thread_id, result.replaced_thread_id)
+        job.pop("development_new_thread", None)
+        job.pop("development_failure_resume", None)
+        stage._wait_for_human(
+            state, job, phase=str(job["phase"]), blockers=result.human_blockers
+        )
+        return
+    if not result.thread_id.strip() or not result.summary.strip():
+        raise ValueError("Development result is incomplete")
+    if not stage.adapter.development_thread_is_allowed(state, result.thread_id):
+        raise ValueError("Change Job Development Thread is not independent")
+    _record_development_thread(job, result.thread_id, result.replaced_thread_id)
+    job.pop("development_new_thread", None)
+    job.pop("development_failure_resume", None)
+    job["development_summary"] = result.summary
+    clear_current_human_blocker(job)
+    job["phase"] = "committing_candidate"
+    stage.save(state)
+    stage._reject_stale(
+        state,
+        job,
+        checkout,
+        "Development result was discarded after requirements changed",
+    )
+
+
+def wait_for_initial_credential(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    http_status: int | None,
+) -> None:
+    wait_for_initial_credential_state(
+        state,
+        work_subject=stage.contract.label,
+        phase=str(job["phase"]),
+        resume_status=str(state.get("status", "active")),
+        http_status=http_status,
+    )
+    stage.save(state)
+
+
+def resume_after_initial_credential(
+    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]
+) -> None:
+    if resume_initial_credential_wait(state, work_subject=stage.contract.label):
+        stage.save(state)
+
+
+def commit_candidate(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    checkout: Path,
+) -> bool:
+    attempt = int(job["pending_attempt"])
+    candidate = stage.publisher.commit_candidate(checkout, job, attempt)
+    if candidate is None:
+        job.pop("pending_attempt", None)
+        return stage._block(
+            state,
+            job,
+            "no_code_changes",
+            "Development Attempt produced no code changes",
+        )
+    job.update(
+        {
+            "candidate_sha": candidate,
+            "modification_attempts": attempt,
+            "code_modification_attempts": attempt,
+            "phase": "candidate",
+        }
+    )
+    stage._sync_attempts(state, job)
+    job.pop("pending_attempt", None)
+    stage.save(state)
+    return True

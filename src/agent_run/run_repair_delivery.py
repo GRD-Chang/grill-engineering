@@ -49,6 +49,7 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
     """Run Repair semantics without Git, GitHub, or StateStore writes."""
 
     stale_disposition = StaleDisposition.FRESH_RUN_ACCEPTANCE
+    classify_required_check_failures = True
 
     def __init__(
         self,

@@ -196,7 +196,22 @@ def test_run_routes_pending_parent_only_check_failure_through_repair(
     fixture = write_fixture(
         git_repo / "github.json",
         issues={},
-        delivery={"required_checks": ["pending", "fail", "pass"]},
+        delivery={
+            "required_checks": ["pending", "fail", "pass"],
+            "required_check_evidence": {
+                "pr_number": 1,
+                "checks": [
+                    {
+                        "name": "cancelled",
+                        "workflow": "ci",
+                        "bucket": "cancel",
+                        "state": "CANCELLED",
+                        "description": "The Parent-only check was cancelled.",
+                        "link": "https://example.invalid/checks/cancelled",
+                    }
+                ],
+            },
+        },
     )
     agents = _parent_only_agents(git_repo / "parent-only-agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))

@@ -51,6 +51,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     """Semantic Adapter for the Ticket delivery consumer."""
 
     stale_disposition = StaleDisposition.BLOCK
+    classify_required_check_failures = False
 
     def __init__(self, git: GitRepository, github: GitHubPublisher) -> None:
         self.git = git

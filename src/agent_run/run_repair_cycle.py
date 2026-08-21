@@ -42,12 +42,24 @@ def start_repair_cycle(run: dict[str, Any], generation: int) -> None:
 
 def repair_checkout_is_active(job: dict[str, Any]) -> bool:
     phase = job.get("phase")
-    if phase in _ACTIVE_CHECKOUT_PHASES:
-        return True
-    return phase == "blocked" and job.get("blocked_reason") in {
+    return phase in _ACTIVE_CHECKOUT_PHASES
+
+
+def end_human_blocked_repair_cycle(
+    run: dict[str, Any], job: dict[str, Any]
+) -> None:
+    """End the current Cycle without carrying its delivery boundary forward."""
+
+    reason = job.get("blocked_reason")
+    if job.get("phase") != "blocked" or reason not in {
         "agent_requires_human",
         "reviewer_requires_human",
-    }
+    }:
+        return
+    cycle = run.get("repair_cycle")
+    if isinstance(cycle, dict):
+        cycle.update({"status": "human_blocked", "ended_reason": reason})
+    run["phase"] = "ready_for_human"
 
 
 def sync_repair_cycle_counters(

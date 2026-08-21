@@ -1970,7 +1970,7 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert publisher.agent_run_statuses[0]["validation_outcome"] == "pass"
 
 
-def test_real_github_evidence_policy_routes_code_failure_to_development(
+def test_ticket_required_check_failure_keeps_legacy_repair_contract(
     git_repo: Path,
 ) -> None:
     (git_repo / "pyproject.toml").write_text(
@@ -1990,11 +1990,18 @@ def test_real_github_evidence_policy_routes_code_failure_to_development(
             super().__init__(repo)
             self.git = GitRepository(repo)
             self.repository = "example/project"
+            self.evidence_fields: list[str] = []
+            self.actions_job_reads = 0
 
-        def _checks(self, _pr_number: int, _fields: str) -> list[object]:
-            return [dict(self.failed_check_evidence["checks"][0])]
+        def _checks(self, _pr_number: int, fields: str) -> list[object]:
+            self.evidence_fields.append(fields)
+            check = self.failed_check_evidence["checks"][0]
+            return [
+                {key: check[key] for key in fields.split(",") if key in check}
+            ]
 
         def _json(self, *_arguments: str, **_kwargs: object) -> object:
+            self.actions_job_reads += 1
             return {
                 "id": 33,
                 "head_sha": self.live_head,
@@ -2028,9 +2035,18 @@ def test_real_github_evidence_policy_routes_code_failure_to_development(
 
     assert completed["status"] == "ticket_completed"
     assert len(agents.development_requests) == 2
-    assert agents.development_requests[1]["ci_evidence"]["checks"][0][
-        "repairability"
-    ] == "code_failure"
+    assert agents.development_requests[1]["repair_source"] == "required_checks"
+    assert publisher.evidence_fields == [
+        "bucket,name,link,workflow,description"
+    ]
+    assert publisher.actions_job_reads == 0
+    assert set(agents.development_requests[1]["ci_evidence"]["checks"][0]) == {
+        "name",
+        "workflow",
+        "bucket",
+        "description",
+        "link",
+    }
 
 
 @pytest.mark.parametrize(
@@ -2062,7 +2078,7 @@ def test_real_github_evidence_policy_routes_code_failure_to_development(
     ],
     ids=("cancelled", "platform", "unknown"),
 )
-def test_non_repairable_required_check_failure_stays_under_supervision(
+def test_ticket_non_repairable_required_check_failure_still_enters_repair(
     git_repo: Path, check: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
@@ -2080,18 +2096,16 @@ def test_non_repairable_required_check_failure_stays_under_supervision(
     }
     agents = CheckRepairAgents(checkout)
 
-    waiting = TicketDeliveryEngine(
+    completed = TicketDeliveryEngine(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
     ).deliver(state["run_id"])
 
-    job = waiting["active_ticket_job"]
-    assert waiting["status"] == "waiting_external"
-    assert waiting["terminal_kind"] == "waiting_external"
-    assert waiting["supervision_window"]["kind"] == "github_convergence"
-    assert job["phase"] == "waiting_checks"
+    assert completed["status"] == "blocked"
+    job = completed["active_ticket_job"]
+    assert job["blocked_reason"] == "modification_budget_exhausted"
     assert job["modification_attempts"] == 1
     assert len(agents.development_requests) == 1
-    assert "ci_evidence" not in job
+    assert "supervision_window" not in completed
 
 
 @pytest.mark.parametrize(
@@ -2102,7 +2116,7 @@ def test_non_repairable_required_check_failure_stays_under_supervision(
         TimeoutError("evidence read timed out"),
     ],
 )
-def test_failed_required_check_evidence_read_is_supervised_without_budget_use(
+def test_ticket_failed_required_check_evidence_read_keeps_legacy_error_contract(
     git_repo: Path, error: BaseException
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2117,13 +2131,12 @@ def test_failed_required_check_evidence_read_is_supervised_without_budget_use(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
     )
 
-    waiting = engine.deliver(state["run_id"])
+    with pytest.raises(type(error), match=str(error)):
+        engine.deliver(state["run_id"])
 
-    job = waiting["active_ticket_job"]
-    assert waiting["status"] == "waiting_external"
-    assert waiting["terminal_kind"] == "waiting_external"
-    assert waiting["supervision_window"]["kind"] == "github_convergence"
-    assert job["phase"] == "publishing"
+    interrupted = states.load_current_run(str(state["run_id"]))
+    assert interrupted is not None
+    job = interrupted["active_ticket_job"]
     assert job["modification_attempts"] == 1
     assert "ci_evidence" not in job
     assert agents.development_thread_ids == [None]

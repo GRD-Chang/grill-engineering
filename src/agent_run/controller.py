@@ -1074,15 +1074,9 @@ def _resume_agent_human_blocker(
     if not isinstance(acceptance, dict):
         return False
     repair = acceptance.get("repair_job")
-    if _resume_change_job(state, repair, ticket=False, human_response=human_response):
-        acceptance["phase"] = "repairing"
-        state.update(
-            {
-                "status": "run_acceptance_pending",
-                "terminal_kind": "run_repair_pending",
-                "diagnostics": [],
-            }
-        )
+    if _resume_run_repair_human_blocker(
+        state, acceptance, repair, human_response=human_response
+    ):
         return True
     if acceptance.get("phase") == "ready_for_human" and acceptance.get(
         "blocked_reason"
@@ -1461,6 +1455,97 @@ def _resume_change_job(
         status = "parent_delivery_pending"
     state.update(
         {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
+    )
+    return True
+
+
+def _resume_run_repair_human_blocker(
+    state: dict[str, Any],
+    run: dict[str, Any],
+    value: object,
+    *,
+    human_response: str | None,
+) -> bool:
+    """Archive a Human-blocked Cycle and schedule a fresh delivery boundary."""
+
+    if not isinstance(value, dict):
+        return False
+    if value.get("phase") != "blocked" or value.get("blocked_reason") not in {
+        "agent_requires_human",
+        "reviewer_requires_human",
+    }:
+        return False
+    blockers = _human_blockers(value)
+    next_generation = int(run.get("repair_generation", 0)) + 1
+    request: dict[str, Any] = {
+        "repair_source": str(value.get("repair_source", "acceptance")),
+        "prior_human_blockers": blockers,
+    }
+    for key in ("human_feedback", "ci_evidence", "merge_conflict_evidence"):
+        if key in value:
+            request[key] = deepcopy(value[key])
+    append_human_response(
+        request, blockers, human_response, generation=next_generation
+    )
+
+    cycle = run.get("repair_cycle")
+    if isinstance(cycle, dict):
+        cycle.update(
+            {
+                "status": "human_blocked",
+                "ended_reason": str(value["blocked_reason"]),
+            }
+        )
+        history = run.setdefault("repair_cycle_history", [])
+        if not isinstance(history, list):
+            raise ValueError("repair_cycle_history must be an array")
+        generation = cycle.get("generation")
+        if not any(
+            isinstance(item, dict) and item.get("generation") == generation
+            for item in history
+        ):
+            history.append(deepcopy(cycle))
+            del history[:-32]
+
+    run_history = run.setdefault("candidate_acceptance_history", [])
+    job_history = value.get("candidate_acceptance_history", [])
+    if not isinstance(run_history, list) or not isinstance(job_history, list):
+        raise ValueError("candidate_acceptance_history must be an array")
+    run_history.extend(deepcopy(job_history))
+
+    discarded = run.setdefault("discarded_repair_thread_ids", [])
+    if not isinstance(discarded, list):
+        raise ValueError("discarded_repair_thread_ids must be an array")
+    for key in (
+        "development_thread_id",
+        "publication_thread_id",
+    ):
+        thread_id = value.get(key)
+        if isinstance(thread_id, str) and thread_id not in discarded:
+            discarded.append(thread_id)
+    for key in (
+        "development_thread_history",
+        "reviewer_thread_ids",
+        "publication_thread_history",
+    ):
+        thread_ids = value.get(key)
+        if isinstance(thread_ids, list):
+            for thread_id in thread_ids:
+                if isinstance(thread_id, str) and thread_id not in discarded:
+                    discarded.append(thread_id)
+
+    run["repair_request"] = request
+    run["phase"] = "repairing"
+    run.pop("blocked_reason", None)
+    run.pop("repair_job", None)
+    state["active_agent_invocation"] = None
+    state.pop("requeue_required", None)
+    state.update(
+        {
+            "status": "run_acceptance_pending",
+            "terminal_kind": "run_repair_pending",
+            "diagnostics": [],
+        }
     )
     return True
 

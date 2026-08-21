@@ -673,6 +673,14 @@ class GhGitHubPublisher:
     def required_check_evidence(
         self, pr_number: int, *, expected_head_sha: str | None = None
     ) -> dict[str, Any]:
+        if expected_head_sha is None:
+            checks = self._checks(pr_number, "bucket,name,link,workflow,description")
+            legacy_failed = [
+                dict(_mapping(check))
+                for check in checks
+                if str(_mapping(check).get("bucket", "")).lower() in {"fail", "cancel"}
+            ]
+            return {"pr_number": pr_number, "checks": legacy_failed}
         checks = self._checks(pr_number, "bucket,state,name,link,workflow,description")
         failed: list[dict[str, Any]] = []
         for raw in checks:
