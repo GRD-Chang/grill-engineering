@@ -88,6 +88,3 @@ class FindingReplaySaveCrashGit(GitRepository):
             snapshot_sha=snapshot_sha,
         )
         raise RuntimeError("crash after replaying finding delta")
-
-
-

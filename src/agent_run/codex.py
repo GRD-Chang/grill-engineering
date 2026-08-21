@@ -144,11 +144,7 @@ class CodexCliBackend:
                 if is_parent_only
                 else "当前 Ticket"
             )
-            mode = (
-                f"Acceptance Repair：{subject}、代码状态和下方未经改写的 "
-                "Acceptance Artifact 是事实依据。逐项处理 finding，保留原意，"
-                "只修改 finding 及其直接影响范围，不改动已通过且不受影响的行为。"
-            )
+            mode = f"Acceptance Repair：{subject}。"
             heading = "Acceptance Repair Input"
             context = _development_context(request)
             prompt_input = (
@@ -166,11 +162,7 @@ class CodexCliBackend:
                 if is_parent_only
                 else "当前 Ticket"
             )
-            mode = (
-                f"Required-Checks Repair：{subject}、代码状态和下方未经改写的 "
-                "CI Evidence 是事实依据。修复失败的 Required Checks 及其直接影响，"
-                "不要绕过检查、删除测试或放宽断言。"
-            )
+            mode = f"Required-Checks Repair：{subject}。"
             heading = "Required-Checks Repair Input"
             context = _development_context(request)
             prompt_input = (
@@ -181,10 +173,7 @@ class CodexCliBackend:
             feedback = request.get("human_feedback")
             if not isinstance(feedback, str) or not feedback.strip():
                 raise ValueError("Human Revision requires human_feedback")
-            mode = (
-                "Human Revision：维护者的下列反馈未经改写，是当前修复目标。"
-                "先以当前代码和事实核验其影响，再完成必要的最小修复。"
-            )
+            mode = "Human Revision。"
             heading = "Human Revision Input"
             context = _development_context(request)
             prompt_input = (
@@ -195,10 +184,7 @@ class CodexCliBackend:
             evidence = request.get("merge_conflict_evidence")
             if not isinstance(evidence, str) or not evidence.strip():
                 raise ValueError("Merge Conflict Repair requires merge_conflict_evidence")
-            mode = (
-                "Merge Conflict Repair：默认分支与 Run Branch 的真实合并预览失败。"
-                "在不绕过既有验收的前提下修复冲突及其直接影响。"
-            )
+            mode = "Merge Conflict Repair。"
             heading = "Merge Conflict Repair Input"
             context = _development_context(request)
             prompt_input = (
@@ -218,9 +204,13 @@ class CodexCliBackend:
         return (
             f"你是负责{role}。使用 skill:implement 完成开发或修复。"
             f"{mode}\n\n"
-            + _development_contract(_development_context(request))
-            + "\n\n最后只用普通文本总结改动、实际验证、两个审查结果和剩余 blocker。"
-            "最后只输出完整 Development "
+            + _development_contract(
+                _development_context(request),
+                acceptance_scope=request.get("acceptance_scope"),
+                repair_scope=request.get("repair_scope"),
+                repair_source=repair_source,
+            )
+            + "\n\n最后只输出完整 Development "
             'wire JSON：正常完成时 `{"result_kind":"development","summary":"...",'
             '"human_blockers":null}`；Human Blocker 时 summary 必须是 null。\n\n'
             f"{heading}:\n{prompt_input}"
@@ -315,7 +305,7 @@ class CodexCliBackend:
         return (
             "你是本次 Final Run 的发布叙事工程师。阅读当前 checkout 的实际累计 diff，"
             "生成最终 Run PR 的语义标题和正文。\n\n"
-            + _publication_contract(context)
+            + _publication_contract(context, acceptance_scope="run")
             + "\n\nRun Acceptance Artifact (verbatim JSON):\n"
             + _pretty(artifact)
             + "\n\nFinal Run Publication Context:\n"
@@ -339,7 +329,9 @@ class CodexCliBackend:
             return (
                 "你是本次 Run Repair 的发布叙事工程师。依据当前 checkout 的实际 diff 和"
                 "下方完整独立验收证据，输出小型 Publication Artifact。\n\n"
-                + _publication_contract(context)
+                + _publication_contract(
+                    context, acceptance_scope=request.get("acceptance_scope")
+                )
                 + "\n\n"
                 + artifact_input
                 + "\n\nPublication Context:\n"
@@ -348,7 +340,9 @@ class CodexCliBackend:
         return (
             "你是本次交付的发布叙事工程师。依据当前 checkout 的实际 diff 和下方完整独立"
             "验收证据，输出小型 Publication Artifact。\n\n"
-            + _publication_contract(context)
+            + _publication_contract(
+                context, acceptance_scope=request.get("acceptance_scope")
+            )
             + "\n\n"
             + artifact_input
             + "\n\nPublication Context:\n"
@@ -480,35 +474,49 @@ class CodexCliBackend:
             "prior_human_blockers",
             "human_response_history",
         )
-        role = (
-            "独立 Run 整体验收工程师"
-            if request.get("acceptance_scope") == "run"
-            else "独立 Fresh Validation 工程师"
+        candidate_run_acceptance = (
+            request.get("acceptance_scope") == "run"
+            and request.get("candidate_acceptance") is True
         )
-        scope_instruction = (
-            "这是 Run Acceptance：从 Parent Issue 和 GitHub 独立读取最终 Ticket Set 与"
-            "依赖关系，检查累计 diff、跨 Ticket 交互、整体需求和预期合并结果；不得把单 "
-            "Ticket 通过当成整体验收通过。"
+        role = (
+            "独立 Candidate Run Acceptance 验收工程师"
+            if candidate_run_acceptance
+            else "独立 Run Repair 验收工程师"
             if request.get("acceptance_scope") == "run"
-            else "这是 Parent-only Fresh Validation：以当前 Parent Issue 的完整验收标准为范围。"
-            if request.get("acceptance_scope") == "parent_only"
-            else "这是 Ticket Fresh Validation：以当前 Ticket 的完整验收标准为范围。"
+            and request.get("repair_scope") == "run_repair"
+            else "独立 Run 整体验收工程师"
+            if request.get("acceptance_scope") == "run"
+            else "独立 Fresh Acceptance 验收工程师"
+        )
+        candidate_instruction = (
+            "这是 Candidate Run Acceptance。当前 Validation Checkout 是将本轮 "
+            "Repair Candidate 应用到当前 default head 后的预期合并结果，HEAD 保持 "
+            "default head 是正常现象。仍须按完整 Run Review Boundary 验收，"
+            "不得把局部 Repair Candidate 的 diff 通过当作完整 Run 通过。\n\n"
+            if candidate_run_acceptance
+            else ""
         )
         prompt = (
             f"你是{role}。\n\n"
-            + _acceptance_contract(context)
+            + candidate_instruction
+            + _acceptance_contract(
+                context,
+                acceptance_scope=request.get("acceptance_scope"),
+                repair_scope=request.get("repair_scope"),
+            )
             + "\n\n"
             + "汇总三条 lane 的实际证据后，只输出符合 schema 的 Acceptance Artifact。"
-            "每条 Finding 都必须写在最合适 lane 的 findings 中，并严格采用“问题：…；证据：…；"
-            "必须修复：…；复验：…”这一条自包含字符串格式。同一问题不得跨 lane 重复。"
+            "每条 Finding 都必须写在最合适 lane 的 findings 中，并严格采用现有 schema 要求的"
+            "字符串格式“问题：…；证据：…；必须修复：…；复验：…”，"
+            "同一问题不得跨 lane 重复。"
             "任何当前范围内、有证据且必须修复的 Finding 都使该 lane 为 fail；有 Finding 时绝不能"
             "写 pass。pass 与 blocked 的 findings 必须为空；blocked 的 evidence 必须说明发生了什么、"
-            "已经尝试什么、以及人必须做什么。任一 fail 将回到 Development；没有 fail 但存在 blocked"
-            "才是 Human Blocker；只有三个 lane 都 pass 才接受。纯主观偏好或当前范围外的未来想法"
-            "不构成 Finding。pass evidence 必须严格使用以下可复核标记：E2E 使用“操作或命令：…；"
+            "已经尝试什么、以及人必须做什么。没有 fail 但存在 blocked 才是 Human Blocker；"
+            "只有三个 lane 都 pass 才接受。纯主观偏好或当前范围外的未来想法不构成 Finding。"
+            "Reviewer 应一次报告当前审查中已经可证明的全部必须修复 Finding，但不得为追求穷尽而扩大"
+            "Review Boundary。pass evidence 必须严格使用以下可复核标记：E2E 使用“操作或命令：…；"
             "退出码：…；结果：…”，Standards 使用“审查范围或基线：…；结论：…”，Spec 使用“已核对"
             "的验收标准：…；覆盖结论：…”。\n\n"
-            f"{scope_instruction}\n\n"
             f"Acceptance Context:\n{_pretty(context)}"
         )
         return prompt
@@ -840,83 +848,226 @@ def _development_context(request: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _issue_context_instruction(context: dict[str, Any]) -> str:
+def _scope_kind(acceptance_scope: object) -> str:
+    if acceptance_scope == "parent_only":
+        return "parent_only"
+    if acceptance_scope == "run":
+        return "run"
+    return "ticket"
+
+
+def _issue_context_instruction(
+    context: dict[str, Any], *, acceptance_scope: object = "ticket"
+) -> str:
+    scope = _scope_kind(acceptance_scope)
+    if scope == "parent_only":
+        scope_instruction = (
+            "parent_issue_url 是当前 Parent-only Delivery 的完整需求源，开始前必须通过只读 "
+            "`gh issue view` 读取其 title、body 和 Acceptance Criteria。"
+        )
+    elif scope == "run":
+        scope_instruction = (
+            "parent_issue_url 是当前 Delivery Run 的完整 Parent 需求源和 Acceptance Criteria，开始前必须通过只读 "
+            "`gh issue view` 读取它，并按当前 Run 的范围独立读取最终 Ticket Set、依赖和必要的"
+            "整体约束。"
+        )
+    else:
+        scope_instruction = (
+            "parent_issue_url 只提供整体背景、术语和当前 Ticket 明确引用且完成其 Acceptance "
+            "Criteria 所需的约束，开始前必须通过只读 `gh issue view` 读取它；它本身不增加"
+            "当前 Ticket 的工作项。"
+        )
     task_instruction = (
-        " task_issue_url 是当前立即工作 Ticket，开始前也必须通过 `gh issue view` 读取它。"
-        if "task_issue_url" in context
+        " task_issue_url 是当前 Ticket 的唯一立即交付合同，开始前也必须通过只读 `gh issue view` "
+        "读取它；其 title、body 和 Acceptance Criteria 优先于 Parent 中可独立交付的 sibling "
+        "或 follow-on 能力。"
+        if scope == "ticket" and "task_issue_url" in context
         else ""
     )
     return (
-        "动态 Context 中的 parent_issue_url 是定义整体交付目标的 Parent Issue，开始前"
-        "必须通过只读 `gh issue view` 读取它；URL 不是需求摘要。当前 Issue 的 title/body "
-        "是唯一需求源；Issue 评论、历史 PR、旧 Artifact、开发者总结和上游 Agent 结论只能"
-        "作为调查线索，不能覆盖当前需求或单独构成验收证据。"
+        "动态 Context 中的 URL 不是需求摘要。"
+        + scope_instruction
         + task_instruction
+        + " Issue 评论、历史 PR、旧 Artifact、开发者总结和上游 Agent 结论只能作为调查线索，"
+        "不能覆盖当前需求或单独构成验收证据。"
         + _resume_recheck_instruction(context)
     )
 
 
-def _development_contract(context: dict[str, Any]) -> str:
+def _review_boundary_instruction(
+    acceptance_scope: object, *, repair_scope: object = None
+) -> str:
+    scope = _scope_kind(acceptance_scope)
+    if scope == "parent_only":
+        return (
+            "当前 Review Boundary 是完整 Parent Issue；Parent 的完整 Acceptance Criteria 和"
+            "Candidate 对其新增或改变路径直接造成的工程风险都属于本轮范围。"
+        )
+    if scope == "run":
+        if repair_scope == "run_repair":
+            return (
+                "当前 Review Boundary 是 Run Repair 的完整 Parent、最终 Ticket Set、依赖关系、"
+                "累计变更、跨 Ticket 交互和预期合并结果；当前 checkout 是 Run Branch 加入 repair "
+                "Candidate 后的无提交合并预览，HEAD 保持 Run Branch base 是正常现象。不得把局部 "
+                "Repair Candidate 单独通过当作整体验收通过。"
+            )
+        return (
+            "当前 Review Boundary 是完整 Parent、最终 Ticket Set、依赖关系、累计变更、跨 Ticket "
+            "交互和预期合并结果；不得把单 Ticket 的通过当作整体验收通过。"
+        )
     return (
-        _issue_context_instruction(context)
+        "当前 Review Boundary 是 Ticket Contract：当前 Ticket 的 title、body 和 Acceptance "
+        "Criteria，以及 Candidate 对新增或改变路径直接造成的工程风险。Parent Context 只用于"
+        "解释背景和必要约束；sibling/follow-on Ticket 不会自动进入本轮范围。"
+    )
+
+
+def _repair_contract(repair_source: object) -> str:
+    if repair_source is None:
+        return ""
+    if repair_source == "acceptance":
+        return (
+            "Acceptance Artifact 是未经改写的修复依据；其中当前 Review Boundary 内的 `findings` 是"
+            "本轮必须处理的问题。"
+            "`evidence` 中的 `Deferred to #N：…` 和 `Non-blocking observation：…` 不是自动修改"
+            "指令。只有解决 Finding、防止本次修复直接回归或满足当前 Acceptance Criteria 确有需要时，"
+            "才调整相关 evidence 或代码。"
+        )
+    if repair_source == "required_checks":
+        return (
+            "CI Evidence 是未经改写的修复依据；只修复失败 Required Check 及其直接影响，不得绕过"
+            "检查、删除测试、放宽断言或把其他建议自动扩成工作项。"
+        )
+    if repair_source == "human_revision":
+        return (
+            "维护者反馈是未经改写的修复依据；先用当前代码和事实核验其影响，只处理完成当前修复所需"
+            "的最小范围。"
+        )
+    if repair_source == "merge_conflict":
+        return (
+            "合并冲突证据是未经改写的修复依据；只解决真实冲突及其直接影响，不借机扩大功能或绕过"
+            "既有验收。"
+        )
+    return ""
+
+
+def _repair_completion_instruction(repair_source: object) -> str:
+    if repair_source != "acceptance":
+        return ""
+    return (
+        "Acceptance Repair 的完成条件还包括：逐项解决当前 Review Boundary 内的每个 Finding，"
+        "按每条 Finding 自带的 `复验` 要求执行验证并取得充分、可复核的证据；不能以一次笼统的"
+        "风险验证替代逐项复验。"
+    )
+
+
+def _development_contract(
+    context: dict[str, Any],
+    *,
+    acceptance_scope: object,
+    repair_source: object,
+    repair_scope: object = None,
+) -> str:
+    return (
+        _issue_context_instruction(context, acceptance_scope=acceptance_scope)
         + "\n\n"
-        + "Controller 负责创建 append-only Candidate、编排、校验和 CI 监督；"
-        "Publisher 执行后续 ref、发布、PR 以及全部 Git/GitHub 写入；"
-        "Codex 只能编辑当前受管工作树，不得进行 Git 历史操作、暂存、提交、推送、合并或 "
-        "GitHub 写入。修复可以删除、恢复或改写先前 Candidate 引入的内容；较小的最终 diff "
-        "仍是正常修复。Controller 不判断任何 Finding 是否可由工作树修复。"
+        + _review_boundary_instruction(acceptance_scope, repair_scope=repair_scope)
+        + "\n"
+        + _repair_contract(repair_source)
+        + "\n"
+        + _repair_completion_instruction(repair_source)
+        + "\n\n"
+        + "目标是最小充分改动：完整满足当前范围的 Acceptance Criteria，处理本次改动直接造成的"
+        "工程风险，同时不增加无关行为、状态、依赖、配置、公开入口或抽象层。优先沿用直接适用"
+        "的现有 Module、Interface 和仓库约定；只有当前正确性、可测试性、已经存在的具体重复"
+        "或既有设计确有需要时，才做局部重构。不要为未来需求、其他 Ticket、假想调用方或可能"
+        "复用增加通用框架、配置、回调、状态、Adapter 或公开 Interface。代码稳定并确认每处改动"
+        "服务当前范围后，删除不需要的代码、状态、分支、配置和依赖；达到完成条件后停止扩展。"
+        + "\n\n"
+        + "当前 checkout 是程序管理的受管开发工作区。程序会用新的 Candidate Commit 记录每次 "
+        "Development 或 Repair 的结果，Git 历史只向前推进。你可以使用 `git log`、`git show`、"
+        "`git diff` 等只读操作检查历史和旧版本，但只修改当前 checkout 的文件树。如果先前 "
+        "Candidate 中有文件改错，直接在当前 checkout 删除、恢复或重写相关内容，并将修正保留为"
+        "未提交变更；不要回退、替换或修改旧 commit。不得执行暂存、commit、`commit --amend`、"
+        "`reset`、`rebase`、`revert`、`cherry-pick`、切换到旧 commit 或其他 branch、merge、push，"
+        "以及其他会移动、创建或改写 Git 历史的操作。Agent 返回后，程序会通过 Controller/Publisher "
+        "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit，并执行后续 Git/GitHub "
+        "交付；你只整理 checkout，不执行这些写入。因此，新的 Candidate 可以撤销、删除或重写先前 "
+        "Candidate 引入的内容，最终 diff 可以比上一轮更小。"
         + "\n\n"
         + _human_blocker_instruction()
-        + "\n\n阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置尽量"
-        "采用 TDD。运行相关单测、typecheck、lint 和完整测试套件，并从真实用户入口"
-        "复验受影响的成功路径、失败路径和边界情况。记录实际命令、exit code、可观察"
-        "结果和必要状态变化；不要用 mock、单元测试或代码阅读替代能够真实运行的核心路径。"
-        "\n\n在当前 checkout 中检查全部未提交内容：保留本任务需要交付"
-        "的代码、测试、文档和配置，清理本次产生的临时、构建和测试产物。仅长期、可再生"
-        "且不应版本控制的项目产物可以加入 `.gitignore`；不得用 `.gitignore` 隐藏应交付"
-        "内容。若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成前清理，"
-        "不得进行宽泛删除。\n\n"
-        "完成实现和使用验证后，必须使用 skill:code-review 派发两个不同 subagent："
-        "Standards Review Subagent 检查仓库标准以及具体 correctness、security、regression 和"
-        "maintainability 问题；Spec Review Subagent 检查 Acceptance Criteria 是否完整实现、"
-        "是否错误实现或存在有实际影响的 scope creep。你不得自行宣布必要审查通过。发现"
-        "blocking finding 后必须修复、重跑受影响测试和真实路径，并重新取得受影响 subagent"
-        "的有效复查。开发侧预审不是正式独立验收。Acceptance Artifact 中任一 lane 的 Finding"
-        "都是下一轮修复的原始输入；逐项处理所属 lane 的自包含 Finding，不得压缩、改写、"
-        "弱化或以开发者判断跳过。只有三个 lane 都 pass 才会由独立验收接受。\n\n"
-        "不得 commit、push、merge、关闭或修改 GitHub。"
+        + "\n\n阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置采用 TDD。"
+        "根据实际改动风险自主选择最低充分验证：覆盖直接影响的成功路径、失败路径和边界情况，"
+        "并优先从真实用户入口复验核心路径。选择相关单测、typecheck、lint、完整测试套件或其他"
+        "检查时记录实际命令、exit code、可观察结果和必要状态变化；完整测试套件不是每轮默认的"
+        "固定门槛，未运行的检查不得声称已通过。不要用 mock、单元测试或代码阅读替代能够真实"
+        "运行的核心路径。"
+        + "\n\n"
+        + "完成条件是：当前 Review Boundary 的 Acceptance Criteria 已完整实现；直接影响的路径已有"
+        "与风险相称的验证；没有已知 blocker；当前 checkout 中保留的全部未提交内容都适合作为"
+        "本次交付。低风险局部改动可以自行做简短收口检查；大型、跨模块或触及认证、权限、持久化、"
+        "并发、数据完整性、外部副作用或公开契约的改动，"
+        "应使用 `skill:code-review` 或定向 Reviewer 取得足够审查。根据实际改动和新发现的风险自主"
+        "选择审查方式与复查强度；没有具体风险依据时，避免重复或嵌套相同的 Review。发现 blocking "
+        "finding 后修复对应问题，重跑受影响验证并取得有效复查。"
+        + "\n\n在当前 checkout 中检查全部未提交内容：保留本任务需要交付的代码、测试、文档和配置，"
+        "清理本次产生的临时、构建和测试产物。仅长期、可再生且不应版本控制的项目产物可以加入"
+        "`.gitignore`；不得用 `.gitignore` 隐藏应交付内容。若在 checkout 外创建临时路径，必须使"
+        "其可定位、只服务本次任务并在完成前清理，不得进行宽泛删除。\n\n"
+        "交付前再次确认没有遗漏未提交内容、临时产物或外部写入。"
     )
 
 
-def _acceptance_contract(context: dict[str, Any]) -> str:
+def _acceptance_contract(
+    context: dict[str, Any], *, acceptance_scope: object, repair_scope: object = None
+) -> str:
     return (
-        _issue_context_instruction(context)
-        + "\n\n不要依赖开发者总结、自测、开发审查、PR 文案或 Publication Artifact；"
-        "使用真实 Git/gh 自行建立事实。必须派发三个不同 subagent 执行真实 E2E、Standards "
-        "Review 和 Spec Review 三条不同 lane：Standards Review 使用 skill:code-review，Spec Review 也使用 "
-        "skill:code-review。你不得替代任何缺失 lane 或自行签署通过；subagent 失败时必须"
-        "解决派发问题并重新派发。\n\n"
-        "Validation Checkout 是只读的，不得创建、修改或删除其中的文件。可构建、测试和"
+        _issue_context_instruction(context, acceptance_scope=acceptance_scope)
+        + "\n\n"
+        + _review_boundary_instruction(acceptance_scope, repair_scope=repair_scope)
+        + "\n\n不要依赖开发者总结、自测、开发侧 Review、PR 文案或 Publication Artifact；使用真实 "
+        "Git/gh 自行建立事实。本次验收必须分别形成 E2E、Standards 和 Spec 三种独立视角，"
+        "并将每条 lane 的证据和结论完整写入 Acceptance Artifact。E2E 默认负责代码稳定后的广泛"
+        "运行验证；Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令，避免重复相同"
+        "的完整测试套件，除非某个具体 Finding 确实需要。"
+        + "\n\n"
+        + "`skill:code-review` 是 Standards 与 Spec 可使用的推荐审查 SOP。根据当前 Review Boundary "
+        "和实际风险选择审查分工与复核强度，确保 E2E、Standards 和 Spec 三种独立视角均形成可复核"
+        "结论。没有具体风险依据时，避免重复派发同类 Reviewer、嵌套相同 Review，或由多个视角重复"
+        "执行相同的昂贵测试。不得用父 Reviewer 自己的判断替代缺失的独立审查视角；派发或验证遇到"
+        "问题时，先处理具体问题再形成可复核结论。"
+        + "\n\n"
+        + "Reviewer 应一次报告当前 Review Boundary 内已经能够证明的全部必须修复 Finding，但不得为追求穷尽"
+        "而扩大 Review Boundary 或进行无边界探索。`findings` 只包含当前 Change Job 必须处理、"
+        "有可复核证据且能由当前 Job 修复的问题；已由明确 sibling/follow-on Issue 承接的内容只以"
+        "`Deferred to #N：…` 写入最相关 lane 的 `evidence`，纯维护性建议、可选重构和文件大小偏好"
+        "只以 `Non-blocking observation：…` 写入 `evidence`。两者都不得进入 `findings`、改变 lane"
+        "状态或成为自动修复指令。"
+        + "\n\n"
+        + "Validation Checkout 是只读的，不得创建、修改或删除其中的文件。可构建、测试和"
         "产生验证中间产物，但任何需要写入的内容必须放在 checkout 外可定位、只服务本轮的"
         "临时路径，并在结束前清理；不得修复源码、测试、配置或 `.gitignore`，也不得整理"
-        "交付内容。发现的问题只能通过"
-        "Acceptance Artifact 返回。不得 commit、push、merge、关闭或修改 GitHub。"
+        "交付内容。不得 commit、push、merge、关闭或修改 GitHub。"
     )
 
 
-def _publication_contract(context: dict[str, Any]) -> str:
+def _publication_contract(
+    context: dict[str, Any], *, acceptance_scope: object
+) -> str:
     return (
-        _issue_context_instruction(context)
-        + "\n\n只读取事实：不得修改 checkout、执行 Git/GitHub 写操作、执行验收或替代"
-        "人工批准。若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成"
-        "前清理。\n\n"
-        "PR 叙事必须有四个非空二级标题：What Problem This Solves 写改前限制、改后能力"
-        "和覆盖边界；Why This Change Was Made 写关键设计路径与约束，不要逐文件罗列；"
-        "User Impact 写用户可执行的结果和兼容或迁移行为；Evidence 只使用完整独立验收"
-        "三条 lane 的实际证据，每条使用“场景 → 实际操作或命令 → 可观察结果”。不得用"
-        "“tests passed”“已验证”“修复完成”等没有场景、操作和结果的空泛表述，不得把"
-        "开发者自述当作验证事实。CI、Candidate、SHA、门禁和生命周期事实不得写入叙事。"
-        "\n\n不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
+        _issue_context_instruction(context, acceptance_scope=acceptance_scope)
+        + "\n\n只读取事实：不得修改 checkout、执行 Git/GitHub 写操作、执行验收或替代人工批准。"
+        "若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成前清理。"
+        + "\n\n"
+        + "PR 叙事必须有四个非空二级标题：What Problem This Solves 写改前限制、改后能力和覆盖"
+        "边界；Why This Change Was Made 写关键设计路径与约束，不要逐文件罗列；User Impact 写"
+        "用户可执行的结果和兼容或迁移行为；Evidence 只使用完整独立验收三条 lane 的实际证据，"
+        "每条使用“场景 → 实际操作或命令 → 可观察结果”。不得用“tests passed”“已验证”“修复完成”"
+        "等没有场景、操作和结果的空泛表述，不得把开发者自述当作验证事实。Evidence 中的"
+        "`Deferred to #N：…` 和 `Non-blocking observation：…` 只是非阻塞审查信息，不得描述为"
+        "当前交付范围的交付成果、已实现能力或 User Impact。CI、Candidate、SHA、门禁和生命周期"
+        "事实不得写入叙事。"
+        + "\n\n不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
         "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
         "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。"
         + "\n\n"

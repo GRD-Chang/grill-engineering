@@ -629,8 +629,10 @@ def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(
             github=FixtureGitHubPublisher(git_repo / "github.json", git),
         ).accept(str(state["run_id"]))
 
-def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
+@pytest.mark.parametrize("new_thread", [False, True])
+def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blocker(
     git_repo: Path,
+    new_thread: bool,
 ) -> None:
     state, states, git = _completed_run(git_repo)
 
@@ -644,7 +646,13 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
             self.checkouts.append(Path(str(request["checkout"])))
             if len(self.requests) == 1:
                 return ReviewResult("blocked-run-reviewer", _human_artifact())
-            assert request["thread_id"] == "blocked-run-reviewer"
+            assert request["thread_id"] == (
+                None if new_thread else "blocked-run-reviewer"
+            )
+            if new_thread:
+                assert request["_invocation_mode"] == "new-thread"
+            else:
+                assert "_invocation_mode" not in request
             assert request["prior_human_blockers"] == [_BLOCKED_EVIDENCE]
             assert request["human_response_history"] == [
                 {
@@ -655,7 +663,10 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
                     "response": "Issue read access has been granted.",
                 }
             ]
-            return ReviewResult("blocked-run-reviewer", _passing_artifact())
+            return ReviewResult(
+                "new-run-reviewer" if new_thread else "blocked-run-reviewer",
+                _passing_artifact(),
+            )
 
     agents = HumanThenPassingReviewer()
     engine = RunAcceptanceEngine(
@@ -674,6 +685,7 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
     ).resume(
         str(state["run_id"]),
         resume_human_blocker=True,
+        new_thread=new_thread,
         human_response="Issue read access has been granted.",
     )
     assert resumed["run_acceptance"]["prior_human_blockers"] == [
@@ -693,7 +705,11 @@ def test_run_acceptance_human_resume_reuses_thread_and_clears_current_blocker(
 
     assert accepted["status"] == "run_publication_pending"
     run = accepted["run_acceptance"]
-    assert run["reviewer_thread_ids"] == ["blocked-run-reviewer"]
+    assert run["reviewer_thread_ids"] == (
+        ["blocked-run-reviewer", "new-run-reviewer"]
+        if new_thread
+        else ["blocked-run-reviewer"]
+    )
     assert len(set(agents.checkouts)) == 2
     assert all(not checkout.exists() for checkout in agents.checkouts)
     assert run["human_blocker_history"] == [

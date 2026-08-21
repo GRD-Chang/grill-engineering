@@ -17,19 +17,47 @@ Codex Worker 返回的结构化意图、判断与证据。它可以包含代码�
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **验收 Finding（Acceptance Finding）**:
-独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是含 `severity`、`summary`、`evidence`、`required_fix` 与 `verification` 的自包含对象；`severity` 仅用于排序，不改变任一 Finding 使 lane `fail` 的语义。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才构成 Finding。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他非阻塞建议不进入 Acceptance Artifact；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
-_Avoid_: 非空 Finding 的 pass、无行动依据的泛泛建议、Controller 解释或重写 Finding、重复写入多个 lane
+独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是符合 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串；它表达一个必须处理的问题，任一 Finding 都使所属 lane `fail`。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才构成 Finding。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。Reviewer 应一次报告当前审查中已经可证明的全部 Findings，不得故意逐轮滴漏；这不要求为追求穷尽而扩大 Review Boundary 或进行无边界探索。纯维护性建议、可选重构、文件大小偏好和其他非阻塞观察不得进入 `findings`，可按 Non-blocking Observation 写入相关 lane 的 `evidence`；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
+_Avoid_: 非空 Finding 的 pass、无行动依据的泛泛建议、Controller 解释或重写 Finding、重复写入多个 lane、故意逐轮滴漏
+
+**Deferred Scope Note（延期范围说明）**:
+Reviewer 在当前 Ticket 审查中实际遇到、但已由明确 sibling/follow-on Issue 负责的范围边界说明。它只以 `Deferred to #N：…` 写入最相关 lane 的 `evidence`，不得进入 `findings`、改变 lane 状态或触发 Repair；Development 遇到同类边界时可写入 Development Summary。Agent 不为生成此说明而遍历完整 Ticket Set，也不负责创建、修改或维护对应 Issue；Publication 不把它叙述为当前 Ticket 的交付成果。
+_Avoid_: 非阻塞 Finding、每轮枚举 sibling、由 Agent 创建 Issue、把 deferred 当作当前交付
+
+**Non-blocking Observation（非阻塞观察）**:
+Reviewer 在当前审查中实际形成的纯维护性建议、可选重构、文件大小偏好或其他不影响当前 Ticket 接受结论的意见。它只以 `Non-blocking observation：…` 写入最相关 lane 的 `evidence`，不得进入 `findings`、改变 lane 状态或触发 Repair；Agent 不负责为其创建或维护 Issue，Publication 不把它叙述为当前 Ticket 的交付成果。
+_Avoid_: Acceptance Finding、Human Blocker、强制寻找建议、以建议触发 Repair
+
+**Review Boundary（审查边界）**:
+一个 Change Job 中可产生必做开发工作或 blocking Finding 的唯一语义范围：Ticket Job 只包含 Ticket Contract 及其 Candidate 对新增或改变路径直接造成的工程风险；Parent-only 覆盖完整 Parent，Run Repair 与 Run Acceptance 覆盖完整 Parent、Ticket Set、累计变更和预期合并结果。Ticket Job 中的 Parent Context 与 sibling/follow-on Issue 只用于理解背景、解释当前 Ticket 明确引用且完成其 AC 所必需的约束，以及 deferred 归属；它们不能自行增加当前 Ticket 的交付项。
+_Avoid_: 把完整 Parent 当作 Ticket 范围、按文件列表划定范围、把未来 Ticket 工作当作当前 Finding
+
+**Ticket Contract（Ticket 合同）**:
+Primary Ticket 当前 title/body 及其中 Acceptance Criteria 形成的唯一立即开发与验收合同。Ticket 对 Parent 的明确引用只引入完成本 Ticket AC 所必需的输入或行为语义，不吸收 Parent 中可独立交付的 sibling/follow-on 能力。
+_Avoid_: 完整 Parent Spec、Issue 评论、sibling Ticket、未来状态机
+
+**Parent Context（Parent 背景）**:
+Ticket Job 为理解整体目标、术语和 Ticket Contract 而读取的 Parent Issue 内容。它帮助 Agent 正确解释当前 Ticket，但本身不是该 Ticket 的需求源、验收清单或新增工作授权。
+_Avoid_: Ticket Contract、Parent-only Delivery 范围、Run Acceptance 范围
+
+**最小充分改动（Minimum Sufficient Change）**:
+能够完整满足当前 Ticket 验收条件、处理本次改动直接造成的工程风险，同时不增加无关行为、状态、依赖、配置、公开入口或抽象层的最小连贯改动。它优先沿用直接适用的现有模块和约定；只有当前正确性、可测试性、已经存在的具体重复或仓库既有设计确有需要时，才进行必要的局部重构。最小不等于机械追求代码行数最少，模块化也不等于增加文件、转发层或为未来需求预留通用框架。
+_Avoid_: 最少代码行、顺手重构、未来扩展点、假想复用、为拆分而拆分
+
+**Prompt 用语约定（Prompt Language Convention）**:
+面向 Codex Worker 的角色、责任、范围、完成条件和工作步骤默认使用清楚直接的中文，但项目中已稳定使用的英文领域术语保持原名，不机械翻译，也不在同一 Prompt 中为同一概念交替使用中英文名称。`Ticket`、`Parent Issue`、`Acceptance Criteria`、`Development`、`Repair`、`Fresh Acceptance`、`E2E`、`Standards`、`Spec`、`Finding` 与 `blocker` 可直接使用；必须与程序、JSON、命令或 skill 精确匹配的名称保留原文并使用反引号。对不稳定、少见或容易误解的英文表达，直接用中文说明所需行为，不以术语本身代替工作要求。
+_Avoid_: 同义词漂移、中英文名称交替、未解释的生僻术语、把抽象名词当作完成标准、翻译机器字段
 
 **验收 Lane 状态（Acceptance Lane Status）**:
 每个 E2E、Standards、Spec lane 独立输出 `status`、`evidence` 与 `findings`。`pass` 表示该 lane 已完整执行且 Findings 为空；`fail` 表示其 Findings 非空；`blocked` 表示该 lane 因权限、凭据、产品决策或不可替代外部操作而无法形成结论，Findings 必须为空且原因写入 evidence。Controller 只从三个 lane 推导结果：任一 `fail` 回到 Development；没有 `fail` 而存在 `blocked` 时成为 Human Blocker；三个均 `pass` 才通过验收。
 _Avoid_: 顶层 verdict、pass 携带 Finding、fail 没有 Finding、blocked 同时产出部分 Finding
 
 **Development Brief（开发简报）**:
-提供给 Development Codex 的最小语义输入，包括 Parent Issue URL、适用时的当前 Ticket URL、不可重建的原始失败证据、GitHub 上下文约定和输出要求。当前 Issue 的 title/body 是需求源；Issue 评论、历史 PR、开发者总结和旧 Artifact 仅是调查线索，不能覆盖当前需求或单独构成验收证据。Codex 直接从本地 worktree 与只读 GitHub 访问获取代码、Issue 与历史 PR 事实，并自主判断需要读取哪些相关对象；Controller 不把 Delivery Run、Revision、SHA 或其他内部运行账本作为任务输入。
+提供给 Development Codex 的最小语义输入，包括 Parent Issue URL、适用时的当前 Ticket URL、不可重建的原始失败证据、GitHub 上下文约定和输出要求。有当前 Ticket 时，其 title/body 是唯一立即交付合同，Parent 只提供 Review Boundary 允许的背景与约束；Parent-only 与 Run Job 则按各自 Review Boundary 使用 Parent。Issue 评论、历史 PR、开发者总结和旧 Artifact 仅是调查线索；Codex 从 worktree 与只读 GitHub 自主获取事实，Controller 不注入内部运行账本。
 _Avoid_: Change Job Record、完整环境快照、实现计划
 
 **Delivery Hygiene（交付卫生）**:
-Development 与 Repair 在当前 checkout 中承担完整交付整理责任：检查全部未提交内容，保留本任务必须交付的代码、测试、文档和配置，删除本次产生的临时、构建和测试产物；仅长期、可再生且不应版本控制的项目产物可进入 `.gitignore`。Fresh Validation、Run Acceptance 与 Publication 只能清理自己创建的验证或临时产物，不得整理交付内容或修改源码、测试、配置和 `.gitignore`。任一 Codex 在 checkout 外创建的临时路径必须可定位、只服务本次任务并在完成前清理，不得进行宽泛删除。Codex 不提交，最终 Git/GitHub 写入仍属于 Publisher。
+Development 与 Repair 在当前 checkout 中承担完整交付整理责任：检查全部未提交内容，保留本任务必须交付的代码、测试、文档和配置，删除本次产生的临时、构建和测试产物；仅长期、可再生且不应版本控制的项目产物可进入 `.gitignore`。Fresh Acceptance、Run Acceptance 与 Publication 只能清理自己创建的验证或临时产物，不得整理交付内容或修改源码、测试、配置和 `.gitignore`。任一 Codex 在 checkout 外创建的临时路径必须可定位、只服务本次任务并在完成前清理，不得进行宽泛删除。Codex 不提交，最终 Git/GitHub 写入仍属于 Publisher。
 _Avoid_: 用 `.gitignore` 隐藏交付、验证者修改交付、留下不应交付的中间产物、Codex 自行提交
 
 **Managed Development Checkout（受管开发工作区）**:
@@ -83,8 +111,8 @@ Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用�
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:
-Development 与 Repair Codex 必须在自测后按 Prompt 派发 Standards 与 Spec 预审 subagent，尽早修复发现的问题；该预审不构成通过决定，也不替代独立验收。Fresh Validation 与 Run Acceptance Codex 必须按 Prompt 派发独立的 E2E、Standards 与 Spec 三条 lane，处理派发失败并重新派发，且不得用父 Agent 自签替代缺失 lane。Controller 不审计 Codex 内部事件流、subagent 身份或 skill 调用 provenance；它只校验父 Reviewer Thread 新鲜性、三 lane 的 status、evidence、findings 与外层 SHA/Revision 绑定。内部 subagent 发现的人工阻塞先交给本阶段顶层 Codex，并由其写入对应 lane 的 `blocked` evidence；只有顶层 Codex 的最终结构化输出可传给 Controller。
-_Avoid_: Controller 内部 Agent 编排器、subagent provenance ledger、父 Agent 自签
+Development 与 Repair Codex 先执行 Review Boundary 的 scope triage，再按当前改动风险选择 self-preflight、定向审查或 `code-review` skill；普通局部改动与已有明确 Finding 的窄修复不固定派发整套预审，高风险或跨模块改动则应在代码稳定后取得足够的开发侧审查。Fresh Acceptance 与 Run Acceptance 仍须形成独立的 E2E、Standards、Spec 三条 lane；Prompt 以 `code-review` skill 作为 Standards/Spec 的推荐 SOP，并让 E2E 默认承担代码冻结后的完整运行验证，但不规定或声称 Controller 能审计精确调用次数、嵌套方式或命令顺序。Controller 只校验父 Reviewer Thread 新鲜性、三 lane 的 status、evidence、findings 与外层 SHA/Revision 绑定；内部 subagent 的人工阻塞由顶层 Codex 写入对应 lane 的 `blocked` evidence，只有顶层结构化输出可传给 Controller。
+_Avoid_: 固定每轮双预审、Controller 内部 Agent 编排器、subagent provenance ledger、把 Prompt SOP 当作可审计调用图、父 Agent 自签
 
 **Controller（控制器）**:
 本地 `agent-run` 单进程中的确定性编排层。它读取 GitHub 与本地事实、维护状态机和 Revision、选择可执行 Job、启动 Codex Threads、校验 Artifacts、执行预算与门禁，并调用 Publisher 完成允许的写操作；它不替 Agent 做需求、代码或修复方案的语义判断。
@@ -143,7 +171,7 @@ _Avoid_: 启动授权、依赖已解除、完成状态
 _Avoid_: 默认分支、Ticket Branch、永久集成分支
 
 **Parent-only Delivery（仅 Parent 交付）**:
-当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Validation、Required Checks 和 Published-Head Gate；`agent-run approve <run-id>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
+当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Acceptance、Required Checks 和 Published-Head Gate；`agent-run approve <run-id>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
 _Avoid_: Run Branch、Final Run PR、跳过独立验收、自动合并
 
 **Ticket PR（Ticket 拉取请求）**:
@@ -327,7 +355,7 @@ Feedback Revision。替换 Generation 从空序列开始。
 _Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
 
 **Review Finding（审查发现）**:
-Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以 `severity`、具体 `summary`、代码或行为 `evidence`、`required_fix` 与 `verification` 组成的对象表达；所有严重度都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
+Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串表达；所有 Finding 都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
 _Avoid_: 风格意见、无证据猜测、实现方案命令
 
 **Acceptance Repair Loop（验收修复循环）**:

@@ -40,36 +40,15 @@
         "evidence": { "type": "string" },
         "findings": {
           "type": "array",
-          "items": { "$ref": "#/$defs/finding" }
+          "items": { "type": "string" }
         }
-      }
-    },
-    "finding": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "severity",
-        "summary",
-        "evidence",
-        "required_fix",
-        "verification"
-      ],
-      "properties": {
-        "severity": {
-          "type": "string",
-          "enum": ["critical", "high", "medium", "low"]
-        },
-        "summary": { "type": "string" },
-        "evidence": { "type": "string" },
-        "required_fix": { "type": "string" },
-        "verification": { "type": "string" }
       }
     }
   }
 }
 ```
 
-该形状使用 OpenAI Structured Outputs 支持的 object、array、string、enum 与 `$defs`/`$ref`；根是 object，所有对象属性均 required，且每个 object 都拒绝额外字段。它刻意不使用 `allOf`、`if`、`then` 或 `else`。
+该形状使用 OpenAI Structured Outputs 支持的 object、array、string、enum；根是 object，所有对象属性均 required，且每个 object 都拒绝额外字段。它刻意不使用 `allOf`、`if`、`then` 或 `else`。
 
 ## Deterministic Semantics
 
@@ -82,11 +61,11 @@ JSON Schema 只定义形状；以下跨字段规则由本地 parser 强制：
 - 没有 `fail` 但至少一个 lane 为 `blocked`，Controller 进入 Human Blocker。
 - 三个 lane 均为 `pass`，才构成验收通过。
 
-Finding 是一个自包含对象：`severity`、`summary`、`evidence`、`required_fix`、`verification` 均为非空字符串；`severity` 仅用于排序，任意严重度的 Finding 均使所属 lane `fail`。同一问题只进入最合适的一个 lane。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才进入 Finding。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他非阻塞建议不得进入 Acceptance Artifact；需要产品决定、权限、凭据或不可替代外部操作时使用 `blocked` evidence。
+Finding 是一个符合 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串。它表达一个必须处理的问题；任意 Finding 都使所属 lane `fail`。同一问题只进入最合适的一个 lane。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才进入 Finding。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他非阻塞建议不得进入 `findings`；实际遇到且由明确 sibling/follow-on Issue 承接的范围说明，可以用 `Deferred to #N：…` 写入最相关 lane 的 `evidence`，纯维护性建议、可选重构和文件大小偏好可以用 `Non-blocking observation：…` 写入 `evidence`。两者都不改变 lane 状态或触发 Repair；需要产品决定、权限、凭据或不可替代外部操作时使用 `blocked` evidence。
 
 ## Reviewer Prompt Contract
 
-主 Reviewer Agent 自行派发 E2E、Standards、Spec 三条 lane，并汇总其结果；Harness 不记录、审计或限制其内部 subagent 调用。主 Reviewer 不得用自身判断替代缺失 lane。
+Reviewer 必须独立形成 E2E、Standards、Spec 三种视角并汇总其结果；`skill:code-review` 是 Standards 与 Spec 可使用的推荐 SOP，但不规定固定 subagent 数量、精确调用次数、调用顺序或嵌套层级。Harness 不记录、审计或限制内部调用；Reviewer 不得用自身判断替代缺失的独立视角。
 
 每个 lane 的 `evidence` 最低应包含：
 

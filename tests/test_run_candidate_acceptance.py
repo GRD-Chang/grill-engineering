@@ -89,6 +89,7 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert run["repair_cycle"]["validation_attempts"] == 1
     assert result["ticket_jobs"]["2"]["modification_attempts"] == 1
     assert len(agents.development_requests) == 1
+    assert agents.development_requests[0]["repair_scope"] == "run_repair"
     assert agents.development_requests[0]["repair_source"] == "acceptance"
     assert agents.development_requests[0]["acceptance_artifact"] == _repair_artifact()
     assert len(agents.review_requests) == 2

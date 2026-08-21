@@ -26,21 +26,92 @@ PASS_EVIDENCE = {
 }
 
 
-def test_publication_prompts_use_flat_human_blocker_wire_shape() -> None:
-    ticket = CodexCliBackend._publication_prompt(
-        {
-            "acceptance_scope": "ticket",
-            "acceptance_artifact": {},
+def _capture_public_prompt(
+    tmp_path: Path,
+    monkeypatch: Any,
+    method: str,
+    request: dict[str, Any],
+    *,
+    name: str,
+) -> str:
+    checkout = tmp_path / name
+    checkout.mkdir()
+    captured: list[str] = []
+    if method == "develop":
+        result: dict[str, Any] = {
+            "result_kind": "development",
+            "summary": "Implemented and verified.",
+            "human_blockers": None,
         }
-    )
-    run_repair = CodexCliBackend._publication_prompt(
-        {
-            "acceptance_scope": "run",
-            "acceptance_artifact": {},
+    elif method == "review":
+        result = {
+            "checks": {
+                lane: {
+                    "status": "pass",
+                    "evidence": PASS_EVIDENCE[lane],
+                    "findings": [],
+                }
+                for lane in ("e2e", "standards", "spec")
+            }
         }
+    else:
+        result = {
+            "result_kind": "publication",
+            "commit_message": "fix(agent): publish validated repair",
+            "pr_title": "fix(agent): publish validated repair",
+            "pr_body_markdown": (
+                "## What Problem This Solves\n\nA validated change is ready.\n\n"
+                "## Why This Change Was Made\n\nThe change follows the contract.\n\n"
+                "## User Impact\n\nThe requested behavior is available.\n\n"
+                "## Evidence\n\nIndependent validation passed."
+            ),
+            "human_blockers": None,
+        }
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(str(options["prompt"]))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(result, ensure_ascii=False), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"public-prompt-test"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
+    getattr(backend, method)({**request, "checkout": str(checkout)})
+    return captured[0]
+
+
+def test_publication_prompts_use_flat_human_blocker_wire_shape(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ticket = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {"acceptance_scope": "ticket", "acceptance_artifact": {}},
+        name="ticket-publication",
     )
-    final_run = CodexCliBackend._run_publication_prompt(
-        {"acceptance_artifact": {}}
+    run_repair = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {"acceptance_scope": "run", "acceptance_artifact": {}},
+        name="run-repair-publication",
+    )
+    final_run = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "run_publication",
+        {"acceptance_artifact": {}},
+        name="final-run-publication",
     )
 
     for prompt in (ticket, run_repair, final_run):
@@ -48,34 +119,52 @@ def test_publication_prompts_use_flat_human_blocker_wire_shape() -> None:
         assert DEVELOPMENT_BLOCKER_SHAPE not in prompt
 
 
-def test_non_publication_prompt_keeps_exact_human_blocker_result() -> None:
-    development = CodexCliBackend._development_prompt(
-        {
-            "acceptance_scope": "ticket",
-        }
+def test_non_publication_prompt_keeps_exact_human_blocker_result(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    development = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {"acceptance_scope": "ticket"},
+        name="development",
     )
 
     assert DEVELOPMENT_BLOCKER_SHAPE in development
     assert PUBLICATION_BLOCKER_SHAPE not in development
 
 
-def test_development_prompt_assigns_candidate_and_publication_authority() -> None:
-    prompt = CodexCliBackend._development_prompt(
+def test_development_prompt_assigns_candidate_and_publication_authority(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
         {
             "acceptance_scope": "ticket",
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "task_issue_url": "https://github.com/example/project/issues/2",
-        }
+        },
+        name="development-authority",
     )
 
-    assert "Controller 负责创建 append-only Candidate、编排、校验和 CI 监督" in prompt
-    assert "Publisher 执行后续 ref、发布、PR 以及全部 Git/GitHub 写入" in prompt
-    assert "Publisher 创建 append-only Candidate" not in prompt
-    assert "Codex 只能编辑当前受管工作树" in prompt
-    assert "不得进行 Git 历史操作、暂存、提交、推送、合并或 GitHub 写入" in prompt
+    assert "当前 checkout 是程序管理的受管开发工作区" in prompt
+    assert "Git 历史只向前推进" in prompt
+    assert "只修改当前 checkout 的文件树" in prompt
+    assert "如果先前 Candidate 中有文件改错" in prompt
+    assert "不要回退、替换或修改旧 commit" in prompt
+    assert "`git log`、`git show`、`git diff` 等只读操作" in prompt
+    assert "最终 diff 可以比上一轮更小" in prompt
+    assert "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit" in prompt
+    assert "执行后续 Git/GitHub 交付" in prompt
+    assert "你只整理 checkout，不执行这些写入" in prompt
+    assert "不得执行暂存、commit、`commit --amend`、`reset`、`rebase`" in prompt
 
 
-def test_repair_prompt_preserves_raw_evidence_without_controller_triage() -> None:
+def test_repair_prompt_preserves_raw_evidence_without_controller_triage(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     artifact = {
         "checks": {
             "e2e": {
@@ -90,16 +179,191 @@ def test_repair_prompt_preserves_raw_evidence_without_controller_triage() -> Non
         }
     }
 
-    prompt = CodexCliBackend._development_prompt(
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
         {
             "acceptance_scope": "ticket",
             "repair_source": "acceptance",
             "acceptance_artifact": artifact,
-        }
+        },
+        name="acceptance-repair",
     )
 
     assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
-    assert "Controller 不判断任何 Finding 是否可由工作树修复" in prompt
+    assert "`findings` 是本轮必须处理的问题" in prompt
+    assert "Deferred to #N：…" in prompt
+    assert "Non-blocking observation：…" in prompt
+    assert "不是自动修改指令" in prompt
+    assert "逐项解决当前 Review Boundary 内的每个 Finding" in prompt
+    assert "按每条 Finding 自带的 `复验` 要求执行验证并取得充分、可复核的证据" in prompt
+    assert "不能以一次笼统的风险验证替代逐项复验" in prompt
+
+
+@pytest.mark.parametrize(
+    ("scope", "required", "forbidden"),
+    [
+        (
+            "ticket",
+            (
+                "Ticket Contract",
+                "Parent Context",
+                "sibling/follow-on Ticket",
+                "task_issue_url",
+            ),
+            ("完整 Parent Issue；",),
+        ),
+        (
+            "parent_only",
+            ("完整 Parent Issue", "Acceptance Criteria"),
+            ("Ticket Contract", "task_issue_url"),
+        ),
+        (
+            "run",
+            ("完整 Parent、最终 Ticket Set", "跨 Ticket 交互", "预期合并结果"),
+            ("Ticket Contract", "task_issue_url"),
+        ),
+    ],
+)
+def test_prompt_scope_selects_the_matching_review_boundary(
+    tmp_path: Path,
+    monkeypatch: Any,
+    scope: str,
+    required: tuple[str, ...],
+    forbidden: tuple[str, ...],
+) -> None:
+    request = {
+        "acceptance_scope": scope,
+        "parent_issue_url": "https://github.com/example/project/issues/90",
+    }
+    if scope == "ticket":
+        request["task_issue_url"] = "https://github.com/example/project/issues/125"
+
+    development = _capture_public_prompt(
+        tmp_path, monkeypatch, "develop", request, name=f"{scope}-development"
+    )
+    review = _capture_public_prompt(
+        tmp_path, monkeypatch, "review", request, name=f"{scope}-review"
+    )
+
+    for marker in required:
+        assert marker in development
+        assert marker in review
+    for marker in forbidden:
+        assert marker not in development
+        assert marker not in review
+
+
+def test_development_prompt_uses_risk_proportional_verification_and_stops_at_completion(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "https://github.com/example/project/issues/90",
+            "task_issue_url": "https://github.com/example/project/issues/125",
+        },
+        name="risk-proportional-development",
+    )
+
+    assert "最小充分改动" in prompt
+    assert "不增加无关行为、状态、依赖、配置、公开入口或抽象层" in prompt
+    assert "不要为未来需求、其他 Ticket、假想调用方" in prompt
+    assert "根据实际改动风险自主选择最低充分验证" in prompt
+    assert "完整测试套件不是每轮默认的固定门槛" in prompt
+    assert "达到完成条件后停止扩展" in prompt
+    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in prompt
+    assert "没有具体风险依据时，避免重复或嵌套相同的 Review" in prompt
+    assert "Prompt 只提供判断框架" not in prompt
+    assert "两个不同 subagent" not in prompt
+
+
+def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestration(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "https://github.com/example/project/issues/90",
+            "task_issue_url": "https://github.com/example/project/issues/125",
+        },
+        name="fresh-acceptance",
+    )
+
+    assert "E2E、Standards 和 Spec 三种独立视角" in prompt
+    assert "E2E 默认负责代码稳定后的广泛运行验证" in prompt
+    assert "Standards 与 Spec 默认使用静态证据" in prompt
+    assert "Deferred to #N：…" in prompt
+    assert "Non-blocking observation：…" in prompt
+    assert "一次报告当前 Review Boundary 内已经能够证明的全部必须修复 Finding" in prompt
+    assert "问题：…；证据：…；必须修复：…；复验：…" in prompt
+    assert "确保 E2E、Standards 和 Spec 三种独立视角均形成可复核结论" in prompt
+    assert "避免重复派发同类 Reviewer、嵌套相同 Review" in prompt
+    assert "不规定固定 subagent 数量" not in prompt
+    assert "必须派发三个不同 subagent" not in prompt
+    assert "任一 fail 将回到 Development" not in prompt
+
+
+def test_run_repair_review_prompt_describes_the_merge_preview_boundary(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            "acceptance_scope": "run",
+            "repair_scope": "run_repair",
+            "parent_issue_url": "https://github.com/example/project/issues/90",
+        },
+        name="run-repair-review",
+    )
+
+    assert "独立 Run Repair 验收工程师" in prompt
+    assert "Run Repair 的完整 Parent、最终 Ticket Set" in prompt
+    assert "repair Candidate 后的无提交合并预览" in prompt
+    assert "HEAD 保持 Run Branch base 是正常现象" in prompt
+    assert "不得把局部 Repair Candidate 单独通过当作整体验收通过" in prompt
+
+
+def test_publication_prompt_does_not_turn_nonblocking_evidence_into_delivery(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "https://github.com/example/project/issues/90",
+            "task_issue_url": "https://github.com/example/project/issues/125",
+            "acceptance_artifact": {
+                "checks": {
+                    lane: {
+                        "status": "pass",
+                        "evidence": (
+                            "Deferred to #117：default branch drift；"
+                            "Non-blocking observation：可选重构。"
+                        ),
+                        "findings": [],
+                    }
+                    for lane in ("e2e", "standards", "spec")
+                }
+            },
+        },
+        name="publication-evidence",
+    )
+
+    assert "Deferred to #N：…" in prompt
+    assert "Non-blocking observation：…" in prompt
+    assert "不得描述为当前交付范围的交付成果、已实现能力或 User Impact" in prompt
 
 
 def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
@@ -273,6 +537,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "develop",
             {
                 "acceptance_scope": "run",
+                "repair_scope": "run_repair",
                 "repair_source": "acceptance",
                 "acceptance_artifact": artifact,
             },
@@ -283,6 +548,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "develop",
             {
                 "acceptance_scope": "run",
+                "repair_scope": "run_repair",
                 "repair_source": "required_checks",
                 "ci_evidence": ci_evidence,
             },
@@ -293,6 +559,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "develop",
             {
                 "acceptance_scope": "run",
+                "repair_scope": "run_repair",
                 "repair_source": "human_revision",
                 "human_feedback": "HUMAN_FEEDBACK_SENTINEL",
             },
@@ -303,6 +570,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "develop",
             {
                 "acceptance_scope": "run",
+                "repair_scope": "run_repair",
                 "repair_source": "merge_conflict",
                 "merge_conflict_evidence": "MERGE_CONFLICT_SENTINEL",
             },
@@ -435,18 +703,28 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
-                assert "Controller 负责创建 append-only Candidate" in prompt
+                assert "当前 checkout 是程序管理的受管开发工作区" in prompt
+                assert "Git 历史只向前推进" in prompt
+                assert "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit" in prompt
+                assert "你只整理 checkout，不执行这些写入" in prompt
+                if role_request.get("repair_scope") == "run_repair":
+                    assert "Run Repair 的完整 Parent、最终 Ticket Set" in prompt, active_case
             else:
                 assert "Controller" not in prompt, active_case
                 assert "Publisher" not in prompt, active_case
-            assert "受管工作区" not in prompt, active_case
-            assert "当前 Issue 的 title/body 是唯一需求源" in prompt, active_case
+                assert "受管开发工作区" not in prompt, active_case
+            assert "动态 Context 中的 URL 不是需求摘要" in prompt, active_case
+            assert "Acceptance Criteria" in prompt, active_case
             if method == "develop":
                 assert "在当前 checkout 中检查全部未提交内容" in prompt, active_case
                 assert "仅长期、可再生且不应版本控制的项目产物" in prompt, active_case
-                assert "不得 commit、push、merge、关闭或修改 GitHub" in prompt, active_case
+                assert (
+                    "不得执行暂存、commit、`commit --amend`、`reset`、`rebase`、`revert`、"
+                    "`cherry-pick`"
+                    in prompt
+                ), active_case
             elif method == "review":
-                assert "真实 E2E、Standards Review 和 Spec Review" in prompt, active_case
+                assert "E2E、Standards 和 Spec 三种独立视角" in prompt, active_case
                 assert "不得修复源码、测试、配置或 `.gitignore`" in prompt, active_case
                 if name == "run_acceptance":
                     assert "跨 Ticket 交互" in prompt
@@ -457,27 +735,133 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "CI、Candidate、SHA、门禁和生命周期" in prompt, active_case
 
 
-def test_run_prompts_describe_run_scope_without_controller_private_records() -> None:
-    checks_repair = CodexCliBackend._development_prompt(
+def test_run_prompts_describe_run_scope_without_controller_private_records(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checks_repair = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
         {
             "acceptance_scope": "run",
             "repair_source": "required_checks",
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "ci_evidence": {"check": "failed"},
-        }
+        },
+        name="run-checks-repair",
     )
-    run_acceptance = CodexCliBackend._review_prompt(
+    run_acceptance = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
         {
             "acceptance_scope": "run",
             "parent_issue_url": "https://github.com/example/project/issues/1",
-        }
+        },
+        name="run-acceptance",
     )
 
     assert "Required-Checks Repair：当前 Delivery Run" in checks_repair
     assert "Required-Checks Repair：当前 Ticket" not in checks_repair
     assert "Completion Record" not in run_acceptance
     assert "Expected Merge Result" not in run_acceptance
-    assert "累计 diff、跨 Ticket 交互、整体需求和预期合并结果" in run_acceptance
+    assert "完整 Parent、最终 Ticket Set、依赖关系、累计变更、跨 Ticket 交互和预期合并结果" in run_acceptance
+
+
+@pytest.mark.parametrize(
+    ("follow_on_number", "follow_on_note"),
+    [
+        (
+            "117",
+            "default branch drift 属于 #117 的最新默认分支重建验收现场",
+        ),
+        (
+            "118",
+            "Git conflict 属于 #118 的 Integration-repair Worktree",
+        ),
+    ],
+)
+def test_ticket_116_keeps_follow_on_scope_out_of_development_and_findings(
+    tmp_path: Path,
+    monkeypatch: Any,
+    follow_on_number: str,
+    follow_on_note: str,
+) -> None:
+    parent_url = "https://github.com/example/project/issues/115"
+    ticket_url = "https://github.com/example/project/issues/116"
+    follow_on_url = (
+        f"https://github.com/example/project/issues/{follow_on_number}"
+    )
+    current_finding = (
+        "问题：#116 的 Candidate Run Acceptance 未覆盖完整 Parent Spec；"
+        "证据：#116 的候选验收缺少完整 Parent、Ticket Set 与预期合并结果；"
+        "必须修复：按 #116 合同补齐 Candidate Run Acceptance；"
+        "复验：重新执行 #116 的完整 Candidate Run Acceptance。"
+    )
+    artifact = {
+        "checks": {
+            "e2e": {
+                "status": "fail",
+                "evidence": f"Deferred to #{follow_on_number}：{follow_on_note}",
+                "findings": [current_finding],
+            },
+            **{
+                lane: {
+                    "status": "pass",
+                    "evidence": PASS_EVIDENCE[lane],
+                    "findings": [],
+                }
+                for lane in ("standards", "spec")
+            },
+        }
+    }
+
+    development = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": parent_url,
+            "task_issue_url": ticket_url,
+        },
+        name=f"ticket-116-development-{follow_on_number}",
+    )
+    review = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": parent_url,
+            "task_issue_url": ticket_url,
+        },
+        name=f"ticket-116-review-{follow_on_number}",
+    )
+    repair = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": parent_url,
+            "task_issue_url": ticket_url,
+            "repair_source": "acceptance",
+            "acceptance_artifact": artifact,
+        },
+        name=f"ticket-116-repair-{follow_on_number}",
+    )
+
+    assert ticket_url in development
+    assert ticket_url in review
+    assert follow_on_url not in development
+    assert follow_on_url not in review
+    assert "sibling/follow-on Ticket 不会自动进入本轮范围" in review
+    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in repair
+    assert f"Deferred to #{follow_on_number}：{follow_on_note}" in repair
+    assert "不是自动修改指令" in repair
+    assert current_finding in repair
+    assert f"Deferred to #{follow_on_number}：" not in artifact["checks"]["e2e"]["findings"]
 
 
 @pytest.mark.parametrize(
@@ -501,6 +885,13 @@ def test_candidate_run_review_prompt_excludes_run_repair_evidence(
         }
     )
 
+    assert "你是独立 Candidate Run Acceptance 验收工程师。" in prompt
+    assert (
+        "当前 Validation Checkout 是将本轮 Repair Candidate 应用到当前 "
+        "default head 后的预期合并结果"
+    ) in prompt
+    assert "仍须按完整 Run Review Boundary 验收" in prompt
+    assert "不得把局部 Repair Candidate 的 diff 通过当作完整 Run 通过" in prompt
     assert "Run Repair Evidence (verbatim)" not in prompt
     assert json.dumps(sentinel, ensure_ascii=False, sort_keys=True) not in prompt
     for private_field in (

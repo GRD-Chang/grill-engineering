@@ -764,11 +764,17 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     development, acceptance = prompts
     assert "skill:implement" in development
     assert "skill:code-review" in development
-    assert "不得自行宣布" in development
-    assert "三个不同 subagent" in acceptance
-    assert "E2E" in acceptance
-    assert acceptance.count("skill:code-review") >= 2
-    assert "不得替代" in acceptance
+    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in development
+    assert "没有具体风险依据时，避免重复或嵌套相同的 Review" in development
+    assert "Prompt 只提供判断框架" not in development
+    assert "E2E、Standards 和 Spec 三种独立视角" in acceptance
+    assert "E2E 默认负责代码稳定后的广泛运行验证" in acceptance
+    assert "Standards 与 Spec 默认使用静态证据" in acceptance
+    assert "skill:code-review" in acceptance
+    assert "确保 E2E、Standards 和 Spec 三种独立视角均形成可复核结论" in acceptance
+    assert "避免重复派发同类 Reviewer、嵌套相同 Review" in acceptance
+    assert "不规定固定 subagent 数量" not in acceptance
+    assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" in acceptance
     assert "每条 Finding 都必须写在最合适 lane 的 findings 中" in acceptance
     assert "pass 与 blocked 的 findings 必须为空" in acceptance
     assert "blocked 的 evidence 必须说明发生了什么" in acceptance
@@ -779,13 +785,61 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert schemas[0]["required"] == ["result_kind", "summary", "human_blockers"]
 
 
-def test_publication_prompts_require_semantic_titles() -> None:
-    ticket_prompt = CodexCliBackend._publication_prompt(
-        {"acceptance_scope": "ticket", "acceptance_artifact": {}}
+def test_publication_prompts_require_semantic_titles(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompts: list[str] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(
+                {
+                    "result_kind": "publication",
+                    "commit_message": "fix(agent): publish validated repair",
+                    "pr_title": "fix(agent): publish validated repair",
+                    "pr_body_markdown": (
+                        "## What Problem This Solves\n\nA validated change is ready.\n\n"
+                        "## Why This Change Was Made\n\nThe change follows the contract.\n\n"
+                        "## User Impact\n\nThe requested behavior is available.\n\n"
+                        "## Evidence\n\nIndependent validation passed."
+                    ),
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"publication-test"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
+    ticket_checkout = tmp_path / "ticket-publication"
+    run_checkout = tmp_path / "run-publication"
+    ticket_checkout.mkdir()
+    run_checkout.mkdir()
+    backend.publication(
+        {
+            "checkout": str(ticket_checkout),
+            "acceptance_scope": "ticket",
+            "acceptance_artifact": {},
+        }
     )
-    run_prompt = CodexCliBackend._publication_prompt(
-        {"acceptance_scope": "run", "acceptance_artifact": {}}
+    backend.publication(
+        {
+            "checkout": str(run_checkout),
+            "acceptance_scope": "run",
+            "acceptance_artifact": {},
+        }
     )
+    ticket_prompt, run_prompt = prompts
 
     assert "Conventional Commit 语义标题格式" in ticket_prompt
     assert "Conventional Commit 语义标题格式" in run_prompt
@@ -924,10 +978,12 @@ def test_development_prompt_matches_normal_and_repair_contracts(
 
     prompt = prompts[0]
     assert mode_text in prompt
-    assert "受影响的成功路径、失败路径和边界情况" in prompt
-    assert "Standards Review Subagent" in prompt
-    assert "Spec Review Subagent" in prompt
-    assert "两个不同 subagent" in prompt
+    assert "直接影响的成功路径、失败路径和边界情况" in prompt
+    assert "根据实际改动风险自主选择最低充分验证" in prompt
+    assert "低风险局部改动可以自行做简短收口检查" in prompt
+    assert "大型、跨模块或触及认证、权限" in prompt
+    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in prompt
+    assert "Prompt 只提供判断框架" not in prompt
     if evidence is not None:
         assert evidence in prompt
         source = (
@@ -940,12 +996,42 @@ def test_development_prompt_matches_normal_and_repair_contracts(
         )
 
 
-def test_merge_conflict_prompt_excludes_unresolved_acceptance_artifact() -> None:
+def test_merge_conflict_prompt_excludes_unresolved_acceptance_artifact(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
     artifact = failed_acceptance_artifact("Preserve this Candidate finding.")
+    prompts: list[str] = []
 
-    prompt = CodexCliBackend._development_prompt(
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(
+                {
+                    "result_kind": "development",
+                    "summary": "Resolved the merge conflict.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"developer-1"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
         {
+            "checkout": str(checkout),
             "acceptance_scope": "run",
+            "repair_scope": "run_repair",
             "repair_source": "merge_conflict",
             "merge_conflict_evidence": "Unresolved paths:\nshared.txt",
             "acceptance_artifact": artifact,
@@ -953,13 +1039,16 @@ def test_merge_conflict_prompt_excludes_unresolved_acceptance_artifact() -> None
         }
     )
 
+    prompt = prompts[0]
     assert "Merge Conflict Evidence (verbatim)" in prompt
-    assert "Unresolved Acceptance Artifact" not in prompt
+    assert "Unresolved paths:\nshared.txt" in prompt
     assert "Preserve this Candidate finding." not in prompt
     assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) not in prompt
 
 
-def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None:
+def test_top_level_prompts_allow_only_issue_urls_and_original_evidence(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     artifact = failed_acceptance_artifact("original")
     internal = {
         "checkout": "/private/checkout",
@@ -971,8 +1060,11 @@ def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None
         "parent": {"body": "private parent body"},
         "ticket": {"body": "private ticket body"},
     }
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
     request = {
         **internal,
+        "checkout": str(checkout),
         "acceptance_scope": "ticket",
         "repair_source": "acceptance",
         "parent_issue_url": "https://github.com/example/project/issues/1",
@@ -980,14 +1072,49 @@ def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None
         "acceptance_artifact": artifact,
     }
 
-    development = CodexCliBackend._development_prompt(request)
-    publication = CodexCliBackend._publication_prompt(
+    prompts: list[str] = []
+    outputs = [
         {
-            **request,
-            "acceptance_artifact": artifact,
-        }
-    )
-    review = CodexCliBackend._review_prompt(request)
+            "result_kind": "development",
+            "summary": "Implemented and verified.",
+            "human_blockers": None,
+        },
+        {
+            "result_kind": "publication",
+            "commit_message": "fix(agent): publish validated repair",
+            "pr_title": "fix(agent): publish validated repair",
+            "pr_body_markdown": (
+                "## What Problem This Solves\n\nA validated change is ready.\n\n"
+                "## Why This Change Was Made\n\nThe change follows the contract.\n\n"
+                "## User Impact\n\nThe requested behavior is available.\n\n"
+                "## Evidence\n\nIndependent validation passed."
+            ),
+            "human_blockers": None,
+        },
+        passing_acceptance_artifact(),
+    ]
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output_index = arguments.index("--output-last-message") + 1
+        Path(arguments[output_index]).write_text(
+            json.dumps(outputs[len(prompts) - 1]), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout='{"type":"thread.started","thread_id":"private-thread"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
+    backend.develop(request)
+    backend.publication(request)
+    backend.review(request)
+    development, publication, review = prompts
 
     for prompt in (development, publication, review):
         assert "https://github.com/example/project/issues/1" in prompt

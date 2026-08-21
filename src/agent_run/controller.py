@@ -284,7 +284,7 @@ class Controller:
                 raise ValueError("--message requires Human Blocker resume")
             if new_thread:
                 if resuming_run_acceptance:
-                    _state_mapping(state, "run_acceptance")["review_new_thread"] = True
+                    _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
                 else:
                     _clear_current_invocation_thread(state)
             else:

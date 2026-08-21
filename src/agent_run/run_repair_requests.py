@@ -27,6 +27,7 @@ class RunRepairRequests:
     ) -> dict[str, Any]:
         request = {
             "acceptance_scope": "run",
+            "repair_scope": "run_repair",
             "repair_source": job.get("repair_source", "acceptance"),
             "parent_issue_url": _issue_url(
                 state, int(_mapping(state, "parent")["number"])

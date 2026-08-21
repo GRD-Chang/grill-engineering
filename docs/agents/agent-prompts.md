@@ -1,13 +1,14 @@
 # Agent Prompt 合同
 
 本文记录 `agent-run` 各智能角色的目标 Prompt。它描述 Agent 应收到的任务合同，
-不描述 Controller、进程或会话内部实现。
+不描述 Controller、进程或会话内部实现；但会说明 Agent 必须知道的相邻交付边界，
+例如返回后由 Controller/Publisher 创建 Candidate 并执行后续 Git/GitHub 交付。
 
 相关领域边界见根目录的 `CONTEXT.md`；命令与权限现状见 `docs/agent-run.md`。
 
 ## Runtime Dynamic Context（运行时动态上下文，唯一合同）
 
-本节优先于本文后续历史示例。Controller 的 Revision、SHA、Candidate、Ticket Graph、Completion Record、开发总结、既有 PR、Run/Thread/Attempt 身份只用于确定性门禁，绝不进入 Codex stdin Prompt。Worker 已有正确 checkout 与只读 GitHub token；开始工作前必须用 `gh issue view` 读取每个 URL。URL 不是需求摘要，当前 Issue 的 title/body 才是需求源；评论、历史 PR、旧 Artifact 和上游总结只能作为调查线索，不能覆盖需求或单独构成验收证据。
+本节优先于本文后续历史示例。Controller 的 Revision、SHA、Candidate 的具体身份、Ticket Graph、Completion Record、开发总结、既有 PR、Run/Thread/Attempt 身份只用于确定性门禁，绝不作为动态事实注入 Codex stdin Prompt。Worker 已有正确 checkout 与只读 GitHub token；开始工作前必须用 `gh issue view` 读取每个 URL。Development/Repair 仍需知道：Agent 返回后，程序会通过 Controller/Publisher 将当前 checkout 中保留的全部未提交内容创建为 Candidate，并执行后续 Git/GitHub 交付。Ticket Job 中，Ticket 的 title、body 和 Acceptance Criteria 是唯一立即交付合同，Parent Issue 只提供背景、术语和完成当前 Ticket 所需的必要约束；Parent-only 与 Run Job 使用各自完整的 Parent 或 Run Review Boundary。URL 不是需求摘要；评论、历史 PR、旧 Artifact 和上游总结只能作为调查线索，不能覆盖需求或单独构成验收证据。
 
 | 顶层角色 | 正常动态字段 | Human Blocker 恢复额外字段 |
 | --- | --- | --- |
@@ -16,7 +17,7 @@
 | Ticket Repair | 两个 URL，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers`，适用时 `human_response_history` |
 | Parent-only Repair | `parent_issue_url`，加一个 `acceptance_artifact` 或 `ci_evidence` | `prior_human_blockers`，适用时 `human_response_history` |
 | Run Repair | `parent_issue_url`，加一个 `acceptance_artifact`、`ci_evidence`、`human_feedback` 或 `merge_conflict_evidence` | `prior_human_blockers`，适用时 `human_response_history` |
-| Ticket / Parent-only Fresh Validation | 相应 Parent URL，Ticket 时再有 task URL | `prior_human_blockers`，适用时 `human_response_history` |
+| Ticket / Parent-only Fresh Acceptance | 相应 Parent URL，Ticket 时再有 task URL | `prior_human_blockers`，适用时 `human_response_history` |
 | Run Acceptance | `parent_issue_url` | `prior_human_blockers`，适用时 `human_response_history` |
 | Ticket Publication | 两个 URL，加完整 `acceptance_artifact` | `prior_human_blockers`，适用时 `human_response_history` |
 | Parent-only / Run Repair Publication | `parent_issue_url`，加完整 `acceptance_artifact` | `prior_human_blockers`，适用时 `human_response_history` |
@@ -28,17 +29,17 @@ Fresh/Run Acceptance 只输出三 lane Acceptance Artifact：任一 lane `fail` 
 
 Controller 按各自既有 schema 验证完整结果、保存/展示原字符串并暂停；字段缺失、非法额外形状、空字符串或超出数量/长度上限的输出属于 malformed output，按普通执行失败处理，绝不能当作 Development Summary。Controller 不分类、不自动重试、不会以保存的 Issue body 兜底，也不读取或管理 Codex 内部 subagent 对话。恢复成功后清除当前告警字段，只保留最近的有界原始历史。
 
-### 固定 Prompt 行为
+### Prompt 行为合同
 
-- Development/Repair：先读 Parent Issue；有 task URL 时也读当前 Ticket。执行 `skill:implement`、真实使用验证和两个独立 review subagent。Agent 在当前 checkout 整理全部未提交内容：保留本任务交付，清理本次中间产物；仅长期、可再生且不应版本控制的项目产物可进入 `.gitignore`。checkout 外临时路径必须可定位、只服务本次任务并在完成前清理。不得 commit、push、merge、关闭或修改 GitHub；开发预审不替代独立验收。
-- Fresh Validation 与 Run Acceptance：首次使用新 Reviewer Thread；先读适用 Issue，派发 E2E、Standards 与 Spec 三条独立 lane，后两条使用 `skill:code-review`，只输出唯一的三 lane Acceptance Artifact。每条 lane 都提供 `status`、可复核 `evidence` 和 `findings`；有 Finding 的 lane 必须为 `fail`，不得同时 pass。pass evidence 固定使用：E2E 的“操作或命令：…；退出码：…；结果：…”，Standards 的“审查范围或基线：…；结论：…”，以及 Spec 的“已核对的验收标准：…；覆盖结论：”。两者都可构建、测试并清理自身中间产物，但不得修复源码、测试、配置或 `.gitignore`。Run Acceptance 额外独立检查累计 diff、跨 Ticket 交互和预期合并结果。Human 恢复才复用该 Reviewer Thread，并重新准备验证 checkout。
-- Publication 与 Final Run Publication：只读适用 Issue、checkout diff 与完整 Fresh/Run Acceptance Artifact；不得修改文件或 Git/GitHub，不替代验收或人工批准。PR 叙事必须有四个必需章节：问题段写改前限制、改后能力和边界；理由段写关键设计与约束；影响段写用户可执行结果和兼容/迁移行为；证据段仅写三条独立验收 lane 的“场景 → 实际操作或命令 → 可观察结果”。CI、SHA、Candidate、门禁和生命周期事实由 Publisher 的状态评论呈现。
+- Development/Repair：先读适用的 Parent Issue；有 task URL 时也读当前 Ticket。执行 `skill:implement`，以最小充分改动满足当前 Review Boundary，并根据实际风险选择最低充分验证和开发侧 Review。低风险局部改动可以自行收口；大型、跨模块或高风险改动可使用 `skill:code-review` 或定向 Reviewer。没有具体风险依据时，避免重复或嵌套相同 Review。Repair 的原始 Finding、CI Evidence、维护者反馈或冲突证据是本轮依据；`Deferred to #N：…` 与 `Non-blocking observation：…` 只是不触发自动修复的 evidence。Agent 只修改当前受管 checkout 的文件树；可通过只读 Git 操作检查历史，但不得暂存、commit、amend、reset、rebase、revert、cherry-pick、切换旧 commit/branch、merge、push 或修改 GitHub。先前 Candidate 有误时，在当前文件树删除、恢复或重写相应内容并保留为未提交变更。Agent 返回后，程序会通过 Controller/Publisher 从当前完整结果创建新的不可变 Candidate Commit 并执行后续 Git/GitHub 交付，因此 Git 历史只向前推进而最终 diff 可以缩小。Agent 还须保留本任务交付、清理本次中间产物；仅长期、可再生且不应版本控制的项目产物可进入 `.gitignore`。checkout 外临时路径必须可定位、只服务本次任务并在完成前清理。Development/Repair 的唯一交付物是 Development wire JSON。
+- Fresh Acceptance 与 Run Acceptance：形成 E2E、Standards 与 Spec 三种独立验收视角，只输出唯一的三 lane Acceptance Artifact。E2E 默认负责代码稳定后的广泛运行验证；Standards/Spec 默认使用静态证据和验证具体问题所需的最小命令，避免重复相同的完整测试套件；`skill:code-review` 是可使用的推荐 SOP。Reviewer 根据 Review Boundary 和风险选择审查分工与复核强度，确保三种视角均形成可复核结论；没有具体风险依据时，避免重复派发同类 Reviewer、嵌套相同 Review 或重复相同昂贵测试。每条 lane 都提供 `status`、可复核 `evidence` 和 `findings`；有 Finding 的 lane 必须为 `fail`，不得同时 pass。Reviewer 应一次报告当前边界内已能证明的全部必须修复 Finding，但不得扩大 Review Boundary。Deferred Scope Note 和 Non-blocking Observation 只进入最相关 lane 的 `evidence`，不进入 `findings`、不改变状态、不触发 Repair。pass evidence 固定使用：E2E 的“操作或命令：…；退出码：…；结果：…”，Standards 的“审查范围或基线：…；结论：…”，以及 Spec 的“已核对的验收标准：…；覆盖结论：…”。可以构建、测试并清理自身中间产物，但不得修复源码、测试、配置或 `.gitignore`。Run Acceptance 额外独立检查累计 diff、跨 Ticket 交互和预期合并结果。Human 恢复才复用该 Reviewer Thread，并重新准备验证 checkout。
+- Publication 与 Final Run Publication：只读适用 Issue、checkout diff 与完整 Fresh/Run Acceptance Artifact；不得修改文件或 Git/GitHub，不替代验收或人工批准。PR 叙事必须有四个必需章节：问题段写改前限制、改后能力和边界；理由段写关键设计与约束；影响段写用户可执行结果和兼容/迁移行为；证据段仅写三条独立验收 lane 的“场景 → 实际操作或命令 → 可观察结果”。Deferred Scope Note 和 Non-blocking Observation 不得被描述为当前交付成果或 User Impact。CI、SHA、Candidate、门禁和生命周期事实由 Publisher 的状态评论呈现。
 - Scope Impact Assessment 已删除。Ticket Graph drift 由 Controller 机械比较并 fail closed，
   不构造语义分类 Prompt，也不创建 Codex Thread。
 
 ## 历史设计记录（不作为运行时 Prompt 合同）
 
-下文从此处到文件结尾均为已废弃的需求演进背景，不能用于实现、测试或推断任何顶层 Codex stdin 字段；其中的 title/body、Revision、SHA、checkout、开发总结与网络失败回退示例均不再有效。运行时唯一合同是上方矩阵与固定行为。
+下文从此处到文件结尾均为已废弃的需求演进背景，不能用于实现、测试或推断任何顶层 Codex stdin 字段；其中的 title/body、Revision、SHA、checkout、开发总结与网络失败回退示例均不再有效。下文保留的固定双预审、固定完整测试或固定 subagent 编排描述已由 Issue #125 supersede；运行时唯一合同是上方矩阵与 Prompt 行为合同。
 
 ## 设计原则
 

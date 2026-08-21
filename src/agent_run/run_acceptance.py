@@ -243,7 +243,6 @@ class RunAcceptanceEngine:
             clear_initial_credential_wait(
                 state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
             )
-            run.pop("reviewer_new_thread", None)
             # The reviewer has already consumed this identity even if a live
             # authority refresh discards its verdict.  Keep it unavailable to
             # the fresh Acceptance that follows a drift.
@@ -254,7 +253,7 @@ class RunAcceptanceEngine:
                 return False
         finally:
             self.git.remove_worktree(checkout)
-        run.pop("review_new_thread", None)
+        run.pop("reviewer_new_thread", None)
         artifact = AcceptanceArtifact.parse(review.artifact)
         record = self._acceptance_record(
             state,
@@ -461,7 +460,7 @@ class RunAcceptanceEngine:
                     run.get("prior_human_blockers")
                     or run.get("reviewer_resume_thread_id")
                 )
-                and not run.get("review_new_thread")
+                and not run.get("reviewer_new_thread")
                 else None
             ),
             **(

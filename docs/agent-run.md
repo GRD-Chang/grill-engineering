@@ -5,7 +5,7 @@
 - 从 Parent Issue 启动或恢复 Delivery Run；
 - 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
-- 为每轮首次候选验收创建全新的 Fresh Validation Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
+- 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
 - Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run` 或 `resume <run-id>` 开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
@@ -171,8 +171,9 @@ Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置�
 正常 Run Acceptance Attempt 在一次性、只读的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
 复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
 最终 Ticket 集合和依赖，
-检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条独立验证 lane，后两条使用
-`skill:code-review`，且不得由父 Reviewer 替代缺失 lane；Run Reviewer 不得修改 Validation Checkout；
+检查准备好的累计 diff，并形成实际 E2E、Standards、Spec 三条独立验证 lane。E2E 默认负责代码
+稳定后的广泛运行验证，Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令；
+`skill:code-review` 是可使用的推荐 SOP，且不得由父 Reviewer 替代缺失 lane。Run Reviewer 不得修改 Validation Checkout；
 需要写入的构建、测试与验证中间产物必须放在 checkout 外可定位、仅服务本轮且结束前清理的临时路径。
 Reviewer 不得修复源码、测试、配置或 `.gitignore`。Ticket Completion
 Revision 按 Ticket number 数值排序，且只绑定已集成 SHA、冻结 Effective Revision 与已验收
@@ -269,12 +270,13 @@ Worker 误写权威历史，不承诺抵抗恶意进程、主动搜索其他宿�
 Codex 可以返回 Development Summary、Publication Artifact 或 Acceptance Artifact，
 但发布动作只能由 Publisher 执行。
 
-Development Codex 使用 `skill:implement` 完成实现、自测和真实 E2E，并派发不同
-subagent 使用 `skill:code-review` 分别执行 Standards 与 Spec Review。它不能自行替代
-缺失审查。Fresh Validation 不接收 Development Summary 或开发侧验证结论，在独立只读
-Validation Checkout 中派发三个不同 subagent，分别完成 E2E、Standards 和 Spec 验证；需要写入的
-验证中间产物必须放在 checkout 外可清理的本轮临时路径；
-subagent 派发失败时必须解决问题并重新派发。
+Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证，并根据实际
+改动风险选择 self-preflight、定向 Reviewer 或 `skill:code-review`。低风险局部改动不固定
+支付完整开发侧预审成本；大型、跨模块或高风险改动仍应取得足够审查。Fresh Acceptance
+不接收 Development Summary 或开发侧验证结论，在独立只读 Validation Checkout 中形成
+E2E、Standards 和 Spec 三条独立验收 lane；`skill:code-review` 是 Standards/Spec 可使用的
+推荐 SOP。需要写入的验证中间产物必须放在 checkout 外可定位、只服务本轮并在结束前清理
+的临时路径。Prompt 不规定固定 subagent 数量、精确调用次数、调用顺序或嵌套层级。
 Controller 不解析 Codex 内部事件流来审计 subagent 身份或 skill 调用；它信任上述
 Prompt 合同，并确定性校验 Fresh 父 Reviewer 不复用 Development/旧 Reviewer Thread、
 三个 lane 均有合法状态和证据，以及外层 SHA/Revision 绑定。
