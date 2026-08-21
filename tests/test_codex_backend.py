@@ -333,7 +333,9 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
 ) -> None:
     attempts: list[list[str]] = []
 
-    def fake_run(arguments: list[str], **_options: Any) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
         attempts.append(arguments)
         output = Path(arguments[arguments.index("--output-last-message") + 1])
         output.write_text(
@@ -363,6 +365,111 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     assert result.thread_id == "development-thread"
     assert len(attempts) == 2
     assert "resume" in attempts[1]
+
+
+def test_bound_model_and_effort_are_sent_on_fresh_resume_and_output_repair(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    attempts: list[list[str]] = []
+    invalid_once = True
+
+    def fake_run(
+        arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal invalid_once
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        invalid = invalid_once
+        invalid_once = False
+        output.write_text(
+            json.dumps(
+                {"invalid": "first attempt"}
+                if invalid
+                else {
+                    "result_kind": "development",
+                    "summary": "Bound configuration was preserved.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"bound-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    binding = {
+        "model": "bound-model",
+        "reasoning_effort": "high",
+    }
+    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
+    result = backend.develop(
+        {"checkout": str(tmp_path), "_execution_binding": binding}
+    )
+    assert result.thread_id == "bound-thread"
+    assert len(attempts) == 2
+    assert "resume" in attempts[1]
+
+    attempts.clear()
+    backend.develop(
+        {
+            "checkout": str(tmp_path),
+            "thread_id": "bound-thread",
+            "_invocation_mode": "resume",
+            "_execution_binding": binding,
+        }
+    )
+    assert len(attempts) == 1
+    assert "resume" in attempts[0]
+    for arguments in attempts:
+        assert _contains_pair(arguments, "--model", "bound-model")
+        assert _contains_pair(
+            arguments, "--config", 'model_reasoning_effort="high"'
+        )
+
+
+def test_bound_codex_failure_is_preserved_without_model_fallback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    attempts: list[list[str]] = []
+
+    def failed_run(
+        arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        return subprocess.CompletedProcess(
+            arguments,
+            1,
+            '{"type":"turn.failed","error":{"message":"unsupported model"}}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", failed_run)
+    with pytest.raises(CodexProcessError, match="unsupported model"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+            {
+                "checkout": str(tmp_path),
+                "_execution_binding": {
+                    "model": "unavailable-model",
+                    "reasoning_effort": "ultra",
+                },
+            }
+        )
+    assert len(attempts) == 1
+    assert _contains_pair(attempts[0], "--model", "unavailable-model")
+    assert _contains_pair(
+        attempts[0], "--config", 'model_reasoning_effort="ultra"'
+    )
+
+
+def _contains_pair(arguments: list[str], option: str, value: str) -> bool:
+    return any(
+        arguments[index : index + 2] == [option, value]
+        for index in range(len(arguments) - 1)
+    )
 
 
 def test_failure_resume_rechecks_current_workspace_before_development(

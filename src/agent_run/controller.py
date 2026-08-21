@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent_run.agent_profiles import AgentProfileStore
 from agent_run.change_currentness import (
     candidate_or_acceptance_is_inconsistent,
     has_currentness_facts,
@@ -63,12 +64,14 @@ class Controller:
         git: GitRepository,
         states: StateStore,
         locator: RunLocatorIndex | None = None,
+        profiles: AgentProfileStore | None = None,
     ) -> None:
         self.github = github
         self.states = states
         self.checkout = git.root
         self.publisher = Publisher(git)
         self.locator = locator
+        self.profiles = profiles
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -165,6 +168,7 @@ class Controller:
             ensure_supervision_window(existing)
             existing["updated_at"] = _now()
             self.states.save_run(str(existing["run_id"]), existing)
+            self._initialize_direct_profile(existing)
             self._register_pending_locator(existing)
             return existing, resumed
 
@@ -292,6 +296,7 @@ class Controller:
             _mark_failed_invocation_resuming(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
+            self._initialize_direct_profile(state)
             return state, True
 
     def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -931,6 +936,7 @@ class Controller:
             # resumed against the same durable Run rather than creating a new
             # branch or Worker identity on the next foreground invocation.
             self.states.save_run(run_id, state)
+            self._initialize_direct_profile(state)
         else:
             state = existing
             require_current_run_state(state)
@@ -1000,6 +1006,12 @@ class Controller:
         )
         state.pop("locator_registration_pending")
         self.states.save_run(run_id, state)
+
+    def _initialize_direct_profile(self, state: dict[str, Any]) -> None:
+        if self.profiles is None:
+            run_id = state.get("run_id")
+            if isinstance(run_id, str):
+                AgentProfileStore(self.states.root).initialize(run_id)
 
     def _available_run_id(
         self, repository: str, parent_number: int, base_sha: str

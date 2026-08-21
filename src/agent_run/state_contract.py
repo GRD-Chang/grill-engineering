@@ -457,6 +457,40 @@ def _require_invocation(
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.{key}"
             )
+    for key in (
+        "binding_id",
+        "binding_role",
+        "profile_role",
+        "model",
+        "reasoning_effort",
+    ):
+        value = invocation.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.{key}"
+            )
+    for key in ("binding_role", "profile_role"):
+        role_value = invocation.get(key)
+        if role_value is not None and role_value not in {
+            "development",
+            "review",
+            "publication",
+        }:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.{key}"
+            )
+    revision = invocation.get("profile_revision")
+    if revision is not None and (
+        not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.profile_revision"
+        )
+    binding = invocation.get("thread_execution_binding")
+    if binding is not None and not isinstance(binding, dict):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.thread_execution_binding"
+        )
 
 
 def _require_active_invocation_identity(

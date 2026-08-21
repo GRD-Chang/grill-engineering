@@ -415,12 +415,22 @@ class CodexCliBackend:
                     "不要修改文件或继续开发。校验错误：" + validation_error[:2000]
                 )
             try:
+                execution_binding = request.get("_execution_binding")
+                model = None
+                reasoning_effort = None
+                if isinstance(execution_binding, dict):
+                    model = _optional_string(execution_binding, "model")
+                    reasoning_effort = _optional_string(
+                        execution_binding, "reasoning_effort"
+                    )
                 output, reported_thread = self._invoke(
                     prompt=attempt_prompt,
                     checkout=checkout,
                     thread_id=current_thread,
                     schema=schema,
                     writable_checkout=initial_writable_checkout and attempt == 1,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
                     on_thread=lambda value: notify(
                         "thread_started",
                         reported_thread_id=value,
@@ -529,6 +539,8 @@ class CodexCliBackend:
         thread_id: str | None,
         schema: dict[str, Any] | None = None,
         writable_checkout: bool = True,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
         on_thread: Callable[[str], None] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
@@ -557,6 +569,12 @@ class CodexCliBackend:
                     "--dangerously-bypass-approvals-and-sandbox",
                     thread_id,
                 ]
+            if model is not None:
+                codex_arguments.extend(["--model", model])
+            if reasoning_effort is not None:
+                codex_arguments.extend(
+                    ["--config", f'model_reasoning_effort="{reasoning_effort}"']
+                )
             if schema is not None:
                 codex_arguments.extend(["--output-schema", str(schema_path)])
             codex_arguments.extend(
