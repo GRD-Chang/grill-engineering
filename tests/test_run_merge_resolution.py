@@ -9,17 +9,19 @@ import pytest
 from agent_run.git import GitError
 from agent_run.github_fixture import FixtureGitHubPublisher
 
-from run_merge_resolution_fixture import (
+from run_merge_resolution_faults import (
     CandidateSaveCrashGit,
     CleanReprepareCrashGit,
     FindingSnapshotCrashGit,
     FindingReplayCrashGit,
     FindingReplaySaveCrashGit,
+)
+from run_merge_resolution_fixture import (
     MergeResolutionFixture,
     _git_output,
 )
 from test_cli import run_cli
-from test_run_acceptance import _passing_artifact
+from run_acceptance_test_support import _passing_artifact
 
 
 def test_merge_resolution_creates_exact_two_parent_candidate(git_repo: Path) -> None:

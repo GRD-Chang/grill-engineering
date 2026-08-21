@@ -11,7 +11,11 @@ from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
-from test_run_acceptance import _completed_run, _passing_artifact, _repair_artifact
+from run_acceptance_test_support import (
+    _completed_run,
+    _passing_artifact,
+    _repair_artifact,
+)
 
 
 @pytest.mark.parametrize(
