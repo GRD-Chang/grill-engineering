@@ -78,7 +78,7 @@ class MergeResolutionAgents:
         if fixture.candidate_finding_default_drift and len(
             self.development_requests
         ) >= 3:
-            assert request["acceptance_artifact"] == _candidate_finding_artifact()
+            assert "acceptance_artifact" not in request
             if fixture.finding_overlaps_conflict:
                 assert "candidate finding repaired shared" in (
                     checkout / "shared.txt"

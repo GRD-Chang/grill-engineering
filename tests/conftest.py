@@ -20,7 +20,15 @@ def git_repo(tmp_path: Path) -> Path:
         check=True,
     )
     (repo / "README.md").write_text("# fixture\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    (repo / "pyproject.toml").write_text(
+        "[tool.agent-run.required-checks]\n"
+        'code-failure-steps = [\n'
+        '  "fixture-ci::fixture-required-check::Run tests",\n'
+        '  "CI::quality::Run tests",\n'
+        ']\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "README.md", "pyproject.toml"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
     return repo
 

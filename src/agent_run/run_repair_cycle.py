@@ -121,6 +121,7 @@ def rotate_repair_job(
         "ticket_write_intent",
         "linked_branch_display",
         "pending_attempt",
+        "integrated_revalidation_merge",
     ):
         rotated.pop(key, None)
     rotated.update(

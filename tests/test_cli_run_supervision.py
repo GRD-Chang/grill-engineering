@@ -400,10 +400,36 @@ def test_run_routes_pending_parent_only_check_failure_through_repair(
 def test_run_routes_pending_final_run_check_failure_through_repair(
     git_repo: Path,
 ) -> None:
+    code_failure = {
+        "name": "quality",
+        "workflow": "CI",
+        "bucket": "fail",
+        "state": "FAILURE",
+        "description": "The configured test step failed.",
+        "link": "https://example.invalid/checks/quality",
+        "job": {
+            "head_sha": "$CURRENT_HEAD",
+            "name": "quality",
+            "workflow_name": "CI",
+            "status": "completed",
+            "conclusion": "failure",
+            "steps": [
+                {
+                    "name": "Run tests",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "number": 6,
+                }
+            ],
+        },
+    }
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
-        delivery={"required_checks": ["none", "pending", "fail", "pass", "pass"]},
+        delivery={
+            "required_checks": ["none", "pending", "fail", "pass", "pass"],
+            "required_check_evidence": {"pr_number": 1, "checks": [code_failure]},
+        },
     )
     agents = run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
@@ -459,6 +485,93 @@ def test_run_routes_pending_final_run_check_failure_through_repair(
         if status.get("pr_number") == final_prs[0]["number"]
     ]
     assert final_statuses[-1]["required_checks"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {
+            "name": "cancelled",
+            "workflow": "ci",
+            "bucket": "cancel",
+            "state": "CANCELLED",
+            "description": "cancelled",
+            "link": "https://example.invalid/checks/cancelled",
+        },
+        {
+            "name": "quality",
+            "workflow": "CI",
+            "bucket": "fail",
+            "state": "FAILURE",
+            "description": "The configured job failed.",
+            "link": "https://example.invalid/checks/quality",
+            "job": {
+                "head_sha": "$CURRENT_HEAD",
+                "name": "quality",
+                "workflow_name": "CI",
+                "status": "completed",
+                "conclusion": "failure",
+                "steps": [
+                    {
+                        "name": "Install system dependencies",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "number": 3,
+                    },
+                    {
+                        "name": "Run tests",
+                        "status": "completed",
+                        "conclusion": "skipped",
+                        "number": 6,
+                    },
+                ],
+            },
+        },
+        {
+            "name": "unknown",
+            "workflow": "ci",
+            "bucket": "fail",
+            "description": "missing conclusion",
+            "link": "https://example.invalid/checks/unknown",
+        },
+    ],
+    ids=("cancelled", "platform", "unknown"),
+)
+def test_public_run_supervises_non_repairable_final_check_failure(
+    git_repo: Path, check: dict[str, Any]
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={
+            "required_checks": ["none", "fail"],
+            "required_check_evidence": {"pr_number": 1, "checks": [check]},
+        },
+    )
+    agents = run_agents(git_repo / "agents.json")
+
+    waiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert waiting.returncode == 2, waiting.stderr
+    assert stdout_json(waiting)["status"] == "supervision_timeout"
+    state = load_only_run_state(git_repo)
+    assert state["run_acceptance"]["modification_attempts"] == 0
+    assert "repair_request" not in state["run_acceptance"]
+    assert "repair_job" not in state["run_acceptance"]
+    assert state["run_acceptance"].get("repair_generation", 0) == 0
+    assert state["run_acceptance"].get("candidate_acceptance_history", []) == []
+    assert not any(
+        invocation.get("work_subject") == f"run-repair:{state['run_id']}"
+        for invocation in state["agent_invocation_history"]
+    )
+    assert state["run_publication"]["phase"] == "waiting_external"
+    status = stdout_json(
+        run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
+    )
+    assert status["supervision"]["kind"] == "github_convergence"
+    assert status["supervision"]["timeout_resume_action"] == (
+        f"agent-run resume {state['run_id']}"
+    )
 
 
 def test_run_resumes_repair_promotion_after_merged_pr_readback_lags(

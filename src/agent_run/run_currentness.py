@@ -8,13 +8,7 @@ from agent_run.git import GitRepository
 from agent_run.graph import state_from_graph
 from agent_run.models import Repository
 from agent_run.scope_changes import reconcile_structure
-from agent_run.state_contract import (
-    MAX_CANDIDATE_ACCEPTANCE_HISTORY as _MAX_CANDIDATE_ACCEPTANCE_HISTORY,
-    require_candidate_acceptance_history,
-)
-
-
-MAX_CANDIDATE_ACCEPTANCE_HISTORY = _MAX_CANDIDATE_ACCEPTANCE_HISTORY
+from agent_run.state_contract import require_candidate_acceptance_history
 
 
 class RunCurrentnessReader(Protocol):
@@ -128,7 +122,7 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
         run["candidate_acceptance_history"] = [
             *run_history,
             *deepcopy(candidate_history),
-        ][-MAX_CANDIDATE_ACCEPTANCE_HISTORY:]
+        ]
         discarded = _string_list(run, "discarded_repair_thread_ids")
         for key in ("development_thread_id",):
             value = repair_job.get(key)

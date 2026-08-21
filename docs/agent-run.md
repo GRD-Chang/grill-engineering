@@ -45,6 +45,18 @@ AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
   agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
+会触发代码修复的 Required Check 必须由 GitHub Actions job API 准确绑定当前 PR head，且失败
+只发生在仓库 `pyproject.toml` 显式列出的稳定 `workflow::name::step`；缺少或矛盾的
+job/step 事实、runner/network 等平台步骤失败和未配置 step 都会 fail closed 地留在 Controller 监督：
+
+```toml
+[tool.agent-run.required-checks]
+code-failure-steps = [
+  "CI::quality::Run tests",
+  "CI::quality::Run type checks",
+]
+```
+
 `status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。处于
 外部等待或监督超时时，两种格式均显示等待种类、对象、head/base、窗口开始与截止、剩余时间、
 重试次数、脱敏的最新观测，以及超时后的唯一恢复操作。前台等待每个轮询间隔至多输出一次同样
@@ -142,8 +154,9 @@ agent-run requeue <run-id> --repo OWNER/REPO
 重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
 Required Checks 仍为 pending 时，`run` 在有限窗口内监督；窗口到期后保存
 `supervision_timeout`，状态提示的恢复操作是 `resume`（同一 Parent 的显式 `run` 同样允许）；两者均不会重复创建 PR 或消耗修改预算。
-Required Check 失败时，Controller 将失败 check 的名称、workflow、描述和链接作为
-原始 CI Evidence 交回同一 Development Thread。
+Required Check 失败时，Controller 读取失败 check 的名称、workflow、描述和链接，并读取其
+Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置明确声明的 code/test step
+被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
 
 新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、仓库根和 `.agent-run` state 目录，最多保留
 最近 32 条，不回填或迁移历史 Run。因此，`status` 与 `history` 可在任意目录下按 Run ID 自动定位；
@@ -167,7 +180,12 @@ base/tree；已关闭 Ticket 后续 title/body 编辑不改变该版本，普通
 Completion Record、
 Expected Merge Result 与 SHA/Revision 绑定只由 Controller 在验收外层校验，不进入 Codex
 Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
-代码修改形成新的 Run Branch commit、废弃旧验收，再由全新 Reviewer 重新检查完整累计结果。
+代码修改先形成不可变 repair Candidate，由全新的 Candidate Run Acceptance Reviewer 按完整 Parent 范围
+检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后仍须经过 repair PR Publication、
+Required Checks、Published-Head Gate 与实际合入；Controller 只在 Candidate tree、repair base、实际 Run tree、
+default head、Parent/Graph revision 和 Ticket Completion records 全部精确匹配时提升该结论。若仅 default head
+前进，Controller 在原 Repair Cycle 重新预演并验收最新组合；其余权威边界失配才废弃 Candidate，并进入新的
+Run Acceptance Generation。
 仅当 Run Reviewer 报告 Human Blocker 后执行 `resume` 时，Controller 复用刚刚被阻塞的
 Reviewer Thread，但仍创建新的 Validation Checkout，并要求它重新读取权威状态和重新验收。
 无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
@@ -183,10 +201,13 @@ commit。合并结果与已验收的预期 merge tree 一致后，Publisher 记�
 closeout 审计评论并显式关闭 Parent Issue。
 
 `approve` 每次都会重新读取 Parent/Graph revision、Run Branch、默认分支、PR head、Fresh
-Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并的默认分支漂移回到 fresh
-Run Acceptance；真实 merge conflict 与最终 PR Required Checks 失败会排入同一个有界 Run
-Repair 引擎。`revise` 原样保存维护者反馈、重置一个新的十次实际变更预算，并同样回到
-Run Repair → fresh Run Acceptance → 新 PR 语义。`abandon` 先把
+Acceptance 与 Required Checks。任一漂移都会拒绝旧批准：可合并的默认分支漂移重新验收准确最新组合，
+真实 merge conflict 与最终 PR Required Checks 失败会排入同一个有界 Run Repair 引擎。Run Repair 遵循
+Repair → Candidate Run Acceptance → 严格 promotion 的路径；若 promotion 的 Candidate、repair base、实际
+Run tree、Parent、Graph 或 Completion 任一非 default 绑定失配，才回退到 fresh Run Acceptance。若只有
+default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；已集成 Job 在 revalidation 中又收到 Finding 时，
+Controller 保留 Repair Thread、Integration-repair Worktree 与计数，归档旧 Job/PR 并轮转新的 branch/PR。
+`revise` 原样保存维护者反馈、重置一个新的十次实际变更预算，并进入同一 Candidate/promotion 语义。`abandon` 先把
 `abandonment_pending` 与逐项恢复义务写入耐久状态，再幂等关闭未合并的自动化 PR、只重开
 带有本 Run Publisher close 证据且尚未进入默认分支的 Ticket。任一步响应丢失后，其他生命周期
 命令都不会恢复正常发布；重复 `abandon` 会在 GitHub 暴露精确 close 或外部 transition 后继续

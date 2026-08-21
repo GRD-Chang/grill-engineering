@@ -10,10 +10,7 @@ from typing import Any
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitError, GitRepository
-from agent_run.run_currentness import (
-    MAX_CANDIDATE_ACCEPTANCE_HISTORY,
-    ticket_completion_records,
-)
+from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import uses_merge_resolution
 from agent_run.state_contract import require_candidate_acceptance_history
 
@@ -98,10 +95,7 @@ class CandidateRunAcceptance:
         require_candidate_acceptance_history(
             [entry], "run_acceptance.repair_job.candidate_acceptance"
         )
-        job["candidate_acceptance_history"] = [
-            *history,
-            entry,
-        ][-MAX_CANDIDATE_ACCEPTANCE_HISTORY:]
+        job["candidate_acceptance_history"] = [*history, entry]
         return record
 
     def is_current(

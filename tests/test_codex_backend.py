@@ -940,7 +940,7 @@ def test_development_prompt_matches_normal_and_repair_contracts(
         )
 
 
-def test_merge_conflict_prompt_preserves_unresolved_acceptance_artifact() -> None:
+def test_merge_conflict_prompt_excludes_unresolved_acceptance_artifact() -> None:
     artifact = failed_acceptance_artifact("Preserve this Candidate finding.")
 
     prompt = CodexCliBackend._development_prompt(
@@ -954,9 +954,9 @@ def test_merge_conflict_prompt_preserves_unresolved_acceptance_artifact() -> Non
     )
 
     assert "Merge Conflict Evidence (verbatim)" in prompt
-    assert "Unresolved Acceptance Artifact (verbatim JSON)" in prompt
-    assert "Preserve this Candidate finding." in prompt
-    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
+    assert "Unresolved Acceptance Artifact" not in prompt
+    assert "Preserve this Candidate finding." not in prompt
+    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) not in prompt
 
 
 def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None:

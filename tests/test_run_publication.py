@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,9 @@ from agent_run.agents import ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.codex import CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
+from agent_run.github_publish import GhGitHubPublisher
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -93,6 +96,16 @@ class DelayedChecksRunPublisher(FixtureGitHubPublisher):
                 "github_timeout", "final PR checks have not converged"
             )
         return super().required_checks(pr_number)
+
+
+class CountingNarrativeRefreshPublisher(FixtureGitHubPublisher):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.refresh_attempts = 0
+
+    def refresh_run_pr_narrative(self, **kwargs: Any) -> None:
+        self.refresh_attempts += 1
+        super().refresh_run_pr_narrative(**kwargs)
 
 
 class UnknownNarrativeWritePublisher(FixtureGitHubPublisher):
@@ -263,7 +276,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     assert waiting["status"] == "waiting_external"
     assert waiting["run_publication"]["phase"] == "waiting_external"
     assert waiting["diagnostics"][0]["waiting_for"] == (
-        "Final Run PR GitHub reconciliation"
+        "Run PR #1 Required Checks observation"
     )
     assert len(agents.requests) == 1
 
@@ -271,6 +284,67 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
 
     assert resumed["status"] == "run_approval_pending"
     assert len(agents.requests) == 1
+
+
+def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
+    git_repo: Path,
+) -> None:
+    state, states, git, _publisher = _accepted_run(git_repo)
+    publisher = CountingNarrativeRefreshPublisher(git_repo / "github.json", git)
+    publisher.data["delivery"]["run_required_checks_read_failures"] = [
+        {
+            "code": "github_write_failed",
+            "message": "temporary gh pr checks failure",
+        }
+    ]
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["terminal_kind"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert waiting["supervision_window"]["kind"] == "github_convergence"
+    assert waiting["diagnostics"][0]["waiting_for"].endswith(
+        "Required Checks observation"
+    )
+    assert all(
+        diagnostic["code"] != "github_write_outcome_unknown"
+        for diagnostic in waiting["diagnostics"]
+    )
+    before_resume = json.loads((git_repo / "github.json").read_text(encoding="utf-8"))
+    final_prs = [
+        pull
+        for pull in before_resume["delivery"]["pull_requests"]
+        if pull.get("scope") == "final_run"
+    ]
+    assert len(final_prs) == 1
+    assert publisher.refresh_attempts == 0
+    original_title = final_prs[0]["title"]
+    original_body = final_prs[0]["body"]
+
+    resumed = engine.publish(str(state["run_id"]))
+
+    assert resumed["status"] == "run_approval_pending"
+    assert len(agents.requests) == 1
+    assert publisher.refresh_attempts == 0
+    after_resume = json.loads((git_repo / "github.json").read_text(encoding="utf-8"))
+    resumed_prs = [
+        pull
+        for pull in after_resume["delivery"]["pull_requests"]
+        if pull.get("scope") == "final_run"
+    ]
+    assert len(resumed_prs) == 1
+    assert resumed_prs[0]["title"] == original_title
+    assert resumed_prs[0]["body"] == original_body
 
 
 def test_unknown_final_pr_narrative_write_does_not_replay(
@@ -286,6 +360,15 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
         default_branch="main",
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
+    assert initial["status"] == "run_approval_pending"
+    # Model an interruption after the PR narrative write but before its
+    # Publication Record became durable. Recovery must reconcile the write
+    # intent without replaying it.
+    initial["run_publication"].pop("record")
+    initial["run_publication"]["phase"] = "waiting_external"
+    initial["status"] = "waiting_external"
+    initial["terminal_kind"] = "waiting_external"
+    states.save_run(str(state["run_id"]), initial)
     uncertain_publisher = UnknownNarrativeWritePublisher(
         git_repo / "github.json", git
     )
@@ -301,7 +384,6 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
     waiting = engine.publish(str(state["run_id"]))
     resumed = engine.publish(str(state["run_id"]))
 
-    assert initial["status"] == "run_approval_pending"
     assert waiting["status"] == "waiting_external"
     assert resumed["status"] == "run_approval_pending"
     assert uncertain_publisher.refresh_attempts == 1
@@ -723,9 +805,151 @@ def test_final_check_failure_enters_shared_run_repair(git_repo: Path) -> None:
     )
 
 
-def test_final_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
+@pytest.mark.parametrize(
+    "check",
+    [
+        {
+            "name": "cancelled",
+            "workflow": "ci",
+            "bucket": "cancel",
+            "state": "CANCELLED",
+            "description": "cancelled",
+            "link": "https://example.invalid/checks/cancelled",
+        },
+        {
+            "name": "platform",
+            "workflow": "ci",
+            "bucket": "fail",
+            "state": "TIMED_OUT",
+            "description": "runner timeout",
+            "link": "https://example.invalid/checks/platform",
+        },
+        {
+            "name": "unknown",
+            "workflow": "ci",
+            "bucket": "fail",
+            "description": "missing conclusion",
+            "link": "https://example.invalid/checks/unknown",
+        },
+    ],
+    ids=("cancelled", "platform", "unknown"),
+)
+def test_final_non_repairable_check_failure_is_supervised_without_candidate(
+    git_repo: Path, check: dict[str, str]
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"].update(
+        {
+            "required_checks": ["fail"],
+            "required_check_evidence": {
+                "pr_number": 1,
+                "checks": [check],
+            },
+        }
+    )
+    before_run = deepcopy(state["run_acceptance"])
+
+    waiting = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["terminal_kind"] == "waiting_external"
+    assert waiting["supervision_window"]["kind"] == "github_convergence"
+    assert waiting["run_acceptance"] == before_run
+    assert "repair_request" not in waiting["run_acceptance"]
+
+
+def test_final_check_evidence_for_a_new_head_cannot_repair_the_approved_head(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    published = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+    publisher.data["delivery"]["required_checks"] = ["fail"]
+    publisher._save()
+
+    class HeadDriftEvidencePublisher(FixtureGitHubPublisher):
+        repository = "example/project"
+
+        def _checks(self, _pr_number: int, _fields: str) -> list[object]:
+            return [
+                {
+                    "name": "quality",
+                    "workflow": "CI",
+                    "bucket": "fail",
+                    "state": "FAILURE",
+                    "description": "Tests failed on a replacement head.",
+                    "link": (
+                        "https://github.com/example/project/actions/runs/22/job/33"
+                    ),
+                }
+            ]
+
+        def _json(self, *_arguments: str, **_kwargs: object) -> object:
+            return {
+                "id": 33,
+                "head_sha": "b" * 40,
+                "name": "quality",
+                "workflow_name": "CI",
+                "status": "completed",
+                "conclusion": "failure",
+                "steps": [
+                    {
+                        "name": "Run tests",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "number": 6,
+                    }
+                ],
+            }
+
+        required_check_evidence = GhGitHubPublisher.required_check_evidence
+
+    waiting = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=HeadDriftEvidencePublisher(git_repo / "github.json", git),
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).approve(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert "repair_request" not in waiting["run_acceptance"]
+    assert "repair_job" not in waiting["run_acceptance"]
+    assert waiting["run_acceptance"]["modification_attempts"] == published[
+        "run_acceptance"
+    ]["modification_attempts"]
+
+
+@pytest.mark.parametrize("mergeable", [False, None], ids=("false", "unknown"))
+def test_final_mergeability_hint_with_clean_local_merge_starts_fresh_acceptance(
+    git_repo: Path, mergeable: bool | None
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     publisher.data["delivery"]["mergeable"] = False
+    if mergeable is None:
+        original_live_pull_request = publisher.live_pull_request
+
+        def live_pull_request(pr_number: int) -> dict[str, Any]:
+            live = original_live_pull_request(pr_number)
+            live["mergeable"] = None
+            return live
+
+        publisher.live_pull_request = live_pull_request  # type: ignore[method-assign]
     published = RunPublicationEngine(
         git=git,
         states=states,
@@ -736,7 +960,7 @@ def test_final_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
     ).publish(str(state["run_id"]))
     assert published["status"] == "run_approval_pending"
 
-    conflicted = RunPublicationEngine(
+    refreshed = RunPublicationEngine(
         git=git,
         states=states,
         agents=RunPublicationAgents(),
@@ -745,11 +969,137 @@ def test_final_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
         default_head_sha=git.resolve("main"),
     ).approve(str(state["run_id"]))
 
-    assert conflicted["status"] == "run_acceptance_pending"
-    assert (
-        conflicted["run_acceptance"]["repair_request"]["repair_source"]
-        == "merge_conflict"
+    assert refreshed["status"] == "run_acceptance_pending"
+    assert refreshed["run_acceptance"]["phase"] == "pending"
+    assert "repair_request" not in refreshed["run_acceptance"]
+    assert "repair_job" not in refreshed["run_acceptance"]
+
+
+def test_final_merge_preview_git_failure_does_not_start_integration_repair(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["mergeable"] = False
+    published = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+
+    class FailingPreviewGit(GitRepository):
+        def prepare_expected_merge_checkout(
+            self,
+            *,
+            default_head_sha: str,
+            run_head_sha: str,
+            checkout: Path,
+        ) -> None:
+            del default_head_sha, run_head_sha, checkout
+            raise GitError("worktree creation failed")
+
+    with pytest.raises(GitError, match="worktree creation failed"):
+        RunPublicationEngine(
+            git=FailingPreviewGit(git_repo),
+            states=states,
+            agents=RunPublicationAgents(),
+            github=publisher,
+            default_branch="main",
+            default_head_sha=git.resolve("main"),
+        ).approve(str(state["run_id"]))
+
+    preserved = states.load_run(str(state["run_id"]))
+    assert preserved is not None
+    assert preserved["status"] == published["status"]
+    assert "repair_request" not in preserved["run_acceptance"]
+    assert "repair_job" not in preserved["run_acceptance"]
+
+
+def test_final_real_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
+    accepted, states, git, publisher = _accepted_run(git_repo)
+    run_worktree = git_repo.parent / "conflicting-run"
+    subprocess.run(
+        ["git", "worktree", "add", str(run_worktree), str(accepted["run_branch"])],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
     )
+    try:
+        (run_worktree / "shared.txt").write_text("run side\n", encoding="utf-8")
+        subprocess.run(["git", "add", "shared.txt"], cwd=run_worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add run-side content"],
+            cwd=run_worktree,
+            check=True,
+            capture_output=True,
+        )
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(run_worktree)],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+    accepted["ticket_jobs"]["2"]["integrated_sha"] = git.resolve(
+        str(accepted["run_branch"])
+    )
+    states.save_run(str(accepted["run_id"]), accepted)
+
+    class ConflictRunReviewer:
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            del request
+            return ReviewResult("conflict-run-reviewer", _passing_artifact())
+
+    reviewer = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=ConflictRunReviewer(),
+        github=publisher,
+        default_head_sha=git.resolve("main"),
+    )
+    refreshed = reviewer.accept(str(accepted["run_id"]))
+    if refreshed["run_acceptance"]["phase"] != "accepted":
+        refreshed = reviewer.accept(str(accepted["run_id"]))
+    assert refreshed["run_acceptance"]["phase"] == "accepted"
+    accepted = refreshed
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+    engine.publish(str(accepted["run_id"]))
+    conflict_path = "shared.txt"
+    target = git_repo / conflict_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("default side\n", encoding="utf-8")
+    subprocess.run(["git", "add", conflict_path], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add conflicting default content"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    publisher.data["default_head_sha"] = git.resolve("main")
+    publisher._save()
+
+    conflicted = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).approve(str(accepted["run_id"]))
+
+    assert conflicted["status"] == "run_acceptance_pending"
+    request = conflicted["run_acceptance"]["repair_request"]
+    assert request["repair_source"] == "merge_conflict"
+    assert conflict_path in request["merge_conflict_evidence"]
 
 
 def test_approve_recovers_a_merge_that_succeeded_before_state_save(

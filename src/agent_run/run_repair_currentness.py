@@ -126,7 +126,9 @@ class RunRepairCurrentness:
         if head_transitioned_after_merge or not isinstance(evidence_fingerprint, str):
             return True
         try:
-            current_evidence = self.github.required_check_evidence(pr_number)
+            current_evidence = self.github.required_check_evidence(
+                pr_number, expected_head_sha=str(live["head_sha"])
+            )
         except (GitHubReadError, OSError, TimeoutError) as error:
             if isinstance(error, GitHubReadError) and not is_github_convergence_error(
                 error.code

@@ -11,6 +11,8 @@ from typing import Any
 
 import pytest
 
+import agent_run.change_delivery as change_delivery_module
+
 from agent_run.agents import (
     DevelopmentResult,
     HumanBlockerResult,
@@ -31,6 +33,7 @@ from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_loop import TicketDeliveryAdapter
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
+from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.parent_delivery_loop import ParentDeliveryAdapter, ParentDeliveryLoop
 from agent_run.revisions import effective_revision
@@ -415,6 +418,8 @@ class ScriptedPublisher:
                     "name": "test",
                     "workflow": "ci",
                     "bucket": "fail",
+                    "state": "FAILURE",
+                    "repairability": "code_failure",
                     "description": "The test job failed.",
                     "link": "https://example.invalid/checks/test",
                 }
@@ -501,7 +506,10 @@ class ScriptedPublisher:
         self.check_position += 1
         return value
 
-    def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
+    def required_check_evidence(
+        self, pr_number: int, *, expected_head_sha: str | None = None
+    ) -> dict[str, Any]:
+        del expected_head_sha
         assert pr_number == self.pr_number
         return self.failed_check_evidence
 
@@ -1184,12 +1192,16 @@ class CheckEvidenceFailsOncePublisher(ScriptedPublisher):
         self.checks = ["fail", "fail", "pass"]
         self.evidence_error: BaseException | None = error
 
-    def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
+    def required_check_evidence(
+        self, pr_number: int, *, expected_head_sha: str | None = None
+    ) -> dict[str, Any]:
         if self.evidence_error is not None:
             error = self.evidence_error
             self.evidence_error = None
             raise error
-        return super().required_check_evidence(pr_number)
+        return super().required_check_evidence(
+            pr_number, expected_head_sha=expected_head_sha
+        )
 
 
 class PublicationContextFailsUntilResumedPublisher(ScriptedPublisher):
@@ -1956,6 +1968,130 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert len(publisher.pr_bodies) == 2
     assert len(publisher.agent_run_statuses) == 1
     assert publisher.agent_run_statuses[0]["validation_outcome"] == "pass"
+
+
+def test_real_github_evidence_policy_routes_code_failure_to_development(
+    git_repo: Path,
+) -> None:
+    (git_repo / "pyproject.toml").write_text(
+        "[tool.agent-run.required-checks]\n"
+        'code-failure-steps = ["ci::test::Run tests"]\n',
+        encoding="utf-8",
+    )
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+
+    class RealEvidencePublisher(ScriptedPublisher):
+        def __init__(self, repo: Path) -> None:
+            super().__init__(repo)
+            self.git = GitRepository(repo)
+            self.repository = "example/project"
+
+        def _checks(self, _pr_number: int, _fields: str) -> list[object]:
+            return [dict(self.failed_check_evidence["checks"][0])]
+
+        def _json(self, *_arguments: str, **_kwargs: object) -> object:
+            return {
+                "id": 33,
+                "head_sha": self.live_head,
+                "name": "test",
+                "workflow_name": "ci",
+                "status": "completed",
+                "conclusion": "failure",
+                "steps": [
+                    {
+                        "name": "Run tests",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "number": 1,
+                    }
+                ],
+            }
+
+        required_check_evidence = GhGitHubPublisher.required_check_evidence
+
+    publisher = RealEvidencePublisher(git_repo)
+    publisher.checks = ["fail", "pass"]
+    publisher.failed_check_evidence["checks"][0].pop("repairability", None)
+    publisher.failed_check_evidence["checks"][0]["link"] = (
+        "https://github.com/example/project/actions/runs/22/job/33"
+    )
+    agents = CheckRepairAgents(checkout)
+
+    completed = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert len(agents.development_requests) == 2
+    assert agents.development_requests[1]["ci_evidence"]["checks"][0][
+        "repairability"
+    ] == "code_failure"
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {
+            "name": "cancelled-test",
+            "workflow": "ci",
+            "bucket": "cancel",
+            "state": "CANCELLED",
+            "description": "The job was cancelled.",
+            "link": "https://example.invalid/checks/cancelled",
+        },
+        {
+            "name": "platform-test",
+            "workflow": "ci",
+            "bucket": "fail",
+            "state": "FAILURE",
+            "description": "The runner platform timed out.",
+            "link": "https://example.invalid/checks/platform",
+        },
+        {
+            "name": "unknown-test",
+            "workflow": "ci",
+            "bucket": "fail",
+            "description": "No authoritative conclusion was reported.",
+            "link": "https://example.invalid/checks/unknown",
+        },
+    ],
+    ids=("cancelled", "platform", "unknown"),
+)
+def test_non_repairable_required_check_failure_stays_under_supervision(
+    git_repo: Path, check: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail"]
+    publisher.failed_check_evidence = {
+        "pr_number": publisher.pr_number,
+        "checks": [check],
+    }
+    agents = CheckRepairAgents(checkout)
+
+    waiting = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    job = waiting["active_ticket_job"]
+    assert waiting["status"] == "waiting_external"
+    assert waiting["terminal_kind"] == "waiting_external"
+    assert waiting["supervision_window"]["kind"] == "github_convergence"
+    assert job["phase"] == "waiting_checks"
+    assert job["modification_attempts"] == 1
+    assert len(agents.development_requests) == 1
+    assert "ci_evidence" not in job
 
 
 @pytest.mark.parametrize(

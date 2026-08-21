@@ -59,9 +59,6 @@ class RunRepairRequests:
             request["human_feedback"] = str(job["human_feedback"])
         elif source == "merge_conflict":
             request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
-            unresolved_artifact = job.get("unresolved_acceptance_artifact")
-            if isinstance(unresolved_artifact, dict):
-                request["acceptance_artifact"] = unresolved_artifact
         _add_human_resume_fields(request, job)
         return request
 

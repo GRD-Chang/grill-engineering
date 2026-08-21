@@ -6,9 +6,6 @@ from typing import Any
 from agent_run.ticket_phase import TicketPhase
 
 
-MAX_CANDIDATE_ACCEPTANCE_HISTORY = 32
-
-
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
 _ACTIVE_RUN_REPAIR_PHASES = frozenset(
     {
@@ -24,6 +21,19 @@ _ACTIVE_RUN_REPAIR_PHASES = frozenset(
         "waiting_merge",
         "escalating",
         "merging",
+        "merged",
+        "blocked",
+    }
+)
+_INTEGRATED_REVALIDATION_MERGE_PHASES = frozenset(
+    {
+        "developing",
+        "repairing",
+        "committing_candidate",
+        "candidate",
+        "reviewing",
+        "accepted",
+        "escalating",
         "merged",
         "blocked",
     }
@@ -44,6 +54,14 @@ _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
         "integrated_sha",
         "repair_source",
         "outcome",
+    }
+)
+_INTEGRATED_REVALIDATION_MERGE_KEYS = frozenset(
+    {
+        "base_sha",
+        "default_base_sha",
+        "candidate_sha",
+        "publication_sha",
     }
 )
 
@@ -90,6 +108,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_human_blocker_containers(state)
     _require_candidate_acceptance_histories(state)
     _require_active_run_repair_mode(state)
+    _require_integrated_revalidation_merge(state)
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -155,15 +174,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
 def require_candidate_acceptance_history(
     value: object, location: str
 ) -> list[dict[str, Any]]:
-    """Validate the bounded, non-nested Candidate Acceptance audit shape."""
+    """Validate the durable, non-nested Candidate Acceptance audit shape."""
 
     if not isinstance(value, list):
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location} history"
-        )
-    if len(value) > MAX_CANDIDATE_ACCEPTANCE_HISTORY:
-        raise IncompatibleRunStateError(
-            f"legacy state has an overlong {location} history"
         )
     validated: list[dict[str, Any]] = []
     for index, item in enumerate(value):
@@ -236,6 +251,41 @@ def _require_active_run_repair_mode(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid run_acceptance.repair_job.repair_mode"
         )
+
+
+def _require_integrated_revalidation_merge(state: dict[str, Any]) -> None:
+    """Validate the persisted authority snapshot used after a merged repair drifts."""
+
+    acceptance = state.get("run_acceptance")
+    if not isinstance(acceptance, dict):
+        return
+    repair = acceptance.get("repair_job")
+    if not isinstance(repair, dict) or "integrated_revalidation_merge" not in repair:
+        return
+    marker = repair["integrated_revalidation_merge"]
+    location = "run_acceptance.repair_job.integrated_revalidation_merge"
+    if not isinstance(marker, dict):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location} object"
+        )
+    if set(marker) != _INTEGRATED_REVALIDATION_MERGE_KEYS:
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location} field set"
+        )
+    if repair.get("phase") not in _INTEGRATED_REVALIDATION_MERGE_PHASES:
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location} phase"
+        )
+    if repair.get("repair_mode") != "squash":
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location} repair mode"
+        )
+    for key in _INTEGRATED_REVALIDATION_MERGE_KEYS:
+        value = marker[key]
+        if not isinstance(value, str) or not value.strip():
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.{key}"
+            )
 
 
 def human_blocker_subject_count(state: dict[str, Any]) -> int:

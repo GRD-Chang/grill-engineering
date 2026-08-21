@@ -11,6 +11,7 @@ from typing import Any
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
+from agent_run.required_checks import annotate_configured_code_failures
 from agent_run.revisions import effective_revision_from_graph
 
 
@@ -67,11 +68,23 @@ class FixtureGitHubReader:
                 base_sha = _mapping(delivery, "published_branches").get(base_branch)
                 if not isinstance(base_sha, str):
                     base_sha = self.repository().default_head_sha
-                return {
+                result: dict[str, Any] = {
                     "state": pull.get("state"), "head_sha": head,
                     "base_branch": base_branch,
                     "base_sha": base_sha,
+                    "integrated_sha": pull.get("integrated_sha"),
                 }
+                integrated = pull.get("integrated_sha")
+                if isinstance(integrated, str):
+                    git = GitRepository(self.path.parent)
+                    result.update(
+                        {
+                            "head_tree": git.resolve(f"{head}^{{tree}}"),
+                            "integrated_tree": git.resolve(f"{integrated}^{{tree}}"),
+                            "integrated_parents": git.commit_parents(integrated),
+                        }
+                    )
+                return result
         raise GitHubReadError("missing_pull_request", f"PR #{pr_number} is missing")
 
     def _delivery_graph_once(self, parent_number: int) -> DeliveryGraph:
@@ -842,7 +855,9 @@ class FixtureGitHubPublisher:
             return "pass"
         return value
 
-    def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
+    def required_check_evidence(
+        self, pr_number: int, *, expected_head_sha: str | None = None
+    ) -> dict[str, Any]:
         delivery = self._delivery()
         pull = self._pull(pr_number)
         failures = delivery.get("required_check_evidence_failures")
@@ -877,20 +892,54 @@ class FixtureGitHubPublisher:
                         raise TimeoutError(message)
                     raise ValueError("fixture evidence failure type is invalid")
         configured = delivery.get("required_check_evidence")
+        actual_head_sha = str(self.live_pull_request(pr_number)["head_sha"])
         if isinstance(configured, dict):
-            return dict(configured)
-        return {
-            "pr_number": pr_number,
-            "checks": [
-                {
-                    "name": "fixture-required-check",
-                    "workflow": "fixture-ci",
-                    "bucket": "fail",
-                    "description": "The fixture required check failed.",
-                    "link": "https://example.invalid/checks/fixture",
-                }
-            ],
-        }
+            evidence = dict(configured)
+        else:
+            evidence = {
+                "pr_number": pr_number,
+                "checks": [
+                    {
+                        "name": "fixture-required-check",
+                        "workflow": "fixture-ci",
+                        "bucket": "fail",
+                        "state": "FAILURE",
+                        "description": "The fixture required check failed.",
+                        "link": "https://example.invalid/checks/fixture",
+                        "job": {
+                            "id": 1,
+                            "head_sha": actual_head_sha,
+                            "name": "fixture-required-check",
+                            "workflow_name": "fixture-ci",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "steps": [
+                                {
+                                    "name": "Run tests",
+                                    "status": "completed",
+                                    "conclusion": "failure",
+                                    "number": 1,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        checks = evidence.get("checks")
+        if isinstance(checks, list) and all(isinstance(check, dict) for check in checks):
+            normalized_checks: list[dict[str, Any]] = []
+            for raw in checks:
+                check = dict(raw)
+                job = check.get("job")
+                if isinstance(job, dict) and job.get("head_sha") == "$CURRENT_HEAD":
+                    check["job"] = {**job, "head_sha": actual_head_sha}
+                normalized_checks.append(check)
+            evidence["checks"] = annotate_configured_code_failures(
+                normalized_checks,
+                self.path.parent,
+                expected_head_sha=expected_head_sha,
+            )
+        return evidence
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         pull = self._pull(pr_number)

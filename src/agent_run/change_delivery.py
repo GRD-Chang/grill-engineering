@@ -39,6 +39,10 @@ from agent_run.external_supervision import (
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.required_checks import (
+    is_explicitly_repairable_code_failure,
+    supervise_unrepairable_check_failure,
+)
 from agent_run.state import StateStore
 from agent_run.worker_credentials import InitialCredentialUnavailable
 
@@ -1046,6 +1050,41 @@ class ChangeDeliveryEngine:
             self.save(state)
             return True
         if checks == "fail":
+            try:
+                evidence = self.github.required_check_evidence(
+                    pr_number, expected_head_sha=str(job["publication_sha"])
+                )
+            except (GitHubReadError, OSError, TimeoutError) as error:
+                if isinstance(
+                    error, GitHubReadError
+                ) and not is_github_convergence_error(error.code):
+                    raise
+                self._record_agent_run_status(
+                    pr_number,
+                    job,
+                    "unavailable",
+                    next_action="retry failed Required Check evidence observation",
+                )
+                wait_for_github_convergence(
+                    state,
+                    code="github_check_evidence_observation_pending",
+                    message="GitHub Required Check failure evidence has not converged",
+                    waiting_for=(
+                        f"Ticket PR #{pr_number} failed Required Check evidence"
+                    ),
+                )
+                ensure_supervision_window(state)
+                self.save(state)
+                return True
+            if not is_explicitly_repairable_code_failure(evidence):
+                supervise_unrepairable_check_failure(
+                    state,
+                    job,
+                    phase="waiting_checks",
+                    waiting_for=f"Change PR #{pr_number} Required Check repairability",
+                )
+                self.save(state)
+                return True
             if int(job["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS:
                 job.update(
                     {
@@ -1054,30 +1093,6 @@ class ChangeDeliveryEngine:
                     }
                 )
             else:
-                try:
-                    evidence = self.github.required_check_evidence(pr_number)
-                except (GitHubReadError, OSError, TimeoutError) as error:
-                    if isinstance(
-                        error, GitHubReadError
-                    ) and not is_github_convergence_error(error.code):
-                        raise
-                    self._record_agent_run_status(
-                        pr_number,
-                        job,
-                        "unavailable",
-                        next_action="retry failed Required Check evidence observation",
-                    )
-                    wait_for_github_convergence(
-                        state,
-                        code="github_check_evidence_observation_pending",
-                        message="GitHub Required Check failure evidence has not converged",
-                        waiting_for=(
-                            f"Ticket PR #{pr_number} failed Required Check evidence"
-                        ),
-                    )
-                    ensure_supervision_window(state)
-                    self.save(state)
-                    return True
                 job.update(
                     {
                         "phase": "repairing",

@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
 
@@ -74,11 +75,13 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         )
     if isinstance(run_repair, dict):
         print(
-            "运行修复周期: "
-            f"第 {run_repair['generation']} 代，"
-            f"代码修改 {run_repair['code_modification_attempts']}/10，"
-            f"候选验收 {run_repair['validation_attempts']} 次，"
-            f"{_display_term(run_repair['phase'])}"
+            "运行修复: "
+            f"Run Acceptance Generation {run_repair['acceptance_generation']}；"
+            f"Repair Cycle Generation {run_repair['repair_cycle_generation']}；"
+            f"代码修改 {run_repair['code_modification_attempts']}/10；"
+            f"Candidate 验证 {run_repair['validation_attempts']} 次；"
+            "Candidate 验证状态 "
+            f"{_display_term(run_repair['candidate_validation_status'])}"
         )
     print(f"已运行: {output['elapsed_seconds']} 秒")
     if output["gate"]:
@@ -367,10 +370,18 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
     cycle = acceptance.get("repair_cycle")
     if not isinstance(job, dict) or not isinstance(cycle, dict):
         return None
+    candidate_validation_status = _candidate_validation_status(job)
     return {
+        # Keep ``generation`` and ``phase`` as compatibility aliases while
+        # exposing each lifecycle dimension under an unambiguous public name.
         "generation": job.get("repair_generation"),
-        "acceptance_generation": job.get("acceptance_generation"),
+        "repair_cycle_generation": cycle.get("generation"),
+        "acceptance_generation": acceptance.get("acceptance_generation"),
         "phase": job.get("phase"),
+        # Keep the old phase-shaped name for clients already consuming it,
+        # but expose the independently derived status as the canonical field.
+        "candidate_validation_phase": candidate_validation_status,
+        "candidate_validation_status": candidate_validation_status,
         "cycle_status": cycle.get("status"),
         "code_modification_attempts": cycle.get("code_modification_attempts", 0),
         "validation_attempts": cycle.get("validation_attempts", 0),
@@ -378,6 +389,36 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "development_thread_id": cycle.get("development_thread_id"),
         "worktree": cycle.get("worktree"),
     }
+
+
+def _candidate_validation_status(job: dict[str, object]) -> str:
+    """Report the current Candidate verdict independently of delivery progress."""
+
+    if job.get("phase") == "stale":
+        return "stale"
+    record = job.get("acceptance_record")
+    candidate_sha = job.get("candidate_sha")
+    if (
+        isinstance(record, dict)
+        and isinstance(candidate_sha, str)
+        and record.get("reviewed_candidate_sha") == candidate_sha
+    ):
+        try:
+            artifact = AcceptanceArtifact.parse(record.get("artifact"))
+        except ValueError:
+            # An interrupted or legacy record is not a completed verdict.
+            pass
+        else:
+            if artifact.is_accepted:
+                return "pass"
+            if artifact.has_failures:
+                return "fail"
+            return "blocked"
+    if job.get("phase") == "reviewing":
+        return "reviewing"
+    if job.get("phase") == "blocked":
+        return "blocked"
+    return "unreviewed"
 
 
 def _elapsed_seconds(created_at: object) -> int | None:
@@ -415,6 +456,10 @@ def _display_term(value: object) -> object:
         "execution_failed": "执行失败，可恢复",
         "supervision_timeout": "监督超时暂停，可恢复",
         "blocked": "已阻塞",
+        "unreviewed": "未验收",
+        "pass": "已通过",
+        "fail": "未通过",
+        "stale": "已失效",
         "completed": "已完成",
         "abandoned": "已放弃",
         "developing": "开发中",

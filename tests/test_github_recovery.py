@@ -97,6 +97,12 @@ def test_github_reader_live_pull_request_returns_integrated_sha(
 
     def fake_json(*arguments: str) -> dict[str, object]:
         calls.append(arguments)
+        if arguments[:1] == ("api",):
+            sha = arguments[1].rsplit("/", 1)[-1]
+            return {
+                "tree": {"sha": f"{sha}-tree"},
+                "parents": [{"sha": "parent-a"}, {"sha": "parent-b"}],
+            }
         return {
             "state": "MERGED",
             "headRefOid": "head-sha",
@@ -110,6 +116,9 @@ def test_github_reader_live_pull_request_returns_integrated_sha(
     live = reader.live_pull_request(12)
 
     assert live["integrated_sha"] == "integrated-sha"
+    assert live["head_tree"] == "head-sha-tree"
+    assert live["integrated_tree"] == "integrated-sha-tree"
+    assert live["integrated_parents"] == ["parent-a", "parent-b"]
     assert "mergeCommit" in calls[0][-1]
 
 

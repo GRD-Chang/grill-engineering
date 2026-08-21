@@ -11,16 +11,18 @@ import pytest
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.controller import Controller
+from agent_run.change_currentness import unknown_pr_mutation
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import (
-    MAX_CANDIDATE_ACCEPTANCE_HISTORY,
+    invalidate_run_acceptance,
     invalidate_stale_run_repair,
     ticket_completion_records,
 )
 from agent_run.run_repair_currentness import RunRepairObservationPending
+from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -328,8 +330,14 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
         git.resolve(repair_branch)
 
 
-def test_merged_conflict_candidate_default_drift_requires_fresh_run_acceptance(
+@pytest.mark.parametrize(
+    ("latest_combination_has_finding", "external_base_drift"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     git_repo: Path,
+    latest_combination_has_finding: bool,
+    external_base_drift: bool,
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
@@ -368,27 +376,37 @@ def test_merged_conflict_candidate_default_drift_requires_fresh_run_acceptance(
         def __init__(self) -> None:
             self.development_requests: list[dict[str, Any]] = []
             self.review_requests: list[dict[str, Any]] = []
+            self._reviews = [_passing_artifact()]
+            self._reviews.extend(
+                [_candidate_finding_artifact(), _candidate_finding_artifact()]
+                if latest_combination_has_finding
+                else [_passing_artifact()]
+            )
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
             self.development_requests.append(request)
             checkout = Path(str(request["checkout"]))
-            assert request["repair_source"] == "merge_conflict"
-            (checkout / "shared.txt").write_text("resolved\n", encoding="utf-8")
-            return DevelopmentResult("conflict-developer", "Resolved conflict.")
+            if len(self.development_requests) == 1:
+                assert request["repair_source"] == "merge_conflict"
+                (checkout / "shared.txt").write_text("resolved\n", encoding="utf-8")
+            else:
+                assert request["repair_source"] == "acceptance"
+                (checkout / "near-budget-repair.txt").write_text(
+                    "tenth modification\n", encoding="utf-8"
+                )
+            return DevelopmentResult("conflict-developer", "Repaired latest finding.")
 
         def review(self, request: dict[str, Any]) -> ReviewResult:
             self.review_requests.append(request)
             checkout = Path(str(request["checkout"]))
             assert (checkout / "shared.txt").read_text(encoding="utf-8") == "resolved\n"
-            if len(self.review_requests) == 1:
-                assert request["candidate_acceptance"] is True
-            else:
-                assert request.get("candidate_acceptance") is not True
+            assert request["candidate_acceptance"] is True
+            if len(self.review_requests) > 1:
                 assert (checkout / "default-after-merge.txt").read_text(
                     encoding="utf-8"
                 ) == "advanced\n"
             return ReviewResult(
-                f"reviewer-{len(self.review_requests)}", _passing_artifact()
+                f"reviewer-{len(self.review_requests)}", self._reviews.pop(0)
             )
 
         def publication(self, _request: dict[str, Any]) -> dict[str, str]:
@@ -432,32 +450,152 @@ def test_merged_conflict_candidate_default_drift_requires_fresh_run_acceptance(
         currentness_reader=FixtureGitHubReader(fixture),
     ).accept(str(state["run_id"]))
 
-    stale_run = first["run_acceptance"]
+    active_run = first["run_acceptance"]
     integrated = git.resolve(run_branch)
     latest_default = git.resolve("main")
     assert first["status"] == "run_acceptance_pending"
-    assert first["terminal_kind"] == "run_acceptance_stale"
-    assert stale_run["phase"] == "pending"
-    assert "repair_job" not in stale_run
+    assert first["terminal_kind"] == "run_repair_pending"
+    assert active_run["phase"] == "repairing"
+    active_job = active_run["repair_job"]
+    generation = active_run["repair_generation"]
+    thread_id = active_job["development_thread_id"]
+    repair_checkout = Path(str(active_job["repair_checkout"]))
+    assert active_job["phase"] == "candidate"
+    assert active_job["base_sha"] == integrated
+    assert active_job["candidate_sha"] == integrated
+    assert active_job["default_base_sha"] == latest_default
+    assert active_job["repair_mode"] == "squash"
+    revalidation_merge = active_job["integrated_revalidation_merge"]
+    assert set(revalidation_merge) == {
+        "base_sha",
+        "default_base_sha",
+        "candidate_sha",
+        "publication_sha",
+    }
+    assert all(isinstance(sha, str) and sha for sha in revalidation_merge.values())
+    assert revalidation_merge["publication_sha"] == active_job["publication_sha"]
+    assert active_run["repair_cycle"]["code_modification_attempts"] == 1
+    assert repair_checkout.exists()
     assert len(agents.review_requests) == 1
 
-    accepted = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=agents,
-        github=FixtureGitHubPublisher(fixture, git),
-        default_head_sha=latest_default,
-        currentness_reader=FixtureGitHubReader(fixture),
-    ).accept(str(state["run_id"]))
+    if external_base_drift:
+        data = json.loads(fixture.read_text(encoding="utf-8"))
+        pull = data["delivery"]["pull_requests"][0]
+        pull["base_branch"] = "main"
+        mutations = deepcopy(data["delivery"].get("mutations", []))
+        fixture.write_text(json.dumps(data), encoding="utf-8")
+        empty_agents = git_repo / "blocked-revalidation-agents.json"
+        empty_agents.write_text("{}", encoding="utf-8")
 
-    assert accepted["status"] == "run_publication_pending"
-    acceptance = accepted["run_acceptance"]["acceptance_record"]
-    assert acceptance["acceptance_scope"] == "run"
-    assert "acceptance_state" not in acceptance
-    assert acceptance["reviewed_head_sha"] == integrated
-    assert acceptance["reviewed_default_base_sha"] == latest_default
-    assert len(agents.development_requests) == 1
-    assert len(agents.review_requests) == 2
+        blocked = run_cli(
+            git_repo,
+            fixture,
+            "run",
+            "1",
+            "--agent-fixture",
+            str(empty_agents),
+        )
+
+        assert blocked.returncode == 2
+        blocked_state = states.load_current_run(str(state["run_id"]))
+        assert blocked_state is not None
+        assert blocked_state["status"] == "blocked"
+        assert blocked_state["diagnostics"][0]["code"] == (
+            "change_pr_base_changed_externally"
+        )
+        after = json.loads(fixture.read_text(encoding="utf-8"))
+        assert after["delivery"].get("mutations", []) == mutations
+        assert len(agents.review_requests) == 1
+        return
+
+    if latest_combination_has_finding:
+        # Model a Cycle already close to its ten-change ceiling.  The
+        # revalidation Finding must consume the same budget instead of opening
+        # a fresh Cycle.
+        active_job["modification_attempts"] = 9
+        active_job["code_modification_attempts"] = 9
+        active_run["repair_cycle"]["code_modification_attempts"] = 9
+        active_run["modification_attempts"] = 9
+        active_run["code_modification_attempts"] = 9
+        states.save_run(str(state["run_id"]), first)
+
+    if latest_combination_has_finding:
+        exhausted = RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=agents,
+            github=FixtureGitHubPublisher(fixture, git),
+            default_head_sha=latest_default,
+            currentness_reader=FixtureGitHubReader(fixture),
+        ).accept(str(state["run_id"]))
+    else:
+        revalidation_agents = git_repo / "revalidation-agents.json"
+        revalidation_agents.write_text(
+            json.dumps(
+                {
+                    "run_reviews": [
+                        {
+                            "thread_id": "revalidation-reviewer",
+                            **_passing_artifact(),
+                        }
+                    ],
+                    "run_publications": [
+                        {
+                            "commit_message": "fix(run): complete revalidation",
+                            "pr_title": "fix(run): complete revalidation",
+                            "pr_body_markdown": (
+                                "## What Problem This Solves\n\n"
+                                "The merged repair must survive default drift.\n\n"
+                                "## Why This Change Was Made\n\n"
+                                "The public lifecycle revalidated the persisted repair.\n\n"
+                                "## User Impact\n\n"
+                                "The final Run can proceed to approval.\n\n"
+                                "## Evidence\n\n"
+                                "A separate CLI process promoted the revalidated Candidate."
+                            ),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        resumed = run_cli(
+            git_repo,
+            fixture,
+            "run",
+            "1",
+            "--agent-fixture",
+            str(revalidation_agents),
+        )
+        assert resumed.returncode == 0, resumed.stdout
+        exhausted = states.load_current_run(str(state["run_id"]))
+        assert exhausted is not None
+
+    exhausted_run = exhausted["run_acceptance"]
+    if not latest_combination_has_finding:
+        assert exhausted["status"] == "run_approval_pending"
+        assert exhausted_run["phase"] == "accepted"
+        assert exhausted_run["repair_generation"] == generation
+        assert exhausted_run["repair_cycle"]["generation"] == generation
+        assert exhausted_run["repair_cycle"]["status"] == "promoted"
+        assert exhausted_run["repair_cycle"]["code_modification_attempts"] == 1
+        assert exhausted_run["development_thread_history"] == [thread_id]
+        assert not repair_checkout.exists()
+        assert len(agents.development_requests) == 1
+        return
+
+    assert exhausted["status"] == "ready_for_human"
+    assert exhausted["terminal_kind"] == "waiting_human"
+    assert exhausted_run["repair_generation"] == generation
+    assert exhausted_run["repair_cycle"]["generation"] == generation
+    assert exhausted_run["repair_cycle"]["status"] == "budget_exhausted"
+    assert exhausted_run["repair_cycle"]["code_modification_attempts"] == 10
+    assert exhausted_run["repair_job"]["development_thread_id"] == thread_id
+    assert exhausted_run["repair_job"]["repair_checkout"] == str(repair_checkout)
+    assert agents.development_requests[-1]["checkout"] == str(repair_checkout)
+    assert not repair_checkout.exists()
+    assert len(agents.development_requests) == 2
+    assert len(agents.review_requests) == 3
 
 
 @pytest.mark.parametrize("dirty_kind", ["unstaged", "untracked"])
@@ -543,7 +681,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     artifact = _repair_artifact()
     run = {
         "phase": "repairing",
-        "acceptance_generation": 1,
+        "acceptance_generation": 4,
+        "repair_generation": 2,
         "modification_attempts": 10,
         "validation_attempts": 10,
         "development_thread_id": "run-repair-developer",
@@ -551,7 +690,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "reviewer_thread_ids": [],
         "acceptance_artifact": artifact,
         "repair_cycle": {
-            "generation": 1,
+            "generation": 2,
             "status": "active",
             "code_modification_attempts": 10,
             "validation_attempts": 10,
@@ -561,7 +700,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "run_id": state["run_id"],
         "phase": "escalating",
         "repair_attempt": 1,
-        "repair_generation": 1,
+        "repair_generation": 2,
         "repair_branch": f"agent-run-repair/{state['run_id']}/1",
         "base_sha": base_sha,
         "default_base_sha": git.resolve("main"),
@@ -603,13 +742,23 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     status_result = run_cli(
         git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
     )
+    text_status_result = run_cli(
+        git_repo, git_repo / "github.json", "status", str(state["run_id"])
+    )
     history_result = run_cli(
         git_repo, git_repo / "github.json", "history", str(state["run_id"]), "--json"
     )
-    assert status_result.returncode == history_result.returncode == 0
+    assert status_result.returncode == text_status_result.returncode == 0
+    assert history_result.returncode == 0
     status = stdout_json(status_result)
+    assert status["run_repair"]["acceptance_generation"] == 4
+    assert status["run_repair"]["repair_cycle_generation"] == 2
+    assert status["run_repair"]["candidate_validation_phase"] == "blocked"
     assert status["run_repair"]["cycle_status"] == "budget_exhausted"
     assert status["run_repair"]["code_modification_attempts"] == 10
+    assert "Run Acceptance Generation 4" in text_status_result.stdout
+    assert "Repair Cycle Generation 2" in text_status_result.stdout
+    assert "Candidate 验证状态 已阻塞" in text_status_result.stdout
     assert stdout_json(history_result)["run_id"] == state["run_id"]
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
@@ -630,53 +779,296 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     ).exists()
 
 
-def test_candidate_acceptance_history_keeps_a_bounded_recovery_window(
+def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
-    engine = RunAcceptanceEngine(
+    run = state["run_acceptance"] = {
+        "phase": "pending",
+        "acceptance_generation": 1,
+        "repair_generation": 1,
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+    }
+    for _ in range(3):
+        invalidate_run_acceptance(state)
+    run.update(
+        {
+            "phase": "repairing",
+            "acceptance_artifact": _repair_artifact(),
+            "repair_request": {"repair_source": "acceptance"},
+        }
+    )
+    state["status"] = "run_acceptance_pending"
+    states.save_run(str(state["run_id"]), state)
+
+    class BlockedRepairAgents:
+        def develop(self, _request: dict[str, Any]) -> HumanBlockerResult:
+            return HumanBlockerResult(
+                "blocked-repair-developer", (_BLOCKED_EVIDENCE,)
+            )
+
+        def review(self, _request: dict[str, Any]) -> ReviewResult:
+            raise AssertionError("blocked Development must stop before review")
+
+        def publication(self, _request: dict[str, Any]) -> dict[str, str]:
+            raise AssertionError("blocked Development must stop before publication")
+
+    blocked = RunAcceptanceEngine(
         git=git,
         states=states,
-        agents=ScriptedRunAgents(),
+        agents=BlockedRepairAgents(),
         github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    ).accept(str(state["run_id"]))
+
+    job = blocked["run_acceptance"]["repair_job"]
+    assert blocked["run_acceptance"]["acceptance_generation"] == 4
+    assert job["acceptance_generation"] == 4
+    assert job["repair_generation"] == 2
+
+    json_status = run_cli(
+        git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
     )
+    text_status = run_cli(
+        git_repo, git_repo / "github.json", "status", str(state["run_id"])
+    )
+    assert json_status.returncode == text_status.returncode == 0
+    repair_status = stdout_json(json_status)["run_repair"]
+    assert repair_status["acceptance_generation"] == 4
+    assert repair_status["repair_cycle_generation"] == 2
+    assert repair_status["candidate_validation_phase"] == "blocked"
+    assert "Run Acceptance Generation 4" in text_status.stdout
+    assert "Repair Cycle Generation 2" in text_status.stdout
+    assert "Candidate 验证状态 已阻塞" in text_status.stdout
+
+
+@pytest.mark.parametrize(
+    ("job_phase", "run_status"),
+    [
+        ("publishing", "active"),
+        ("waiting_checks", "waiting_external"),
+        ("waiting_merge", "waiting_external"),
+    ],
+)
+def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
+    git_repo: Path, job_phase: str, run_status: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
     candidate_sha = git.resolve(str(state["run_branch"]))
-    base_sha = candidate_sha
-    job = {
-        "default_base_sha": git.resolve("main"),
-        "candidate_sha": candidate_sha,
-        "base_sha": base_sha,
-        "parent_revision": state["parent"]["revision"],
-        "ticket_graph_revision": state["ticket_graph"]["revision"],
-        "ticket_completion_records": ticket_completion_records(state),
-        "repair_source": "acceptance",
-        "repair_mode": "squash",
-        "candidate_acceptance_history": [],
+    state["status"] = run_status
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "acceptance_generation": 4,
+        "repair_cycle": {
+            "generation": 2,
+            "status": "active",
+            "code_modification_attempts": 1,
+            "validation_attempts": 1,
+        },
+        "repair_job": {
+            "phase": job_phase,
+            "repair_mode": "squash",
+            "candidate_sha": candidate_sha,
+            "acceptance_record": {
+                "reviewed_candidate_sha": candidate_sha,
+                "artifact": _passing_artifact(),
+            },
+        },
     }
+    states.save_run(str(state["run_id"]), state)
 
-    for attempt in range(MAX_CANDIDATE_ACCEPTANCE_HISTORY + 8):
-        engine.candidate_acceptance.record(
-            job,
-            f"reviewer-{attempt}",
-            _passing_artifact(),
-        )
+    json_status = run_cli(
+        git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
+    )
+    text_status = run_cli(
+        git_repo, git_repo / "github.json", "status", str(state["run_id"])
+    )
 
-    history = job["candidate_acceptance_history"]
-    assert len(history) == MAX_CANDIDATE_ACCEPTANCE_HISTORY
-    assert history[0]["reviewer_thread_id"] == "reviewer-8"
-    assert history[-1]["reviewer_thread_id"] == "reviewer-39"
+    assert json_status.returncode == text_status.returncode == 0
+    repair_status = stdout_json(json_status)["run_repair"]
+    assert repair_status["phase"] == job_phase
+    assert repair_status["candidate_validation_status"] == "pass"
+    assert repair_status["candidate_validation_phase"] == "pass"
+    assert "Candidate 验证状态 已通过" in text_status.stdout
+
+
+def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class ConsecutiveCandidateAgents(ScriptedRunAgents):
+        def __init__(self) -> None:
+            super().__init__()
+            self._reviews = [
+                _repair_artifact(),
+                _candidate_finding_artifact(),
+                _passing_artifact(),
+            ]
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.development_requests.append(request)
+            checkout = Path(str(request["checkout"]))
+            candidate_number = len(self.development_requests)
+            (checkout / "run-repair.txt").write_text(
+                f"repaired-{candidate_number}\n", encoding="utf-8"
+            )
+            return DevelopmentResult(
+                thread_id="run-repair-developer",
+                summary=f"Produced Candidate {candidate_number}.",
+            )
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.review_requests.append(request)
+            if len(self.review_requests) == 3:
+                json_status = run_cli(
+                    git_repo, fixture, "status", str(state["run_id"]), "--json"
+                )
+                text_status = run_cli(
+                    git_repo, fixture, "status", str(state["run_id"])
+                )
+                assert json_status.returncode == text_status.returncode == 0
+                repair_status = stdout_json(json_status)["run_repair"]
+                assert repair_status["candidate_validation_status"] == "reviewing"
+                assert "Candidate 验证状态 验收中" in text_status.stdout
+            return ReviewResult(
+                thread_id=f"run-reviewer-{len(self.review_requests)}",
+                artifact=self._reviews.pop(0),
+            )
+
+        def publication(self, request: dict[str, Any]) -> dict[str, str]:
+            json_status = run_cli(
+                git_repo, fixture, "status", str(state["run_id"]), "--json"
+            )
+            text_status = run_cli(
+                git_repo, fixture, "status", str(state["run_id"])
+            )
+            assert json_status.returncode == text_status.returncode == 0
+            repair_status = stdout_json(json_status)["run_repair"]
+            assert repair_status["candidate_validation_status"] == "pass"
+            assert "Candidate 验证状态 已通过" in text_status.stdout
+            return super().publication(request)
+
+    agents = ConsecutiveCandidateAgents()
+    result = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+
+    assert result["status"] == "run_publication_pending"
+    assert len(agents.development_requests) == 2
+    assert len(agents.review_requests) == 3
+
+
+def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_reload(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+
+    class AuditAgents:
+        cycle = 0
+        candidate_count = 0
+        review_count = 0
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.candidate_count += 1
+            checkout = Path(str(request["checkout"]))
+            (checkout / f"audit-{self.candidate_count}.txt").write_text(
+                f"candidate {self.candidate_count}\n", encoding="utf-8"
+            )
+            return DevelopmentResult(
+                f"audit-developer-{self.cycle}", "Created a distinct audit Candidate."
+            )
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            assert request["candidate_acceptance"] is True
+            self.review_count += 1
+            attempt = (self.review_count - 1) % 9
+            return ReviewResult(
+                f"audit-reviewer-{self.review_count}",
+                _passing_artifact() if attempt == 8 else _candidate_finding_artifact(),
+            )
+
+        def publication(self, _request: dict[str, Any]) -> dict[str, str]:
+            return {
+                "commit_message": f"fix(run): publish audit cycle {self.cycle}",
+                "pr_title": f"fix(run): publish audit cycle {self.cycle}",
+                "pr_body_markdown": (
+                    "## What Problem This Solves\n\nThe Run needs repair.\n\n"
+                    "## Why This Change Was Made\n\nEach Candidate is immutable.\n\n"
+                    "## User Impact\n\nThe repaired Run is auditable.\n\n"
+                    "## Evidence\n\nCandidate Run Acceptance passed."
+                ),
+            }
+
+    agents = AuditAgents()
+    for cycle in range(4):
+        agents.cycle = cycle + 1
+        previous = state.get("run_acceptance")
+        prior = previous if isinstance(previous, dict) else {}
+        artifact = _repair_artifact()
+        state["run_acceptance"] = {
+            "phase": "repairing",
+            "repair_generation": int(prior.get("repair_generation", 0)),
+            "modification_attempts": 0,
+            "validation_attempts": 0,
+            "reviewer_thread_ids": list(prior.get("reviewer_thread_ids", [])),
+            "development_thread_history": list(
+                prior.get("development_thread_history", [])
+            ),
+            "candidate_acceptance_history": list(
+                prior.get("candidate_acceptance_history", [])
+            ),
+            "acceptance_artifact": artifact,
+            "repair_request": {
+                "repair_source": "acceptance",
+                "acceptance_artifact": artifact,
+            },
+        }
+        state["status"] = "run_acceptance_pending"
+        state["terminal_kind"] = "run_repair_pending"
+        state.pop("run_publication", None)
+        states.save_run(str(state["run_id"]), state)
+
+        promoted = RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=agents,
+            github=FixtureGitHubPublisher(fixture, git),
+        ).accept(str(state["run_id"]))
+
+        assert promoted["status"] == "run_publication_pending"
+        reloaded_cycle = states.load_current_run(str(state["run_id"]))
+        assert reloaded_cycle is not None
+        state = reloaded_cycle
+        assert len(state["run_acceptance"]["candidate_acceptance_history"]) == (
+            cycle + 1
+        ) * 9
+
+    history = state["run_acceptance"]["candidate_acceptance_history"]
+    assert len(history) == 36
+    assert len({entry["candidate_sha"] for entry in history}) == 36
+    assert history[0]["reviewer_thread_id"] == "audit-reviewer-1"
+    assert history[-1]["reviewer_thread_id"] == "audit-reviewer-36"
     assert all("acceptance_record" not in item for item in history)
     assert all("artifact" not in item for item in history)
     assert history[-1]["ticket_completion_records_fingerprint"] == canonical_fingerprint(
-        job["ticket_completion_records"]
+        ticket_completion_records(state)
     )
     assert require_candidate_acceptance_history(
         history, "run_acceptance.candidate_acceptance"
     ) == history
-    with pytest.raises(IncompatibleRunStateError):
-        require_candidate_acceptance_history(
-            [*history, history[-1]], "run_acceptance.candidate_acceptance"
-        )
+    states.save_run(str(state["run_id"]), state)
+    reloaded = states.load_current_run(str(state["run_id"]))
+    assert reloaded is not None
+    assert reloaded["run_acceptance"]["candidate_acceptance_history"][0] == history[0]
 
 
 @pytest.mark.parametrize(
@@ -723,6 +1115,94 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     require_current_run_state(state)
 
 
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value", "expected"),
+    [
+        (None, None, None),
+        ("head_sha", "foreign-head", "change_pr_head_changed_externally"),
+        ("base_branch", "foreign-base", "change_pr_base_changed_externally"),
+        ("base_sha", "foreign-base", "change_pr_base_changed_externally"),
+        ("integrated_sha", "foreign-merge", "change_pr_integrated_sha_changed_externally"),
+        ("integrated_tree", "foreign-tree", "change_pr_integrated_tree_changed_externally"),
+        ("integrated_parents", [], "change_pr_integrated_parents_changed_externally"),
+    ],
+)
+def test_integrated_revalidation_pr_exemption_requires_exact_live_facts(
+    git_repo: Path,
+    changed_field: str | None,
+    changed_value: object,
+    expected: str | None,
+) -> None:
+    git = GitRepository(git_repo)
+    base = git.resolve("main")
+    tree = git.resolve(f"{base}^{{tree}}")
+
+    def commit_tree(message: str, *parents: str) -> str:
+        command = ["git", "commit-tree", tree]
+        for parent in parents:
+            command.extend(("-p", parent))
+        return subprocess.run(
+            command,
+            cwd=git_repo,
+            input=f"{message}\n",
+            text=True,
+            check=True,
+            capture_output=True,
+        ).stdout.strip()
+
+    default = commit_tree("default", base)
+    candidate = commit_tree("candidate", base, default)
+    integrated = commit_tree("integrated", base, candidate)
+    state = {"run_branch": "agent-run/run-1"}
+    job = {
+        "pr_number": 7,
+        "integrated_sha": integrated,
+        "integrated_revalidation_merge": {
+            "base_sha": base,
+            "default_base_sha": default,
+            "candidate_sha": candidate,
+            "publication_sha": candidate,
+        },
+    }
+    live: dict[str, object] = {
+        "state": "MERGED",
+        "head_sha": candidate,
+        "base_branch": state["run_branch"],
+        "base_sha": integrated,
+        "integrated_sha": integrated,
+        "head_tree": tree,
+        "integrated_tree": tree,
+        "integrated_parents": [base, candidate],
+    }
+    canonical_live = dict(live)
+    if changed_field is not None:
+        live[changed_field] = changed_value
+
+    class Reader:
+        def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+            assert pr_number == 7
+            return dict(live)
+
+    assert unknown_pr_mutation(
+        state, "run-repair:1", job, Reader(), git
+    ) == expected
+
+    foreign_trees = {
+        **canonical_live,
+        "head_tree": "foreign-tree",
+        "integrated_tree": "foreign-tree",
+    }
+
+    class ForeignTreeReader:
+        def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+            assert pr_number == 7
+            return foreign_trees
+
+    assert unknown_pr_mutation(
+        state, "run-repair:1", job, ForeignTreeReader(), git
+    ) == "change_pr_head_tree_changed_externally"
+
+
 def _malformed_candidate_history() -> list[dict[str, object]]:
     return [{"candidate_sha": "candidate", "artifact": {"result_kind": "acceptance"}}]
 
@@ -761,27 +1241,65 @@ def test_candidate_history_stale_recovery_rejects_unknown_fields_before_mutation
     assert state == before
 
 
-def test_run_repair_promotion_mismatch_discards_candidate_for_fresh_acceptance(
-    git_repo: Path,
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "candidate_tree",
+        "repair_base",
+        "actual_run_tree",
+        "default_head",
+        "parent_revision",
+        "graph_revision",
+        "completion_records",
+    ],
+)
+def test_run_repair_promotion_rejects_each_authority_binding(
+    git_repo: Path, mismatch: str,
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
 
-    class MismatchingPublisher(FixtureGitHubPublisher):
-        def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
-            super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
-            subprocess.run(
-                ["git", "update-ref", f"refs/heads/{run_branch}", git.resolve("main")],
-                cwd=git.root,
-                check=True,
-            )
+    class PromotionMismatchEngine(RunAcceptanceEngine):
+        def _candidate_promotion_record(
+            self,
+            live_state: dict[str, Any],
+            job: dict[str, Any],
+            integrated: str,
+        ) -> dict[str, Any] | None:
+            record = job["acceptance_record"]
+            if mismatch == "candidate_tree":
+                record["reviewed_candidate_tree"] = "mismatched-candidate-tree"
+            elif mismatch == "repair_base":
+                record["repair_base_run_head_sha"] = "mismatched-repair-base"
+            elif mismatch == "actual_run_tree":
+                subprocess.run(
+                    [
+                        "git",
+                        "update-ref",
+                        f"refs/heads/{live_state['run_branch']}",
+                        git.resolve("main"),
+                    ],
+                    cwd=git.root,
+                    check=True,
+                )
+            elif mismatch == "default_head":
+                record["reviewed_default_base_sha"] = integrated
+            elif mismatch == "parent_revision":
+                live_state["parent"]["revision"] = "mismatched-parent-revision"
+            elif mismatch == "graph_revision":
+                live_state["ticket_graph"]["revision"] = "mismatched-graph-revision"
+            elif mismatch == "completion_records":
+                live_state["ticket_jobs"]["2"]["effective_revision"] = (
+                    "mismatched-completion-revision"
+                )
+            return super()._candidate_promotion_record(live_state, job, integrated)
 
     agents = ScriptedRunAgents()
-    result = RunAcceptanceEngine(
+    result = PromotionMismatchEngine(
         git=git,
         states=states,
         agents=agents,
-        github=MismatchingPublisher(fixture, git),
+        github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
 
     run = result["run_acceptance"]
@@ -798,19 +1316,74 @@ def test_run_repair_promotion_mismatch_discards_candidate_for_fresh_acceptance(
     assert not (states.root / "worktrees" / str(state["run_id"]) / "run-repair").exists()
 
 
-def test_run_repair_unknown_required_checks_waits_without_new_candidate(
-    git_repo: Path,
+@pytest.mark.parametrize(
+    ("checks", "evidence"),
+    [
+        ("unknown", None),
+        (
+            "fail",
+            {
+                "pr_number": 1,
+                "checks": [
+                    {
+                        "name": "cancelled",
+                        "workflow": "ci",
+                        "bucket": "cancel",
+                        "state": "CANCELLED",
+                        "link": "https://example.invalid/cancelled",
+                    }
+                ],
+            },
+        ),
+        (
+            "fail",
+            {
+                "pr_number": 1,
+                "checks": [
+                    {
+                        "name": "platform",
+                        "workflow": "ci",
+                        "bucket": "fail",
+                        "state": "FAILURE",
+                        "link": "https://example.invalid/platform",
+                    }
+                ],
+            },
+        ),
+        (
+            "fail",
+            {
+                "pr_number": 1,
+                "checks": [
+                    {
+                        "name": "unknown",
+                        "workflow": "ci",
+                        "bucket": "fail",
+                        "link": "https://example.invalid/unknown",
+                    }
+                ],
+            },
+        ),
+    ],
+    ids=("unknown-status", "cancelled", "platform-failure", "unknown-evidence"),
+)
+def test_run_repair_non_repairable_required_checks_wait_without_new_candidate(
+    git_repo: Path, checks: str, evidence: dict[str, object] | None,
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
-    data.setdefault("delivery", {})["required_checks"] = ["unknown"]
+    delivery = data.setdefault("delivery", {})
+    delivery["required_checks"] = [checks]
+    if evidence is not None:
+        delivery["required_check_evidence"] = evidence
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
+    agents = ScriptedRunAgents()
     result = RunAcceptanceEngine(
         git=git,
         states=states,
-        agents=ScriptedRunAgents(),
+        agents=agents,
         github=FixtureGitHubPublisher(fixture, git),
     ).accept(str(state["run_id"]))
 
@@ -821,6 +1394,8 @@ def test_run_repair_unknown_required_checks_waits_without_new_candidate(
     assert job["phase"] == "waiting_checks"
     assert job["modification_attempts"] == 1
     assert run["repair_cycle"]["code_modification_attempts"] == 1
+    assert len(job["candidate_acceptance_history"]) == 1
+    assert len(agents.development_requests) == 1
     assert run.get("completed_repair_jobs", []) == []
     assert result["supervision_window"]["kind"] == "github_convergence"
 
@@ -1202,7 +1777,9 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
         "acceptance_artifact": _repair_artifact(),
         "repair_request": {
             "repair_source": "required_checks",
-            "ci_evidence": publisher.required_check_evidence(final_pr),
+            "ci_evidence": publisher.required_check_evidence(
+                final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
+            ),
         },
     }
     states.save_run(str(state["run_id"]), state)
@@ -1302,7 +1879,9 @@ def test_run_repair_promotion_rejects_final_pr_trigger_drift(
         "acceptance_artifact": _repair_artifact(),
         "repair_request": {
             "repair_source": "required_checks",
-            "ci_evidence": publisher.required_check_evidence(final_pr),
+            "ci_evidence": publisher.required_check_evidence(
+                final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
+            ),
         },
     }
     states.save_run(str(state["run_id"]), state)
@@ -1368,7 +1947,9 @@ def test_run_repair_trigger_creation_supervises_recoverable_pr_reads(
         "acceptance_artifact": _repair_artifact(),
         "repair_request": {
             "repair_source": "required_checks",
-            "ci_evidence": publisher.required_check_evidence(final_pr),
+            "ci_evidence": publisher.required_check_evidence(
+                final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
+            ),
         },
     }
     states.save_run(str(state["run_id"]), state)
@@ -1442,7 +2023,13 @@ def test_run_repair_currentness_supervises_recoverable_live_pr_reads(
     ).repair_currentness
     assert currentness is not None
     trigger = currentness.create_trigger(
-        state, "required_checks", {"ci_evidence": publisher.required_check_evidence(final_pr)}
+        state,
+        "required_checks",
+        {
+            "ci_evidence": publisher.required_check_evidence(
+                final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
+            )
+        },
     )
     assert trigger is not None
     job = {"repair_trigger": trigger}
@@ -1503,7 +2090,9 @@ def test_run_repair_resumes_returned_candidate_review_after_currentness_read_fai
         "acceptance_artifact": _repair_artifact(),
         "repair_request": {
             "repair_source": "required_checks",
-            "ci_evidence": publisher.required_check_evidence(final_pr),
+            "ci_evidence": publisher.required_check_evidence(
+                final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
+            ),
         },
     }
     states.save_run(str(state["run_id"]), state)
@@ -2504,6 +3093,37 @@ def test_run_repair_rejects_ticket_development_thread_reuse(
         ).accept(str(state["run_id"]))
 
 
+def test_run_repair_rejects_current_reviewer_thread_as_development(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+
+    class ReusedCandidateReviewer(ScriptedRunAgents):
+        def __init__(self) -> None:
+            super().__init__()
+            self._reviews = [_repair_artifact(), _candidate_finding_artifact()]
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            if not self.development_requests:
+                return super().develop(request)
+            self.development_requests.append(request)
+            checkout = Path(str(request["checkout"]))
+            (checkout / "follow-up-repair.txt").write_text(
+                "repaired reviewer finding\n", encoding="utf-8"
+            )
+            return DevelopmentResult(
+                "run-reviewer-2", "Illegally reused the Candidate Reviewer."
+            )
+
+    with pytest.raises(ValueError, match="not independent"):
+        RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=ReusedCandidateReviewer(),
+            github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        ).accept(str(state["run_id"]))
+
+
 def test_run_acceptance_discards_a_review_when_its_parent_snapshot_drifts(
     git_repo: Path,
 ) -> None:
@@ -2929,7 +3549,9 @@ def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
         "acceptance_artifact": _repair_artifact(),
         "repair_request": {
             "repair_source": "required_checks",
-            "ci_evidence": publisher.required_check_evidence(pr_number),
+            "ci_evidence": publisher.required_check_evidence(
+                pr_number, expected_head_sha=git.resolve(str(state["run_branch"]))
+            ),
         },
     }
     states.save_run(str(state["run_id"]), state)
@@ -2973,12 +3595,16 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
     class FingerprintReadFailsOncePublisher(FixtureGitHubPublisher):
         evidence_error: BaseException | None = error
 
-        def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
+        def required_check_evidence(
+            self, pr_number: int, *, expected_head_sha: str | None = None
+        ) -> dict[str, Any]:
             if self.evidence_error is not None:
                 raised = self.evidence_error
                 self.evidence_error = None
                 raise raised
-            return super().required_check_evidence(pr_number)
+            return super().required_check_evidence(
+                pr_number, expected_head_sha=expected_head_sha
+            )
 
     publisher = FingerprintReadFailsOncePublisher(fixture, git)
     publisher.ensure_final_run_ref(
@@ -2993,7 +3619,9 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
         title="Final Run",
         body="Original final Run narrative.",
     )
-    evidence = FixtureGitHubPublisher(fixture, git).required_check_evidence(pr_number)
+    evidence = FixtureGitHubPublisher(fixture, git).required_check_evidence(
+        pr_number, expected_head_sha=git.resolve(str(state["run_branch"]))
+    )
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": pr_number}
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -3090,19 +3718,20 @@ def test_stale_run_repair_keeps_threads_out_of_fresh_review(
             "reviewer_thread_ids": ["repair-reviewer"],
         },
     }
+    state["ticket_jobs"]["2"]["development_thread_history"] = [
+        "ticket-developer-old"
+    ]
 
     invalidate_stale_run_repair(state)
 
-    engine = RunAcceptanceEngine(
-        git=_git,
-        states=_states,
-        agents=ScriptedRunAgents(),
-    )
-    assert engine._all_prior_threads(state, run) >= {
+    assert prior_thread_identities(state, run) >= {
         "run-reviewer",
         "repair-developer",
         "repair-developer-old",
         "repair-reviewer",
+        "ticket-developer",
+        "ticket-developer-old",
+        "ticket-reviewer",
     }
 
 

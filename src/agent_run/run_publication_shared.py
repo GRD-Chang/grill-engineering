@@ -130,11 +130,14 @@ class RunPublicationShared:
         state: dict[str, Any],
         publication: dict[str, Any],
         pr_number: int,
+        expected_head_sha: str,
     ) -> dict[str, Any] | None:
         """Read failed-check evidence or persist one bounded convergence wait."""
 
         try:
-            return self.github.required_check_evidence(pr_number)
+            return self.github.required_check_evidence(
+                pr_number, expected_head_sha=expected_head_sha
+            )
         except (GitHubReadError, OSError, TimeoutError) as error:
             if isinstance(error, GitHubReadError) and not is_github_convergence_error(
                 error.code

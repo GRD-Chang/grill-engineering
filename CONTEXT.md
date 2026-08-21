@@ -164,7 +164,7 @@ _Avoid_: Ticket PR、squash 整个 Delivery Run、自动合入默认分支
 _Avoid_: Ticket Fresh Acceptance、简单汇总各票 pass、最终人工验收、只审 Repair diff
 
 **Candidate Run Acceptance（候选运行整体验收）**:
-Run Repair 尚未写入 Run Branch 时，对 repair Candidate `C` 与准确默认分支 head `D` 的预期合并结果执行的完整 Run Acceptance。它与正常 Run Acceptance 使用相同的 Parent 范围和 E2E、Standards、Spec lane；其通过记录只有在 Candidate、Repair base、实际合入后的 Run Branch tree、默认分支、Parent Spec、Ticket Graph 与 Ticket Completion 全部严格一致时，才可由 Controller 提升为正式 Run Acceptance。否则该记录失效，不得复用。
+Run Repair 尚未写入 Run Branch 时，对 repair Candidate `C` 与准确默认分支 head `D` 的预期合并结果执行的完整 Run Acceptance。它与正常 Run Acceptance 使用相同的 Parent 范围和 E2E、Standards、Spec lane；每个 Candidate 的 tree、预期合并 tree、requirements/currentness 边界、Reviewer 与结论形成不可变的轻量审计记录，由所属 Run 永久保留而不截断。其通过记录只有在 Candidate、Repair base、实际合入后的 Run Branch tree、默认分支、Parent Spec、Ticket Graph 与 Ticket Completion 全部严格一致时，才可由 Controller 提升为正式 Run Acceptance。否则该记录失效，不得复用。
 _Avoid_: 仅审 repair diff、合入后无条件重跑同一 Reviewer、用候选通过直接授权发布
 
 **Default Branch Drift（默认分支漂移）**:
@@ -180,19 +180,19 @@ Delivery Run 独有并跨最终集成修复 Attempt 复用的持久 Development 
 _Avoid_: Ticket Development Thread、Run Reviewer Thread、人工修复会话
 
 **Integration-repair Worktree（集成修复工作区）**:
-一个活跃 Run Repair Job 唯一、持久且可写的受管工作区。默认分支与 Run Branch 的预期合并发生冲突时，Controller 在此准备真实三方合并现场；Repair Codex 可读取 Git 状态、编辑和测试以解决语义冲突，但不得提交、push、rebase、创建 PR 或合并。它与稳定 Run Branch 及每次一次性、只读的 Validation Checkout 严格分离；同一 Repair Job 的后续 Acceptance Finding 返回该工作区继续前进式修复，不新建开发工作区。每次 Candidate Run Acceptance 结束后，Controller 清理其 Validation Checkout，而不是丢弃仍可能继续修复的 Integration-repair Worktree。
+一个活跃 Repair Cycle 唯一、持久且可写的受管工作区。默认分支与 Run Branch 的预期合并发生冲突时，Controller 在此准备真实三方合并现场；Repair Codex 可读取 Git 状态、编辑和测试以解决语义冲突，但不得提交、push、rebase、创建 PR 或合并。它与稳定 Run Branch 及每次一次性、只读的 Validation Checkout 严格分离；同一 Cycle 的后续 Acceptance Finding 返回该工作区继续前进式修复，即使已集成 Job 被轮转为新的 Job/PR 也不新建开发工作区。每次 Candidate Run Acceptance 结束后，Controller 清理其 Validation Checkout，而不是丢弃仍可能继续修复的 Integration-repair Worktree。
 _Avoid_: 在 Run Branch 直接修复、让 Reviewer 读取开发中目录、让 Codex 自行准备或发布 merge、为每个 Finding 新建 worktree
 
 **Run Repair Job（运行修复任务）**:
-一次 Run Acceptance、Run PR CI 或默认分支合并冲突修复循环使用 Change Job Contract 创建的 Development–Acceptance Engine 实例。它以当前 Run Branch 为 base、原始失败 Artifact、CI Evidence 或冲突证据为修复输入，并拥有一张稳定 Run Repair PR；同一时刻最多一个 Run Repair Job 活跃，前一 Job 合并后若新的验收、CI 或合并预检再发现问题则创建新 Job，但继续复用 Run Repair Thread。
+Repair Cycle 中一次可发布修复使用 Change Job Contract 创建的 Development–Acceptance Engine 实例。它以当前 Run Branch 为 base、原始失败 Artifact、CI Evidence 或冲突证据为修复输入；同一时刻最多一个 Run Repair Job 活跃。Job 未集成时，多轮 Development Attempt 复用该 Job 的 branch/PR；Job 已集成后，若同一 Cycle 的 Candidate revalidation 在新的 default head 上又产生 Finding，Controller 归档该 Job，并以新的 base、branch 和 PR 身份轮转出后继 Job，同时保留 Repair Cycle 的预算、Run Repair Thread 与 Integration-repair Worktree。
 _Avoid_: Ticket Job、整个 Delivery Run 唯一 PR、独立修复流水线
 
 **Repair Cycle（修复周期）**:
-为解决同一准确 Run Acceptance、Run PR CI 或默认分支合并冲突问题而连续执行的有界修复工作；一个活跃 Run Repair Job 实现一个 Repair Cycle。它在可修复 Finding、可修复 CI 失败或 Git conflict 出现时以零次修改开始；每当 Repair Codex 产出一个含实际交付树修改的新 repair Candidate，`code_modification_attempts` 加一，最多十次。冲突检测、worktree 准备、Reviewer 重跑、Required Checks 重试和无交付树修改的调查不计数。Candidate 或 repair PR 的 Required Check 已明确且可由本次代码修复的失败返回同一 Cycle；pending、未知或暂时平台错误只进入 Controller 监督，不消耗预算。默认分支漂移不结束 Cycle；Candidate 被提升为正式 Run Acceptance、需要人工决定、预算耗尽，或 Run Branch/Parent/Graph/Ticket Completion 漂移时结束 Cycle。
+为解决同一准确 Run Acceptance、Run PR CI 或默认分支合并冲突问题而连续执行的有界修复工作；一个 Cycle 可依次包含多个 Run Repair Job，但任一时刻只允许一个活跃 Job。它在可修复 Finding、可修复 CI 失败或 Git conflict 出现时以零次修改开始；每当 Repair Codex 产出一个含实际交付树修改的新 repair Candidate，`code_modification_attempts` 加一，最多十次。冲突检测、worktree 准备、Reviewer 重跑、Required Checks 重试和无交付树修改的调查不计数。Candidate 或 repair PR 的 Required Check 只有同时得到 GitHub `FAILURE` 结论、准确绑定当前 PR head 的 completed Actions job，并由 job steps 证明失败仅发生在仓库 `pyproject.toml` 的 `tool.agent-run.required-checks.code-failure-steps` 所列 `workflow::name::step`，才被视为已明确且可由本次代码修复并返回同一 Cycle；pending、未知、缺少或矛盾的 job/step 事实、未配置 step、cancelled、runner 或暂时平台错误只进入 Controller 监督，不消耗预算。默认分支漂移以及已集成 Job 的 revalidation Finding 都不结束 Cycle 或重置预算；Candidate 被提升为正式 Run Acceptance、需要人工决定、预算耗尽，或 Run Branch/Parent/Graph/Ticket Completion 漂移时结束 Cycle。
 _Avoid_: 用 Delivery Run 的历史累计修改数作为当前预算、把流程重试计作代码修改、base 漂移重置同一问题的预算
 
 **Run Repair PR（运行修复拉取请求）**:
-一个 Run Repair Job 独有并在该 Job 的多轮 Development Attempt 中稳定复用的 PR，其 head 是独立 run-repair branch，base 是 Run Branch。普通 Finding Repair 通过与 Ticket Job 相同的 Candidate、Publication、Fresh Acceptance、Required Checks 和 Published-Head Gate 控制流，以 squash merge 进入 Run Branch；默认分支与 Run Branch 的 Git 冲突则使用 Merge-resolution Candidate，repair PR 以普通 merge commit 进入 Run Branch，以保留已解决默认分支 head 的祖先关系。合并后不再复用，后续问题创建新的 Run Repair Job/PR。
+一个 Run Repair Job 独有并在该 Job 未集成前的多轮 Development Attempt 中稳定复用的 PR，其 head 是独立 run-repair branch，base 是 Run Branch。普通 Finding Repair 依次经过 Candidate、Candidate Run Acceptance、Publication、Required Checks 和 Published-Head Gate，以 squash merge 进入 Run Branch；默认分支与 Run Branch 的 Git 冲突则使用 Merge-resolution Candidate，repair PR 以普通 merge commit 进入 Run Branch，以保留已解决默认分支 head 的祖先关系。已合入的 PR 身份不可改写或复用；同一 Cycle 后续 revalidation Finding 由轮转后的新 Job/branch/PR 承载。
 _Avoid_: Run PR、Ticket PR、将冲突解法 squash 到旧 Run head、直接推送 Run Branch
 
 **Merge-resolution Candidate（合并解决候选）**:
@@ -200,7 +200,7 @@ _Avoid_: Run PR、Ticket PR、将冲突解法 squash 到旧 Run head、直接推
 _Avoid_: Agent 自行提交 merge、squash resolution tree、隐式 rebase Run Branch、把冲突只当作文本补丁
 
 **Run Acceptance Repair Loop（运行验收修复循环）**:
-Run Acceptance 或已创建 Run PR 的 CI 产生可自动修复问题后，Controller 创建一个 Repair Cycle 的 Run Repair Job，并将原始 Acceptance Artifact 或 CI Evidence 交给复用的 Run Repair Thread。Development–Acceptance Engine 产出 Candidate；Candidate Run Acceptance 以完整 Parent 范围检查准确 default head 与 Candidate 的预期合并结果。repair PR 的 Required Checks 与 Published-Head Gate 通过并合入 Run Branch后，Controller 只有在 Candidate tree、实际 Run Branch tree、default head、Parent、Graph 与 Ticket Completion 均严格保持一致时，才将该 Candidate Acceptance 提升为正式 Run Acceptance；否则启动新的 Run Acceptance。Git 冲突修复使用 Merge-resolution Candidate 与普通 merge，其他 repair 使用 squash merge。该循环持续到通过、需要人工决策或当前 Repair Cycle 耗尽十次实际代码修复预算。
+Run Acceptance 或已创建 Run PR 的 CI 产生可自动修复问题后，Controller 创建 Repair Cycle 与首个 Run Repair Job，并将原始 Acceptance Artifact 或 CI Evidence 交给复用的 Run Repair Thread。Development–Acceptance Engine 产出 Candidate；Candidate Run Acceptance 以完整 Parent 范围检查准确 default head 与 Candidate 的预期合并结果。repair PR 的 Required Checks 与 Published-Head Gate 通过并合入 Run Branch 后，Controller 只有在 Candidate tree、repair base、实际 Run Branch tree、default head、Parent、Graph 与 Ticket Completion 均严格保持一致时，才将该 Candidate Acceptance 提升为正式 Run Acceptance。已受控合入后若仅 default head 前进，Controller 在同一 Cycle/worktree 重新预演和验收：新的 Finding 轮转新 Job/branch/PR 并继续消耗同一预算；其他 promotion 边界失配则废弃 Candidate，进入新的 Run Acceptance Generation。Git 冲突修复使用 Merge-resolution Candidate 与普通 merge，其他 repair 使用 squash merge。该循环持续到 promotion、需要人工决策或当前 Repair Cycle 耗尽十次实际代码修复预算。
 _Avoid_: 复用不等价的旧 Reviewer、直接修改 Run Branch、仅修复局部 Ticket diff、对同一已验收树无条件重跑 Reviewer
 
 **Run Feedback Revision（运行反馈版本）**:
@@ -343,7 +343,7 @@ Publisher 在创建、压缩、推送和合并候选时执行的确定性 Git �
 _Avoid_: Hosted CI Gate、Fresh Acceptance、本地 changed-surface validation
 
 **Hosted CI Gate（托管 CI 门禁）**:
-任何 Published PR 推送后由 GitHub Ruleset 针对 live head SHA 声明的 Required Checks 自动测试门禁，适用于 Ticket PR、Run Repair PR 和 Run PR。MVP 不实现 Controller 本地测试配置、changed-surface validation 或 CI 发现窗口；存在 Required Checks 时必须等待并读取结果，失败时把对应日志交回对应 Development Thread，全部通过后才允许后续合并或最终人工验收。目标 branch 没有 Required Check 时按仓库无强制 CI 处理，不构成阻塞；普通非必需 Check 不参与自动门禁。Publisher 不得使用 Ruleset bypass 权限绕过 Required Checks。
+任何 Published PR 推送后由 GitHub Ruleset 针对 live head SHA 声明的 Required Checks 自动测试门禁，适用于 Ticket PR、Run Repair PR 和 Run PR。MVP 不实现 Controller 本地测试配置、changed-surface validation 或 CI 发现窗口；存在 Required Checks 时必须等待并读取结果，失败时保存 check 与 Actions job/step 的结构化证据，只有仓库配置明确声明的 code/test step failure 才交回对应 Development Thread，其他失败由 Controller 监督；全部通过后才允许后续合并或最终人工验收。目标 branch 没有 Required Check 时按仓库无强制 CI 处理，不构成阻塞；普通非必需 Check 不参与自动门禁。Publisher 不得使用 Ruleset bypass 权限绕过 Required Checks。
 _Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acceptance
 
 **Acceptance Record（验收记录）**:

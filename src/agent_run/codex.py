@@ -201,16 +201,8 @@ class CodexCliBackend:
             )
             heading = "Merge Conflict Repair Input"
             context = _development_context(request)
-            unresolved_artifact = request.get("acceptance_artifact")
-            artifact_input = (
-                "\n\nUnresolved Acceptance Artifact (verbatim JSON):\n"
-                + _pretty(unresolved_artifact)
-                if isinstance(unresolved_artifact, dict)
-                else ""
-            )
             prompt_input = (
                 f"Merge Conflict Evidence (verbatim):\n{evidence}"
-                f"{artifact_input}"
                 f"\n\nDevelopment Brief:\n{_pretty(context)}"
             )
         else:

@@ -13,6 +13,7 @@ from agent_run.github_publish import (
     _matches_ref,
     _render_agent_run_status,
 )
+from agent_run.required_checks import is_explicitly_repairable_code_failure
 
 
 def test_live_pull_request_uses_the_requested_repository_as_its_base(
@@ -40,6 +41,126 @@ def test_live_pull_request_uses_the_requested_repository_as_its_base(
 
     assert live["base_repository"] == "example/project"
     assert "baseRepository" not in calls[0][-1]
+
+
+def test_real_publisher_applies_repository_owned_check_repairability(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (git_repo / "pyproject.toml").write_text(
+        "[tool.agent-run.required-checks]\n"
+        'code-failure-steps = ["tests::unit::Run tests"]\n',
+        encoding="utf-8",
+    )
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher,
+        "_checks",
+        lambda _pr, _fields: [
+            {
+                "name": "unit",
+                "workflow": "tests",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "Tests failed.",
+                "link": (
+                    "https://github.com/example/project/actions/runs/22/job/33"
+                ),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        publisher,
+        "live_pull_request",
+        lambda _pr: {"head_sha": "a" * 40},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *_args, **_kwargs: {
+            "id": 33,
+            "head_sha": "a" * 40,
+            "name": "unit",
+            "workflow_name": "tests",
+            "status": "completed",
+            "conclusion": "failure",
+            "html_url": "https://github.com/example/project/runs/22/jobs/33",
+            "steps": [
+                {
+                    "name": "Run tests",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "number": 6,
+                }
+            ],
+        },
+    )
+
+    evidence = publisher.required_check_evidence(12, expected_head_sha="a" * 40)
+
+    assert evidence["checks"][0]["repairability"] == "code_failure"
+    assert is_explicitly_repairable_code_failure(evidence) is True
+
+
+def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (git_repo / "pyproject.toml").write_text(
+        "[tool.agent-run.required-checks]\n"
+        'code-failure-steps = ["CI::quality::Run tests"]\n',
+        encoding="utf-8",
+    )
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher,
+        "_checks",
+        lambda _pr, _fields: [
+            {
+                "name": "quality",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The job failed.",
+                "link": "https://github.com/example/project/actions/runs/22/job/33",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        publisher,
+        "live_pull_request",
+        lambda _pr: {"head_sha": "a" * 40},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *_args, **_kwargs: {
+            "id": 33,
+            "head_sha": "a" * 40,
+            "name": "quality",
+            "workflow_name": "CI",
+            "status": "completed",
+            "conclusion": "failure",
+            "html_url": "https://github.com/example/project/runs/22/jobs/33",
+            "steps": [
+                {
+                    "name": "Install system dependencies",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "number": 3,
+                },
+                {
+                    "name": "Run tests",
+                    "status": "completed",
+                    "conclusion": "skipped",
+                    "number": 6,
+                },
+            ],
+        },
+    )
+
+    evidence = publisher.required_check_evidence(12, expected_head_sha="a" * 40)
+
+    assert "repairability" not in evidence["checks"][0]
+    assert is_explicitly_repairable_code_failure(evidence) is False
 
 
 def test_supersession_status_renders_the_receipt_fields() -> None:
@@ -2251,6 +2372,26 @@ def test_unrecognized_required_check_bucket_is_supervised_as_unknown(
     )
 
     assert publisher.required_checks(12) == "unknown"
+
+
+def test_required_checks_cli_failure_is_classified_as_a_read_failure(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher,
+        "_run",
+        lambda *_arguments: subprocess.CompletedProcess(
+            _arguments, 2, "", "temporary gh pr checks failure"
+        ),
+    )
+
+    with pytest.raises(GitHubReadError) as raised:
+        publisher.required_checks(12)
+
+    assert raised.value.code == "github_read_failed"
+    assert raised.value.message == "temporary gh pr checks failure"
 
 
 def test_ruleset_branch_globs_do_not_cross_path_segments() -> None:

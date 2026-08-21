@@ -700,13 +700,18 @@ def test_run_reconciles_unknown_ticket_merge_outcomes_in_one_call(
     assert [entry["attempt"] for entry in job["merge_reconciliation_history"]] == [1, 2]
 
 
-def test_run_retries_final_pr_read_lag_in_one_call(git_repo: Path) -> None:
+def test_run_supervises_misclassified_final_checks_read_without_rewriting_pr(
+    git_repo: Path,
+) -> None:
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
         delivery={
             "run_required_checks_read_failures": [
-                {"code": "github_timeout", "message": "final checks still converging"}
+                {
+                    "code": "github_write_failed",
+                    "message": "temporary gh pr checks failure",
+                }
             ]
         },
     )
@@ -718,6 +723,12 @@ def test_run_retries_final_pr_read_lag_in_one_call(git_repo: Path) -> None:
     assert stdout_json(completed)["status"] == "run_approval_pending"
     state = load_only_run_state(git_repo)
     assert state["run_publication"]["phase"] == "ready_for_approval"
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    assert len(fixture_data["delivery"]["pull_requests"]) == 2
+    assert all(
+        item.get("code") != "github_write_outcome_unknown"
+        for item in state.get("diagnostics", [])
+    )
 
 
 def test_run_advances_multiple_tickets_without_final_merge(git_repo: Path) -> None:
