@@ -480,6 +480,39 @@ def test_run_prompts_describe_run_scope_without_controller_private_records() -> 
     assert "累计 diff、跨 Ticket 交互、整体需求和预期合并结果" in run_acceptance
 
 
+@pytest.mark.parametrize(
+    ("evidence_key", "sentinel"),
+    [
+        ("acceptance_artifact", {"evidence": "ACCEPTANCE_EVIDENCE_SENTINEL"}),
+        ("ci_evidence", {"check": "CI_EVIDENCE_SENTINEL"}),
+        ("human_feedback", "HUMAN_FEEDBACK_SENTINEL"),
+        ("merge_conflict_evidence", "MERGE_CONFLICT_SENTINEL"),
+    ],
+)
+def test_candidate_run_review_prompt_excludes_run_repair_evidence(
+    evidence_key: str, sentinel: object
+) -> None:
+    prompt = CodexCliBackend._review_prompt(
+        {
+            "acceptance_scope": "run",
+            "candidate_acceptance": True,
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            evidence_key: sentinel,
+        }
+    )
+
+    assert "Run Repair Evidence (verbatim)" not in prompt
+    assert json.dumps(sentinel, ensure_ascii=False, sort_keys=True) not in prompt
+    for private_field in (
+        "default_base_sha",
+        "candidate_sha",
+        "repair_base_run_head_sha",
+        "expected_merge_tree",
+        "inspection_command",
+    ):
+        assert private_field not in prompt
+
+
 def test_human_blocker_resume_context_reaches_original_thread_stdin_verbatim(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

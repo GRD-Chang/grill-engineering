@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from agent_run.git import GitRepository
+from agent_run.git import GitError, GitRepository
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records
 
@@ -49,8 +49,9 @@ def stale_change_job_reason(
     if job.get("ticket_completion_records") != ticket_completion_records(state):
         return "run_repair_ticket_completion_changed"
     run_branch = state.get("run_branch")
-    if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
-        return "run_repair_base_changed"
+    if isinstance(run_branch, str):
+        if job.get("base_sha") != git.resolve(run_branch):
+            return "run_repair_base_changed"
     return None
 
 
@@ -79,6 +80,50 @@ def unknown_pr_mutation(
     if not isinstance(pr_number, int):
         return None
     live = github.live_pull_request(pr_number)
+    if (
+        subject.startswith("run-repair:")
+        and live.get("state") == "MERGED"
+        and isinstance(job.get("integrated_revalidation_merge"), dict)
+    ):
+        marker = _mapping(job, "integrated_revalidation_merge")
+        integrated = job.get("integrated_sha")
+        published_base = marker.get("base_sha")
+        published_default = marker.get("default_base_sha")
+        published_candidate = marker.get("candidate_sha")
+        published_head = marker.get("publication_sha")
+        try:
+            published_head_tree = git.resolve(f"{published_head}^{{tree}}")
+            integrated_tree = git.resolve(f"{integrated}^{{tree}}")
+            local_facts_match = (
+                git.commit_parents(str(published_candidate))
+                == [published_base, published_default]
+                and git.commit_parents(str(published_head))
+                == [published_base, published_default]
+                and git.commit_parents(str(integrated))
+                == [published_base, published_head]
+                and git.is_ancestor(str(published_default), str(integrated))
+            )
+        except (GitError, ValueError):
+            published_head_tree = None
+            integrated_tree = None
+            local_facts_match = False
+        if live.get("head_sha") != published_head:
+            return "change_pr_head_changed_externally"
+        if live.get("base_branch") != state.get("run_branch"):
+            return "change_pr_base_changed_externally"
+        if not isinstance(integrated, str) or live.get("integrated_sha") != integrated:
+            return "change_pr_integrated_sha_changed_externally"
+        if live.get("base_sha") != integrated:
+            return "change_pr_base_changed_externally"
+        if live.get("head_tree") != published_head_tree:
+            return "change_pr_head_tree_changed_externally"
+        if live.get("integrated_tree") != integrated_tree:
+            return "change_pr_integrated_tree_changed_externally"
+        if live.get("integrated_parents") != [published_base, published_head]:
+            return "change_pr_integrated_parents_changed_externally"
+        if not local_facts_match:
+            return "change_pr_integrated_authority_changed_externally"
+        return None
     if live.get("state") != "OPEN":
         return "change_pr_closed_or_merged_externally"
     if live.get("head_sha") != job.get("publication_sha"):

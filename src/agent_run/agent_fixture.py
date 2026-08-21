@@ -244,9 +244,7 @@ class FixtureAgentBackend:
             else "reviews"
         )
         self._maybe_fail_initial_credential(name, request)
-        if request.get("acceptance_scope") != "run" or request.get(
-            "repair_scope"
-        ) == "run_repair":
+        if request.get("acceptance_scope") != "run":
             return self._legacy_review(name, request)
         artifact, thread_id = self._output_attempts(
             name,
@@ -434,7 +432,11 @@ class FixtureAgentBackend:
         scope = (
             None
             if request is None
-            else request.get("repair_scope", request.get("acceptance_scope"))
+            else (
+                "run_repair"
+                if request.get("candidate_acceptance") is True
+                else request.get("acceptance_scope")
+            )
         )
         scoped_role = f"{role}:{scope}" if isinstance(scope, str) else None
         failures = (

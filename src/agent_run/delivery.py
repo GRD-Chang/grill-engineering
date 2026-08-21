@@ -128,6 +128,7 @@ class TicketDeliveryEngine:
                 self._block_closed_current_pr(state, active)
             elif live_state == "MERGED" and phase not in {
                 TicketPhase.MERGING.value,
+                TicketPhase.WAITING_MERGE.value,
                 TicketPhase.MERGED.value,
             }:
                 if self._can_reset_superseded_integration(active):
@@ -137,7 +138,10 @@ class TicketDeliveryEngine:
                     self._save(state)
                 else:
                     self._block_external_merge(state, active)
-            elif phase == TicketPhase.MERGING.value:
+            elif phase in {
+                TicketPhase.MERGING.value,
+                TicketPhase.WAITING_MERGE.value,
+            }:
                 active["pending_effective_revision"] = expected_revision
                 self._save(state)
             else:

@@ -70,13 +70,43 @@ class GhGitHubReader:
         repository = self.repository()
         data = self._gh_json(
             "pr", "view", str(pr_number), "--repo", repository.name_with_owner,
-            "--json", "state,headRefOid,baseRefName,baseRefOid",
+            "--json", "state,headRefOid,baseRefName,baseRefOid,mergeCommit",
         )
-        return {
+        merge_commit = data.get("mergeCommit")
+        integrated_sha = (
+            merge_commit.get("oid")
+            if isinstance(merge_commit, dict)
+            else None
+        )
+        result: dict[str, Any] = {
             "state": _string(data, "state"),
             "head_sha": _string(data, "headRefOid"),
             "base_branch": _string(data, "baseRefName"),
             "base_sha": _string(data, "baseRefOid"),
+            "integrated_sha": integrated_sha,
+        }
+        head_sha = result["head_sha"]
+        if isinstance(integrated_sha, str) and isinstance(head_sha, str):
+            integrated = self._commit_metadata(repository.name_with_owner, integrated_sha)
+            head = self._commit_metadata(repository.name_with_owner, head_sha)
+            result.update(
+                {
+                    "head_tree": head["tree"],
+                    "integrated_tree": integrated["tree"],
+                    "integrated_parents": integrated["parents"],
+                }
+            )
+        return result
+
+    def _commit_metadata(self, repository: str, sha: str) -> dict[str, Any]:
+        data = self._gh_json("api", f"repos/{repository}/git/commits/{sha}")
+        tree = _mapping(data, "tree")
+        parents = data.get("parents")
+        if not isinstance(parents, list):
+            raise GitHubReadError("github_invalid_response", "commit parents must be an array")
+        return {
+            "tree": _string(tree, "sha"),
+            "parents": [_string(_as_mapping(parent), "sha") for parent in parents],
         }
 
     def _read_parent(

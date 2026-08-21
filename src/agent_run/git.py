@@ -4,6 +4,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from agent_run.git_errors import GitError as GitError
+from agent_run.git_errors import MergeConflictError as MergeConflictError
+from agent_run.git_integration_commit import IntegrationRepairCommitGit
+from agent_run.git_integration_scene import IntegrationRepairSceneGit
 from agent_run.github_retry import run_read_command
 
 
@@ -16,14 +20,11 @@ MANAGED_DELIVERY_BRANCH_PREFIXES = (
 def is_managed_delivery_branch(branch: str) -> bool:
     return branch.startswith(MANAGED_DELIVERY_BRANCH_PREFIXES)
 
-
-class GitError(RuntimeError):
-    pass
-
-
 class GitRepository:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._integration_scene = IntegrationRepairSceneGit(self)
+        self._integration_commit = IntegrationRepairCommitGit(self)
 
     @classmethod
     def discover(cls, start: Path) -> GitRepository:
@@ -121,6 +122,34 @@ class GitRepository:
                 added.stderr.strip() or "could not create Run Repair checkout"
             )
 
+    def rotate_run_repair_checkout(
+        self,
+        *,
+        checkout: Path,
+        current_branch: str,
+        next_branch: str,
+        candidate_sha: str,
+    ) -> None:
+        """Move one persistent repair checkout onto a fresh managed Job branch."""
+
+        if self.ticket_checkout_matches(checkout, next_branch):
+            if self.checkout_head(checkout) != candidate_sha:
+                raise GitError("rotated Run Repair checkout has a foreign Candidate")
+            return
+        if not self.ticket_checkout_matches(checkout, current_branch):
+            raise GitError("existing Run Repair checkout does not match its Job branch")
+        if not is_managed_delivery_branch(next_branch):
+            raise GitError(f"refusing to create unmanaged branch {next_branch!r}")
+        if self._resolve(f"refs/heads/{next_branch}") is not None:
+            raise GitError(f"Run Repair Job branch {next_branch!r} already exists")
+        switched = self._run_in(
+            checkout, "switch", "-c", next_branch, candidate_sha
+        )
+        if switched.returncode != 0:
+            raise GitError(
+                switched.stderr.strip() or "could not rotate Run Repair Job branch"
+            )
+
     def ticket_checkout_matches(self, checkout: Path, branch: str) -> bool:
         if not checkout.exists():
             return False
@@ -191,10 +220,97 @@ class GitRepository:
         )
         if merged.returncode == 0:
             return
+        unmerged = self._run_in(
+            checkout, "diff", "--name-only", "--diff-filter=U"
+        )
         self._run_in(checkout, "merge", "--abort")
-        raise GitError(
-            merged.stderr.strip()
-            or "Run Branch cannot be merged into the current default branch"
+        evidence = "\n".join(
+            detail
+            for detail in (merged.stdout.strip(), merged.stderr.strip())
+            if detail
+        )
+        if unmerged.returncode != 0 or not unmerged.stdout.strip():
+            raise GitError(
+                evidence or "Run Branch merge preview failed before conflict detection"
+            )
+        raise MergeConflictError(
+            evidence or "Run Branch cannot be merged into the current default branch"
+        )
+
+    def prepare_integration_repair_checkout(
+        self,
+        checkout: Path,
+        *,
+        run_head_sha: str,
+        default_head_sha: str,
+        squash_candidate_sha: str | None = None,
+        allow_clean_merge: bool = False,
+        allow_staged_resolution: bool = False,
+    ) -> str:
+        return self._integration_scene.prepare_integration_repair_checkout(
+            checkout,
+            run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha,
+            squash_candidate_sha=squash_candidate_sha,
+            allow_clean_merge=allow_clean_merge,
+            allow_staged_resolution=allow_staged_resolution,
+        )
+
+    def convert_squash_candidate_to_integration_repair(
+        self,
+        checkout: Path,
+        *,
+        run_head_sha: str,
+        default_head_sha: str,
+        candidate_sha: str,
+    ) -> str:
+        return self._integration_scene.convert_squash_candidate_to_integration_repair(
+            checkout,
+            run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha,
+            candidate_sha=candidate_sha,
+        )
+
+    def reprepare_integration_repair_checkout(
+        self,
+        checkout: Path,
+        *,
+        run_head_sha: str,
+        default_head_sha: str,
+        superseded_candidate_sha: str | None,
+        superseded_default_head_sha: str,
+        superseded_publication_sha: str | None = None,
+        squash_candidate_sha: str | None = None,
+        finding_snapshot_sha: str | None = None,
+        discard_invocation_changes: bool = False,
+    ) -> str | None:
+        return self._integration_scene.reprepare_integration_repair_checkout(
+            checkout,
+            run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha,
+            superseded_candidate_sha=superseded_candidate_sha,
+            superseded_default_head_sha=superseded_default_head_sha,
+            superseded_publication_sha=superseded_publication_sha,
+            squash_candidate_sha=squash_candidate_sha,
+            finding_snapshot_sha=finding_snapshot_sha,
+            discard_invocation_changes=discard_invocation_changes,
+        )
+
+    def _replay_finding_delta(
+        self,
+        checkout: Path,
+        *,
+        run_head_sha: str,
+        default_head_sha: str,
+        candidate_sha: str,
+        snapshot_sha: str,
+    ) -> None:
+        self._integration_scene._replay_finding_delta(
+            checkout,
+            run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha,
+            candidate_sha=candidate_sha,
+            snapshot_sha=snapshot_sha,
         )
 
     def expected_merge_tree(
@@ -273,6 +389,41 @@ class GitRepository:
             )
         return self._resolve_in(checkout, "HEAD")
 
+    def commit_merge_resolution_candidate(
+        self,
+        checkout: Path,
+        *,
+        run_head_sha: str,
+        default_head_sha: str,
+        attempt: int,
+        squash_candidate_sha: str | None = None,
+        expected_conflict_paths: tuple[str, ...] = (),
+    ) -> str | None:
+        return self._integration_commit.commit_merge_resolution_candidate(
+            checkout,
+            run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha,
+            attempt=attempt,
+            squash_candidate_sha=squash_candidate_sha,
+            expected_conflict_paths=expected_conflict_paths,
+        )
+
+    def integration_conflict_paths(self, checkout: Path) -> tuple[str, ...]:
+        return self._integration_scene.integration_conflict_paths(checkout)
+
+    def create_integration_repair_snapshot(
+        self,
+        checkout: Path,
+        *,
+        candidate_sha: str,
+        attempt: int,
+    ) -> str | None:
+        return self._integration_scene.create_integration_repair_snapshot(
+            checkout,
+            candidate_sha=candidate_sha,
+            attempt=attempt,
+        )
+
     def create_publication_commit(
         self,
         checkout: Path,
@@ -282,6 +433,19 @@ class GitRepository:
         message: str,
     ) -> str:
         tree = self._resolve_in(checkout, f"{candidate_sha}^{{tree}}")
+        current = self._resolve_in(checkout, "HEAD")
+        if (
+            self._resolve_in(checkout, "HEAD^{tree}") == tree
+            and self.commit_parents(current) == [base_sha]
+        ):
+            current_message = self._run_in(
+                checkout, "show", "-s", "--format=%B", current
+            )
+            if (
+                current_message.returncode == 0
+                and current_message.stdout.strip() == message.strip()
+            ):
+                return current
         created = self._run_in(
             checkout,
             "commit-tree",
@@ -303,6 +467,23 @@ class GitRepository:
         if publication_tree != tree:
             raise GitError("publication commit changed the accepted candidate tree")
         return publication_sha
+
+    def create_merge_resolution_publication_commit(
+        self,
+        checkout: Path,
+        *,
+        candidate_sha: str,
+        run_head_sha: str,
+        default_head_sha: str,
+        message: str,
+    ) -> str:
+        return self._integration_commit.create_merge_resolution_publication_commit(
+            checkout,
+            candidate_sha=candidate_sha,
+            run_head_sha=run_head_sha,
+            default_head_sha=default_head_sha,
+            message=message,
+        )
 
     def reset_checkout_to_base(self, checkout: Path, base_branch: str) -> None:
         """Discard an invalidated Candidate from its managed checkout."""
@@ -337,6 +518,11 @@ class GitRepository:
         if result.returncode != 0:
             raise GitError(result.stderr.strip() or "could not read commit parents")
         return result.stdout.strip().split()
+
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
+        return self._run(
+            "merge-base", "--is-ancestor", ancestor_sha, descendant_sha
+        ).returncode == 0
 
     def remove_worktree(self, checkout: Path) -> None:
         if checkout.exists():
@@ -382,6 +568,10 @@ class GitRepository:
         if result.returncode != 0:
             raise GitError(result.stderr.strip() or f"could not resolve {reference}")
         return result.stdout.strip()
+
+    def _resolve_in_optional(self, directory: Path, reference: str) -> str | None:
+        result = self._run_in(directory, "rev-parse", "--verify", reference)
+        return result.stdout.strip() if result.returncode == 0 else None
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

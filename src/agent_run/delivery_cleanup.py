@@ -57,6 +57,24 @@ class DeliveryCleanupEngine:
         )
         return self._attempt(state)
 
+    def complete_run_repairs(
+        self, state: dict[str, Any], jobs: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Retire every Job identity used by one completed Repair Cycle."""
+
+        for job in jobs:
+            if job.get("phase") != "completed" or not isinstance(
+                job.get("integrated_sha"), str
+            ):
+                continue
+            self._schedule(
+                state,
+                kind="run_repair",
+                branch=self._string(job, "repair_branch"),
+                checkout=self._worktree(state, "run-repair"),
+            )
+        return self._attempt(state)
+
     def complete_parent(self, state: dict[str, Any]) -> dict[str, Any]:
         job = state.get("parent_job")
         if not isinstance(job, dict) or job.get("phase") != "completed":

@@ -10,6 +10,7 @@ from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
 from agent_run.github import GhGitHubReader, GitHubReadError, MergeOutcomeUnknownError
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
+from agent_run.required_checks import annotate_configured_code_failures
 
 _ACCEPTANCE_MARKER = "<!-- agent-run:acceptance-record -->"
 _RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
@@ -661,19 +662,51 @@ class GhGitHubPublisher:
         buckets = {str(_mapping(check).get("bucket", "")).lower() for check in checks}
         if not buckets:
             return "none"
+        if buckets - {"fail", "cancel", "pending", "pass", "skipping", "neutral"}:
+            return "unknown"
         if buckets & {"fail", "cancel"}:
             return "fail"
         if "pending" in buckets:
             return "pending"
         return "pass"
 
-    def required_check_evidence(self, pr_number: int) -> dict[str, Any]:
-        checks = self._checks(pr_number, "bucket,name,link,workflow,description")
-        failed = [
-            dict(_mapping(check))
-            for check in checks
-            if str(_mapping(check).get("bucket", "")).lower() in {"fail", "cancel"}
-        ]
+    def required_check_evidence(
+        self, pr_number: int, *, expected_head_sha: str | None = None
+    ) -> dict[str, Any]:
+        if expected_head_sha is None:
+            checks = self._checks(pr_number, "bucket,name,link,workflow,description")
+            legacy_failed = [
+                dict(_mapping(check))
+                for check in checks
+                if str(_mapping(check).get("bucket", "")).lower() in {"fail", "cancel"}
+            ]
+            return {"pr_number": pr_number, "checks": legacy_failed}
+        checks = self._checks(pr_number, "bucket,state,name,link,workflow,description")
+        failed: list[dict[str, Any]] = []
+        for raw in checks:
+            check = dict(_mapping(raw))
+            if str(check.get("bucket", "")).lower() not in {"fail", "cancel"}:
+                continue
+            job_id = _actions_job_id(check.get("link"), self.repository)
+            if job_id is not None:
+                job = _mapping(
+                    self._json(
+                        "api",
+                        f"repos/{self.repository}/actions/jobs/{job_id}",
+                    )
+                )
+                if _integer(job, "id") != job_id:
+                    raise GitHubReadError(
+                        "github_invalid_response",
+                        "Actions job response does not match the requested job",
+                    )
+                check["job"] = dict(job)
+            failed.append(check)
+        failed = annotate_configured_code_failures(
+            failed,
+            self.git.root,
+            expected_head_sha=expected_head_sha,
+        )
         return {"pr_number": pr_number, "checks": failed}
 
     def _checks(self, pr_number: int, fields: str) -> list[object]:
@@ -695,7 +728,7 @@ class GhGitHubPublisher:
             return self._ruleset_checks(pr_number, fields)
         if result.returncode not in {0, 1, 8}:
             raise GitHubReadError(
-                "github_write_failed", result.stderr.strip() or "gh command failed"
+                "github_read_failed", result.stderr.strip() or "gh command failed"
             )
         try:
             checks = json.loads(result.stdout or "null")
@@ -1921,6 +1954,17 @@ def _mapping(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise GitHubReadError("github_invalid_response", "expected an object")
     return value
+
+
+def _actions_job_id(link: object, repository: str) -> int | None:
+    if not isinstance(link, str):
+        return None
+    match = re.fullmatch(
+        rf"https://github\.com/{re.escape(repository)}/"
+        rf"(?:actions/runs/\d+/job|runs/\d+/jobs)/(\d+)(?:[/?#].*)?",
+        link,
+    )
+    return int(match.group(1)) if match is not None else None
 
 
 def _integer(data: dict[str, Any], key: str) -> int:

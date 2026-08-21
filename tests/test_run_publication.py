@@ -8,188 +8,23 @@ from typing import Any
 import pytest
 
 from agent_run.agents import ReviewResult
-from agent_run.agent_invocation import canonical_fingerprint
-from agent_run.codex import CodexProcessError
 from agent_run.github_fixture import FixtureGitHubPublisher
-from agent_run.github import GitHubReadError
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 
-from test_run_acceptance import _completed_run, _passing_artifact
+from run_acceptance_test_support import _passing_artifact
 from test_cli import run_internal_stage, run_cli, stdout_json
 
-
-class RunPublicationAgents:
-    def __init__(self) -> None:
-        self.requests: list[dict[str, Any]] = []
-
-    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        self.requests.append(request)
-        return {
-            "result_kind": "publication",
-            "commit_message": "feat(run): publish the completed delivery",
-            "pr_title": "feat(run): publish the completed delivery",
-            "pr_body_markdown": (
-                "## What Problem This Solves\n\nThe accepted Run needs a human merge boundary.\n\n"
-                "## Why This Change Was Made\n\nIt makes the completed delivery reviewable.\n\n"
-                "## User Impact\n\nMaintainers can inspect and approve one final PR.\n\n"
-                "## Evidence\n\nFresh Run Acceptance passed."
-            ),
-            "human_blockers": None,
-        }
-
-
-class InvocationRunPublicationAgents(RunPublicationAgents):
-    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        result = super().run_publication(request)
-        event = request["_invocation_event"]
-        event("started", requested_thread_id=None, attempt_count=0)
-        event(
-            "thread_started",
-            reported_thread_id="final-publication-thread",
-            attempt_count=1,
-        )
-        event(
-            "completed",
-            reported_thread_id="final-publication-thread",
-            attempt_count=1,
-        )
-        result["_thread_id"] = "final-publication-thread"
-        return result
-
-
-class PassingRunReviewer:
-    def review(self, request: dict[str, Any]) -> ReviewResult:
-        del request
-        return ReviewResult("run-reviewer", _passing_artifact())
-
-
-class InterruptedRunPublisher(FixtureGitHubPublisher):
-    def ensure_run_pr(
-        self,
-        *,
-        branch: str,
-        base_branch: str,
-        expected_head_sha: str,
-        expected_base_sha: str,
-        title: str,
-        body: str,
-    ) -> int:
-        del branch, base_branch, expected_head_sha, expected_base_sha, title, body
-        raise OSError("simulated Publisher interruption")
-
-
-class DelayedChecksRunPublisher(FixtureGitHubPublisher):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.read_failures = 1
-
-    def required_checks(self, pr_number: int) -> str:
-        if self.read_failures:
-            self.read_failures -= 1
-            raise GitHubReadError(
-                "github_timeout", "final PR checks have not converged"
-            )
-        return super().required_checks(pr_number)
-
-
-class UnknownNarrativeWritePublisher(FixtureGitHubPublisher):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.refresh_attempts = 0
-
-    def refresh_run_pr_narrative(self, **kwargs: Any) -> None:
-        self.refresh_attempts += 1
-        super().refresh_run_pr_narrative(**kwargs)
-        raise GitHubReadError(
-            "github_write_failed", "final PR narrative write outcome is unknown"
-        )
-
-
-class HumanThenRunPublicationAgents:
-    def __init__(self) -> None:
-        self.requests: list[dict[str, Any]] = []
-
-    def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-        self.requests.append(request)
-        if len(self.requests) == 1:
-            return {
-                "result_kind": "human_blocker",
-                "commit_message": None,
-                "pr_title": None,
-                "pr_body_markdown": None,
-                "human_blockers": [
-                    "GitHub denied access; tried gh issue view; grant Issue read access."
-                ],
-                "_thread_id": "blocked-publication-thread",
-            }
-        assert request["thread_id"] == "blocked-publication-thread"
-        assert request["prior_human_blockers"] == [
-            "GitHub denied access; tried gh issue view; grant Issue read access."
-        ]
-        assert request["human_response_history"] == [
-            {
-                "generation": 1,
-                "human_blockers": [
-                    "GitHub denied access; tried gh issue view; grant Issue read access."
-                ],
-                "response": "Issue read access is now available.",
-            }
-        ]
-        return {
-            "result_kind": "publication",
-            "commit_message": "feat(run): publish the completed delivery",
-            "pr_title": "feat(run): publish the completed delivery",
-            "pr_body_markdown": (
-                "## What Problem This Solves\n\nThe accepted Run needs publication.\n\n"
-                "## Why This Change Was Made\n\nAccess has been restored.\n\n"
-                "## User Impact\n\nMaintainers can approve the Run.\n\n"
-                "## Evidence\n\nThe original thread rechecked GitHub."
-            ),
-            "human_blockers": None,
-            "_thread_id": "blocked-publication-thread",
-        }
-
-
-def _accepted_run(
-    git_repo: Path,
-) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
-    state, states, git = _completed_run(git_repo)
-    tree = git.resolve(f"{state['run_branch']}^{{tree}}")
-    integrated = subprocess.run(
-        [
-            "git",
-            "commit-tree",
-            tree,
-            "-p",
-            str(state["run_branch"]),
-            "-m",
-            "feat(ticket): integrated accepted ticket",
-        ],
-        cwd=git_repo,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.strip()
-    subprocess.run(
-        ["git", "update-ref", f"refs/heads/{state['run_branch']}", integrated],
-        cwd=git_repo,
-        check=True,
-    )
-    state["ticket_jobs"]["2"]["integrated_sha"] = integrated
-    states.save_run(str(state["run_id"]), state)
-    publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
-    accepted = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=PassingRunReviewer(),
-        github=publisher,
-        default_head_sha=git.resolve("main"),
-    ).accept(str(state["run_id"]))
-    return accepted, states, git, publisher
-
+from run_publication_test_support import (
+    CountingNarrativeRefreshPublisher,
+    DelayedChecksRunPublisher,
+    HumanThenRunPublicationAgents,
+    RunPublicationAgents,
+    UnknownNarrativeWritePublisher,
+    _accepted_run,
+)
 
 def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     git_repo: Path,
@@ -242,7 +77,6 @@ def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     assert 1 in publisher.data["delivery"]["closed_issues"]
     assert publisher.data["parent"]["state"] == "CLOSED"
 
-
 def test_final_pr_read_lag_waits_without_recreating_publication(
     git_repo: Path,
 ) -> None:
@@ -263,7 +97,7 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     assert waiting["status"] == "waiting_external"
     assert waiting["run_publication"]["phase"] == "waiting_external"
     assert waiting["diagnostics"][0]["waiting_for"] == (
-        "Final Run PR GitHub reconciliation"
+        "Run PR #1 Required Checks observation"
     )
     assert len(agents.requests) == 1
 
@@ -272,6 +106,65 @@ def test_final_pr_read_lag_waits_without_recreating_publication(
     assert resumed["status"] == "run_approval_pending"
     assert len(agents.requests) == 1
 
+def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
+    git_repo: Path,
+) -> None:
+    state, states, git, _publisher = _accepted_run(git_repo)
+    publisher = CountingNarrativeRefreshPublisher(git_repo / "github.json", git)
+    publisher.data["delivery"]["run_required_checks_read_failures"] = [
+        {
+            "code": "github_write_failed",
+            "message": "temporary gh pr checks failure",
+        }
+    ]
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["terminal_kind"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert waiting["supervision_window"]["kind"] == "github_convergence"
+    assert waiting["diagnostics"][0]["waiting_for"].endswith(
+        "Required Checks observation"
+    )
+    assert all(
+        diagnostic["code"] != "github_write_outcome_unknown"
+        for diagnostic in waiting["diagnostics"]
+    )
+    before_resume = json.loads((git_repo / "github.json").read_text(encoding="utf-8"))
+    final_prs = [
+        pull
+        for pull in before_resume["delivery"]["pull_requests"]
+        if pull.get("scope") == "final_run"
+    ]
+    assert len(final_prs) == 1
+    assert publisher.refresh_attempts == 0
+    original_title = final_prs[0]["title"]
+    original_body = final_prs[0]["body"]
+
+    resumed = engine.publish(str(state["run_id"]))
+
+    assert resumed["status"] == "run_approval_pending"
+    assert len(agents.requests) == 1
+    assert publisher.refresh_attempts == 0
+    after_resume = json.loads((git_repo / "github.json").read_text(encoding="utf-8"))
+    resumed_prs = [
+        pull
+        for pull in after_resume["delivery"]["pull_requests"]
+        if pull.get("scope") == "final_run"
+    ]
+    assert len(resumed_prs) == 1
+    assert resumed_prs[0]["title"] == original_title
+    assert resumed_prs[0]["body"] == original_body
 
 def test_unknown_final_pr_narrative_write_does_not_replay(
     git_repo: Path,
@@ -286,6 +179,15 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
         default_branch="main",
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
+    assert initial["status"] == "run_approval_pending"
+    # Model an interruption after the PR narrative write but before its
+    # Publication Record became durable. Recovery must reconcile the write
+    # intent without replaying it.
+    initial["run_publication"].pop("record")
+    initial["run_publication"]["phase"] = "waiting_external"
+    initial["status"] = "waiting_external"
+    initial["terminal_kind"] = "waiting_external"
+    states.save_run(str(state["run_id"]), initial)
     uncertain_publisher = UnknownNarrativeWritePublisher(
         git_repo / "github.json", git
     )
@@ -301,11 +203,9 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
     waiting = engine.publish(str(state["run_id"]))
     resumed = engine.publish(str(state["run_id"]))
 
-    assert initial["status"] == "run_approval_pending"
     assert waiting["status"] == "waiting_external"
     assert resumed["status"] == "run_approval_pending"
     assert uncertain_publisher.refresh_attempts == 1
-
 
 def test_final_publication_human_resume_clears_current_blocker(
     git_repo: Path,
@@ -376,7 +276,6 @@ def test_final_publication_human_resume_clears_current_blocker(
     for key in ("human_blockers", "human_blocker_phase", "prior_human_blockers"):
         assert key not in publication
 
-
 def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     state["ticket_jobs"]["2"]["pr_number"] = 42
@@ -400,7 +299,6 @@ def test_final_run_pr_renders_completed_ticket_links(git_repo: Path) -> None:
     assert body.index("## Completed Tickets") < body.index(
         "## What Problem This Solves"
     )
-
 
 def test_fresh_publication_refreshes_an_existing_final_run_pr(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -472,7 +370,6 @@ def test_fresh_publication_refreshes_an_existing_final_run_pr(git_repo: Path) ->
     assert pull["title"] == "feat(run): refreshed final delivery"
     assert "Fresh default-base acceptance passed." in pull["body"]
 
-
 def test_publication_does_not_create_a_final_pr_after_parent_drifts(
     git_repo: Path,
 ) -> None:
@@ -500,7 +397,6 @@ def test_publication_does_not_create_a_final_pr_after_parent_drifts(
     assert published["status"] == "run_acceptance_pending"
     assert published["run_acceptance"]["phase"] == "pending"
     assert drifting.data["delivery"]["pull_requests"] == []
-
 
 def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -541,7 +437,6 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert publisher.data["delivery"]["closed_issues"].count(1) == 1
     assert publisher.data["parent"]["state"] == "CLOSED"
 
-
 def test_final_run_closeout_records_its_actual_delivery_type(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     engine = RunPublicationEngine(
@@ -563,7 +458,6 @@ def test_final_run_closeout_records_its_actual_delivery_type(git_repo: Path) -> 
     )
     assert comment["action"] == "parent_completion_comment"
     assert comment["delivery_type"] == "Final Run"
-
 
 def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -602,7 +496,6 @@ def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) ->
         ]
         == "OPEN"
     )
-
 
 def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
     git_repo: Path,
@@ -657,7 +550,6 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
     ).record_execution_failure(str(state["run_id"]), "must not overwrite abandonment")
     assert states.load_run(str(state["run_id"]))["status"] == "abandoned"
 
-
 def test_abandon_recovers_lost_final_run_pr_close_response(
     git_repo: Path,
 ) -> None:
@@ -700,736 +592,3 @@ def test_abandon_recovers_lost_final_run_pr_close_response(
         for mutation in publisher.data["delivery"]["mutations"]
         if mutation["action"] == "close_final_run_pr"
     ] == close_mutations
-
-
-def test_final_check_failure_enters_shared_run_repair(git_repo: Path) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    publisher.data["delivery"]["required_checks"] = ["fail"]
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-
-    failed_checks = engine.publish(str(state["run_id"]))
-
-    assert failed_checks["status"] == "run_acceptance_pending"
-    assert (
-        failed_checks["run_acceptance"]["repair_request"]["repair_source"]
-        == "required_checks"
-    )
-
-
-def test_final_merge_conflict_enters_shared_run_repair(git_repo: Path) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    publisher.data["delivery"]["mergeable"] = False
-    published = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-    assert published["status"] == "run_approval_pending"
-
-    conflicted = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).approve(str(state["run_id"]))
-
-    assert conflicted["status"] == "run_acceptance_pending"
-    assert (
-        conflicted["run_acceptance"]["repair_request"]["repair_source"]
-        == "merge_conflict"
-    )
-
-
-def test_approve_recovers_a_merge_that_succeeded_before_state_save(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-    engine.publish(str(state["run_id"]))
-    publisher.data["delivery"]["crash_after_normal_merge_once"] = True
-
-    waiting = engine.approve(str(state["run_id"]))
-    assert waiting["status"] == "waiting_external"
-    assert waiting["run_publication"]["phase"] == "waiting_external"
-
-    recovered = engine.approve(str(state["run_id"]))
-    assert recovered["status"] == "completed"
-    assert recovered["run_publication"]["phase"] == "merged"
-    assert recovered["run_publication"]["merge_intent"]["attempts"] == 1
-
-
-def test_approve_rejects_external_merge_without_persisted_final_run_intent(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-    published = engine.publish(str(state["run_id"]))
-    pr_number = int(published["run_publication"]["pr_number"])
-    publisher.normal_merge(pr_number=pr_number, expected_head_sha=git.resolve(str(state["run_branch"])))
-
-    with pytest.raises(GitHubReadError, match="persisted merge intent"):
-        engine.approve(str(state["run_id"]))
-
-    assert publisher.data["parent"].get("state") != "CLOSED"
-
-
-def test_pending_check_that_later_fails_enters_shared_run_repair(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    publisher.data["delivery"]["required_checks"] = ["pending", "fail"]
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-
-    waiting = engine.publish(str(state["run_id"]))
-    assert waiting["status"] == "waiting_checks"
-    repaired = engine.publish(str(state["run_id"]))
-
-    assert repaired["status"] == "run_acceptance_pending"
-    assert (
-        repaired["run_acceptance"]["repair_request"]["repair_source"]
-        == "required_checks"
-    )
-
-
-def test_worker_failure_before_publication_artifact_is_not_retried(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-
-    class InterruptedPublication(RunPublicationAgents):
-        def __init__(self) -> None:
-            super().__init__()
-            self.attempts = 0
-
-        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
-            del request
-            self.attempts += 1
-            raise CodexProcessError("simulated publication worker crash")
-
-    agents = InterruptedPublication()
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=agents,
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-    with pytest.raises(CodexProcessError, match="publication worker crash"):
-        engine.publish(str(state["run_id"]))
-
-    interrupted = states.load_run(str(state["run_id"]))
-    assert interrupted is not None
-    assert interrupted["run_publication"]["phase"] == "publishing"
-    assert interrupted["run_publication"]["publication_attempts"] == 1
-    assert agents.attempts == 1
-    assert interrupted["run_acceptance"]["phase"] == "accepted"
-
-    retried = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-    assert retried["status"] == "run_approval_pending"
-    assert retried["run_publication"]["publication_attempts"] == 2
-    assert retried["run_acceptance"]["phase"] == "accepted"
-
-
-def test_malformed_final_run_publication_is_not_retried(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-
-    class MalformedRunPublication:
-        def __init__(self) -> None:
-            self.attempts = 0
-
-        def run_publication(self, request: dict[str, Any]) -> dict[str, str]:
-            del request
-            self.attempts += 1
-            return {"invalid": "publication"}
-
-    agents = MalformedRunPublication()
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=agents,
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-
-    with pytest.raises(ValueError, match="commit_message"):
-        engine.publish(str(state["run_id"]))
-
-    assert agents.attempts == 1
-    interrupted = states.load_run(str(state["run_id"]))
-    assert interrupted is not None
-    assert interrupted["run_publication"]["phase"] == "publishing"
-    assert interrupted["run_publication"]["publication_attempts"] == 1
-
-
-def test_final_publication_discards_an_artifact_when_run_head_drifts(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-
-    class DriftingRunPublication(RunPublicationAgents):
-        def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-            result = super().run_publication(request)
-            tree = git.resolve(f"{state['run_branch']}^{{tree}}")
-            drifted = subprocess.run(
-                [
-                    "git",
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    str(state["run_branch"]),
-                    "-m",
-                    "test: drift run head during publication",
-                ],
-                cwd=git_repo,
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout.strip()
-            subprocess.run(
-                ["git", "update-ref", f"refs/heads/{state['run_branch']}", drifted],
-                cwd=git_repo,
-                check=True,
-            )
-            return result
-
-    stale = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=DriftingRunPublication(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-
-    assert stale["status"] == "run_acceptance_pending"
-    assert stale["run_acceptance"]["phase"] == "pending"
-    assert "artifact" not in stale["run_publication"]
-
-
-def test_final_publication_discards_an_artifact_when_default_base_advances(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    fixture = git_repo / "github.json"
-
-    class DriftingDefaultPublication(RunPublicationAgents):
-        def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
-            result = super().run_publication(request)
-            (git_repo / "default-branch.txt").write_text("advanced\n", encoding="utf-8")
-            subprocess.run(
-                ["git", "add", "default-branch.txt"], cwd=git_repo, check=True
-            )
-            subprocess.run(
-                ["git", "commit", "-m", "advance default during publication"],
-                cwd=git_repo,
-                check=True,
-                capture_output=True,
-            )
-            data = json.loads(fixture.read_text(encoding="utf-8"))
-            data["default_head_sha"] = git.resolve("main")
-            fixture.write_text(json.dumps(data), encoding="utf-8")
-            return result
-
-    stale = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=DriftingDefaultPublication(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=state["run_acceptance"]["acceptance_record"][
-            "reviewed_default_base_sha"
-        ],
-        currentness_reader=FixtureGitHubReader(fixture),
-    ).publish(str(state["run_id"]))
-
-    assert stale["status"] == "run_acceptance_pending"
-    assert stale["run_acceptance"]["phase"] == "pending"
-    assert "artifact" not in stale["run_publication"]
-    assert "pr_number" not in stale["run_publication"]
-
-
-def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
-    git_repo: Path,
-) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "malformed-run-publication.json"
-    agents.write_text(
-        json.dumps({"run_publications": [{"invalid": "publication"}]}),
-        encoding="utf-8",
-    )
-
-    failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(agents),
-    )
-
-    assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
-    persisted = states.load_run(str(state["run_id"]))
-    assert persisted is not None
-    assert persisted["status"] == "execution_failed"
-    assert persisted["terminal_kind"] == "execution_failed"
-    assert persisted["run_publication"]["phase"] == "publishing"
-    assert persisted["run_publication"]["publication_attempts"] == 1
-    invocation = persisted["active_agent_invocation"]
-    assert invocation["role"] == "final_publication"
-    assert invocation["status"] == "failed"
-
-
-def test_final_publication_fixture_missing_thread_marks_invocation_failed(
-    git_repo: Path,
-) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "missing-run-publication-thread.json"
-    agents.write_text(
-        json.dumps({"run_publications": [{"no_thread": True}]}),
-        encoding="utf-8",
-    )
-
-    failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(agents),
-    )
-
-    assert failed.returncode == 2
-    persisted = states.load_run(str(state["run_id"]))
-    assert persisted is not None
-    assert persisted["active_agent_invocation"]["status"] == "failed"
-
-
-def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
-    git_repo: Path,
-) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "repair-run-publication.json"
-    artifact = RunPublicationAgents().run_publication({})
-    agents.write_text(
-        json.dumps(
-            {
-                "run_publications": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "run-publication-thread",
-                        "invalid": "publication",
-                    },
-                    {
-                        "expected_thread_id": "run-publication-thread",
-                        "thread_id": "run-publication-thread",
-                        **artifact,
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    published = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(agents),
-    )
-
-    assert published.returncode == 0, published.stderr
-    persisted = states.load_run(str(state["run_id"]))
-    assert persisted is not None
-    invocation = persisted["active_agent_invocation"]
-    assert invocation["status"] == "completed"
-    assert invocation["reported_thread_id"] == "run-publication-thread"
-    assert invocation["attempt_count"] == 2
-
-
-def test_final_publication_fixture_records_a_fresh_thread_without_expectation(
-    git_repo: Path,
-) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "fresh-run-publication.json"
-    agents.write_text(
-        json.dumps({"run_publications": [RunPublicationAgents().run_publication({})]}),
-        encoding="utf-8",
-    )
-
-    published = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(agents),
-    )
-
-    assert published.returncode == 0, published.stderr
-    persisted = states.load_run(str(state["run_id"]))
-    assert persisted is not None
-    invocation = persisted["active_agent_invocation"]
-    assert invocation["status"] == "completed"
-    assert invocation["requested_thread_id"] is None
-    assert invocation["reported_thread_id"] == "fixture-run-publication"
-
-
-def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
-    git_repo: Path,
-) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    failed_agents = git_repo / "failed-run-publication.json"
-    failed_agents.write_text(
-        json.dumps(
-            {
-                "run_publications": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "failed-run-publication-thread",
-                        "invalid": "publication",
-                    },
-                    {
-                        "expected_thread_id": "failed-run-publication-thread",
-                        "thread_id": "failed-run-publication-thread",
-                        "invalid": "publication",
-                    },
-                    {
-                        "expected_thread_id": "failed-run-publication-thread",
-                        "thread_id": "failed-run-publication-thread",
-                        "invalid": "publication",
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(failed_agents),
-    )
-    assert failed.returncode == 2
-
-    resumed_agents = git_repo / "resumed-run-publication.json"
-    resumed_agents.write_text(
-        json.dumps(
-            {
-                "run_publications": [
-                    {
-                        "expected_thread_id": "failed-run-publication-thread",
-                        "thread_id": "failed-run-publication-thread",
-                        **RunPublicationAgents().run_publication({}),
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    resumed = run_cli(
-        git_repo,
-        git_repo / "github.json",
-        "resume",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(resumed_agents),
-    )
-
-    assert resumed.returncode == 0, resumed.stderr
-    persisted = states.load_run(str(state["run_id"]))
-    assert persisted is not None
-    history = persisted["agent_invocation_history"]
-    assert history[-2]["status"] == "failed"
-    assert history[-2]["attempt_count"] == 3
-    assert history[-1]["status"] == "completed"
-    assert history[-1]["attempt_count"] == 1
-
-
-def test_publish_run_retries_only_exhausted_final_run_publication(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-
-    pending = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=InterruptedRunPublisher(git_repo / "github.json", git),
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-    acceptance = pending["run_acceptance"]["acceptance_record"]
-    agents = git_repo / "resume-publication-agents.json"
-    agents.write_text(
-        json.dumps({"run_publications": [RunPublicationAgents().run_publication({})]}),
-        encoding="utf-8",
-    )
-
-    resumed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(agents),
-    )
-
-    assert resumed.returncode == 0, resumed.stderr
-    assert stdout_json(resumed)["status"] == "run_approval_pending"
-    recovered = states.load_run(str(state["run_id"]))
-    assert recovered is not None
-    assert recovered["run_acceptance"]["acceptance_record"] == acceptance
-    assert recovered["run_publication"]["publication_attempts"] == 1
-
-
-def test_recovered_publication_replaces_the_pending_terminal_kind(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-
-    pending = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=InterruptedRunPublisher(git_repo / "github.json", git),
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-    publisher.data["delivery"]["required_checks"] = ["pending"]
-
-    waiting = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-
-    assert pending["terminal_kind"] == "publication_pending"
-    assert waiting["status"] == "waiting_checks"
-    assert waiting["terminal_kind"] == "waiting_checks"
-
-
-def test_final_run_publication_receives_only_role_required_facts(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    agents = RunPublicationAgents()
-
-    RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=agents,
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-
-    request = agents.requests[0]
-    assert callable(request.pop("_invocation_event"))
-    assert callable(request.pop("_currentness_check"))
-    assert set(request) == {"acceptance_artifact", "checkout", "parent_issue_url"}
-    assert request["parent_issue_url"].endswith("/issues/1")
-
-
-def test_final_run_publication_invocation_binds_accepted_run_identity(
-    git_repo: Path,
-) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    agents = InvocationRunPublicationAgents()
-
-    completed = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=agents,
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-
-    invocation = completed["active_agent_invocation"]
-    run = completed["run_acceptance"]
-    acceptance = run["acceptance_record"]
-    request = agents.requests[0]
-    assert invocation["status"] == "completed"
-    assert invocation["work_subject"] == f"run-publication:{state['run_id']}"
-    assert invocation["generation"] == run["validation_attempts"]
-    assert invocation["input_fingerprint"] == canonical_fingerprint(request)
-    assert invocation["currentness_boundary"] == {
-        "reviewed_head_sha": acceptance["reviewed_head_sha"],
-        "reviewed_default_base_sha": acceptance["reviewed_default_base_sha"],
-        "expected_merge_tree": acceptance["expected_merge_tree"],
-        "parent_revision": acceptance["parent_revision"],
-        "ticket_graph_revision": acceptance["ticket_graph_revision"],
-        "ticket_completion_records_fingerprint": canonical_fingerprint(
-            acceptance["ticket_completion_records"]
-        ),
-    }
-    assert completed["agent_invocation_history"][-1] == invocation
-
-
-def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    agents = RunPublicationAgents()
-    publisher.data["delivery"]["crash_after_ensure_run_pr_once"] = True
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=agents,
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-
-    retried = engine.publish(str(state["run_id"]))
-
-    assert retried["status"] == "run_approval_pending"
-    assert len(agents.requests) == 2
-
-
-def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    engine = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    )
-    published = engine.publish(str(state["run_id"]))
-    publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
-    published["run_publication"]["phase"] = "publishing"
-    states.save_run(str(state["run_id"]), published)
-
-    stale = engine.publish(str(state["run_id"]))
-
-    assert stale["status"] == "run_acceptance_pending"
-    assert stale["run_acceptance"]["phase"] == "pending"
-    assert len(publisher.data["delivery"]["pull_requests"]) == 1
-
-    class FreshRunReviewer:
-        def review(self, request: dict[str, Any]) -> ReviewResult:
-            del request
-            return ReviewResult("fresh-run-reviewer", _passing_artifact())
-
-    fresh = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=FreshRunReviewer(),
-        github=publisher,
-        default_head_sha=git.resolve("main"),
-    ).accept(str(state["run_id"]))
-    recovered = RunPublicationEngine(
-        git=git,
-        states=states,
-        agents=RunPublicationAgents(),
-        github=publisher,
-        default_branch="main",
-        default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
-
-    assert fresh["run_acceptance"]["phase"] == "accepted"
-    assert (
-        recovered["run_publication"]["pr_number"]
-        != published["run_publication"]["pr_number"]
-    )
-    assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == [
-        "CLOSED",
-        "OPEN",
-    ]
-
-
-def test_revise_is_rejected_outside_a_human_gate(git_repo: Path) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
-    with pytest.raises(ValueError, match="explicit human gate"):
-        RunPublicationEngine(
-            git=git,
-            states=states,
-            agents=RunPublicationAgents(),
-            github=publisher,
-            default_branch="main",
-            default_head_sha=git.resolve("main"),
-        ).revise(str(state["run_id"]), "too early")
-
-
-def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
-    git_repo: Path,
-) -> None:
-    state, _states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "run-publication-agents.json"
-    artifact = RunPublicationAgents().run_publication({"run_id": state["run_id"]})
-    agents.write_text(json.dumps({"run_publications": [artifact]}), encoding="utf-8")
-
-    published = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
-        "publish-run",
-        str(state["run_id"]),
-        "--agent-fixture",
-        str(agents),
-    )
-
-    assert published.returncode == 0, published.stderr
-    assert stdout_json(published)["status"] == "run_approval_pending"
-    approved = run_cli(
-        git_repo, git_repo / "github.json", "approve", str(state["run_id"])
-    )
-    assert approved.returncode == 0, approved.stderr
-    assert stdout_json(approved)["status"] == "completed"
-    assert (
-        FixtureGitHubPublisher(git_repo / "github.json", _git).live_pull_request(1)[
-            "state"
-        ]
-        == "MERGED"
-    )

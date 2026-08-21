@@ -5,43 +5,36 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import (
-    canonical_fingerprint,
     fail_interrupted_invocation,
     invocation_event_recorder,
-    select_publication_thread,
 )
 from agent_run.artifacts import (
     AcceptanceArtifact,
     append_human_blocker_history,
     clear_current_human_blocker,
 )
-from agent_run.change_delivery import (
-    MAX_MODIFICATION_ATTEMPTS,
-    MAX_PUBLICATION_CONTEXT_ATTEMPTS,
-    ChangeDeliveryEngine,
-    ChangeJobContract,
-    StaleDisposition,
-    ensure_change_branch_authority,
-    latest_reviewer_thread,
-)
+from agent_run.change_delivery import latest_reviewer_thread
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
     wait_for_initial_credential,
 )
-from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
-from agent_run.git import GitRepository
+from agent_run.git import GitRepository, MergeConflictError
 from agent_run.human_responses import current_human_response_history
-from agent_run.revisions import effective_revision
 from agent_run.run_currentness import (
     RunCurrentnessReader,
     invalidate_run_acceptance,
-    invalidate_stale_run_repair,
     refresh_run_currentness,
     run_currentness_boundary,
     ticket_completion_records,
 )
+from agent_run.run_candidate_acceptance import CandidateRunAcceptance
+from agent_run.run_repair_lifecycle import RunRepairLifecycle
+from agent_run.run_repair_promotion import RunRepairPromotion
+from agent_run.run_repair_currentness import RunRepairCurrentness
+from agent_run.run_repair_requests import RunRepairRequests
+from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.state import StateStore
 from agent_run.worker_credentials import InitialCredentialUnavailable
 
@@ -73,6 +66,19 @@ class RunAcceptanceEngine:
         self.default_head_sha = default_head_sha
         self.github = github
         self.currentness_reader = currentness_reader
+        self.candidate_acceptance = CandidateRunAcceptance(
+            git, default_head_sha=default_head_sha
+        )
+        self.repair_requests = (
+            RunRepairRequests(git, github) if github is not None else None
+        )
+        self.repair_currentness = (
+            RunRepairCurrentness(git, github, states)
+            if github is not None
+            else None
+        )
+        self._repair_lifecycle = RunRepairLifecycle(self)
+        self._repair_promotion = RunRepairPromotion(self)
 
     def accept(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
@@ -132,6 +138,12 @@ class RunAcceptanceEngine:
                     if repair == "blocked":
                         run["phase"] = "ready_for_human"
                         continue
+                    if repair == "promoted":
+                        # The Candidate Acceptance has already been promoted
+                        # to the integrated Run boundary.  Run Publication is
+                        # the next phase; do not ask a second full Run
+                        # Reviewer to repeat the same three lanes.
+                        return self._save(state)
                     run["phase"] = "pending"
                     run.pop("acceptance_record", None)
                     run.pop("acceptance_artifact", None)
@@ -154,11 +166,27 @@ class RunAcceptanceEngine:
         checkout = self._validation_checkout(state, validation_attempt)
         try:
             default_head = self._default_head(state)
-            self.git.prepare_expected_merge_checkout(
-                default_head_sha=default_head,
-                run_head_sha=run_head,
-                checkout=checkout,
-            )
+            try:
+                self.git.prepare_expected_merge_checkout(
+                    default_head_sha=default_head,
+                    run_head_sha=run_head,
+                    checkout=checkout,
+                )
+            except MergeConflictError as error:
+                run["phase"] = "repairing"
+                run["repair_request"] = {
+                    "repair_source": "merge_conflict",
+                    "merge_conflict_evidence": str(error),
+                }
+                state.update(
+                    {
+                        "status": "run_acceptance_pending",
+                        "terminal_kind": "run_repair_pending",
+                        "diagnostics": [],
+                    }
+                )
+                self._save(state)
+                return True
             expected_merge_tree = self.git.expected_merge_tree(
                 default_head_sha=default_head,
                 run_head_sha=run_head,
@@ -267,10 +295,6 @@ class RunAcceptanceEngine:
                     ],
                 }
             )
-        elif int(run["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS:
-            clear_current_human_blocker(run)
-            run["phase"] = "ready_for_human"
-            run["blocked_reason"] = "modification_budget_exhausted"
         else:
             clear_current_human_blocker(run)
             run["phase"] = "repairing"
@@ -289,6 +313,7 @@ class RunAcceptanceEngine:
         if default_head is None:
             return False
         self.default_head_sha = default_head
+        self.candidate_acceptance.update_default_head(default_head)
         return True
 
     def _record_final_pr_status(
@@ -325,166 +350,42 @@ class RunAcceptanceEngine:
         )
 
     def _repair(self, state: dict[str, Any], run: dict[str, Any]) -> str:
-        """Deliver a Run Repair through the same Change Job lifecycle as Tickets.
+        return self._repair_lifecycle._repair(state, run)
 
-        The repair remains deliberately separate from a Ticket: it receives a
-        Run-Repair branch and PR, and its completion callback only returns the
-        Run to a wholly fresh overall acceptance.  The shared engine owns every
-        candidate, publication, fresh-review, checks, exact-head, and squash
-        transition in between.
-        """
-        if self.github is None:
-            raise ValueError("Run Repair requires the Publisher")
-        job = self._repair_job(state, run)
-        branch = str(job["repair_branch"])
-        ensure_change_branch_authority(
-            github=self.github,
-            state=state,
-            job=job,
-            branch=branch,
-            base_branch=str(state["run_branch"]),
-            save=self._save,
-        )
-        checkout = self._repair_checkout(state)
-        preserve_checkout = False
-        try:
-            self.git.prepare_ticket_checkout(
-                branch=branch, base_sha=str(job["base_sha"]), checkout=checkout
-            )
-            self._repair_engine().run(state, job, checkout)
-            preserve_checkout = (
-                job.get("blocked_reason") == "agent_requires_human"
-                and job.get("human_blocker_phase") in {"developing", "repairing"}
-            )
-        finally:
-            if not preserve_checkout:
-                self.git.remove_worktree(checkout)
-                self._remove_empty_directories(checkout)
-        if job["phase"] == "completed":
-            DeliveryCleanupEngine(
-                git=self.git, states=self.states, github=self.github
-            ).complete_run_repair(state, job)
-            return "merged"
-        if job["phase"] == "blocked":
-            return (
-                "no_code_changes"
-                if job.get("blocked_reason") == "no_code_changes"
-                else "blocked"
-            )
-        if job["phase"] == "stale":
-            return "stale"
-        return "waiting"
+    def _invalidate_stale_repair(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        self._repair_promotion._invalidate_stale_repair(state, job, checkout)
 
-    def _repair_engine(self) -> ChangeDeliveryEngine:
-        github = self.github
-        if github is None:
-            raise ValueError("Run Repair requires the Publisher")
-        return ChangeDeliveryEngine(
-            git=self.git,
-            github=github,
-            agents=self.agents,
-            contract=ChangeJobContract(
-                label=lambda job: f"run-repair-{job['repair_attempt']}",
-                branch=lambda job: str(job["repair_branch"]),
-                base_branch=lambda state: str(state["run_branch"]),
-                candidate=lambda checkout, _job, attempt: self.git.commit_run_repair_candidate(
-                    checkout, attempt=attempt
-                ),
-                development_thread_is_allowed=lambda _state, thread_id: thread_id
-                not in self._all_prior_threads(_state, self._run_state(_state)),
-                development_request=self._development_request,
-                publication_request=self._publication_request,
-                review_request=self._repair_review_request,
-                prepare_validation=self._prepare_repair_validation,
-                ensure_pr=lambda state, job, publication: github.ensure_change_pr(
-                    branch=str(job["repair_branch"]),
-                    base_branch=str(state["run_branch"]),
-                    title=str(publication["pr_title"]),
-                    body=self._render_run_repair_pr_body(state, publication),
-                    expected_head_sha=str(job["publication_sha"]),
-                    expected_base_sha=str(job["base_sha"]),
-                ),
-                acceptance_record=self._repair_acceptance_record,
-                acceptance_is_current=self._repair_acceptance_is_current,
-                invalidate_stale=self._invalidate_stale_repair,
-                stale_disposition=StaleDisposition.FRESH_RUN_ACCEPTANCE,
-                revision_changed=self._repair_revision_changed,
-                requires_explicit_approval=lambda _state, _job: False,
-                after_merge=self._after_repair_merge,
-                escalate=self._escalate_repair,
-                save=self._save,
-                linked_issue_number=lambda state, _job: int(self._mapping(state, "parent")["number"]),
-            ),
-        )
+    def _complete_integration_reprepare(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        self._repair_promotion._complete_integration_reprepare(state, job, checkout)
 
-    def _repair_job(self, state: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
-        existing = run.get("repair_job")
-        if isinstance(existing, dict):
-            return existing
-        base_sha = self.git.resolve(str(state["run_branch"]))
-        attempt = int(run["modification_attempts"]) + 1
-        generation = int(run.get("repair_generation", 0)) + 1
-        run["repair_generation"] = generation
-        # The generic engine only knows a job's own thread history.  Seed it
-        # with every prior Ticket and Run identity so a repair reviewer cannot
-        # accidentally reuse any of them.
-        prior_threads = sorted(self._all_prior_threads(state, run))
-        repair_request = run.pop("repair_request", {})
-        if not isinstance(repair_request, dict):
-            raise ValueError("repair_request must be an object")
-        repair_source = str(repair_request.get("repair_source", "acceptance"))
-        if repair_source not in {
-            "acceptance",
-            "human_revision",
-            "required_checks",
-            "merge_conflict",
-        }:
-            raise ValueError("invalid Run Repair source")
-        job = {
-            "run_id": state["run_id"],
-            "phase": "developing",
-            "repair_attempt": attempt,
-            "repair_generation": generation,
-            "repair_branch": (
-                f"agent-run-repair/{state['run_id']}/{attempt}"
-                if generation == 1
-                else f"agent-run-repair/{state['run_id']}/{attempt}-generation-{generation}"
-            ),
-            "base_sha": base_sha,
-            "parent_revision": self._mapping(state, "parent")["revision"],
-            "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
-            "ticket_completion_records": ticket_completion_records(state),
-            "repair_source": repair_source,
-            "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
-            "modification_attempts": int(run["modification_attempts"]),
-            "validation_attempts": 0,
-            "acceptance_generation": 1,
-            "development_thread_id": None,
-            "development_thread_history": [],
-            "reviewer_thread_ids": prior_threads,
-            "prior_reviewer_thread_ids": prior_threads,
-        }
-        trigger = self._repair_trigger(state, repair_source, repair_request)
-        if trigger is not None:
-            job["repair_trigger"] = trigger
-        if repair_source == "human_revision":
-            feedback = repair_request.get("human_feedback")
-            if not isinstance(feedback, str) or not feedback.strip():
-                raise ValueError("human revision feedback must be non-empty")
-            job["human_feedback"] = feedback
-        if repair_source == "required_checks":
-            evidence = repair_request.get("ci_evidence")
-            if not isinstance(evidence, dict):
-                raise ValueError("required-check repair evidence must be an object")
-            job["ci_evidence"] = evidence
-        if repair_source == "merge_conflict":
-            evidence = repair_request.get("merge_conflict_evidence")
-            if not isinstance(evidence, str) or not evidence.strip():
-                raise ValueError("merge-conflict repair evidence must be non-empty")
-            job["merge_conflict_evidence"] = evidence
-        run["repair_job"] = job
-        self._save(state)
-        return job
+    def _render_run_repair_pr_body(
+        self, state: dict[str, Any], publication: dict[str, Any]
+    ) -> str:
+        return self._repair_lifecycle._render_run_repair_pr_body(state, publication)
+
+    def _prepare_repair_validation(
+        self, checkout: Path, job: dict[str, Any], validation: Path
+    ) -> None:
+        self._repair_lifecycle._prepare_repair_validation(checkout, job, validation)
+
+    def _after_repair_merge(
+        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
+    ) -> bool:
+        return self._repair_promotion._after_repair_merge(state, job, live)
+
+    def _escalate_repair(
+        self, state: dict[str, Any], job: dict[str, Any], code: str
+    ) -> None:
+        self._repair_promotion._escalate_repair(state, job, code)
+
+    def _sync_repair_cycle_counters(
+        self, run: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        self._repair_lifecycle._sync_repair_cycle_counters(run, job)
 
     def _run_state(self, state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("run_acceptance")
@@ -498,6 +399,7 @@ class RunAcceptanceEngine:
             "development_thread_id": None,
             "development_thread_history": [],
             "reviewer_thread_ids": [],
+            "candidate_acceptance_history": [],
         }
         state["run_acceptance"] = run
         return run
@@ -505,6 +407,11 @@ class RunAcceptanceEngine:
     def _invalidate_stale_acceptance(
         self, state: dict[str, Any], run: dict[str, Any]
     ) -> None:
+        # An active Repair Job owns its own currentness checks.  This guard only
+        # invalidates a persisted, pre-repair Run Acceptance record before a
+        # new Repair Cycle can reuse it.
+        if isinstance(run.get("repair_job"), dict):
+            return
         record = run.get("acceptance_record")
         if not isinstance(record, dict):
             return
@@ -574,359 +481,10 @@ class RunAcceptanceEngine:
             ),
         }
 
-    def _development_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "run",
-            "repair_source": job.get("repair_source", "acceptance"),
-            "parent_issue_url": self._issue_url(
-                state, int(self._mapping(state, "parent")["number"])
-            ),
-            "run_id": state["run_id"],
-            "parent": dict(self._mapping(state, "parent")),
-            "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": ticket_completion_records(state),
-            "base_sha": job["base_sha"],
-            "head_sha": self.git.checkout_head(checkout),
-            "checkout": str(checkout),
-            "thread_id": None
-            if job.get("development_new_thread")
-            else job.get("development_thread_id"),
-            "development_summary": job.get("development_summary"),
-        }
-        source = str(request["repair_source"])
-        if source == "acceptance":
-            request["acceptance_artifact"] = self._mapping(job, "acceptance_artifact")
-        elif source == "required_checks":
-            request["ci_evidence"] = self._mapping(job, "ci_evidence")
-        elif source == "human_revision":
-            request["human_feedback"] = str(job["human_feedback"])
-        elif source == "merge_conflict":
-            request["merge_conflict_evidence"] = str(job["merge_conflict_evidence"])
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job, generation=int(job.get("human_response_generation", job.get("repair_generation", 1)))
-        ):
-            request["human_response_history"] = history
-        return request
-
-    def _publication_request(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        checkout: Path,
-    ) -> dict[str, Any]:
-        request = {
-            "acceptance_scope": "run",
-            "parent_issue_url": self._issue_url(
-                state, int(self._mapping(state, "parent")["number"])
-            ),
-            "run_id": state["run_id"],
-            "parent": self._mapping(state, "parent"),
-            "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": ticket_completion_records(state),
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "checkout": str(checkout),
-            "thread_id": select_publication_thread(
-                job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
-            ),
-            "acceptance_artifact": self._mapping(job, "acceptance_artifact"),
-        }
-        if job.get("prior_human_blockers"):
-            request["prior_human_blockers"] = job["prior_human_blockers"]
-        if history := current_human_response_history(
-            job,
-            generation=int(
-                job.get("human_response_generation", job.get("repair_generation", 1))
-            ),
-        ):
-            request["human_response_history"] = history
-        return request
-
-    def _invalidate_stale_repair(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        del checkout
-        invalidate_stale_run_repair(state)
-        job["phase"] = "stale"
-
-    def _render_run_repair_pr_body(
-        self, state: dict[str, Any], publication: dict[str, Any]
-    ) -> str:
-        parent = self._mapping(state, "parent")
-        narrative = str(publication["pr_body_markdown"]).strip()
-        return (
-            f"Parent Issue: #{int(parent['number'])}\n"
-            "Delivery Type: Run Repair\n\n"
-            f"{narrative}"
-        )
-
-    def _prepare_repair_validation(
-        self, _checkout: Path, job: dict[str, Any], validation: Path
-    ) -> None:
-        # The repair reviewer must inspect the Run Branch with the repair
-        # publication merged into it, not merely the repair branch by itself.
-        self.git.prepare_expected_merge_checkout(
-            default_head_sha=str(job["base_sha"]),
-            run_head_sha=str(job["candidate_sha"]),
-            checkout=validation,
-        )
-
-    def _repair_review_request(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "run",
-            "parent_issue_url": self._issue_url(
-                state, int(self._mapping(state, "parent")["number"])
-            ),
-            "repair_scope": "run_repair",
-            "run_id": state["run_id"],
-            "parent": dict(self._mapping(state, "parent")),
-            "ticket_graph": self._mapping(state, "ticket_graph"),
-            "ticket_completion_records": ticket_completion_records(state),
-            "base_sha": job["base_sha"],
-            "run_head_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "expected_merge_result": {
-                "run_branch_head_sha": job["base_sha"],
-                "repair_candidate_sha": job["candidate_sha"],
-                "inspection_command": (
-                    f"git diff {job['base_sha']} {job['candidate_sha']}"
-                ),
-                "checkout_state": "Run Branch plus repair publication merge preview; HEAD remains Run Branch base",
-            },
-            "checkout": str(checkout),
-            "thread_id": latest_reviewer_thread(job)
-            if (
-                (
-                    job.get("review_human_blocker_resume")
-                    or job.get("review_resume_thread_id")
-                )
-                and not job.get("review_new_thread")
-            )
-            else None,
-            **(
-                {"prior_human_blockers": job["prior_human_blockers"]}
-                if job.get("prior_human_blockers")
-                else {}
-            ),
-            **(
-                {"human_response_history": history}
-                if (
-                    history := current_human_response_history(
-                        job,
-                        generation=int(
-                            job.get(
-                                "human_response_generation",
-                                job.get("repair_generation", 1),
-                            )
-                        ),
-                    )
-                )
-                else {}
-            ),
-        }
-
-    def _repair_acceptance_record(
-        self,
-        _state: dict[str, Any],
-        job: dict[str, Any],
-        reviewer_thread_id: str,
-        artifact: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "acceptance_scope": "run_repair",
-            "reviewed_base_sha": job["base_sha"],
-            "reviewed_candidate_sha": job["candidate_sha"],
-            "reviewed_candidate_tree": self.git.resolve(
-                f"{job['candidate_sha']}^{{tree}}"
-            ),
-            "parent_revision": job["parent_revision"],
-            "ticket_graph_revision": job["ticket_graph_revision"],
-            "ticket_completion_records": job["ticket_completion_records"],
-            "reviewer_thread_id": reviewer_thread_id,
-            "repair_source": self._mapping(job, "acceptance_artifact"),
-            "artifact": artifact,
-        }
-
-    def _repair_acceptance_is_current(
-        self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
-    ) -> bool:
-        return (
-            acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")
-            and acceptance.get("reviewed_candidate_tree")
-            == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")
-            and not self._repair_revision_changed(state, job)
-        )
-
-    def _repair_revision_changed(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> bool:
-        return (
-            not self._refresh_run_currentness(state)
-            or not self._repair_trigger_is_current(job)
-            or self.git.resolve(str(state["run_branch"])) != job.get("base_sha")
-            or self._mapping(state, "parent").get("revision")
-            != job.get("parent_revision")
-            or self._mapping(state, "ticket_graph").get("revision")
-            != job.get("ticket_graph_revision")
-            or ticket_completion_records(state)
-            != job.get("ticket_completion_records")
-        )
-
-    def _repair_trigger(
-        self,
-        state: dict[str, Any],
-        repair_source: str,
-        repair_request: dict[str, Any],
+    def _candidate_promotion_record(
+        self, state: dict[str, Any], job: dict[str, Any], integrated: str
     ) -> dict[str, Any] | None:
-        publication = state.get("run_publication")
-        pr_number = publication.get("pr_number") if isinstance(publication, dict) else None
-        if not isinstance(pr_number, int):
-            return None
-        if self.github is None:
-            raise ValueError("Run Repair requires the Publisher")
-        live = self.github.live_pull_request(pr_number)
-        trigger = {
-            "pr_number": pr_number,
-            "state": live.get("state"),
-            "head_sha": live.get("head_sha"),
-            "base_branch": live.get("base_branch"),
-            "base_sha": live.get("base_sha"),
-        }
-        if repair_source == "required_checks":
-            evidence = repair_request.get("ci_evidence")
-            if not isinstance(evidence, dict):
-                raise ValueError("required-check repair evidence must be an object")
-            trigger["ci_evidence_fingerprint"] = canonical_fingerprint(evidence)
-        return trigger
-
-    def _repair_trigger_is_current(self, job: dict[str, Any]) -> bool:
-        trigger = job.get("repair_trigger")
-        if trigger is None:
-            return True
-        if not isinstance(trigger, dict) or self.github is None:
-            return False
-        pr_number = trigger.get("pr_number")
-        if not isinstance(pr_number, int):
-            return False
-        live = self.github.live_pull_request(pr_number)
-        if any(
-            trigger.get(key) != live.get(key)
-            for key in ("state", "head_sha", "base_branch", "base_sha")
-        ):
-            return False
-        evidence_fingerprint = trigger.get("ci_evidence_fingerprint")
-        return not isinstance(evidence_fingerprint, str) or (
-            evidence_fingerprint
-            == canonical_fingerprint(self.github.required_check_evidence(pr_number))
-        )
-
-    def _after_repair_merge(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        _live_before_merge: dict[str, Any],
-    ) -> bool:
-        if self.github is None:
-            raise ValueError("Run Repair requires the Publisher")
-        live = self.github.live_pull_request(int(job["pr_number"]))
-        integrated = job.get("integrated_sha")
-        publication = self._mapping(job, "publication")
-        if (
-            live.get("state") != "MERGED"
-            or not isinstance(integrated, str)
-            or live.get("integrated_sha") != integrated
-            or live.get("head_sha") != job.get("publication_sha")
-            or live.get("base_branch") != state.get("run_branch")
-            or live.get("head_tree") != live.get("integrated_tree")
-            or live.get("integrated_message") != publication.get("commit_message")
-            or live.get("integrated_parents") != [job.get("base_sha")]
-        ):
-            return self._block_repair(
-                state,
-                job,
-                "merged_result_mismatch",
-                "Merged Run Repair PR does not match Publisher merge intent",
-            )
-        run = self._run_state(state)
-        prior = set(self._string_list(job, "prior_reviewer_thread_ids"))
-        reviewers = self._string_list(run, "reviewer_thread_ids")
-        reviewers.extend(
-            thread_id
-            for thread_id in self._string_list(job, "reviewer_thread_ids")
-            if thread_id not in prior and thread_id not in reviewers
-        )
-        run["reviewer_thread_ids"] = reviewers
-        history = self._string_list(run, "development_thread_history")
-        development_ids = [
-            *self._string_list(job, "development_thread_history"),
-            str(job.get("development_thread_id", "")),
-        ]
-        for thread_id in development_ids:
-            if thread_id and thread_id not in history:
-                history.append(thread_id)
-        run["development_thread_history"] = history
-        run.update(
-            {
-                "modification_attempts": int(job["modification_attempts"]),
-                "candidate_sha": job["candidate_sha"],
-                "publication_sha": job["publication_sha"],
-                "repair_pr_number": job["pr_number"],
-                "integrated_sha": integrated,
-            }
-        )
-        completed_repairs = run.setdefault("completed_repair_jobs", [])
-        if not isinstance(completed_repairs, list):
-            raise ValueError("completed_repair_jobs must be a list")
-        completed = {
-            "phase": "completed",
-            "repair_branch": job["repair_branch"],
-            "integrated_sha": integrated,
-        }
-        display = job.get("linked_branch_display")
-        if isinstance(display, dict):
-            completed["linked_branch_display"] = dict(display)
-        completed_repairs.append(completed)
-        run.pop("repair_job", None)
-        state["status"] = "run_acceptance_pending"
-        state["diagnostics"] = []
-        return True
-
-    def _escalate_repair(
-        self, state: dict[str, Any], job: dict[str, Any], code: str
-    ) -> None:
-        run = self._run_state(state)
-        run.update({"phase": "ready_for_human", "blocked_reason": code})
-        state["status"] = "ready_for_human"
-        state["terminal_kind"] = "waiting_human"
-        state["diagnostics"] = [
-            {
-                "code": code,
-                "message": "Run Repair requires explicit human intervention",
-                "change_job": f"run-repair-{job['repair_attempt']}",
-            }
-        ]
-
-    def _block_repair(
-        self,
-        state: dict[str, Any],
-        job: dict[str, Any],
-        code: str,
-        message: str,
-    ) -> bool:
-        job.update({"phase": "blocked", "blocked_reason": code})
-        state["status"] = "blocked"
-        state["diagnostics"] = [
-            {"code": code, "message": message, "change_job": f"run-repair-{job['repair_attempt']}"}
-        ]
-        self._save(state)
-        return False
+        return self.candidate_acceptance.promotion_record(state, job, integrated)
 
     def _acceptance_record(
         self,
@@ -967,7 +525,7 @@ class RunAcceptanceEngine:
                 "Human Blocker resume requires the latest Reviewer Thread"
             )
         if not thread_id.strip() or (
-            thread_id in self._all_prior_threads(state, run) and not resumed
+            thread_id in prior_thread_identities(state, run) and not resumed
         ):
             raise ValueError("Run Acceptance requires a new Reviewer Thread")
         reviewers = self._string_list(run, "reviewer_thread_ids")
@@ -977,31 +535,6 @@ class RunAcceptanceEngine:
         run.pop("reviewer_resume_thread_id", None)
         run.pop("reviewer_new_thread", None)
         self._save(state)
-
-    def _all_prior_threads(
-        self, state: dict[str, Any], run: dict[str, Any]
-    ) -> set[str]:
-        values = set(self._string_list(run, "reviewer_thread_ids"))
-        for key in ("development_thread_id",):
-            value = run.get(key)
-            if isinstance(value, str):
-                values.add(value)
-        values.update(self._string_list(run, "development_thread_history"))
-        discarded = run.get("discarded_repair_thread_ids")
-        if discarded is not None:
-            values.update(self._string_list(run, "discarded_repair_thread_ids"))
-        for job in self._mapping(state, "ticket_jobs").values():
-            if not isinstance(job, dict):
-                continue
-            for key in ("development_thread_id",):
-                value = job.get(key)
-                if isinstance(value, str):
-                    values.add(value)
-            for key in ("development_thread_history", "reviewer_thread_ids"):
-                value = job.get(key, [])
-                if isinstance(value, list):
-                    values.update(item for item in value if isinstance(item, str))
-        return values
 
     def _all_tickets_completed(self, state: dict[str, Any]) -> bool:
         order = self._mapping(state, "ticket_graph").get("ordered_ticket_numbers")

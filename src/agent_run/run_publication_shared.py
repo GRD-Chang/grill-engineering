@@ -6,6 +6,11 @@ from typing import Any
 from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.human_responses import current_human_response_history
@@ -120,6 +125,35 @@ class RunPublicationShared:
         )
         return state
 
+    def _required_check_evidence(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        expected_head_sha: str,
+    ) -> dict[str, Any] | None:
+        """Read failed-check evidence or persist one bounded convergence wait."""
+
+        try:
+            return self.github.required_check_evidence(
+                pr_number, expected_head_sha=expected_head_sha
+            )
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_check_evidence_observation_pending",
+                message="Final Run Required Check failure evidence has not converged",
+                waiting_for=f"Final Run PR #{pr_number} failed Required Check evidence",
+            )
+            ensure_supervision_window(state)
+            self._save(state)
+            return None
+
     def _publication_request(self, state: dict[str, Any], checkout: Path) -> dict[str, Any]:
         parent = self._mapping(state, "parent")
         publication = self._publication_state(state)
@@ -186,6 +220,7 @@ class RunPublicationShared:
         next_action = {
             "fail": "repair failed Required Checks",
             "pending": "wait for Required Checks",
+            "unknown": "retry Required Checks observation",
         }.get(checks, "await explicit maintainer approval")
         self.github.record_agent_run_status(
             pr_number,

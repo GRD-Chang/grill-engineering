@@ -366,11 +366,7 @@ class CodexCliBackend:
             schema=acceptance_schema(),
             output_name="Acceptance Artifact",
             validate=lambda value: AcceptanceArtifact.parse(value),
-            initial_writable_checkout=True,
-        )
-        return ReviewResult(
-            thread_id=thread_id,
-            artifact=_json_object(output, "Acceptance Artifact"),
+            initial_writable_checkout=False,
         )
         return ReviewResult(
             thread_id=thread_id,
@@ -900,8 +896,10 @@ def _acceptance_contract(context: dict[str, Any]) -> str:
         "Review 和 Spec Review 三条不同 lane：Standards Review 使用 skill:code-review，Spec Review 也使用 "
         "skill:code-review。你不得替代任何缺失 lane 或自行签署通过；subagent 失败时必须"
         "解决派发问题并重新派发。\n\n"
-        "可构建、测试和产生验证中间产物，并在结束前清理自己创建的验证或临时产物；不得"
-        "修复源码、测试、配置或 `.gitignore`，也不得整理交付内容。发现的问题只能通过"
+        "Validation Checkout 是只读的，不得创建、修改或删除其中的文件。可构建、测试和"
+        "产生验证中间产物，但任何需要写入的内容必须放在 checkout 外可定位、只服务本轮的"
+        "临时路径，并在结束前清理；不得修复源码、测试、配置或 `.gitignore`，也不得整理"
+        "交付内容。发现的问题只能通过"
         "Acceptance Artifact 返回。不得 commit、push、merge、关闭或修改 GitHub。"
     )
 

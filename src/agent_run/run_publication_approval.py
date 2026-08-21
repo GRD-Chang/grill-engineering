@@ -15,9 +15,13 @@ from agent_run.external_supervision import (
     wait_for_github_convergence,
 )
 from agent_run.error_safety import bounded_error
-from agent_run.git import GitError
+from agent_run.git import MergeConflictError
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.run_currentness import ticket_completion_records
+from agent_run.required_checks import (
+    is_explicitly_repairable_code_failure,
+    supervise_unrepairable_check_failure,
+)
 from agent_run.run_publication_shared import RunPublicationShared
 
 
@@ -77,8 +81,6 @@ class RunPublicationApproval(RunPublicationShared):
                     state,
                     "merged final Run PR does not match its reviewed publication boundary",
                 )
-            if not self._acceptance_is_current(state, run):
-                return self._invalidate_for_fresh_acceptance(state)
             try:
                 self._require_final_pr_identity(
                     live=live,
@@ -95,6 +97,10 @@ class RunPublicationApproval(RunPublicationShared):
                 ):
                     return self._invalidate_for_fresh_acceptance(state)
                 raise
+            if record.get("default_head_sha") != self.default_head_sha:
+                return self._handle_default_drift(state)
+            if not self._acceptance_is_current(state, run):
+                return self._invalidate_for_fresh_acceptance(state)
             if (
                 record.get("pr_head_sha") != live.get("head_sha")
                 or record.get("run_head_sha") != run_head
@@ -104,8 +110,6 @@ class RunPublicationApproval(RunPublicationShared):
                 or live.get("base_sha") != self.default_head_sha
                 or live.get("base_branch") != self.default_branch
             ):
-                if record.get("default_head_sha") != self.default_head_sha:
-                    return self._handle_default_drift(state)
                 return self._invalidate_for_fresh_acceptance(state)
             authority = self._approval_grant_authority(
                 state, run, pr_number, run_head
@@ -119,17 +123,13 @@ class RunPublicationApproval(RunPublicationShared):
             ):
                 publication["approval_grant"] = create_grant(authority)
                 self._save(state)
-            if live.get("state") != "OPEN" or not live.get("mergeable"):
-                return self._save(
-                    self._queue_repair(
-                        state,
-                        repair_source="merge_conflict",
-                        merge_conflict_evidence=(
-                            "Final Run PR is no longer mergeable against the current "
-                            "default branch."
-                        ),
-                    )
+            if live.get("state") != "OPEN":
+                raise GitHubReadError(
+                    "final_run_pr_not_open",
+                    "Final Run PR is not open at the approved publication boundary",
                 )
+            if live.get("mergeable") is not True:
+                return self._preview_current_merge(state)
             try:
                 checks = self.github.required_checks(pr_number)
             except GitHubReadError as error:
@@ -143,7 +143,7 @@ class RunPublicationApproval(RunPublicationShared):
                     code=error.code,
                     message=error.message,
                 )
-            except OSError as error:
+            except (OSError, TimeoutError) as error:
                 return self._wait_for_required_checks_convergence(
                     state,
                     publication,
@@ -153,16 +153,41 @@ class RunPublicationApproval(RunPublicationShared):
                     message=str(error),
                 )
             if checks == "fail":
+                evidence = self._required_check_evidence(
+                    state, publication, pr_number, run_head
+                )
+                if evidence is None:
+                    return state
+                if not is_explicitly_repairable_code_failure(evidence):
+                    supervise_unrepairable_check_failure(
+                        state,
+                        publication,
+                        phase="waiting_external",
+                        waiting_for=(
+                            f"Run PR #{pr_number} Required Check repairability"
+                        ),
+                    )
+                    return self._save(state)
                 return self._save(
                     self._queue_repair(
                         state,
                         repair_source="required_checks",
-                        ci_evidence=self.github.required_check_evidence(pr_number),
+                        ci_evidence=evidence,
                     )
                 )
             if checks == "pending":
                 publication["phase"] = "waiting_checks"
                 state["status"] = "waiting_checks"
+                ensure_supervision_window(state)
+                return self._save(state)
+            if checks == "unknown":
+                publication["phase"] = "waiting_external"
+                wait_for_github_convergence(
+                    state,
+                    code="github_checks_observation_unknown",
+                    message="GitHub Required Checks returned an unknown state",
+                    waiting_for=f"Run PR #{pr_number} Required Checks observation",
+                )
                 ensure_supervision_window(state)
                 return self._save(state)
             if not grant_matches(publication.get("approval_grant"), authority):
@@ -395,6 +420,11 @@ class RunPublicationApproval(RunPublicationShared):
             return self._save(state)
 
     def _handle_default_drift(self, state: dict[str, Any]) -> dict[str, Any]:
+        return self._preview_current_merge(state)
+
+    def _preview_current_merge(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Use local Git facts to distinguish a conflict from a clean re-review."""
+
         checkout = self._publication_checkout(state)
         try:
             self.git.prepare_expected_merge_checkout(
@@ -402,7 +432,7 @@ class RunPublicationApproval(RunPublicationShared):
                 run_head_sha=self.git.resolve(str(state["run_branch"])),
                 checkout=checkout,
             )
-        except GitError as error:
+        except MergeConflictError as error:
             return self._save(
                 self._queue_repair(
                     state,

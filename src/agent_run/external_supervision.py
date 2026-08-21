@@ -299,6 +299,10 @@ def _waiting_object(state: dict[str, Any]) -> str:
     active = state.get("active_ticket_job")
     if isinstance(active, dict) and isinstance(active.get("pr_number"), int):
         return f"Ticket PR #{active['pr_number']} 的 GitHub 对账"
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if isinstance(repair, dict) and isinstance(repair.get("pr_number"), int):
+        return f"Run Repair PR #{repair['pr_number']} 的 GitHub 对账"
     publication = state.get("run_publication")
     if isinstance(publication, dict) and isinstance(publication.get("pr_number"), int):
         return f"Run PR #{publication['pr_number']} 的 GitHub 对账"
@@ -430,8 +434,14 @@ def public_supervision_snapshot(
 
 
 def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
-    for key in ("active_ticket_job", "parent_job", "run_publication"):
-        job = state.get(key)
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    for job in (
+        state.get("active_ticket_job"),
+        repair,
+        state.get("parent_job"),
+        state.get("run_publication"),
+    ):
         if not isinstance(job, dict):
             continue
         head_sha = next(
@@ -515,6 +525,24 @@ def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
             if review_facts := _review_boundary_facts(value):
                 identity["review_boundary"] = review_facts
             subject[key] = identity
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if isinstance(repair, dict):
+        repair_identity = {
+            item: repair.get(item)
+            for item in (
+                "phase",
+                "repair_generation",
+                "pr_number",
+                "base_sha",
+                "candidate_sha",
+                "publication_sha",
+            )
+            if repair.get(item) is not None
+        }
+        if review_facts := _review_boundary_facts(repair):
+            repair_identity["review_boundary"] = review_facts
+        subject["run_repair_job"] = repair_identity
     return json.dumps(subject, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 

@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
 
@@ -39,6 +40,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     active = _active_ticket_job(state)
     active_ticket = active.get("ticket_number") if active else None
     worker = _current_worker(state)
+    run_repair = _run_repair_status(state)
     output = {
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
@@ -47,6 +49,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "active_ticket": active_ticket,
         "phase": _current_phase(state),
         "worker": worker,
+        "run_repair": run_repair,
         "elapsed_seconds": _elapsed_seconds(state.get("created_at")),
         "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
         "next_action": _next_action(state),
@@ -69,6 +72,16 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
             "当前工作代理: "
             f"{worker['role']}（第 {worker['attempt']} 次尝试，{_display_term(worker['phase'])}，"
             f"会话 {worker['thread_id'] or '尚不可用'}）"
+        )
+    if isinstance(run_repair, dict):
+        print(
+            "运行修复: "
+            f"Run Acceptance Generation {run_repair['acceptance_generation']}；"
+            f"Repair Cycle Generation {run_repair['repair_cycle_generation']}；"
+            f"代码修改 {run_repair['code_modification_attempts']}/10；"
+            f"Candidate 验证 {run_repair['validation_attempts']} 次；"
+            "Candidate 验证状态 "
+            f"{_display_term(run_repair['candidate_validation_status'])}"
         )
     print(f"已运行: {output['elapsed_seconds']} 秒")
     if output["gate"]:
@@ -261,6 +274,10 @@ def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
             "phase": publication.get("phase"),
         }
     acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        repair = acceptance.get("repair_job")
+        if isinstance(repair, dict):
+            return _worker_from_job(repair, run_repair=True)
     if isinstance(acceptance, dict) and acceptance.get("phase") == "reviewing":
         reviewer_ids = acceptance.get("reviewer_thread_ids")
         thread_id = (
@@ -308,27 +325,32 @@ def _active_ticket_job(state: dict[str, object]) -> dict[str, object] | None:
     return active
 
 
-def _worker_from_job(job: dict[str, object]) -> dict[str, object] | None:
+def _worker_from_job(
+    job: dict[str, object], *, run_repair: bool = False
+) -> dict[str, object] | None:
     phase = str(job.get("phase"))
+    review_role = "运行修复验收工作代理" if run_repair else "独立验收工作代理"
+    publication_role = "运行修复发布工作代理" if run_repair else "发布工作代理"
+    development_role = "运行修复开发工作代理" if run_repair else "开发工作代理"
     if phase in {"reviewing", "validating"}:
         reviewer_ids = job.get("reviewer_thread_ids")
         thread_id = reviewer_ids[-1] if isinstance(reviewer_ids, list) and reviewer_ids else None
         return {
-            "role": "独立验收工作代理",
+            "role": review_role,
             "attempt": job.get("validation_attempts"),
             "thread_id": thread_id,
             "phase": phase,
         }
     if phase in {"publishing", "publication_pending"}:
         return {
-            "role": "发布工作代理",
+            "role": publication_role,
             "attempt": job.get("publication_attempts"),
             "thread_id": job.get("publication_thread_id"),
             "phase": phase,
         }
     if phase in {"developing", "repairing"}:
         return {
-            "role": "开发工作代理",
+            "role": development_role,
             "attempt": job.get("pending_attempt", job.get("modification_attempts")),
             "thread_id": (
                 None
@@ -338,6 +360,65 @@ def _worker_from_job(job: dict[str, object]) -> dict[str, object] | None:
             "phase": phase,
         }
     return None
+
+
+def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
+    acceptance = state.get("run_acceptance")
+    if not isinstance(acceptance, dict):
+        return None
+    job = acceptance.get("repair_job")
+    cycle = acceptance.get("repair_cycle")
+    if not isinstance(job, dict) or not isinstance(cycle, dict):
+        return None
+    candidate_validation_status = _candidate_validation_status(job)
+    return {
+        # Keep ``generation`` and ``phase`` as compatibility aliases while
+        # exposing each lifecycle dimension under an unambiguous public name.
+        "generation": job.get("repair_generation"),
+        "repair_cycle_generation": cycle.get("generation"),
+        "acceptance_generation": acceptance.get("acceptance_generation"),
+        "phase": job.get("phase"),
+        # Keep the old phase-shaped name for clients already consuming it,
+        # but expose the independently derived status as the canonical field.
+        "candidate_validation_phase": candidate_validation_status,
+        "candidate_validation_status": candidate_validation_status,
+        "cycle_status": cycle.get("status"),
+        "code_modification_attempts": cycle.get("code_modification_attempts", 0),
+        "validation_attempts": cycle.get("validation_attempts", 0),
+        "candidate_sha": job.get("candidate_sha"),
+        "development_thread_id": cycle.get("development_thread_id"),
+        "worktree": cycle.get("worktree"),
+    }
+
+
+def _candidate_validation_status(job: dict[str, object]) -> str:
+    """Report the current Candidate verdict independently of delivery progress."""
+
+    if job.get("phase") == "stale":
+        return "stale"
+    record = job.get("acceptance_record")
+    candidate_sha = job.get("candidate_sha")
+    if (
+        isinstance(record, dict)
+        and isinstance(candidate_sha, str)
+        and record.get("reviewed_candidate_sha") == candidate_sha
+    ):
+        try:
+            artifact = AcceptanceArtifact.parse(record.get("artifact"))
+        except ValueError:
+            # An interrupted or legacy record is not a completed verdict.
+            pass
+        else:
+            if artifact.is_accepted:
+                return "pass"
+            if artifact.has_failures:
+                return "fail"
+            return "blocked"
+    if job.get("phase") == "reviewing":
+        return "reviewing"
+    if job.get("phase") == "blocked":
+        return "blocked"
+    return "unreviewed"
 
 
 def _elapsed_seconds(created_at: object) -> int | None:
@@ -375,6 +456,10 @@ def _display_term(value: object) -> object:
         "execution_failed": "执行失败，可恢复",
         "supervision_timeout": "监督超时暂停，可恢复",
         "blocked": "已阻塞",
+        "unreviewed": "未验收",
+        "pass": "已通过",
+        "fail": "未通过",
+        "stale": "已失效",
         "completed": "已完成",
         "abandoned": "已放弃",
         "developing": "开发中",

@@ -373,6 +373,20 @@ def test_start_contract_documents_its_managed_run_branch_side_effect(
         assert "受管 Run Branch" in path.read_text(encoding="utf-8")
 
 
+def test_run_repair_docs_describe_job_rotation_and_candidate_promotion() -> None:
+    context = (PROJECT_ROOT / "CONTEXT.md").read_text(encoding="utf-8")
+    operator_guide = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "一个 Cycle 可依次包含多个 Run Repair Job" in context
+    assert "轮转出后继 Job" in context
+    assert "Candidate Run Acceptance → 严格 promotion" in operator_guide
+    assert "归档旧 Job/PR 并轮转新的 branch/PR" in operator_guide
+    assert "一个活跃 Run Repair Job 实现一个 Repair Cycle" not in context
+    assert "Run Repair → fresh Run Acceptance → 新 PR" not in operator_guide
+
+
 def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
     git_repo: Path, tmp_path: Path
 ) -> None:

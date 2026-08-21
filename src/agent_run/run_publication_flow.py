@@ -23,11 +23,16 @@ from agent_run.credential_availability import (
 )
 from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import (
+    ensure_supervision_window,
     is_github_convergence_error,
     wait_for_github_convergence,
 )
 from agent_run.git import GitError
 from agent_run.github import GitHubReadError
+from agent_run.required_checks import (
+    is_explicitly_repairable_code_failure,
+    supervise_unrepairable_check_failure,
+)
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_currentness import run_currentness_boundary
@@ -483,6 +488,7 @@ class RunPublicationFlow(RunPublicationShared):
             publication.pop("write_intent", None)
             write_intent_resolved = True
         pr_number = existing
+        created_pr = pr_number is None
         if pr_number is None:
             self._persist_write_intent(
                 state, publication, "create_final_pr", ref_authority
@@ -496,7 +502,17 @@ class RunPublicationFlow(RunPublicationShared):
                 body=narrative,
             )
             publication.pop("write_intent", None)
-        elif not write_intent_resolved:
+        live = self.github.live_pull_request(pr_number)
+        if not self._final_pr_is_current(
+            pr_number, run_head, str(state["run_branch"]), str(state["repository"])
+        ):
+            return self._invalidate_for_fresh_acceptance(state)
+        record = self._record(state, run_head, str(live["head_sha"]))
+        if (
+            not created_pr
+            and not write_intent_resolved
+            and publication.get("record") != record
+        ):
             self._persist_write_intent(state, publication, "refresh_final_pr_narrative")
             self.github.refresh_run_pr_narrative(
                 pr_number=pr_number,
@@ -508,11 +524,6 @@ class RunPublicationFlow(RunPublicationShared):
                 body=narrative,
             )
             publication.pop("write_intent", None)
-        live = self.github.live_pull_request(pr_number)
-        if not self._final_pr_is_current(
-            pr_number, run_head, str(state["run_branch"]), str(state["repository"])
-        ):
-            return self._invalidate_for_fresh_acceptance(state)
         try:
             ensure_linked_branch_display(
                 github=self.github,
@@ -528,23 +539,63 @@ class RunPublicationFlow(RunPublicationShared):
             # durable pre-call intent makes an interrupted call indeterminate
             # and prevents any recovery replay.
             self._save(state)
-        record = self._record(state, run_head, str(live["head_sha"]))
         self.github.record_run_publication(pr_number, record)
         publication.update({"pr_number": pr_number, "record": record})
         publication.pop("last_publication_error", None)
-        checks = self.github.required_checks(pr_number)
+        try:
+            checks = self.github.required_checks(pr_number)
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError):
+                if not is_github_convergence_error(error.code):
+                    raise
+                code = error.code
+                message = error.message
+            else:
+                code = "github_checks_observation_failed"
+                message = str(error)
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code=code,
+                message=message,
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+            return self._save(state)
         self._record_agent_run_status(pr_number, run, run_head, checks)
         if checks == "fail":
-            self._queue_repair(
-                state,
-                repair_source="required_checks",
-                ci_evidence=self.github.required_check_evidence(pr_number),
+            evidence = self._required_check_evidence(
+                state, publication, pr_number, run_head
             )
+            if evidence is None:
+                return state
+            if is_explicitly_repairable_code_failure(evidence):
+                self._queue_repair(
+                    state,
+                    repair_source="required_checks",
+                    ci_evidence=evidence,
+                )
+            else:
+                supervise_unrepairable_check_failure(
+                    state,
+                    publication,
+                    phase="waiting_external",
+                    waiting_for=f"Run PR #{pr_number} Required Check repairability",
+                )
         elif checks == "pending":
             publication["phase"] = "waiting_checks"
             state["status"] = "waiting_checks"
             state["terminal_kind"] = "waiting_checks"
             state["diagnostics"] = []
+        elif checks == "unknown":
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_unknown",
+                message="GitHub Required Checks returned an unknown state",
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
         else:
             publication["phase"] = "ready_for_approval"
             state["status"] = "run_approval_pending"
