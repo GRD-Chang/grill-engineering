@@ -2,9 +2,11 @@ from __future__ import annotations
 
 """Concrete Change Delivery adapters for the Run Repair consumer."""
 
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import (
     ChangeDeliveryAdapter,
     ChangeDeliveryEngine,
@@ -14,6 +16,7 @@ from agent_run.change_delivery import (
 from agent_run.git import GitRepository
 from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_currentness import RunCurrentnessReader, refresh_run_currentness
+from agent_run.run_repair_cycle import uses_merge_resolution
 from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_repair_requests import RunRepairRequests
 
@@ -95,7 +98,13 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
         reviewer_thread_id: str,
         artifact: dict[str, Any],
     ) -> dict[str, Any]:
-        return self.candidate_acceptance.record(job, reviewer_thread_id, artifact)
+        record = self.candidate_acceptance.record(job, reviewer_thread_id, artifact)
+        parsed = AcceptanceArtifact.parse(artifact)
+        if parsed.is_accepted:
+            job.pop("unresolved_acceptance_artifact", None)
+        elif parsed.has_failures:
+            job["unresolved_acceptance_artifact"] = deepcopy(artifact)
+        return record
 
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
@@ -155,11 +164,39 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
     def commit_candidate(
         self, checkout: Path, job: dict[str, Any], attempt: int
     ) -> str | None:
-        candidate = self.owner.git.commit_run_repair_candidate(
-            checkout, attempt=attempt
-        )
+        if uses_merge_resolution(job):
+            squash_candidate = job.get("integration_squash_candidate_sha")
+            raw_conflict_paths = job.get("integration_conflict_paths", [])
+            if not isinstance(raw_conflict_paths, list) or not all(
+                isinstance(path, str) for path in raw_conflict_paths
+            ):
+                raise ValueError("integration_conflict_paths must contain strings")
+            conflict_paths = tuple(raw_conflict_paths)
+            if isinstance(squash_candidate, str):
+                candidate = self.owner.git.commit_merge_resolution_candidate(
+                    checkout,
+                    run_head_sha=str(job["base_sha"]),
+                    default_head_sha=str(job["default_base_sha"]),
+                    attempt=attempt,
+                    squash_candidate_sha=squash_candidate,
+                    expected_conflict_paths=conflict_paths,
+                )
+            else:
+                candidate = self.owner.git.commit_merge_resolution_candidate(
+                    checkout,
+                    run_head_sha=str(job["base_sha"]),
+                    default_head_sha=str(job["default_base_sha"]),
+                    attempt=attempt,
+                    expected_conflict_paths=conflict_paths,
+                )
+        else:
+            candidate = self.owner.git.commit_run_repair_candidate(
+                checkout, attempt=attempt
+            )
         if candidate is None:
             return None
+        job.pop("integration_squash_candidate_sha", None)
+        job.pop("integration_finding_snapshot_sha", None)
         integrated = job.get("integrated_sha")
         publication_sha = job.get("publication_sha")
         if not (
@@ -181,6 +218,24 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
             repair_branch=repair_branch,
             repair_job_attempt=repair_job_attempt,
             modification_attempt=attempt,
+        )
+
+    def create_publication_commit(
+        self, checkout: Path, job: dict[str, Any], message: str
+    ) -> str:
+        if uses_merge_resolution(job):
+            return self.owner.git.create_merge_resolution_publication_commit(
+                checkout,
+                candidate_sha=str(job["candidate_sha"]),
+                run_head_sha=str(job["base_sha"]),
+                default_head_sha=str(job["default_base_sha"]),
+                message=message,
+            )
+        return self.owner.git.create_publication_commit(
+            checkout,
+            candidate_sha=str(job["candidate_sha"]),
+            base_sha=str(job["base_sha"]),
+            message=message,
         )
 
     def rotate_job_checkout(
@@ -242,6 +297,31 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
         self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
     ) -> bool:
         return self.owner._after_repair_merge(state, job, live)
+
+    def merge(
+        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
+    ) -> str:
+        github = self.owner.github
+        if github is None:
+            raise ValueError("Run Repair requires the Publisher")
+        if uses_merge_resolution(job):
+            return github.normal_merge(
+                pr_number=int(job["pr_number"]),
+                expected_head_sha=str(job["publication_sha"]),
+            )
+        return github.squash_merge(
+            pr_number=int(job["pr_number"]),
+            expected_head_sha=str(job["publication_sha"]),
+            run_branch=str(state["run_branch"]),
+            commit_message=str(publication["commit_message"]),
+        )
+
+    def merge_description(self, job: dict[str, Any]) -> str:
+        return (
+            "ordinary merge"
+            if uses_merge_resolution(job)
+            else "squash merge"
+        )
 
     def escalate(
         self, state: dict[str, Any], job: dict[str, Any], code: str

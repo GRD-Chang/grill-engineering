@@ -155,12 +155,13 @@ Required Check 失败时，Controller 将失败 check 的名称、workflow、描
 同一个带精确 head 绑定的 merge intent 三次；任一状态矛盾则停止等待人工处理。
 
 当所有 Ticket 完成后，`run` 自动进入 `run_acceptance_pending` 并推进 Run Acceptance。
-正常 Run Acceptance Attempt 在一次性、可写的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
+正常 Run Acceptance Attempt 在一次性、只读的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
 复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
 最终 Ticket 集合和依赖，
 检查准备好的累计 diff，并进行实际 E2E、Standards、Spec 三条独立验证 lane，后两条使用
-`skill:code-review`，且不得由父 Reviewer 替代缺失 lane；Run Reviewer 可构建、测试和清理自身
-中间产物，但不得修复源码、测试、配置或 `.gitignore`。Ticket Completion
+`skill:code-review`，且不得由父 Reviewer 替代缺失 lane；Run Reviewer 不得修改 Validation Checkout；
+需要写入的构建、测试与验证中间产物必须放在 checkout 外可定位、仅服务本轮且结束前清理的临时路径。
+Reviewer 不得修复源码、测试、配置或 `.gitignore`。Ticket Completion
 Revision 按 Ticket number 数值排序，且只绑定已集成 SHA、冻结 Effective Revision 与已验收
 base/tree；已关闭 Ticket 后续 title/body 编辑不改变该版本，普通 reopen 则 fail closed。
 Completion Record、
@@ -249,8 +250,9 @@ Codex 可以返回 Development Summary、Publication Artifact 或 Acceptance Art
 
 Development Codex 使用 `skill:implement` 完成实现、自测和真实 E2E，并派发不同
 subagent 使用 `skill:code-review` 分别执行 Standards 与 Spec Review。它不能自行替代
-缺失审查。Fresh Validation 不接收 Development Summary 或开发侧验证结论，在独立可写
-Validation Checkout 中派发三个不同 subagent，分别完成 E2E、Standards 和 Spec 验证；
+缺失审查。Fresh Validation 不接收 Development Summary 或开发侧验证结论，在独立只读
+Validation Checkout 中派发三个不同 subagent，分别完成 E2E、Standards 和 Spec 验证；需要写入的
+验证中间产物必须放在 checkout 外可清理的本轮临时路径；
 subagent 派发失败时必须解决问题并重新派发。
 Controller 不解析 Codex 内部事件流来审计 subagent 身份或 skill 调用；它信任上述
 Prompt 合同，并确定性校验 Fresh 父 Reviewer 不复用 Development/旧 Reviewer Thread、

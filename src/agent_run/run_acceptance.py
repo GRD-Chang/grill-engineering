@@ -28,7 +28,7 @@ from agent_run.credential_availability import (
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_protocol import GitHubPublisher
-from agent_run.git import GitRepository
+from agent_run.git import GitRepository, MergeConflictError
 from agent_run.human_responses import current_human_response_history
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import (
@@ -47,6 +47,7 @@ from agent_run.run_repair_cycle import (
     rotate_repair_job,
     start_repair_cycle,
     sync_repair_cycle_counters,
+    uses_merge_resolution,
 )
 from agent_run.run_repair_currentness import (
     RunRepairCurrentness,
@@ -188,11 +189,27 @@ class RunAcceptanceEngine:
         checkout = self._validation_checkout(state, validation_attempt)
         try:
             default_head = self._default_head(state)
-            self.git.prepare_expected_merge_checkout(
-                default_head_sha=default_head,
-                run_head_sha=run_head,
-                checkout=checkout,
-            )
+            try:
+                self.git.prepare_expected_merge_checkout(
+                    default_head_sha=default_head,
+                    run_head_sha=run_head,
+                    checkout=checkout,
+                )
+            except MergeConflictError as error:
+                run["phase"] = "repairing"
+                run["repair_request"] = {
+                    "repair_source": "merge_conflict",
+                    "merge_conflict_evidence": str(error),
+                }
+                state.update(
+                    {
+                        "status": "run_acceptance_pending",
+                        "terminal_kind": "run_repair_pending",
+                        "diagnostics": [],
+                    }
+                )
+                self._save(state)
+                return True
             expected_merge_tree = self.git.expected_merge_tree(
                 default_head_sha=default_head,
                 run_head_sha=run_head,
@@ -390,8 +407,45 @@ class RunAcceptanceEngine:
                 self.git.prepare_ticket_checkout(
                     branch=branch, base_sha=str(job["base_sha"]), checkout=checkout
                 )
+                if job.get("integration_reprepare_required") is True:
+                    self._complete_integration_reprepare(state, job, checkout)
+                elif job.get("integration_squash_conversion_required") is True:
+                    self._complete_squash_repair_conflict_conversion(
+                        state, job, checkout
+                    )
+                elif uses_merge_resolution(job) and not isinstance(
+                    job.get("candidate_sha"), str
+                ):
+                    evidence = self.git.prepare_integration_repair_checkout(
+                        checkout,
+                        run_head_sha=str(job["base_sha"]),
+                        default_head_sha=str(job["default_base_sha"]),
+                        squash_candidate_sha=(
+                            str(job["integration_squash_candidate_sha"])
+                            if isinstance(
+                                job.get("integration_squash_candidate_sha"), str
+                            )
+                            else None
+                        ),
+                        allow_clean_merge=job.get("phase") == "committing_candidate",
+                        allow_staged_resolution=(
+                            job.get("development_failure_resume") is True
+                        ),
+                    )
+                    if evidence:
+                        job["merge_conflict_evidence"] = evidence
+                        job["integration_conflict_paths"] = list(
+                            self.git.integration_conflict_paths(checkout)
+                        )
                 try:
                     self._repair_engine(state, job).run(state, job, checkout)
+                except MergeConflictError as error:
+                    if not self._convert_squash_repair_conflict(
+                        state, job, checkout, error
+                    ):
+                        raise
+                    preserve_checkout = True
+                    continue
                 except RunRepairJobRotationRequired as rotation:
                     job = rotate_repair_job(
                         run,
@@ -438,6 +492,71 @@ class RunAcceptanceEngine:
         if job["phase"] == "stale":
             return "stale"
         return "waiting"
+
+    def _convert_squash_repair_conflict(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        checkout: Path,
+        error: MergeConflictError,
+    ) -> bool:
+        """Convert a stale squash Candidate preview into the real conflict scene."""
+
+        candidate = job.get("candidate_sha")
+        if uses_merge_resolution(job) or not isinstance(candidate, str):
+            return False
+        job.update(
+            {
+                "repair_mode": "merge_resolution",
+                "repair_source": "merge_conflict",
+                "merge_conflict_evidence": str(error),
+                "integration_squash_candidate_sha": candidate,
+                "integration_squash_conversion_required": True,
+                "phase": "repairing",
+            }
+        )
+        job.pop("candidate_sha", None)
+        job.pop("acceptance_record", None)
+        job.pop("acceptance_artifact", None)
+        job.pop("pending_review_result", None)
+        run = self._run_state(state)
+        run["phase"] = "repairing"
+        self._sync_repair_cycle_counters(run, job)
+        state.update(
+            {
+                "status": "run_acceptance_pending",
+                "terminal_kind": "run_repair_pending",
+                "diagnostics": [],
+            }
+        )
+        self._save(state)
+        return True
+
+    def _complete_squash_repair_conflict_conversion(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        candidate = job.get("integration_squash_candidate_sha")
+        if not isinstance(candidate, str):
+            raise ValueError("squash conflict conversion requires its Candidate")
+        evidence = self.git.convert_squash_candidate_to_integration_repair(
+            checkout,
+            run_head_sha=str(job["base_sha"]),
+            default_head_sha=str(job["default_base_sha"]),
+            candidate_sha=candidate,
+        )
+        job.update(
+            {
+                "repair_mode": "merge_resolution",
+                "repair_source": "merge_conflict",
+                "merge_conflict_evidence": evidence,
+                "integration_conflict_paths": list(
+                    self.git.integration_conflict_paths(checkout)
+                ),
+                "phase": "repairing",
+            }
+        )
+        job.pop("integration_squash_conversion_required", None)
+        self._save(state)
 
     def _repair_engine(
         self, state: dict[str, Any], job: dict[str, Any]
@@ -519,8 +638,9 @@ class RunAcceptanceEngine:
             "ticket_graph_revision": self._mapping(state, "ticket_graph")["revision"],
             "ticket_completion_records": ticket_completion_records(state),
             "repair_source": repair_source,
-            "repair_input_artifact": self._mapping(run, "acceptance_artifact"),
-            "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
+            "repair_mode": (
+                "merge_resolution" if repair_source == "merge_conflict" else "squash"
+            ),
             "modification_attempts": initial_modifications,
             "code_modification_attempts": initial_modifications,
             "validation_attempts": initial_validations,
@@ -532,6 +652,11 @@ class RunAcceptanceEngine:
             "candidate_acceptance_history": [],
             "repair_checkout": str(self._repair_checkout(state)),
         }
+        if repair_source == "acceptance":
+            artifact = self._mapping(run, "acceptance_artifact")
+            job["repair_input_artifact"] = artifact
+            job["acceptance_artifact"] = artifact
+            job["unresolved_acceptance_artifact"] = deepcopy(artifact)
         if repair_source == "human_revision":
             feedback = repair_request.get("human_feedback")
             if not isinstance(feedback, str) or not feedback.strip():
@@ -704,13 +829,20 @@ class RunAcceptanceEngine:
             or str(self._mapping(state, "base")["sha"])
         )
         currentness = self.repair_currentness
+        integrated_merge_resolution = (
+            uses_merge_resolution(job)
+            and isinstance(job.get("integrated_sha"), str)
+            and job.get("integrated_publication_sha") == job.get("publication_sha")
+        )
         if (
             currentness is not None
             and current_default != job.get("default_base_sha")
             and not currentness.non_default_revision_changed(
                 state, job, default_head_sha=current_default
             )
+            and not integrated_merge_resolution
         ):
+            self._preserve_stale_acceptance_repair(state, job, checkout)
             self._rebind_repair_to_default(state, job, current_default)
             return
         self.git.remove_worktree(checkout)
@@ -728,6 +860,14 @@ class RunAcceptanceEngine:
             isinstance(job.get("integrated_sha"), str)
             and job.get("integrated_publication_sha") == job.get("publication_sha")
         )
+        prior_default_head = str(job["default_base_sha"])
+        prior_publication_sha = job.get("publication_sha")
+        acceptance_artifact = job.get("acceptance_artifact")
+        if (
+            job.get("repair_source") == "acceptance"
+            and isinstance(acceptance_artifact, dict)
+        ):
+            job["unresolved_acceptance_artifact"] = deepcopy(acceptance_artifact)
         job["default_base_sha"] = default_head
         self.default_head_sha = default_head
         self.candidate_acceptance.update_default_head(default_head)
@@ -745,9 +885,56 @@ class RunAcceptanceEngine:
             stale_keys.extend(("publication", "publication_sha"))
         for key in stale_keys:
             job.pop(key, None)
-        if prior_phase != "committing_candidate" and isinstance(
-            job.get("candidate_sha"), str
-        ):
+        candidate_sha = job.get("candidate_sha")
+        squash_candidate_sha = job.get("integration_squash_candidate_sha")
+        finding_snapshot_sha = job.get("integration_finding_snapshot_sha")
+        pending_attempt = job.get("pending_attempt")
+        reprepare_merge_resolution = (
+            not publication_was_integrated
+            and uses_merge_resolution(job)
+            and (
+                isinstance(candidate_sha, str)
+                or isinstance(squash_candidate_sha, str)
+                or isinstance(finding_snapshot_sha, str)
+                or (
+                    isinstance(pending_attempt, int)
+                    and pending_attempt > int(job.get("modification_attempts", 0))
+                )
+            )
+        )
+        if reprepare_merge_resolution:
+            if isinstance(candidate_sha, str):
+                superseded = job.setdefault("superseded_candidate_shas", [])
+                if not isinstance(superseded, list) or not all(
+                    isinstance(sha, str) for sha in superseded
+                ):
+                    raise ValueError("superseded_candidate_shas must contain strings")
+                if candidate_sha not in superseded:
+                    superseded.append(candidate_sha)
+                job["integration_reprepare_candidate_sha"] = candidate_sha
+            job["integration_reprepare_default_sha"] = prior_default_head
+            if isinstance(prior_publication_sha, str):
+                publications = job.setdefault("superseded_publication_shas", [])
+                if not isinstance(publications, list) or not all(
+                    isinstance(sha, str) for sha in publications
+                ):
+                    raise ValueError("superseded_publication_shas must contain strings")
+                if prior_publication_sha not in publications:
+                    publications.append(prior_publication_sha)
+                job["integration_reprepare_publication_sha"] = prior_publication_sha
+            job["integration_reprepare_required"] = True
+            if (
+                prior_phase == "committing_candidate"
+                and isinstance(pending_attempt, int)
+                and pending_attempt > int(job.get("modification_attempts", 0))
+            ):
+                job["integration_reprepare_discard_invocation_changes"] = True
+            if job.get("integration_reprepare_preserved_changes") is True:
+                job["integration_reprepare_discard_invocation_changes"] = True
+            job["repair_source"] = "merge_conflict"
+            job.pop("candidate_sha", None)
+            job["phase"] = "repairing"
+        elif prior_phase != "committing_candidate" and isinstance(candidate_sha, str):
             job["phase"] = "candidate"
         run = self._run_state(state)
         run["phase"] = "repairing"
@@ -767,6 +954,115 @@ class RunAcceptanceEngine:
                 "diagnostics": [],
             }
         )
+
+    def _preserve_stale_acceptance_repair(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        """Save a completed finding-repair invocation before rebasing its merge scene."""
+
+        pending_attempt = job.get("pending_attempt")
+        unresolved_artifact = job.get("unresolved_acceptance_artifact")
+        candidate_sha = job.get("candidate_sha")
+        if not (
+            uses_merge_resolution(job)
+            and job.get("phase") == "committing_candidate"
+            and job.get("repair_source") == "acceptance"
+            and isinstance(unresolved_artifact, dict)
+            and isinstance(candidate_sha, str)
+            and isinstance(pending_attempt, int)
+            and pending_attempt > int(job.get("modification_attempts", 0))
+        ):
+            return
+        snapshot = self.git.create_integration_repair_snapshot(
+            checkout,
+            candidate_sha=candidate_sha,
+            attempt=pending_attempt,
+        )
+        if snapshot is None:
+            return
+        job["integration_finding_snapshot_sha"] = snapshot
+        job["integration_reprepare_preserved_changes"] = True
+        job["modification_attempts"] = pending_attempt
+        job["code_modification_attempts"] = pending_attempt
+        job.pop("pending_attempt", None)
+        self._sync_repair_cycle_counters(self._run_state(state), job)
+
+    def _complete_integration_reprepare(
+        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
+    ) -> None:
+        superseded_candidate = job.get("integration_reprepare_candidate_sha")
+        superseded_default = job.get("integration_reprepare_default_sha")
+        superseded_publication = job.get("integration_reprepare_publication_sha")
+        if superseded_candidate is not None and not isinstance(
+            superseded_candidate, str
+        ):
+            raise ValueError("integration reprepare Candidate must be a string")
+        if superseded_candidate is None:
+            pending_attempt = job.get("pending_attempt")
+            if not (
+                isinstance(job.get("integration_squash_candidate_sha"), str)
+                or isinstance(job.get("integration_finding_snapshot_sha"), str)
+                or (
+                    isinstance(pending_attempt, int)
+                    and pending_attempt > int(job.get("modification_attempts", 0))
+                )
+            ):
+                raise ValueError("integration reprepare requires its pending attempt")
+        if not isinstance(superseded_default, str):
+            raise ValueError("integration reprepare requires its superseded default head")
+        evidence = self.git.reprepare_integration_repair_checkout(
+            checkout,
+            run_head_sha=str(job["base_sha"]),
+            default_head_sha=str(job["default_base_sha"]),
+            superseded_candidate_sha=superseded_candidate,
+            superseded_default_head_sha=superseded_default,
+            superseded_publication_sha=(
+                superseded_publication
+                if isinstance(superseded_publication, str)
+                else None
+            ),
+            squash_candidate_sha=(
+                str(job["integration_squash_candidate_sha"])
+                if isinstance(job.get("integration_squash_candidate_sha"), str)
+                else None
+            ),
+            finding_snapshot_sha=(
+                str(job["integration_finding_snapshot_sha"])
+                if isinstance(job.get("integration_finding_snapshot_sha"), str)
+                else None
+            ),
+            discard_invocation_changes=(
+                job.get("integration_reprepare_discard_invocation_changes") is True
+            ),
+        )
+        if evidence is None:
+            pending_attempt = job.get("pending_attempt")
+            if not (
+                isinstance(pending_attempt, int)
+                and pending_attempt > int(job["modification_attempts"])
+            ):
+                job["pending_attempt"] = int(job["modification_attempts"])
+            job["phase"] = "committing_candidate"
+            job.pop("merge_conflict_evidence", None)
+            job.pop("integration_conflict_paths", None)
+        else:
+            job.update(
+                {
+                    "repair_source": "merge_conflict",
+                    "merge_conflict_evidence": evidence,
+                    "integration_conflict_paths": list(
+                        self.git.integration_conflict_paths(checkout)
+                    ),
+                    "phase": "repairing",
+                }
+            )
+        job.pop("integration_reprepare_candidate_sha", None)
+        job.pop("integration_reprepare_default_sha", None)
+        job.pop("integration_reprepare_publication_sha", None)
+        job.pop("integration_reprepare_discard_invocation_changes", None)
+        job.pop("integration_reprepare_preserved_changes", None)
+        job.pop("integration_reprepare_required", None)
+        self._save(state)
 
     @staticmethod
     def _repair_checkout_is_active(job: dict[str, Any]) -> bool:
@@ -838,6 +1134,12 @@ class RunAcceptanceEngine:
         )
         integrated = job.get("integrated_sha")
         publication = self._mapping(job, "publication")
+        merge_resolution = uses_merge_resolution(job)
+        expected_parents = (
+            [job.get("base_sha"), job.get("publication_sha")]
+            if merge_resolution
+            else [job.get("base_sha")]
+        )
         if (
             live.get("state") != "MERGED"
             or not isinstance(integrated, str)
@@ -845,8 +1147,21 @@ class RunAcceptanceEngine:
             or live.get("head_sha") != job.get("publication_sha")
             or live.get("base_branch") != state.get("run_branch")
             or live.get("head_tree") != live.get("integrated_tree")
-            or live.get("integrated_message") != publication.get("commit_message")
-            or live.get("integrated_parents") != [job.get("base_sha")]
+            or (
+                not merge_resolution
+                and live.get("integrated_message") != publication.get("commit_message")
+            )
+            or live.get("integrated_parents") != expected_parents
+            or (
+                merge_resolution
+                and (
+                    self.git.commit_parents(str(job["candidate_sha"]))
+                    != [job.get("base_sha"), job.get("default_base_sha")]
+                    or self.git.commit_parents(str(job["publication_sha"]))
+                    != [job.get("base_sha"), job.get("default_base_sha")]
+                    or not self.git.is_ancestor(str(job["default_base_sha"]), integrated)
+                )
+            )
         ):
             self._invalidate_stale_repair(state, job, self._repair_checkout(state))
             return False

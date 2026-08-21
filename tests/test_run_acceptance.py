@@ -328,6 +328,212 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
         git.resolve(repair_branch)
 
 
+def test_merged_conflict_candidate_default_drift_requires_fresh_run_acceptance(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    run_branch = str(state["run_branch"])
+
+    subprocess.run(["git", "switch", run_branch], cwd=git_repo, check=True)
+    (git_repo / "shared.txt").write_text("run branch\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "change shared file on run branch"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    run_head = git.resolve(run_branch)
+    subprocess.run(["git", "switch", "main"], cwd=git_repo, check=True)
+    (git_repo / "shared.txt").write_text("default branch\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "change shared file on default branch"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    initial_default = git.resolve("main")
+    state["ticket_jobs"]["2"]["integrated_sha"] = run_head
+    states.save_run(str(state["run_id"]), state)
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["default_head_sha"] = initial_default
+    fixture_data.setdefault("delivery", {}).setdefault("published_branches", {})[
+        run_branch
+    ] = run_head
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    class ConflictThenFreshAgents:
+        def __init__(self) -> None:
+            self.development_requests: list[dict[str, Any]] = []
+            self.review_requests: list[dict[str, Any]] = []
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.development_requests.append(request)
+            checkout = Path(str(request["checkout"]))
+            assert request["repair_source"] == "merge_conflict"
+            (checkout / "shared.txt").write_text("resolved\n", encoding="utf-8")
+            return DevelopmentResult("conflict-developer", "Resolved conflict.")
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.review_requests.append(request)
+            checkout = Path(str(request["checkout"]))
+            assert (checkout / "shared.txt").read_text(encoding="utf-8") == "resolved\n"
+            if len(self.review_requests) == 1:
+                assert request["candidate_acceptance"] is True
+            else:
+                assert request.get("candidate_acceptance") is not True
+                assert (checkout / "default-after-merge.txt").read_text(
+                    encoding="utf-8"
+                ) == "advanced\n"
+            return ReviewResult(
+                f"reviewer-{len(self.review_requests)}", _passing_artifact()
+            )
+
+        def publication(self, _request: dict[str, Any]) -> dict[str, str]:
+            return {
+                "commit_message": "fix(run): resolve default conflict",
+                "pr_title": "fix(run): resolve default conflict",
+                "pr_body_markdown": (
+                    "## What Problem This Solves\n\nThe Run conflicted.\n\n"
+                    "## Why This Change Was Made\n\nThe exact merge was resolved.\n\n"
+                    "## User Impact\n\nThe Run is mergeable.\n\n"
+                    "## Evidence\n\nFresh acceptance passed."
+                ),
+            }
+
+    class DriftAfterMergePublisher(FixtureGitHubPublisher):
+        def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
+            super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
+            (git_repo / "default-after-merge.txt").write_text(
+                "advanced\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "add", "default-after-merge.txt"], cwd=git_repo, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "advance default after conflict merge"],
+                cwd=git_repo,
+                check=True,
+                capture_output=True,
+            )
+            data = json.loads(fixture.read_text(encoding="utf-8"))
+            data["default_head_sha"] = git.resolve("main")
+            fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    agents = ConflictThenFreshAgents()
+    first = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=DriftAfterMergePublisher(fixture, git),
+        default_head_sha=initial_default,
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    stale_run = first["run_acceptance"]
+    integrated = git.resolve(run_branch)
+    latest_default = git.resolve("main")
+    assert first["status"] == "run_acceptance_pending"
+    assert first["terminal_kind"] == "run_acceptance_stale"
+    assert stale_run["phase"] == "pending"
+    assert "repair_job" not in stale_run
+    assert len(agents.review_requests) == 1
+
+    accepted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+        default_head_sha=latest_default,
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert accepted["status"] == "run_publication_pending"
+    acceptance = accepted["run_acceptance"]["acceptance_record"]
+    assert acceptance["acceptance_scope"] == "run"
+    assert "acceptance_state" not in acceptance
+    assert acceptance["reviewed_head_sha"] == integrated
+    assert acceptance["reviewed_default_base_sha"] == latest_default
+    assert len(agents.development_requests) == 1
+    assert len(agents.review_requests) == 2
+
+
+@pytest.mark.parametrize("dirty_kind", ["unstaged", "untracked"])
+def test_interrupted_staged_conflict_recovery_rejects_other_dirty_changes(
+    git_repo: Path, dirty_kind: str
+) -> None:
+    git = GitRepository(git_repo)
+    (git_repo / "shared.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add shared base"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "switch", "-c", "run"], cwd=git_repo, check=True)
+    (git_repo / "shared.txt").write_text("run\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "change shared on run"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    run_head = git.resolve("run")
+    subprocess.run(["git", "switch", "main"], cwd=git_repo, check=True)
+    (git_repo / "shared.txt").write_text("default\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "change shared on default"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    default_head = git.resolve("main")
+    checkout = git_repo.parent / f"repair-{dirty_kind}"
+    git.prepare_ticket_checkout(
+        branch=f"agent-run-repair/test-{dirty_kind}",
+        base_sha=run_head,
+        checkout=checkout,
+    )
+    try:
+        git.prepare_integration_repair_checkout(
+            checkout,
+            run_head_sha=run_head,
+            default_head_sha=default_head,
+        )
+        (checkout / "shared.txt").write_text("resolved\n", encoding="utf-8")
+        subprocess.run(["git", "add", "shared.txt"], cwd=checkout, check=True)
+        if dirty_kind == "unstaged":
+            (checkout / "shared.txt").write_text(
+                "changed after staging\n", encoding="utf-8"
+            )
+        else:
+            (checkout / "untracked.txt").write_text("foreign\n", encoding="utf-8")
+
+        with pytest.raises(GitError, match="contains unstaged changes"):
+            git.prepare_integration_repair_checkout(
+                checkout,
+                run_head_sha=run_head,
+                default_head_sha=default_head,
+                allow_staged_resolution=True,
+            )
+
+        assert git.checkout_head(checkout) == run_head
+        assert subprocess.run(
+            ["git", "rev-parse", "MERGE_HEAD"],
+            cwd=checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip() == default_head
+    finally:
+        git.remove_worktree(checkout)
+
+
 def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     git_repo: Path,
 ) -> None:
@@ -364,6 +570,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "ticket_graph_revision": state["ticket_graph"]["revision"],
         "ticket_completion_records": ticket_completion_records(state),
         "repair_source": "acceptance",
+        "repair_mode": "squash",
         "repair_input_artifact": artifact,
         "acceptance_artifact": artifact,
         "modification_attempts": 10,
@@ -443,6 +650,7 @@ def test_candidate_acceptance_history_keeps_a_bounded_recovery_window(
         "ticket_graph_revision": state["ticket_graph"]["revision"],
         "ticket_completion_records": ticket_completion_records(state),
         "repair_source": "acceptance",
+        "repair_mode": "squash",
         "candidate_acceptance_history": [],
     }
 
@@ -500,6 +708,7 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
         "ticket_graph_revision": state["ticket_graph"]["revision"],
         "ticket_completion_records": ticket_completion_records(state),
         "repair_source": "acceptance",
+        "repair_mode": "squash",
         "candidate_acceptance_history": [],
     }
 
@@ -2234,6 +2443,7 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
     job: dict[str, Any] = {
         "phase": "publication_pending",
         "repair_source": "acceptance",
+        "repair_mode": "squash",
         "acceptance_artifact": _repair_artifact(),
     }
     run["repair_job"] = job
@@ -2635,6 +2845,7 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
             "ticket_graph_revision": state["ticket_graph"]["revision"],
             "ticket_completion_records": [],
             "repair_source": "acceptance",
+            "repair_mode": "squash",
             "acceptance_artifact": _repair_artifact(),
             "development_thread_id": "repair-old",
             "reviewer_thread_ids": ["repair-reviewer-old"],

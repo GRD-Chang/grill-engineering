@@ -120,6 +120,10 @@ class ChangeDeliveryPublisher(Protocol):
         self, checkout: Path, job: dict[str, Any], attempt: int
     ) -> str | None: ...
 
+    def create_publication_commit(
+        self, checkout: Path, job: dict[str, Any], message: str
+    ) -> str: ...
+
     def prepare_validation(
         self, checkout: Path, job: dict[str, Any], validation: Path
     ) -> None: ...
@@ -142,6 +146,12 @@ class ChangeDeliveryPublisher(Protocol):
     def after_merge(
         self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
     ) -> bool: ...
+
+    def merge(
+        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
+    ) -> str: ...
+
+    def merge_description(self, job: dict[str, Any]) -> str: ...
 
     def escalate(
         self, state: dict[str, Any], job: dict[str, Any], code: str
@@ -330,6 +340,12 @@ class ChangeDeliveryEngine:
                 if phase in {"developing", "repairing"}:
                     self._develop(state, job, checkout)
                 if job["phase"] == "committing_candidate":
+                    self._reject_stale(
+                        state,
+                        job,
+                        checkout,
+                        "Candidate was not created after requirements changed",
+                    )
                     if not self._commit_candidate(state, job, checkout):
                         return state
                 if job["phase"] == "candidate":
@@ -617,11 +633,8 @@ class ChangeDeliveryEngine:
             self._invalidate_stale(state, job, checkout)
             self.save(state)
             return
-        sha = self.git.create_publication_commit(
-            checkout,
-            candidate_sha=str(job["candidate_sha"]),
-            base_sha=str(job["base_sha"]),
-            message=publication.commit_message,
+        sha = self.publisher.create_publication_commit(
+            checkout, job, publication.commit_message
         )
         job.update(
             {
@@ -1140,7 +1153,7 @@ class ChangeDeliveryEngine:
             pr_number,
             job,
             checks,
-            next_action="squash merge into the Run Branch",
+            next_action=f"{self.publisher.merge_description(job)} into the Run Branch",
         )
         attempts = merge_intent.get("attempts", 0)
         if type(attempts) is not int or attempts < 0:
@@ -1150,12 +1163,7 @@ class ChangeDeliveryEngine:
         merge_intent["attempts"] = attempts + 1
         self.save(state)
         try:
-            integrated = self.github.squash_merge(
-                pr_number=pr_number,
-                expected_head_sha=str(job["publication_sha"]),
-                run_branch=self.contract.base_branch,
-                commit_message=str(publication["commit_message"]),
-            )
+            integrated = self.publisher.merge(state, job, publication)
         except MergeOutcomeUnknownError as error:
             history = job.setdefault("merge_reconciliation_history", [])
             if not isinstance(history, list):
@@ -1199,7 +1207,7 @@ class ChangeDeliveryEngine:
                         "code": "merge_reconciliation_pending",
                         "message": message
                         or "Merge intent reached its retry limit; waiting for GitHub reconciliation",
-                        "waiting_for": "squash merge outcome",
+                        "waiting_for": f"{self.publisher.merge_description(job)} outcome",
                     }
                 ],
             }

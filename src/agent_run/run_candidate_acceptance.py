@@ -14,6 +14,7 @@ from agent_run.run_currentness import (
     MAX_CANDIDATE_ACCEPTANCE_HISTORY,
     ticket_completion_records,
 )
+from agent_run.run_repair_cycle import uses_merge_resolution
 from agent_run.state_contract import require_candidate_acceptance_history
 
 
@@ -45,6 +46,7 @@ class CandidateRunAcceptance:
         default_base = str(job["default_base_sha"])
         candidate_sha = str(job["candidate_sha"])
         candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
+        self._require_merge_resolution_parents(job, candidate_sha)
         expected_merge_tree = self.git.expected_merge_tree(
             default_head_sha=default_base,
             run_head_sha=candidate_sha,
@@ -111,6 +113,7 @@ class CandidateRunAcceptance:
             return False
         try:
             candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
+            self._require_merge_resolution_parents(job, candidate_sha)
             expected_merge_tree = self.git.expected_merge_tree(
                 default_head_sha=default_base,
                 run_head_sha=candidate_sha,
@@ -153,6 +156,7 @@ class CandidateRunAcceptance:
                 default_head_sha=default_base,
                 run_head_sha=integrated,
             )
+            self._require_merge_resolution_parents(job, candidate_sha)
         except (GitError, KeyError, TypeError, ValueError):
             return None
         parent_revision = _mapping(state, "parent").get("revision")
@@ -173,6 +177,10 @@ class CandidateRunAcceptance:
             or self.git.resolve(str(state["run_branch"])) != integrated
             or integrated_tree != candidate_tree
             or run_tree != candidate_tree
+            or (
+                uses_merge_resolution(job)
+                and not self.git.is_ancestor(default_base, integrated)
+            )
             or record.get("parent_revision") != parent_revision
             or record.get("ticket_graph_revision") != graph_revision
             or record.get("ticket_completion_records") != completions
@@ -189,6 +197,15 @@ class CandidateRunAcceptance:
             }
         )
         return promoted
+
+    def _require_merge_resolution_parents(
+        self, job: dict[str, Any], candidate_sha: str
+    ) -> None:
+        if not uses_merge_resolution(job):
+            return
+        expected = [str(job["base_sha"]), str(job["default_base_sha"])]
+        if self.git.commit_parents(candidate_sha) != expected:
+            raise GitError("Merge-resolution Candidate parents do not match its boundary")
 
     def _default_head(self, state: dict[str, Any]) -> str:
         return self.default_head_sha or str(_mapping(state, "base")["sha"])

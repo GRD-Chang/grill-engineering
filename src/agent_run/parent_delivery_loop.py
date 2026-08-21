@@ -196,6 +196,16 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
             checkout, ticket_number=0, attempt=attempt
         )
 
+    def create_publication_commit(
+        self, checkout: Path, job: dict[str, Any], message: str
+    ) -> str:
+        return self.owner.git.create_publication_commit(
+            checkout,
+            candidate_sha=str(job["candidate_sha"]),
+            base_sha=str(job["base_sha"]),
+            message=message,
+        )
+
     def prepare_validation(
         self, _checkout: Path, job: dict[str, Any], validation: Path
     ) -> None:
@@ -232,6 +242,19 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
         self, _state: dict[str, Any], _job: dict[str, Any], _live: dict[str, Any]
     ) -> bool:
         return True
+
+    def merge(
+        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
+    ) -> str:
+        return self.owner.github.squash_merge(
+            pr_number=int(job["pr_number"]),
+            expected_head_sha=str(job["publication_sha"]),
+            run_branch=str(_mapping(state, "base")["branch"]),
+            commit_message=str(publication["commit_message"]),
+        )
+
+    def merge_description(self, _job: dict[str, Any]) -> str:
+        return "squash merge"
 
     def escalate(
         self, state: dict[str, Any], job: dict[str, Any], code: str

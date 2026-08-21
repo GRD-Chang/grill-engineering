@@ -10,6 +10,24 @@ MAX_CANDIDATE_ACCEPTANCE_HISTORY = 32
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
+_ACTIVE_RUN_REPAIR_PHASES = frozenset(
+    {
+        "developing",
+        "repairing",
+        "committing_candidate",
+        "candidate",
+        "reviewing",
+        "accepted",
+        "publishing",
+        "publication_pending",
+        "waiting_checks",
+        "waiting_merge",
+        "escalating",
+        "merging",
+        "merged",
+        "blocked",
+    }
+)
 _CANDIDATE_ACCEPTANCE_HISTORY_KEYS = frozenset(
     {
         "candidate_sha",
@@ -71,6 +89,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_ticket_graph(state["ticket_graph"])
     _require_human_blocker_containers(state)
     _require_candidate_acceptance_histories(state)
+    _require_active_run_repair_mode(state)
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -204,6 +223,19 @@ def _require_candidate_acceptance_histories(state: dict[str, Any]) -> None:
             require_candidate_acceptance_history(
                 repair_history, "run_acceptance.repair_job.candidate_acceptance"
             )
+
+
+def _require_active_run_repair_mode(state: dict[str, Any]) -> None:
+    acceptance = state.get("run_acceptance")
+    if not isinstance(acceptance, dict):
+        return
+    repair = acceptance.get("repair_job")
+    if not isinstance(repair, dict) or repair.get("phase") not in _ACTIVE_RUN_REPAIR_PHASES:
+        return
+    if repair.get("repair_mode") not in {"squash", "merge_resolution"}:
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid run_acceptance.repair_job.repair_mode"
+        )
 
 
 def human_blocker_subject_count(state: dict[str, Any]) -> int:

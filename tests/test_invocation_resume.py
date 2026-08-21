@@ -176,6 +176,7 @@ def _prepared_resume(
             "repair_job": {
                 "phase": "accepted",
                 "repair_generation": 2,
+                "repair_mode": "squash",
                 "publication_thread_id": "current-repair-thread",
             }
         }

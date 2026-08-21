@@ -22,6 +22,13 @@ _ACTIVE_CHECKOUT_PHASES = frozenset(
 )
 
 
+def uses_merge_resolution(job: dict[str, Any]) -> bool:
+    mode = job.get("repair_mode")
+    if not isinstance(mode, str) or mode not in {"merge_resolution", "squash"}:
+        raise ValueError("invalid Run Repair mode")
+    return mode == "merge_resolution"
+
+
 def start_repair_cycle(run: dict[str, Any], generation: int) -> None:
     run["modification_attempts"] = 0
     run["code_modification_attempts"] = 0

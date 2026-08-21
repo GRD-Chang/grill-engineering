@@ -940,6 +940,25 @@ def test_development_prompt_matches_normal_and_repair_contracts(
         )
 
 
+def test_merge_conflict_prompt_preserves_unresolved_acceptance_artifact() -> None:
+    artifact = failed_acceptance_artifact("Preserve this Candidate finding.")
+
+    prompt = CodexCliBackend._development_prompt(
+        {
+            "acceptance_scope": "run",
+            "repair_source": "merge_conflict",
+            "merge_conflict_evidence": "Unresolved paths:\nshared.txt",
+            "acceptance_artifact": artifact,
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+        }
+    )
+
+    assert "Merge Conflict Evidence (verbatim)" in prompt
+    assert "Unresolved Acceptance Artifact (verbatim JSON)" in prompt
+    assert "Preserve this Candidate finding." in prompt
+    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
+
+
 def test_top_level_prompts_allow_only_issue_urls_and_original_evidence() -> None:
     artifact = failed_acceptance_artifact("original")
     internal = {
@@ -1244,6 +1263,119 @@ def test_publication_uses_a_read_only_checkout(
 
     assert len(calls) == 1
     assert calls[0]["writable_checkout"] is False
+
+
+def test_reviewer_uses_a_read_only_checkout(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    calls: list[dict[str, Any]] = []
+
+    def fake_invoke(self: CodexCliBackend, **options: Any) -> tuple[str, str]:
+        del self
+        calls.append(options)
+        return json.dumps(passing_acceptance_artifact()), "reviewer-thread"
+
+    monkeypatch.setattr(CodexCliBackend, "_invoke", fake_invoke)
+    CodexCliBackend(credential_provider=lambda: "reader-secret").review(
+        {
+            "checkout": str(checkout),
+            "ticket": {"number": 3},
+            "base_sha": "a" * 40,
+            "candidate_sha": "b" * 40,
+        }
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["writable_checkout"] is False
+
+
+def test_reviewer_prompt_requires_external_temporary_paths_for_writes() -> None:
+    prompt = CodexCliBackend._review_prompt(
+        {
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/2",
+        }
+    )
+
+    assert "Validation Checkout 是只读的" in prompt
+    assert "不得创建、修改或删除其中的文件" in prompt
+    assert "checkout 外可定位、只服务本轮的临时路径" in prompt
+    assert "并在结束前清理" in prompt
+
+
+def test_production_reviewer_cannot_create_modify_or_delete_checkout_files(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    worker = tmp_path / "reviewer-worker"
+    worker.write_text(
+        """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+failures = []
+for name, operation in (
+    ("create", lambda: pathlib.Path("reviewer-mutated.txt").write_text("created\\n")),
+    ("modify", lambda: pathlib.Path("README.md").write_text("modified\\n")),
+    ("delete", lambda: pathlib.Path("README.md").unlink()),
+):
+    try:
+        operation()
+    except OSError:
+        failures.append(name)
+if failures != ["create", "modify", "delete"]:
+    raise RuntimeError("Reviewer changed its Validation Checkout: " + repr(failures))
+output = pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+output.write_text(json.dumps({
+    "checks": {
+        "e2e": {"status": "pass", "evidence": "操作或命令：真实只读探测；退出码：0；结果：三类写入均被拒绝。", "findings": []},
+        "standards": {"status": "pass", "evidence": "审查范围或基线：生产 Reviewer 沙箱；结论：未发现违反项。", "findings": []},
+        "spec": {"status": "pass", "evidence": "已核对的验收标准：只读 Validation Checkout；覆盖结论：创建、修改、删除均不可用。", "findings": []}
+    }
+}), encoding="utf-8")
+print('{"type":"thread.started","thread_id":"read-only-reviewer"}')
+""",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    candidate_tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+    result = CodexCliBackend(
+        executable=str(worker), credential_provider=lambda: "reader-secret"
+    ).review(
+        {
+            "checkout": str(git_repo),
+            "ticket": {"number": 3},
+            "base_sha": "a" * 40,
+            "candidate_sha": "b" * 40,
+        }
+    )
+
+    assert result.thread_id == "read-only-reviewer"
+    assert not (git_repo / "reviewer-mutated.txt").exists()
+    assert (git_repo / "README.md").read_text(encoding="utf-8") == "# fixture\n"
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip() == candidate_tree
+    assert subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout == ""
 
 
 def test_live_codex_backend_rejects_empty_minted_token(
