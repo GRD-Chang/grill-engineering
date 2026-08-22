@@ -113,7 +113,7 @@ def test_preset_change_keeps_independent_publication_until_explicit_restore(
         "reasoning_effort": "max",
         "reference": None,
         "provenance": {
-            "preset": "premium",
+            "preset": "economy",
             "overrides": ["model"],
             "reference": None,
         },

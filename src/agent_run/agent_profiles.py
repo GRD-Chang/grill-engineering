@@ -117,6 +117,7 @@ def resolve_profiles(
     }
 
     current_profiles: Mapping[str, Any] = {}
+    preserve_independent_publication_provenance = False
     if current is not None:
         loaded_profiles = current.get("profiles")
         if not isinstance(loaded_profiles, Mapping):
@@ -147,11 +148,12 @@ def resolve_profiles(
                     "reference": existing.get("reference"),
                 },
             }
-    elif current is not None and not publication_overridden and not publication_from_development:
+    elif current is not None and not publication_from_development:
         existing = current_profiles.get("publication")
         if not isinstance(existing, Mapping):
             raise AgentProfileError("current publication profile is malformed")
         if existing.get("reference") is None:
+            preserve_independent_publication_provenance = True
             model = existing.get("model")
             effort = existing.get("reasoning_effort")
             if not isinstance(model, str) or not model:
@@ -207,8 +209,16 @@ def resolve_profiles(
         )
         if not isinstance(prior_overrides, list):
             prior_overrides = []
+        provenance_preset = baseline_name
+        if (
+            role == "publication"
+            and preserve_independent_publication_provenance
+            and isinstance(prior_provenance, Mapping)
+            and isinstance(prior_provenance.get("preset"), str)
+        ):
+            provenance_preset = str(prior_provenance["preset"])
         roles[role]["provenance"] = {
-            "preset": baseline_name,
+            "preset": provenance_preset,
             "overrides": list(dict.fromkeys([*prior_overrides, *override_fields])),
             "reference": roles[role].get("reference"),
         }
@@ -522,17 +532,18 @@ class ProfiledAgentBackend:
             request["_invocation_mode"] = "fresh"
             thread_id = None
         request["_execution_binding"] = dict(binding)
-        print(
-            "Agent Execution Binding: "
-            f"role={role} "
-            f"thread={'resume' if thread_id is not None else 'new'} "
-            f"model={binding['model']} "
-            f"reasoning_effort={binding['reasoning_effort']} "
-            f"profile_revision={binding['profile_revision']} "
-            f"thread_id={thread_id if thread_id is not None else 'none'}",
-            file=sys.stderr,
-            flush=True,
-        )
+        if not getattr(self.backend, "emits_execution_binding", False):
+            print(
+                "Agent Execution Binding: "
+                f"role={role} "
+                f"thread={'resume' if thread_id is not None else 'new'} "
+                f"model={binding['model']} "
+                f"reasoning_effort={binding['reasoning_effort']} "
+                f"profile_revision={binding['profile_revision']} "
+                f"thread_id={thread_id if thread_id is not None else 'none'}",
+                file=sys.stderr,
+                flush=True,
+            )
         original_event = request.get("_invocation_event")
         original_execution_role = request.get("_execution_role")
         event = original_event if callable(original_event) else None

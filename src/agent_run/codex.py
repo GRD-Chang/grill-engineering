@@ -66,6 +66,8 @@ class _CodexThreadResumeError(CodexProcessError):
 class CodexCliBackend:
     """Runs untrusted role-scoped agents without Publisher GitHub credentials."""
 
+    emits_execution_binding = True
+
     def __init__(
         self,
         executable: str = "codex",

@@ -428,7 +428,9 @@ def test_bound_model_and_effort_are_sent_on_fresh_resume_and_output_repair(
     )
     assert result.thread_id == "bound-thread"
     assert len(attempts) == 2
-    assert "resume" in attempts[1]
+    fresh_attempts = list(attempts)
+    assert "resume" not in fresh_attempts[0]
+    assert "resume" in fresh_attempts[1]
 
     attempts.clear()
     backend.develop(
@@ -441,7 +443,8 @@ def test_bound_model_and_effort_are_sent_on_fresh_resume_and_output_repair(
     )
     assert len(attempts) == 1
     assert "resume" in attempts[0]
-    for arguments in attempts:
+    resume_attempts = list(attempts)
+    for arguments in [*fresh_attempts, *resume_attempts]:
         assert _contains_pair(arguments, "--model", "bound-model")
         assert _contains_pair(
             arguments, "--config", 'model_reasoning_effort="high"'
