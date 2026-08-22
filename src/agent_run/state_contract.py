@@ -461,6 +461,7 @@ def _require_invocation(
         "binding_id",
         "binding_role",
         "profile_role",
+        "invocation_role",
         "model",
         "reasoning_effort",
     ):
@@ -469,7 +470,7 @@ def _require_invocation(
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.{key}"
             )
-    for key in ("binding_role", "profile_role"):
+    for key in ("binding_role", "profile_role", "invocation_role"):
         role_value = invocation.get(key)
         if role_value is not None and role_value not in {
             "development",

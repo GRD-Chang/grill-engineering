@@ -57,7 +57,8 @@ agent-run run <parent-issue> --preset premium \
 ```
 
 已有 Run 的配置通过独立命令创建新的 Profile Revision；它不会推进 Run、启动 Agent 或改变已有
-Thread。Publication 默认继续引用 Development，也可显式覆盖，或恢复引用：
+Thread。Publication 默认继续引用 Development；显式覆盖后即使切换 preset 也保持独立，只有明确
+恢复引用才重新跟随 Development：
 
 ```bash
 agent-run configure <run-id> --development-model gpt-5.6-luna
@@ -66,8 +67,9 @@ agent-run configure <run-id> --publication-from-development
 ```
 
 同一 Thread 的 Resume 与 Output Repair 始终使用原绑定；配置只影响后来创建的 Thread。`status` 在
-运行中的顶层 Codex 显示 role、Thread、model、reasoning effort 和 Profile Revision，空闲时显示
-`none`；`history --json` 保留每次启动的相同事实。
+运行中的顶层 Codex 显示实际 Invocation role、Thread、model、reasoning effort 和 Profile Revision；
+如果 Thread 引用另一 Profile，还会同时显示被引用的 Profile role。空闲时显示 `none`；
+`history --json` 保留每次启动的相同事实，包括仍在运行中的 Invocation。
 
 会触发代码修复的 Required Check 必须由 GitHub Actions job API 准确绑定当前 PR head，且失败
 只发生在仓库 `pyproject.toml` 显式列出的稳定 `workflow::name::step`；缺少或矛盾的

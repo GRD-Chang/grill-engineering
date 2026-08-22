@@ -95,6 +95,11 @@ def resolve_profiles(
 
     validate_profile_options(preset=preset, overrides=overrides)
     supplied = dict(overrides or {})
+    publication_from_development = supplied.get("publication_from_development") is True
+    publication_overridden = any(
+        supplied.get(key) is not None
+        for key in ("publication_model", "publication_effort")
+    )
     baseline_name = preset or _current_preset(current) or DEFAULT_PRESET
     baseline = deepcopy(PRESETS[baseline_name])
     roles: dict[str, dict[str, Any]] = {
@@ -111,10 +116,13 @@ def resolve_profiles(
         "reference": "development",
     }
 
-    if current is not None and preset is None:
-        current_profiles = current.get("profiles")
-        if not isinstance(current_profiles, Mapping):
+    current_profiles: Mapping[str, Any] = {}
+    if current is not None:
+        loaded_profiles = current.get("profiles")
+        if not isinstance(loaded_profiles, Mapping):
             raise AgentProfileError("current Agent Profile Revision is malformed")
+        current_profiles = loaded_profiles
+    if current is not None and preset is None:
         for role in ROLE_NAMES:
             existing = current_profiles.get(role)
             if not isinstance(existing, Mapping):
@@ -139,8 +147,32 @@ def resolve_profiles(
                     "reference": existing.get("reference"),
                 },
             }
+    elif current is not None and not publication_overridden and not publication_from_development:
+        existing = current_profiles.get("publication")
+        if not isinstance(existing, Mapping):
+            raise AgentProfileError("current publication profile is malformed")
+        if existing.get("reference") is None:
+            model = existing.get("model")
+            effort = existing.get("reasoning_effort")
+            if not isinstance(model, str) or not model:
+                raise AgentProfileError("current publication model is malformed")
+            if not isinstance(effort, str) or effort not in REASONING_EFFORTS:
+                raise AgentProfileError(
+                    "current publication reasoning effort is malformed"
+                )
+            roles["publication"] = {
+                "model": model,
+                "reasoning_effort": effort,
+                "reference": None,
+                "provenance": deepcopy(existing.get("provenance"))
+                if isinstance(existing.get("provenance"), Mapping)
+                else {
+                    "preset": _current_preset(current) or DEFAULT_PRESET,
+                    "overrides": [],
+                    "reference": None,
+                },
+            }
 
-    publication_from_development = supplied.get("publication_from_development") is True
     for role in ("development", "review", "publication"):
         model_key = f"{role}_model"
         effort_key = f"{role}_effort"
@@ -149,13 +181,9 @@ def resolve_profiles(
         if isinstance(supplied.get(effort_key), str):
             roles[role]["reasoning_effort"] = str(supplied[effort_key])
 
-    publication_overridden = any(
-        supplied.get(key) is not None
-        for key in ("publication_model", "publication_effort")
-    )
     if publication_from_development or (
         not publication_overridden
-        and (preset is not None or roles["publication"].get("reference") == "development")
+        and roles["publication"].get("reference") == "development"
     ):
         roles["publication"]["reference"] = "development"
         roles["publication"]["model"] = roles["development"]["model"]
@@ -500,11 +528,13 @@ class ProfiledAgentBackend:
             f"thread={'resume' if thread_id is not None else 'new'} "
             f"model={binding['model']} "
             f"reasoning_effort={binding['reasoning_effort']} "
-            f"profile_revision={binding['profile_revision']}",
+            f"profile_revision={binding['profile_revision']} "
+            f"thread_id={thread_id if thread_id is not None else 'none'}",
             file=sys.stderr,
             flush=True,
         )
         original_event = request.get("_invocation_event")
+        original_execution_role = request.get("_execution_role")
         event = original_event if callable(original_event) else None
 
         def notify(kind: str, **facts: object) -> None:
@@ -514,6 +544,7 @@ class ProfiledAgentBackend:
                         "binding_id": binding["binding_id"],
                         "binding_role": binding["role"],
                         "profile_role": binding["role"],
+                        "invocation_role": role,
                         "model": binding["model"],
                         "reasoning_effort": binding["reasoning_effort"],
                         "profile_revision": binding["profile_revision"],
@@ -533,6 +564,7 @@ class ProfiledAgentBackend:
                             "binding_id": binding["binding_id"],
                             "binding_role": binding["role"],
                             "profile_role": binding["role"],
+                            "invocation_role": role,
                             "model": binding["model"],
                             "reasoning_effort": binding["reasoning_effort"],
                             "profile_revision": binding["profile_revision"],
@@ -545,10 +577,15 @@ class ProfiledAgentBackend:
                 event(kind, **facts)
 
         request["_invocation_event"] = notify
+        request["_execution_role"] = role
         try:
             return operation(request)
         finally:
             request["_invocation_event"] = original_event
+            if original_execution_role is None:
+                request.pop("_execution_role", None)
+            else:
+                request["_execution_role"] = original_execution_role
 
 
 def _current_preset(current: Mapping[str, Any] | None) -> str | None:

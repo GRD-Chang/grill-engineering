@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend, resolve_profiles
+from agent_run.agent_invocation import invocation_event_recorder
 from conftest import write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance
@@ -93,6 +94,36 @@ def test_publication_override_is_independent_until_reference_is_restored(
     )
     assert restored["profiles"]["publication"]["reference"] == "development"
     assert restored["profiles"]["publication"]["model"] == "later-development"
+
+
+def test_preset_change_keeps_independent_publication_until_explicit_restore(
+    tmp_path: Path,
+) -> None:
+    store = AgentProfileStore(tmp_path)
+    store.initialize("run-1")
+    store.configure("run-1", overrides={"publication_model": "custom-pub"})
+
+    changed = store.configure(
+        "run-1",
+        preset="premium",
+        overrides={"development_model": "premium-development"},
+    )
+    assert changed["profiles"]["publication"] == {
+        "model": "custom-pub",
+        "reasoning_effort": "max",
+        "reference": None,
+        "provenance": {
+            "preset": "premium",
+            "overrides": ["model"],
+            "reference": None,
+        },
+    }
+
+    restored = store.configure(
+        "run-1", overrides={"publication_from_development": True}
+    )
+    assert restored["profiles"]["publication"]["reference"] == "development"
+    assert restored["profiles"]["publication"]["model"] == "premium-development"
 
 
 def test_profile_writers_serialize_and_atomic_failure_preserves_previous_revision(
@@ -198,6 +229,52 @@ def test_profiled_backend_records_binding_facts_before_agent_starts(tmp_path: Pa
     assert resumed_events[0]["profile_revision"] == 1
     assert resumed_events[0]["model"] == "gpt-5.6-luna"
 
+    publication_events: list[dict[str, Any]] = []
+    profiled.publication(
+        {
+            "run_id": "run-1",
+            "thread_id": "thread-1",
+            "_invocation_event": lambda kind, **facts: publication_events.append(
+                {"kind": kind, **facts}
+            ),
+        }
+    )
+    assert publication_events[0]["invocation_role"] == "publication"
+    assert publication_events[0]["binding_role"] == "development"
+    assert publication_events[0]["profile_role"] == "development"
+
+
+def test_invocation_history_contains_started_snapshot_before_completion() -> None:
+    state: dict[str, Any] = {"run_id": "run-1", "agent_invocation_history": []}
+    saved: list[dict[str, Any]] = []
+    record = invocation_event_recorder(
+        state,
+        role="publication",
+        phase="publication",
+        work_subject="ticket:1",
+        generation=1,
+        invocation_input={"request": "value"},
+        currentness_boundary={"head_sha": "abc"},
+        save=lambda value: saved.append(json.loads(json.dumps(value))),
+    )
+
+    record(
+        "started",
+        requested_thread_id=None,
+        invocation_role="publication",
+        binding_role="development",
+        profile_role="development",
+        model="gpt-5.6-luna",
+        reasoning_effort="max",
+        profile_revision=1,
+    )
+    assert state["agent_invocation_history"][0]["status"] == "running"
+    assert saved[-1]["agent_invocation_history"][0]["status"] == "running"
+
+    record("completed", reported_thread_id="thread-1", attempt_count=1)
+    assert len(state["agent_invocation_history"]) == 1
+    assert state["agent_invocation_history"][0]["status"] == "completed"
+
 
 def test_independent_publication_does_not_reuse_development_thread(
     tmp_path: Path,
@@ -267,8 +344,6 @@ def test_public_cli_creates_and_updates_a_run_profile(
         fixture,
         "start",
         "1",
-        "--preset",
-        "premium",
         "--development-effort",
         "high",
     )
@@ -277,7 +352,7 @@ def test_public_cli_creates_and_updates_a_run_profile(
     profile_path = git_repo / ".agent-run" / "profiles" / f"{run_id}.json"
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     assert profile["profile_revision"] == 1
-    assert profile["profiles"]["development"]["model"] == "gpt-5.6-sol"
+    assert profile["profiles"]["development"]["model"] == "gpt-5.6-luna"
     assert profile["profiles"]["development"]["reasoning_effort"] == "high"
     assert profile["profiles"]["publication"]["reference"] == "development"
     before_status = load_only_run_state(git_repo)["status"]
@@ -293,9 +368,50 @@ def test_public_cli_creates_and_updates_a_run_profile(
     assert configured.returncode == 0, configured.stderr
     assert stdout_json(configured)["profile_revision"] == 2
     assert load_only_run_state(git_repo)["status"] == before_status
+
+    independent = run_cli(
+        git_repo,
+        fixture,
+        "configure",
+        run_id,
+        "--publication-model",
+        "custom-pub",
+    )
+    assert independent.returncode == 0, independent.stderr
+    independent_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert independent_profile["profiles"]["publication"]["reference"] is None
+    assert independent_profile["profiles"]["publication"]["model"] == "custom-pub"
+
+    changed_preset = run_cli(
+        git_repo,
+        fixture,
+        "configure",
+        run_id,
+        "--preset",
+        "premium",
+        "--development-model",
+        "premium-development",
+    )
+    assert changed_preset.returncode == 0, changed_preset.stderr
+    changed_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert changed_profile["profiles"]["publication"]["reference"] is None
+    assert changed_profile["profiles"]["publication"]["model"] == "custom-pub"
+
+    restored = run_cli(
+        git_repo,
+        fixture,
+        "configure",
+        run_id,
+        "--publication-from-development",
+    )
+    assert restored.returncode == 0, restored.stderr
+    restored_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert restored_profile["profiles"]["publication"]["reference"] == "development"
+    assert restored_profile["profiles"]["publication"]["model"] == "premium-development"
+
     empty = run_cli(git_repo, fixture, "configure", run_id)
     assert empty.returncode == 2
-    assert json.loads(profile_path.read_text(encoding="utf-8"))["profile_revision"] == 2
+    assert json.loads(profile_path.read_text(encoding="utf-8"))["profile_revision"] == 5
 
 
 def test_public_configuration_during_active_invocation_keeps_old_binding(
@@ -341,8 +457,6 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         "agent_run",
         "run",
         "1",
-        "--preset",
-        "premium",
         "--development-model",
         "old-development",
         "--agent-fixture",
@@ -369,7 +483,18 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
 
         active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         assert active_before["agent_invocation"]["model"] == "old-development"
+        assert active_before["agent_invocation"]["reasoning_effort"] == "max"
         assert active_before["agent_invocation"]["profile_revision"] == 1
+        active_history = stdout_json(
+            run_cli(git_repo, fixture, "history", run_id, "--json")
+        )
+        running = next(
+            item
+            for item in active_history["agent_invocations"]
+            if item.get("status") == "running"
+        )
+        assert running["model"] == "old-development"
+        assert running["invocation_role"] == "development"
 
         configured = run_cli(
             git_repo,
@@ -395,7 +520,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         assert json.loads(stdout)["status"] == "parent_approval_pending"
         assert (
             "Agent Execution Binding: role=development thread=new "
-            "model=old-development reasoning_effort=medium profile_revision=1"
+            "model=old-development reasoning_effort=max profile_revision=1"
         ) in stderr
         assert (
             "Agent Execution Binding: role=review thread=new "
@@ -410,7 +535,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
             if item.get("binding_role") == "development"
         )
         assert development["model"] == "old-development"
-        assert development["reasoning_effort"] == "medium"
+        assert development["reasoning_effort"] == "max"
         assert development["profile_revision"] == 1
         review = next(
             item
@@ -422,7 +547,94 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         text_history = run_cli(git_repo, fixture, "history", run_id).stdout
         assert "model=old-development" in text_history
         assert "profile_revision=1" in text_history
+        publication = next(
+            item
+            for item in history["agent_invocations"]
+            if item.get("invocation_role") == "publication"
+        )
+        assert publication["binding_role"] == "development"
+        assert "Agent Invocation publication(profile=development)" in text_history
     finally:
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+
+
+def test_public_resume_reuses_bound_thread_and_reports_its_id(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    blocked_agents = git_repo / "blocked-agents.json"
+    blocked_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-development",
+                        "human_blockers": ["需要恢复开发权限。"],
+                    }
+                ],
+                "publications": [],
+                "reviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    blocked = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(blocked_agents),
+    )
+    assert blocked.returncode == 2, blocked.stderr
+    run_id = str(stdout_json(blocked)["run_id"])
+    failed_history = stdout_json(
+        run_cli(git_repo, fixture, "history", run_id, "--json")
+    )["agent_invocations"]
+    first_development = next(
+        item for item in failed_history if item.get("invocation_role") == "development"
+    )
+    assert first_development["status"] == "completed"
+
+    resumed_agents = git_repo / "resumed-agents.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": "parent-development",
+                        "thread_id": "parent-development",
+                        "summary": "恢复后完成开发。",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [passing_acceptance("parent-review", "恢复后验收通过。")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--message",
+        "权限已恢复。",
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "parent_approval_pending"
+    history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))[
+        "agent_invocations"
+    ]
+    development_invocations = [
+        item for item in history if item.get("invocation_role") == "development"
+    ]
+    assert len(development_invocations) == 2
+    assert development_invocations[1]["binding_id"] == first_development["binding_id"]
+    assert development_invocations[1]["requested_thread_id"] == "parent-development"
+    assert "Agent Execution Binding: role=development thread=resume" in resumed.stderr
+    assert "thread_id=parent-development" in resumed.stderr

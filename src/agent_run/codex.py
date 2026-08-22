@@ -5,6 +5,7 @@ import json
 import math
 import re
 import shutil
+import sys
 import threading
 import tempfile
 from pathlib import Path
@@ -423,6 +424,12 @@ class CodexCliBackend:
                     reasoning_effort = _optional_string(
                         execution_binding, "reasoning_effort"
                     )
+                self._print_execution_binding(
+                    request,
+                    thread_id=current_thread,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                )
                 output, reported_thread = self._invoke(
                     prompt=attempt_prompt,
                     checkout=checkout,
@@ -474,6 +481,31 @@ class CodexCliBackend:
             )
             return output, current_thread
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _print_execution_binding(
+        request: dict[str, Any],
+        *,
+        thread_id: str | None,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> None:
+        binding = request.get("_execution_binding")
+        if not isinstance(binding, dict):
+            return
+        role = request.get("_execution_role") or binding.get("role")
+        revision = binding.get("profile_revision")
+        print(
+            "Agent Execution Binding: "
+            f"role={role} "
+            f"thread={'resume' if thread_id is not None else 'new'} "
+            f"model={model or binding.get('model')} "
+            f"reasoning_effort={reasoning_effort or binding.get('reasoning_effort')} "
+            f"profile_revision={revision} "
+            f"thread_id={thread_id if thread_id is not None else 'none'}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _review_prompt(request: dict[str, Any]) -> str:

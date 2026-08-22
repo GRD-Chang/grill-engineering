@@ -175,7 +175,7 @@ def failed_acceptance_artifact(
 
 
 def test_publication_repairs_invalid_output_in_same_thread(
-    tmp_path: Path, monkeypatch: Any
+    tmp_path: Path, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     attempts: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
@@ -212,6 +212,13 @@ def test_publication_repairs_invalid_output_in_same_thread(
         {
             "checkout": str(tmp_path),
             "acceptance_artifact": {},
+            "_execution_role": "publication",
+            "_execution_binding": {
+                "role": "development",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "max",
+                "profile_revision": 1,
+            },
             "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
         }
     )
@@ -223,6 +230,16 @@ def test_publication_repairs_invalid_output_in_same_thread(
         "completed",
         {"reported_thread_id": "publication-thread", "attempt_count": 2},
     )
+    binding_lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("Agent Execution Binding:")
+    ]
+    assert len(binding_lines) == 2
+    assert "role=publication thread=new" in binding_lines[0]
+    assert "thread_id=none" in binding_lines[0]
+    assert "role=publication thread=resume" in binding_lines[1]
+    assert "thread_id=publication-thread" in binding_lines[1]
 
 
 def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
