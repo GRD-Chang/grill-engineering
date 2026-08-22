@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -67,6 +69,7 @@ class FixtureAgentBackend:
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+        self._wait_for_invocation_gate("developments", request)
         no_thread = step.get("no_thread", False)
         if not isinstance(no_thread, bool):
             raise ValueError("scripted Development no_thread must be a boolean")
@@ -208,6 +211,7 @@ class FixtureAgentBackend:
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+            self._wait_for_invocation_gate("publications", request)
             if no_thread:
                 error = "scripted Publication did not report a Thread ID"
                 event("failed", attempt_count=1, error=error)
@@ -281,6 +285,7 @@ class FixtureAgentBackend:
                 attempt_count=0,
                 invocation_mode=request.get("_invocation_mode"),
             )
+        self._wait_for_invocation_gate(name, request)
         no_thread = step.get("no_thread", False)
         if not isinstance(no_thread, bool):
             raise ValueError("scripted Fresh Acceptance no_thread must be a boolean")
@@ -365,6 +370,7 @@ class FixtureAgentBackend:
             )
 
         start_invocation()
+        self._wait_for_invocation_gate(name, request, attempt=1)
         currentness = request.get("_currentness_check")
         for attempt in range(1, 4):
             if attempt > 1 and callable(currentness) and not currentness():
@@ -372,6 +378,8 @@ class FixtureAgentBackend:
                 start_invocation()
                 notify("failed", attempt_count=attempt - 1, error=message)
                 raise ValueError(message)
+            if attempt > 1:
+                self._wait_for_invocation_gate(name, request, attempt=attempt)
             try:
                 step = self._next(name)
                 has_expected_thread = "expected_thread_id" in step
@@ -450,6 +458,86 @@ class FixtureAgentBackend:
             _raise_initial_credential_failure(failures.pop(0))
         if self.initial_credential_failures:
             _raise_initial_credential_failure(self.initial_credential_failures.pop(0))
+
+    def _wait_for_invocation_gate(
+        self, role: str, request: dict[str, Any], *, attempt: int = 1
+    ) -> None:
+        configured = self.data.get("invocation_gate")
+        if configured is None:
+            configured = self.data.get("agent_gate")
+        if configured is None and "pause_file" in self.data:
+            configured = {
+                "pause_file": self.data.get("pause_file"),
+                "release_file": self.data.get("release_file"),
+            }
+        if configured is None:
+            return
+        if not isinstance(configured, dict):
+            raise ValueError("invocation_gate must be an object")
+        configured_attempt = configured.get("attempt", 1)
+        if (
+            not isinstance(configured_attempt, int)
+            or isinstance(configured_attempt, bool)
+            or configured_attempt <= 0
+        ):
+            raise ValueError("invocation_gate.attempt must be a positive integer")
+        if configured_attempt != attempt:
+            return
+
+        selected_role = configured.get("role")
+        role_alias = {
+            "developments": "development",
+            "development": "developments",
+            "reviews": "review",
+            "run_reviews": "review",
+            "review": "reviews",
+            "publications": "publication",
+            "run_publications": "publication",
+            "publication": "publications",
+        }.get(role)
+        if selected_role is not None and selected_role not in {
+            role,
+            role_alias,
+            request.get("acceptance_scope"),
+            request.get("repair_scope"),
+        }:
+            return
+        started_file = configured.get("started_file") or configured.get("ready_file")
+        if started_file is None:
+            started_file = configured.get("pause_file")
+        release_file = configured.get("release_file") or configured.get(
+            "continue_file"
+        )
+        if not isinstance(started_file, str) or not started_file:
+            raise ValueError("invocation_gate.started_file must be a non-empty path")
+        if not isinstance(release_file, str) or not release_file:
+            raise ValueError("invocation_gate.release_file must be a non-empty path")
+
+        started_path = Path(started_file)
+        release_path = Path(release_file)
+        started_path.parent.mkdir(parents=True, exist_ok=True)
+        started_path.touch()
+        timeout = configured.get("timeout_seconds", 30)
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            timeout_value = float("nan")
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(timeout_value)
+            or timeout_value <= 0
+            or timeout_value > 300
+        ):
+            raise ValueError(
+                "invocation_gate.timeout_seconds must be finite and in (0, 300]"
+            )
+        deadline = time.monotonic() + timeout_value
+        while not release_path.exists():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("invocation_gate timed out waiting for release")
+            time.sleep(min(0.02, remaining))
 
     def _next(self, name: str) -> dict[str, Any]:
         values = self.data.get(name)

@@ -32,7 +32,6 @@ class RunRepairRequests:
             "parent_issue_url": _issue_url(
                 state, int(_mapping(state, "parent")["number"])
             ),
-            "run_id": state["run_id"],
             "parent": dict(_mapping(state, "parent")),
             "ticket_graph": _mapping(state, "ticket_graph"),
             "ticket_completion_records": ticket_completion_records(state),
@@ -71,7 +70,6 @@ class RunRepairRequests:
             "parent_issue_url": _issue_url(
                 state, int(_mapping(state, "parent")["number"])
             ),
-            "run_id": state["run_id"],
             "parent": _mapping(state, "parent"),
             "ticket_graph": _mapping(state, "ticket_graph"),
             "ticket_completion_records": ticket_completion_records(state),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any
+from typing import Any, Callable
 
 from agent_run.controller import Controller
 from agent_run.state import StateStore
@@ -17,12 +17,15 @@ def _run_to_human_gate(
     states: StateStore,
     controller: Controller,
     driver: Any,
+    initialize_profile: Callable[[dict[str, Any], bool], None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     state, resumed = controller.start_or_resume_unfinished(parsed.parent)
     run_id = state.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("Delivery Run is missing its Run ID")
     state = _load_local_run(states, run_id)
+    if initialize_profile is not None:
+        initialize_profile(state, resumed)
     return driver.advance(state), resumed
 
 

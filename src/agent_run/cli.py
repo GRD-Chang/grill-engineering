@@ -9,6 +9,12 @@ from typing import Sequence
 
 from agent_run import cli_presentation, cli_surface
 from agent_run.agent_fixture import FixtureAgentBackend
+from agent_run.agent_profiles import (
+    AgentProfileStore,
+    ProfileOverrides,
+    ProfiledAgentBackend,
+    validate_profile_options,
+)
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
@@ -68,19 +74,21 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,promotion-handshake}",
+        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,promotion-handshake}",
     )
     start = subcommands.add_parser(
         "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
     )
     start.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(start)
+    _add_profile_options(start)
     start.add_argument("--new-run", action="store_true", help=argparse.SUPPRESS)
     run = subcommands.add_parser(
         "run", help="推进正常 Job Loop，停在需要操作者处理的边界"
     )
     run.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(run)
+    _add_profile_options(run)
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume = subcommands.add_parser(
         "resume", help="恢复失败/Human Blocker Invocation 或监督超时窗口"
@@ -123,6 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("run_id", help="交付运行标识")
     _add_common_options(history)
     history.add_argument("--json", action="store_true", dest="as_json")
+    configure = subcommands.add_parser(
+        "configure",
+        aliases=["config", "profile"],
+        help="为未来创建的顶层 Codex Thread 创建新的 Agent Profile Revision",
+    )
+    configure.add_argument("run_id", help="交付运行标识")
+    _add_common_options(configure)
+    _add_profile_options(configure)
+    configure.add_argument("--json", action="store_true", dest="as_json")
     promotion = subcommands.add_parser(
         "promotion-handshake",
         help="从不可变 Runner 执行一次真实 Structured Outputs promotion handshake",
@@ -150,6 +167,13 @@ def _main_with_parser(
     states: StateStore | FaultInjectingStateStore | None = None
     precondition_failed = False
     try:
+        creation_profile = (
+            _profile_configuration(parsed)
+            if parsed.command in {"start", "run"}
+            else None
+        )
+        if parsed.command in {"configure", "config", "profile"}:
+            return _configure_profile(parsed)
         if parsed.command in {"status", "history"}:
             state = _load_read_only_run(parsed)
             if parsed.command == "status":
@@ -184,7 +208,14 @@ def _main_with_parser(
             if isinstance(crash_after_save, int)
             else StateStore(state_root)
         )
-        controller = Controller(github, git, states, locator=RunLocatorIndex.default())
+        profiles = AgentProfileStore(state_root)
+        controller = Controller(
+            github,
+            git,
+            states,
+            locator=RunLocatorIndex.default(),
+            profiles=profiles,
+        )
         runner_verification = current_immutable_runner()
         if runner_verification is None:
             if fixture_path is None:
@@ -202,19 +233,30 @@ def _main_with_parser(
                 promotion_audit_file(runner_verification),
                 active_codex_version,
             )
+        if parsed.command in {"resume", "requeue", "approve", "revise", "abandon"}:
+            _require_profile(profiles, parsed.run_id)
         if cli_surface._is_lifecycle_action(parsed.command):
             local_state = cli_surface._load_local_run(states, parsed.run_id)
             if not cli_surface._command_is_ready(local_state, parsed.command):
                 cli_presentation._print_precondition_failure(local_state)
                 return 2
         if parsed.command == "run":
-            driver = _run_driver(parsed, states, controller, git, github)
+            driver = _run_driver(parsed, states, controller, git, github, profiles)
             state, resumed = cli_surface._run_to_human_gate(
-                parsed, states, controller, driver
+                parsed,
+                states,
+                controller,
+                driver,
+                initialize_profile=lambda value, resumed_run: _initialize_profile(
+                    profiles, value, creation_profile, allow_create=not resumed_run
+                ),
             )
         elif parsed.command == "start":
             state, resumed = controller.start(
                 parsed.parent, reuse_existing=not parsed.new_run
+            )
+            _initialize_profile(
+                profiles, state, creation_profile, allow_create=not resumed
             )
         elif parsed.command == "resume":
             current = cli_surface._load_local_run(states, parsed.run_id)
@@ -252,7 +294,9 @@ def _main_with_parser(
                 return 2
             if not is_github_refresh_wait(state):
                 if current.get("status") == "supervision_timeout":
-                    state = _run_driver(parsed, states, controller, git, github).advance(state)
+                    state = _run_driver(
+                        parsed, states, controller, git, github, profiles
+                    ).advance(state)
                 else:
                     publisher = (
                         FixtureGitHubPublisher(Path(parsed.github_fixture), git)
@@ -260,11 +304,7 @@ def _main_with_parser(
                         else GhGitHubPublisher(str(state["repository"]), git)
                     )
                     agent_fixture = getattr(parsed, "agent_fixture", None)
-                    agents = (
-                        FixtureAgentBackend(Path(agent_fixture))
-                        if agent_fixture
-                        else CodexCliBackend()
-                    )
+                    agents = _agent_backend(parsed, profiles)
                     publication_retried = _has_resumed_agent_phase(state)
                     if publication_retried:
                         if state.get("delivery_type") == "parent_only":
@@ -311,7 +351,7 @@ def _main_with_parser(
                             ).publish(parsed.run_id)
         elif parsed.command == "requeue":
             state = _run_driver(
-                parsed, states, controller, git, github
+                parsed, states, controller, git, github, profiles
             ).operations.requeue(parsed.run_id).state
             resumed = True
         else:
@@ -351,15 +391,7 @@ def _main_with_parser(
                 if parsed.github_fixture
                 else GhGitHubPublisher(repository.name_with_owner, git)
             )
-            if parsed.command == "revise":
-                agent_fixture = getattr(parsed, "agent_fixture", None)
-                agents = (
-                    FixtureAgentBackend(Path(agent_fixture))
-                    if agent_fixture
-                    else CodexCliBackend()
-                )
-            else:
-                agents = CodexCliBackend()
+            agents = _agent_backend(parsed, profiles)
             publication = RunPublicationEngine(
                 git=git,
                 states=states,
@@ -615,12 +647,9 @@ def _run_driver(
     controller: Controller,
     git: GitRepository,
     github: FixtureGitHubReader | GhGitHubReader,
+    profiles: AgentProfileStore,
 ) -> RunDriver:
-    agents = (
-        FixtureAgentBackend(Path(parsed.agent_fixture))
-        if parsed.agent_fixture
-        else CodexCliBackend()
-    )
+    agents = _agent_backend(parsed, profiles)
     return RunDriver(
         operations=DirectRunOperations(
             controller=controller,
@@ -633,9 +662,23 @@ def _run_driver(
                 else GhGitHubPublisher(github.repository().name_with_owner, git)
             ),
             agents=agents,
+            profiles=profiles,
         ),
         states=states,
         supervisor=_foreground_supervisor(parsed),
+    )
+
+
+def _agent_backend(
+    parsed: argparse.Namespace, profiles: AgentProfileStore
+) -> ProfiledAgentBackend:
+    fixture = getattr(parsed, "agent_fixture", None)
+    backend = FixtureAgentBackend(Path(fixture)) if fixture else CodexCliBackend()
+    run_id = getattr(parsed, "run_id", None)
+    return ProfiledAgentBackend(
+        backend,
+        profiles,
+        run_id=run_id if isinstance(run_id, str) else None,
     )
 
 
@@ -681,6 +724,146 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
         type=_positive_integer,
         help=argparse.SUPPRESS,
     )
+
+
+def _add_profile_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--preset",
+        "--profile-preset",
+        dest="profile_preset",
+        help="Agent Execution Preset（默认 economy）",
+    )
+    parser.add_argument(
+        "--development-model",
+        "--dev-model",
+        dest="development_model",
+        help="Development 顶层 Codex 的 model",
+    )
+    parser.add_argument(
+        "--development-effort",
+        "--development-reasoning-effort",
+        "--dev-effort",
+        dest="development_effort",
+        help="Development 顶层 Codex 的 reasoning effort",
+    )
+    parser.add_argument(
+        "--review-model", dest="review_model", help="Review 顶层 Codex 的 model"
+    )
+    parser.add_argument(
+        "--review-effort",
+        "--review-reasoning-effort",
+        dest="review_effort",
+        help="Review 顶层 Codex 的 reasoning effort",
+    )
+    parser.add_argument(
+        "--publication-model",
+        dest="publication_model",
+        help="Publication 顶层 Codex 的 model",
+    )
+    parser.add_argument(
+        "--publication-effort",
+        "--publication-reasoning-effort",
+        dest="publication_effort",
+        help="Publication 顶层 Codex 的 reasoning effort",
+    )
+    parser.add_argument(
+        "--publication-from-development",
+        "--publication-reference-development",
+        "--publication-use-development",
+        action="store_true",
+        default=None,
+        dest="publication_from_development",
+        help="让 Publication 恢复引用 Development Profile",
+    )
+    parser.add_argument(
+        "--publication-reference",
+        choices=("development",),
+        dest="publication_reference",
+        help=argparse.SUPPRESS,
+    )
+
+
+def _profile_configuration(
+    parsed: argparse.Namespace,
+) -> tuple[str | None, ProfileOverrides]:
+    publication_from_development = parsed.publication_from_development
+    if parsed.publication_reference == "development":
+        publication_from_development = True
+    overrides: dict[str, str | bool | None] = {
+        "development_model": parsed.development_model,
+        "development_effort": parsed.development_effort,
+        "review_model": parsed.review_model,
+        "review_effort": parsed.review_effort,
+        "publication_model": parsed.publication_model,
+        "publication_effort": parsed.publication_effort,
+        "publication_from_development": publication_from_development,
+    }
+    validate_profile_options(preset=parsed.profile_preset, overrides=overrides)
+    return parsed.profile_preset, overrides
+
+
+def _initialize_profile(
+    profiles: AgentProfileStore,
+    state: dict[str, object],
+    configuration: tuple[str | None, ProfileOverrides] | None,
+    *,
+    allow_create: bool = True,
+) -> None:
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str):
+        raise ValueError("Delivery Run is missing its Run ID")
+    if not allow_create and profiles.load(run_id) is None:
+        raise IncompatibleRunStateError(
+            "Delivery Run lacks an Agent Execution Profile; create a new Run"
+        )
+    preset, overrides = configuration or (None, {})
+    profiles.initialize(run_id, preset=preset, overrides=overrides)
+
+
+def _require_profile(profiles: AgentProfileStore, run_id: str) -> None:
+    if profiles.load(run_id) is None:
+        raise IncompatibleRunStateError(
+            "Delivery Run lacks an Agent Execution Profile; create a new Run"
+        )
+
+
+def _configure_profile(parsed: argparse.Namespace) -> int:
+    state_root = _profile_state_root(parsed)
+    state = StateStore(state_root).load_current_run(parsed.run_id)
+    if state is None:
+        raise ValueError(f"unknown Delivery Run: {parsed.run_id}")
+    preset, overrides = _profile_configuration(parsed)
+    document = AgentProfileStore(state_root).configure(
+        parsed.run_id, preset=preset, overrides=overrides
+    )
+    print(
+        json.dumps(
+            {
+                "result": "configured",
+                "run_id": parsed.run_id,
+                "profile_revision": document["profile_revision"],
+                "preset": document["preset"],
+                "profiles": document["profiles"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _profile_state_root(parsed: argparse.Namespace) -> Path:
+    if parsed.state_dir:
+        return Path(parsed.state_dir).resolve()
+    try:
+        git = GitRepository.discover(Path.cwd())
+    except GitError:
+        git = None
+    if git is not None:
+        local_root = git.root / ".agent-run"
+        if StateStore(local_root).load_run(parsed.run_id) is not None:
+            return local_root
+    return RunLocatorIndex.default().resolve_state_dir(parsed.run_id)
 
 
 def _positive_integer(value: str) -> int:

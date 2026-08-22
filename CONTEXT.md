@@ -381,13 +381,29 @@ _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的�
 **Agent Invocation（Agent 调用）**:
 Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
 Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output Attempt 前成为 active，
-并绑定 Work Subject、Generation、输入指纹与机械 Currentness Boundary；记录只保存输入指纹和
-有界边界事实，不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
+并绑定 Work Subject、Generation、输入指纹、机械 Currentness Boundary 与实际 Thread Execution Binding；记录只保存输入指纹、有界边界事实、model、reasoning effort 与 Agent Profile Revision，
+不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
 立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
 checkout 只读，且不增加领域 Development、Validation 或 Publication Attempt。进程失败、缺失或
 不匹配的 Thread 只结束当前 Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原
 Thread，或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
+
+**Agent Execution Profile（Agent 执行配置）**:
+Delivery Run 为未来创建的各顶层 Codex Thread 保存的 model 与 reasoning effort 选择，可以来自命名预设或用户自定义值。它只约束 Controller 直接启动的顶层 Codex，不约束这些 Codex 自行派发的 subagent。
+_Avoid_: Codex 用户全局默认、Subagent Profile、Acceptance Policy
+
+**Agent Execution Preset（Agent 执行预设）**:
+创建 Delivery Run 时可选的一组内置 Development、Review 与 Publication Agent Execution Profile。预设只提供初始值；选择时其准确 model、reasoning effort 与角色引用会被解析进 Agent Profile Revision，已有 Run 不随预设定义更新。
+_Avoid_: 动态模型别名、Acceptance Policy、Codex 用户全局配置
+
+**Agent Profile Revision（Agent 配置修订）**:
+Delivery Run 当前 Development、Review 与 Publication 三组 Agent Execution Profile 的一个有序、不可变快照。用户修改配置会创建新的 Revision；既有 Thread 保留原绑定，后来创建的新 Thread 绑定修改时已生效的最新 Revision。
+_Avoid_: Thread Execution Binding、Job Generation、Codex 用户全局配置版本
+
+**Thread Execution Binding（线程执行绑定）**:
+一个顶层 Codex Thread 创建时从当时有效的 Agent Profile Revision 解析并绑定的不可变角色、model 与 reasoning effort。同一 Thread 的后续 Invocation、Resume 与 Output Repair 始终使用该绑定；配置修改只影响后来创建的新 Thread。
+_Avoid_: Invocation 级切换模型、运行中切换模型、Codex 用户全局默认
 
 **Output Attempt（输出尝试）**:
 一个 Agent Invocation 内的一次 `codex exec` 进程执行。初始输出是第一个 Output Attempt；仅当进程

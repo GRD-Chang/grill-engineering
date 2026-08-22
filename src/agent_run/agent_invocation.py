@@ -24,6 +24,27 @@ def canonical_fingerprint(value: object) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _sync_invocation_history(
+    state: dict[str, Any], invocation: dict[str, Any]
+) -> None:
+    """Keep one live history snapshot for each started Invocation."""
+
+    history = state.setdefault("agent_invocation_history", [])
+    if not isinstance(history, list):
+        raise ValueError("agent_invocation_history must be an array")
+    started_at = invocation.get("started_at")
+    for index in range(len(history) - 1, -1, -1):
+        previous = history[index]
+        if (
+            isinstance(previous, dict)
+            and previous.get("started_at") == started_at
+            and previous.get("work_subject") == invocation.get("work_subject")
+        ):
+            history[index] = dict(invocation)
+            return
+    history.append(dict(invocation))
+
+
 def select_publication_thread(
     job: dict[str, Any], *, max_context_attempts: int
 ) -> str | None:
@@ -72,6 +93,14 @@ def invocation_event_recorder(
                 "status": "running",
                 "requested_thread_id": facts.get("requested_thread_id"),
                 "reported_thread_id": None,
+                "binding_id": facts.get("binding_id"),
+                "binding_role": facts.get("binding_role"),
+                "profile_role": facts.get("profile_role"),
+                "invocation_role": facts.get("invocation_role"),
+                "model": facts.get("model"),
+                "reasoning_effort": facts.get("reasoning_effort"),
+                "profile_revision": facts.get("profile_revision"),
+                "thread_execution_binding": facts.get("thread_execution_binding"),
                 "attempt_count": 0,
                 "started_at": now,
                 "ended_at": None,
@@ -80,6 +109,7 @@ def invocation_event_recorder(
                 "signal": None,
             }
             state["active_agent_invocation"] = invocation
+            _sync_invocation_history(state, invocation)
         else:
             active = state.get("active_agent_invocation")
             if not isinstance(active, dict):
@@ -95,10 +125,7 @@ def invocation_event_recorder(
                     invocation.update(
                         {"status": "failed", "ended_at": now, "error": error}
                     )
-                    history = state.setdefault("agent_invocation_history", [])
-                    if not isinstance(history, list):
-                        raise ValueError("agent_invocation_history must be an array")
-                    history.append(dict(invocation))
+                    _sync_invocation_history(state, invocation)
                     state.update(
                         {
                             "status": "execution_failed",
@@ -113,10 +140,6 @@ def invocation_event_recorder(
             elif kind in {"completed", "failed"}:
                 invocation["status"] = kind
                 invocation["ended_at"] = now
-                history = state.setdefault("agent_invocation_history", [])
-                if not isinstance(history, list):
-                    raise ValueError("agent_invocation_history must be an array")
-                history.append(dict(invocation))
                 if kind == "failed":
                     state.update(
                         {
@@ -133,6 +156,7 @@ def invocation_event_recorder(
                             ],
                         }
                     )
+            _sync_invocation_history(state, invocation)
         save(state)
 
     return record
@@ -158,11 +182,8 @@ def fail_interrupted_invocation(
             "error": "controller_interrupted",
         }
     )
-    history = state.setdefault("agent_invocation_history", [])
-    if not isinstance(history, list):
-        raise ValueError("agent_invocation_history must be an array")
-    history.append(failed)
     state["active_agent_invocation"] = failed
+    _sync_invocation_history(state, failed)
     state.update(
         {
             "status": "execution_failed",

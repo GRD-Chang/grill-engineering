@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Protocol
 
+from agent_run.agent_profiles import AgentProfileStore
 from agent_run.codex import CodexProcessError
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
@@ -84,6 +85,7 @@ class DirectRunOperations:
         github_reader: Any,
         publisher_factory: Callable[[], Any],
         agents: Any,
+        profiles: AgentProfileStore | None = None,
     ) -> None:
         self.controller = controller
         self.states = states
@@ -92,6 +94,7 @@ class DirectRunOperations:
         self._publisher_factory = publisher_factory
         self._publisher: Any | None = None
         self.agents = agents
+        self.profiles = profiles
 
     @property
     def publisher(self) -> Any:
@@ -270,6 +273,16 @@ class DirectRunOperations:
 
     def dispatch(self, step: RunStep, run_id: str) -> RunOutcome:
         """Execute a typed step; the Driver never dispatches on raw state."""
+
+        # The direct engine seam is also used by legacy in-process callers
+        # that predate the public profile-aware CLI.  Seed only that seam's
+        # independent control plane; the CLI passes an existing store and
+        # therefore remains fail-closed for old Runs.
+        if self.profiles is None:
+            AgentProfileStore(self.states.root).initialize(run_id)
+        set_run_id = getattr(self.agents, "set_run_id", None)
+        if callable(set_run_id):
+            set_run_id(run_id)
 
         return {
             RunStep.DELIVER: self.deliver,

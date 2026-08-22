@@ -41,6 +41,12 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     active_ticket = active.get("ticket_number") if active else None
     worker = _current_worker(state)
     run_repair = _run_repair_status(state)
+    invocation = state.get("active_agent_invocation")
+    active_invocation = (
+        invocation
+        if isinstance(invocation, dict) and invocation.get("status") == "running"
+        else None
+    )
     output = {
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
@@ -56,7 +62,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "diagnostics": state.get("diagnostics", []),
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
-        "agent_invocation": state.get("active_agent_invocation"),
+        "agent_invocation": active_invocation,
         "supervision": public_supervision_snapshot(state),
     }
     if as_json:
@@ -73,6 +79,28 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
             f"{worker['role']}（第 {worker['attempt']} 次尝试，{_display_term(worker['phase'])}，"
             f"会话 {worker['thread_id'] or '尚不可用'}）"
         )
+    if isinstance(active_invocation, dict):
+        invocation_role = (
+            active_invocation.get("invocation_role")
+            or active_invocation.get("role")
+            or active_invocation.get("binding_role")
+        )
+        profile_role = active_invocation.get("profile_role") or active_invocation.get(
+            "binding_role"
+        )
+        role_text = str(invocation_role)
+        if profile_role is not None and profile_role != invocation_role:
+            role_text += f"（Profile {profile_role}）"
+        print(
+            "当前 Codex: "
+            f"{role_text}；"
+            f"Thread {active_invocation.get('reported_thread_id') or active_invocation.get('requested_thread_id') or '尚不可用'}；"
+            f"model {active_invocation.get('model') or '未绑定'}；"
+            f"reasoning effort {active_invocation.get('reasoning_effort') or '未绑定'}；"
+            f"Profile Revision {active_invocation.get('profile_revision') or '未绑定'}"
+        )
+    else:
+        print("当前 Codex: none")
     if isinstance(run_repair, dict):
         print(
             "运行修复: "
@@ -126,14 +154,26 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     for invocation in invocations:
         if not isinstance(invocation, dict):
             continue
+        invocation_role = (
+            invocation.get("invocation_role")
+            or invocation.get("role")
+            or invocation.get("binding_role")
+        )
+        profile_role = invocation.get("profile_role") or invocation.get("binding_role")
+        role_text = str(invocation_role)
+        if profile_role is not None and profile_role != invocation_role:
+            role_text += f"(profile={profile_role})"
         print(
             "Agent Invocation "
-            f"{invocation.get('role')} {invocation.get('status')} "
+            f"{role_text} {invocation.get('status')} "
             f"attempts={invocation.get('attempt_count')} "
             f"return_code={invocation.get('return_code')} "
             f"signal={invocation.get('signal')} "
             f"requested={invocation.get('requested_thread_id')} "
             f"reported={invocation.get('reported_thread_id')} "
+            f"model={invocation.get('model')} "
+            f"effort={invocation.get('reasoning_effort')} "
+            f"profile_revision={invocation.get('profile_revision')} "
             f"error={invocation.get('error')}"
         )
     for event in timeline:
