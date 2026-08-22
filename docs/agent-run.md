@@ -66,6 +66,10 @@ agent-run configure <run-id> --publication-model gpt-5.6-sol
 agent-run configure <run-id> --publication-from-development
 ```
 
+Profile Revision 同时保留各角色的 preset 与显式覆盖来源。Publication 从 Development
+解除引用时，仍沿用的 Development 显式字段会记录在 `provenance.inherited` 中，避免仅凭当前
+preset 误解其实际值来源。
+
 同一 Thread 的 Resume 与 Output Repair 始终使用原绑定；配置只影响后来创建的 Thread。`status` 在
 运行中的顶层 Codex 显示实际 Invocation role、Thread、model、reasoning effort 和 Profile Revision；
 如果 Thread 引用另一 Profile，还会同时显示被引用的 Profile role。空闲时显示 `none`；

@@ -127,6 +127,45 @@ def test_preset_change_keeps_independent_publication_until_explicit_restore(
     assert restored["profiles"]["publication"]["model"] == "premium-development"
 
 
+def test_publication_provenance_keeps_preset_and_inherited_effort_source(
+    tmp_path: Path,
+) -> None:
+    store = AgentProfileStore(tmp_path)
+    store.initialize("run-1")
+    store.configure("run-1", overrides={"publication_model": "custom-pub"})
+
+    store.configure("run-1", preset="premium")
+    changed = store.configure("run-1", overrides={"review_model": "custom-review"})
+    publication = changed["profiles"]["publication"]
+    assert publication["model"] == "custom-pub"
+    assert publication["reasoning_effort"] == "max"
+    assert publication["provenance"] == {
+        "preset": "economy",
+        "overrides": ["model"],
+        "reference": None,
+    }
+
+    linked_store = AgentProfileStore(tmp_path / "linked")
+    linked_store.initialize("run-1")
+    linked_store.configure("run-1", overrides={"development_effort": "ultra"})
+    detached = linked_store.configure(
+        "run-1", overrides={"publication_model": "custom-pub"}
+    )
+    assert detached["profiles"]["publication"]["provenance"] == {
+        "preset": "economy",
+        "overrides": ["model"],
+        "reference": None,
+        "inherited": {"role": "development", "overrides": ["effort"]},
+    }
+
+    later = linked_store.configure(
+        "run-1", overrides={"review_model": "custom-review"}
+    )
+    assert later["profiles"]["publication"]["provenance"] == detached[
+        "profiles"
+    ]["publication"]["provenance"]
+
+
 def test_profile_writers_serialize_and_atomic_failure_preserves_previous_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -643,25 +682,117 @@ def test_public_resume_reuses_bound_thread_and_reports_its_id(git_repo: Path) ->
 
 def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    started_file = git_repo / "output-repair.started"
+    release_file = git_repo / "output-repair.release"
     agent_fixture = run_agents(git_repo / "agents.json")
     agent_data = json.loads(agent_fixture.read_text(encoding="utf-8"))
+    agent_data["invocation_gate"] = {
+        "role": "run_reviews",
+        "attempt": 2,
+        "started_file": str(started_file),
+        "release_file": str(release_file),
+        "timeout_seconds": 20,
+    }
     agent_data["run_reviews"] = [
         {"thread_id": "run-reviewer", "invalid": "first attempt"},
         passing_acceptance("run-reviewer", "Output Repair passed."),
     ]
     agent_fixture.write_text(json.dumps(agent_data), encoding="utf-8")
 
-    completed = run_cli(
-        git_repo,
-        fixture,
+    environment = os.environ.copy()
+    source_path = str(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not environment.get("PYTHONPATH")
+        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "agent_run",
         "run",
         "1",
         "--agent-fixture",
         str(agent_fixture),
+        "--github-fixture",
+        str(fixture),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=git_repo,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    try:
+        deadline = time.monotonic() + 10
+        while not started_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started_file.exists()
 
-    assert completed.returncode == 0, completed.stderr
-    assert stdout_json(completed)["status"] == "run_approval_pending"
+        run_files = list((git_repo / ".agent-run" / "runs").glob("*.json"))
+        assert len(run_files) == 1
+        run_id = run_files[0].stem
+
+        active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+        invocation_before = active_before["agent_invocation"]
+        assert invocation_before["model"] == "gpt-5.6-sol"
+        assert invocation_before["reasoning_effort"] == "high"
+        assert invocation_before["profile_revision"] == 1
+        assert invocation_before["invocation_role"] == "review"
+        assert invocation_before["binding_role"] == "review"
+        assert invocation_before["profile_role"] == "review"
+        assert invocation_before["reported_thread_id"] == "run-reviewer"
+        binding_before = {
+            key: invocation_before[key]
+            for key in ("binding_id", "model", "reasoning_effort", "profile_revision")
+        }
+
+        active_history = stdout_json(
+            run_cli(git_repo, fixture, "history", run_id, "--json")
+        )
+        running = next(
+            item
+            for item in active_history["agent_invocations"]
+            if item.get("status") == "running"
+        )
+        assert running["attempt_count"] == 1
+        assert running["binding_id"] == binding_before["binding_id"]
+        assert running["profile_revision"] == binding_before["profile_revision"]
+
+        configured = run_cli(
+            git_repo,
+            fixture,
+            "configure",
+            run_id,
+            "--review-model",
+            "changed-review",
+        )
+        assert configured.returncode == 0, configured.stderr
+        assert stdout_json(configured)["profile_revision"] == 2
+
+        active_after = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+        invocation_after = active_after["agent_invocation"]
+        assert {
+            key: invocation_after[key]
+            for key in ("binding_id", "model", "reasoning_effort", "profile_revision")
+        } == binding_before
+        assert invocation_after["reported_thread_id"] == "run-reviewer"
+
+        release_file.touch()
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        assert json.loads(stdout)["status"] == "run_approval_pending"
+    finally:
+        if process.poll() is None:
+            release_file.touch()
+            try:
+                process.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
     state = load_only_run_state(git_repo)
     reviewer_invocations = [
         item
@@ -673,3 +804,7 @@ def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
     assert reviewer_invocations[0]["attempt_count"] == 2
     assert reviewer_invocations[0]["requested_thread_id"] is None
     assert reviewer_invocations[0]["reported_thread_id"] == "run-reviewer"
+    assert {
+        key: reviewer_invocations[0][key]
+        for key in ("binding_id", "model", "reasoning_effort", "profile_revision")
+    } == binding_before

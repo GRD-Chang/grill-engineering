@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -10,6 +9,8 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
+
+from agent_run.execution_binding import emit_execution_binding
 
 
 ROLE_NAMES = ("development", "review", "publication")
@@ -118,6 +119,7 @@ def resolve_profiles(
 
     current_profiles: Mapping[str, Any] = {}
     preserve_independent_publication_provenance = False
+    publication_inherited_overrides: list[str] = []
     if current is not None:
         loaded_profiles = current.get("profiles")
         if not isinstance(loaded_profiles, Mapping):
@@ -134,6 +136,14 @@ def resolve_profiles(
                 raise AgentProfileError(f"current {role} model is malformed")
             if not isinstance(effort, str) or effort not in REASONING_EFFORTS:
                 raise AgentProfileError(f"current {role} reasoning effort is malformed")
+            if role == "publication" and existing.get("reference") is None:
+                preserve_independent_publication_provenance = True
+            if role == "publication" and existing.get("reference") == "development":
+                development = current_profiles.get("development")
+                if isinstance(development, Mapping):
+                    publication_inherited_overrides = _provenance_overrides(
+                        development.get("provenance")
+                    )
             roles[role] = {
                 "model": model,
                 "reasoning_effort": effort,
@@ -210,6 +220,17 @@ def resolve_profiles(
         if not isinstance(prior_overrides, list):
             prior_overrides = []
         provenance_preset = baseline_name
+        inherited_overrides: list[str] = []
+        if role == "publication" and roles[role].get("reference") == "development":
+            # A restored/reference Publication has no independent override history;
+            # its provenance is the Development profile it currently follows.
+            prior_overrides = []
+        elif role == "publication":
+            inherited = _publication_inherited_overrides(prior_provenance)
+            inherited_overrides = publication_inherited_overrides or inherited
+            inherited_overrides = [
+                field for field in inherited_overrides if field not in override_fields
+            ]
         if (
             role == "publication"
             and preserve_independent_publication_provenance
@@ -217,11 +238,17 @@ def resolve_profiles(
             and isinstance(prior_provenance.get("preset"), str)
         ):
             provenance_preset = str(prior_provenance["preset"])
-        roles[role]["provenance"] = {
+        provenance: dict[str, Any] = {
             "preset": provenance_preset,
             "overrides": list(dict.fromkeys([*prior_overrides, *override_fields])),
             "reference": roles[role].get("reference"),
         }
+        if role == "publication" and inherited_overrides:
+            provenance["inherited"] = {
+                "role": "development",
+                "overrides": list(dict.fromkeys(inherited_overrides)),
+            }
+        roles[role]["provenance"] = provenance
     return {
         "preset": baseline_name,
         "profiles": roles,
@@ -533,16 +560,12 @@ class ProfiledAgentBackend:
             thread_id = None
         request["_execution_binding"] = dict(binding)
         if not getattr(self.backend, "emits_execution_binding", False):
-            print(
-                "Agent Execution Binding: "
-                f"role={role} "
-                f"thread={'resume' if thread_id is not None else 'new'} "
-                f"model={binding['model']} "
-                f"reasoning_effort={binding['reasoning_effort']} "
-                f"profile_revision={binding['profile_revision']} "
-                f"thread_id={thread_id if thread_id is not None else 'none'}",
-                file=sys.stderr,
-                flush=True,
+            emit_execution_binding(
+                role=role,
+                thread_id=thread_id,
+                model=binding["model"],
+                reasoning_effort=binding["reasoning_effort"],
+                profile_revision=binding["profile_revision"],
             )
         original_event = request.get("_invocation_event")
         original_execution_role = request.get("_execution_role")
@@ -604,6 +627,24 @@ def _current_preset(current: Mapping[str, Any] | None) -> str | None:
         return None
     value = current.get("preset")
     return value if isinstance(value, str) and value in PRESETS else None
+
+
+def _provenance_overrides(value: object) -> list[str]:
+    if not isinstance(value, Mapping):
+        return []
+    overrides = value.get("overrides")
+    if not isinstance(overrides, list):
+        return []
+    return [field for field in overrides if field in {"model", "effort"}]
+
+
+def _publication_inherited_overrides(value: object) -> list[str]:
+    if not isinstance(value, Mapping):
+        return []
+    inherited = value.get("inherited")
+    if not isinstance(inherited, Mapping) or inherited.get("role") != "development":
+        return []
+    return _provenance_overrides(inherited)
 
 
 def _profile_for_role(document: Mapping[str, Any], role: str) -> Mapping[str, Any]:

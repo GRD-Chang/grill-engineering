@@ -370,7 +370,7 @@ class FixtureAgentBackend:
             )
 
         start_invocation()
-        self._wait_for_invocation_gate(name, request)
+        self._wait_for_invocation_gate(name, request, attempt=1)
         currentness = request.get("_currentness_check")
         for attempt in range(1, 4):
             if attempt > 1 and callable(currentness) and not currentness():
@@ -378,6 +378,8 @@ class FixtureAgentBackend:
                 start_invocation()
                 notify("failed", attempt_count=attempt - 1, error=message)
                 raise ValueError(message)
+            if attempt > 1:
+                self._wait_for_invocation_gate(name, request, attempt=attempt)
             try:
                 step = self._next(name)
                 has_expected_thread = "expected_thread_id" in step
@@ -457,7 +459,9 @@ class FixtureAgentBackend:
         if self.initial_credential_failures:
             _raise_initial_credential_failure(self.initial_credential_failures.pop(0))
 
-    def _wait_for_invocation_gate(self, role: str, request: dict[str, Any]) -> None:
+    def _wait_for_invocation_gate(
+        self, role: str, request: dict[str, Any], *, attempt: int = 1
+    ) -> None:
         configured = self.data.get("invocation_gate")
         if configured is None:
             configured = self.data.get("agent_gate")
@@ -470,6 +474,15 @@ class FixtureAgentBackend:
             return
         if not isinstance(configured, dict):
             raise ValueError("invocation_gate must be an object")
+        configured_attempt = configured.get("attempt", 1)
+        if (
+            not isinstance(configured_attempt, int)
+            or isinstance(configured_attempt, bool)
+            or configured_attempt <= 0
+        ):
+            raise ValueError("invocation_gate.attempt must be a positive integer")
+        if configured_attempt != attempt:
+            return
 
         selected_role = configured.get("role")
         role_alias = {

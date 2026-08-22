@@ -5,7 +5,6 @@ import json
 import math
 import re
 import shutil
-import sys
 import threading
 import tempfile
 from pathlib import Path
@@ -31,6 +30,7 @@ from agent_run.artifacts import (
 )
 from agent_run.github_auth import mint_read_only_installation_credential
 from agent_run.error_safety import bounded_error
+from agent_run.execution_binding import emit_execution_binding
 from agent_run.worker_sandbox import (
     WorkerSandboxError,
     bubblewrap_command,
@@ -497,16 +497,12 @@ class CodexCliBackend:
             return
         role = request.get("_execution_role") or binding.get("role")
         revision = binding.get("profile_revision")
-        print(
-            "Agent Execution Binding: "
-            f"role={role} "
-            f"thread={'resume' if thread_id is not None else 'new'} "
-            f"model={model or binding.get('model')} "
-            f"reasoning_effort={reasoning_effort or binding.get('reasoning_effort')} "
-            f"profile_revision={revision} "
-            f"thread_id={thread_id if thread_id is not None else 'none'}",
-            file=sys.stderr,
-            flush=True,
+        emit_execution_binding(
+            role=role,
+            thread_id=thread_id,
+            model=model or binding.get("model"),
+            reasoning_effort=reasoning_effort or binding.get("reasoning_effort"),
+            profile_revision=revision,
         )
 
     @staticmethod
