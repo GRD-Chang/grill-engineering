@@ -12,9 +12,10 @@ import pytest
 
 from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend, resolve_profiles
 from agent_run.agent_invocation import invocation_event_recorder
+from cli_fixtures import run_agents
 from conftest import write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_publication, passing_acceptance
+from test_cli_delivery import parent_publication, passing_acceptance, ticket
 
 
 def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> None:
@@ -638,3 +639,37 @@ def test_public_resume_reuses_bound_thread_and_reports_its_id(git_repo: Path) ->
     assert development_invocations[1]["requested_thread_id"] == "parent-development"
     assert "Agent Execution Binding: role=development thread=resume" in resumed.stderr
     assert "thread_id=parent-development" in resumed.stderr
+
+
+def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agent_fixture = run_agents(git_repo / "agents.json")
+    agent_data = json.loads(agent_fixture.read_text(encoding="utf-8"))
+    agent_data["run_reviews"] = [
+        {"thread_id": "run-reviewer", "invalid": "first attempt"},
+        passing_acceptance("run-reviewer", "Output Repair passed."),
+    ]
+    agent_fixture.write_text(json.dumps(agent_data), encoding="utf-8")
+
+    completed = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "run_approval_pending"
+    state = load_only_run_state(git_repo)
+    reviewer_invocations = [
+        item
+        for item in state["agent_invocation_history"]
+        if item.get("role") == "reviewer"
+    ]
+    assert len(reviewer_invocations) == 1
+    assert reviewer_invocations[0]["invocation_role"] == "review"
+    assert reviewer_invocations[0]["attempt_count"] == 2
+    assert reviewer_invocations[0]["requested_thread_id"] is None
+    assert reviewer_invocations[0]["reported_thread_id"] == "run-reviewer"
