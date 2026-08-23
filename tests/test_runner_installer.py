@@ -26,7 +26,11 @@ def _source_tree(tmp_path: Path) -> Path:
     source.mkdir()
     shutil.copy2(PROJECT_ROOT / "install.sh", source / "install.sh")
     shutil.copy2(PROJECT_ROOT / "pyproject.toml", source / "pyproject.toml")
-    shutil.copytree(PROJECT_ROOT / "src", source / "src")
+    shutil.copytree(
+        PROJECT_ROOT / "src",
+        source / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
+    )
     (source / "install.sh").chmod(0o755)
     return source
 
@@ -44,6 +48,7 @@ def _fake_codex(
     status_file.write_text(status, encoding="utf-8")
     behavior_file = tmp_path / "codex-behavior"
     behavior_file.write_text(behavior, encoding="utf-8")
+    pid_file = tmp_path / "codex-pid"
     cwd_file = tmp_path / "codex-cwd"
     path_file = tmp_path / "codex-path"
     script = directory / "codex"
@@ -57,14 +62,16 @@ def _fake_codex(
         f"count = pathlib.Path({str(count)!r})\n"
         f"status_file = pathlib.Path({str(status_file)!r})\n"
         f"behavior_file = pathlib.Path({str(behavior_file)!r})\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
         f"cwd_file = pathlib.Path({str(cwd_file)!r})\n"
         f"path_file = pathlib.Path({str(path_file)!r})\n"
         "current = int(count.read_text() if count.exists() else '0')\n"
         "count.write_text(str(current + 1))\n"
+        "pid_file.write_text(str(os.getpid()))\n"
         "cwd_file.write_text(str(pathlib.Path.cwd()))\n"
         "path_file.write_text(os.environ['PATH'])\n"
         "behavior = behavior_file.read_text()\n"
-        "if behavior == 'nonzero':\n"
+        "if behavior in {'nonzero', 'not-logged-in'}:\n"
         "    sys.exit(7)\n"
         "if behavior == 'missing':\n"
         "    sys.exit(0)\n"
@@ -83,6 +90,10 @@ def _fake_codex(
         "    'properties': {'status': {'type': 'string', 'enum': ['ok']}},\n"
         "    'required': ['status'],\n"
         "}\n"
+        "if behavior == 'wrong-result':\n"
+        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "    output.write_text(json.dumps({'status': 'not-ok'}))\n"
+        "    sys.exit(0)\n"
         "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
         "output.write_text(json.dumps({'status': status_file.read_text()}))\n",
         encoding="utf-8",
@@ -97,6 +108,7 @@ def _run(
     fake_bin: Path,
     *arguments: str,
     path: str | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.update(
@@ -109,7 +121,7 @@ def _run(
     )
     return subprocess.run(
         [str(source / "install.sh"), *arguments],
-        cwd=source,
+        cwd=cwd or source,
         env=environment,
         text=True,
         capture_output=True,
@@ -129,6 +141,81 @@ def _manifest(snapshot: Path) -> dict[str, object]:
     loaded = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
     return loaded
+
+
+def _file_tree(root: Path) -> dict[str, bytes]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _managed_state_snapshot(
+    home: Path, *, config: Path, locator: Path, delivery: Path
+) -> dict[str, object]:
+    data_root = _data_root(home)
+    active = data_root / "active"
+    generation = active.resolve()
+    return {
+        "active": os.readlink(active),
+        "generation_links": {
+            name: os.readlink(generation / name)
+            for name in ("current", "previous")
+            if (generation / name).is_symlink()
+        },
+        "stable_entry": os.readlink(home / ".local" / "bin" / "agent-run"),
+        "snapshots": sorted(path.name for path in (data_root / "snapshots").iterdir()),
+        "generations": sorted(path.name for path in (data_root / "generations").iterdir()),
+        "staging": sorted(path.name for path in (data_root / "staging").iterdir()),
+        "profile": (home / ".profile").read_bytes(),
+        "app_profile": config.read_bytes(),
+        "locator": locator.read_bytes(),
+        "delivery_state": _file_tree(delivery / ".agent-run"),
+    }
+
+
+def _install_a_and_b(source: Path, home: Path, fake_bin: Path) -> None:
+    for version in ("a", "b"):
+        (source / "src" / "agent_run" / "__init__.py").write_text(
+            f"__version__ = '{version}'\n", encoding="utf-8"
+        )
+        result = _run(source, home, fake_bin)
+        assert result.returncode == 0, result.stderr
+
+
+def _write_public_state_fixtures(tmp_path: Path, home: Path) -> tuple[Path, Path, Path]:
+    config = home / "config" / "agent-run" / "github-app.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('{"profile":"keep"}\n', encoding="utf-8")
+    locator = home / "state" / "agent-run" / "run-locator.json"
+    locator.parent.mkdir(parents=True, exist_ok=True)
+    locator.write_text('{"entries":[]}\n', encoding="utf-8")
+    delivery = tmp_path / "delivery"
+    (delivery / ".agent-run" / "runs").mkdir(parents=True)
+    (delivery / ".agent-run" / "runs" / "existing.json").write_text(
+        '{"run_id":"existing"}\n', encoding="utf-8"
+    )
+    return config, locator, delivery
+
+
+def _assert_process_gone(pid_file: Path) -> None:
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    os.kill(pid, signal.SIGKILL)
+    raise AssertionError("Codex process survived failed public installation")
 
 
 def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
@@ -530,6 +617,314 @@ def test_git_provenance_marks_an_untracked_source_dirty(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     manifest = _manifest(_active_snapshot(home))
     assert manifest["source_provenance"] == provenance
+
+
+def test_clean_git_source_is_not_polluted_by_public_install(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Agent Run Tests"], cwd=source, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "agent-run-tests@example.invalid"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial source"], cwd=source, check=True)
+    before = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert before.stdout == ""
+
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    result = _run(source, home, fake_bin)
+
+    assert result.returncode == 0, result.stderr
+    assert _manifest(_active_snapshot(home))["source_provenance"] == {
+        "kind": "git",
+        "commit": subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip(),
+        "ref": "main",
+        "dirty": False,
+    }
+    after = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert after.stdout == ""
+    assert not (source / "build").exists()
+    assert not (source / "src" / "agent_run" / "__pycache__").exists()
+    assert not list(source.glob("*.egg-info"))
+
+
+def test_install_rejects_managed_paths_inside_source_without_writing_source(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+
+    result = _run(source, source, fake_bin)
+
+    assert result.returncode == 1
+    assert "受管 Runner 路径不能位于源码目录内" in result.stderr
+    assert not (source / "data" / "agent-run").exists()
+    assert not (source / ".local").exists()
+    assert not (source / ".profile").exists()
+    assert not (source / "src" / "agent_run" / "__pycache__").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "build",
+        "missing_codex",
+        "not_logged_in",
+        "nonzero",
+        "timeout",
+        "missing_output",
+        "schema_rejection",
+    ],
+)
+def test_public_install_failures_preserve_existing_state(
+    tmp_path: Path, failure: str
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    _install_a_and_b(source, home, fake_bin)
+    config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
+    before = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'c'\n", encoding="utf-8"
+    )
+    path: str | None = None
+    if failure == "build":
+        pyproject = source / "pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text(encoding="utf-8").replace(
+                'build-backend = "setuptools.build_meta"',
+                'build-backend = "missing.backend"',
+            ),
+            encoding="utf-8",
+        )
+    elif failure == "missing_codex":
+        path = "/usr/bin:/bin"
+    elif failure == "not_logged_in":
+        (tmp_path / "codex-behavior").write_text("not-logged-in", encoding="utf-8")
+    elif failure == "nonzero":
+        (tmp_path / "codex-behavior").write_text("nonzero", encoding="utf-8")
+    elif failure == "timeout":
+        (tmp_path / "codex-behavior").write_text("timeout", encoding="utf-8")
+        probe = source / "src" / "agent_run" / "runner_probe.py"
+        probe.write_text(
+            probe.read_text(encoding="utf-8").replace(
+                "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 0.2"
+            ),
+            encoding="utf-8",
+        )
+    elif failure == "missing_output":
+        (tmp_path / "codex-behavior").write_text("missing", encoding="utf-8")
+    elif failure == "schema_rejection":
+        (tmp_path / "codex-behavior").write_text("wrong-result", encoding="utf-8")
+    else:
+        raise AssertionError(f"unhandled failure: {failure}")
+
+    result = _run(source, home, fake_bin, path=path, cwd=delivery)
+
+    assert result.returncode == 1, result.stderr
+    assert "Traceback" not in result.stderr
+    assert _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    ) == before
+    if failure == "timeout":
+        _assert_process_gone(tmp_path / "codex-pid")
+
+
+def _write_activation_fault_sitecustomize(
+    directory: Path, *, fault: str, data_root: Path
+) -> None:
+    directory.mkdir()
+    (directory / "sitecustomize.py").write_text(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "if sys.argv and sys.argv[0].endswith('runner_installer.py'):\n"
+        f"    fault = {fault!r}\n"
+        f"    active = {str(data_root / 'active')!r}\n"
+        f"    generations = {str(data_root / 'generations')!r}\n"
+        "    if fault == 'rename':\n"
+        "        original_replace = os.replace\n"
+        "        state = {'injected': False}\n"
+        "        def replace(source, destination, *args, **kwargs):\n"
+        "            result = original_replace(source, destination, *args, **kwargs)\n"
+        "            if not state['injected'] and os.fspath(destination) == active:\n"
+        "                state['injected'] = True\n"
+        "                raise OSError('injected public activation rename failure')\n"
+        "            return result\n"
+        "        os.replace = replace\n"
+        "    elif fault == 'sync':\n"
+        "        original_open = os.open\n"
+        "        state = {'injected': False}\n"
+        "        def open_(path, flags, *args, **kwargs):\n"
+        "            if not state['injected'] and os.fspath(path) == generations:\n"
+        "                state['injected'] = True\n"
+        "                raise OSError('injected public activation sync failure')\n"
+        "            return original_open(path, flags, *args, **kwargs)\n"
+        "        os.open = open_\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("fault", ["rename", "sync"])
+def test_public_activation_faults_preserve_existing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    _install_a_and_b(source, home, fake_bin)
+    config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
+    before = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'c'\n", encoding="utf-8"
+    )
+
+    injector = tmp_path / "fault-injector"
+    _write_activation_fault_sitecustomize(
+        injector, fault=fault, data_root=_data_root(home)
+    )
+    monkeypatch.setenv("PYTHONPATH", str(injector))
+    result = _run(source, home, fake_bin, cwd=delivery)
+
+    assert result.returncode == 1, result.stderr
+    assert "Traceback" not in result.stderr
+    assert _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    ) == before
+
+
+def test_public_sigint_cleans_candidate_probe_process_and_state(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    _install_a_and_b(source, home, fake_bin)
+    config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
+    before = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'c'\n", encoding="utf-8"
+    )
+    (tmp_path / "codex-behavior").write_text("sleep", encoding="utf-8")
+    pid_file = tmp_path / "codex-pid"
+    pid_file.unlink()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        }
+    )
+    process = subprocess.Popen(
+        [str(source / "install.sh")],
+        cwd=delivery,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 30
+    while not pid_file.exists() and time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    assert pid_file.exists(), process.communicate(timeout=10)[1]
+
+    process.send_signal(signal.SIGINT)
+    _stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode != 0, stderr
+    _assert_process_gone(pid_file)
+    assert _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    ) == before
+
+
+def test_public_install_does_not_invoke_external_tool_sentinels(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    sentinel_directory = tmp_path / "external-tool-sentinels"
+    sentinel_directory.mkdir()
+    commands = (
+        "sudo",
+        "apt",
+        "apt-get",
+        "apt-cache",
+        "dnf",
+        "yum",
+        "pacman",
+        "apk",
+        "pipx",
+    )
+    markers: list[Path] = []
+    for command in commands:
+        marker = sentinel_directory / f"{command}.called"
+        markers.append(marker)
+        script = sentinel_directory / command
+        script.write_text(
+            "#!/bin/sh\n"
+            f"printf called > {str(marker)!r}\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+
+    result = _run(
+        source,
+        home,
+        fake_bin,
+        path=os.pathsep.join(
+            [str(sentinel_directory), str(fake_bin), os.environ["PATH"]]
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert int(count.read_text(encoding="utf-8")) == 1
+    assert str(fake_bin) in (tmp_path / "codex-path").read_text(encoding="utf-8").split(
+        os.pathsep
+    )
+    assert not [marker for marker in markers if marker.exists()]
 
 
 def test_install_keeps_only_current_and_previous_after_a_b_c(

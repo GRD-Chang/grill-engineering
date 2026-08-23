@@ -23,6 +23,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence, cast
 
+if __name__ == "__main__":
+    # The public source-tree entry point must not create its own bytecode files
+    # before provenance is captured.
+    sys.dont_write_bytecode = True
+
 try:
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
@@ -108,6 +113,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     source = Path(parsed.source).resolve()
     paths = InstallPaths.from_environment()
     try:
+        _reject_managed_paths_inside_source(paths, source)
         with _management_lock(paths):
             if parsed.rollback:
                 result = _rollback(paths)
@@ -317,6 +323,12 @@ def _check_source(source: Path) -> None:
         raise InstallerError("源码目录缺少 pyproject.toml")
 
 
+def _reject_managed_paths_inside_source(paths: InstallPaths, source: Path) -> None:
+    for managed_path in (paths.data_root, paths.user_bin, paths.profile):
+        if managed_path.is_relative_to(source):
+            raise InstallerError("受管 Runner 路径不能位于源码目录内")
+
+
 def _check_prerequisites(source: Path) -> None:
     if platform.python_implementation() != "CPython" or sys.version_info < (3, 11):
         raise InstallerError("需要 CPython 3.11 或更高版本")
@@ -363,7 +375,26 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
     python = candidate / "bin" / "python"
     if not python.exists():
         raise InstallerError("隔离环境缺少 Python 入口")
-    return_code = _run_pip_install(python, source)
+    build_source = Path(
+        tempfile.mkdtemp(prefix="build-source-", dir=str(candidate.parent))
+    )
+    try:
+        try:
+            shutil.copytree(
+                source,
+                build_source,
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git", ".agent-run"),
+            )
+        except (OSError, shutil.Error) as error:
+            raise InstallerError("无法准备隔离 Python package build source") from error
+        return_code = _run_pip_install(python, build_source)
+    finally:
+        try:
+            shutil.rmtree(build_source)
+        except OSError:
+            pass
     if return_code != 0:
         raise InstallerError("Python package build or non-editable installation failed")
     package = _runtime_package(candidate)
@@ -396,6 +427,9 @@ def _run_pip_install(python: Path, source: Path) -> int:
     except subprocess.TimeoutExpired as error:
         _terminate_process_group(process)
         raise InstallerError("Python package build or non-editable installation timed out") from error
+    except BaseException:
+        _terminate_process_group(process)
+        raise
     return return_code
 
 
@@ -485,6 +519,9 @@ def _read_candidate_probe_output(
     except (OSError, subprocess.SubprocessError) as error:
         _terminate_process_group(process)
         raise InstallerError("Runner Compatibility Check failed") from error
+    except BaseException:
+        _terminate_process_group(process)
+        raise
     finally:
         for stream in streams.values():
             if stream is not None:
