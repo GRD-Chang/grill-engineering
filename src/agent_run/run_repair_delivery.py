@@ -174,26 +174,37 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
             ):
                 raise ValueError("integration_conflict_paths must contain strings")
             conflict_paths = tuple(raw_conflict_paths)
+            commit_options: dict[str, Any] = {
+                "expected_conflict_paths": conflict_paths,
+                "candidate_intent": (
+                    job.get("candidate_commit_intent")
+                    if isinstance(job.get("candidate_commit_intent"), dict)
+                    else None
+                ),
+            }
             if isinstance(squash_candidate, str):
-                candidate = self.owner.git.commit_merge_resolution_candidate(
-                    checkout,
-                    run_head_sha=str(job["base_sha"]),
-                    default_head_sha=str(job["default_base_sha"]),
-                    attempt=attempt,
-                    squash_candidate_sha=squash_candidate,
-                    expected_conflict_paths=conflict_paths,
-                )
-            else:
-                candidate = self.owner.git.commit_merge_resolution_candidate(
-                    checkout,
-                    run_head_sha=str(job["base_sha"]),
-                    default_head_sha=str(job["default_base_sha"]),
-                    attempt=attempt,
-                    expected_conflict_paths=conflict_paths,
-                )
+                commit_options["squash_candidate_sha"] = squash_candidate
+            candidate = self.owner.git.commit_merge_resolution_candidate(
+                checkout,
+                run_head_sha=str(job["base_sha"]),
+                default_head_sha=str(job["default_base_sha"]),
+                attempt=attempt,
+                **commit_options,
+            )
         else:
             candidate = self.owner.git.commit_run_repair_candidate(
-                checkout, attempt=attempt
+                checkout,
+                attempt=attempt,
+                expected_head=str(
+                    job.get("managed_checkout_head")
+                    or job.get("candidate_sha")
+                    or job["base_sha"]
+                ),
+                candidate_intent=(
+                    job.get("candidate_commit_intent")
+                    if isinstance(job.get("candidate_commit_intent"), dict)
+                    else None
+                ),
             )
         if candidate is None:
             return None

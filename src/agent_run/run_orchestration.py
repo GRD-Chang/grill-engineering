@@ -43,6 +43,7 @@ class DeliveryRunEngine:
                 "waiting_checks",
                 "waiting_external",
                 "publication_pending",
+                "requeue_required",
             }:
                 return result
             state, _ = self.controller.resume(run_id)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -8,16 +10,25 @@ import pytest
 
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
-from agent_run.controller import Controller
+from agent_run.controller import Controller, _resume_review_budget_window
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
-from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_currentness import (
+    ticket_completion_records,
+    ticket_integration_records,
+)
+from agent_run.state_contract import (
+    IncompatibleRunStateError,
+    require_active_ticket_publication_authorization,
+    require_completed_ticket_integration_records,
+)
 
 from test_cli import run_internal_stage, run_cli, stdout_json
 
 from run_acceptance_test_support import (
     FreshCycleRunAgents,
     ScriptedRunAgents,
+    _canonical_run_budget,
     _BLOCKED_EVIDENCE,
     _candidate_finding_artifact,
     _completed_run,
@@ -27,10 +38,182 @@ from run_acceptance_test_support import (
     _repair_artifact,
 )
 
+
+def _integration_record(
+    *,
+    source: str = "accepted",
+    pr_number: int = 21,
+    base_sha: str = "base-sha",
+    candidate_sha: str = "candidate-sha",
+    candidate_tree: str = "candidate-tree",
+    publication_sha: str = "published-sha",
+    integrated_sha: str | None = None,
+    acceptance_record: dict[str, Any] | None = None,
+    fallback_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    integrated = integrated_sha or candidate_sha
+    record: dict[str, Any] = {
+        "source": source,
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+        "candidate_tree": candidate_tree,
+        "publication_sha": publication_sha,
+        "integrated_sha": integrated,
+        "integrated_publication_sha": publication_sha,
+        "integrated_tree": candidate_tree,
+        "integrated_message": "fix: integrated ticket",
+        "integrated_parents": [base_sha],
+        "effective_revision": "effective-revision",
+        "window": 1,
+        "final_ci_fix_used": False,
+        "required_checks_mode": (
+            "configured" if source == "accepted" else "not_configured"
+        ),
+        "required_checks": "pass" if source == "accepted" else "none",
+        "required_checks_evidence": {
+            "pr_number": pr_number,
+            "head_sha": publication_sha,
+            "result": "pass" if source == "accepted" else "none",
+            "checks": (
+                [{"name": "test", "bucket": "pass"}]
+                if source == "accepted"
+                else []
+            ),
+        },
+        "pr": {
+            "number": pr_number,
+            "state": "MERGED",
+            "head_sha": publication_sha,
+            "base_sha": base_sha,
+            "merge_commit_sha": integrated,
+        },
+    }
+    if source == "accepted":
+        authorization = dict(acceptance_record or {})
+        authorization.setdefault("acceptance_scope", "change_job")
+        authorization.setdefault("reviewed_base_sha", base_sha)
+        authorization.setdefault("reviewed_candidate_sha", candidate_sha)
+        authorization.setdefault("reviewed_candidate_tree", candidate_tree)
+        authorization.setdefault("effective_revision", record["effective_revision"])
+        authorization.setdefault("reviewer_thread_id", "ticket-reviewer")
+        authorization.setdefault("artifact", _passing_artifact())
+        record["acceptance_record"] = authorization
+        review_artifact = {
+            "reviewer_thread_id": authorization["reviewer_thread_id"],
+            "candidate_sha": authorization["reviewed_candidate_sha"],
+            "reviewed_base_sha": authorization["reviewed_base_sha"],
+            "review_identity": {
+                "reviewed_base_sha": authorization["reviewed_base_sha"],
+                "reviewed_candidate_sha": authorization["reviewed_candidate_sha"],
+                "reviewed_candidate_tree": authorization["reviewed_candidate_tree"],
+            },
+            "artifact": authorization["artifact"],
+        }
+        record["review_budget"] = {
+            "window": 1,
+            "development_attempts": 1,
+            "reviewer_invocations": 1,
+            "final_ci_fix_used": False,
+            "review_artifacts": [review_artifact],
+            "checkpoint_reason": None,
+        }
+    else:
+        authorization = dict(fallback_receipt or {})
+        authorization.setdefault("kind", "ticket_fallback_publication_receipt")
+        authorization.setdefault("base_sha", base_sha)
+        authorization.setdefault("candidate_sha", candidate_sha)
+        authorization.setdefault("candidate_tree", candidate_tree)
+        authorization.setdefault("publication_sha", publication_sha)
+        authorization.setdefault("effective_revision", record["effective_revision"])
+        authorization.setdefault("pr_number", pr_number)
+        authorization.setdefault(
+            "required_checks_evidence", record["required_checks_evidence"]
+        )
+        review_artifacts = [
+            {
+                "reviewer_thread_id": f"ticket-reviewer-{index}",
+                "candidate_sha": f"reviewed-candidate-{index}",
+                "reviewed_base_sha": base_sha,
+                "review_identity": {
+                    "reviewed_base_sha": base_sha,
+                    "reviewed_candidate_sha": f"reviewed-candidate-{index}",
+                    "reviewed_candidate_tree": f"reviewed-tree-{index}",
+                },
+                "artifact": _candidate_finding_artifact(),
+            }
+            for index in range(1, 4)
+        ]
+        last_artifact = review_artifacts[-1]["artifact"]
+        authorization.setdefault("window", 1)
+        authorization.setdefault("reviewer_invocations", 3)
+        authorization.setdefault("review_artifacts", review_artifacts)
+        authorization.setdefault(
+            "last_review_candidate_sha", "reviewed-candidate-3"
+        )
+        authorization.setdefault("validation_attempts", 3)
+        authorization.setdefault("development_attempts", 4)
+        authorization.setdefault(
+            "review_budget",
+            {
+                "window": 1,
+                "development_attempts": 4,
+                "reviewer_invocations": 3,
+                "final_ci_fix_used": False,
+                "review_artifacts": review_artifacts,
+                "checkpoint_reason": None,
+            },
+        )
+        authorization.setdefault("final_ci_fix_used", False)
+        authorization.setdefault("final_ci_fix_failure_head", None)
+        authorization.setdefault("last_attempt_kind", "ordinary")
+        authorization.setdefault("repair_source", "acceptance")
+        authorization.setdefault("failure_evidence_source", "acceptance")
+        authorization.setdefault("failure_evidence", last_artifact)
+        authorization.setdefault("git_integrity_evidence", None)
+        authorization.setdefault(
+            "development_summary", "Repaired the ticket candidate."
+        )
+        authorization.setdefault("code_delta_base_sha", base_sha)
+        authorization.setdefault(
+            "code_delta", [{"status": "M", "path": "ticket.py"}]
+        )
+        authorization.setdefault("repair_delta_base_sha", "reviewed-candidate-3")
+        authorization.setdefault(
+            "repair_delta", [{"status": "M", "path": "ticket.py"}]
+        )
+        authorization.setdefault("required_check_failure_head", None)
+        authorization.setdefault("previous_publication_authority", None)
+        authorization.setdefault(
+            "git_integrity",
+            {
+                "status": "pass",
+                "base_sha": base_sha,
+                "candidate_sha": candidate_sha,
+                "candidate_tree": candidate_tree,
+                "base_is_ancestor": "true",
+            },
+        )
+        authorization.setdefault("last_acceptance_artifact", last_artifact)
+        record["fallback_receipt"] = authorization
+    return record
+
+
 def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    integration_record = _integration_record(
+        publication_sha="published-2",
+        integrated_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+    )
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = (
+        integration_record
+    )
+    state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
+        integration_record["review_budget"]
+    )
+    states.save_run(str(state["run_id"]), state)
 
     class InvocationReviewer:
         def __init__(self) -> None:
@@ -61,6 +244,14 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
     assert invocation["work_subject"] == f"run-acceptance:{state['run_id']}"
     assert invocation["generation"] == 1
     assert invocation["input_fingerprint"] == canonical_fingerprint(agents.request)
+    assert agents.request["ticket_integration_records"] == [
+        {
+            "ticket_number": 2,
+            "integrated_sha": state["ticket_jobs"]["2"]["integrated_sha"],
+            "effective_revision": state["ticket_jobs"]["2"]["effective_revision"],
+            "integration_record": integration_record,
+        }
+    ]
     assert invocation["currentness_boundary"] == {
         "reviewed_head_sha": acceptance["reviewed_head_sha"],
         "reviewed_default_base_sha": acceptance["reviewed_default_base_sha"],
@@ -72,6 +263,551 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
         ),
     }
 
+
+def test_run_acceptance_rejects_completed_ticket_without_integration_record(
+    git_repo: Path,
+) -> None:
+    state, states, _git = _completed_run(git_repo)
+    state["ticket_jobs"]["2"].pop("deterministic_integration_record")
+    states.save_run(str(state["run_id"]), state)
+    state_before = deepcopy(states.load_run(str(state["run_id"])))
+
+    with pytest.raises(
+        IncompatibleRunStateError,
+        match=r"completed Ticket 2 is missing .*deterministic_integration_record",
+    ):
+        RunAcceptanceEngine(
+            git=_git,
+            states=states,
+            agents=object(),
+        ).accept(str(state["run_id"]))
+
+    assert states.load_run(str(state["run_id"])) == state_before
+
+
+def test_run_acceptance_cli_reports_incompatible_missing_integration_record(
+    git_repo: Path,
+) -> None:
+    state, states, _git = _completed_run(git_repo)
+    state["ticket_jobs"]["2"].pop("deterministic_integration_record")
+    states.save_run(str(state["run_id"]), state)
+    state_before = deepcopy(states.load_run(str(state["run_id"])))
+
+    result = run_cli(
+        git_repo,
+        git_repo / "github.json",
+        "resume",
+        str(state["run_id"]),
+    )
+
+    output = stdout_json(result)
+    assert result.returncode == 2
+    assert output["status"] == "incompatible_run_state"
+    assert output["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert "不会迁移" in output["diagnostics"][0]["message"]
+    assert states.load_run(str(state["run_id"])) == state_before
+
+
+@pytest.mark.parametrize("source", ["accepted", "fallback"])
+def test_completed_ticket_integration_record_rejects_source_evidence_drift(
+    git_repo: Path, source: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    record = _integration_record(
+        source=source,
+        candidate_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+        candidate_tree=git.resolve(
+            f'{state["ticket_jobs"]["2"]["integrated_sha"]}^{{tree}}'
+        ),
+        publication_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+        integrated_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+        acceptance_record={"artifact": _passing_artifact()},
+        fallback_receipt={"candidate_sha": "fallback-candidate"},
+    )
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    if source == "accepted":
+        state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
+            record["review_budget"]
+        )
+    if source == "accepted":
+        record["pr"]["head_sha"] = "different-head"
+    else:
+        record["required_checks_evidence"]["result"] = "pass"
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(
+        IncompatibleRunStateError, match="deterministic_integration_record"
+    ):
+        RunAcceptanceEngine(
+            git=git,
+            states=states,
+            agents=object(),
+        ).accept(str(state["run_id"]))
+
+
+@pytest.mark.parametrize("source", ["accepted", "fallback"])
+def test_completed_ticket_integration_record_rejects_empty_nested_authorization(
+    git_repo: Path, source: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    record = _integration_record(
+        source=source,
+        candidate_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+        candidate_tree=git.resolve(
+            f'{state["ticket_jobs"]["2"]["integrated_sha"]}^{{tree}}'
+        ),
+        publication_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+        integrated_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
+    )
+    record["acceptance_record" if source == "accepted" else "fallback_receipt"] = {}
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    if source == "accepted":
+        state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
+            record["review_budget"]
+        )
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(
+        IncompatibleRunStateError,
+        match=r"acceptance_record|fallback_receipt",
+    ):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+def test_completed_ticket_integration_record_rejects_nested_boundary_drift(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    integrated = str(state["ticket_jobs"]["2"]["integrated_sha"])
+    record = _integration_record(
+        candidate_sha=integrated,
+        candidate_tree=git.resolve(f"{integrated}^{{tree}}"),
+        publication_sha=integrated,
+        integrated_sha=integrated,
+    )
+    record["acceptance_record"]["reviewed_candidate_sha"] = "foreign-candidate"
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    state["ticket_jobs"]["2"]["review_budget"] = deepcopy(record["review_budget"])
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(
+        IncompatibleRunStateError, match="acceptance_record boundary"
+    ):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+def test_completed_ticket_acceptance_authorization_requires_a_passing_artifact(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    integrated = str(state["ticket_jobs"]["2"]["integrated_sha"])
+    record = _integration_record(
+        candidate_sha=integrated,
+        candidate_tree=git.resolve(f"{integrated}^{{tree}}"),
+        publication_sha=integrated,
+        integrated_sha=integrated,
+        acceptance_record={"artifact": _candidate_finding_artifact()},
+    )
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    state["ticket_jobs"]["2"]["review_budget"] = deepcopy(record["review_budget"])
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="artifact must be pass"):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["zero_invocations", "count_mismatch", "record_budget"]
+)
+def test_completed_accepted_ticket_binds_review_budget_authorization(
+    git_repo: Path, mutation: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    job = state["ticket_jobs"]["2"]
+    record = job["deterministic_integration_record"]
+    if mutation == "zero_invocations":
+        job["review_budget"]["reviewer_invocations"] = 0
+        job["review_budget"]["review_artifacts"] = []
+        record["review_budget"] = deepcopy(job["review_budget"])
+        expected = "no Reviewer invocation"
+    elif mutation == "count_mismatch":
+        job["review_budget"]["reviewer_invocations"] = 2
+        record["review_budget"] = deepcopy(job["review_budget"])
+        expected = "invocation and Artifact counts differ"
+    else:
+        record["review_budget"] = {}
+        expected = "review budget is not bound"
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match=expected):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+def test_active_ticket_publication_rejects_a_structurally_valid_fail_artifact() -> None:
+    record = _integration_record()
+    acceptance = record["acceptance_record"]
+    job: dict[str, Any] = {
+        "phase": "accepted",
+        "base_sha": record["base_sha"],
+        "candidate_sha": record["candidate_sha"],
+        "effective_revision": record["effective_revision"],
+        "acceptance_record": acceptance,
+        "acceptance_artifact": acceptance["artifact"],
+    }
+    acceptance["artifact"] = _candidate_finding_artifact()
+    job["acceptance_artifact"] = acceptance["artifact"]
+
+    with pytest.raises(IncompatibleRunStateError, match="artifact must be pass"):
+        require_active_ticket_publication_authorization(
+            job, candidate_tree=record["candidate_tree"]
+        )
+
+
+def test_active_ticket_accepted_publication_binds_budget_and_review_artifact() -> None:
+    record = _integration_record()
+    acceptance = record["acceptance_record"]
+    review_artifact = {
+        "reviewer_thread_id": acceptance["reviewer_thread_id"],
+        "candidate_sha": acceptance["reviewed_candidate_sha"],
+        "reviewed_base_sha": acceptance["reviewed_base_sha"],
+        "review_identity": {
+            "reviewed_base_sha": acceptance["reviewed_base_sha"],
+            "reviewed_candidate_sha": acceptance["reviewed_candidate_sha"],
+            "reviewed_candidate_tree": acceptance["reviewed_candidate_tree"],
+        },
+        "artifact": acceptance["artifact"],
+    }
+    job: dict[str, Any] = {
+        "phase": "accepted",
+        "base_sha": record["base_sha"],
+        "candidate_sha": record["candidate_sha"],
+        "effective_revision": record["effective_revision"],
+        "acceptance_record": acceptance,
+        "acceptance_artifact": acceptance["artifact"],
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 0,
+            "reviewer_invocations": 1,
+            "final_ci_fix_used": False,
+            "review_artifacts": [review_artifact],
+            "checkpoint_reason": None,
+        },
+        "review_budget_history": [],
+    }
+
+    require_active_ticket_publication_authorization(
+        job, candidate_tree=record["candidate_tree"]
+    )
+
+    job["review_budget"]["reviewer_invocations"] = 0
+    job["review_budget"]["review_artifacts"] = []
+    with pytest.raises(IncompatibleRunStateError, match="no Reviewer invocation"):
+        require_active_ticket_publication_authorization(
+            job, candidate_tree=record["candidate_tree"]
+        )
+
+    job["review_budget"]["reviewer_invocations"] = 1
+    job["review_budget"]["review_artifacts"] = [review_artifact]
+    job["review_budget"]["review_artifacts"][0]["candidate_sha"] = "foreign"
+    with pytest.raises(IncompatibleRunStateError, match="matching Review Artifact"):
+        require_active_ticket_publication_authorization(
+            job, candidate_tree=record["candidate_tree"]
+        )
+
+
+def test_active_ticket_fallback_rejects_missing_audit_before_publication() -> None:
+    record = _integration_record(source="fallback")
+    receipt = record["fallback_receipt"]
+    job: dict[str, Any] = {
+        "phase": "publication_pending",
+        "base_sha": record["base_sha"],
+        "candidate_sha": record["candidate_sha"],
+        "effective_revision": record["effective_revision"],
+        "review_budget": receipt["review_budget"],
+        "publication_authority": "fallback",
+        "fallback_publication_receipt": receipt,
+    }
+    for key in ("publication_sha", "pr_number", "required_checks_evidence"):
+        receipt.pop(key)
+    receipt.pop("development_summary")
+
+    with pytest.raises(IncompatibleRunStateError, match="fallback_receipt"):
+        require_active_ticket_publication_authorization(
+            job, candidate_tree=record["candidate_tree"]
+        )
+
+
+def test_active_ticket_fallback_requires_complete_receipt_before_merge() -> None:
+    record = _integration_record(source="fallback")
+    receipt = record["fallback_receipt"]
+    job: dict[str, Any] = {
+        "phase": "merging",
+        "base_sha": record["base_sha"],
+        "candidate_sha": record["candidate_sha"],
+        "effective_revision": record["effective_revision"],
+        "publication_sha": record["publication_sha"],
+        "pr_number": record["pr_number"],
+        "required_checks": "none",
+        "required_checks_evidence": record["required_checks_evidence"],
+        "review_budget": receipt["review_budget"],
+        "publication_authority": "fallback",
+        "fallback_publication_receipt": receipt,
+    }
+    receipt.pop("git_integrity")
+
+    with pytest.raises(IncompatibleRunStateError, match="fallback_receipt"):
+        require_active_ticket_publication_authorization(
+            job, candidate_tree=record["candidate_tree"]
+        )
+
+
+def test_required_checks_fallback_must_bind_previous_publication_authority() -> None:
+    record = _integration_record(source="fallback")
+    receipt = record["fallback_receipt"]
+    failure = {
+        "pr_number": record["pr_number"],
+        "head_sha": record["publication_sha"],
+        "checks": [
+            {
+                "name": "tests",
+                "workflow": "tests",
+                "link": "https://github.com/example/project/actions/runs/1",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "repairability": "code_failure",
+            }
+        ],
+        "result": "fail",
+    }
+    receipt.update(
+        {
+            "repair_source": "required_checks",
+            "failure_evidence_source": "required_checks",
+            "failure_evidence": failure,
+            "required_check_failure_evidence": failure,
+            "required_check_failure_head": record["publication_sha"],
+            "repair_delta_base_sha": record["publication_sha"],
+            "previous_publication_authority": "acceptance",
+            "previous_publication_authorization": {
+                "authority": "acceptance",
+                "pr_number": record["pr_number"],
+                "publication_sha": record["publication_sha"],
+                "base_sha": record["base_sha"],
+                "effective_revision": record["effective_revision"],
+                "candidate_sha": "previous-candidate",
+                "candidate_tree": "previous-tree",
+                "acceptance_record": {
+                    "acceptance_scope": "change_job",
+                    "reviewed_base_sha": record["base_sha"],
+                    "reviewed_candidate_sha": "previous-candidate",
+                    "reviewed_candidate_tree": "previous-tree",
+                    "effective_revision": record["effective_revision"],
+                    "reviewer_thread_id": "previous-reviewer",
+                    "artifact": _passing_artifact(),
+                },
+                "fallback_receipt": None,
+            },
+        }
+    )
+    state = {
+        "ticket_jobs": {
+            "2": {
+                "phase": "completed",
+                "integrated_sha": record["integrated_sha"],
+                "deterministic_integration_record": record,
+            }
+        }
+    }
+
+    require_completed_ticket_integration_records(state)
+    with pytest.raises(IncompatibleRunStateError, match="previous publication"):
+        receipt["previous_publication_authority"] = None
+        require_completed_ticket_integration_records(state)
+
+    receipt["previous_publication_authority"] = "fallback"
+    with pytest.raises(IncompatibleRunStateError, match="previous_publication_authorization"):
+        require_completed_ticket_integration_records(state)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reviewer_invocations", 2),
+        ("review_artifacts", []),
+        ("repair_source", "required_checks"),
+        ("failure_evidence", {}),
+        ("development_attempts", 3),
+        ("git_integrity", {"status": "fail"}),
+    ],
+)
+def test_completed_ticket_fallback_receipt_requires_complete_audit_facts(
+    git_repo: Path, field: str, value: object
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    integrated = str(state["ticket_jobs"]["2"]["integrated_sha"])
+    record = _integration_record(
+        source="fallback",
+        candidate_sha=integrated,
+        candidate_tree=git.resolve(f"{integrated}^{{tree}}"),
+        publication_sha=integrated,
+        integrated_sha=integrated,
+    )
+    record["fallback_receipt"][field] = value
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="fallback_receipt"):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+@pytest.mark.parametrize("mutated", ["record", "job"])
+def test_completed_ticket_integration_record_binds_the_real_integrated_sha(
+    git_repo: Path, mutated: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    if mutated == "record":
+        state["ticket_jobs"]["2"]["deterministic_integration_record"][
+            "integrated_sha"
+        ] = "foreign-integrated-sha"
+    else:
+        state["ticket_jobs"]["2"]["integrated_sha"] = "foreign-integrated-sha"
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="integrated_sha"):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "field"),
+    [
+        ("accepted", "acceptance_scope"),
+        ("fallback", "kind"),
+    ],
+)
+def test_completed_ticket_integration_record_rejects_nested_role_drift(
+    git_repo: Path, source: str, field: str
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    integrated = str(state["ticket_jobs"]["2"]["integrated_sha"])
+    record = _integration_record(
+        source=source,
+        candidate_sha=integrated,
+        candidate_tree=git.resolve(f"{integrated}^{{tree}}"),
+        publication_sha=integrated,
+        integrated_sha=integrated,
+    )
+    record["acceptance_record" if source == "accepted" else "fallback_receipt"][
+        field
+    ] = "foreign-role"
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    if source == "accepted":
+        state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
+            record["review_budget"]
+        )
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="scope|kind"):
+        RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
+            str(state["run_id"])
+        )
+
+
+def test_r5_resume_reuses_the_repair_development_thread(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    run_head = git.resolve(str(state["run_branch"]))
+    candidate = subprocess.run(
+        [
+            "git",
+            "commit-tree",
+            git.resolve(f"{run_head}^{{tree}}"),
+            "-p",
+            run_head,
+            "-m",
+            "fix(run): preserve the reviewed repair candidate",
+        ],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    thread_id = "r5-development-thread"
+    thread_history = ["r5-development-thread-old-turn"]
+    exhausted_budget = _canonical_run_budget()
+    exhausted_budget["reviewer_invocations"] = 5
+    state["run_acceptance"] = {
+        "phase": "ready_for_human",
+        "repair_generation": 1,
+        "acceptance_generation": 1,
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "reviewer_thread_ids": [],
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "review_budget": deepcopy(exhausted_budget),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "blocked",
+            "blocked_reason": "review_budget_exhausted",
+            "repair_mode": "squash",
+            "repair_source": "acceptance",
+            "acceptance_artifact": _repair_artifact(),
+            "candidate_sha": candidate,
+            "development_thread_id": thread_id,
+            "development_thread_history": thread_history,
+            "review_budget": exhausted_budget,
+            "review_budget_history": [],
+        },
+    }
+    state["status"] = "ready_for_human"
+    states.save_run(str(state["run_id"]), state)
+
+    assert _resume_review_budget_window(state)
+    run = state["run_acceptance"]
+    assert run["phase"] == "repairing"
+    assert "repair_job" not in run
+
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=object(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    )
+    job = engine._repair_lifecycle._repair_job(state, run)
+    assert job["phase"] == "developing"
+    assert job["development_thread_id"] == thread_id
+    assert job["development_thread_history"] == thread_history
+    assert job["repair_seed_candidate_sha"] == candidate
+    assert job["repair_mode"] == "squash"
+
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "r5-seed"
+    git.prepare_ticket_checkout(
+        branch=str(job["repair_branch"]),
+        base_sha=str(job["base_sha"]),
+        checkout=checkout,
+    )
+    git.seed_managed_checkout(checkout, expected_head=candidate)
+    assert git.checkout_head(checkout) == candidate
+    git.remove_worktree(checkout)
+
+    assert engine.repair_requests is not None
+    request = engine.repair_requests.development(state, job, git_repo)
+    assert request["thread_id"] == thread_id
+
+
 @pytest.mark.parametrize("new_thread", [False, True])
 def test_run_acceptance_execution_failure_resumes_selected_thread(
     git_repo: Path, new_thread: bool
@@ -79,6 +815,8 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
@@ -116,6 +854,8 @@ def test_second_reviewer_attempt_keeps_the_run_acceptance_generation(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 2,
@@ -156,6 +896,8 @@ def test_resume_rejects_stale_run_invocation_before_agent_start(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
@@ -207,7 +949,21 @@ def test_ticket_completion_records_are_minimal_and_sorted_numerically(
             "reviewed_candidate_tree": "tree-10",
             "artifact": _passing_artifact(),
         },
+        "deterministic_integration_record": _integration_record(
+            pr_number=31,
+            candidate_sha="candidate-10",
+            candidate_tree="tree-10",
+            publication_sha="published-10",
+            integrated_sha="integrated-10",
+            acceptance_record={"artifact": _passing_artifact()},
+        ),
     }
+    state["ticket_jobs"]["10"]["review_budget"] = deepcopy(
+        state["ticket_jobs"]["10"]["deterministic_integration_record"][
+            "review_budget"
+        ]
+    )
+    state["ticket_jobs"]["10"]["review_budget_history"] = []
     state["ticket_jobs"]["2"].update(
         {
             "integrated_sha": "integrated-2",
@@ -219,7 +975,12 @@ def test_ticket_completion_records_are_minimal_and_sorted_numerically(
             },
         }
     )
-
+    integration = state["ticket_jobs"]["2"]["deterministic_integration_record"]
+    state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
+        integration["review_budget"]
+    )
+    integration["integrated_sha"] = "integrated-2"
+    integration["pr"]["merge_commit_sha"] = "integrated-2"
     records = ticket_completion_records(state)
 
     assert records == [
@@ -238,6 +999,60 @@ def test_ticket_completion_records_are_minimal_and_sorted_numerically(
             "reviewed_candidate_tree": "tree-10",
         },
     ]
+
+
+def test_ticket_integration_records_preserve_exact_pr_and_checks_evidence(
+    git_repo: Path,
+) -> None:
+    state, _states, _git = _completed_run(git_repo)
+    state["ticket_jobs"]["2"].update(
+        {
+            "integrated_sha": "integrated-2",
+            "effective_revision": "effective-2",
+            "deterministic_integration_record": _integration_record(
+                pr_number=21,
+                publication_sha="published-2",
+                integrated_sha="integrated-2",
+                acceptance_record={"artifact": _passing_artifact()},
+            ),
+        }
+    )
+    state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
+        state["ticket_jobs"]["2"]["deterministic_integration_record"][
+            "review_budget"
+        ]
+    )
+    state["ticket_jobs"]["2"]["deterministic_integration_record"][
+        "required_checks_evidence"
+    ]["checks"] = [{"name": "test", "bucket": "pass", "state": "SUCCESS"}]
+    state["ticket_jobs"]["10"] = {
+        "ticket_number": 10,
+        "phase": "completed",
+        "integrated_sha": "integrated-10",
+        "effective_revision": "effective-10",
+        "deterministic_integration_record": _integration_record(
+            source="fallback",
+            pr_number=31,
+            candidate_sha="candidate-10",
+            candidate_tree="tree-10",
+            publication_sha="published-10",
+            integrated_sha="integrated-10",
+            fallback_receipt={"candidate_sha": "candidate-10"},
+        ),
+    }
+
+    records = ticket_integration_records(state)
+
+    assert [record["ticket_number"] for record in records] == [2, 10]
+    assert records[0]["integration_record"]["pr_number"] == 21
+    assert records[0]["integration_record"]["pr"]["head_sha"] == "published-2"
+    assert records[0]["integration_record"]["required_checks_evidence"] == {
+        "pr_number": 21,
+        "head_sha": "published-2",
+        "result": "pass",
+        "checks": [{"name": "test", "bucket": "pass", "state": "SUCCESS"}],
+    }
+    assert records[1]["integration_record"]["source"] == "fallback"
 
 def test_closed_ticket_edits_do_not_change_its_completion_revision(
     git_repo: Path,
@@ -326,6 +1141,8 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,
@@ -771,6 +1588,8 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
     )
     run = state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "development_thread_id": None,
@@ -978,6 +1797,9 @@ def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
     assert invocation["status"] == "completed"
     assert invocation["reported_thread_id"] == "run-reviewer-thread"
     assert invocation["attempt_count"] == 2
+    assert persisted["run_acceptance"]["review_budget"][
+        "reviewer_invocations"
+    ] == 1
 
 def test_run_acceptance_fixture_missing_thread_marks_invocation_failed(
     git_repo: Path,

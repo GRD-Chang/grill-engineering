@@ -8,6 +8,9 @@ from agent_run.git import GitRepository
 from agent_run.graph import state_from_graph
 from agent_run.models import Repository
 from agent_run.scope_changes import reconcile_structure
+from agent_run.integration_record_contract import (
+    require_completed_ticket_integration_records,
+)
 from agent_run.state_contract import require_candidate_acceptance_history
 
 
@@ -23,6 +26,7 @@ def refresh_run_currentness(
     state: dict[str, Any], *, reader: RunCurrentnessReader, git: GitRepository
 ) -> str | None:
     """Project live authority and return its resolved default base when usable."""
+    require_completed_ticket_integration_records(state)
     repository = reader.repository()
     default_head = git.resolve_base(
         repository.default_branch, repository.default_head_sha
@@ -47,6 +51,7 @@ def refresh_run_currentness(
 def ticket_completion_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Project completed Ticket state into the Run currentness contract."""
 
+    require_completed_ticket_integration_records(state)
     graph = _mapping(state.get("ticket_graph"), "ticket_graph")
     tickets = _mapping(graph.get("tickets"), "ticket_graph.tickets")
     jobs = _mapping(state.get("ticket_jobs"), "ticket_jobs")
@@ -55,16 +60,71 @@ def ticket_completion_records(state: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(job, dict) or job.get("phase") != "completed":
             continue
         _mapping(tickets.get(key), f"ticket {key}")
-        acceptance = _mapping(
-            job.get("acceptance_record"), f"completed ticket {key} acceptance_record"
-        )
+        acceptance = job.get("acceptance_record")
+        if not isinstance(acceptance, dict):
+            receipt = _mapping(
+                job.get("fallback_publication_receipt"),
+                f"completed ticket {key} fallback_publication_receipt",
+            )
+            reviewed_base_sha = receipt.get("base_sha")
+            reviewed_candidate_tree = receipt.get("candidate_tree")
+        else:
+            reviewed_base_sha = acceptance.get("reviewed_base_sha")
+            reviewed_candidate_tree = acceptance.get("reviewed_candidate_tree")
         records.append(
             {
                 "ticket_number": int(key),
                 "integrated_sha": job.get("integrated_sha"),
                 "effective_revision": job.get("effective_revision"),
-                "reviewed_base_sha": acceptance.get("reviewed_base_sha"),
-                "reviewed_candidate_tree": acceptance.get("reviewed_candidate_tree"),
+                "reviewed_base_sha": reviewed_base_sha,
+                "reviewed_candidate_tree": reviewed_candidate_tree,
+            }
+        )
+    return records
+
+
+def ticket_fallback_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose fallback receipts to the complete Run Reviewer as evidence."""
+
+    require_completed_ticket_integration_records(state)
+    jobs = _mapping(state.get("ticket_jobs"), "ticket_jobs")
+    records: list[dict[str, Any]] = []
+    for key, job in sorted(jobs.items(), key=lambda item: int(item[0])):
+        if not isinstance(job, dict) or job.get("publication_authority") != "fallback":
+            continue
+        receipt = job.get("fallback_publication_receipt")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"completed ticket {key} fallback receipt is invalid")
+        records.append(
+            {
+                "ticket_number": int(key),
+                "integrated_sha": job.get("integrated_sha"),
+                "effective_revision": job.get("effective_revision"),
+                "receipt": deepcopy(receipt),
+                "integration_record": deepcopy(
+                    job.get("deterministic_integration_record")
+                ),
+            }
+        )
+    return records
+
+
+def ticket_integration_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project completed Ticket Integration Records for Run-level review."""
+
+    require_completed_ticket_integration_records(state)
+    jobs = _mapping(state.get("ticket_jobs"), "ticket_jobs")
+    records: list[dict[str, Any]] = []
+    for key, job in sorted(jobs.items(), key=lambda item: int(item[0])):
+        if not isinstance(job, dict) or job.get("phase") != "completed":
+            continue
+        integration = job.get("deterministic_integration_record")
+        records.append(
+            {
+                "ticket_number": int(key),
+                "integrated_sha": job.get("integrated_sha"),
+                "effective_revision": job.get("effective_revision"),
+                "integration_record": deepcopy(integration),
             }
         )
     return records

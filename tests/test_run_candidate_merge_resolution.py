@@ -19,6 +19,7 @@ from run_acceptance_test_support import (
     _candidate_finding_artifact,
     _completed_run,
     _passing_artifact,
+    _sync_completed_ticket_integrated_sha,
 )
 
 @pytest.mark.parametrize(
@@ -54,7 +55,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         capture_output=True,
     )
     initial_default = git.resolve("main")
-    state["ticket_jobs"]["2"]["integrated_sha"] = run_head
+    _sync_completed_ticket_integrated_sha(state, git, run_head)
     states.save_run(str(state["run_id"]), state)
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["default_head_sha"] = initial_default
@@ -205,6 +206,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         # a fresh Cycle.
         active_job["modification_attempts"] = 9
         active_job["code_modification_attempts"] = 9
+        active_job["review_budget"]["development_attempts"] = 9
         active_run["repair_cycle"]["code_modification_attempts"] = 9
         active_run["modification_attempts"] = 9
         active_run["code_modification_attempts"] = 9

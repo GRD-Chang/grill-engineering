@@ -529,6 +529,15 @@ def test_nonretryable_blocked_job_yields_to_independent_frontier(
         {
             "phase": "blocked",
             "blocked_reason": "published_head_mismatch",
+            "review_budget": {
+                "window": 1,
+                "development_attempts": 0,
+                "reviewer_invocations": 0,
+                "final_ci_fix_used": False,
+                "review_artifacts": [],
+                "checkpoint_reason": None,
+            },
+            "review_budget_history": [],
         }
     )
     states.save_run(str(state["run_id"]), state)

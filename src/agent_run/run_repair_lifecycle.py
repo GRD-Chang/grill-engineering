@@ -23,6 +23,7 @@ from agent_run.run_repair_cycle import (
     sync_repair_cycle_counters,
     uses_merge_resolution,
 )
+from agent_run.review_budget import RUN_POLICY, ensure_budget, new_budget
 from agent_run.run_repair_currentness import RunRepairObservationPending
 from agent_run.run_repair_delivery import (
     RunRepairAdapter,
@@ -76,6 +77,12 @@ class RunRepairLifecycle:
                 self.owner.git.prepare_ticket_checkout(
                     branch=branch, base_sha=str(job["base_sha"]), checkout=checkout
                 )
+                preserved_candidate = job.pop("repair_seed_candidate_sha", None)
+                if preserved_candidate is not None:
+                    self.owner.git.seed_managed_checkout(
+                        checkout, expected_head=str(preserved_candidate)
+                    )
+                    self.owner._save(state)
                 if job.get("integration_reprepare_required") is True:
                     self.owner._complete_integration_reprepare(state, job, checkout)
                 elif job.get("integration_squash_conversion_required") is True:
@@ -283,14 +290,51 @@ class RunRepairLifecycle:
         repair_request = run.pop("repair_request", {})
         if not isinstance(repair_request, dict):
             raise ValueError("repair_request must be an object")
+        requested_thread_id = repair_request.get("development_thread_id")
+        if requested_thread_id is not None and (
+            not isinstance(requested_thread_id, str) or not requested_thread_id.strip()
+        ):
+            raise ValueError("repair_request has an invalid Development Thread ID")
+        requested_thread_history = repair_request.get("development_thread_history", [])
+        if not isinstance(requested_thread_history, list) or not all(
+            isinstance(item, str) and item.strip() for item in requested_thread_history
+        ):
+            raise ValueError("repair_request has invalid Development Thread history")
+        development_thread_id = requested_thread_id
+        development_thread_history = list(requested_thread_history)
+        preserved_candidate = repair_request.get("repair_candidate_sha")
+        if preserved_candidate is not None and (
+            not isinstance(preserved_candidate, str)
+            or not preserved_candidate.strip()
+        ):
+            raise ValueError("repair_request has an invalid preserved Candidate")
+        if isinstance(preserved_candidate, str):
+            if not self.owner.git.is_ancestor(base_sha, preserved_candidate):
+                raise ValueError(
+                    "incompatible_run_state: preserved Run Repair Candidate is not based on the current Run Branch"
+                )
+            self.owner.git.resolve(f"{preserved_candidate}^{{tree}}")
+        run_state = self.owner._run_state(state)
+        run_budget = ensure_budget(run_state, RUN_POLICY)
+        run_budget_history = run_state.get("review_budget_history")
+        if not isinstance(run_budget_history, list):
+            raise ValueError("run review_budget_history must be an array")
+        prior_review_artifacts = deepcopy(run_budget["review_artifacts"][-1:])
         repair_source = str(repair_request.get("repair_source", "acceptance"))
         if repair_source not in {
             "acceptance",
+            "git_integrity",
             "human_revision",
             "required_checks",
             "merge_conflict",
         }:
             raise ValueError("invalid Run Repair source")
+        requested_repair_mode = repair_request.get("repair_mode")
+        if requested_repair_mode is not None and requested_repair_mode not in {
+            "squash",
+            "merge_resolution",
+        }:
+            raise ValueError("invalid Run Repair mode")
         job = {
             "run_id": state["run_id"],
             "phase": "developing",
@@ -310,7 +354,13 @@ class RunRepairLifecycle:
             "ticket_completion_records": ticket_completion_records(state),
             "repair_source": repair_source,
             "repair_mode": (
-                "merge_resolution" if repair_source == "merge_conflict" else "squash"
+                str(requested_repair_mode)
+                if requested_repair_mode is not None
+                else (
+                    "merge_resolution"
+                    if repair_source == "merge_conflict"
+                    else "squash"
+                )
             ),
             "modification_attempts": initial_modifications,
             "code_modification_attempts": initial_modifications,
@@ -318,9 +368,16 @@ class RunRepairLifecycle:
             "acceptance_generation": int(run.get("acceptance_generation", 1)),
             "development_thread_id": development_thread_id,
             "development_thread_history": development_thread_history,
+            "repair_seed_candidate_sha": preserved_candidate,
             "reviewer_thread_ids": prior_threads,
             "prior_reviewer_thread_ids": prior_threads,
             "candidate_acceptance_history": [],
+            "review_budget": new_budget(
+                window=run_budget["window"],
+                reviewer_invocations=run_budget["reviewer_invocations"],
+                review_artifacts=prior_review_artifacts,
+            ),
+            "review_budget_history": deepcopy(run_budget_history),
             "repair_checkout": str(self.owner._repair_checkout(state)),
         }
         for key in (
@@ -331,10 +388,17 @@ class RunRepairLifecycle:
             if key in repair_request:
                 job[key] = deepcopy(repair_request[key])
         if repair_source == "acceptance":
-            artifact = self.owner._mapping(run, "acceptance_artifact")
+            artifact = repair_request.get("acceptance_artifact")
+            if not isinstance(artifact, dict):
+                artifact = self.owner._mapping(run, "acceptance_artifact")
             job["repair_input_artifact"] = artifact
             job["acceptance_artifact"] = artifact
             job["unresolved_acceptance_artifact"] = deepcopy(artifact)
+        if repair_source == "git_integrity":
+            evidence = repair_request.get("git_integrity_evidence")
+            if not isinstance(evidence, dict):
+                raise ValueError("Git Integrity repair evidence must be an object")
+            job["git_integrity_evidence"] = evidence
         if repair_source == "human_revision":
             feedback = repair_request.get("human_feedback")
             if not isinstance(feedback, str) or not feedback.strip():

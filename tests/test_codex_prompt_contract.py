@@ -119,6 +119,211 @@ def test_publication_prompts_use_flat_human_blocker_wire_shape(
         assert DEVELOPMENT_BLOCKER_SHAPE not in prompt
 
 
+def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    artifact = {
+        "checks": {
+            lane: {
+                "status": "pass",
+                "evidence": PASS_EVIDENCE[lane],
+                "findings": [],
+            }
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    cases = (
+        (
+            "ticket-review-identity",
+            {
+                "acceptance_scope": "ticket",
+                "current_review_identity": {
+                    "reviewed_base_sha": "TICKET_CURRENT_BASE",
+                    "reviewed_candidate_sha": "TICKET_CURRENT_CANDIDATE",
+                    "reviewed_candidate_tree": "TICKET_CURRENT_TREE",
+                },
+                "previous_acceptance_artifact": artifact,
+                "previous_review_identity": {
+                    "reviewed_base_sha": "TICKET_PREVIOUS_BASE",
+                    "reviewed_candidate_sha": "TICKET_PREVIOUS_CANDIDATE",
+                },
+            },
+            (
+                "TICKET_CURRENT_BASE",
+                "TICKET_CURRENT_CANDIDATE",
+                "TICKET_CURRENT_TREE",
+                "TICKET_PREVIOUS_BASE",
+                "TICKET_PREVIOUS_CANDIDATE",
+                "Previous reviewed Candidate",
+            ),
+        ),
+        (
+            "run-review-identity",
+            {
+                "acceptance_scope": "run",
+                "current_review_identity": {
+                    "default_base_sha": "RUN_CURRENT_DEFAULT",
+                    "run_head_sha": "RUN_CURRENT_HEAD",
+                    "expected_merge_tree": "RUN_CURRENT_TREE",
+                },
+                "previous_acceptance_artifact": artifact,
+                "previous_review_identity": {
+                    "default_base_sha": "RUN_PREVIOUS_DEFAULT",
+                    "run_head_sha": "RUN_PREVIOUS_HEAD",
+                    "expected_merge_tree": "RUN_PREVIOUS_TREE",
+                },
+            },
+            (
+                "RUN_CURRENT_DEFAULT",
+                "RUN_CURRENT_HEAD",
+                "RUN_CURRENT_TREE",
+                "RUN_PREVIOUS_DEFAULT",
+                "RUN_PREVIOUS_HEAD",
+                "Previous Run head",
+            ),
+        ),
+        (
+            "run-repair-review-identity",
+            {
+                "acceptance_scope": "run",
+                "candidate_acceptance": True,
+                "repair_scope": "run_repair",
+                "current_review_identity": {
+                    "run_base_sha": "REPAIR_CURRENT_BASE",
+                    "repair_candidate_sha": "REPAIR_CURRENT_CANDIDATE",
+                    "expected_merge_tree": "REPAIR_CURRENT_TREE",
+                },
+                "previous_acceptance_artifact": artifact,
+                "previous_review_identity": {
+                    "run_base_sha": "REPAIR_PREVIOUS_BASE",
+                    "repair_candidate_sha": "REPAIR_PREVIOUS_CANDIDATE",
+                    "expected_merge_tree": "REPAIR_PREVIOUS_TREE",
+                },
+            },
+            (
+                "REPAIR_CURRENT_BASE",
+                "REPAIR_CURRENT_CANDIDATE",
+                "REPAIR_CURRENT_TREE",
+                "REPAIR_PREVIOUS_BASE",
+                "REPAIR_PREVIOUS_CANDIDATE",
+                "Previous Repair Candidate",
+            ),
+        ),
+    )
+
+    for name, request, required in cases:
+        prompt = _capture_public_prompt(
+            tmp_path, monkeypatch, "review", request, name=name
+        )
+        for marker in required:
+            assert marker in prompt
+        for marker in required[:3]:
+            assert prompt.count(marker) == 1
+        assert "Reviewer 2+" not in prompt
+        assert "本窗口 Reviewer" not in prompt
+        assert "因前次调用失败而继续的同 Thread Resume" not in prompt
+
+    r2_prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            "acceptance_scope": "run",
+            "candidate_acceptance": True,
+            "repair_scope": "run_repair",
+            "current_review_identity": {
+                "run_base_sha": "R2_CURRENT_BASE",
+                "repair_candidate_sha": "R2_CURRENT_CANDIDATE",
+                "expected_merge_tree": "R2_CURRENT_TREE",
+            },
+            "previous_acceptance_artifact": artifact,
+            "previous_review_identity": {
+                "default_base_sha": "R1_DEFAULT_BASE",
+                "run_head_sha": "R1_RUN_HEAD",
+                "expected_merge_tree": "R1_EXPECTED_TREE",
+            },
+        },
+        name="run-repair-review-previous-run",
+    )
+    assert "Previous Run Acceptance Context" in r2_prompt
+    assert "R1_DEFAULT_BASE" in r2_prompt
+    assert "R1_RUN_HEAD" in r2_prompt
+    assert "Previous Repair Candidate" not in r2_prompt
+
+
+def test_fallback_publication_prompt_receives_only_minimal_projection(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            "acceptance_scope": "ticket",
+            "fallback_receipt": {
+                "window": "PRIVATE_WINDOW",
+                "reviewer_invocations": "PRIVATE_REVIEW_COUNT",
+                "review_artifacts": ["PRIVATE_ARTIFACT"],
+                "ci_evidence": "PRIVATE_CI",
+            },
+            "fallback_publication_context": {
+                "last_review_identity": {
+                    "reviewed_candidate_sha": "SAFE_PREVIOUS_CANDIDATE"
+                },
+                "current_candidate_identity": {
+                    "reviewed_candidate_sha": "SAFE_CURRENT_CANDIDATE"
+                },
+                "development_delta": True,
+                "current_candidate_has_additional_review": False,
+            },
+        },
+        name="fallback-minimal-projection",
+    )
+
+    assert "SAFE_PREVIOUS_CANDIDATE" in prompt
+    assert "SAFE_CURRENT_CANDIDATE" in prompt
+    assert "PRIVATE_WINDOW" not in prompt
+    assert "PRIVATE_REVIEW_COUNT" not in prompt
+    assert "PRIVATE_ARTIFACT" not in prompt
+    assert "PRIVATE_CI" not in prompt
+    assert "Fallback Publication Context" in prompt
+    assert "不证明三个验收 lane 通过" in prompt
+    assert "完整独立验收三条 lane 的实际证据" not in prompt
+    assert "Candidate delta" in prompt
+
+
+def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ticket = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {"acceptance_scope": "ticket"},
+        name="ticket-role",
+    )
+    parent = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {"acceptance_scope": "parent_only"},
+        name="parent-role",
+    )
+    run_repair = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {"acceptance_scope": "run", "acceptance_artifact": {}},
+        name="run-repair-role",
+    )
+
+    assert "当前 Ticket Candidate 的独立集成验收工程师" in ticket
+    assert "当前 Parent-only Candidate 的独立验收工程师" in parent
+    assert "当前 Run Repair PR 的发布叙事工程师" in run_repair
+    assert "独立 Fresh Acceptance 验收工程师" not in ticket
+    assert "独立 Fresh Acceptance 验收工程师" not in parent
+
+
 def test_non_publication_prompt_keeps_exact_human_blocker_result(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -199,6 +404,36 @@ def test_repair_prompt_preserves_raw_evidence_without_controller_triage(
     assert "逐项解决当前 Review Boundary 内的每个 Finding" in prompt
     assert "按每条 Finding 自带的 `复验` 要求执行验证并取得充分、可复核的证据" in prompt
     assert "不能以一次笼统的风险验证替代逐项复验" in prompt
+
+
+def test_git_integrity_prompt_preserves_only_raw_integrity_evidence(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    evidence = {
+        "kind": "git_integrity",
+        "observed_head": "INTEGRITY_HEAD",
+        "actual_subject": "agent-owned commit",
+        "expected_subject": "chore(ticket-3): candidate 1",
+        "workspace_clean": "true",
+    }
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "repair_source": "git_integrity",
+            "git_integrity_evidence": evidence,
+        },
+        name="git-integrity-repair",
+    )
+
+    assert "Git Integrity Repair" in prompt
+    assert "INTEGRITY_HEAD" in prompt
+    assert "agent-owned commit" in prompt
+    assert "reviewer_invocations" not in prompt
+    assert "modification_attempts" not in prompt
+    assert "fallback" not in prompt.lower()
 
 
 @pytest.mark.parametrize(

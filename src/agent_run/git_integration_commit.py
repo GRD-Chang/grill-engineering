@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Protocol
 
-from agent_run.git_errors import GitError
+from agent_run.git_errors import GitError, GitIntegrityError
 
 
 class GitCommitOperations(Protocol):
@@ -35,6 +35,7 @@ class IntegrationRepairCommitGit:
         default_head_sha: str,
         attempt: int,
         squash_candidate_sha: str | None = None,
+        candidate_intent: dict[str, object] | None = None,
         expected_conflict_paths: tuple[str, ...] = (),
     ) -> str | None:
         """Publisher-owned two-parent commit of a resolved integration tree."""
@@ -47,15 +48,58 @@ class IntegrationRepairCommitGit:
                 status.stderr.strip() or "could not inspect Integration-repair Worktree"
             )
         merge_head = self._git._resolve_in_optional(checkout, "MERGE_HEAD")
+        allowed_boundary_heads = {run_head_sha}
+        if isinstance(squash_candidate_sha, str):
+            allowed_boundary_heads.add(squash_candidate_sha)
+        has_managed_merge_candidate = self._git.commit_parents(checkout_head) == [
+            run_head_sha,
+            default_head_sha,
+        ]
+        if (
+            status.stdout.strip()
+            and checkout_head not in allowed_boundary_heads
+            and not has_managed_merge_candidate
+        ):
+            raise GitIntegrityError(
+                "managed merge-resolution checkout has an unowned commit before Candidate creation",
+                evidence={
+                    "kind": "git_integrity",
+                    "status": "fail",
+                    "reason": "checkout HEAD differs from the managed merge boundary",
+                    "observed_head": checkout_head,
+                    "actual_subject": self._git.commit_subject(checkout_head),
+                    "expected_subject": expected_message,
+                    "workspace_clean": "false",
+                },
+            )
         if not status.stdout.strip() and merge_head is None:
-            if (
-                self._git.commit_parents(checkout_head) == [run_head_sha, default_head_sha]
-                and self._git.commit_subject(checkout_head) == expected_message
+            if self._merge_candidate_matches_intent(
+                checkout,
+                checkout_head=checkout_head,
+                run_head_sha=run_head_sha,
+                default_head_sha=default_head_sha,
+                expected_message=expected_message,
+                candidate_intent=candidate_intent,
             ):
                 return checkout_head
+            if has_managed_merge_candidate:
+                return None
+            if checkout_head not in allowed_boundary_heads:
+                raise GitIntegrityError(
+                    "managed merge-resolution checkout contains an unowned clean commit",
+                    evidence={
+                        "kind": "git_integrity",
+                        "status": "fail",
+                        "reason": "clean merge-resolution head has an unexpected boundary",
+                        "observed_head": checkout_head,
+                        "actual_subject": self._git.commit_subject(checkout_head),
+                        "expected_subject": expected_message,
+                        "workspace_clean": "true",
+                    },
+                )
             return None
         if merge_head is not None:
-            allowed_head = checkout_head == run_head_sha or (
+            allowed_head = checkout_head in allowed_boundary_heads or (
                 isinstance(squash_candidate_sha, str)
                 and checkout_head == squash_candidate_sha
                 and self._git.commit_parents(squash_candidate_sha) == [run_head_sha]
@@ -89,6 +133,7 @@ class IntegrationRepairCommitGit:
             default_head_sha,
             "-m",
             expected_message,
+            *self._candidate_intent_message(candidate_intent),
         )
         if created.returncode != 0:
             raise GitError(
@@ -103,6 +148,41 @@ class IntegrationRepairCommitGit:
         if self._git.commit_parents(candidate) != [run_head_sha, default_head_sha]:
             raise GitError("Merge-resolution Candidate parents changed unexpectedly")
         return candidate
+
+    def _merge_candidate_matches_intent(
+        self,
+        checkout: Path,
+        *,
+        checkout_head: str,
+        run_head_sha: str,
+        default_head_sha: str,
+        expected_message: str,
+        candidate_intent: dict[str, object] | None,
+    ) -> bool:
+        if not isinstance(candidate_intent, dict):
+            return False
+        if self._git.commit_parents(checkout_head) != [run_head_sha, default_head_sha]:
+            return False
+        if self._git.commit_subject(checkout_head) != expected_message:
+            return False
+        token = candidate_intent.get("token")
+        if not isinstance(token, str) or not token:
+            return False
+        message = self._git._run_in(
+            checkout, "show", "-s", "--format=%B", checkout_head
+        )
+        return message.returncode == 0 and (
+            f"agent-run-candidate-intent: {token}" in message.stdout
+        )
+
+    @staticmethod
+    def _candidate_intent_message(
+        candidate_intent: dict[str, object] | None,
+    ) -> tuple[str, ...]:
+        token = candidate_intent.get("token") if isinstance(candidate_intent, dict) else None
+        if not isinstance(token, str) or not token:
+            return ()
+        return ("-m", f"agent-run-candidate-intent: {token}")
 
     def _require_repaired_unmerged_paths(
         self, checkout: Path, *, expected_conflict_paths: tuple[str, ...]

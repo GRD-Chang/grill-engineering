@@ -10,6 +10,7 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.cli_presentation import _print_precondition_failure
+from agent_run.review_budget import budget_checkpoint_subjects
 
 
 def _run_to_human_gate(
@@ -53,7 +54,12 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         return True
     return (
         human_blocker_subject_count(state) == 1
+        or _review_budget_checkpoint_count(state) == 1
     )
+
+
+def _review_budget_checkpoint_count(state: dict[str, object]) -> int:
+    return len(budget_checkpoint_subjects(state))
 
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:

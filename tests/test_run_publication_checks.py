@@ -15,7 +15,10 @@ from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 
-from run_acceptance_test_support import _passing_artifact
+from run_acceptance_test_support import (
+    _passing_artifact,
+    _sync_completed_ticket_integrated_sha,
+)
 
 from run_publication_test_support import RunPublicationAgents, _accepted_run
 
@@ -272,8 +275,8 @@ def test_final_real_merge_conflict_enters_shared_run_repair(git_repo: Path) -> N
             check=True,
             capture_output=True,
         )
-    accepted["ticket_jobs"]["2"]["integrated_sha"] = git.resolve(
-        str(accepted["run_branch"])
+    _sync_completed_ticket_integrated_sha(
+        accepted, git, git.resolve(str(accepted["run_branch"]))
     )
     states.save_run(str(accepted["run_id"]), accepted)
 

@@ -61,6 +61,7 @@ def review(
         # identity must remain durable before a fresh output attempt.
         stage.save(state)
         raise
+    stage.mark_review_invocation(job)
     job["pending_review_result"] = {
         "reviewer_thread_id": review.thread_id,
         "artifact": artifact.raw,
@@ -90,9 +91,55 @@ def complete_review(
         "Fresh Acceptance was discarded after requirements changed",
     )
     job["acceptance_artifact"] = artifact.raw
+    previous_repair_source = job.get("repair_source")
+    # A new valid Acceptance Artifact supersedes any earlier Required-Checks
+    # repair input when it is itself an Acceptance Repair.  A passing review
+    # after CI repair still needs the exact CI failure as Publication context;
+    # a later failed Acceptance Repair must clear it before its next Worker.
+    if not artifact.is_accepted:
+        job.pop("ci_evidence", None)
+        job.pop("final_ci_fix_failure_head", None)
+        job.pop("required_checks_evidence", None)
+    elif previous_repair_source != "required_checks":
+        job.pop("ci_evidence", None)
+        job.pop("final_ci_fix_failure_head", None)
+        job.pop("required_checks_evidence", None)
+    budget = job.get("review_budget")
+    if isinstance(budget, dict):
+        candidate_sha = str(job["candidate_sha"])
+        if isinstance(job.get("default_base_sha"), str):
+            review_identity = {
+                "run_base_sha": str(job["base_sha"]),
+                "repair_candidate_sha": candidate_sha,
+                "expected_merge_tree": stage.git.expected_merge_tree(
+                    default_head_sha=str(job["default_base_sha"]),
+                    run_head_sha=candidate_sha,
+                ),
+            }
+        else:
+            review_identity = {
+                "reviewed_base_sha": str(job["base_sha"]),
+                "reviewed_candidate_sha": candidate_sha,
+                "reviewed_candidate_tree": stage.git.resolve(
+                    f"{candidate_sha}^{{tree}}"
+                ),
+            }
+        budget["review_artifacts"].append(
+            {
+                "reviewer_thread_id": reviewer_thread_id,
+                "candidate_sha": candidate_sha,
+                "reviewed_base_sha": str(job["base_sha"]),
+                "review_identity": review_identity,
+                "artifact": artifact.raw,
+            }
+        )
+        del budget["review_artifacts"][:-5]
+    job["last_review_candidate_sha"] = str(job["candidate_sha"])
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw
     )
+    if not artifact.is_accepted:
+        job["repair_source"] = "acceptance"
     job.pop("pending_review_result", None)
     # A first rejection has no PR to expose.  For a repair after a PR
     # already exists, update that PR's one status comment immediately so
@@ -125,6 +172,16 @@ def complete_review(
         )
     if artifact.is_accepted:
         job["phase"] = "accepted"
+    elif (
+        not stage.review_budget_policy().fallback
+        and stage.review_budget_exhausted_for_review(job)
+    ):
+        stage._checkpoint_budget(
+            state,
+            job,
+            "review_budget_exhausted",
+            "Review budget is exhausted and the current Candidate still needs modification",
+        )
     elif stage.modification_budget_exhausted(job):
         job["phase"] = "escalating"
         job["escalation_code"] = (
@@ -133,7 +190,6 @@ def complete_review(
             else "modification_budget_exhausted"
         )
     else:
-        job["repair_source"] = "acceptance"
         job["phase"] = "repairing"
     stage.save(state)
 

@@ -526,8 +526,8 @@ def test_failure_resume_rechecks_current_workspace_before_development(
         }
     )
 
-    assert "因前次调用失败而继续的同 Thread Resume" in prompts[0]
-    assert "重新核验权威输入和实际工作" in prompts[0]
+    assert "因前次调用失败而继续的同 Thread Resume" not in prompts[0]
+    assert "Development Brief:" in prompts[0]
 
 
 def test_failure_resume_rechecks_current_workspace_before_publication(
@@ -558,8 +558,8 @@ def test_failure_resume_rechecks_current_workspace_before_publication(
         initial_writable_checkout=False,
     )
 
-    assert "因前次调用失败而继续的同 Thread Resume" in prompts[0]
-    assert "重新核验权威输入和实际工作" in prompts[0]
+    assert "因前次调用失败而继续的同 Thread Resume" not in prompts[0]
+    assert prompts[0] == "Publication stage prompt"
 
 
 @pytest.mark.parametrize(

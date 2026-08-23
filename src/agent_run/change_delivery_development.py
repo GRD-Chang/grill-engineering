@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from agent_run.agents import HumanBlockerResult
 from agent_run.artifacts import clear_current_human_blocker
@@ -16,6 +17,7 @@ from agent_run.credential_availability import (
     resume_initial_credential_wait,
     wait_for_initial_credential as wait_for_initial_credential_state,
 )
+from agent_run.git_errors import GitError, GitIntegrityError
 
 
 def develop(
@@ -32,16 +34,45 @@ def develop(
         "Development did not start after requirements changed",
     )
     pending = job.get("pending_attempt")
+    attempt_kind = str(job.get("next_attempt_kind", "ordinary"))
     attempt = (
         pending
         if isinstance(pending, int)
         and pending > int(job.get("modification_attempts", 0))
         else int(job.get("modification_attempts", 0)) + 1
     )
+    pending_resume = (
+        isinstance(pending, int)
+        and pending > int(job.get("modification_attempts", 0))
+    )
+    if not pending_resume:
+        stage.mark_development_attempt(job, attempt_kind=attempt_kind)
     # Persist the actual Worker attempt before invoking Codex.  This
     # makes a foreground status query truthful even while Codex is still
     # running, and leaves an observable recovery boundary on interruption.
     job["pending_attempt"] = attempt
+    job["pending_attempt_kind"] = attempt_kind
+    if pending_resume:
+        if not isinstance(job.get("managed_checkout_head"), str):
+            raise ValueError(
+                "incompatible_run_state: pending Development is missing its managed checkout head"
+            )
+    else:
+        job["managed_checkout_head"] = stage.git.checkout_head(checkout)
+    intent = job.get("candidate_commit_intent")
+    if not (
+        isinstance(intent, dict)
+        and intent.get("expected_head") == job["managed_checkout_head"]
+        and intent.get("attempt") == attempt
+        and isinstance(intent.get("token"), str)
+        and intent.get("token")
+    ):
+        job["candidate_commit_intent"] = {
+            "kind": "candidate_commit",
+            "expected_head": str(job["managed_checkout_head"]),
+            "attempt": attempt,
+            "token": uuid4().hex,
+        }
     stage.save(state)
     request = stage.adapter.development_request(state, job, checkout)
     request["_invocation_event"] = stage._invocation_events(
@@ -114,9 +145,57 @@ def commit_candidate(
     checkout: Path,
 ) -> bool:
     attempt = int(job["pending_attempt"])
-    candidate = stage.publisher.commit_candidate(checkout, job, attempt)
+    expected_head = str(
+        job.get("managed_checkout_head")
+        or job.get("candidate_sha")
+        or job.get("base_sha")
+    )
+    intent = job.get("candidate_commit_intent")
+    if not (
+        isinstance(intent, dict)
+        and intent.get("expected_head") == expected_head
+        and intent.get("attempt") == attempt
+        and isinstance(intent.get("token"), str)
+        and intent.get("token")
+    ):
+        intent = {
+            "kind": "candidate_commit",
+            "expected_head": expected_head,
+            "attempt": attempt,
+            "token": uuid4().hex,
+        }
+        job["candidate_commit_intent"] = intent
+        stage.save(state)
+    try:
+        candidate = stage.publisher.commit_candidate(checkout, job, attempt)
+    except GitIntegrityError as error:
+        evidence = dict(error.evidence)
+        evidence.update(
+            {
+                "expected_head": str(
+                    expected_head
+                ),
+                "base_sha": str(job.get("base_sha", "")),
+                "previous_candidate_sha": str(job.get("candidate_sha", "")),
+            }
+        )
+        return _route_git_integrity_repair(stage, state, job, checkout, evidence)
     if candidate is None:
+        observed_head = stage.git.checkout_head(checkout)
+        if observed_head != expected_head:
+            evidence = {
+                "kind": "git_integrity",
+                "status": "fail",
+                "reason": "clean checkout head differs from the managed Candidate boundary",
+                "expected_head": expected_head,
+                "observed_head": observed_head,
+                "base_sha": str(job.get("base_sha", "")),
+                "previous_candidate_sha": str(job.get("candidate_sha", "")),
+                "workspace_clean": "true",
+            }
+            return _route_git_integrity_repair(stage, state, job, checkout, evidence)
         job.pop("pending_attempt", None)
+        job.pop("candidate_commit_intent", None)
         return stage._block(
             state,
             job,
@@ -128,10 +207,63 @@ def commit_candidate(
             "candidate_sha": candidate,
             "modification_attempts": attempt,
             "code_modification_attempts": attempt,
+            "attempt_kind": str(job.pop("pending_attempt_kind", "ordinary")),
             "phase": "candidate",
         }
     )
+    job.pop("next_attempt_kind", None)
+    job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
     job.pop("pending_attempt", None)
+    stage.save(state)
+    return True
+
+
+def _route_git_integrity_repair(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    checkout: Path,
+    evidence: dict[str, str],
+) -> bool:
+    """Return an integrity finding to the same Development Thread."""
+
+    expected_head = evidence.get("expected_head") or job.get("managed_checkout_head")
+    if not isinstance(expected_head, str) or not expected_head:
+        raise GitError("Git Integrity Repair is missing its legal checkout boundary")
+    try:
+        stage.git.restore_managed_checkout(checkout, expected_head=expected_head)
+    except GitError as error:
+        evidence["recovery_error"] = str(error)
+        job["git_integrity_evidence"] = evidence
+        job.update(
+            {
+                "phase": "escalating",
+                "escalation_code": "git_integrity_boundary_restore_failed",
+            }
+        )
+        stage.save(state)
+        return True
+
+    evidence["recovery_head"] = expected_head
+    evidence["recovery_action"] = "controller_reset_and_clean"
+    job["git_integrity_evidence"] = evidence
+    job["repair_source"] = "git_integrity"
+    job.pop("ci_evidence", None)
+    job.pop("required_checks_evidence", None)
+    job.pop("final_ci_fix_failure_head", None)
+    job["phase"] = "repairing"
+    job["managed_checkout_head"] = expected_head
+    job["modification_attempts"] = int(job["pending_attempt"])
+    job["code_modification_attempts"] = int(job["pending_attempt"])
+    job["attempt_kind"] = "ordinary"
+    job.pop("candidate_sha", None)
+    job.pop("acceptance_record", None)
+    job.pop("acceptance_artifact", None)
+    job.pop("pending_attempt", None)
+    job.pop("pending_attempt_kind", None)
+    job.pop("next_attempt_kind", None)
+    job.pop("candidate_commit_intent", None)
+    stage._sync_attempts(state, job)
     stage.save(state)
     return True

@@ -8,6 +8,7 @@ latest authoritative facts.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,11 @@ def _retired_record(subject: str, job: dict[str, Any]) -> dict[str, Any]:
         "had_candidate": isinstance(job.get("candidate_sha"), str),
         "had_acceptance": isinstance(job.get("acceptance_record"), dict),
         "had_publication": isinstance(job.get("publication"), dict),
+        "superseded_integrations": deepcopy(
+            job.get("superseded_integrations", [])
+        ),
+        "review_budget": deepcopy(job.get("review_budget")),
+        "review_budget_history": deepcopy(job.get("review_budget_history", [])),
     }
     return record
 

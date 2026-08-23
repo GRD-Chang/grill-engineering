@@ -21,6 +21,17 @@ from conftest import write_fixture
 from test_cli import issue, run_cli, stdout_json
 
 
+def _canonical_budget() -> dict[str, Any]:
+    return {
+        "window": 1,
+        "development_attempts": 0,
+        "reviewer_invocations": 0,
+        "final_ci_fix_used": False,
+        "review_artifacts": [],
+        "checkpoint_reason": None,
+    }
+
+
 def test_fixture_ticket_pr_rejects_same_sha_on_wrong_base_branch(
     git_repo: Path,
 ) -> None:
@@ -164,6 +175,8 @@ def _ticket_state() -> dict[str, Any]:
         "development_thread_id": "thread-old",
         "development_thread_history": ["thread-old", "development-earlier"],
         "reviewer_thread_ids": ["reviewer-old"],
+        "review_budget": _canonical_budget(),
+        "review_budget_history": [],
     }
     return {
         "run_id": "run-1",
@@ -226,6 +239,8 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
             "parent_generation": 2,
             "phase": "developing",
             "parent_branch": "agent-run/run-1/parent-generation-2",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
         },
     }
     parent_retired = requeue_change_job(parent_state)
@@ -238,17 +253,28 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
     repair = {
         "repair_generation": 3,
         "phase": "developing",
+        "review_budget": _canonical_budget(),
+        "review_budget_history": [],
         "repair_branch": "agent-run-repair/run-1/2-generation-3",
         "ticket_completion_records": [{"ticket_number": 7}],
     }
     repair_state: dict[str, Any] = {
         "run_id": "run-1",
         "status": "requeue_required",
-        "run_acceptance": {"phase": "repairing", "repair_job": repair},
+        "run_acceptance": {
+            "phase": "repairing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
+            "repair_job": repair,
+        },
     }
     repair_retired = requeue_change_job(repair_state)
     assert repair_retired["work_subject"] == "run-repair:run-1"
-    assert repair_state["run_acceptance"] == {"phase": "pending"}
+    assert repair_state["run_acceptance"] == {
+        "phase": "pending",
+        "review_budget": _canonical_budget(),
+        "review_budget_history": [],
+    }
     assert repair_state["active_agent_invocation"] is None
     assert repair_state["status"] == "run_acceptance_pending"
 
@@ -337,6 +363,8 @@ def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
             "ticket_branch_generation": 1,
             "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
             "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
         }
@@ -385,6 +413,8 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
             "ticket_branch_generation": 1,
             "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
             "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
         }
@@ -458,6 +488,8 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
             "ticket_branch_generation": 1,
             "ticket_branch": branch,
             "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
             "pr_number": pr_number,
@@ -536,6 +568,8 @@ def test_requeue_blocks_an_external_close_during_retirement(
             "ticket_branch_generation": 1,
             "ticket_branch": branch,
             "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
             "pr_number": pr_number,
@@ -585,7 +619,7 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     base_sha = git.resolve(str(state["run_branch"]))
     publisher.ensure_ticket_branch(branch=branch, base_branch=str(state["run_branch"]), ticket_number=7, expected_base_sha=base_sha, expected_remote_sha=base_sha, recovery_remote_sha=base_sha)
     pr_number = publisher.ensure_ticket_pr(branch=branch, base_branch=str(state["run_branch"]), title="old", body="old", primary_ticket=7, expected_head_sha=base_sha, expected_base_sha=base_sha)
-    job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
+    job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "review_budget": _canonical_budget(), "review_budget_history": [], "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)
     assert stdout_json(run_cli(git_repo, fixture, "run", "1"))["status"] == "requeue_required"
@@ -619,6 +653,8 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
             "ticket_branch_generation": 1,
             "ticket_branch": f"agent-run/{run_id}/ticket-7",
             "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
             "pr_number": 99,
@@ -691,6 +727,8 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
             "ticket_branch_generation": 1,
             "ticket_branch": f"agent-run/{run_id}/ticket-7",
             "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "effective_revision": "old-revision",
             "base_sha": GitRepository(git_repo).resolve(str(state["run_branch"])),
         }
@@ -724,6 +762,8 @@ def test_stale_human_blocker_cannot_resume_the_old_generation(git_repo: Path) ->
             "ticket_branch_generation": 1,
             "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
             "phase": "blocked",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "blocked_reason": "reviewer_requires_human",
             "human_blocker_phase": "candidate",
             "human_blockers": ["need decision"],

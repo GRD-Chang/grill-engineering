@@ -7,6 +7,7 @@ from typing import Any
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
+from agent_run.review_budget import RUN_POLICY, TICKET_POLICY
 
 def _print_precondition_failure(state: dict[str, object]) -> None:
     active = _active_ticket_job(state)
@@ -41,6 +42,8 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     active_ticket = active.get("ticket_number") if active else None
     worker = _current_worker(state)
     run_repair = _run_repair_status(state)
+    review_budget = _public_review_budget(state)
+    current_identity = _current_delivery_identity(state)
     invocation = state.get("active_agent_invocation")
     active_invocation = (
         invocation
@@ -56,6 +59,9 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "phase": _current_phase(state),
         "worker": worker,
         "run_repair": run_repair,
+        "candidate_sha": current_identity.get("candidate_sha"),
+        "pr_number": current_identity.get("pr_number"),
+        "review_budget": review_budget,
         "elapsed_seconds": _elapsed_seconds(state.get("created_at")),
         "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
         "next_action": _next_action(state),
@@ -73,6 +79,10 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     print(f"当前阶段: {_display_term(output['phase'])}")
     if active_ticket is not None:
         print(f"当前任务: #{active_ticket}")
+    print(
+        "当前 Candidate/PR: "
+        f"{output['candidate_sha'] or 'none'} / {output['pr_number'] or 'none'}"
+    )
     if worker is not None:
         print(
             "当前工作代理: "
@@ -110,6 +120,14 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
             f"Candidate 验证 {run_repair['validation_attempts']} 次；"
             "Candidate 验证状态 "
             f"{_display_term(run_repair['candidate_validation_status'])}"
+        )
+    if isinstance(review_budget, dict):
+        print(
+            "Review Budget: "
+            f"Window {review_budget['window']}；"
+            f"Development {review_budget['development_attempts']}/{review_budget['development_limit']}；"
+            f"Reviewer {review_budget['reviewer_invocations']}/{review_budget['reviewer_limit']}；"
+            f"Final CI-fix {'used' if review_budget['final_ci_fix_used'] else 'available'}"
         )
     print(f"已运行: {output['elapsed_seconds']} 秒")
     if output["gate"]:
@@ -365,6 +383,54 @@ def _active_ticket_job(state: dict[str, object]) -> dict[str, object] | None:
     return active
 
 
+def _current_delivery_identity(state: dict[str, object]) -> dict[str, object]:
+    """Return the Candidate/PR boundary operators need for diagnosis."""
+
+    active = _active_ticket_job(state)
+    if active is not None:
+        return {
+            "candidate_sha": active.get("candidate_sha"),
+            "pr_number": active.get("pr_number"),
+        }
+    parent = state.get("parent_job")
+    if isinstance(parent, dict) and parent.get("phase") not in {
+        "completed",
+        "merged",
+        "abandoned",
+    }:
+        return {
+            "candidate_sha": parent.get("candidate_sha"),
+            "pr_number": parent.get("pr_number"),
+        }
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        repair = acceptance.get("repair_job")
+        if isinstance(repair, dict):
+            return {
+                "candidate_sha": repair.get("candidate_sha"),
+                "pr_number": repair.get("pr_number"),
+            }
+        candidate = acceptance.get("reviewed_head_sha") or acceptance.get(
+            "candidate_sha"
+        )
+        publication = state.get("run_publication")
+        pr_number = publication.get("pr_number") if isinstance(publication, dict) else None
+        if candidate is not None or pr_number is not None:
+            return {"candidate_sha": candidate, "pr_number": pr_number}
+    publication = state.get("run_publication")
+    if isinstance(publication, dict):
+        record = publication.get("record")
+        return {
+            "candidate_sha": (
+                record.get("run_head_sha")
+                if isinstance(record, dict)
+                else publication.get("head_sha")
+            ),
+            "pr_number": publication.get("pr_number"),
+        }
+    return {"candidate_sha": None, "pr_number": None}
+
+
 def _worker_from_job(
     job: dict[str, object], *, run_repair: bool = False
 ) -> dict[str, object] | None:
@@ -428,6 +494,43 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "candidate_sha": job.get("candidate_sha"),
         "development_thread_id": cycle.get("development_thread_id"),
         "worktree": cycle.get("worktree"),
+    }
+
+
+def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
+    """Expose the active subject's bounded window without leaking policy logic."""
+
+    subject: dict[str, object] | None = None
+    active = state.get("active_ticket_job")
+    if isinstance(active, dict) and active.get("phase") not in {"completed", "merged"}:
+        subject = active
+        policy = TICKET_POLICY
+    else:
+        parent = state.get("parent_job")
+        if isinstance(parent, dict):
+            subject = parent
+            policy = RUN_POLICY
+        else:
+            acceptance = state.get("run_acceptance")
+            if not isinstance(acceptance, dict):
+                return None
+            repair = acceptance.get("repair_job")
+            subject = repair if isinstance(repair, dict) else acceptance
+            policy = RUN_POLICY
+    budget = subject.get("review_budget")
+    if not isinstance(budget, dict):
+        return None
+    return {
+        "window": budget.get("window"),
+        "development_attempts": budget.get("development_attempts"),
+        "development_limit": policy.development_limit,
+        "reviewer_invocations": budget.get("reviewer_invocations"),
+        "reviewer_limit": policy.review_limit,
+        "final_ci_fix_used": budget.get("final_ci_fix_used"),
+        "final_ci_fix_limit": policy.final_ci_fix_limit,
+        "checkpoint_reason": budget.get("checkpoint_reason"),
+        "candidate_sha": _current_delivery_identity(state).get("candidate_sha"),
+        "pr_number": _current_delivery_identity(state).get("pr_number"),
     }
 
 

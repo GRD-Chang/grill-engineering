@@ -20,6 +20,7 @@ from test_cli import run_internal_stage, run_cli, stdout_json
 
 from run_acceptance_test_support import (
     ScriptedRunAgents,
+    _canonical_run_budget,
     _completed_run,
     _passing_artifact,
     _repair_artifact,
@@ -109,6 +110,8 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     )
     run = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],
@@ -117,6 +120,8 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
         "acceptance_artifact": _repair_artifact(),
         "repair_job": {
             "phase": "developing",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "repair_generation": 1,
             "repair_branch": repair_branch,
             "base_sha": "stale-run-base",
@@ -199,6 +204,8 @@ def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": pr_number}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],
@@ -281,6 +288,8 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": pr_number}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],
@@ -363,10 +372,14 @@ def test_stale_run_repair_keeps_threads_out_of_fresh_review(
     state, _states, _git = _completed_run(git_repo)
     run = state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": ["run-reviewer"],
         "repair_job": {
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "development_thread_id": "repair-developer",
             "development_thread_history": ["repair-developer-old"],
             "reviewer_thread_ids": ["repair-reviewer"],
@@ -420,6 +433,8 @@ def test_interrupted_run_review_restarts_with_a_fresh_attempt(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 1,
         "modification_attempts": 0,
         "validation_attempts": 1,

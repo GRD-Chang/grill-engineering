@@ -14,6 +14,7 @@ class CandidateSaveCrashGit(GitRepository):
         default_head_sha: str,
         attempt: int,
         squash_candidate_sha: str | None = None,
+        candidate_intent: dict[str, object] | None = None,
         expected_conflict_paths: tuple[str, ...] = (),
     ) -> str:
         candidate = super().commit_merge_resolution_candidate(
@@ -22,6 +23,7 @@ class CandidateSaveCrashGit(GitRepository):
             default_head_sha=default_head_sha,
             attempt=attempt,
             squash_candidate_sha=squash_candidate_sha,
+            candidate_intent=candidate_intent,
             expected_conflict_paths=expected_conflict_paths,
         )
         raise RuntimeError(f"crash after creating {candidate}")
@@ -36,6 +38,7 @@ class CleanReprepareCrashGit(GitRepository):
         default_head_sha: str,
         attempt: int,
         squash_candidate_sha: str | None = None,
+        candidate_intent: dict[str, object] | None = None,
         expected_conflict_paths: tuple[str, ...] = (),
     ) -> str | None:
         raise RuntimeError("crash before creating clean reprepare Candidate")

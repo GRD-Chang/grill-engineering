@@ -13,6 +13,7 @@ from agent_run.change_delivery_contracts import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.review_budget import ReviewBudgetPolicy
 
 
 class ChangeDeliveryStage(Protocol):
@@ -95,5 +96,23 @@ class ChangeDeliveryStage(Protocol):
     ) -> None: ...
 
     def modification_budget_exhausted(self, job: dict[str, Any]) -> bool: ...
+
+    def review_budget_policy(self) -> ReviewBudgetPolicy: ...
+
+    def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool: ...
+
+    def _checkpoint_budget(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        code: str,
+        message: str,
+    ) -> None: ...
+
+    def mark_development_attempt(
+        self, job: dict[str, Any], *, attempt_kind: str
+    ) -> int: ...
+
+    def mark_review_invocation(self, job: dict[str, Any]) -> int: ...
 
     def publication_budget_exhausted(self, attempts: int) -> bool: ...

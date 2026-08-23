@@ -90,34 +90,6 @@ def _write_agents(path: Path, *, two_revisions: bool) -> Path:
     return path
 
 
-def _write_recovery_agents(path: Path) -> Path:
-    path.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": "developer-2",
-                        "thread_id": "developer-2",
-                        "summary": (
-                            "Rebuilt after the invalidated revision returned."
-                        ),
-                        "write_files": {"revision.txt": "rebuilt\n"},
-                    }
-                ],
-                "publications": [_publication("rebuilt")],
-                "reviews": [
-                    passing_acceptance(
-                        "reviewer-rebuilt",
-                        "Fresh review passed after ABA recovery.",
-                    )
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
 def _write_replacement_agents(path: Path) -> Path:
     path.write_text(
         json.dumps(
@@ -572,7 +544,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
             ("required_checks", 28),
         ],
 )
-def test_aba_revision_after_crash_still_forces_fresh_rebuild(
+def test_aba_revision_after_crash_requires_explicit_requeue(
     git_repo: Path, action: str, mismatch_save: int
 ) -> None:
     original_body = _ticket()["body"]
@@ -618,40 +590,73 @@ def test_aba_revision_after_crash_still_forces_fresh_rebuild(
     live = json.loads(fixture.read_text(encoding="utf-8"))
     live["issues"]["2"]["body"] = original_body
     fixture.write_text(json.dumps(live), encoding="utf-8")
-    recovery_agents = _write_recovery_agents(
-        git_repo / "agents-recovery.json"
+    replacement_agents = _write_replacement_agents(
+        git_repo / "agents-replacement.json"
     )
 
-    recovered = run_internal_stage(
+    stale = run_internal_stage(
         git_repo,
         fixture,
         "deliver",
         run_id,
         "--agent-fixture",
-        str(recovery_agents),
+        str(replacement_agents),
     )
 
-    assert recovered.returncode == 0, recovered.stdout
+    assert stale.returncode == 2, stale.stdout
+    stale_state = load_only_run_state(git_repo)
+    assert stale_state["status"] == "requeue_required"
+    stale_job = stale_state["ticket_jobs"]["2"]
+    assert stale_job["ticket_branch_generation"] == 1
+    assert stale_job["development_thread_id"] == "developer-2"
+    assert stale_job["phase"] == "blocked"
+    assert stale_job["blocked_reason"] == "effective_revision_mismatch"
+
+    requeued = run_cli(
+        git_repo,
+        fixture,
+        "requeue",
+        run_id,
+        "--agent-fixture",
+        str(replacement_agents),
+    )
+
+    assert requeued.returncode == 0, requeued.stdout
     state = load_only_run_state(git_repo)
     job = state["ticket_jobs"]["2"]
     assert state["status"] == "run_acceptance_pending"
     assert job["phase"] == "completed"
-    assert job["reviewer_thread_ids"] == [
-        "reviewer-original",
-        "reviewer-rebuilt",
-    ]
-    assert job["acceptance_record"]["reviewer_thread_id"] == (
-        "reviewer-rebuilt"
-    )
+    assert job["ticket_branch_generation"] == 2
+    assert job["development_thread_id"] == "developer-current"
+    assert job["reviewer_thread_ids"] == ["reviewer-current"]
+    assert job["acceptance_record"]["reviewer_thread_id"] == "reviewer-current"
     assert job["acceptance_record"]["effective_revision"] == (
         job["effective_revision"]
     )
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
-    assert len(delivery["pull_requests"]) == 1
+    pull_states = [pull["state"] for pull in delivery["pull_requests"]]
+    assert pull_states[-1] == "MERGED"
+    if action == "publish_branch":
+        assert pull_states == ["MERGED"]
+    else:
+        assert pull_states == ["CLOSED", "MERGED"]
     assert delivery["acceptance_records"] == []
-    assert len(delivery["agent_run_status"]) == 1
+    statuses = delivery["agent_run_status"]
+    if action == "publish_branch":
+        assert len(statuses) == 1
+    else:
+        assert statuses[0]["scope"] == "superseded_generation"
+        assert statuses[0]["generation"] == 1
+        assert len(statuses) == 2
     assert delivery["closed_issues"] == [2]
-    assert [
-        mutation["action"] for mutation in delivery["mutations"]
-    ] == ["completion_comment", "close_issue", "delete_managed_branch"]
+    expected_mutations = [
+        "completion_comment",
+        "close_issue",
+        "delete_managed_branch",
+    ]
+    if action != "publish_branch":
+        expected_mutations.insert(0, "close_change_pr")
+    assert [mutation["action"] for mutation in delivery["mutations"]] == (
+        expected_mutations
+    )

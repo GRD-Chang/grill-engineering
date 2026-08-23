@@ -13,6 +13,7 @@ from agent_run.state_contract import (
 )
 from conftest import write_fixture
 from test_cli import issue, load_only_run_state, run_cli, stdout_json
+from run_acceptance_test_support import _canonical_run_budget
 
 
 def _git_refs(repo: Path) -> str:
@@ -33,7 +34,11 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
     state = load_only_run_state(git_repo)
-    repair_job: dict[str, object] = {"phase": phase}
+    repair_job: dict[str, object] = {
+        "phase": phase,
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+    }
     if repair_mode is not None:
         repair_job["repair_mode"] = repair_mode
     state["run_acceptance"] = {
@@ -77,7 +82,14 @@ def test_canonical_run_repair_modes_pass_state_validation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
-        "repair_job": {"phase": "developing", "repair_mode": repair_mode},
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "developing",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+            "repair_mode": repair_mode,
+        },
     }
 
     require_current_run_state(state)
@@ -91,7 +103,13 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
-        "repair_job": {"phase": "candidate"},
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "candidate",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+        },
     }
 
     with pytest.raises(IncompatibleRunStateError, match="repair_mode"):
@@ -153,8 +171,12 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": {
             "phase": phase,
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "repair_mode": "squash",
             "integrated_revalidation_merge": marker,
         },
@@ -183,8 +205,12 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": {
             "phase": "candidate",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "repair_mode": "squash",
             "integrated_revalidation_merge": _integrated_revalidation_merge(),
         },
@@ -201,8 +227,12 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_job": {
             "phase": "completed",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "repair_mode": "squash",
             "integrated_revalidation_merge": _integrated_revalidation_merge(),
         },

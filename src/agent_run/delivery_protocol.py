@@ -161,6 +161,10 @@ class GitHubPublisher(Protocol):
 
     def required_checks(self, pr_number: int) -> str: ...
 
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]: ...
+
     def required_check_evidence(
         self, pr_number: int, *, expected_head_sha: str | None = None
     ) -> dict[str, Any]: ...

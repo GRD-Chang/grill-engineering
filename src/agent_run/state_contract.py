@@ -3,7 +3,22 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from agent_run.review_budget import (
+    RUN_POLICY,
+    TICKET_POLICY,
+    ReviewBudgetPolicy,
+    ensure_budget,
+)
+from agent_run.integration_record_contract import (
+    require_completed_ticket_integration_records as require_completed_ticket_integration_records,
+)
+from agent_run.state_errors import (
+    IncompatibleRunStateError as IncompatibleRunStateError,
+)
 from agent_run.ticket_phase import TicketPhase
+from agent_run.ticket_publication_contract import (
+    require_active_ticket_publication_authorization as require_active_ticket_publication_authorization,
+)
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
@@ -64,12 +79,6 @@ _INTEGRATED_REVALIDATION_MERGE_KEYS = frozenset(
         "publication_sha",
     }
 )
-
-
-class IncompatibleRunStateError(ValueError):
-    """A persisted Run predates the one supported Invocation/Generation shape."""
-
-
 def require_current_run_state(state: dict[str, Any]) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
 
@@ -82,6 +91,10 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     ) != 2:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible branch authority protocol"
+        )
+    if state.get("review_budget_protocol") != 1:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Review Budget protocol"
         )
     for key, expected in (
         ("run_id", str),
@@ -105,6 +118,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
+    require_completed_ticket_integration_records(state)
+    _require_review_budget_windows(state)
+    active_ticket = state.get("active_ticket_job")
+    if isinstance(active_ticket, dict):
+        require_active_ticket_publication_authorization(active_ticket)
     _require_human_blocker_containers(state)
     _require_candidate_acceptance_histories(state)
     _require_active_run_repair_mode(state)
@@ -286,6 +304,40 @@ def _require_integrated_revalidation_merge(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.{key}"
             )
+
+
+def _require_review_budget_windows(state: dict[str, Any]) -> None:
+    """Reject Jobs that cannot prove the canonical bounded-budget shape."""
+
+    subjects: list[tuple[str, dict[str, Any], ReviewBudgetPolicy]] = []
+    ticket_jobs = state.get("ticket_jobs")
+    if isinstance(ticket_jobs, dict):
+        subjects.extend(
+            (f"ticket_jobs[{key}]", job, TICKET_POLICY)
+            for key, job in ticket_jobs.items()
+            if isinstance(job, dict) and _looks_like_materialized_job(job)
+        )
+    for key in ("parent_job", "run_acceptance"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            subjects.append((key, value, RUN_POLICY))
+            if key == "run_acceptance" and isinstance(value.get("repair_job"), dict):
+                subjects.append(("run_acceptance.repair_job", value["repair_job"], RUN_POLICY))
+    for location, job, policy in subjects:
+        try:
+            ensure_budget(job, policy)
+        except (TypeError, ValueError) as error:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid canonical {location}.review_budget"
+            ) from error
+
+
+def _looks_like_materialized_job(value: dict[str, Any]) -> bool:
+    """Exclude frontier selection placeholders from nested Job validation."""
+
+    return any(
+        key in value for key in ("phase", "review_budget", "modification_attempts")
+    )
 
 
 def human_blocker_subject_count(state: dict[str, Any]) -> int:

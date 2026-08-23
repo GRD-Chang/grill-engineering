@@ -28,6 +28,7 @@ from test_cli import run_cli, stdout_json
 from run_acceptance_test_support import (
     ScriptedRunAgents,
     _BLOCKED_EVIDENCE,
+    _canonical_run_budget,
     _candidate_finding_artifact,
     _completed_run,
     _human_artifact,
@@ -75,6 +76,10 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
         "run-reviewer-1",
         "run-reviewer-2",
     ]
+    assert [
+        item["reviewer_thread_id"]
+        for item in run["review_budget"]["review_artifacts"]
+    ] == ["run-reviewer-1", "run-reviewer-2"]
 
     assert run["reviewed_head_sha"] == git.resolve(str(state["run_branch"]))
     assert run["acceptance_record"]["acceptance_state"] == "integrated"
@@ -95,6 +100,19 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert len(agents.review_requests) == 2
     candidate_request = agents.review_requests[1]
     assert candidate_request["candidate_acceptance"] is True
+    assert candidate_request["repair_scope"] == "run_repair"
+    assert candidate_request["previous_acceptance_artifact"] == _repair_artifact()
+    assert candidate_request["previous_review_identity"] == agents.review_requests[0][
+        "current_review_identity"
+    ]
+    assert set(candidate_request["current_review_identity"]) == {
+        "run_base_sha",
+        "repair_candidate_sha",
+        "expected_merge_tree",
+    }
+    assert candidate_request["current_review_identity"]["repair_candidate_sha"] == (
+        run["candidate_sha"]
+    )
     assert not {
         "run_id",
         "parent",
@@ -152,6 +170,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     artifact = _repair_artifact()
     run = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 4,
         "repair_generation": 2,
         "modification_attempts": 10,
@@ -170,6 +190,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     run["repair_job"] = {
         "run_id": state["run_id"],
         "phase": "escalating",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_attempt": 1,
         "repair_generation": 2,
         "repair_branch": f"agent-run-repair/{state['run_id']}/1",
@@ -255,6 +277,8 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     state, states, git = _completed_run(git_repo)
     run = state["run_acceptance"] = {
         "phase": "pending",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 1,
         "repair_generation": 1,
         "modification_attempts": 0,
@@ -330,6 +354,8 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     state["status"] = run_status
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "acceptance_generation": 4,
         "repair_cycle": {
             "generation": 2,
@@ -339,6 +365,8 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
         },
         "repair_job": {
             "phase": job_phase,
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "repair_mode": "squash",
             "candidate_sha": candidate_sha,
             "acceptance_record": {
@@ -457,10 +485,10 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
         def review(self, request: dict[str, Any]) -> ReviewResult:
             assert request["candidate_acceptance"] is True
             self.review_count += 1
-            attempt = (self.review_count - 1) % 9
+            attempt = (self.review_count - 1) % 5
             return ReviewResult(
                 f"audit-reviewer-{self.review_count}",
-                _passing_artifact() if attempt == 8 else _candidate_finding_artifact(),
+                _passing_artifact() if attempt == 4 else _candidate_finding_artifact(),
             )
 
         def publication(self, _request: dict[str, Any]) -> dict[str, str]:
@@ -483,6 +511,8 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
         artifact = _repair_artifact()
         state["run_acceptance"] = {
             "phase": "repairing",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "repair_generation": int(prior.get("repair_generation", 0)),
             "modification_attempts": 0,
             "validation_attempts": 0,
@@ -517,13 +547,13 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
         state = reloaded_cycle
         assert len(state["run_acceptance"]["candidate_acceptance_history"]) == (
             cycle + 1
-        ) * 9
+            ) * 5
 
     history = state["run_acceptance"]["candidate_acceptance_history"]
-    assert len(history) == 36
-    assert len({entry["candidate_sha"] for entry in history}) == 36
+    assert len(history) == 20
+    assert len({entry["candidate_sha"] for entry in history}) == 20
     assert history[0]["reviewer_thread_id"] == "audit-reviewer-1"
-    assert history[-1]["reviewer_thread_id"] == "audit-reviewer-36"
+    assert history[-1]["reviewer_thread_id"] == "audit-reviewer-20"
     assert all("acceptance_record" not in item for item in history)
     assert all("artifact" not in item for item in history)
     assert history[-1]["ticket_completion_records_fingerprint"] == canonical_fingerprint(
@@ -559,6 +589,8 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     )
     candidate_sha = git.resolve(str(state["run_branch"]))
     job = {
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "default_base_sha": git.resolve("main"),
         "candidate_sha": candidate_sha,
         "base_sha": candidate_sha,
@@ -575,6 +607,8 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     assert job["candidate_acceptance_history"][-1]["outcome"] == expected_outcome
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "candidate_acceptance_history": [],
         "repair_job": job,
     }

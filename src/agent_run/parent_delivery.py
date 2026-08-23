@@ -25,6 +25,7 @@ from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.parent_delivery_loop import ParentDeliveryLoop
 from agent_run.state import StateStore
+from agent_run.review_budget import RUN_POLICY, new_budget, reset_budget
 
 
 class ParentDeliveryEngine:
@@ -328,6 +329,8 @@ class ParentDeliveryEngine:
             "reviewer_thread_ids": [],
             "validation_attempts": 0,
             "acceptance_artifact": None,
+            "review_budget": new_budget(),
+            "review_budget_history": [],
         }
         state["parent_job"] = job
         self._save(state)
@@ -337,6 +340,7 @@ class ParentDeliveryEngine:
     def _reset_for_revision(
         state: dict[str, Any], job: dict[str, Any], revision: str
     ) -> None:
+        reset_budget(job, RUN_POLICY)
         for key in (
             "candidate_sha",
             "publication",
@@ -355,6 +359,14 @@ class ParentDeliveryEngine:
             "human_response_history",
             "human_response_generation",
             "prior_human_blockers",
+            "publication_authority",
+            "fallback_publication_receipt",
+            "deterministic_integration_record",
+            "required_checks",
+            "required_checks_mode",
+            "next_attempt_kind",
+            "last_review_candidate_sha",
+            "final_ci_fix_failure_head",
         ):
             job.pop(key, None)
         job.update(

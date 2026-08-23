@@ -9,6 +9,8 @@ and StateStore persistence are kept in their own seam.  In particular,
 neither layer gets a shortcut from development to a Run Branch write.
 """
 
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +19,15 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
 from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.review_budget import (
+    ReviewBudgetPolicy,
+    can_start_development,
+    can_start_review,
+    ensure_budget,
+    mark_development,
+    mark_review,
+    policy_for_subject,
+)
 
 MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
@@ -39,6 +50,12 @@ from agent_run.change_delivery_development import (
     resume_after_initial_credential,
     wait_for_initial_credential as wait_for_initial_credential_stage,
 )
+from agent_run.change_delivery_fallback import (
+    fallback_candidate_is_eligible,
+    fallback_publication_context,
+    prepare_ticket_fallback,
+    previous_publication_authorization,
+)
 from agent_run.change_delivery_publication_agent import (
     invocation_events,
     invocation_identity,
@@ -56,6 +73,9 @@ from agent_run.change_delivery_state import (
 )
 from agent_run.change_delivery_threads import (
     latest_reviewer_thread as latest_reviewer_thread,
+)
+from agent_run.ticket_publication_contract import (
+    require_active_ticket_publication_authorization,
 )
 
 
@@ -93,7 +113,9 @@ class ChangeDeliveryEngine:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
         try:
+            ensure_budget(job, self.review_budget_policy())
             while True:
+                self._require_ticket_publication_authorization(job)
                 phase = str(job["phase"])
                 if phase in {"completed", "blocked"}:
                     return state
@@ -122,6 +144,8 @@ class ChangeDeliveryEngine:
                     return self.save(state)
                 if phase in {"developing", "repairing"}:
                     self._develop(state, job, checkout)
+                    if job["phase"] in {"blocked", "escalating"}:
+                        continue
                 if job["phase"] == "committing_candidate":
                     self._reject_stale(
                         state,
@@ -132,6 +156,21 @@ class ChangeDeliveryEngine:
                     if not self._commit_candidate(state, job, checkout):
                         return state
                 if job["phase"] == "candidate":
+                    if self.review_budget_exhausted_for_review(job):
+                        if self._prepare_ticket_fallback(state, job):
+                            continue
+                        checkpoint_code = (
+                            "modification_budget_exhausted"
+                            if self.review_budget_policy().fallback
+                            else "review_budget_exhausted"
+                        )
+                        self._checkpoint_budget(
+                            state,
+                            job,
+                            checkpoint_code,
+                            "Review budget is exhausted and the current Candidate still needs modification",
+                        )
+                        continue
                     self._review(state, job, checkout)
                     if job["phase"] == "escalating":
                         # Budget exhaustion is a durable terminal boundary;
@@ -187,6 +226,7 @@ class ChangeDeliveryEngine:
         except _TerminalChangeJob:
             return state
         except InitialCredentialUnavailable as error:
+            self._refund_unstarted_credential_invocation(job)
             self._wait_for_initial_credential(
                 state, job, http_status=error.http_status
             )
@@ -218,6 +258,19 @@ class ChangeDeliveryEngine:
     def _develop(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
+        attempt_kind = str(job.get("next_attempt_kind", "ordinary"))
+        if attempt_kind not in {"ordinary", "final_ci_fix"}:
+            raise ValueError(f"unknown Development attempt kind: {attempt_kind}")
+        if not can_start_development(
+            job, self.review_budget_policy(), attempt_kind=attempt_kind
+        ):
+            self._checkpoint_budget(
+                state,
+                job,
+                "modification_budget_exhausted",
+                "Development budget is exhausted for the current Review Budget Window",
+            )
+            return
         develop(self, state, job, checkout)
 
     def _wait_for_initial_credential(
@@ -245,6 +298,29 @@ class ChangeDeliveryEngine:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         publication(self, state, job, checkout)
+
+    def _require_ticket_publication_authorization(
+        self, job: dict[str, Any]
+    ) -> None:
+        if not self.contract.label.startswith("ticket-") or job.get("phase") not in {
+            "accepted",
+            "publication_pending",
+            "publishing",
+            "waiting_checks",
+            "waiting_merge",
+            "merging",
+        }:
+            return
+        candidate_sha = job.get("candidate_sha")
+        if not isinstance(candidate_sha, str) or not candidate_sha.strip():
+            raise ValueError("active Ticket publication is missing candidate_sha")
+        candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
+        require_active_ticket_publication_authorization(
+            job,
+            candidate_tree=candidate_tree,
+            location=self.contract.label.replace("ticket-", "ticket_jobs[", 1)
+            + "]",
+        )
 
     def _invocation_events(
         self,
@@ -294,7 +370,67 @@ class ChangeDeliveryEngine:
         return publish_and_merge(self, state, job, checkout)
 
     def modification_budget_exhausted(self, job: dict[str, Any]) -> bool:
-        return int(job["modification_attempts"]) >= MAX_MODIFICATION_ATTEMPTS
+        return not can_start_development(job, self.review_budget_policy())
+
+    def _refund_unstarted_credential_invocation(self, job: dict[str, Any]) -> None:
+        budget = ensure_budget(job, self.review_budget_policy())
+        if (
+            job.get("phase") in {"developing", "repairing"}
+            and isinstance(job.get("pending_attempt"), int)
+            and job["pending_attempt"] > int(job.get("modification_attempts", 0))
+        ):
+            if job.get("pending_attempt_kind") == "final_ci_fix":
+                budget["final_ci_fix_used"] = False
+            elif budget["development_attempts"] > 0:
+                budget["development_attempts"] -= 1
+            job.pop("pending_attempt", None)
+            job.pop("pending_attempt_kind", None)
+
+    def review_budget_policy(self) -> ReviewBudgetPolicy:
+        policy = policy_for_subject(self.contract.label)
+        if policy.fallback and MAX_MODIFICATION_ATTEMPTS != 10:
+            return replace(policy, development_limit=MAX_MODIFICATION_ATTEMPTS)
+        return policy
+
+    def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool:
+        return not can_start_review(job, self.review_budget_policy())
+
+    def mark_development_attempt(
+        self, job: dict[str, Any], *, attempt_kind: str
+    ) -> int:
+        return mark_development(
+            job, self.review_budget_policy(), attempt_kind=attempt_kind
+        )
+
+    def mark_review_invocation(self, job: dict[str, Any]) -> int:
+        return mark_review(job, self.review_budget_policy())
+
+    def _checkpoint_budget(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        code: str,
+        message: str,
+    ) -> None:
+        job.update({"phase": "escalating", "escalation_code": code})
+        budget = ensure_budget(job, self.review_budget_policy())
+        budget["checkpoint_reason"] = code
+        self.save(state)
+
+    @staticmethod
+    def _previous_publication_authorization(
+        job: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return previous_publication_authorization(job)
+
+    def _prepare_ticket_fallback(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool:
+        return prepare_ticket_fallback(self, state, job)
+
+    @staticmethod
+    def _fallback_candidate_is_eligible(job: dict[str, Any]) -> bool:
+        return fallback_candidate_is_eligible(job)
 
     def publication_budget_exhausted(self, attempts: int) -> bool:
         return attempts >= MAX_PUBLICATION_ATTEMPTS
@@ -327,12 +463,19 @@ class ChangeDeliveryEngine:
         *,
         next_action: str | None = None,
     ) -> None:
-        artifact = _mapping(job, "acceptance_artifact")
-        raw_checks = _mapping(artifact, "checks")
-        lane_statuses = {
-            lane: str(_mapping(raw_checks, lane)["status"])
-            for lane in ("e2e", "standards", "spec")
-        }
+        if job.get("publication_authority") == "fallback":
+            validation_outcome = "fallback"
+            lane_statuses = {
+                lane: "not_run" for lane in ("e2e", "standards", "spec")
+            }
+        else:
+            artifact = _mapping(job, "acceptance_artifact")
+            raw_checks = _mapping(artifact, "checks")
+            validation_outcome = AcceptanceArtifact.parse(artifact).outcome
+            lane_statuses = {
+                lane: str(_mapping(raw_checks, lane)["status"])
+                for lane in ("e2e", "standards", "spec")
+            }
         if next_action is None:
             if checks == "pending":
                 next_action = "wait for Required Checks"
@@ -348,7 +491,7 @@ class ChangeDeliveryEngine:
                 "scope": self.contract.label,
                 "base_sha": str(job["base_sha"]),
                 "candidate_sha": str(job["candidate_sha"]),
-                "validation_outcome": AcceptanceArtifact.parse(artifact).outcome,
+                "validation_outcome": validation_outcome,
                 "lane_statuses": lane_statuses,
                 "required_checks": checks,
                 "next_action": next_action,
@@ -358,6 +501,27 @@ class ChangeDeliveryEngine:
     def _publication_is_current(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
+        if job.get("publication_authority") == "fallback":
+            receipt = job.get("fallback_publication_receipt")
+            if not isinstance(receipt, dict):
+                return False
+            candidate = job.get("candidate_sha")
+            if not isinstance(candidate, str):
+                return False
+            try:
+                candidate_tree = self.git.resolve(f"{candidate}^{{tree}}")
+            except (GitError, ValueError):
+                return False
+            return (
+                receipt.get("base_sha") == job.get("base_sha")
+                and receipt.get("candidate_sha") == candidate
+                and receipt.get("candidate_tree") == candidate_tree
+                and receipt.get("effective_revision") == job.get("effective_revision")
+                and self.adapter.base_is_current(
+                    self.git.resolve(self.contract.base_branch), job
+                )
+                and not self.adapter.revision_changed(state, job)
+            )
         acceptance = job.get("acceptance_record")
         return (
             isinstance(acceptance, dict)

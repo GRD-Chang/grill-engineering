@@ -172,6 +172,18 @@ def _accepted_run(
         check=True,
     )
     state["ticket_jobs"]["2"]["integrated_sha"] = integrated
+    integration = state["ticket_jobs"]["2"]["deterministic_integration_record"]
+    integration.update(
+        {
+            "integrated_sha": integrated,
+            "integrated_tree": tree,
+            "integrated_message": git.commit_subject(integrated),
+            "integrated_parents": git.commit_parents(integrated),
+        }
+    )
+    integration["pr"].update(
+        {"state": "MERGED", "merge_commit_sha": integrated}
+    )
     states.save_run(str(state["run_id"]), state)
     publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
     accepted = RunAcceptanceEngine(

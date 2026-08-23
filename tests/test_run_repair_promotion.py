@@ -17,6 +17,7 @@ from agent_run.state_contract import IncompatibleRunStateError
 
 from run_acceptance_test_support import (
     ScriptedRunAgents,
+    _canonical_run_budget,
     _candidate_finding_artifact,
     _completed_run,
     _passing_artifact,
@@ -32,6 +33,8 @@ def test_candidate_history_state_load_rejects_nested_acceptance_record_before_mu
     state, states, _git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "pending",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "candidate_acceptance_history": _malformed_candidate_history(),
     }
     states.save_run(str(state["run_id"]), state)
@@ -45,9 +48,13 @@ def test_candidate_history_stale_recovery_rejects_unknown_fields_before_mutation
     state, _states, _git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "repair_cycle": {"status": "active"},
         "candidate_acceptance_history": [],
         "repair_job": {
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
             "candidate_acceptance_history": _malformed_candidate_history(),
         },
     }
@@ -582,6 +589,8 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     }
     state["run_acceptance"] = {
         "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],

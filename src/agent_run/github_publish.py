@@ -5,6 +5,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
 from agent_run.github import GhGitHubReader, GitHubReadError, MergeOutcomeUnknownError
@@ -670,6 +671,40 @@ class GhGitHubPublisher:
             return "pending"
         return "pass"
 
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        live = self.live_pull_request(pr_number)
+        if live.get("head_sha") != expected_head_sha:
+            raise GitHubReadError(
+                "change_pr_head_drift",
+                "Required Checks snapshot does not match the expected PR head",
+            )
+        checks = [
+            dict(_mapping(check))
+            for check in self._checks(
+                pr_number, "bucket,state,name,link,workflow,description"
+            )
+        ]
+        buckets = {str(check.get("bucket", "")).lower() for check in checks}
+        result = (
+            "none"
+            if not buckets
+            else "fail"
+            if buckets & {"fail", "cancel"}
+            else "pending"
+            if "pending" in buckets
+            else "unknown"
+            if buckets - {"fail", "cancel", "pending", "pass", "skipping", "neutral"}
+            else "pass"
+        )
+        return {
+            "pr_number": pr_number,
+            "head_sha": expected_head_sha,
+            "result": result,
+            "checks": checks,
+        }
+
     def required_check_evidence(
         self, pr_number: int, *, expected_head_sha: str | None = None
     ) -> dict[str, Any]:
@@ -738,24 +773,23 @@ class GhGitHubPublisher:
             ) from error
         if not isinstance(checks, list):
             raise GitHubReadError("github_invalid_response", "checks must be an array")
-        return checks
+        if not checks:
+            return self._ruleset_checks(pr_number, fields)
+        live = self.live_pull_request(pr_number)
+        required_contexts = self._required_check_contexts(
+            _string(live, "base_branch")
+        )
+        if not required_contexts:
+            return checks
+        return self._project_required_checks(required_contexts, checks)
 
     def _ruleset_checks(self, pr_number: int, fields: str) -> list[object]:
         live = self.live_pull_request(pr_number)
-        base_branch = _string(live, "base_branch")
-        required_contexts = self._ruleset_required_contexts(base_branch)
+        required_contexts = self._required_check_contexts(
+            _string(live, "base_branch")
+        )
         if not required_contexts:
             return []
-        integration_bound = [
-            context
-            for context, integration_id in required_contexts.items()
-            if integration_id is not None
-        ]
-        if integration_bound:
-            raise GitHubReadError(
-                "github_unsupported_ruleset",
-                "Ruleset required checks with integration_id are not safely observable",
-            )
         requested_fields = tuple(field for field in fields.split(",") if field)
         check_fields = ",".join(dict.fromkeys((*requested_fields, "name")))
         checks = self._json(
@@ -770,6 +804,27 @@ class GhGitHubPublisher:
         )
         if not isinstance(checks, list):
             raise GitHubReadError("github_invalid_response", "checks must be an array")
+        return self._project_required_checks(required_contexts, checks)
+
+    def _required_check_contexts(self, branch: str) -> dict[str, int | None]:
+        required_contexts = self._ruleset_required_contexts(branch)
+        for context in self._branch_protection_required_contexts(branch):
+            required_contexts.setdefault(context, None)
+        integration_bound = [
+            context
+            for context, integration_id in required_contexts.items()
+            if integration_id is not None
+        ]
+        if integration_bound:
+            raise GitHubReadError(
+                "github_unsupported_ruleset",
+                "Ruleset required checks with integration_id are not safely observable",
+            )
+        return required_contexts
+
+    def _project_required_checks(
+        self, required_contexts: dict[str, int | None], checks: list[object]
+    ) -> list[object]:
         matching = [
             check
             for check in checks
@@ -781,6 +836,46 @@ class GhGitHubPublisher:
             for context in required_contexts
             if context not in observed
         ]
+
+    def _branch_protection_required_contexts(self, branch: str) -> list[str]:
+        """Read classic branch-protection contexts, including unreported ones.
+
+        ``gh pr checks --required`` omits a protected context until its first
+        check run exists.  The protection API is the authority for that
+        missing-run case; a 404 means this branch has no classic protection.
+        Any other response is a read failure so the caller cannot mistake an
+        unavailable protection read for an unconfigured repository.
+        """
+
+        endpoint = (
+            f"repos/{self.repository}/branches/{quote(branch, safe='')}/"
+            "protection/required_status_checks/contexts"
+        )
+        result = self._run("api", endpoint)
+        if result.returncode == 404 or (
+            result.returncode != 0 and "http 404" in result.stderr.lower()
+        ):
+            return []
+        if result.returncode != 0:
+            raise GitHubReadError(
+                "github_read_failed",
+                result.stderr.strip() or "could not read branch protection",
+            )
+        try:
+            payload = json.loads(result.stdout or "null")
+        except json.JSONDecodeError as error:
+            raise GitHubReadError(
+                "github_invalid_response",
+                f"branch protection contexts are invalid: {error}",
+            ) from error
+        if not isinstance(payload, list) or not all(
+            isinstance(context, str) and context.strip() for context in payload
+        ):
+            raise GitHubReadError(
+                "github_invalid_response",
+                "branch protection contexts must be an array of strings",
+            )
+        return list(dict.fromkeys(payload))
 
     def _ruleset_required_contexts(self, branch: str) -> dict[str, int | None]:
         pages = self._json(

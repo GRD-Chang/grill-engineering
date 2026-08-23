@@ -17,9 +17,22 @@ from agent_run.cli_surface import _resume_is_ready
 from agent_run.human_responses import append_human_response
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from conftest import write_fixture
+from run_acceptance_test_support import _passing_artifact
+
+
+def _canonical_budget() -> dict[str, Any]:
+    return {
+        "window": 1,
+        "development_attempts": 0,
+        "reviewer_invocations": 0,
+        "final_ci_fix_used": False,
+        "review_artifacts": [],
+        "checkpoint_reason": None,
+    }
 
 
 def test_human_response_history_keeps_ordered_immutable_entries() -> None:
@@ -100,6 +113,8 @@ def test_parent_revision_reset_starts_a_new_human_response_generation() -> None:
     state: dict[str, Any] = {"base": {"sha": "base"}}
     job: dict[str, Any] = {
         "parent_generation": 1,
+        "review_budget": _canonical_budget(),
+        "review_budget_history": [],
         "human_response_generation": 1,
         "human_response_history": [{"generation": 1, "response": "old"}],
         "prior_human_blockers": ["old blocker"],
@@ -160,21 +175,68 @@ def _prepared_resume(
 
     if subject_kind == "ticket":
         job = state["ticket_jobs"]["3"]
+        ticket = state["ticket_graph"]["tickets"]["3"]
+        current_revision = effective_revision(
+            ticket_revision=str(ticket["content_revision"]),
+            parent_revision=str(state["parent"]["revision"]),
+            graph_revision=str(state["ticket_graph"]["revision"]),
+        )
         job.update(
             {
                 "ticket_number": 3,
                 "ticket_branch_generation": 2,
                 "phase": "accepted",
+                "base_sha": GitRepository(git_repo).resolve(
+                    str(state["run_branch"])
+                ),
+                "candidate_sha": "candidate-sha",
+                "effective_revision": current_revision,
+                "acceptance_artifact": _passing_artifact(),
+                "acceptance_record": {
+                    "acceptance_scope": "change_job",
+                    "reviewed_base_sha": GitRepository(git_repo).resolve(
+                        str(state["run_branch"])
+                    ),
+                    "reviewed_candidate_sha": "candidate-sha",
+                    "reviewed_candidate_tree": "candidate-tree",
+                    "effective_revision": current_revision,
+                    "reviewer_thread_id": "reviewer-thread",
+                    "artifact": _passing_artifact(),
+                },
                 "publication_thread_id": "current-ticket-thread",
+                "review_budget": _canonical_budget(),
+                "review_budget_history": [],
             }
         )
+        acceptance = job["acceptance_record"]
+        job["review_budget"]["reviewer_invocations"] = 1
+        job["review_budget"]["review_artifacts"] = [
+            {
+                "reviewer_thread_id": acceptance["reviewer_thread_id"],
+                "candidate_sha": acceptance["reviewed_candidate_sha"],
+                "reviewed_base_sha": acceptance["reviewed_base_sha"],
+                "review_identity": {
+                    "reviewed_base_sha": acceptance["reviewed_base_sha"],
+                    "reviewed_candidate_sha": acceptance["reviewed_candidate_sha"],
+                    "reviewed_candidate_tree": acceptance["reviewed_candidate_tree"],
+                },
+                "artifact": acceptance["artifact"],
+            }
+        ]
+        active_ticket = state.get("active_ticket_job")
+        if isinstance(active_ticket, dict):
+            active_ticket.update(job)
         role = "publication"
         work_subject = "ticket:3"
     elif subject_kind == "run_repair":
         state["run_acceptance"] = {
             "phase": "repairing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "repair_job": {
                 "phase": "accepted",
+                "review_budget": _canonical_budget(),
+                "review_budget_history": [],
                 "repair_generation": 2,
                 "repair_mode": "squash",
                 "publication_thread_id": "current-repair-thread",
@@ -185,6 +247,8 @@ def _prepared_resume(
     elif subject_kind == "final_publication":
         state["run_acceptance"] = {
             "phase": "accepted",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
             "validation_attempts": 2,
             "acceptance_generation": 2,
         }
@@ -197,7 +261,9 @@ def _prepared_resume(
     elif subject_kind == "parent_only":
         state["parent_job"] = {
             "phase": "accepted",
-            "publication_thread_id": "current-parent-thread"
+            "publication_thread_id": "current-parent-thread",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
         }
         role = "publication"
         work_subject = f"parent-only:{run_id}"
@@ -298,6 +364,8 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
             "phase": "developing",
             "ticket_branch_generation": 1,
             "development_thread_id": "development-thread",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
         }
     )
     state.update(

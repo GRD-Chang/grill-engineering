@@ -13,6 +13,10 @@ from agent_run.delivery_loop import (
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.revisions import effective_revision
+from agent_run.review_budget import new_budget
+from agent_run.ticket_publication_contract import (
+    require_active_ticket_publication_authorization,
+)
 from agent_run.state import StateStore
 from agent_run.ticket_phase import (
     BLOCKED_MESSAGES,
@@ -42,6 +46,27 @@ class TicketDeliveryEngine:
             if state is None:
                 raise ValueError(f"unknown Delivery Run: {run_id}")
             job = self._job(state)
+            if state.get("status") in {"blocked", "requeue_required"}:
+                return state
+            if job.get("phase") in {
+                "accepted",
+                "publication_pending",
+                "publishing",
+                "waiting_checks",
+                "waiting_merge",
+                "merging",
+            }:
+                candidate_sha = job.get("candidate_sha")
+                if not isinstance(candidate_sha, str) or not candidate_sha.strip():
+                    raise ValueError(
+                        "active Ticket publication is missing candidate_sha"
+                    )
+                candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
+                require_active_ticket_publication_authorization(
+                    job,
+                    candidate_tree=candidate_tree,
+                    location=f"ticket_jobs[{job.get('ticket_number', 'active')}]",
+                )
             ticket_number = int(job["ticket_number"])
             checkout = (
                 self.states.root
@@ -126,24 +151,16 @@ class TicketDeliveryEngine:
             live_state = self._current_pr_state(active)
             if live_state not in {None, "OPEN", "MERGED"}:
                 self._block_closed_current_pr(state, active)
-            elif live_state == "MERGED" and phase not in {
-                TicketPhase.MERGING.value,
-                TicketPhase.WAITING_MERGE.value,
-                TicketPhase.MERGED.value,
-            }:
-                if self._can_reset_superseded_integration(active):
-                    self._reset_for_revision(
-                        state, active, expected_revision
-                    )
-                    self._save(state)
-                else:
-                    self._block_external_merge(state, active)
-            elif phase in {
-                TicketPhase.MERGING.value,
-                TicketPhase.WAITING_MERGE.value,
-            }:
-                active["pending_effective_revision"] = expected_revision
-                self._save(state)
+            elif (
+                live_state == "MERGED"
+                and phase not in {
+                    TicketPhase.MERGING.value,
+                    TicketPhase.WAITING_MERGE.value,
+                    TicketPhase.MERGED.value,
+                }
+                and active.get("blocked_reason") != "merged_revision_mismatch"
+            ):
+                self._block_external_merge(state, active)
             else:
                 if phase == TicketPhase.MERGED.value:
                     integrated_sha = active.get("integrated_sha")
@@ -154,7 +171,7 @@ class TicketDeliveryEngine:
                     _record_superseded_integration(
                         active, integrated_sha
                     )
-                self._reset_for_revision(state, active, expected_revision)
+                self._mark_revision_stale(state, active)
                 self._save(state)
         elif (
             active.get("phase") == "blocked"
@@ -166,12 +183,13 @@ class TicketDeliveryEngine:
         elif (
             active.get("phase") == TicketPhase.BLOCKED.value
             and active.get("blocked_reason")
-            == "effective_revision_mismatch"
+            in {"effective_revision_mismatch", "merged_revision_mismatch"}
         ):
             # The live content may have changed and then returned to the same
             # fingerprint. The persisted mismatch still invalidates every
-            # prior artifact, so rebuild instead of treating the Job as idle.
-            self._reset_for_revision(state, active, expected_revision)
+            # prior artifact, but only an explicit Requeue may create a new
+            # generation and budget window.
+            self._mark_revision_stale(state, active)
             self._save(state)
         elif active.get("phase") == TicketPhase.BLOCKED.value:
             self._restore_blocked_projection(state, active)
@@ -194,26 +212,29 @@ class TicketDeliveryEngine:
         self._save(state)
 
     @staticmethod
-    def _can_reset_superseded_integration(
-        active: dict[str, Any]
-    ) -> bool:
-        merge_intent = active.get("merge_intent")
-        records = active.get("superseded_integrations")
-        if (
-            active.get("phase") != TicketPhase.BLOCKED.value
-            or active.get("blocked_reason") != "merged_revision_mismatch"
-            or not isinstance(merge_intent, dict)
-            or not isinstance(records, list)
-        ):
-            return False
-        expected_record = {
-            "pr_number": active.get("pr_number"),
-            "integrated_sha": active.get("integrated_sha"),
-            "effective_revision": active.get("effective_revision"),
-        }
-        return any(
-            isinstance(record, dict) and record == expected_record
-            for record in records
+    def _mark_revision_stale(
+        state: dict[str, Any], active: dict[str, Any]
+    ) -> None:
+        generation = active.get("ticket_branch_generation")
+        if type(generation) is not int or generation < 1:
+            raise ValueError("stale Ticket Job has invalid branch generation")
+        state.update(
+            {
+                "status": "requeue_required",
+                "terminal_kind": "requeue_required",
+                "diagnostics": [
+                    {
+                        "code": "ticket_requirements_changed",
+                        "message": "Ticket requirements changed; run requeue",
+                        "ticket_number": active.get("ticket_number"),
+                    }
+                ],
+                "requeue_required": {
+                    "work_subject": f"ticket:{active.get('ticket_number')}",
+                    "generation": generation,
+                    "reason": "ticket_requirements_changed",
+                },
+            }
         )
 
     def _current_pr_state(self, active: dict[str, Any]) -> object:
@@ -291,42 +312,9 @@ class TicketDeliveryEngine:
             "reviewer_thread_ids": [],
             "validation_attempts": 0,
             "acceptance_artifact": None,
+            "review_budget": new_budget(),
+            "review_budget_history": [],
         }
-
-    def _reset_for_revision(
-        self,
-        state: dict[str, Any],
-        active: dict[str, Any],
-        expected_revision: str,
-    ) -> None:
-        for key in (
-            "candidate_sha",
-            "publication",
-            "publication_sha",
-            "acceptance_artifact",
-            "acceptance_record",
-            "repair_source",
-            "ci_evidence",
-            "integrated_sha",
-            "merge_intent",
-            "ticket_close_intent",
-            "ticket_close_ownership",
-            "ticket_closed_by_run",
-            "pr_number",
-            "pending_effective_revision",
-            "blocked_reason",
-        ):
-            active.pop(key, None)
-        active.update(
-            {
-                "base_sha": self.git.resolve(str(state["run_branch"])),
-                "effective_revision": expected_revision,
-                "phase": TicketPhase.DEVELOPING.value,
-                "modification_attempts": 0,
-                "validation_attempts": 0,
-                "source_revision_changed": False,
-            }
-        )
 
     @staticmethod
     def _remove_empty_worktree_directories(checkout: Path) -> None:

@@ -28,6 +28,17 @@ from conftest import write_fixture
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
+def _canonical_run_budget() -> dict[str, object]:
+    return {
+        "window": 1,
+        "development_attempts": 0,
+        "reviewer_invocations": 0,
+        "final_ci_fix_used": False,
+        "review_artifacts": [],
+        "checkpoint_reason": None,
+    }
+
+
 def test_lifecycle_help_describes_operator_boundaries() -> None:
     help_text = build_parser().format_help()
 
@@ -44,6 +55,31 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
         assert internal_command not in help_text
         with pytest.raises(SystemExit):
             build_parser().parse_args([internal_command, "run-id"])
+
+
+def test_status_exposes_current_candidate_and_pr_in_top_level_and_budget(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "active",
+        "active_ticket_job": {
+            "phase": "candidate",
+            "ticket_number": 3,
+            "candidate_sha": "CANDIDATE-1",
+            "pr_number": 17,
+            "review_budget": _canonical_run_budget(),
+        },
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["candidate_sha"] == "CANDIDATE-1"
+    assert output["pr_number"] == 17
+    assert output["review_budget"]["candidate_sha"] == "CANDIDATE-1"
+    assert output["review_budget"]["pr_number"] == 17
 
 
 @pytest.mark.parametrize("command", ["deliver", "accept-run", "publish-run"])
@@ -961,6 +997,8 @@ def test_resume_rejects_an_owner_that_has_already_advanced(
                 "phase": "accepted",
                 "acceptance_generation": 1,
                 "validation_attempts": 1,
+                "review_budget": _canonical_run_budget(),
+                "review_budget_history": [],
             },
             "active_agent_invocation": failed_invocation(
                 work_subject=(
@@ -1044,6 +1082,8 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
                 "phase": "accepted",
                 "acceptance_generation": 1,
                 "validation_attempts": 1,
+                "review_budget": _canonical_run_budget(),
+                "review_budget_history": [],
             },
             "active_agent_invocation": {
                 **failed_invocation(
@@ -1164,6 +1204,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "phase": "blocked",
                     "blocked_reason": "agent_requires_human",
                     "human_blockers": ["Need maintainer input."],
+                    "review_budget": _canonical_run_budget(),
+                    "review_budget_history": [],
                 }
             },
             f"agent-run resume {run_id}",
@@ -1177,7 +1219,12 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
         state.update(additions)
         if state.get("active_agent_invocation") is not None:
             state["ticket_jobs"]["2"].update(
-                {"ticket_branch_generation": 1, "phase": "developing"}
+                {
+                    "ticket_branch_generation": 1,
+                    "phase": "developing",
+                    "review_budget": _canonical_run_budget(),
+                    "review_budget_history": [],
+                }
             )
         state_path.write_text(json.dumps(state), encoding="utf-8")
 

@@ -5,7 +5,10 @@ import subprocess
 from pathlib import Path
 
 from agent_run.git_errors import GitError as GitError
-from agent_run.git_errors import MergeConflictError as MergeConflictError
+from agent_run.git_errors import (
+    GitIntegrityError as GitIntegrityError,
+    MergeConflictError as MergeConflictError,
+)
 from agent_run.git_integration_commit import IntegrationRepairCommitGit
 from agent_run.git_integration_scene import IntegrationRepairSceneGit
 from agent_run.github_retry import run_read_command
@@ -121,6 +124,61 @@ class GitRepository:
             raise GitError(
                 added.stderr.strip() or "could not create Run Repair checkout"
             )
+
+    def restore_managed_checkout(
+        self, checkout: Path, *, expected_head: str
+    ) -> None:
+        """Restore a managed worktree after an Agent-owned Git mutation.
+
+        The observed foreign commit remains available in the raw integrity
+        evidence, but the managed branch and worktree are moved back to the
+        last Controller-owned boundary before another Candidate is created.
+        """
+
+        branch = self._run_in(checkout, "symbolic-ref", "--short", "HEAD")
+        branch_name = branch.stdout.strip()
+        if branch.returncode != 0 or not is_managed_delivery_branch(branch_name):
+            raise GitError(
+                "refusing to restore a checkout that is not on a managed delivery branch"
+            )
+        if not self._commit_exists(expected_head):
+            raise GitError("managed checkout recovery boundary does not exist")
+        reset = self._run_in(checkout, "reset", "--hard", expected_head)
+        if reset.returncode != 0:
+            raise GitError(
+                reset.stderr.strip() or "could not restore managed checkout boundary"
+            )
+        cleaned = self._run_in(checkout, "clean", "-fd")
+        if cleaned.returncode != 0:
+            raise GitError(
+                cleaned.stderr.strip() or "could not clean managed checkout boundary"
+            )
+        if self.checkout_head(checkout) != expected_head:
+            raise GitError("managed checkout recovery did not restore its expected head")
+
+    def seed_managed_checkout(self, checkout: Path, *, expected_head: str) -> None:
+        """Move a fresh managed repair checkout to a preserved Candidate."""
+
+        branch = self._run_in(checkout, "symbolic-ref", "--short", "HEAD")
+        branch_name = branch.stdout.strip()
+        if branch.returncode != 0 or not is_managed_delivery_branch(branch_name):
+            raise GitError(
+                "refusing to seed a checkout that is not on a managed delivery branch"
+            )
+        if not self._commit_exists(expected_head):
+            raise GitError("preserved repair Candidate does not exist")
+        reset = self._run_in(checkout, "reset", "--hard", expected_head)
+        if reset.returncode != 0:
+            raise GitError(
+                reset.stderr.strip() or "could not seed the managed repair checkout"
+            )
+        cleaned = self._run_in(checkout, "clean", "-fd")
+        if cleaned.returncode != 0:
+            raise GitError(
+                cleaned.stderr.strip() or "could not clean the managed repair checkout"
+            )
+        if self.checkout_head(checkout) != expected_head:
+            raise GitError("managed repair checkout seed did not match its Candidate")
 
     def rotate_run_repair_checkout(
         self,
@@ -331,19 +389,59 @@ class GitRepository:
         return tree
 
     def commit_candidate(
-        self, checkout: Path, *, ticket_number: int, attempt: int
+        self,
+        checkout: Path,
+        *,
+        ticket_number: int,
+        attempt: int,
+        expected_head: str | None = None,
+        candidate_intent: dict[str, object] | None = None,
     ) -> str | None:
         status = self._run_in(checkout, "status", "--porcelain=v1")
         if status.returncode != 0:
             raise GitError(status.stderr.strip() or "could not inspect ticket checkout")
-        if not status.stdout.strip():
-            expected_message = f"chore(ticket-{ticket_number}): candidate {attempt}"
+        observed_head = self._resolve_in(checkout, "HEAD")
+        if status.stdout.strip() and expected_head is not None and observed_head != expected_head:
             subject = self._run_in(checkout, "log", "-1", "--format=%s")
-            if (
-                subject.returncode == 0
-                and subject.stdout.strip() == expected_message
+            raise GitIntegrityError(
+                "managed checkout has an unowned commit before Candidate creation",
+                evidence={
+                    "kind": "git_integrity",
+                    "status": "fail",
+                    "reason": "checkout HEAD differs from the managed Candidate boundary",
+                    "observed_head": observed_head,
+                    "actual_subject": subject.stdout.strip()
+                    if subject.returncode == 0
+                    else "",
+                    "expected_subject": f"chore(ticket-{ticket_number}): candidate {attempt}",
+                    "workspace_clean": "false",
+                },
+            )
+        expected_message = f"chore(ticket-{ticket_number}): candidate {attempt}"
+        if not status.stdout.strip():
+            subject = self._run_in(checkout, "log", "-1", "--format=%s")
+            if self._candidate_commit_matches_intent(
+                checkout,
+                observed_head=observed_head,
+                expected_head=expected_head,
+                expected_subject=expected_message,
+                candidate_intent=candidate_intent,
             ):
                 return self._resolve_in(checkout, "HEAD")
+            if expected_head is not None and observed_head != expected_head:
+                actual_subject = subject.stdout.strip() if subject.returncode == 0 else ""
+                raise GitIntegrityError(
+                    "managed checkout contains an unowned clean commit",
+                    evidence={
+                        "kind": "git_integrity",
+                        "status": "fail",
+                        "reason": "clean checkout head has an unexpected commit subject",
+                        "observed_head": observed_head,
+                        "actual_subject": actual_subject,
+                        "expected_subject": expected_message,
+                        "workspace_clean": "true",
+                    },
+                )
             return None
         added = self._run_in(checkout, "add", "--all")
         if added.returncode != 0:
@@ -352,28 +450,68 @@ class GitRepository:
             checkout,
             "commit",
             "-m",
-            f"chore(ticket-{ticket_number}): candidate {attempt}",
+            expected_message,
+            *self._candidate_intent_message(candidate_intent),
         )
         if committed.returncode != 0:
             raise GitError(committed.stderr.strip() or "could not commit candidate")
         return self._resolve_in(checkout, "HEAD")
 
     def commit_run_repair_candidate(
-        self, checkout: Path, *, attempt: int
+        self,
+        checkout: Path,
+        *,
+        attempt: int,
+        expected_head: str | None = None,
+        candidate_intent: dict[str, object] | None = None,
     ) -> str | None:
         status = self._run_in(checkout, "status", "--porcelain=v1")
         if status.returncode != 0:
             raise GitError(
                 status.stderr.strip() or "could not inspect Run Repair checkout"
             )
+        observed_head = self._resolve_in(checkout, "HEAD")
+        if status.stdout.strip() and expected_head is not None and observed_head != expected_head:
+            subject = self._run_in(checkout, "log", "-1", "--format=%s")
+            raise GitIntegrityError(
+                "managed Run Repair checkout has an unowned commit before Candidate creation",
+                evidence={
+                    "kind": "git_integrity",
+                    "status": "fail",
+                    "reason": "checkout HEAD differs from the managed Candidate boundary",
+                    "observed_head": observed_head,
+                    "actual_subject": subject.stdout.strip()
+                    if subject.returncode == 0
+                    else "",
+                    "expected_subject": f"chore(run-repair): candidate {attempt}",
+                    "workspace_clean": "false",
+                },
+            )
         expected_message = f"chore(run-repair): candidate {attempt}"
         if not status.stdout.strip():
             subject = self._run_in(checkout, "log", "-1", "--format=%s")
-            if (
-                subject.returncode == 0
-                and subject.stdout.strip() == expected_message
+            if self._candidate_commit_matches_intent(
+                checkout,
+                observed_head=observed_head,
+                expected_head=expected_head,
+                expected_subject=expected_message,
+                candidate_intent=candidate_intent,
             ):
                 return self._resolve_in(checkout, "HEAD")
+            if expected_head is not None and observed_head != expected_head:
+                actual_subject = subject.stdout.strip() if subject.returncode == 0 else ""
+                raise GitIntegrityError(
+                    "managed Run Repair checkout contains an unowned clean commit",
+                    evidence={
+                        "kind": "git_integrity",
+                        "status": "fail",
+                        "reason": "clean checkout head has an unexpected commit subject",
+                        "observed_head": observed_head,
+                        "actual_subject": actual_subject,
+                        "expected_subject": expected_message,
+                        "workspace_clean": "true",
+                    },
+                )
             return None
         added = self._run_in(checkout, "add", "--all")
         if added.returncode != 0:
@@ -381,7 +519,11 @@ class GitRepository:
                 added.stderr.strip() or "could not stage Run Repair candidate"
             )
         committed = self._run_in(
-            checkout, "commit", "-m", expected_message
+            checkout,
+            "commit",
+            "-m",
+            expected_message,
+            *self._candidate_intent_message(candidate_intent),
         )
         if committed.returncode != 0:
             raise GitError(
@@ -397,6 +539,7 @@ class GitRepository:
         default_head_sha: str,
         attempt: int,
         squash_candidate_sha: str | None = None,
+        candidate_intent: dict[str, object] | None = None,
         expected_conflict_paths: tuple[str, ...] = (),
     ) -> str | None:
         return self._integration_commit.commit_merge_resolution_candidate(
@@ -405,6 +548,7 @@ class GitRepository:
             default_head_sha=default_head_sha,
             attempt=attempt,
             squash_candidate_sha=squash_candidate_sha,
+            candidate_intent=candidate_intent,
             expected_conflict_paths=expected_conflict_paths,
         )
 
@@ -507,11 +651,78 @@ class GitRepository:
             raise GitError(result.stderr.strip() or "could not read ticket diff")
         return result.stdout
 
+    def diff_name_status(self, base_sha: str, head_sha: str) -> list[dict[str, str]]:
+        """Return a compact, durable description of a Candidate code delta."""
+        result = self._run(
+            "diff", "--no-ext-diff", "--no-textconv", "--name-status", base_sha, head_sha
+        )
+        if result.returncode != 0:
+            raise GitError(result.stderr.strip() or "could not read Candidate delta")
+        changed: list[dict[str, str]] = []
+        for line in result.stdout.splitlines():
+            status, separator, path = line.partition("\t")
+            if separator and status and path:
+                changed.append({"status": status, "path": path})
+        return changed
+
+    def verify_candidate_integrity(
+        self, base_sha: str, candidate_sha: str
+    ) -> dict[str, str]:
+        """Verify only the immutable Git boundary needed by fallback publication."""
+        candidate_tree = self.resolve(f"{candidate_sha}^{{tree}}")
+        relation = self._run("merge-base", "--is-ancestor", base_sha, candidate_sha)
+        if relation.returncode != 0:
+            raise GitError("Candidate is not a descendant of the bound base")
+        return {
+            "status": "pass",
+            "base_sha": base_sha,
+            "candidate_sha": candidate_sha,
+            "candidate_tree": candidate_tree,
+            "base_is_ancestor": "true",
+        }
+
     def commit_subject(self, sha: str) -> str:
         result = self._run("log", "-1", "--format=%s", sha)
         if result.returncode != 0:
             raise GitError(result.stderr.strip() or "could not read commit subject")
         return result.stdout.strip()
+
+    @staticmethod
+    def _candidate_intent_message(
+        candidate_intent: dict[str, object] | None,
+    ) -> tuple[str, ...]:
+        token = candidate_intent.get("token") if isinstance(candidate_intent, dict) else None
+        if not isinstance(token, str) or not token:
+            return ()
+        return ("-m", f"agent-run-candidate-intent: {token}")
+
+    def _candidate_commit_matches_intent(
+        self,
+        checkout: Path,
+        *,
+        observed_head: str,
+        expected_head: str | None,
+        expected_subject: str,
+        candidate_intent: dict[str, object] | None,
+    ) -> bool:
+        if not isinstance(expected_head, str) or observed_head == expected_head:
+            return False
+        if not isinstance(candidate_intent, dict):
+            return False
+        if candidate_intent.get("expected_head") != expected_head:
+            return False
+        if self.commit_subject(observed_head) != expected_subject:
+            return False
+        parents = self.commit_parents(observed_head)
+        if parents != [expected_head]:
+            return False
+        token = candidate_intent.get("token")
+        if not isinstance(token, str) or not token:
+            return False
+        message = self._run_in(checkout, "show", "-s", "--format=%B", observed_head)
+        return message.returncode == 0 and (
+            f"agent-run-candidate-intent: {token}" in message.stdout
+        )
 
     def commit_parents(self, sha: str) -> list[str]:
         result = self._run("show", "-s", "--format=%P", sha)

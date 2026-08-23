@@ -14,7 +14,12 @@ from agent_run.change_delivery import (
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
-from agent_run.run_currentness import ticket_completion_records
+from agent_run.review_budget import previous_review_context
+from agent_run.run_currentness import (
+    ticket_completion_records,
+    ticket_fallback_records,
+    ticket_integration_records,
+)
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,11 @@ class RunRepairRequests:
             "development_summary": job.get("development_summary"),
         }
         source = str(request["repair_source"])
-        if source == "acceptance":
+        if source == "git_integrity":
+            request["git_integrity_evidence"] = _mapping(
+                job, "git_integrity_evidence"
+            )
+        elif source == "acceptance":
             artifact_key = (
                 "acceptance_artifact"
                 if isinstance(job.get("acceptance_artifact"), dict)
@@ -90,9 +99,18 @@ class RunRepairRequests:
         request: dict[str, Any] = {
             "acceptance_scope": "run",
             "candidate_acceptance": True,
+            "repair_scope": "run_repair",
             "parent_issue_url": _issue_url(
                 state, int(_mapping(state, "parent")["number"])
             ),
+            "current_review_identity": {
+                "run_base_sha": str(job["base_sha"]),
+                "repair_candidate_sha": str(job["candidate_sha"]),
+                "expected_merge_tree": self.git.expected_merge_tree(
+                    default_head_sha=str(job["default_base_sha"]),
+                    run_head_sha=str(job["candidate_sha"]),
+                ),
+            },
             "checkout": str(checkout),
             "thread_id": (
                 latest_reviewer_thread(job)
@@ -107,6 +125,16 @@ class RunRepairRequests:
             ),
         }
         _add_human_resume_fields(request, job)
+        fallbacks = ticket_fallback_records(state)
+        if fallbacks:
+            request["fallback_ticket_records"] = fallbacks
+        integrations = ticket_integration_records(state)
+        if integrations:
+            request["ticket_integration_records"] = integrations
+        previous = previous_review_context(job)
+        if previous is not None:
+            request["previous_acceptance_artifact"] = previous["artifact"]
+            request["previous_review_identity"] = previous["identity"]
         return request
 
     @staticmethod

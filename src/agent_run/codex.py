@@ -134,6 +134,24 @@ class CodexCliBackend:
             )
             heading = "Development Brief"
             prompt_input = _pretty(_development_context(request))
+        elif repair_source == "git_integrity":
+            evidence = request.get("git_integrity_evidence")
+            if not isinstance(evidence, dict):
+                raise ValueError("Git Integrity Repair requires git_integrity_evidence")
+            subject = (
+                "当前 Delivery Run"
+                if is_run_repair
+                else "当前 Parent Issue"
+                if is_parent_only
+                else "当前 Ticket"
+            )
+            mode = f"Git Integrity Repair：{subject}。"
+            heading = "Git Integrity Repair Input"
+            context = _development_context(request)
+            prompt_input = (
+                f"Git Integrity Evidence (verbatim JSON):\n{_pretty(evidence)}"
+                f"\n\nDevelopment Brief:\n{_pretty(context)}"
+            )
         elif repair_source == "acceptance":
             artifact = request.get("acceptance_artifact")
             if not isinstance(artifact, dict):
@@ -324,27 +342,40 @@ class CodexCliBackend:
             "prior_human_blockers",
             "human_response_history",
         )
+        fallback_context = request.get("fallback_publication_context")
         artifact = request.get("acceptance_artifact")
-        if not isinstance(artifact, dict):
-            raise ValueError("Publication requires acceptance_artifact")
-        artifact_input = "Acceptance Artifact (verbatim JSON):\n" + _pretty(artifact)
-        if request.get("acceptance_scope") == "run":
-            return (
-                "你是本次 Run Repair 的发布叙事工程师。依据当前 checkout 的实际 diff 和"
-                "下方完整独立验收证据，输出小型 Publication Artifact。\n\n"
-                + _publication_contract(
-                    context, acceptance_scope=request.get("acceptance_scope")
-                )
-                + "\n\n"
-                + artifact_input
-                + "\n\nPublication Context:\n"
-                + _pretty(context)
+        if isinstance(fallback_context, dict):
+            artifact_input = (
+                "Fallback Publication Context:\n"
+                + _pretty(fallback_context)
+                + "\n\n这是 Controller 从已验证发布凭据投影的最小叙事事实。"
+                "它不证明三个验收 lane 通过，不得把它写成 Acceptance Record、Review pass 或 CI pass；"
+                "Publication 只负责生成叙事，不重新验收代码。"
             )
+        elif isinstance(artifact, dict):
+            artifact_input = "Acceptance Artifact (verbatim JSON):\n" + _pretty(artifact)
+        else:
+            raise ValueError(
+                "Publication requires acceptance_artifact or fallback_publication_context"
+            )
+        scope = _scope_kind(request.get("acceptance_scope"))
+        role = {
+            "ticket": "当前 Ticket PR 的发布叙事工程师",
+            "parent_only": "当前 Parent-only PR 的发布叙事工程师",
+            "run": "当前 Run Repair PR 的发布叙事工程师",
+        }[scope]
+        evidence_phrase = (
+            "下方最小 Fallback Publication Context"
+            if isinstance(fallback_context, dict)
+            else "下方完整独立验收证据"
+        )
         return (
-            "你是本次交付的发布叙事工程师。依据当前 checkout 的实际 diff 和下方完整独立"
-            "验收证据，输出小型 Publication Artifact。\n\n"
+            f"你是{role}。依据当前 checkout 的实际 diff 和{evidence_phrase}，"
+            "输出小型 Publication Artifact。\n\n"
             + _publication_contract(
-                context, acceptance_scope=request.get("acceptance_scope")
+                context,
+                acceptance_scope=request.get("acceptance_scope"),
+                fallback=isinstance(fallback_context, dict),
             )
             + "\n\n"
             + artifact_input
@@ -399,11 +430,6 @@ class CodexCliBackend:
         current_thread = thread_id
         validation_error = ""
         currentness = request.get("_currentness_check")
-        if request.get("_invocation_mode") == "resume" and thread_id is not None:
-            prompt = (
-                "这是一次因前次调用失败而继续的同 Thread Resume。请基于当前 workspace "
-                "重新核验权威输入和实际工作，再满足完整阶段 contract。\n\n" + prompt
-        )
         for attempt in range(1, 4):
             if callable(currentness) and not currentness():
                 stale = CodexProcessError(
@@ -513,29 +539,50 @@ class CodexCliBackend:
             "task_issue_url",
             "prior_human_blockers",
             "human_response_history",
+            "fallback_ticket_records",
+            "ticket_integration_records",
+        )
+        run_repair = (
+            request.get("acceptance_scope") == "run"
+            and request.get("repair_scope") == "run_repair"
         )
         candidate_run_acceptance = (
             request.get("acceptance_scope") == "run"
             and request.get("candidate_acceptance") is True
+            and not run_repair
         )
         role = (
-            "独立 Candidate Run Acceptance 验收工程师"
+            "独立 Run Repair 验收工程师"
+            if run_repair
+            else "独立 Candidate Run Acceptance 验收工程师"
             if candidate_run_acceptance
-            else "独立 Run Repair 验收工程师"
-            if request.get("acceptance_scope") == "run"
-            and request.get("repair_scope") == "run_repair"
             else "独立 Run 整体验收工程师"
             if request.get("acceptance_scope") == "run"
-            else "独立 Fresh Acceptance 验收工程师"
+            else "当前 Parent-only Candidate 的独立验收工程师"
+            if request.get("acceptance_scope") == "parent_only"
+            else "当前 Ticket Candidate 的独立集成验收工程师"
         )
-        candidate_instruction = (
-            "这是 Candidate Run Acceptance。当前 Validation Checkout 是将本轮 "
-            "Repair Candidate 应用到当前 default head 后的预期合并结果，HEAD 保持 "
-            "default head 是正常现象。仍须按完整 Run Review Boundary 验收，"
-            "不得把局部 Repair Candidate 的 diff 通过当作完整 Run 通过。\n\n"
-            if candidate_run_acceptance
-            else ""
-        )
+        if run_repair:
+            candidate_instruction = (
+                "这是 Run Repair Candidate Acceptance。当前 Validation Checkout 是将本轮 "
+                "Run Repair Candidate 应用到准确 Run/default base 后的无提交合并预览；"
+                "HEAD 保持 base 是正常现象。验收 Repair 进入完整 Run 后的结果，不能只审查局部 "
+                "Repair diff。\n\n"
+            )
+        elif candidate_run_acceptance:
+            candidate_instruction = (
+                "这是 Candidate Run Acceptance。当前 Validation Checkout 是将本轮 "
+                "Repair Candidate 应用到当前 default head 后的预期合并结果，HEAD 保持 "
+                "default head 是正常现象。仍须按完整 Run Review Boundary 验收，"
+                "不得把局部 Repair Candidate 的 diff 通过当作完整 Run 通过。\n\n"
+            )
+        else:
+            candidate_instruction = ""
+        current_review = _review_identity_block(request)
+        previous_review = ""
+        previous_artifact = request.get("previous_acceptance_artifact")
+        if isinstance(previous_artifact, dict):
+            previous_review = _previous_review_block(request, previous_artifact)
         prompt = (
             f"你是{role}。\n\n"
             + candidate_instruction
@@ -544,6 +591,8 @@ class CodexCliBackend:
                 acceptance_scope=request.get("acceptance_scope"),
                 repair_scope=request.get("repair_scope"),
             )
+            + current_review
+            + previous_review
             + "\n\n"
             + "汇总三条 lane 的实际证据后，只输出符合 schema 的 Acceptance Artifact。"
             "每条 Finding 都必须写在最合适 lane 的 findings 中，并严格采用现有 schema 要求的"
@@ -886,6 +935,105 @@ def _prompt_context(request: dict[str, Any], *fields: str) -> dict[str, Any]:
     return {field: request[field] for field in fields if field in request and request[field] is not None}
 
 
+def _review_identity_block(request: dict[str, Any]) -> str:
+    identity = request.get("current_review_identity")
+    if not isinstance(identity, dict):
+        return ""
+    scope = _scope_kind(request.get("acceptance_scope"))
+    labels: tuple[tuple[str, str], ...]
+    if scope == "run" and request.get("repair_scope") == "run_repair":
+        labels = (
+            ("当前 Run base", "run_base_sha"),
+            ("当前 Repair Candidate", "repair_candidate_sha"),
+            ("当前 expected merge tree", "expected_merge_tree"),
+        )
+    elif scope == "run":
+        labels = (
+            ("当前 default base", "default_base_sha"),
+            ("当前 Run head", "run_head_sha"),
+            ("当前 expected merge tree", "expected_merge_tree"),
+        )
+    else:
+        labels = (
+            ("当前 reviewed base", "reviewed_base_sha"),
+            ("当前 Candidate", "reviewed_candidate_sha"),
+            ("当前 Candidate tree", "reviewed_candidate_tree"),
+        )
+    lines = ["\n\nCurrent Review Boundary Identity:"]
+    for label, key in labels:
+        if key in identity:
+            lines.append(f"- {label}：{identity[key]}")
+    return "\n".join(lines)
+
+
+def _previous_review_block(
+    request: dict[str, Any], artifact: dict[str, Any]
+) -> str:
+    scope = _scope_kind(request.get("acceptance_scope"))
+    identity = request.get("previous_review_identity", {})
+    labels: tuple[tuple[str, str], ...]
+    previous_is_run_repair = isinstance(identity, dict) and (
+        "run_base_sha" in identity or "repair_candidate_sha" in identity
+    )
+    previous_is_run = isinstance(identity, dict) and (
+        "default_base_sha" in identity or "run_head_sha" in identity
+    )
+    if scope == "run" and previous_is_run_repair:
+        title = "Previous Run Repair Acceptance Context"
+        labels = (
+            ("Previous Run base", "run_base_sha"),
+            ("Previous Repair Candidate", "repair_candidate_sha"),
+            ("Previous expected merge tree", "expected_merge_tree"),
+        )
+        guidance = (
+            "当前 Repair Candidate 对完整 Run 合并预览产生的变化，以及相关集成回归。"
+            "这不限制你的审查范围。你仍然对当前完整 Run Repair 合并预览负责，可以自主全量审核并报告"
+            "当前 Review Boundary 内的新问题。"
+        )
+        closing = "上一轮 Artifact 不能授权当前合并预览。"
+    elif scope == "run" and previous_is_run:
+        title = "Previous Run Acceptance Context"
+        labels = (
+            ("Previous default base", "default_base_sha"),
+            ("Previous Run head", "run_head_sha"),
+            ("Previous expected merge tree", "expected_merge_tree"),
+        )
+        guidance = (
+            "当前 Run Repair 产生的变化，以及相关集成回归。"
+            "这是审查倾向，不是范围限制。你仍然对当前最终合并预览的完整独立验收负责，可以自主进行"
+            "定向复核或全量审核、调整审查顺序，并报告完整 Run Review Boundary 内的新问题。"
+        )
+        closing = "上一 Artifact 只描述上一组 default base、Run head 和预期合并结果，不能授权当前最终合并预览。"
+    else:
+        title = "Previous Acceptance Context"
+        labels = (
+            ("Previous reviewed base", "reviewed_base_sha"),
+            ("Previous reviewed Candidate", "reviewed_candidate_sha"),
+        )
+        guidance = (
+            "上一轮报告的问题、当前 Candidate 针对这些问题产生的变化，以及相关回归风险。"
+            "这是审查倾向，不是范围限制。你仍然对当前 Candidate 的完整独立验收负责，可以自主进行"
+            "定向复核或全量审核、调整审查顺序，并报告当前 Review Boundary 内的新问题。"
+        )
+        closing = "上一轮 Artifact 只描述上一 Candidate，不能授权当前 Candidate。"
+    identity_lines = [f"\n\n## {title}", "", "下面是紧邻上一轮 Reviewer 的完整 Acceptance Artifact。"]
+    if isinstance(identity, dict):
+        for label, key in labels:
+            if key in identity:
+                identity_lines.append(f"{label}：{identity[key]}")
+    identity_lines.extend(
+        [
+            "",
+            "Previous Acceptance Artifact（verbatim JSON）:",
+            _pretty(artifact),
+            "",
+            f"建议优先参考{guidance}",
+            f"{closing}本轮只输出当前对象的新 Acceptance Artifact，不输出 Finding closure 表或逐项对照。",
+        ]
+    )
+    return "\n".join(identity_lines)
+
+
 def _development_context(request: dict[str, Any]) -> dict[str, Any]:
     return _prompt_context(
         request,
@@ -980,6 +1128,12 @@ def _repair_contract(repair_source: object) -> str:
             "`evidence` 中的 `Deferred to #N：…` 和 `Non-blocking observation：…` 不是自动修改"
             "指令。只有解决 Finding、防止本次修复直接回归或满足当前 Acceptance Criteria 确有需要时，"
             "才调整相关 evidence 或代码。"
+        )
+    if repair_source == "git_integrity":
+        return (
+            "Git Integrity Evidence 是未经改写的修复依据。恢复当前受管 checkout 的合法 Git 边界，"
+            "只处理证据及其直接影响；不要执行 commit、reset、rebase、merge、push 或其他 Git 历史写入。"
+            "程序会在你返回后重新执行完整性检查并创建新的 Candidate。"
         )
     if repair_source == "required_checks":
         return (
@@ -1079,8 +1233,8 @@ def _acceptance_contract(
         "运行验证；Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令，避免重复相同"
         "的完整测试套件，除非某个具体 Finding 确实需要。"
         + "\n\n"
-        + "`skill:code-review` 是 Standards 与 Spec 可使用的推荐审查 SOP。根据当前 Review Boundary "
-        "和实际风险选择审查分工与复核强度，确保 E2E、Standards 和 Spec 三种独立视角均形成可复核"
+        + "每次 Reviewer 都必须调用 `skill:code-review`，并将其作为 Standards 与 Spec 的实际审查 SOP。"
+        "根据当前 Review Boundary 和实际风险选择审查分工与复核强度，确保 E2E、Standards 和 Spec 三种独立视角均形成可复核"
         "结论。没有具体风险依据时，避免重复派发同类 Reviewer、嵌套相同 Review，或由多个视角重复"
         "执行相同的昂贵测试。不得用父 Reviewer 自己的判断替代缺失的独立审查视角；派发或验证遇到"
         "问题时，先处理具体问题再形成可复核结论。"
@@ -1100,27 +1254,41 @@ def _acceptance_contract(
 
 
 def _publication_contract(
-    context: dict[str, Any], *, acceptance_scope: object
+    context: dict[str, Any], *, acceptance_scope: object, fallback: bool = False
 ) -> str:
-    return (
+    evidence_contract = (
+        "这是 Deterministic Ticket Fallback Publication。当前没有 Fresh Acceptance Artifact；"
+        "Fallback Publication Receipt 不是验收结论。Evidence 使用 Fallback Publication Context 中"
+        "实际提供的 Receipt 投影，准确区分最近一次独立 Reviewer 已审查的对象、其后产生的 Candidate"
+        " delta 与 repair delta、Git Integrity 结果以及失败来源。不得声称当前 Candidate 通过任何验收 lane、"
+        "关闭 Finding、Required Checks 通过或取得 Run Acceptance。"
+        if fallback
+        else (
+            "PR 叙事必须有四个非空二级标题：What Problem This Solves 写改前限制、改后能力和覆盖"
+            "边界；Why This Change Was Made 写关键设计路径与约束，不要逐文件罗列；User Impact 写"
+            "用户可执行的结果和兼容或迁移行为；Evidence 只使用完整独立验收三条 lane 的实际证据，"
+            "每条使用“场景 → 实际操作或命令 → 可观察结果”。不得用“tests passed”“已验证”“修复完成”"
+            "等没有场景、操作和结果的空泛表述，不得把开发者自述当作验证事实。Evidence 中的"
+            "`Deferred to #N：…` 和 `Non-blocking observation：…` 只是非阻塞审查信息，不得描述为"
+            "当前交付范围的交付成果、已实现能力或 User Impact。CI、Candidate、SHA、门禁和生命周期"
+            "事实不得写入叙事。"
+        )
+    )
+    contract = (
         _issue_context_instruction(context, acceptance_scope=acceptance_scope)
         + "\n\n只读取事实：不得修改 checkout、执行 Git/GitHub 写操作、执行验收或替代人工批准。"
         "若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成前清理。"
         + "\n\n"
-        + "PR 叙事必须有四个非空二级标题：What Problem This Solves 写改前限制、改后能力和覆盖"
-        "边界；Why This Change Was Made 写关键设计路径与约束，不要逐文件罗列；User Impact 写"
-        "用户可执行的结果和兼容或迁移行为；Evidence 只使用完整独立验收三条 lane 的实际证据，"
-        "每条使用“场景 → 实际操作或命令 → 可观察结果”。不得用“tests passed”“已验证”“修复完成”"
-        "等没有场景、操作和结果的空泛表述，不得把开发者自述当作验证事实。Evidence 中的"
-        "`Deferred to #N：…` 和 `Non-blocking observation：…` 只是非阻塞审查信息，不得描述为"
-        "当前交付范围的交付成果、已实现能力或 User Impact。CI、Candidate、SHA、门禁和生命周期"
-        "事实不得写入叙事。"
+        + "PR 叙事必须有四个非空二级标题：What Problem This Solves、Why This Change Was Made、"
+        "User Impact 和 Evidence。"
+        + evidence_contract
         + "\n\n不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
         "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
         "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。"
         + "\n\n"
         + _publication_human_blocker_instruction()
     )
+    return contract
 
 
 def _resume_recheck_instruction(context: dict[str, Any]) -> str:

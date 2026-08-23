@@ -2276,6 +2276,16 @@ def test_required_checks_falls_back_when_gh_omits_ruleset_requirements(
             return subprocess.CompletedProcess(
                 arguments, 1, "", "no required checks reported on the 'ticket' branch"
             )
+        if (
+            arguments[0:1] == ("api",)
+            and arguments[1].startswith(
+                "repos/example/project/branches/agent-run%2Frun-1%2Frun/"
+            )
+            and arguments[1].endswith(
+                "/protection/required_status_checks/contexts"
+            )
+        ):
+            return subprocess.CompletedProcess(arguments, 404, "", "Not Found")
         if arguments[:2] == ("api", "repos/example/project/rulesets"):
             return subprocess.CompletedProcess(
                 arguments,
@@ -2353,11 +2363,82 @@ def test_ruleset_required_check_not_yet_reported_is_pending(
         "_ruleset_required_contexts",
         lambda _branch: {"test": None},
     )
+    monkeypatch.setattr(
+        publisher, "_branch_protection_required_contexts", lambda _branch: []
+    )
     monkeypatch.setattr(publisher, "_json", lambda *_arguments, **_kwargs: [])
 
     assert publisher._ruleset_checks(12, "bucket") == [
         {"name": "test", "bucket": "pending"}
     ]
+
+
+def test_partial_required_check_reporting_projects_missing_context_as_pending(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher,
+        "live_pull_request",
+        lambda _pr: {"base_branch": "main"},
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_ruleset_required_contexts",
+        lambda _branch: {"A": None, "B": None},
+    )
+    monkeypatch.setattr(
+        publisher, "_branch_protection_required_contexts", lambda _branch: []
+    )
+
+    def fake_run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        assert "--required" in arguments
+        return subprocess.CompletedProcess(
+            arguments, 0, '[{"name":"A","bucket":"pass"}]', ""
+        )
+
+    monkeypatch.setattr(publisher, "_run", fake_run)
+
+    assert publisher._checks(12, "bucket,name") == [
+        {"name": "A", "bucket": "pass"},
+        {"name": "B", "bucket": "pending"},
+    ]
+    assert publisher.required_checks(12) == "pending"
+
+
+def test_branch_protection_required_check_not_yet_reported_is_pending(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+
+    def fake_run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        if "--required" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 1, "", "no required checks reported"
+            )
+        if arguments[:2] == (
+            "api",
+            "repos/example/project/rulesets",
+        ):
+            return subprocess.CompletedProcess(arguments, 0, "[[]]", "")
+        if arguments[0:1] == ("api",) and arguments[1].endswith(
+            "/protection/required_status_checks/contexts"
+        ):
+            return subprocess.CompletedProcess(arguments, 0, '["test"]', "")
+        return subprocess.CompletedProcess(
+            arguments, 0, '[{"name":"optional","bucket":"pass"}]', ""
+        )
+
+    monkeypatch.setattr(publisher, "_run", fake_run)
+    monkeypatch.setattr(
+        publisher,
+        "live_pull_request",
+        lambda _pr: {"base_branch": "agent-run/run-1/run"},
+    )
+
+    assert publisher.required_checks(12) == "pending"
 
 
 def test_unrecognized_required_check_bucket_is_supervised_as_unknown(

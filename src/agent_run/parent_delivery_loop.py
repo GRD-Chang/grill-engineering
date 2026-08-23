@@ -19,13 +19,14 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
+from agent_run.review_budget import RUN_POLICY, ensure_budget, previous_review_context
 
 
 class ParentDeliveryAdapter(ChangeDeliveryAdapter):
     """Semantic Adapter for the Parent-only delivery consumer."""
 
     stale_disposition = StaleDisposition.BLOCK
-    classify_required_check_failures = False
+    classify_required_check_failures = True
 
     def __init__(self, git: GitRepository, github: GitHubPublisher) -> None:
         self.git = git
@@ -63,7 +64,12 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             job, generation=int(job.get("parent_generation", 1))
         ):
             request["human_response_history"] = history
-        if job.get("repair_source") == "acceptance":
+        if job.get("repair_source") == "git_integrity":
+            request["repair_source"] = "git_integrity"
+            request["git_integrity_evidence"] = _mapping(
+                job, "git_integrity_evidence"
+            )
+        elif job.get("repair_source") == "acceptance":
             request["repair_source"] = "acceptance"
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         elif job.get("repair_source") == "required_checks":
@@ -111,6 +117,13 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             "parent": _parent(state),
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
+            "current_review_identity": {
+                "reviewed_base_sha": str(job["base_sha"]),
+                "reviewed_candidate_sha": str(job["candidate_sha"]),
+                "reviewed_candidate_tree": self.git.resolve(
+                    f"{job['candidate_sha']}^{{tree}}"
+                ),
+            },
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
             "thread_id": (
@@ -131,6 +144,10 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             job, generation=int(job.get("parent_generation", 1))
         ):
             request["human_response_history"] = history
+        previous = previous_review_context(job)
+        if previous is not None:
+            request["previous_acceptance_artifact"] = previous["artifact"]
+            request["previous_review_identity"] = previous["identity"]
         return request
 
     def acceptance_record(
@@ -191,10 +208,22 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
         self.owner = owner
 
     def commit_candidate(
-        self, checkout: Path, _job: dict[str, Any], attempt: int
+        self, checkout: Path, job: dict[str, Any], attempt: int
     ) -> str | None:
         return self.owner.git.commit_candidate(
-            checkout, ticket_number=0, attempt=attempt
+            checkout,
+            ticket_number=0,
+            attempt=attempt,
+            expected_head=str(
+                job.get("managed_checkout_head")
+                or job.get("candidate_sha")
+                or job["base_sha"]
+            ),
+            candidate_intent=(
+                job.get("candidate_commit_intent")
+                if isinstance(job.get("candidate_commit_intent"), dict)
+                else None
+            ),
         )
 
     def create_publication_commit(
@@ -333,6 +362,14 @@ class ParentDeliveryLoop:
             "approval_grant",
             "repair_source",
             "ci_evidence",
+            "publication_authority",
+            "fallback_publication_receipt",
+            "deterministic_integration_record",
+            "required_checks",
+            "required_checks_mode",
+            "next_attempt_kind",
+            "last_review_candidate_sha",
+            "final_ci_fix_failure_head",
         ):
             job.pop(key, None)
         job.update(
@@ -348,6 +385,9 @@ class ParentDeliveryLoop:
     @staticmethod
     def _escalate(state: dict[str, Any], job: dict[str, Any], code: str) -> None:
         job["blocked_reason"] = code
+        if code == "review_budget_exhausted":
+            budget = ensure_budget(job, RUN_POLICY)
+            budget["checkpoint_reason"] = code
         state["status"] = "blocked"
         state["diagnostics"] = [{"code": code, "message": "Parent Issue requires explicit human intervention"}]
 

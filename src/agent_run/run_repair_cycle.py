@@ -2,7 +2,10 @@ from __future__ import annotations
 
 """Repair Cycle state, counters, and terminal transitions."""
 
+from copy import deepcopy
 from typing import Any
+
+from agent_run.review_budget import RUN_POLICY, ensure_budget
 
 
 _ACTIVE_CHECKOUT_PHASES = frozenset(
@@ -65,6 +68,21 @@ def end_human_blocked_repair_cycle(
 def sync_repair_cycle_counters(
     run: dict[str, Any], job: dict[str, Any]
 ) -> None:
+    run_budget = ensure_budget(run, RUN_POLICY)
+    job_budget = ensure_budget(job, RUN_POLICY)
+    # A Run Review Budget Window spans the top-level Reviewer and every Run
+    # Repair Reviewer.  Seed/raise the active repair projection from the
+    # durable Run count so a rotated Repair Job cannot reopen old capacity.
+    if job_budget["reviewer_invocations"] < run_budget["reviewer_invocations"]:
+        job_budget["reviewer_invocations"] = run_budget["reviewer_invocations"]
+    run_budget["reviewer_invocations"] = max(
+        run_budget["reviewer_invocations"], job_budget["reviewer_invocations"]
+    )
+    merged_artifacts = _merge_review_artifacts(
+        run_budget["review_artifacts"], job_budget["review_artifacts"]
+    )
+    run_budget["review_artifacts"] = deepcopy(merged_artifacts)
+    job_budget["review_artifacts"] = deepcopy(merged_artifacts)
     cycle = run.get("repair_cycle")
     if not isinstance(cycle, dict):
         return
@@ -84,6 +102,26 @@ def sync_repair_cycle_counters(
         cycle["worktree"] = checkout
     run["code_modification_attempts"] = modifications
     run["modification_attempts"] = modifications
+
+
+def _merge_review_artifacts(
+    run_artifacts: list[dict[str, Any]], job_artifacts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep one ordered, bounded view of Run and active Repair artifacts."""
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for artifact in [*run_artifacts, *job_artifacts]:
+        reviewer = str(artifact.get("reviewer_thread_id", ""))
+        candidate = str(artifact.get("candidate_sha", ""))
+        identity = artifact.get("review_identity")
+        identity_key = repr(identity) if isinstance(identity, dict) else ""
+        key = (reviewer, candidate, identity_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(deepcopy(artifact))
+    return merged[-5:]
 
 
 def rotate_repair_job(
@@ -134,6 +172,9 @@ def rotate_repair_job(
         "linked_branch_display",
         "pending_attempt",
         "integrated_revalidation_merge",
+        "deterministic_integration_record",
+        "required_checks",
+        "required_checks_mode",
     ):
         rotated.pop(key, None)
     rotated.update(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,14 @@ from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
 from conftest import write_fixture
-from test_delivery import PassAgents, ScriptedPublisher, issue
+from test_delivery import (
+    E2E_PASS_EVIDENCE,
+    SPEC_PASS_EVIDENCE,
+    STANDARDS_PASS_EVIDENCE,
+    PassAgents,
+    ScriptedPublisher,
+    issue,
+)
 
 
 class PartialCheckoutGit(GitRepository):
@@ -160,8 +168,102 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
             "phase": "completed",
             "ticket_branch": branch,
             "integrated_sha": "integrated",
+            "deterministic_integration_record": {
+                "source": "accepted",
+                "base_sha": "base",
+                "candidate_sha": "integrated",
+                "candidate_tree": "tree",
+                "publication_sha": "integrated",
+                "integrated_sha": "integrated",
+                "integrated_publication_sha": "integrated",
+                "integrated_tree": "tree",
+                "integrated_message": "feat: integrated ticket",
+                "integrated_parents": ["base"],
+                "effective_revision": "ticket-2-revision",
+                "pr_number": 1,
+                "window": 1,
+                "final_ci_fix_used": False,
+                "required_checks_mode": "configured",
+                "required_checks": "pass",
+                "required_checks_evidence": {
+                    "pr_number": 1,
+                    "head_sha": "integrated",
+                    "result": "pass",
+                    "checks": [{"name": "fixture", "bucket": "pass"}],
+                },
+                "pr": {
+                    "number": 1,
+                    "state": "MERGED",
+                    "head_sha": "integrated",
+                    "base_sha": "base",
+                    "merge_commit_sha": "integrated",
+                },
+                "acceptance_record": {
+                    "acceptance_scope": "change_job",
+                    "reviewed_base_sha": "base",
+                    "reviewed_candidate_sha": "integrated",
+                    "reviewed_candidate_tree": "tree",
+                    "effective_revision": "ticket-2-revision",
+                    "reviewer_thread_id": "ticket-reviewer",
+                    "artifact": {
+                        "checks": {
+                            "e2e": {
+                                "status": "pass",
+                                "evidence": E2E_PASS_EVIDENCE,
+                                "findings": [],
+                            },
+                            "standards": {
+                                "status": "pass",
+                                "evidence": STANDARDS_PASS_EVIDENCE,
+                                "findings": [],
+                            },
+                            "spec": {
+                                "status": "pass",
+                                "evidence": SPEC_PASS_EVIDENCE,
+                                "findings": [],
+                            },
+                        }
+                    },
+                },
+            },
+            "review_budget": {
+                "window": 1,
+                "development_attempts": 0,
+                "reviewer_invocations": 0,
+                "final_ci_fix_used": False,
+                "review_artifacts": [],
+                "checkpoint_reason": None,
+            },
+            "review_budget_history": [],
         }
     )
+    cleanup_job = state["ticket_jobs"]["2"]
+    cleanup_record = cleanup_job["deterministic_integration_record"]
+    cleanup_acceptance = cleanup_record["acceptance_record"]
+    cleanup_review_artifact = {
+        "reviewer_thread_id": cleanup_acceptance["reviewer_thread_id"],
+        "candidate_sha": cleanup_acceptance["reviewed_candidate_sha"],
+        "reviewed_base_sha": cleanup_acceptance["reviewed_base_sha"],
+        "review_identity": {
+            "reviewed_base_sha": cleanup_acceptance["reviewed_base_sha"],
+            "reviewed_candidate_sha": cleanup_acceptance[
+                "reviewed_candidate_sha"
+            ],
+            "reviewed_candidate_tree": cleanup_acceptance[
+                "reviewed_candidate_tree"
+            ],
+        },
+        "artifact": cleanup_acceptance["artifact"],
+    }
+    cleanup_job["review_budget"] = {
+        "window": 1,
+        "development_attempts": 0,
+        "reviewer_invocations": 1,
+        "final_ci_fix_used": False,
+        "review_artifacts": [cleanup_review_artifact],
+        "checkpoint_reason": None,
+    }
+    cleanup_record["review_budget"] = deepcopy(cleanup_job["review_budget"])
     state["delivery_cleanup"] = {
         "status": "cleanup_pending",
         "items": {

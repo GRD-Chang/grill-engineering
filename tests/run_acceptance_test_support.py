@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,17 @@ _PASS_EVIDENCE = {
     "standards": "审查范围或基线：仓库编码规范与完整 Run diff；结论：未发现违反项。",
     "spec": "已核对的验收标准：Parent Issue 的全部验收标准；覆盖结论：完整 Run 已覆盖。",
 }
+
+
+def _canonical_run_budget() -> dict[str, object]:
+    return {
+        "window": 1,
+        "development_attempts": 0,
+        "reviewer_invocations": 0,
+        "final_ci_fix_used": False,
+        "review_artifacts": [],
+        "checkpoint_reason": None,
+    }
 
 def _passing_artifact() -> dict[str, object]:
     return {
@@ -209,7 +221,122 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
             ],
             "acceptance_record": {"artifact": _passing_artifact()},
             "integrated_sha": git.resolve(str(state["run_branch"])),
+            "review_budget": {
+                "window": 1,
+                "development_attempts": 1,
+                "reviewer_invocations": 0,
+                "final_ci_fix_used": False,
+                "review_artifacts": [],
+                "checkpoint_reason": None,
+            },
+            "review_budget_history": [],
         }
+    }
+    integrated_sha = str(state["ticket_jobs"]["2"]["integrated_sha"])
+    effective_revision = state["ticket_graph"]["tickets"]["2"][
+        "content_revision"
+    ]
+    candidate_tree = git.resolve(f"{integrated_sha}^{{tree}}")
+    acceptance_record = {
+        "acceptance_scope": "change_job",
+        "reviewed_base_sha": str(state["base"]["sha"]),
+        "reviewed_candidate_sha": integrated_sha,
+        "reviewed_candidate_tree": candidate_tree,
+        "effective_revision": effective_revision,
+        "reviewer_thread_id": "ticket-reviewer",
+        "artifact": _passing_artifact(),
+    }
+    state["ticket_jobs"]["2"]["acceptance_record"] = acceptance_record
+    review_artifact = {
+        "reviewer_thread_id": acceptance_record["reviewer_thread_id"],
+        "candidate_sha": acceptance_record["reviewed_candidate_sha"],
+        "reviewed_base_sha": acceptance_record["reviewed_base_sha"],
+        "review_identity": {
+            "reviewed_base_sha": acceptance_record["reviewed_base_sha"],
+            "reviewed_candidate_sha": acceptance_record["reviewed_candidate_sha"],
+            "reviewed_candidate_tree": acceptance_record["reviewed_candidate_tree"],
+        },
+        "artifact": acceptance_record["artifact"],
+    }
+    state["ticket_jobs"]["2"]["review_budget"] = {
+        "window": 1,
+        "development_attempts": 1,
+        "reviewer_invocations": 1,
+        "final_ci_fix_used": False,
+        "review_artifacts": [review_artifact],
+        "checkpoint_reason": None,
+    }
+    state["ticket_jobs"]["2"]["deterministic_integration_record"] = {
+        "source": "accepted",
+        "base_sha": str(state["base"]["sha"]),
+        "candidate_sha": integrated_sha,
+        "candidate_tree": candidate_tree,
+        "publication_sha": integrated_sha,
+        "integrated_sha": integrated_sha,
+        "integrated_publication_sha": integrated_sha,
+        "integrated_tree": candidate_tree,
+        "integrated_message": git.commit_subject(integrated_sha),
+        "integrated_parents": [str(state["base"]["sha"])],
+        "effective_revision": effective_revision,
+        "pr_number": 1,
+        "window": 1,
+        "final_ci_fix_used": False,
+        "review_budget": deepcopy(state["ticket_jobs"]["2"]["review_budget"]),
+        "required_checks_mode": "configured",
+        "required_checks": "pass",
+        "required_checks_evidence": {
+            "pr_number": 1,
+            "head_sha": integrated_sha,
+            "result": "pass",
+            "checks": [{"name": "fixture", "bucket": "pass"}],
+        },
+        "pr": {
+            "number": 1,
+            "state": "MERGED",
+            "head_sha": integrated_sha,
+            "base_sha": str(state["base"]["sha"]),
+            "merge_commit_sha": integrated_sha,
+        },
+        "acceptance_record": acceptance_record,
     }
     states.save_run(str(state["run_id"]), state)
     return state, states, git
+
+
+def _sync_completed_ticket_integrated_sha(
+    state: dict[str, Any], git: GitRepository, integrated_sha: str
+) -> None:
+    """Keep fixture Ticket state and its Integration Record at one commit."""
+
+    job = state["ticket_jobs"]["2"]
+    record = job["deterministic_integration_record"]
+    parents = git.commit_parents(integrated_sha)
+    base_sha = parents[0]
+    job["integrated_sha"] = integrated_sha
+    record.update(
+        {
+            "base_sha": base_sha,
+            "integrated_sha": integrated_sha,
+            "integrated_tree": git.resolve(f"{integrated_sha}^{{tree}}"),
+            "integrated_message": git.commit_subject(integrated_sha),
+            "integrated_parents": parents,
+        }
+    )
+    record["pr"].update({"base_sha": base_sha, "merge_commit_sha": integrated_sha})
+    authorization = record.get("acceptance_record")
+    if isinstance(authorization, dict):
+        authorization["reviewed_base_sha"] = base_sha
+    budget = job.get("review_budget")
+    if isinstance(budget, dict):
+        artifacts = budget.get("review_artifacts")
+        if isinstance(artifacts, list):
+            for item in artifacts:
+                if not isinstance(item, dict):
+                    continue
+                item["reviewed_base_sha"] = base_sha
+                identity = item.get("review_identity")
+                if isinstance(identity, dict) and "reviewed_base_sha" in identity:
+                    identity["reviewed_base_sha"] = base_sha
+        record_budget = record.get("review_budget")
+        if isinstance(record_budget, dict):
+            record["review_budget"] = deepcopy(budget)

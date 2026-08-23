@@ -36,6 +36,12 @@ from agent_run.run_currentness import (
     ticket_completion_records_fingerprint,
 )
 from agent_run.run_locator import RunLocatorIndex
+from agent_run.review_budget import (
+    RUN_POLICY,
+    TICKET_POLICY,
+    budget_checkpoint_subjects,
+    reset_budget,
+)
 from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
     wait_for_recoverable_github_read,
@@ -279,14 +285,19 @@ class Controller:
             if human_response is not None:
                 human_response = _validated_human_response(human_response)
             resuming_run_acceptance = False
-            if resume_human_blocker:
+            budget_resumed = _resume_review_budget_window(state)
+            if budget_resumed and human_response is not None:
+                raise ValueError("Review Budget resume does not accept a Human Blocker response")
+            if budget_resumed:
+                resumed_subject = True
+            elif resume_human_blocker:
                 resuming_run_acceptance = _run_acceptance_human_blocker(state)
                 resumed_subject = _resume_agent_human_blocker(state, human_response)
                 if human_response is not None and not resumed_subject:
                     raise ValueError("--message requires a current Human Blocker")
             elif human_response is not None:
                 raise ValueError("--message requires Human Blocker resume")
-            if new_thread:
+            if new_thread and not budget_resumed:
                 if resuming_run_acceptance:
                     _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
                 else:
@@ -660,9 +671,47 @@ class Controller:
                     credential_availability
                 )
             refreshed.pop("currentness_resolution_pending", None)
-            self._mark_stale_change_job(
-                refreshed, check_requeue_currentness=check_requeue_currentness
-            )
+            if state.get("status") == "requeue_required":
+                if check_requeue_currentness:
+                    # The graph projection may materialize the blocked Job as
+                    # ``blocked``/``active``.  Give the currentness checker a
+                    # neutral projection so it can distinguish a real PR
+                    # mutation from the already-authorized local requeue.
+                    refreshed.update(
+                        {
+                            "status": "active",
+                            "terminal_kind": None,
+                            "diagnostics": [],
+                        }
+                    )
+                    self._mark_stale_change_job(
+                        refreshed, check_requeue_currentness=True
+                    )
+                if refreshed.get("status") not in {
+                    "active",
+                    "requeue_required",
+                }:
+                    return refreshed
+                # Graph reconciliation projects normal lifecycle phases from
+                # GitHub facts and can otherwise erase a local stale-boundary
+                # decision, especially when an ABA revision returns to its
+                # original fingerprint.  Requeue is an explicit operator
+                # decision, so preserve it until the requeue command consumes
+                # the transition.
+                refreshed.update(
+                    {
+                        "status": "requeue_required",
+                        "terminal_kind": "requeue_required",
+                        "diagnostics": deepcopy(state.get("diagnostics", [])),
+                        "requeue_required": deepcopy(
+                            state.get("requeue_required")
+                        ),
+                    }
+                )
+            else:
+                self._mark_stale_change_job(
+                    refreshed, check_requeue_currentness=check_requeue_currentness
+                )
             self._invalidate_stale_final_run(refreshed, default_head)
             refreshed.pop("github_refresh_pending", None)
             return refreshed
@@ -863,6 +912,7 @@ class Controller:
         state: dict[str, Any] = {
             "run_id": run_id,
             "branch_authority_protocol": 2,
+            "review_budget_protocol": 1,
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
             "base": {"branch": repository.default_branch, "sha": base_sha},
@@ -1145,6 +1195,153 @@ def _resume_agent_human_blocker(
         )
         return True
     return False
+
+
+def _resume_review_budget_window(state: dict[str, Any]) -> bool:
+    """Open exactly one new bounded window after an explicit budget pause."""
+
+    subjects = budget_checkpoint_subjects(state)
+    if not subjects:
+        return False
+    if len(subjects) > 1:
+        raise ValueError("multiple Review Budget checkpoints require an unambiguous resume target")
+    subject_kind, subject = subjects[0]
+    if subject_kind == "ticket":
+        reset_budget(subject, TICKET_POLICY)
+        subject.pop("blocked_reason", None)
+        subject.pop("escalation_code", None)
+        _resume_change_subject_after_budget(subject)
+        state["active_ticket_job"] = subject
+        state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+        return True
+    if subject_kind == "parent":
+        reset_budget(subject, RUN_POLICY)
+        subject.pop("blocked_reason", None)
+        subject.pop("escalation_code", None)
+        _resume_change_subject_after_budget(subject)
+        state.update(
+            {"status": "parent_delivery_pending", "terminal_kind": None, "diagnostics": []}
+        )
+        return True
+    if subject_kind == "run":
+        reset_budget(subject, RUN_POLICY)
+        subject.pop("blocked_reason", None)
+        subject["phase"] = "repairing"
+        subject["repair_request"] = _budget_repair_request(subject)
+        state.update(
+            {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
+        )
+        return True
+    run_state = _state_mapping(state, "run_acceptance")
+    reset_budget(run_state, RUN_POLICY)
+    run_state["repair_request"] = _budget_repair_request(subject)
+    run_state["phase"] = "repairing"
+    run_state.pop("blocked_reason", None)
+    run_state.pop("repair_job", None)
+    state.update(
+        {"status": "run_acceptance_pending", "terminal_kind": "run_repair_pending", "diagnostics": []}
+    )
+    return True
+
+
+def _resume_change_subject_after_budget(job: dict[str, Any]) -> None:
+    source = str(job.get("repair_source", ""))
+    if source == "required_checks" and isinstance(job.get("ci_evidence"), dict):
+        job["phase"] = "repairing"
+        job["repair_source"] = "required_checks"
+    elif source == "git_integrity" and isinstance(
+        job.get("git_integrity_evidence"), dict
+    ):
+        job["phase"] = "repairing"
+        job["repair_source"] = "git_integrity"
+    elif source == "acceptance" and isinstance(
+        job.get("acceptance_artifact"), dict
+    ):
+        job["phase"] = "repairing"
+        job["repair_source"] = "acceptance"
+    elif source == "human_revision" and isinstance(
+        job.get("human_feedback"), str
+    ):
+        job["phase"] = "repairing"
+        job["repair_source"] = "human_revision"
+    elif source == "merge_conflict" and isinstance(
+        job.get("merge_conflict_evidence"), str
+    ):
+        job["phase"] = "repairing"
+        job["repair_source"] = "merge_conflict"
+    else:
+        job["phase"] = "developing"
+    job.pop("next_attempt_kind", None)
+
+
+def _budget_repair_request(job: dict[str, Any]) -> dict[str, Any]:
+    source = str(job.get("repair_source", ""))
+    if source == "required_checks" and isinstance(job.get("ci_evidence"), dict):
+        request = {
+            "repair_source": "required_checks",
+            "ci_evidence": deepcopy(job["ci_evidence"]),
+        }
+    elif source == "git_integrity" and isinstance(
+        job.get("git_integrity_evidence"), dict
+    ):
+        request = {
+            "repair_source": "git_integrity",
+            "git_integrity_evidence": deepcopy(job["git_integrity_evidence"]),
+        }
+    elif source == "human_revision" and isinstance(job.get("human_feedback"), str):
+        request = {
+            "repair_source": "human_revision",
+            "human_feedback": str(job["human_feedback"]),
+        }
+    elif source == "merge_conflict" and isinstance(
+        job.get("merge_conflict_evidence"), str
+    ):
+        request = {
+            "repair_source": "merge_conflict",
+            "merge_conflict_evidence": str(job["merge_conflict_evidence"]),
+        }
+    else:
+        artifact = job.get("acceptance_artifact")
+        if not isinstance(artifact, dict):
+            artifact = job.get("unresolved_acceptance_artifact")
+        if not isinstance(artifact, dict):
+            raise ValueError("budget checkpoint has no repair evidence")
+        request = {
+            "repair_source": "acceptance",
+            "acceptance_artifact": deepcopy(artifact),
+        }
+    candidate = job.get("candidate_sha")
+    if candidate is not None:
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise ValueError("budget checkpoint has an invalid current Candidate")
+        request["repair_candidate_sha"] = candidate
+    repair_mode = job.get("repair_mode")
+    if repair_mode is not None:
+        if repair_mode not in {"squash", "merge_resolution"}:
+            raise ValueError("budget checkpoint has an invalid Run Repair mode")
+        request["repair_mode"] = repair_mode
+    return _carry_development_thread_context(request, job)
+
+
+def _carry_development_thread_context(
+    request: dict[str, Any], job: dict[str, Any]
+) -> dict[str, Any]:
+    """Carry the persistent Development Thread across an R5 Job rotation."""
+
+    thread_id = job.get("development_thread_id")
+    if thread_id is not None and (
+        not isinstance(thread_id, str) or not thread_id.strip()
+    ):
+        raise ValueError("budget checkpoint has an invalid Development Thread ID")
+    history = job.get("development_thread_history", [])
+    if not isinstance(history, list) or not all(
+        isinstance(item, str) and item.strip() for item in history
+    ):
+        raise ValueError("budget checkpoint has invalid Development Thread history")
+    if thread_id is not None:
+        request["development_thread_id"] = thread_id
+    request["development_thread_history"] = deepcopy(history)
+    return request
 
 
 def _clear_current_invocation_thread(state: dict[str, Any]) -> None:

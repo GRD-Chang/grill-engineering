@@ -18,6 +18,7 @@ from agent_run.change_delivery import (
     latest_reviewer_thread,
     StaleDisposition,
 )
+from agent_run.change_delivery_fallback import fallback_publication_context
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
@@ -28,6 +29,7 @@ from agent_run.external_supervision import (
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
+from agent_run.review_budget import previous_review_context
 
 
 def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> None:
@@ -51,7 +53,7 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     """Semantic Adapter for the Ticket delivery consumer."""
 
     stale_disposition = StaleDisposition.BLOCK
-    classify_required_check_failures = False
+    classify_required_check_failures = True
 
     def __init__(self, git: GitRepository, github: GitHubPublisher) -> None:
         self.git = git
@@ -93,7 +95,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             request["human_response_history"] = history
         if job.get("development_summary"):
             request["development_summary"] = str(job["development_summary"])
-        if job.get("repair_source") == "acceptance":
+        if job.get("repair_source") == "git_integrity":
+            request["repair_source"] = "git_integrity"
+            request["git_integrity_evidence"] = _mapping(
+                job, "git_integrity_evidence"
+            )
+        elif job.get("repair_source") == "acceptance":
             request["repair_source"] = "acceptance"
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         elif job.get("repair_source") == "required_checks":
@@ -118,8 +125,13 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "thread_id": select_publication_thread(
                 job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
             ),
-            "acceptance_artifact": _mapping(job, "acceptance_artifact"),
         }
+        if job.get("publication_authority") == "fallback":
+            request["fallback_publication_context"] = fallback_publication_context(
+                _mapping(job, "fallback_publication_receipt")
+            )
+        else:
+            request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         if job.get("prior_human_blockers"):
             request["prior_human_blockers"] = job["prior_human_blockers"]
         if history := current_human_response_history(
@@ -131,9 +143,15 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         existing_pr = job.get("pr_number")
         if isinstance(existing_pr, int):
             request["existing_pr"] = self.github.publication_context(existing_pr)
-        if job.get("repair_source") == "acceptance":
+        if (
+            job.get("publication_authority") != "fallback"
+            and job.get("repair_source") == "acceptance"
+        ):
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
-        elif job.get("repair_source") == "required_checks":
+        elif (
+            job.get("publication_authority") != "fallback"
+            and job.get("repair_source") == "required_checks"
+        ):
             request["ci_evidence"] = _mapping(job, "ci_evidence")
         return request
 
@@ -149,6 +167,13 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "ticket": _ticket(state, job),
             "base_sha": job["base_sha"],
             "candidate_sha": job["candidate_sha"],
+            "current_review_identity": {
+                "reviewed_base_sha": str(job["base_sha"]),
+                "reviewed_candidate_sha": str(job["candidate_sha"]),
+                "reviewed_candidate_tree": self.git.resolve(
+                    f"{job['candidate_sha']}^{{tree}}"
+                ),
+            },
             "effective_revision": job["effective_revision"],
             "checkout": str(checkout),
             "thread_id": (
@@ -169,6 +194,10 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             job, generation=int(job.get("ticket_branch_generation", 1))
         ):
             request["human_response_history"] = history
+        previous = previous_review_context(job)
+        if previous is not None:
+            request["previous_acceptance_artifact"] = previous["artifact"]
+            request["previous_review_identity"] = previous["identity"]
         return request
 
     def acceptance_record(
@@ -235,7 +264,19 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
         self, checkout: Path, job: dict[str, Any], attempt: int
     ) -> str | None:
         return self.owner.git.commit_candidate(
-            checkout, ticket_number=int(job["ticket_number"]), attempt=attempt
+            checkout,
+            ticket_number=int(job["ticket_number"]),
+            attempt=attempt,
+            expected_head=str(
+                job.get("managed_checkout_head")
+                or job.get("candidate_sha")
+                or job["base_sha"]
+            ),
+            candidate_intent=(
+                job.get("candidate_commit_intent")
+                if isinstance(job.get("candidate_commit_intent"), dict)
+                else None
+            ),
         )
 
     def create_publication_commit(
@@ -363,6 +404,14 @@ class TicketDeliveryLoop:
             "last_publication_error",
             "repair_source",
             "ci_evidence",
+            "publication_authority",
+            "fallback_publication_receipt",
+            "deterministic_integration_record",
+            "required_checks",
+            "required_checks_mode",
+            "next_attempt_kind",
+            "last_review_candidate_sha",
+            "final_ci_fix_failure_head",
         ):
             job.pop(key, None)
         job.update(
@@ -408,6 +457,48 @@ class TicketDeliveryLoop:
                 "merged_revision_mismatch",
                 "Merged Ticket PR was integrated, but no longer matches the current revision",
             )
+        integration_record = job.get("deterministic_integration_record")
+        integrated_tree = live.get("integrated_tree")
+        integrated_message = live.get("integrated_message")
+        integrated_parents = live.get("integrated_parents")
+        if (
+            not isinstance(integration_record, dict)
+            or not isinstance(integrated_tree, str)
+            or not integrated_tree
+            or not isinstance(integrated_message, str)
+            or not integrated_message
+            or not isinstance(integrated_parents, list)
+            or not all(
+                isinstance(parent, str) and parent for parent in integrated_parents
+            )
+        ):
+            return self._block(
+                state,
+                job,
+                "merged_result_mismatch",
+                "Merged Ticket PR is missing its canonical integrated commit evidence",
+            )
+        record_pr = integration_record.get("pr")
+        if not isinstance(record_pr, dict):
+            return self._block(
+                state,
+                job,
+                "merged_result_mismatch",
+                "Merged Ticket PR is missing its canonical PR evidence",
+            )
+        # The Integration Record is created before merge so publication can
+        # persist its authority boundary.  Only the live post-merge facts can
+        # establish the commit that actually entered the Run Branch.
+        integrated_facts = {
+            "integrated_sha": integrated,
+            "integrated_publication_sha": str(job["publication_sha"]),
+            "integrated_tree": integrated_tree,
+            "integrated_message": integrated_message,
+            "integrated_parents": list(integrated_parents),
+        }
+        integration_record.update(integrated_facts)
+        record_pr.update({"state": "MERGED", "merge_commit_sha": integrated})
+        job.update(integrated_facts)
         # Persist the integrated boundary before the external Issue mutation.
         job["phase"] = TicketPhase.MERGED.value
         self._save(state)

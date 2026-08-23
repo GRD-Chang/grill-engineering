@@ -15,6 +15,7 @@ from run_acceptance_test_support import (
     _candidate_finding_artifact,
     _completed_run,
     _passing_artifact,
+    _sync_completed_ticket_integrated_sha,
 )
 
 
@@ -327,7 +328,7 @@ class MergeResolutionFixture:
             capture_output=True,
         )
         default_head = self.git.resolve("main")
-        self.state["ticket_jobs"]["2"]["integrated_sha"] = run_head
+        _sync_completed_ticket_integrated_sha(self.state, self.git, run_head)
         self.states.save_run(str(self.state["run_id"]), self.state)
         fixture_data = json.loads(self.fixture.read_text(encoding="utf-8"))
         fixture_data["default_head_sha"] = default_head

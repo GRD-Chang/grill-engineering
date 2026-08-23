@@ -28,6 +28,8 @@ from agent_run.run_currentness import (
     refresh_run_currentness,
     run_currentness_boundary,
     ticket_completion_records,
+    ticket_fallback_records,
+    ticket_integration_records,
 )
 from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_repair_lifecycle import RunRepairLifecycle
@@ -36,7 +38,17 @@ from agent_run.run_repair_currentness import RunRepairCurrentness
 from agent_run.run_repair_requests import RunRepairRequests
 from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.state import StateStore
+from agent_run.integration_record_contract import (
+    require_completed_ticket_integration_records,
+)
 from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.review_budget import (
+    RUN_POLICY,
+    ensure_budget,
+    mark_review,
+    new_budget,
+    previous_review_context,
+)
 
 
 _RUN_ACCEPTANCE_CREDENTIAL_SUBJECT = "run-acceptance"
@@ -90,6 +102,7 @@ class RunAcceptanceEngine:
             if not self._all_tickets_completed(state):
                 raise ValueError("Run Acceptance requires every Ticket to be completed")
             run = self._run_state(state)
+            ensure_budget(run, RUN_POLICY)
             self._invalidate_stale_acceptance(state, run)
             while True:
                 phase = str(run["phase"])
@@ -151,6 +164,24 @@ class RunAcceptanceEngine:
                     continue
                 if phase != "pending":
                     raise ValueError(f"unknown Run Acceptance phase: {phase}")
+                budget = ensure_budget(run, RUN_POLICY)
+                if int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit:
+                    run["phase"] = "ready_for_human"
+                    run["blocked_reason"] = "review_budget_exhausted"
+                    budget["checkpoint_reason"] = "review_budget_exhausted"
+                    state.update(
+                        {
+                            "status": "ready_for_human",
+                            "terminal_kind": "waiting_human",
+                            "diagnostics": [
+                                {
+                                    "code": "review_budget_exhausted",
+                                    "message": "Run Acceptance review budget is exhausted; resume is required",
+                                }
+                            ],
+                        }
+                    )
+                    return self._save(state)
                 if not self._review(state, run):
                     return self._save(state)
 
@@ -192,7 +223,7 @@ class RunAcceptanceEngine:
                 run_head_sha=run_head,
             )
             request = self._review_request(
-                state, run, checkout, run_head, default_head
+                state, run, checkout, run_head, default_head, expected_merge_tree
             )
             if run.get("reviewer_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
@@ -243,6 +274,12 @@ class RunAcceptanceEngine:
             clear_initial_credential_wait(
                 state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
             )
+            # Only a returned Artifact that passes the strict schema parser
+            # consumes a Reviewer invocation.  Count it before currentness
+            # re-checking because the Reviewer did complete a valid audit even
+            # when a live boundary refresh discards that verdict.
+            artifact = AcceptanceArtifact.parse(review.artifact)
+            mark_review(run, RUN_POLICY)
             # The reviewer has already consumed this identity even if a live
             # authority refresh discards its verdict.  Keep it unavailable to
             # the fresh Acceptance that follows a drift.
@@ -254,7 +291,22 @@ class RunAcceptanceEngine:
         finally:
             self.git.remove_worktree(checkout)
         run.pop("reviewer_new_thread", None)
-        artifact = AcceptanceArtifact.parse(review.artifact)
+        budget = ensure_budget(run, RUN_POLICY)
+        budget["review_artifacts"].append(
+            {
+                "reviewer_thread_id": review.thread_id,
+                "candidate_sha": run_head,
+                "reviewed_base_sha": default_head,
+                "expected_merge_tree": expected_merge_tree,
+                "review_identity": {
+                    "default_base_sha": default_head,
+                    "run_head_sha": run_head,
+                    "expected_merge_tree": expected_merge_tree,
+                },
+                "artifact": artifact.raw,
+            }
+        )
+        del budget["review_artifacts"][:-5]
         record = self._acceptance_record(
             state,
             run_head,
@@ -296,7 +348,25 @@ class RunAcceptanceEngine:
             )
         else:
             clear_current_human_blocker(run)
-            run["phase"] = "repairing"
+            budget = ensure_budget(run, RUN_POLICY)
+            if int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit:
+                run["phase"] = "ready_for_human"
+                run["blocked_reason"] = "review_budget_exhausted"
+                budget["checkpoint_reason"] = "review_budget_exhausted"
+                state.update(
+                    {
+                        "status": "ready_for_human",
+                        "terminal_kind": "waiting_human",
+                        "diagnostics": [
+                            {
+                                "code": "review_budget_exhausted",
+                                "message": "Run Acceptance review budget is exhausted; resume is required",
+                            }
+                        ],
+                    }
+                )
+            else:
+                run["phase"] = "repairing"
         if not artifact.requires_human:
             self._record_final_pr_status(state, artifact.raw, run_head)
         self._save(state)
@@ -304,6 +374,7 @@ class RunAcceptanceEngine:
 
     def _refresh_run_currentness(self, state: dict[str, Any]) -> bool:
         """Re-read GitHub before applying a Reviewer result when configured."""
+        require_completed_ticket_integration_records(state)
         if self.currentness_reader is None:
             return True
         default_head = refresh_run_currentness(
@@ -399,6 +470,8 @@ class RunAcceptanceEngine:
             "development_thread_history": [],
             "reviewer_thread_ids": [],
             "candidate_acceptance_history": [],
+            "review_budget": new_budget(),
+            "review_budget_history": [],
         }
         state["run_acceptance"] = run
         return run
@@ -435,8 +508,9 @@ class RunAcceptanceEngine:
         checkout: Path,
         run_head: str,
         default_head: str,
+        expected_merge_tree: str,
     ) -> dict[str, Any]:
-        return {
+        request = {
             "acceptance_scope": "run",
             "parent_issue_url": self._issue_url(
                 state, int(self._mapping(state, "parent")["number"])
@@ -447,6 +521,11 @@ class RunAcceptanceEngine:
             "ticket_completion_records": ticket_completion_records(state),
             "base_sha": default_head,
             "run_head_sha": run_head,
+            "current_review_identity": {
+                "default_base_sha": default_head,
+                "run_head_sha": run_head,
+                "expected_merge_tree": expected_merge_tree,
+            },
             "expected_merge_result": {
                 "default_base_sha": default_head,
                 "run_branch_head_sha": run_head,
@@ -479,6 +558,17 @@ class RunAcceptanceEngine:
                 else {}
             ),
         }
+        fallbacks = ticket_fallback_records(state)
+        if fallbacks:
+            request["fallback_ticket_records"] = fallbacks
+        integrations = ticket_integration_records(state)
+        if integrations:
+            request["ticket_integration_records"] = integrations
+        previous = previous_review_context(run)
+        if previous is not None:
+            request["previous_acceptance_artifact"] = previous["artifact"]
+            request["previous_review_identity"] = previous["identity"]
+        return request
 
     def _candidate_promotion_record(
         self, state: dict[str, Any], job: dict[str, Any], integrated: str
@@ -536,6 +626,7 @@ class RunAcceptanceEngine:
         self._save(state)
 
     def _all_tickets_completed(self, state: dict[str, Any]) -> bool:
+        require_completed_ticket_integration_records(state)
         order = self._mapping(state, "ticket_graph").get("ordered_ticket_numbers")
         jobs = self._mapping(state, "ticket_jobs")
         return isinstance(order, list) and bool(order) and all(
