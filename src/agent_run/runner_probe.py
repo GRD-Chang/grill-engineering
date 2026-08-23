@@ -1,0 +1,144 @@
+"""The one-shot Structured Outputs check used by the source installer."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+
+try:
+    from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
+except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
+    from runner_runtime import (  # type: ignore[import-not-found, no-redef]
+        RuntimeTreeError,
+        find_runtime_package,
+    )
+
+
+PROBE_TIMEOUT_SECONDS = 120.0
+MAX_FINAL_OUTPUT_BYTES = 16 * 1024
+
+PROBE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"status": {"type": "string", "enum": ["ok"]}},
+    "required": ["status"],
+}
+
+
+class RunnerProbeError(RuntimeError):
+    """A candidate cannot be activated because its Codex check failed."""
+
+
+class RunnerProbeBackend:
+    """Run a minimal Codex request without Worker or lifecycle dependencies."""
+
+    def __init__(
+        self,
+        executable: str = "codex",
+        *,
+        timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
+    ) -> None:
+        resolved = shutil.which(executable)
+        if resolved is None:
+            raise RunnerProbeError("Codex executable is not available on PATH")
+        self.executable = resolved
+        self.timeout_seconds = timeout_seconds
+
+    def check(self, candidate: Path) -> dict[str, str]:
+        _require_runtime_package(candidate)
+        with tempfile.TemporaryDirectory(prefix="agent-run-probe-") as temporary_name:
+            temporary = Path(temporary_name)
+            empty_directory = temporary / "empty"
+            empty_directory.mkdir()
+            schema_path = temporary / "schema.json"
+            output_path = temporary / "last-message.json"
+            schema_path.write_text(
+                json.dumps(PROBE_SCHEMA, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            command = [
+                self.executable,
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+                "--cd",
+                str(empty_directory),
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            prompt = (
+                "你是 Source Runner Compatibility Check 员工，负责验证候选 Runner Snapshot 的 Codex "
+                "结构化输出能力。"
+                "本轮唯一交付是完成一次无副作用的兼容性检查并返回检查结果。"
+                "权威事实只有当前 PATH 上的 Codex、调用方提供的空工作目录和 output-schema；"
+                "不要把候选 Runner 当作工作目录，也不要读取源码或访问网络。"
+                "你的边界是不调用工具、不修改文件、不创建持久状态、不执行 Worker、GitHub、发布或生命周期操作。"
+                '完成条件是只返回精确 JSON 对象 {"status":"ok"}，不得增加任何字段。'
+                '唯一交付物是这个 JSON 对象。'
+            )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=empty_directory,
+                    env=os.environ.copy(),
+                    text=True,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                try:
+                    process.communicate(input=prompt, timeout=self.timeout_seconds)
+                except subprocess.TimeoutExpired as error:
+                    _terminate_process_group(process)
+                    raise RunnerProbeError("Codex Compatibility Check timed out") from error
+            except subprocess.TimeoutExpired as error:
+                raise RunnerProbeError("Codex Compatibility Check timed out") from error
+            except OSError as error:
+                raise RunnerProbeError("could not start Codex Compatibility Check") from error
+            if process.returncode != 0:
+                raise RunnerProbeError("Codex Compatibility Check returned a non-zero exit")
+            if not output_path.is_file():
+                raise RunnerProbeError("Codex Compatibility Check produced no final output")
+            final_output = output_path.read_bytes()
+            if len(final_output) > MAX_FINAL_OUTPUT_BYTES:
+                raise RunnerProbeError("Codex Compatibility Check final output is too large")
+            try:
+                loaded: object = json.loads(final_output.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RunnerProbeError("Codex Compatibility Check returned invalid JSON") from error
+            if loaded != {"status": "ok"}:
+                raise RunnerProbeError("Codex Compatibility Check rejected the required schema")
+        return {"result": "passed"}
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _require_runtime_package(candidate: Path) -> Path:
+    try:
+        return find_runtime_package(candidate)
+    except RuntimeTreeError as error:
+        raise RunnerProbeError(str(error)) from error
