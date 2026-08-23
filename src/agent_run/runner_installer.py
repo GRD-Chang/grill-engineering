@@ -9,26 +9,23 @@ import json
 import os
 import platform
 import re
+import selectors
 import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Sequence, cast
 
 try:
-    from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
-    from runner_probe import (  # type: ignore[import-not-found, no-redef]
-        RunnerProbeBackend,
-        RunnerProbeError,
-    )
     from runner_runtime import (  # type: ignore[import-not-found, no-redef]
         RuntimeTreeError,
         find_runtime_package,
@@ -46,6 +43,23 @@ _PATH_BLOCK_RE = re.compile(
     rf"(?ms)^{re.escape(PATH_BLOCK_START)}\n.*?^{re.escape(PATH_BLOCK_END)}\n?"
 )
 _MAX_GIT_FIELD_BYTES = 512
+_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0
+_MAX_CANDIDATE_PROBE_OUTPUT_BYTES = 16 * 1024
+_SAFE_CANDIDATE_PROBE_ERRORS = frozenset(
+    {
+        "Codex executable is not available on PATH",
+        "Codex Compatibility Check timed out",
+        "could not start Codex Compatibility Check",
+        "Codex Compatibility Check returned a non-zero exit",
+        "Codex Compatibility Check produced no final output",
+        "Codex Compatibility Check final output is too large",
+        "Codex Compatibility Check returned invalid JSON",
+        "Codex Compatibility Check rejected the required schema",
+        "candidate Runner has an invalid runtime tree",
+        "candidate Runner runtime escapes its Snapshot",
+        "candidate Runner runtime contains a symlink outside its Snapshot",
+    }
+)
 
 
 class InstallerError(RuntimeError):
@@ -146,10 +160,17 @@ def _management_lock(paths: InstallPaths) -> Iterator[None]:
 
 def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
     _check_source(source)
+    source_provenance = _source_provenance(source)
     _check_managed_entry(paths, for_uninstall=False)
     old_current, old_previous, old_generation = _read_active(paths)
     entry_was_present = paths.stable_entry.exists() or paths.stable_entry.is_symlink()
     profile_backup = _profile_backup(paths.profile)
+    pre_cleanup_warnings: list[str] = []
+    if old_current is not None and old_generation is not None:
+        pre_cleanup_warnings = _cleanup_retired(
+            paths, old_current, old_previous, old_generation
+        )
+        _emit_warnings(pre_cleanup_warnings)
     _check_prerequisites(source)
     paths.snapshots.mkdir(parents=True, exist_ok=True)
     paths.generations.mkdir(parents=True, exist_ok=True)
@@ -168,13 +189,13 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
             _validate_snapshot(snapshot, identity)
             _remove_path(candidate)
         else:
-            RunnerProbeBackend().check(candidate)
+            _run_candidate_probe(candidate)
             _write_manifest(
                 candidate,
                 {
                     "content_identity": identity,
                     "python": python_version,
-                    "source_provenance": _source_provenance(source),
+                    "source_provenance": source_provenance,
                     "built_at_utc": _now(),
                     "compatibility_check": {"result": "passed"},
                 },
@@ -196,33 +217,43 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
                 if not entry_was_present and _is_managed_entry(paths):
                     paths.stable_entry.unlink(missing_ok=True)
                 raise
-            warnings = _cleanup_retired(paths, snapshot, old_previous, old_generation)
+            warnings = [
+                *pre_cleanup_warnings,
+                *_cleanup_retired(paths, snapshot, old_previous, old_generation),
+            ]
             return _install_result(snapshot, old_previous, warnings, idempotent=True)
 
-        activated = False
         generation: Path | None = None
+        activation_warnings: list[str] = []
         try:
-            generation = _activate(
+            _ensure_profile(paths)
+            _ensure_stable_entry(paths)
+            generation, activation_warnings = _activate(
                 paths,
                 current=snapshot,
                 previous=old_current,
+                old_generation=old_generation,
             )
-            activated = True
-            _ensure_profile(paths)
-            _ensure_stable_entry(paths)
         except BaseException:
             _restore_profile(paths.profile, profile_backup)
-            if activated and generation is not None:
+            if generation is not None:
                 _restore_active(paths, old_generation, generation)
             if not entry_was_present and _is_managed_entry(paths):
                 paths.stable_entry.unlink(missing_ok=True)
-            if created_snapshot and snapshot is not None and snapshot.exists():
+            if (
+                created_snapshot
+                and snapshot is not None
+                and snapshot.exists()
+                and not _active_references_snapshot(paths, snapshot)
+            ):
                 _remove_path(snapshot)
             raise
-        warnings = _cleanup_retired(paths, snapshot, old_current, generation)
+        warnings = [
+            *pre_cleanup_warnings,
+            *activation_warnings,
+            *_cleanup_retired(paths, snapshot, old_current, generation),
+        ]
         return _install_result(snapshot, old_current, warnings, idempotent=False)
-    except RunnerProbeError as error:
-        raise InstallerError(str(error)) from error
     finally:
         if candidate.exists() or candidate.is_symlink():
             _remove_path(candidate)
@@ -234,8 +265,16 @@ def _rollback(paths: InstallPaths) -> dict[str, object]:
     current, previous, generation = _read_active(paths)
     if current is None or previous is None or generation is None:
         raise InstallerError("没有可用的 previous Snapshot，Active Runner 未改变")
-    new_generation = _activate(paths, current=previous, previous=current)
-    warnings = _cleanup_retired(paths, previous, current, new_generation)
+    new_generation, activation_warnings = _activate(
+        paths,
+        current=previous,
+        previous=current,
+        old_generation=generation,
+    )
+    warnings = [
+        *activation_warnings,
+        *_cleanup_retired(paths, previous, current, new_generation),
+    ]
     return {
         "result": "rolled_back",
         "active_snapshot": _manifest_identity(previous),
@@ -360,7 +399,110 @@ def _run_pip_install(python: Path, source: Path) -> int:
     return return_code
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def _run_candidate_probe(candidate: Path) -> None:
+    python = candidate / "bin" / "python"
+    if not python.is_file():
+        raise InstallerError("隔离环境缺少 Runner Compatibility Check 入口")
+    with tempfile.TemporaryDirectory(prefix="agent-run-candidate-probe-") as temporary_name:
+        empty_directory = Path(temporary_name)
+        probe_environment = os.environ.copy()
+        for variable in ("PYTHONHOME", "PYTHONPATH"):
+            probe_environment.pop(variable, None)
+        probe_environment["TMPDIR"] = str(empty_directory)
+        probe_environment["AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP"] = "1"
+        try:
+            process = subprocess.Popen(
+                [str(python), "-m", "agent_run.runner_probe", str(candidate)],
+                cwd=empty_directory,
+                env=probe_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise InstallerError("无法启动候选 Runner Compatibility Check") from error
+        output, error_output = _read_candidate_probe_output(
+            process, timeout_seconds=_CANDIDATE_PROBE_TIMEOUT_SECONDS
+        )
+        if process.returncode != 0:
+            raise InstallerError(_safe_candidate_probe_error(error_output))
+        try:
+            loaded: object = json.loads(output)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InstallerError("Runner Compatibility Check produced invalid output") from error
+        if loaded != {"result": "passed"}:
+            raise InstallerError("Runner Compatibility Check produced an invalid result")
+
+
+def _read_candidate_probe_output(
+    process: subprocess.Popen[Any], *, timeout_seconds: float
+) -> tuple[bytes, bytes]:
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    if any(stream is None for stream in streams.values()):
+        _terminate_process_group(process)
+        raise InstallerError("Runner Compatibility Check failed")
+    deadline = time.monotonic() + timeout_seconds
+    buffers = {name: bytearray() for name in streams}
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in streams.values():
+                assert stream is not None
+                selector.register(stream, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_process_group(process)
+                    raise InstallerError("Runner Compatibility Check timed out")
+                events = selector.select(timeout=remaining)
+                if not events:
+                    _terminate_process_group(process)
+                    raise InstallerError("Runner Compatibility Check timed out")
+                for key, _mask in events:
+                    stream = cast(Any, key.fileobj)
+                    chunk = os.read(stream.fileno(), 4096)
+                    if not chunk:
+                        selector.unregister(stream)
+                        continue
+                    name = next(
+                        stream_name
+                        for stream_name, candidate_stream in streams.items()
+                        if candidate_stream is stream
+                    )
+                    buffers[name].extend(chunk)
+                    if len(buffers[name]) > _MAX_CANDIDATE_PROBE_OUTPUT_BYTES:
+                        _terminate_process_group(process)
+                        raise InstallerError("Runner Compatibility Check output is too large")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process_group(process)
+            raise InstallerError("Runner Compatibility Check timed out")
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            _terminate_process_group(process)
+            raise InstallerError("Runner Compatibility Check timed out") from error
+        return bytes(buffers["stdout"]), bytes(buffers["stderr"])
+    except (OSError, subprocess.SubprocessError) as error:
+        _terminate_process_group(process)
+        raise InstallerError("Runner Compatibility Check failed") from error
+    finally:
+        for stream in streams.values():
+            if stream is not None:
+                stream.close()
+
+
+def _safe_candidate_probe_error(error_output: bytes) -> str:
+    try:
+        detail = error_output.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return "Runner Compatibility Check returned a non-zero exit"
+    prefix = "runner probe: "
+    if detail.startswith(prefix) and detail.removeprefix(prefix) in _SAFE_CANDIDATE_PROBE_ERRORS:
+        return detail.removeprefix(prefix)
+    return "Runner Compatibility Check returned a non-zero exit"
+
+
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except OSError:
@@ -411,6 +553,7 @@ def _source_provenance(source: Path) -> dict[str, object]:
     dirty = (
         _git_status(source, "diff", "--quiet") is False
         or _git_status(source, "diff", "--cached", "--quiet") is False
+        or _git_has_changes(source) is True
     )
     return {"kind": "git", "commit": commit, "ref": ref, "dirty": dirty}
 
@@ -442,6 +585,48 @@ def _git_status(source: Path, *arguments: str) -> bool | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return result.returncode == 0
+
+
+def _git_has_changes(source: Path) -> bool | None:
+    try:
+        process = subprocess.Popen(
+            [
+                "git",
+                "-C",
+                str(source),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    output = process.stdout
+    if output is None:
+        process.wait()
+        return None
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(output, selectors.EVENT_READ)
+            if not selector.select(timeout=3):
+                _terminate_process_group(process)
+                return None
+            if os.read(output.fileno(), 1):
+                _terminate_process_group(process)
+                return True
+        try:
+            return False if process.wait(timeout=3) == 0 else None
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process)
+            return None
+    except (OSError, subprocess.SubprocessError):
+        _terminate_process_group(process)
+        return None
+    finally:
+        output.close()
 
 
 def _write_manifest(snapshot: Path, manifest: dict[str, object]) -> None:
@@ -517,13 +702,15 @@ def _activate(
     *,
     current: Path,
     previous: Path | None,
-) -> Path:
+    old_generation: Path | None,
+) -> tuple[Path, list[str]]:
     paths.generations.mkdir(parents=True, exist_ok=True)
     transaction = uuid.uuid4().hex
     temporary_generation = paths.generations / f".generation-{transaction}.tmp"
     generation = paths.generations / transaction
     temporary_active = paths.data_root / f".active-{transaction}.tmp"
     temporary_generation.mkdir()
+    active_switched = False
     try:
         os.symlink(current, temporary_generation / "current")
         if previous is not None:
@@ -531,6 +718,7 @@ def _activate(
         os.replace(temporary_generation, generation)
         os.symlink(generation, temporary_active)
         os.replace(temporary_active, paths.active)
+        active_switched = True
         _sync_directory(paths.generations)
         _sync_directory(paths.data_root)
     except BaseException:
@@ -538,10 +726,19 @@ def _activate(
             temporary_active.unlink(missing_ok=True)
         if temporary_generation.exists() or temporary_generation.is_symlink():
             _remove_path(temporary_generation)
-        if generation.exists() and not _active_points_to(paths.active, generation):
+        if active_switched or _active_points_to(paths.active, generation):
+            if not _restore_active(paths, old_generation, generation):
+                if not _complete_active_generation(paths, generation):
+                    if generation.exists() and not _active_points_to(paths.active, generation):
+                        _remove_path(generation)
+                    raise InstallerError(
+                        "Active Runner 恢复失败且新 generation 不完整，未能安全激活"
+                    )
+                return generation, ["Active Runner 恢复失败，已保留完整新 generation"]
+        elif generation.exists():
             _remove_path(generation)
         raise
-    return generation
+    return generation, []
 
 
 def _cleanup_retired(
@@ -603,6 +800,11 @@ def _clear_staging(staging: Path) -> None:
                 "agent-run install: warning: staging cleanup failed; will retry",
                 file=sys.stderr,
             )
+
+
+def _emit_warnings(warnings: Sequence[str]) -> None:
+    for warning in warnings:
+        print(f"agent-run install: warning: {warning}", file=sys.stderr)
 
 
 def _check_managed_entry(paths: InstallPaths, *, for_uninstall: bool) -> None:
@@ -717,28 +919,77 @@ def _install_result(
 
 
 def _active_points_to(active: Path, generation: Path) -> bool:
-    return active.is_symlink() and active.resolve() == generation.resolve()
+    try:
+        return active.is_symlink() and active.resolve() == generation.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _active_matches_generation(active: Path, generation: Path | None) -> bool:
+    if generation is None:
+        return not active.exists() and not active.is_symlink()
+    return _active_points_to(active, generation)
+
+
+def _active_references_snapshot(paths: InstallPaths, snapshot: Path) -> bool:
+    if not paths.active.is_symlink():
+        return False
+    try:
+        generation = paths.active.resolve()
+        for link_name in ("current", "previous"):
+            link = generation / link_name
+            if link.is_symlink() and link.resolve() == snapshot.resolve():
+                return True
+    except (OSError, RuntimeError):
+        return True
+    return False
 
 
 def _restore_active(
     paths: InstallPaths,
     previous_generation: Path | None,
     failed_generation: Path,
-) -> None:
-    if previous_generation is None:
-        if paths.active.is_symlink() or paths.active.exists():
-            paths.active.unlink()
-    else:
-        temporary = paths.data_root / f".active-restore-{uuid.uuid4().hex}.tmp"
+) -> bool:
+    temporary: Path | None = None
+    restored = False
+    try:
         try:
-            os.symlink(previous_generation, temporary)
-            os.replace(temporary, paths.active)
-            _sync_directory(paths.data_root)
-        finally:
+            if previous_generation is None:
+                if paths.active.is_symlink() or paths.active.exists():
+                    paths.active.unlink()
+                _sync_directory(paths.data_root)
+            else:
+                temporary = paths.data_root / f".active-restore-{uuid.uuid4().hex}.tmp"
+                os.symlink(previous_generation, temporary)
+                os.replace(temporary, paths.active)
+                _sync_directory(paths.data_root)
+            restored = _active_matches_generation(paths.active, previous_generation)
+        except OSError:
+            restored = _active_matches_generation(paths.active, previous_generation)
+    finally:
+        if temporary is not None:
             if temporary.is_symlink() or temporary.exists():
                 temporary.unlink(missing_ok=True)
-    if failed_generation.exists() or failed_generation.is_symlink():
-        _remove_path(failed_generation)
+        if restored and (
+            failed_generation.exists() or failed_generation.is_symlink()
+        ) and not _active_points_to(paths.active, failed_generation):
+            _remove_path(failed_generation)
+    return restored
+
+
+def _complete_active_generation(paths: InstallPaths, generation: Path) -> bool:
+    if not _active_points_to(paths.active, generation) or not generation.is_dir():
+        return False
+    try:
+        current = _generation_link(generation / "current")
+        _validate_snapshot(current, _manifest_identity(current))
+        previous_link = generation / "previous"
+        if previous_link.exists() or previous_link.is_symlink():
+            previous = _generation_link(previous_link)
+            _validate_snapshot(previous, _manifest_identity(previous))
+    except (InstallerError, OSError, RuntimeError):
+        return False
+    return True
 
 
 def _remove_path(path: Path) -> None:
@@ -749,10 +1000,7 @@ def _remove_path(path: Path) -> None:
 
 
 def _sync_directory(directory: Path) -> None:
-    try:
-        descriptor = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
+    descriptor = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:

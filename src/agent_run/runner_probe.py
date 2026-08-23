@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 try:
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
@@ -96,7 +98,9 @@ class RunnerProbeBackend:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    start_new_session=True,
+                    start_new_session=(
+                        os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") != "1"
+                    ),
                 )
                 try:
                     process.communicate(input=prompt, timeout=self.timeout_seconds)
@@ -111,7 +115,16 @@ class RunnerProbeBackend:
                 raise RunnerProbeError("Codex Compatibility Check returned a non-zero exit")
             if not output_path.is_file():
                 raise RunnerProbeError("Codex Compatibility Check produced no final output")
-            final_output = output_path.read_bytes()
+            try:
+                output_size = output_path.stat().st_size
+            except OSError as error:
+                raise RunnerProbeError(
+                    "Codex Compatibility Check produced no final output"
+                ) from error
+            if output_size > MAX_FINAL_OUTPUT_BYTES:
+                raise RunnerProbeError("Codex Compatibility Check final output is too large")
+            with output_path.open("rb") as output_file:
+                final_output = output_file.read(MAX_FINAL_OUTPUT_BYTES + 1)
             if len(final_output) > MAX_FINAL_OUTPUT_BYTES:
                 raise RunnerProbeError("Codex Compatibility Check final output is too large")
             try:
@@ -123,7 +136,32 @@ class RunnerProbeBackend:
         return {"result": "passed"}
 
 
+def main(arguments: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m agent_run.runner_probe",
+        description="运行候选 Runner Snapshot 的 Compatibility Check",
+    )
+    parser.add_argument("candidate", help="候选 Snapshot 或 staging 环境路径")
+    parsed = parser.parse_args(list(arguments) if arguments is not None else None)
+    try:
+        result = RunnerProbeBackend().check(Path(parsed.candidate).resolve())
+    except RunnerProbeError as error:
+        print(f"runner probe: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") == "1":
+        try:
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except OSError:
@@ -142,3 +180,7 @@ def _require_runtime_package(candidate: Path) -> Path:
         return find_runtime_package(candidate)
     except RuntimeTreeError as error:
         raise RunnerProbeError(str(error)) from error
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

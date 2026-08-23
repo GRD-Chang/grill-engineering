@@ -3,14 +3,19 @@ from __future__ import annotations
 import json
 import fcntl
 import os
+import signal
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
+from conftest import write_fixture
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -39,27 +44,45 @@ def _fake_codex(
     status_file.write_text(status, encoding="utf-8")
     behavior_file = tmp_path / "codex-behavior"
     behavior_file.write_text(behavior, encoding="utf-8")
+    cwd_file = tmp_path / "codex-cwd"
+    path_file = tmp_path / "codex-path"
     script = directory / "codex"
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
+        "import os\n"
         "import pathlib\n"
         "import sys\n"
         "import time\n"
         f"count = pathlib.Path({str(count)!r})\n"
         f"status_file = pathlib.Path({str(status_file)!r})\n"
         f"behavior_file = pathlib.Path({str(behavior_file)!r})\n"
+        f"cwd_file = pathlib.Path({str(cwd_file)!r})\n"
+        f"path_file = pathlib.Path({str(path_file)!r})\n"
         "current = int(count.read_text() if count.exists() else '0')\n"
         "count.write_text(str(current + 1))\n"
+        "cwd_file.write_text(str(pathlib.Path.cwd()))\n"
+        "path_file.write_text(os.environ['PATH'])\n"
         "behavior = behavior_file.read_text()\n"
         "if behavior == 'nonzero':\n"
         "    sys.exit(7)\n"
         "if behavior == 'missing':\n"
         "    sys.exit(0)\n"
+        "if behavior == 'large':\n"
+        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "    output.write_bytes(b'x' * (16 * 1024 + 1))\n"
+        "    sys.exit(0)\n"
         "if behavior == 'timeout':\n"
         "    time.sleep(130)\n"
+        "if behavior == 'sleep':\n"
+        "    time.sleep(2)\n"
         "schema = pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1])\n"
-        "assert json.loads(schema.read_text())['properties']['status']['enum'] == ['ok']\n"
+        "assert json.loads(schema.read_text()) == {\n"
+        "    'type': 'object',\n"
+        "    'additionalProperties': False,\n"
+        "    'properties': {'status': {'type': 'string', 'enum': ['ok']}},\n"
+        "    'required': ['status'],\n"
+        "}\n"
         "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
         "output.write_text(json.dumps({'status': status_file.read_text()}))\n",
         encoding="utf-8",
@@ -73,6 +96,7 @@ def _run(
     home: Path,
     fake_bin: Path,
     *arguments: str,
+    path: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.update(
@@ -80,7 +104,7 @@ def _run(
             "HOME": str(home),
             "XDG_DATA_HOME": str(home / "data"),
             "XDG_CONFIG_HOME": str(home / "config"),
-            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "PATH": path if path is not None else f"{fake_bin}{os.pathsep}{environment['PATH']}",
         }
     )
     return subprocess.run(
@@ -118,7 +142,9 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     first = _run(source, home, fake_bin)
     assert first.returncode == 0, first.stderr
     first_snapshot = _active_snapshot(home)
-    first_identity = _manifest(first_snapshot)["content_identity"]
+    first_manifest = _manifest(first_snapshot)
+    first_identity = first_manifest["content_identity"]
+    assert first_manifest["source_provenance"] == {"kind": "source-directory"}
     assert int(count.read_text()) == 1
     assert (home / ".local" / "bin" / "agent-run").is_symlink()
     command = subprocess.run(
@@ -160,7 +186,46 @@ def test_install_failure_preserves_active_and_cleans_candidate(tmp_path: Path) -
     assert int(count.read_text()) == 1
 
 
-@pytest.mark.parametrize("behavior", ["nonzero", "missing"])
+def test_build_failure_preserves_no_active_runner_and_cleans_staging(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    pyproject = source / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'build-backend = "setuptools.build_meta"',
+            'build-backend = "missing.backend"',
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(source, home, fake_bin)
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert not (_data_root(home) / "active").exists()
+    assert not list((_data_root(home) / "staging").glob("*"))
+    assert not list((_data_root(home) / "snapshots").glob("*"))
+
+
+def test_missing_codex_preserves_no_active_runner(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(source, home, fake_bin, path="/usr/bin:/bin")
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "Codex executable is not available on PATH" in result.stderr
+    assert not (_data_root(home) / "active").exists()
+    assert not list((_data_root(home) / "staging").glob("*"))
+    assert not list((_data_root(home) / "snapshots").glob("*"))
+
+
+@pytest.mark.parametrize("behavior", ["nonzero", "missing", "large"])
 def test_probe_process_failures_preserve_no_active_runner(
     tmp_path: Path, behavior: str
 ) -> None:
@@ -194,6 +259,277 @@ def test_probe_timeout_terminates_its_process_group(
 
     with pytest.raises(RunnerProbeError, match="timed out"):
         RunnerProbeBackend(timeout_seconds=0.05).check(tmp_path / "candidate")
+
+
+def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0",
+            "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 0.5",
+        ),
+        encoding="utf-8",
+    )
+    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe.write_text(
+        probe.read_text(encoding="utf-8").replace(
+            "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 10.0"
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    pid_file = tmp_path / "codex-pid"
+    codex = fake_bin / "codex"
+    codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import pathlib\n"
+        "import time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    probe_tmp = tmp_path / "probe-tmp"
+    probe_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(probe_tmp))
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(
+        source,
+        home,
+        fake_bin,
+        path=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    )
+
+    assert result.returncode == 1
+    assert "Compatibility Check timed out" in result.stderr
+    assert pid_file.is_file()
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        os.kill(pid, signal.SIGKILL)
+        raise AssertionError("nested Codex process survived candidate probe timeout")
+    assert not list(probe_tmp.glob("agent-run-candidate-probe-*"))
+    assert not list(probe_tmp.glob("agent-run-probe-*"))
+    assert not (_data_root(home) / "active").exists()
+    assert not list((_data_root(home) / "staging").glob("*"))
+    assert not list((_data_root(home) / "snapshots").glob("*"))
+
+
+def test_candidate_probe_inner_timeout_kills_forked_codex_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0",
+            "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 10.0",
+        ),
+        encoding="utf-8",
+    )
+    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe.write_text(
+        probe.read_text(encoding="utf-8").replace(
+            "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 0.2"
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    parent_pid_file = tmp_path / "codex-parent-pid"
+    child_pid_file = tmp_path / "codex-child-pid"
+    codex = fake_bin / "codex"
+    codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import pathlib\n"
+        "import time\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        f"    pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(10)\n"
+        "else:\n"
+        f"    pathlib.Path({str(parent_pid_file)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    probe_tmp = tmp_path / "probe-tmp"
+    probe_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(probe_tmp))
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(
+        source,
+        home,
+        fake_bin,
+        path=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    )
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert child_pid_file.is_file()
+    survivors: list[int] = []
+    for pid_file in (parent_pid_file, child_pid_file):
+        if not pid_file.is_file():
+            continue
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        survivors.append(pid)
+    for pid in survivors:
+        os.kill(pid, signal.SIGKILL)
+    assert not survivors, "forked Codex process survived inner probe timeout"
+    assert not list(probe_tmp.glob("agent-run-candidate-probe-*"))
+    assert not list(probe_tmp.glob("agent-run-probe-*"))
+    assert not (_data_root(home) / "active").exists()
+    assert not list((_data_root(home) / "staging").glob("*"))
+    assert not list((_data_root(home) / "snapshots").glob("*"))
+
+
+def test_compatibility_check_executes_candidate_probe_code(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    first = _run(source, home, fake_bin)
+    assert first.returncode == 0, first.stderr
+    probe_cwd = Path((tmp_path / "codex-cwd").read_text(encoding="utf-8"))
+    assert probe_cwd.name == "empty"
+    assert source not in probe_cwd.parents
+    assert (tmp_path / "codex-path").read_text(encoding="utf-8").split(os.pathsep)[0] == str(
+        fake_bin
+    )
+    first_identity = _manifest(_active_snapshot(home))["content_identity"]
+    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe.write_text(
+        probe.read_text(encoding="utf-8").replace(
+            "raise SystemExit(main())", "raise SystemExit(3)"
+        ),
+        encoding="utf-8",
+    )
+
+    failed = _run(source, home, fake_bin)
+
+    assert failed.returncode == 1
+    assert "Traceback" not in failed.stderr
+    assert int(count.read_text()) == 1
+    assert _manifest(_active_snapshot(home))["content_identity"] == first_identity
+    assert sorted(path.name for path in (_data_root(home) / "snapshots").iterdir()) == [
+        first_identity
+    ]
+    assert not list((_data_root(home) / "staging").glob("*"))
+
+
+def test_candidate_probe_ignores_pythonpath_outside_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    first = _run(source, home, fake_bin)
+    assert first.returncode == 0, first.stderr
+
+    shadow_package = tmp_path / "shadow" / "agent_run"
+    shadow_package.mkdir(parents=True)
+    (shadow_package / "__init__.py").write_text("\n", encoding="utf-8")
+    (shadow_package / "runner_probe.py").write_text(
+        "raise SystemExit(7)\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(shadow_package.parent.parent))
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'second'\n", encoding="utf-8"
+    )
+
+    result = _run(source, home, fake_bin)
+
+    assert result.returncode == 0, result.stderr
+    assert int(count.read_text()) == 2
+
+
+def test_compatibility_check_rejects_schema_drift_in_candidate_probe(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe.write_text(
+        probe.read_text(encoding="utf-8").replace('"enum": ["ok"]', '"enum": ["wrong"]'),
+        encoding="utf-8",
+    )
+
+    result = _run(source, home, fake_bin)
+
+    assert result.returncode == 1
+    assert int(count.read_text()) == 1
+    assert not (_data_root(home) / "active").exists()
+    assert not list((_data_root(home) / "snapshots").glob("*"))
+
+
+def test_git_provenance_marks_an_untracked_source_dirty(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Agent Run Tests"], cwd=source, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "agent-run-tests@example.invalid"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "initial source"], cwd=source, check=True
+    )
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    clean_provenance = runner_installer._source_provenance(source)
+    assert clean_provenance["kind"] == "git"
+    assert clean_provenance["dirty"] is False
+    clean_result = _run(source, home, fake_bin)
+    assert clean_result.returncode == 0, clean_result.stderr
+    assert _manifest(_active_snapshot(home))["source_provenance"] == clean_provenance
+
+    (source / "src" / "agent_run" / "untracked.py").write_text(
+        "untracked = True\n", encoding="utf-8"
+    )
+    provenance = runner_installer._source_provenance(source)
+    assert provenance["kind"] == "git"
+    assert provenance["dirty"] is True
+    result = _run(source, home, fake_bin)
+
+    assert result.returncode == 0, result.stderr
+    manifest = _manifest(_active_snapshot(home))
+    assert manifest["source_provenance"] == provenance
 
 
 def test_install_keeps_only_current_and_previous_after_a_b_c(
@@ -336,6 +672,407 @@ def test_post_activation_failure_restores_old_generation(
     assert (home / ".local" / "bin" / "agent-run").is_symlink()
 
 
+@pytest.mark.parametrize("failure_call", [1, 2])
+def test_activation_sync_failure_restores_the_complete_old_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_call: int,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'first'\n", encoding="utf-8"
+    )
+    assert _run(source, home, fake_bin).returncode == 0
+    first_identity = _manifest(_active_snapshot(home))["content_identity"]
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'second'\n", encoding="utf-8"
+    )
+    assert _run(source, home, fake_bin).returncode == 0
+    second_identity = _manifest(_active_snapshot(home))["content_identity"]
+    assert isinstance(first_identity, str)
+    assert isinstance(second_identity, str)
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'failed-third'\n", encoding="utf-8"
+    )
+
+    calls = 0
+
+    def fail_sync(_directory: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError("injected directory sync failure")
+
+    monkeypatch.setattr(runner_installer, "_sync_directory", fail_sync)
+    with pytest.raises(OSError, match="injected directory sync failure"):
+        runner_installer._install(runner_installer.InstallPaths.from_environment(), source)
+
+    paths = runner_installer.InstallPaths.from_environment()
+    current, previous, generation = runner_installer._read_active(paths)
+    assert current is not None and previous is not None and generation is not None
+    assert _manifest(current)["content_identity"] == second_identity
+    assert _manifest(previous)["content_identity"] == first_identity
+    assert (generation / "current").resolve() == current.resolve()
+    assert (generation / "previous").resolve() == previous.resolve()
+    assert paths.stable_entry.is_symlink()
+    assert paths.stable_entry.resolve().is_file()
+    assert sorted(path.name for path in paths.snapshots.iterdir()) == sorted(
+        [first_identity, second_identity]
+    )
+    assert not list(paths.staging.iterdir())
+
+
+def test_initial_activation_sync_failure_leaves_no_active_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    def fail_sync(_directory: Path) -> None:
+        raise OSError("injected initial sync failure")
+
+    monkeypatch.setattr(runner_installer, "_sync_directory", fail_sync)
+    with pytest.raises(OSError, match="injected initial sync failure"):
+        runner_installer._install(runner_installer.InstallPaths.from_environment(), source)
+
+    data_root = _data_root(home)
+    assert not (data_root / "active").exists()
+    assert not list((data_root / "snapshots").glob("*"))
+    assert not list((data_root / "staging").glob("*"))
+    assert not (home / ".local" / "bin" / "agent-run").exists()
+
+
+def test_initial_activation_recovery_failure_keeps_a_complete_new_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    paths = runner_installer.InstallPaths.from_environment()
+    original_replace = os.replace
+    original_unlink = os.unlink
+    active_replace_calls = 0
+
+    def replace_then_fail(source_path: Path, destination: Path) -> None:
+        nonlocal active_replace_calls
+        if destination == paths.active:
+            active_replace_calls += 1
+            original_replace(source_path, destination)
+            raise OSError("injected initial active rename failure")
+        original_replace(source_path, destination)
+
+    def unlink_active_only(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> None:
+        if os.fspath(path) == os.fspath(paths.active):
+            raise OSError("injected active unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace_then_fail)
+    monkeypatch.setattr(os, "unlink", unlink_active_only)
+
+    result = runner_installer._install(paths, source)
+
+    assert result["warning"] == ["Active Runner 恢复失败，已保留完整新 generation"]
+    assert active_replace_calls == 1
+    current, previous, generation = runner_installer._read_active(paths)
+    assert current is not None and previous is None and generation is not None
+    assert (generation / "current").resolve() == current.resolve()
+    assert paths.stable_entry.resolve().is_file()
+    assert len(list(paths.snapshots.iterdir())) == 1
+    assert not list(paths.staging.iterdir())
+
+
+def test_activation_rename_failure_after_swap_restores_the_old_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert _run(source, home, fake_bin).returncode == 0
+    old_identity = _manifest(_active_snapshot(home))["content_identity"]
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'rename-failure'\n", encoding="utf-8"
+    )
+    paths = runner_installer.InstallPaths.from_environment()
+    original_replace = os.replace
+    active_replace_calls = 0
+
+    def replace_then_fail(source_path: Path, destination: Path) -> None:
+        nonlocal active_replace_calls
+        if destination == paths.active:
+            active_replace_calls += 1
+            original_replace(source_path, destination)
+            if active_replace_calls == 1:
+                raise OSError("injected active rename failure")
+            return
+        original_replace(source_path, destination)
+
+    monkeypatch.setattr(os, "replace", replace_then_fail)
+    with pytest.raises(OSError, match="injected active rename failure"):
+        runner_installer._install(paths, source)
+
+    current, previous, generation = runner_installer._read_active(paths)
+    assert current is not None and previous is None and generation is not None
+    assert _manifest(current)["content_identity"] == old_identity
+    assert (generation / "current").resolve() == current.resolve()
+    assert paths.stable_entry.resolve().is_file()
+    assert sorted(path.name for path in paths.snapshots.iterdir()) == [old_identity]
+    assert not list(paths.staging.iterdir())
+    assert active_replace_calls == 2
+
+
+def test_recovery_failure_keeps_a_complete_new_generation_with_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert _run(source, home, fake_bin).returncode == 0
+    old_identity = _manifest(_active_snapshot(home))["content_identity"]
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'recovery-warning'\n", encoding="utf-8"
+    )
+
+    paths = runner_installer.InstallPaths.from_environment()
+    original_replace = os.replace
+    active_replace_calls = 0
+
+    def replace_then_fail(source_path: Path, destination: Path) -> None:
+        nonlocal active_replace_calls
+        if destination == paths.active:
+            active_replace_calls += 1
+            if active_replace_calls == 2:
+                raise OSError("injected recovery rename failure")
+            original_replace(source_path, destination)
+            if active_replace_calls == 1:
+                raise OSError("injected active rename failure")
+            return
+        original_replace(source_path, destination)
+
+    monkeypatch.setattr(os, "replace", replace_then_fail)
+
+    result = runner_installer._install(paths, source)
+
+    assert result["warning"] == ["Active Runner 恢复失败，已保留完整新 generation"]
+    assert active_replace_calls == 2
+    current, previous, generation = runner_installer._read_active(paths)
+    assert current is not None and previous is not None and generation is not None
+    assert _manifest(current)["content_identity"] != old_identity
+    assert _manifest(previous)["content_identity"] == old_identity
+    assert (generation / "current").resolve() == current.resolve()
+    assert (generation / "previous").resolve() == previous.resolve()
+    assert paths.stable_entry.resolve().is_file()
+    assert len(list(paths.snapshots.iterdir())) == 2
+    assert not list(paths.staging.iterdir())
+
+
+@pytest.mark.parametrize("directory_name", ["generations", "data_root"])
+def test_activation_directory_open_failure_restores_the_old_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    directory_name: str,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert _run(source, home, fake_bin).returncode == 0
+    old_identity = _manifest(_active_snapshot(home))["content_identity"]
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'open-failure'\n", encoding="utf-8"
+    )
+    paths = runner_installer.InstallPaths.from_environment()
+    target = paths.generations if directory_name == "generations" else paths.data_root
+    original_open = os.open
+
+    def fail_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        *mode: int,
+        **options: Any,
+    ) -> int:
+        if Path(path) == target:
+            raise OSError("injected directory open failure")
+        return original_open(path, flags, *mode, **options)
+
+    monkeypatch.setattr(os, "open", fail_open)
+    with pytest.raises(OSError, match="injected directory open failure"):
+        runner_installer._install(paths, source)
+
+    current, previous, generation = runner_installer._read_active(paths)
+    assert current is not None and previous is None and generation is not None
+    assert _manifest(current)["content_identity"] == old_identity
+    assert (generation / "current").resolve() == current.resolve()
+    assert paths.stable_entry.resolve().is_file()
+    assert sorted(path.name for path in paths.snapshots.iterdir()) == [old_identity]
+    assert not list(paths.staging.iterdir())
+
+
+def test_retired_cleanup_is_retried_before_a_later_build_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert _run(source, home, fake_bin).returncode == 0
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'second'\n", encoding="utf-8"
+    )
+    assert _run(source, home, fake_bin).returncode == 0
+    paths = runner_installer.InstallPaths.from_environment()
+    current_before, previous_before, _generation_before = runner_installer._read_active(paths)
+    assert current_before is not None and previous_before is not None
+    (paths.snapshots / "stale-snapshot").mkdir()
+    (paths.generations / "stale-generation").mkdir()
+    events: list[str] = []
+
+    def injected_cleanup(*_arguments: object) -> list[str]:
+        events.append("cleanup")
+        return ["旧 Snapshot 清理失败"]
+
+    def injected_build(_candidate: Path, _source: Path) -> tuple[str, str]:
+        events.append("build")
+        raise runner_installer.InstallerError("injected build failure")
+
+    monkeypatch.setattr(runner_installer, "_cleanup_retired", injected_cleanup)
+    monkeypatch.setattr(runner_installer, "_build_candidate", injected_build)
+    with pytest.raises(runner_installer.InstallerError, match="injected build failure"):
+        runner_installer._install(paths, source)
+
+    assert events == ["cleanup", "build"]
+    assert "旧 Snapshot 清理失败" in capsys.readouterr().err
+    current_after, previous_after, _generation_after = runner_installer._read_active(paths)
+    assert current_after == current_before
+    assert previous_after == previous_before
+    assert (paths.snapshots / "stale-snapshot").is_dir()
+    assert (paths.generations / "stale-generation").is_dir()
+
+
+def test_retired_cleanup_failure_is_warning_only_and_next_install_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert _run(source, home, fake_bin).returncode == 0
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'second'\n", encoding="utf-8"
+    )
+    assert _run(source, home, fake_bin).returncode == 0
+    paths = runner_installer.InstallPaths.from_environment()
+    stale_snapshot = paths.snapshots / "stale-snapshot"
+    stale_generation = paths.generations / "stale-generation"
+    stale_snapshot.mkdir()
+    stale_generation.mkdir()
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'third'\n", encoding="utf-8"
+    )
+    original_remove = runner_installer._remove_path
+    blocked = True
+
+    def fail_retired_cleanup(path: Path) -> None:
+        if blocked and path in {stale_snapshot, stale_generation}:
+            raise OSError("injected retired cleanup failure")
+        original_remove(path)
+
+    monkeypatch.setattr(runner_installer, "_remove_path", fail_retired_cleanup)
+    first_update = runner_installer._install(paths, source)
+    assert first_update["warning"]
+    assert stale_snapshot.is_dir()
+    assert stale_generation.is_dir()
+    active_after_failure = _active_snapshot(home)
+    assert _manifest(active_after_failure)["source_provenance"]
+
+    blocked = False
+    second_update = runner_installer._install(paths, source)
+    assert second_update["warning"] is None
+    assert not stale_snapshot.exists()
+    assert not stale_generation.exists()
+    assert _active_snapshot(home) == active_after_failure
+
+
 def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +1088,8 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     )
     assert _run(source, home, fake_bin).returncode == 0
     second_identity = _manifest(_active_snapshot(home))["content_identity"]
+    assert isinstance(first_identity, str)
+    assert isinstance(second_identity, str)
     assert second_identity != first_identity
     assert int(count.read_text()) == 2
 
@@ -448,3 +1187,218 @@ def test_management_lock_is_non_blocking(
 
     assert result.returncode == 1
     assert "另一个" in result.stderr
+
+
+@pytest.mark.parametrize("second_arguments", [(), ("--rollback",), ("--uninstall",)])
+def test_concurrent_management_operations_have_one_winner_and_keep_invariants(
+    tmp_path: Path,
+    second_arguments: tuple[str, ...],
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    for version in ("first", "second"):
+        (source / "src" / "agent_run" / "__init__.py").write_text(
+            f"__version__ = '{version}'\n", encoding="utf-8"
+        )
+        initial = _run(source, home, fake_bin)
+        assert initial.returncode == 0, initial.stderr
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'third'\n", encoding="utf-8"
+    )
+    (tmp_path / "codex-behavior").write_text("sleep", encoding="utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        }
+    )
+    lock = _data_root(home) / "install.lock"
+    first = subprocess.Popen(
+        [str(source / "install.sh")],
+        cwd=source,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 5
+    lock_held = False
+    while time.monotonic() < deadline:
+        with lock.open("a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_held = True
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if lock_held:
+            break
+        time.sleep(0.01)
+    if not lock_held:
+        first.kill()
+        first.communicate(timeout=10)
+        raise AssertionError("first install did not acquire the management lock")
+    second = _run(source, home, fake_bin, *second_arguments)
+    first_stdout, first_stderr = first.communicate(timeout=240)
+
+    assert first.returncode == 0, first_stderr
+    assert first_stdout
+    assert second.returncode == 1
+    assert "另一个" in second.stderr
+    data_root = _data_root(home)
+    generation = (data_root / "active").resolve()
+    current = (generation / "current").resolve()
+    previous = (generation / "previous").resolve()
+    assert current.is_dir() and previous.is_dir()
+    assert (home / ".local" / "bin" / "agent-run").resolve().is_file()
+    assert len(list((data_root / "snapshots").iterdir())) == 2
+    assert not list((data_root / "staging").iterdir())
+
+
+def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatible_state(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    delivery = tmp_path / "delivery"
+    delivery.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=delivery, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Agent Run Tests"], cwd=delivery, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "agent-run-tests@example.invalid"],
+        cwd=delivery,
+        check=True,
+    )
+    (delivery / "README.md").write_text("# delivery\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=delivery, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial delivery"], cwd=delivery, check=True)
+    fixture = write_fixture(
+        delivery / "github.json",
+        issues={
+            "2": {
+                "number": 2,
+                "title": "Ticket 2",
+                "body": "Implement ticket 2.",
+                "state": "OPEN",
+                "labels": ["ready-for-agent"],
+                "blocked_by": [],
+            }
+        },
+    )
+    assert _run(source, home, fake_bin).returncode == 0
+    cli_environment = os.environ.copy()
+    cli_environment.update(
+        {
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(home / "state"),
+            "PATH": f"{home / '.local' / 'bin'}{os.pathsep}{cli_environment['PATH']}",
+        }
+    )
+    entry = home / ".local" / "bin" / "agent-run"
+    started = subprocess.run(
+        [str(entry), "start", "1", "--github-fixture", str(fixture)],
+        cwd=delivery,
+        env=cli_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert started.returncode == 0, started.stderr
+    started_output = json.loads(started.stdout)
+    run_id = started_output["run_id"]
+    state_path = next((delivery / ".agent-run" / "runs").glob("*.json"))
+
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'second'\n", encoding="utf-8"
+    )
+    updated = _run(source, home, fake_bin)
+    assert updated.returncode == 0, updated.stderr
+    continued = subprocess.run(
+        [str(entry), "start", "1", "--github-fixture", str(fixture)],
+        cwd=delivery,
+        env=cli_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert continued.returncode == 0, continued.stderr
+    continued_output = json.loads(continued.stdout)
+    assert continued_output["result"] == "resumed"
+    assert continued_output["run_id"] == run_id
+
+    rollback = _run(source, home, fake_bin, "--rollback")
+    assert rollback.returncode == 0, rollback.stderr
+    continued_after_rollback = subprocess.run(
+        [str(entry), "start", "1", "--github-fixture", str(fixture)],
+        cwd=delivery,
+        env=cli_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert continued_after_rollback.returncode == 0, continued_after_rollback.stderr
+    rollback_output = json.loads(continued_after_rollback.stdout)
+    assert rollback_output["result"] == "resumed"
+    assert rollback_output["run_id"] == run_id
+
+    incompatible = json.loads(state_path.read_text(encoding="utf-8"))
+    incompatible["schema_version"] = 1
+    state_path.write_text(json.dumps(incompatible), encoding="utf-8")
+    before = state_path.read_bytes()
+    locator_path = home / "state" / "agent-run" / "run-locator.json"
+    locator_before = locator_path.read_bytes()
+    target_files_before = {
+        path.relative_to(delivery / ".agent-run"): path.read_bytes()
+        for path in (delivery / ".agent-run").rglob("*")
+        if path.is_file()
+    }
+    target_paths_before = sorted(
+        path.relative_to(delivery / ".agent-run")
+        for path in (delivery / ".agent-run").rglob("*")
+    )
+    rejected = subprocess.run(
+        [str(entry), "run", "1", "--github-fixture", str(fixture)],
+        cwd=delivery,
+        env=cli_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode == 2
+    assert json.loads(rejected.stdout)["status"] == "incompatible_run_state"
+    assert state_path.read_bytes() == before
+    assert locator_path.read_bytes() == locator_before
+    assert {
+        path.relative_to(delivery / ".agent-run"): path.read_bytes()
+        for path in (delivery / ".agent-run").rglob("*")
+        if path.is_file()
+    } == target_files_before
+    assert sorted(
+        path.relative_to(delivery / ".agent-run")
+        for path in (delivery / ".agent-run").rglob("*")
+    ) == target_paths_before
+
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'third'\n", encoding="utf-8"
+    )
+    assert _run(source, home, fake_bin).returncode == 0
+    assert state_path.read_bytes() == before
+    assert locator_path.read_bytes() == locator_before
+    assert {
+        path.relative_to(delivery / ".agent-run"): path.read_bytes()
+        for path in (delivery / ".agent-run").rglob("*")
+        if path.is_file()
+    } == target_files_before
+    assert sorted(
+        path.relative_to(delivery / ".agent-run")
+        for path in (delivery / ".agent-run").rglob("*")
+    ) == target_paths_before
