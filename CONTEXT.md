@@ -511,6 +511,10 @@ _Avoid_: 隐式新增 Ticket、正文中的阻塞描述、普通相关 Issue
 一个 Delivery Run 所依据的 Parent Spec title/body 内容版本指纹。Controller 同时保留 accepted 与 observed revision 作为机械 currentness 输入；评论、assignee 与时间戳不进入 revision，具体 stale 路由由 Job Generation 规则决定。
 _Avoid_: Ticket Content Revision、Ticket Graph Revision、Git commit
 
+**Deterministic Contradiction（确定性矛盾）**:
+Controller 已取得不能与当前 Change Job Record 和 Currentness Boundary 安全一致解释的权威事实时形成的 fail-closed 终态。它停止 Codex 与 Publisher mutation；操作者可以读取状态与历史或放弃 Delivery Run，但系统不从普通重试、等待或 Runner 更新推断恢复授权。
+_Avoid_: GitHub Convergence Wait、Supervision Timeout Pause、Human Blocker、Invocation Resume、自动恢复
+
 **Unsupported Scope Change（不支持的范围变化）**:
 运行中 observed Ticket Set 或 `blockedBy` Graph Revision 与 accepted revision 不一致时的 fail-closed 状态。Controller 保留 accepted/observed revision、变化摘要和 observed graph；该状态不运行 Codex、不新建 Thread、不 Requeue、不继续交付，也不执行 Publisher mutation。操作者只能查看状态/历史、恢复 GitHub 原图或放弃当前 Run。
 _Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue

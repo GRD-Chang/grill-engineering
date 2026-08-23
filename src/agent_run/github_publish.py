@@ -745,6 +745,8 @@ class GhGitHubPublisher:
         return {"pr_number": pr_number, "checks": failed}
 
     def _checks(self, pr_number: int, fields: str) -> list[object]:
+        requested_fields = tuple(field for field in fields.split(",") if field)
+        check_fields = ",".join(dict.fromkeys((*requested_fields, "name")))
         arguments = (
             "pr",
             "checks",
@@ -753,14 +755,14 @@ class GhGitHubPublisher:
             self.repository,
             "--required",
             "--json",
-            fields,
+            check_fields,
         )
         result = self._run(*arguments)
         if (
             result.returncode == 1
             and "no required checks reported" in result.stderr.lower()
         ):
-            return self._ruleset_checks(pr_number, fields)
+            return self._ruleset_checks(pr_number, check_fields)
         if result.returncode not in {0, 1, 8}:
             raise GitHubReadError(
                 "github_read_failed", result.stderr.strip() or "gh command failed"
@@ -773,8 +775,10 @@ class GhGitHubPublisher:
             ) from error
         if not isinstance(checks, list):
             raise GitHubReadError("github_invalid_response", "checks must be an array")
+        for check in checks:
+            _string(_mapping(check), "name")
         if not checks:
-            return self._ruleset_checks(pr_number, fields)
+            return self._ruleset_checks(pr_number, check_fields)
         live = self.live_pull_request(pr_number)
         required_contexts = self._required_check_contexts(
             _string(live, "base_branch")
@@ -790,8 +794,6 @@ class GhGitHubPublisher:
         )
         if not required_contexts:
             return []
-        requested_fields = tuple(field for field in fields.split(",") if field)
-        check_fields = ",".join(dict.fromkeys((*requested_fields, "name")))
         checks = self._json(
             "pr",
             "checks",
@@ -799,7 +801,7 @@ class GhGitHubPublisher:
             "--repo",
             self.repository,
             "--json",
-            check_fields,
+            fields,
             allowed_exit_codes={0, 1, 8},
         )
         if not isinstance(checks, list):
