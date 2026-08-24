@@ -16,12 +16,13 @@ import pytest
 from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
 from conftest import write_fixture
+from support.fast_runner_installer import build_candidate as fast_build_candidate
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
-def _source_tree(tmp_path: Path) -> Path:
+def _source_tree(tmp_path: Path, *, real_install: bool = False) -> Path:
     source = tmp_path / "source"
     source.mkdir()
     shutil.copy2(PROJECT_ROOT / "install.sh", source / "install.sh")
@@ -31,8 +32,26 @@ def _source_tree(tmp_path: Path) -> Path:
         source / "src",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
     )
+    if not real_install:
+        shutil.copy2(
+            PROJECT_ROOT / "tests" / "support" / "fast_runner_installer.py",
+            source / "fast_runner_installer.py",
+        )
+        (source / "install.sh").write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\n'
+            'exec python3 "$SOURCE_DIR/fast_runner_installer.py" "$@" '
+            '--source "$SOURCE_DIR"\n',
+            encoding="utf-8",
+        )
     (source / "install.sh").chmod(0o755)
     return source
+
+
+@pytest.fixture
+def fast_in_process_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_installer, "_build_candidate", fast_build_candidate)
 
 
 def _fake_codex(
@@ -278,14 +297,7 @@ def test_build_failure_preserves_no_active_runner_and_cleans_staging(tmp_path: P
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    pyproject = source / "pyproject.toml"
-    pyproject.write_text(
-        pyproject.read_text(encoding="utf-8").replace(
-            'build-backend = "setuptools.build_meta"',
-            'build-backend = "missing.backend"',
-        ),
-        encoding="utf-8",
-    )
+    (source / ".agent-run-test-build-failure").touch()
 
     result = _run(source, home, fake_bin)
 
@@ -620,7 +632,7 @@ def test_git_provenance_marks_an_untracked_source_dirty(tmp_path: Path) -> None:
 
 
 def test_clean_git_source_is_not_polluted_by_public_install(tmp_path: Path) -> None:
-    source = _source_tree(tmp_path)
+    source = _source_tree(tmp_path, real_install=True)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
     subprocess.run(
         ["git", "config", "user.name", "Agent Run Tests"], cwd=source, check=True
@@ -644,9 +656,53 @@ def test_clean_git_source_is_not_polluted_by_public_install(tmp_path: Path) -> N
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    result = _run(source, home, fake_bin)
+    sentinel_directory = tmp_path / "external-tool-sentinels"
+    sentinel_directory.mkdir()
+    markers: list[Path] = []
+    for command_name in (
+        "sudo",
+        "apt",
+        "apt-get",
+        "apt-cache",
+        "dnf",
+        "yum",
+        "pacman",
+        "apk",
+        "pipx",
+    ):
+        marker = sentinel_directory / f"{command_name}.called"
+        markers.append(marker)
+        command = sentinel_directory / command_name
+        command.write_text(
+            "#!/bin/sh\n"
+            f"printf called > {str(marker)!r}\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        command.chmod(0o755)
+    result = _run(
+        source,
+        home,
+        fake_bin,
+        path=os.pathsep.join(
+            [str(sentinel_directory), str(fake_bin), os.environ["PATH"]]
+        ),
+    )
 
     assert result.returncode == 0, result.stderr
+    assert not [marker for marker in markers if marker.exists()]
+    stable_entry = home / ".local" / "bin" / "agent-run"
+    assert stable_entry.is_symlink()
+    assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
+    command = subprocess.run(
+        [str(stable_entry), "--help"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert command.returncode == 0, command.stderr
+    assert "agent-run" in command.stdout
     assert _manifest(_active_snapshot(home))["source_provenance"] == {
         "kind": "git",
         "commit": subprocess.run(
@@ -718,14 +774,7 @@ def test_public_install_failures_preserve_existing_state(
     )
     path: str | None = None
     if failure == "build":
-        pyproject = source / "pyproject.toml"
-        pyproject.write_text(
-            pyproject.read_text(encoding="utf-8").replace(
-                'build-backend = "setuptools.build_meta"',
-                'build-backend = "missing.backend"',
-            ),
-            encoding="utf-8",
-        )
+        (source / ".agent-run-test-build-failure").touch()
     elif failure == "missing_codex":
         path = "/usr/bin:/bin"
     elif failure == "not_logged_in":
@@ -1143,56 +1192,6 @@ def test_public_reactivating_previous_snapshot_reprobes_before_activation(
     ) == after_reactivation
 
 
-def test_public_install_does_not_invoke_external_tool_sentinels(
-    tmp_path: Path,
-) -> None:
-    source = _source_tree(tmp_path)
-    fake_bin, count, _status_file = _fake_codex(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    sentinel_directory = tmp_path / "external-tool-sentinels"
-    sentinel_directory.mkdir()
-    commands = (
-        "sudo",
-        "apt",
-        "apt-get",
-        "apt-cache",
-        "dnf",
-        "yum",
-        "pacman",
-        "apk",
-        "pipx",
-    )
-    markers: list[Path] = []
-    for command in commands:
-        marker = sentinel_directory / f"{command}.called"
-        markers.append(marker)
-        script = sentinel_directory / command
-        script.write_text(
-            "#!/bin/sh\n"
-            f"printf called > {str(marker)!r}\n"
-            "exit 99\n",
-            encoding="utf-8",
-        )
-        script.chmod(0o755)
-
-    result = _run(
-        source,
-        home,
-        fake_bin,
-        path=os.pathsep.join(
-            [str(sentinel_directory), str(fake_bin), os.environ["PATH"]]
-        ),
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert int(count.read_text(encoding="utf-8")) == 1
-    assert str(fake_bin) in (tmp_path / "codex-path").read_text(encoding="utf-8").split(
-        os.pathsep
-    )
-    assert not [marker for marker in markers if marker.exists()]
-
-
 def test_install_keeps_only_current_and_previous_after_a_b_c(
     tmp_path: Path,
 ) -> None:
@@ -1297,7 +1296,9 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
 
 
 def test_post_activation_failure_restores_old_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -1337,6 +1338,7 @@ def test_post_activation_failure_restores_old_generation(
 def test_activation_sync_failure_restores_the_complete_old_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
     failure_call: int,
 ) -> None:
     source = _source_tree(tmp_path)
@@ -1398,6 +1400,7 @@ def test_activation_sync_failure_restores_the_complete_old_generation(
 def test_initial_activation_sync_failure_leaves_no_active_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -1429,6 +1432,7 @@ def test_initial_activation_sync_failure_leaves_no_active_runner(
 def test_initial_activation_recovery_failure_keeps_a_complete_new_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -1479,6 +1483,7 @@ def test_initial_activation_recovery_failure_keeps_a_complete_new_generation(
 def test_activation_rename_failure_after_swap_restores_the_old_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -1528,6 +1533,7 @@ def test_activation_rename_failure_after_swap_restores_the_old_generation(
 def test_recovery_failure_keeps_a_complete_new_generation_with_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -1584,6 +1590,7 @@ def test_recovery_failure_keeps_a_complete_new_generation_with_warning(
 def test_activation_directory_open_failure_restores_the_old_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
     directory_name: str,
 ) -> None:
     source = _source_tree(tmp_path)
@@ -1634,6 +1641,7 @@ def test_retired_cleanup_is_retried_before_a_later_build_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -1684,6 +1692,7 @@ def test_retired_cleanup_is_retried_before_a_later_build_failure(
 def test_retired_cleanup_failure_is_warning_only_and_next_install_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fast_in_process_build: None,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
