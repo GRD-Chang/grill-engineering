@@ -103,9 +103,9 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 有界错误；`semantic_agent_attempts`、`output_attempts`、`budget_windows` 与
 `publication_operation_retries` 分别展示语义工作、输出修复、预算和外部发布操作重试，不把这些
 层级混成一个计数。每次公共 `resume` 另存独立授权事件；`status --json` 的 `latest_resume` 显示
-最近一次，`history --json` 的 `agent_resumes` 显示保留期内的原因、Thread、Attempt 与 successor
-关联，`resume_audit` 则显示总数、压缩数和滚动摘要。审计仅保留最近 64 条明细但不限制 Resume
-次数，也不保存维护者消息或原始错误文本。它不保存 Prompt、transcript 或 Acceptance Artifact。
+最近一次，`history --json` 的 `agent_resumes` 显示每次授权的原因、Thread、Attempt 与 successor
+关联，`resume_audit` 则显示总数和滚动摘要。审计保留每次 Resume 的完整小型事实且不限制次数，
+但不保存维护者消息或原始错误文本。它不保存 Prompt、transcript 或 Acceptance Artifact。
 Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中最多修复两次，且不增加领域 attempt；进程失败不会自动重试或替换

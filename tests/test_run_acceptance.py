@@ -12,6 +12,7 @@ from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.controller import Controller, _resume_review_budget_window
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.git import MergeConflictError
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import run_currentness_boundary
 from agent_run.run_currentness import (
@@ -263,6 +264,66 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
             acceptance["ticket_completion_records"]
         ),
     }
+
+
+def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    run = {
+        "phase": "pending",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "acceptance_generation": 1,
+        "modification_attempts": 0,
+        "validation_attempts": 2,
+        "development_thread_id": None,
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+    }
+    state["run_acceptance"] = run
+    states.save_run(str(state["run_id"]), state)
+    agents = ScriptedRunAgents()
+    agents._reviews = [_passing_artifact()]
+    engine = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    )
+    prepare_expected_merge = git.prepare_expected_merge_checkout
+
+    def conflict(**_kwargs: object) -> None:
+        raise MergeConflictError("merge preview conflicts")
+
+    monkeypatch.setattr(git, "prepare_expected_merge_checkout", conflict)
+    assert engine._review(state, run)
+
+    assert run["phase"] == "repairing"
+    assert run["validation_attempts"] == 2
+    assert run["review_budget"]["reviewer_invocations"] == 0
+    assert "pending_semantic_attempt" not in run
+    assert "semantic_attempt_history" not in run
+    assert state.get("active_agent_invocation") is None
+
+    monkeypatch.setattr(
+        git, "prepare_expected_merge_checkout", prepare_expected_merge
+    )
+    run["phase"] = "pending"
+    run.pop("repair_request")
+    state.update(
+        {
+            "status": "run_acceptance_pending",
+            "terminal_kind": "all_tickets_completed",
+            "diagnostics": [],
+        }
+    )
+    states.save_run(str(state["run_id"]), state)
+
+    assert engine._review(state, run)
+    assert run["validation_attempts"] == 3
+    assert run["review_budget"]["reviewer_invocations"] == 1
+    assert [attempt["ordinal"] for attempt in run["semantic_attempt_history"]] == [3]
 
 
 def test_run_acceptance_rejects_completed_ticket_without_integration_record(

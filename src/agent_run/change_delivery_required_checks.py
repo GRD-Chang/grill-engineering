@@ -99,6 +99,8 @@ def _verify_live_publication_head(
             error.code
         ):
             raise
+        if stage._record_publication_operation_failure(state, job, error):
+            return True
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -146,6 +148,8 @@ def observe_required_checks(
             error.code
         ):
             raise
+        if stage._record_publication_operation_failure(state, job, error):
+            return True, checks
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -200,6 +204,8 @@ def observe_required_checks(
                 error.code
             ):
                 raise
+            if stage._record_publication_operation_failure(state, job, error):
+                return True, checks
             stage._record_agent_run_status(
                 pr_number,
                 job,
@@ -251,7 +257,26 @@ def observe_required_checks(
         if live_head_outcome is not None:
             return live_head_outcome, checks
         if not stage.adapter.classify_required_check_failures:
-            evidence = stage.github.required_check_evidence(pr_number)
+            try:
+                evidence = stage.github.required_check_evidence(pr_number)
+            except (GitHubReadError, OSError, TimeoutError) as error:
+                if isinstance(
+                    error, GitHubReadError
+                ) and not is_github_convergence_error(error.code):
+                    raise
+                if stage._record_publication_operation_failure(state, job, error):
+                    return True, checks
+                wait_for_github_convergence(
+                    state,
+                    code="github_check_evidence_observation_pending",
+                    message="GitHub Required Check failure evidence has not converged",
+                    waiting_for=(
+                        f"Ticket PR #{pr_number} failed Required Check evidence"
+                    ),
+                )
+                ensure_supervision_window(state)
+                stage.save(state)
+                return True, checks
             live_head_outcome = _verify_live_publication_head(
                 stage, state, job, pr_number, checks
             )
@@ -290,6 +315,8 @@ def observe_required_checks(
                 error.code
             ):
                 raise
+            if stage._record_publication_operation_failure(state, job, error):
+                return True, checks
             stage._record_agent_run_status(
                 pr_number,
                 job,

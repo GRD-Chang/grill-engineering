@@ -18,6 +18,8 @@ from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
+from agent_run.publication_operation_retry import record_publication_operation_failure
+from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.worker_credentials import InitialCredentialUnavailable
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -37,7 +39,6 @@ from agent_run.review_budget import (
 
 MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
-MAX_PUBLICATION_ATTEMPTS = MAX_PUBLICATION_CONTEXT_ATTEMPTS + 1
 
 
 from agent_run.change_delivery_branches import (
@@ -132,13 +133,9 @@ class ChangeDeliveryEngine:
                     # already-counted semantic narrative.
                     return state
                 if phase == "merged":
-                    live = self.publisher.live_pull_request(
-                        state, job, int(job["pr_number"])
-                    )
-                    if not self.publisher.after_merge(state, job, live):
+                    if self._publish_and_merge(state, job, checkout):
                         return state
-                    job["phase"] = "completed"
-                    return self.save(state)
+                    continue
                 if phase == "escalating":
                     self.publisher.escalate(state, job, str(job["escalation_code"]))
                     job["phase"] = "blocked"
@@ -434,6 +431,8 @@ class ChangeDeliveryEngine:
                 0, int(job.get("publication_attempts", 0)) - 1
             )
             release_semantic_attempt(job)
+            job.pop("publication_operation_retry", None)
+            job.pop("last_publication_error", None)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
         policy = policy_for_subject(self.contract.label)
@@ -481,8 +480,25 @@ class ChangeDeliveryEngine:
     def _fallback_candidate_is_eligible(job: dict[str, Any]) -> bool:
         return fallback_candidate_is_eligible(job)
 
-    def publication_budget_exhausted(self, attempts: int) -> bool:
-        return attempts >= MAX_PUBLICATION_ATTEMPTS
+    def _record_publication_operation_failure(
+        self, state: dict[str, Any], job: dict[str, Any], error: Exception
+    ) -> bool:
+        exhausted = record_publication_operation_failure(job, error)
+        if exhausted:
+            job["phase"] = "publication_pending"
+            state.update(
+                {
+                    "status": "publication_pending",
+                    "terminal_kind": "publication_pending",
+                    "diagnostics": [
+                        publication_pending_diagnostic(
+                            subject_key="change_job", subject=self.contract.label
+                        )
+                    ],
+                }
+            )
+        self.save(state)
+        return exhausted
 
     def _wait_for_merge_reconciliation(
         self, state: dict[str, Any], job: dict[str, Any], message: str | None = None

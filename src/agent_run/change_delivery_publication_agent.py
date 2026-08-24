@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Publication-agent narrative and commit stage for Change Delivery."""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
@@ -12,7 +12,7 @@ from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.external_supervision import is_github_convergence_error
 from agent_run.github import GitHubReadError
-from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     canonical_fingerprint,
@@ -50,35 +50,9 @@ def publication(
         if not stage._publication_is_current(state, job):
             _invalidate_stale_publication(stage, state, job, checkout)
             return
-        try:
-            request = stage.adapter.publication_request(state, job, checkout)
-        except GitHubReadError as error:
-            if not is_github_convergence_error(error.code):
-                raise
-            operation_retry = job.setdefault(
-                "publication_operation_retry",
-                {"attempts": 0, "limit": 5},
-            )
-            if not isinstance(operation_retry, dict):
-                raise ValueError("Publication Operation Retry must be an object")
-            attempts = int(operation_retry.get("attempts", 0)) + 1
-            operation_retry["attempts"] = attempts
-            job["last_publication_error"] = str(error)
-            if stage.publication_budget_exhausted(attempts):
-                job["phase"] = "publication_pending"
-                state["status"] = "publication_pending"
-                state["terminal_kind"] = "publication_pending"
-                state["diagnostics"] = [
-                    publication_pending_diagnostic(
-                        subject_key="change_job", subject=stage.contract.label
-                    )
-                ]
-                stage.save(state)
-                return
-            stage.save(state)
-            continue
         semantic_attempt = pending_semantic_attempt(job, role="publication")
         if semantic_attempt is None:
+            begin_publication_operation_attempt(job)
             ordinal = int(job.get("publication_attempts", 0)) + 1
             job["publication_attempts"] = ordinal
             work_subject, generation = stage.adapter.invocation_identity(state, job)
@@ -91,6 +65,14 @@ def publication(
                 ordinal=ordinal,
             )
         stage.save(state)
+        try:
+            request = stage.adapter.publication_request(state, job, checkout)
+        except GitHubReadError as error:
+            if not is_github_convergence_error(error.code):
+                raise
+            if stage._record_publication_operation_failure(state, job, error):
+                return
+            continue
         request["_invocation_event"] = stage._invocation_events(
             state,
             job,

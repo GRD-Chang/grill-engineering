@@ -128,6 +128,7 @@ def test_status_distinguishes_semantic_invocation_output_budget_and_publication_
     }
     assert output["budget_window"] is None
     assert output["publication_operation_retry"] == {
+        "semantic_attempt_id": "attempt-publication-2",
         "work_subject": "ticket:3",
         "attempts": 2,
         "limit": 4,
@@ -224,7 +225,12 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
         {"work_subject": "ticket:3", "role": "reviewer", "window": 1},
     ]
     assert output["publication_operation_retries"] == [
-        {"work_subject": "ticket:3", "attempts": 1, "limit": 3}
+        {
+            "semantic_attempt_id": None,
+            "work_subject": "ticket:3",
+            "attempts": 1,
+            "limit": 3,
+        }
     ]
 
     cli.cli_presentation._print_history(state, as_json=False)
@@ -350,6 +356,7 @@ def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(
     checkout = "/repo/.agent-run/worktrees/run-1/run-repair"
     state: dict[str, object] = {
         "run_id": "run-1",
+        "parent": {"number": 1},
         "status": "run_acceptance_pending",
         "diagnostics": [],
         "delivery_cleanup": {
@@ -373,10 +380,11 @@ def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(
     output = json.loads(capsys.readouterr().out)
 
     recovery = output["delivery_cleanup"]["items"][0]["recovery_action"]
-    assert f"inspect/commit/salvage {checkout}" in recovery
-    assert "resume run-1 only to retire" in recovery
+    assert f"copy/salvage {checkout}" in recovery
+    assert "run 1 to retire it and continue fresh Run Acceptance" in recovery
     assert "abandon run-1 --discard-worktree" in recovery
-    assert output["next_action"].startswith("先检查、提交或转存 stale")
+    assert output["next_action"].startswith("先检查并把 stale")
+    assert "agent-run run 1" in output["next_action"]
 
 
 @pytest.mark.parametrize("command", ["deliver", "accept-run", "publish-run"])

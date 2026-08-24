@@ -12,10 +12,7 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
     parse_publication_wire_result,
 )
-from agent_run.change_delivery import (
-    MAX_PUBLICATION_ATTEMPTS,
-    ensure_linked_branch_display,
-)
+from agent_run.change_delivery import ensure_linked_branch_display
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
@@ -34,6 +31,7 @@ from agent_run.required_checks import (
     supervise_unrepairable_check_failure,
 )
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_currentness import run_currentness_boundary
 from agent_run.worker_credentials import InitialCredentialUnavailable
@@ -72,7 +70,18 @@ class RunPublicationFlow(RunPublicationShared):
         if publication["phase"] == "ready_for_human":
             return state
         if publication["phase"] == "stale":
+            attempt_audit = {
+                key: publication[key]
+                for key in (
+                    "publication_attempts",
+                    "semantic_attempt_history",
+                    "publication_operation_retry",
+                    "last_publication_error",
+                )
+                if key in publication
+            }
             publication.clear()
+            publication.update(attempt_audit)
             publication["phase"] = "pending"
         if publication["phase"] == "publication_pending":
             return state
@@ -84,69 +93,81 @@ class RunPublicationFlow(RunPublicationShared):
             publication["phase"] = "pending"
         if not self._acceptance_is_current(state, run):
             return self._invalidate_for_fresh_acceptance(state)
-        if publication["phase"] in {
+        continue_accepted_publication = publication["phase"] in {
             "waiting_checks",
             "waiting_external",
             "ready_for_approval",
-        }:
-            return self._publish_accepted_run(state, run, publication)
-        if publication["phase"] != "pending":
+        }
+        if not continue_accepted_publication and publication["phase"] != "pending":
             raise ValueError("unknown Final Run Publication phase")
         while True:
-            publication["phase"] = "publishing"
-            stored_artifact = publication.get("artifact")
-            if isinstance(stored_artifact, dict):
-                artifact = PublicationArtifact.from_stored(
-                    stored_artifact, delivery_run=str(state["run_id"])
-                )
+            if continue_accepted_publication:
+                continue_accepted_publication = False
             else:
-                semantic_attempt = pending_semantic_attempt(
-                    publication, role="publication"
-                )
-                newly_allocated = semantic_attempt is None
-                if semantic_attempt is None:
-                    ordinal = int(publication.get("publication_attempts", 0)) + 1
-                    publication["publication_attempts"] = ordinal
-                    semantic_attempt = allocate_semantic_attempt(
+                publication["phase"] = "publishing"
+                stored_artifact = publication.get("artifact")
+                if isinstance(stored_artifact, dict):
+                    artifact = PublicationArtifact.from_stored(
+                        stored_artifact, delivery_run=str(state["run_id"])
+                    )
+                else:
+                    semantic_attempt = pending_semantic_attempt(
+                        publication, role="publication"
+                    )
+                    newly_allocated = semantic_attempt is None
+                    if semantic_attempt is None:
+                        begin_publication_operation_attempt(publication)
+                        ordinal = int(publication.get("publication_attempts", 0)) + 1
+                        publication["publication_attempts"] = ordinal
+                        semantic_attempt = allocate_semantic_attempt(
+                            publication,
+                            role="publication",
+                            work_subject=f"run-publication:{state['run_id']}",
+                            generation=int(run.get("acceptance_generation", 1)),
+                            currentness_boundary=self._publication_boundary(state),
+                            ordinal=ordinal,
+                        )
+                    self._save(state)
+                    created_artifact = self._create_publication_artifact(
+                        state,
                         publication,
-                        role="publication",
-                        work_subject=f"run-publication:{state['run_id']}",
-                        generation=int(run.get("acceptance_generation", 1)),
-                        currentness_boundary=self._publication_boundary(state),
-                        ordinal=ordinal,
+                        semantic_attempt,
+                        newly_allocated=newly_allocated,
                     )
-                self._save(state)
-                created_artifact = self._create_publication_artifact(
-                    state,
-                    publication,
-                    semantic_attempt,
-                    newly_allocated=newly_allocated,
-                )
-                if created_artifact is None:
-                    return self._save(state)
-                artifact = created_artifact
-                close_semantic_attempt(
-                    publication,
-                    semantic_attempt,
-                    outcome="publication_artifact",
-                )
-                self._save(state)
-                publication["artifact"] = {
-                    "commit_message": artifact.commit_message,
-                    "pr_title": artifact.pr_title,
-                    "pr_body_markdown": artifact.pr_body_markdown,
-                }
-            try:
-                return self._publish_accepted_run(state, run, publication)
-            except (GitError, GitHubReadError, OSError) as error:
-                if isinstance(error, GitHubReadError):
-                    return self._handle_github_error(state, publication, error)
-                if self._final_run_ref_write_is_pending(publication):
-                    return self._handle_final_run_ref_error(
-                        state, publication, error
+                    if created_artifact is None:
+                        return self._save(state)
+                    artifact = created_artifact
+                    close_semantic_attempt(
+                        publication,
+                        semantic_attempt,
+                        outcome="publication_artifact",
                     )
-                if self._publication_failed(state, publication, error):
-                    return state
+                    self._save(state)
+                    publication["artifact"] = {
+                        "commit_message": artifact.commit_message,
+                        "pr_title": artifact.pr_title,
+                        "pr_body_markdown": artifact.pr_body_markdown,
+                    }
+            result = self._continue_accepted_publication(state, run, publication)
+            if result is not None:
+                return result
+
+    def _continue_accepted_publication(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        publication: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            return self._publish_accepted_run(state, run, publication)
+        except (GitError, GitHubReadError, OSError) as error:
+            if isinstance(error, GitHubReadError):
+                return self._handle_github_error(state, publication, error)
+            if self._final_run_ref_write_is_pending(publication):
+                return self._handle_final_run_ref_error(state, publication, error)
+            if self._publication_failed(state, publication, error):
+                return state
+            return None
 
     def _handle_github_error(
         self,
@@ -239,6 +260,8 @@ class RunPublicationFlow(RunPublicationShared):
         error: Exception,
     ) -> dict[str, Any]:
         if isinstance(error, OSError):
+            if self._record_operation_failure(state, publication, error):
+                return state
             # The ref may have been created after the response was lost.  Keep
             # its durable intent so the next call performs readback only.
             publication["phase"] = "waiting_external"
@@ -337,6 +360,8 @@ class RunPublicationFlow(RunPublicationShared):
                         0, int(publication["publication_attempts"]) - 1
                     )
                     release_semantic_attempt(publication)
+                    publication.pop("publication_operation_retry", None)
+                    publication.pop("last_publication_error", None)
                 wait_for_initial_credential(
                     state,
                     work_subject=_RUN_PUBLICATION_CREDENTIAL_SUBJECT,

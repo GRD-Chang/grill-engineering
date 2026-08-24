@@ -462,20 +462,28 @@ def _publication_operation_retry(
     retry = subject.get("publication_operation_retry")
     if not isinstance(retry, dict):
         return None
+    semantic_attempt_id: object = None
     work_subject: object = None
     pending = subject.get("pending_semantic_attempt")
-    if isinstance(pending, dict):
+    if isinstance(pending, dict) and pending.get("role") == "publication":
+        semantic_attempt_id = pending.get("attempt_id")
         work_subject = pending.get("work_subject")
     if work_subject is None:
         history = subject.get("semantic_attempt_history")
         if isinstance(history, list):
             for attempt in reversed(history):
-                if isinstance(attempt, dict) and attempt.get("role") == "publication":
+                if (
+                    isinstance(attempt, dict)
+                    and attempt.get("role") == "publication"
+                    and attempt.get("ordinal") == subject.get("publication_attempts")
+                ):
+                    semantic_attempt_id = attempt.get("attempt_id")
                     work_subject = attempt.get("work_subject")
                     break
     if work_subject is None and isinstance(subject.get("ticket_number"), int):
         work_subject = f"ticket:{subject['ticket_number']}"
     return {
+        "semantic_attempt_id": semantic_attempt_id,
         "work_subject": work_subject,
         "attempts": retry.get("attempts"),
         "limit": retry.get("limit"),
@@ -486,16 +494,38 @@ def _publication_operation_retries(
     state: dict[str, object],
 ) -> list[dict[str, object]]:
     retries: list[dict[str, object]] = []
-    seen: set[tuple[object, object, object]] = set()
+    seen: set[object] = set()
     for subject in semantic_attempt_subjects(state):
+        projected: list[dict[str, object]] = []
         retry = _publication_operation_retry(subject)
-        if retry is None:
-            continue
-        key = (retry["work_subject"], retry["attempts"], retry["limit"])
-        if key in seen:
-            continue
-        seen.add(key)
-        retries.append(retry)
+        if retry is not None:
+            projected.append(retry)
+        history = subject.get("semantic_attempt_history")
+        if isinstance(history, list):
+            for attempt in history:
+                if not isinstance(attempt, dict):
+                    continue
+                attempt_retry = attempt.get("publication_operation_retry")
+                if not isinstance(attempt_retry, dict):
+                    continue
+                projected.append(
+                    {
+                        "semantic_attempt_id": attempt.get("attempt_id"),
+                        "work_subject": attempt.get("work_subject"),
+                        "attempts": attempt_retry.get("attempts"),
+                        "limit": attempt_retry.get("limit"),
+                    }
+                )
+        for item in projected:
+            key = item.get("semantic_attempt_id") or (
+                item["work_subject"],
+                item["attempts"],
+                item["limit"],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            retries.append(item)
     return retries
 
 
@@ -525,6 +555,8 @@ def _public_delivery_cleanup(
     raw_items = cleanup.get("items")
     items: list[dict[str, object]] = []
     recovery_action = f"agent-run resume {state.get('run_id')}"
+    parent = state.get("parent")
+    parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
     if isinstance(raw_items, dict):
         for key in sorted(raw_items, key=str):
             item = raw_items[key]
@@ -533,8 +565,9 @@ def _public_delivery_cleanup(
             item_recovery_action = recovery_action
             if item.get("recovery_kind") == "stale_dirty_checkout":
                 item_recovery_action = (
-                    f"inspect/commit/salvage {item.get('checkout')}; then use "
-                    f"agent-run resume {state.get('run_id')} only to retire the stale checkout, "
+                    f"inspect and copy/salvage {item.get('checkout')} to a safe location; "
+                    f"make the stale checkout clean, then use agent-run run {parent_number} "
+                    "to retire it and continue fresh Run Acceptance, "
                     f"or agent-run abandon {state.get('run_id')} --discard-worktree"
                 )
             items.append(
@@ -603,8 +636,9 @@ def _next_action(state: dict[str, Any]) -> str:
             for item in items.values()
         ):
             return (
-                "先检查、提交或转存 stale Managed Development Checkout；"
-                f"随后仅用 agent-run resume {run_id} 退休旧 checkout，"
+                "先检查并把 stale Managed Development Checkout 的成果转存到安全位置，"
+                "再使旧 checkout 恢复 clean；"
+                f"随后用 agent-run run {parent_number} 退休旧 checkout 并继续 fresh Run Acceptance，"
                 f"或用 agent-run abandon {run_id} --discard-worktree 明确丢弃"
             )
         return f"agent-run resume {run_id}"

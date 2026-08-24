@@ -15,6 +15,7 @@ from agent_run.change_currentness import (
     stale_change_job_reason,
     unknown_pr_mutation,
 )
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.error_safety import bounded_error
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
@@ -869,6 +870,21 @@ class Controller:
                 / str(state["run_id"])
                 / "run-repair"
             )
+            repair_branch = str(job["repair_branch"])
+            dirty_reason = self.publisher.git.managed_checkout_dirty_reason(checkout)
+            if dirty_reason is not None:
+                invalidate_stale_run_repair(state)
+                DeliveryCleanupEngine(
+                    git=self.publisher.git,
+                    states=self.states,
+                ).preserve_dirty_checkout(
+                    state,
+                    kind="run_repair",
+                    branch=repair_branch,
+                    checkout=checkout,
+                    reason=dirty_reason,
+                )
+                return
             self.publisher.git.remove_worktree(checkout)
             for directory in (checkout.parent, checkout.parent.parent):
                 try:

@@ -19,6 +19,17 @@ from agent_run.ticket_phase import TicketPhase
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization as require_active_ticket_publication_authorization,
 )
+from agent_run.publication_operation_retry import (
+    publication_operation_attempt,
+    require_publication_operation_retry,
+)
+from agent_run.resume_audit_contract import (
+    RESUME_AUDIT_EVENT_KEYS,
+    RESUME_AUDIT_KINDS,
+    resume_event_digest,
+    resume_history_digest,
+    resume_identity,
+)
 from agent_run.semantic_attempt import (
     require_controller_reprepare_intent,
     require_semantic_attempt,
@@ -45,16 +56,6 @@ _ACTIVE_RUN_REPAIR_PHASES = frozenset(
         "blocked",
     }
 )
-_RESUME_AUDIT_KINDS = frozenset(
-    {
-        "agent_invocation",
-        "budget_checkpoint",
-        "github_refresh_retry",
-        "human_blocker",
-        "supervision_timeout",
-    }
-)
-_MAX_RESUME_AUDIT_EVENTS = 64
 _INTEGRATED_REVALIDATION_MERGE_PHASES = frozenset(
     {
         "developing",
@@ -151,7 +152,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_active_run_repair_mode(state)
     _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
-    _require_resume_audit(state["resume_audit"])
+    _require_resume_audit(state["resume_audit"], run_id=str(state["run_id"]))
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -456,22 +457,22 @@ def _require_ticket_graph(graph: dict[str, Any]) -> None:
         raise IncompatibleRunStateError("legacy state has an invalid ticket_graph.tickets")
 
 
-def _require_resume_audit(audit: dict[str, Any]) -> None:
+def _require_resume_audit(audit: dict[str, Any], *, run_id: str) -> None:
     total = audit.get("total")
     compacted = audit.get("compacted")
     history = audit.get("history")
     digest = audit.get("rolling_digest")
     if type(total) is not int or total < 0:
         raise IncompatibleRunStateError("legacy state has an invalid resume_audit.total")
-    if type(compacted) is not int or compacted < 0:
+    if compacted != 0:
         raise IncompatibleRunStateError(
             "legacy state has an invalid resume_audit.compacted"
         )
-    if not isinstance(history, list) or len(history) > _MAX_RESUME_AUDIT_EVENTS:
+    if not isinstance(history, list):
         raise IncompatibleRunStateError(
             "legacy state has an invalid resume_audit.history"
         )
-    if total != compacted + len(history):
+    if total != len(history):
         raise IncompatibleRunStateError(
             "legacy state has inconsistent Resume audit counters"
         )
@@ -487,11 +488,11 @@ def _require_resume_audit(audit: dict[str, Any]) -> None:
         )
     for index, event in enumerate(history):
         location = f"resume_audit.history[{index}]"
-        if not isinstance(event, dict):
+        if not isinstance(event, dict) or set(event) != RESUME_AUDIT_EVENT_KEYS:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}"
             )
-        expected_sequence = compacted + index + 1
+        expected_sequence = index + 1
         if event.get("sequence") != expected_sequence:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.sequence"
@@ -506,7 +507,15 @@ def _require_resume_audit(audit: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.resume_id"
             )
-        if event.get("kind") not in _RESUME_AUDIT_KINDS:
+        if event["resume_id"] != resume_identity(run_id, event):
+            raise IncompatibleRunStateError(
+                f"legacy state has a noncanonical {location}.resume_id"
+            )
+        if event.get("event_digest") != resume_event_digest(event):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.event_digest"
+            )
+        if event.get("kind") not in RESUME_AUDIT_KINDS:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.kind"
             )
@@ -538,6 +547,10 @@ def _require_resume_audit(audit: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.generation"
             )
+    if digest != resume_history_digest(history):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent resume_audit.rolling_digest"
+        )
 
 
 def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
@@ -586,7 +599,6 @@ def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
             )
 
     retained_ids = set(events_by_id)
-    compacted = audit["compacted"]
     linked_invocations = list(invocations)
     active = state.get("active_agent_invocation")
     if isinstance(active, dict):
@@ -596,16 +608,9 @@ def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
         if resume_id is None:
             continue
         if resume_id not in retained_ids:
-            resume_sequence = invocation.get("resume_sequence")
-            if (
-                type(resume_sequence) is not int
-                or resume_sequence < 1
-                or resume_sequence > compacted
-            ):
-                raise IncompatibleRunStateError(
-                    "legacy state has an Invocation bound to an unknown Resume"
-                )
-            continue
+            raise IncompatibleRunStateError(
+                "legacy state has an Invocation bound to an unknown Resume"
+            )
         event = events_by_id[resume_id]
         semantic_attempt = invocation.get("semantic_attempt")
         if (
@@ -951,6 +956,11 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
     _require_controller_reprepare_state(state, acceptance)
     records_by_id: dict[str, dict[str, Any]] = {}
     for location, owner, roles, work_subject, generation in owners:
+        _require_owner_publication_operation_retry(
+            owner,
+            location=location,
+            publication_capable="publication" in roles,
+        )
         pending = owner.get("pending_semantic_attempt")
         if pending is not None:
             if not isinstance(pending, dict):
@@ -992,6 +1002,50 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             _require_unique_attempt_record(records_by_id, attempt, item_location)
 
 
+def _require_owner_publication_operation_retry(
+    owner: dict[str, Any], *, location: str, publication_capable: bool
+) -> None:
+    value = owner.get("publication_operation_retry")
+    if value is None:
+        if owner.get("phase") == "publication_pending":
+            raise IncompatibleRunStateError(
+                f"legacy state has {location}.publication_pending without its Operation Retry"
+            )
+        return
+    if not publication_capable:
+        raise IncompatibleRunStateError(
+            f"legacy state has Publication Operation Retry on non-publication owner {location}"
+        )
+    try:
+        retry = require_publication_operation_retry(
+            value,
+            location=f"{location}.publication_operation_retry",
+        )
+    except ValueError as error:
+        raise IncompatibleRunStateError(f"legacy state has invalid {error}") from error
+    exhausted = retry["attempts"] == retry["limit"]
+    phase = owner.get("phase")
+    if phase == "publication_pending" and not exhausted:
+        raise IncompatibleRunStateError(
+            f"legacy state has non-exhausted {location}.publication_pending"
+        )
+    if exhausted and phase not in {"publication_pending", "stale", "abandoned"}:
+        raise IncompatibleRunStateError(
+            f"legacy state has exhausted {location}.publication_operation_retry outside a terminal boundary"
+        )
+    attempt = publication_operation_attempt(owner)
+    if attempt is None:
+        raise IncompatibleRunStateError(
+            f"legacy state has orphaned {location}.publication_operation_retry"
+        )
+    if attempt.get("status") == "completed" and attempt.get(
+        "publication_operation_retry"
+    ) != retry:
+        raise IncompatibleRunStateError(
+            f"legacy state has conflicting {location}.publication_operation_retry authority"
+        )
+
+
 def _require_owner_attempt(
     attempt: dict[str, Any],
     *,
@@ -1009,6 +1063,21 @@ def _require_owner_attempt(
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}: {error}"
         ) from error
+    attempt_retry = attempt.get("publication_operation_retry")
+    if attempt_retry is not None:
+        if status != "completed" or attempt.get("role") != "publication":
+            raise IncompatibleRunStateError(
+                f"legacy state has misplaced Publication Operation Retry at {location}"
+            )
+        try:
+            require_publication_operation_retry(
+                attempt_retry,
+                location=f"{location}.publication_operation_retry",
+            )
+        except ValueError as error:
+            raise IncompatibleRunStateError(
+                f"legacy state has invalid {error}"
+            ) from error
     generation = int(attempt["generation"])
     if (
         attempt["role"] not in roles

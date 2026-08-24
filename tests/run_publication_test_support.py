@@ -81,6 +81,45 @@ class DelayedChecksRunPublisher(FixtureGitHubPublisher):
             )
         return super().required_checks(pr_number)
 
+
+class WaitingThenInterruptedChecksPublisher(FixtureGitHubPublisher):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.required_check_calls = 0
+        self.interrupted_live_reads = 0
+        self.interrupt_live_reads = False
+
+    def live_pull_request(self, pr_number: int) -> dict[str, Any]:
+        if self.interrupt_live_reads:
+            self.interrupted_live_reads += 1
+            raise OSError("final PR live read process interrupted")
+        return super().live_pull_request(pr_number)
+
+    def required_checks(self, pr_number: int) -> str:
+        self.required_check_calls += 1
+        if self.required_check_calls == 1:
+            self.interrupt_live_reads = True
+            raise GitHubReadError(
+                "github_timeout", "final PR checks have not converged"
+            )
+        return super().required_checks(pr_number)
+
+
+class InterruptedFinalRefPublisher(FixtureGitHubPublisher):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.ref_calls = 0
+
+    def ensure_final_run_ref(self, *, branch: str, expected_head_sha: str) -> None:
+        del branch, expected_head_sha
+        self.ref_calls += 1
+        raise OSError("final ref write response was lost")
+
+    def final_run_ref_matches(self, *, branch: str, expected_head_sha: str) -> bool:
+        del branch, expected_head_sha
+        self.ref_calls += 1
+        raise OSError("final ref readback was interrupted")
+
 class CountingNarrativeRefreshPublisher(FixtureGitHubPublisher):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

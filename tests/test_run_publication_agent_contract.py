@@ -878,6 +878,7 @@ def test_retries_publication_operation_without_a_fresh_narrative_agent(
 
 def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["crash_after_ensure_run_pr_once"] = True
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -887,6 +888,11 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
         default_head_sha=git.resolve("main"),
     )
     published = engine.publish(str(state["run_id"]))
+    prior_attempt = published["run_publication"]["semantic_attempt_history"][-1]
+    assert prior_attempt["publication_operation_retry"] == {
+        "attempts": 1,
+        "limit": 5,
+    }
     publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
     published["run_publication"]["phase"] = "publishing"
     states.save_run(str(state["run_id"]), published)
@@ -919,6 +925,14 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
     ).publish(str(state["run_id"]))
 
     assert fresh["run_acceptance"]["phase"] == "accepted"
+    attempts = recovered["run_publication"]["semantic_attempt_history"]
+    assert [attempt["ordinal"] for attempt in attempts] == [1, 2]
+    assert attempts[0]["attempt_id"] == prior_attempt["attempt_id"]
+    assert attempts[0]["publication_operation_retry"] == {
+        "attempts": 1,
+        "limit": 5,
+    }
+    assert attempts[1]["attempt_id"] != attempts[0]["attempt_id"]
     assert (
         recovered["run_publication"]["pr_number"]
         != published["run_publication"]["pr_number"]

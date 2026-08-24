@@ -206,10 +206,6 @@ class RunAcceptanceEngine:
             if pending_attempt is not None
             else int(run.get("validation_attempts", 0)) + 1
         )
-        if pending_attempt is None:
-            run["validation_attempts"] = validation_attempt
-        run["phase"] = "reviewing"
-        self._save(state)
         checkout = self._validation_checkout(state, validation_attempt)
         try:
             default_head = self._default_head(state)
@@ -247,6 +243,8 @@ class RunAcceptanceEngine:
                 reviewed_default_base_sha=default_head,
                 expected_merge_tree=expected_merge_tree,
             )
+            if pending_attempt is None:
+                run["validation_attempts"] = validation_attempt
             semantic_attempt = allocate_semantic_attempt(
                 run,
                 role="reviewer",
@@ -256,6 +254,7 @@ class RunAcceptanceEngine:
                 ordinal=validation_attempt,
                 budget_window=int(ensure_budget(run, RUN_POLICY)["window"]),
             )
+            run["phase"] = "reviewing"
             self._save(state)
             if run.get("reviewer_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"

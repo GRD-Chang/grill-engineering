@@ -163,6 +163,16 @@ class DirectRunOperations:
 
     def accept(self, run_id: str) -> RunOutcome:
         refreshed, _ = self.controller.resume(run_id)
+        if _has_pending_stale_dirty_checkout(refreshed):
+            refreshed = DeliveryCleanupEngine(
+                git=self.git, states=self.states, github=self.publisher
+            ).resume(run_id)
+            if _has_pending_stale_dirty_checkout(refreshed):
+                return RunOutcome(
+                    kind=RunOutcomeKind.HUMAN_GATE,
+                    state=refreshed,
+                    next_step=None,
+                )
         acceptance = refreshed.get("run_acceptance")
         repair_wait = (
             isinstance(acceptance, dict)
@@ -434,6 +444,8 @@ class RunDriver:
 def _next_step(state: dict[str, Any]) -> RunStep | None:
     """Select the following step while translating persistent state to a result."""
 
+    if _has_pending_stale_dirty_checkout(state):
+        return RunStep.ACCEPT
     status = str(state.get("status"))
     if status in {
         "active",
@@ -469,6 +481,19 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
     if status == "waiting_external":
         return RunStep.REQUEUE if isinstance(state.get("requeue_transition"), dict) else RunStep.DELIVER
     return None
+
+
+def _has_pending_stale_dirty_checkout(state: dict[str, Any]) -> bool:
+    cleanup = state.get("delivery_cleanup")
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "cleanup_pending":
+        return False
+    items = cleanup.get("items")
+    return isinstance(items, dict) and any(
+        isinstance(item, dict)
+        and item.get("status") != "completed"
+        and item.get("recovery_kind") == "stale_dirty_checkout"
+        for item in items.values()
+    )
 
 
 def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:

@@ -8,21 +8,16 @@ from typing import Any
 
 from agent_run.external_supervision import is_github_refresh_wait
 from agent_run.review_budget import budget_checkpoint_subjects
+from agent_run.resume_audit_contract import (
+    RESUME_AUDIT_KINDS,
+    resume_event_digest,
+    resume_history_digest,
+    resume_identity,
+)
 from agent_run.semantic_attempt import (
-    canonical_fingerprint,
     invocation_attempt_is_pending,
 )
 from agent_run.state_contract import human_blocker_subject_count
-
-
-MAX_RESUME_AUDIT_EVENTS = 64
-RESUME_AUDIT_KINDS = {
-    "agent_invocation",
-    "budget_checkpoint",
-    "github_refresh_retry",
-    "human_blocker",
-    "supervision_timeout",
-}
 
 
 def append_explicit_resume_audit(
@@ -51,8 +46,8 @@ def append_explicit_resume_audit(
     compacted = audit.get("compacted")
     if type(total) is not int or total < 0:
         raise ValueError("resume_audit.total must be non-negative")
-    if type(compacted) is not int or compacted < 0:
-        raise ValueError("resume_audit.compacted must be non-negative")
+    if compacted != 0:
+        raise ValueError("resume_audit.compacted must remain zero")
 
     invocation = state.get("active_agent_invocation")
     active = (
@@ -92,27 +87,10 @@ def append_explicit_resume_audit(
         "human_response_supplied": human_response_supplied,
         "successor_invocation_started_at": None,
     }
-    event["resume_id"] = canonical_fingerprint(
-        {
-            "run_id": state.get("run_id"),
-            "sequence": sequence,
-            "requested_at": requested_at,
-            "kind": event["kind"],
-            "semantic_attempt_id": event["semantic_attempt_id"],
-            "source_invocation_started_at": event[
-                "source_invocation_started_at"
-            ],
-            "new_thread": new_thread,
-        }
-    )
-    previous_digest = audit.get("rolling_digest")
-    audit["rolling_digest"] = canonical_fingerprint(
-        {"previous": previous_digest, "resume_id": event["resume_id"]}
-    )
+    event["resume_id"] = resume_identity(str(state["run_id"]), event)
+    event["event_digest"] = resume_event_digest(event)
     history.append(event)
-    if len(history) > MAX_RESUME_AUDIT_EVENTS:
-        del history[0]
-        audit["compacted"] = compacted + 1
+    audit["rolling_digest"] = resume_history_digest(history)
     audit["total"] = sequence
     return deepcopy(event)
 
@@ -122,6 +100,7 @@ def latest_resume_audit(state: dict[str, Any]) -> dict[str, Any] | None:
     history = audit.get("history") if isinstance(audit, dict) else None
     if not isinstance(history, list) or not history:
         return None
+    assert isinstance(audit, dict)
     latest = history[-1]
     return deepcopy(latest) if isinstance(latest, dict) else None
 
@@ -138,6 +117,7 @@ def bind_resume_to_successor(
     history = audit.get("history") if isinstance(audit, dict) else None
     if not isinstance(history, list) or not history:
         return None
+    assert isinstance(audit, dict)
     event = history[-1]
     if not isinstance(event, dict) or event.get("kind") not in {
         "agent_invocation",
@@ -164,6 +144,8 @@ def bind_resume_to_successor(
             "successor_invocation_started_at": successor_started_at,
         }
     )
+    event["event_digest"] = resume_event_digest(event)
+    audit["rolling_digest"] = resume_history_digest(history)
     return resume_id, sequence
 
 

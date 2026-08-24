@@ -253,6 +253,11 @@ def close_semantic_attempt(
         raise ValueError("Semantic Agent Attempt closeout does not match pending work")
     completed = deepcopy(pending)
     completed.update({"status": "completed", "outcome": outcome})
+    operation_retry = subject.get("publication_operation_retry")
+    if completed.get("role") == "publication" and isinstance(
+        operation_retry, dict
+    ):
+        completed["publication_operation_retry"] = deepcopy(operation_retry)
     history = subject.setdefault("semantic_attempt_history", [])
     if not isinstance(history, list):
         raise ValueError("semantic_attempt_history must be an array")

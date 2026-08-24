@@ -358,6 +358,7 @@ class ParentDeliveryLoop:
             "acceptance_record",
             "publication_attempts",
             "publication_thread_id",
+            "publication_operation_retry",
             "last_publication_error",
             "approval_grant",
             "repair_source",

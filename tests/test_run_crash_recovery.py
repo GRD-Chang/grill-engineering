@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_run.state import StateStore
+from agent_run.resume_audit_contract import resume_event_digest, resume_history_digest
 from agent_run.state_contract import require_current_run_state
 from agent_run.state_errors import IncompatibleRunStateError
 from conftest import write_fixture
@@ -349,15 +350,33 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
         with pytest.raises(IncompatibleRunStateError):
             require_current_run_state(malformed)
 
-    compacted = deepcopy(final_state)
-    compacted["resume_audit"].update({"compacted": 3, "history": []})
-    require_current_run_state(compacted)
-    fabricated = deepcopy(compacted)
+    fabricated = deepcopy(final_state)
     fabricated_successor = fabricated["agent_invocation_history"][successor_index]
     fabricated_successor["resume_id"] = "sha256:" + "2" * 64
     fabricated_successor["resume_sequence"] = 4
     with pytest.raises(IncompatibleRunStateError):
         require_current_run_state(fabricated)
+
+    for mutation in ("failure_code", "rolling_digest", "unknown_field"):
+        malformed_audit = deepcopy(final_state)
+        if mutation == "failure_code":
+            malformed_audit["resume_audit"]["history"][0][mutation] = "forged"
+        elif mutation == "rolling_digest":
+            malformed_audit["resume_audit"][mutation] = "sha256:" + "3" * 64
+        else:
+            malformed_audit["resume_audit"]["history"][0][mutation] = "private"
+        with pytest.raises(IncompatibleRunStateError):
+            require_current_run_state(malformed_audit)
+
+    forged_identity = deepcopy(final_state)
+    forged_event = forged_identity["resume_audit"]["history"][0]
+    forged_event["resume_id"] = "sha256:" + "4" * 64
+    forged_event["event_digest"] = resume_event_digest(forged_event)
+    forged_identity["resume_audit"]["rolling_digest"] = resume_history_digest(
+        forged_identity["resume_audit"]["history"]
+    )
+    with pytest.raises(IncompatibleRunStateError, match="noncanonical"):
+        require_current_run_state(forged_identity)
 
     status = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
     history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))

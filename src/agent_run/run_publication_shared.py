@@ -22,7 +22,9 @@ from agent_run.run_currentness import (
     ticket_completion_records,
 )
 from agent_run.state import StateStore
-from agent_run.change_delivery import MAX_PUBLICATION_ATTEMPTS
+from agent_run.publication_operation_retry import (
+    record_publication_operation_failure,
+)
 from agent_run.publication_pending import publication_pending_diagnostic
 
 
@@ -164,20 +166,10 @@ class RunPublicationShared:
         publication: dict[str, Any],
         error: Exception,
     ) -> bool:
-        operation_retry = publication.setdefault(
-            "publication_operation_retry",
-            {"attempts": 0, "limit": MAX_PUBLICATION_ATTEMPTS},
-        )
-        if not isinstance(operation_retry, dict):
-            raise ValueError("Publication Operation Retry must be an object")
-        operation_retry["attempts"] = int(operation_retry.get("attempts", 0)) + 1
-        if int(operation_retry["attempts"]) < int(
-            operation_retry.get("limit", MAX_PUBLICATION_ATTEMPTS)
-        ):
+        if not record_publication_operation_failure(publication, error):
             return False
         publication["phase"] = "publication_pending"
         publication.pop("write_intent", None)
-        publication["last_publication_error"] = str(error)
         state.update(
             {
                 "status": "publication_pending",
