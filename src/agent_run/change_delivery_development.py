@@ -18,6 +18,12 @@ from agent_run.credential_availability import (
     wait_for_initial_credential as wait_for_initial_credential_state,
 )
 from agent_run.git_errors import GitError, GitIntegrityError
+from agent_run.semantic_attempt import (
+    allocate_semantic_attempt,
+    close_semantic_attempt,
+    pending_semantic_attempt,
+    require_controller_reprepare_intent,
+)
 
 
 def develop(
@@ -59,6 +65,19 @@ def develop(
             )
     else:
         job["managed_checkout_head"] = stage.git.checkout_head(checkout)
+    work_subject, generation = stage.adapter.invocation_identity(state, job)
+    budget = job.get("review_budget")
+    if not isinstance(budget, dict) or type(budget.get("window")) is not int:
+        raise ValueError("Development is missing its Review Budget Window")
+    semantic_attempt = allocate_semantic_attempt(
+        job,
+        role="development",
+        work_subject=work_subject,
+        generation=generation,
+        currentness_boundary=stage._invocation_boundary(job),
+        ordinal=attempt,
+        budget_window=int(budget["window"]),
+    )
     intent = job.get("candidate_commit_intent")
     if not (
         isinstance(intent, dict)
@@ -76,7 +95,12 @@ def develop(
     stage.save(state)
     request = stage.adapter.development_request(state, job, checkout)
     request["_invocation_event"] = stage._invocation_events(
-        state, job, request, role="development", phase=str(job["phase"])
+        state,
+        job,
+        request,
+        role="development",
+        phase=str(job["phase"]),
+        semantic_attempt=semantic_attempt,
     )
     request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
     if job.get("development_new_thread") is True:
@@ -145,6 +169,9 @@ def commit_candidate(
     checkout: Path,
 ) -> bool:
     attempt = int(job["pending_attempt"])
+    controller_reprepared = "controller_candidate_reprepare" in job
+    if controller_reprepared:
+        require_controller_reprepare_intent(job)
     expected_head = str(
         job.get("managed_checkout_head")
         or job.get("candidate_sha")
@@ -194,6 +221,12 @@ def commit_candidate(
                 "workspace_clean": "true",
             }
             return _route_git_integrity_repair(stage, state, job, checkout, evidence)
+        semantic_attempt = pending_semantic_attempt(job, role="development")
+        if semantic_attempt is None and not controller_reprepared:
+            raise ValueError("Development closeout is missing its Semantic Attempt")
+        if semantic_attempt is not None:
+            close_semantic_attempt(job, semantic_attempt, outcome="no_code_changes")
+        job.pop("controller_candidate_reprepare", None)
         job.pop("pending_attempt", None)
         job.pop("candidate_commit_intent", None)
         return stage._block(
@@ -214,6 +247,12 @@ def commit_candidate(
     job.pop("next_attempt_kind", None)
     job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
+    semantic_attempt = pending_semantic_attempt(job, role="development")
+    if semantic_attempt is None and not controller_reprepared:
+        raise ValueError("Candidate closeout is missing its Semantic Attempt")
+    if semantic_attempt is not None:
+        close_semantic_attempt(job, semantic_attempt, outcome="candidate")
+    job.pop("controller_candidate_reprepare", None)
     job.pop("pending_attempt", None)
     stage.save(state)
     return True
@@ -265,5 +304,9 @@ def _route_git_integrity_repair(
     job.pop("next_attempt_kind", None)
     job.pop("candidate_commit_intent", None)
     stage._sync_attempts(state, job)
+    semantic_attempt = pending_semantic_attempt(job, role="development")
+    if semantic_attempt is None:
+        raise ValueError("Git Integrity closeout is missing its Semantic Attempt")
+    close_semantic_attempt(job, semantic_attempt, outcome="git_integrity_repair")
     stage.save(state)
     return True

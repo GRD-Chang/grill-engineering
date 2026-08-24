@@ -266,7 +266,9 @@ def budget_checkpoint_subjects(
 
 
 def _is_budget_checkpoint(value: dict[str, Any]) -> bool:
-    return value.get("blocked_reason") in {
+    return value.get("pending_semantic_attempt") is None and value.get(
+        "blocked_reason"
+    ) in {
         "modification_budget_exhausted",
         "review_budget_exhausted",
     }

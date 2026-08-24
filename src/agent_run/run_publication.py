@@ -48,8 +48,8 @@ class RunPublicationEngine:
     def revise(self, run_id: str, feedback: str) -> dict[str, Any]:
         return self._approval().revise(run_id, feedback)
 
-    def abandon(self, run_id: str) -> dict[str, Any]:
-        return self._approval().abandon(run_id)
+    def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
+        return self._approval().abandon(run_id, discard_worktree=discard_worktree)
 
     def _flow(self) -> RunPublicationFlow:
         return RunPublicationFlow(

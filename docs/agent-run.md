@@ -38,7 +38,7 @@ agent-run resume <run-id> [--new-thread] [--message "..."] --repo OWNER/REPO
 agent-run requeue <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
 agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
-agent-run abandon <run-id> --repo OWNER/REPO
+agent-run abandon <run-id> [--discard-worktree] --repo OWNER/REPO
 AGENT_RUN_GITHUB_APP_ID=<app-id> \
 AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
 AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
@@ -93,14 +93,24 @@ code-failure-steps = [
 脱敏的进度记录，不会打印凭据或原始响应体。
 在前台窗口仍运行时，这个恢复操作仅说明窗口到期或进程中断后的下一步，不要求维护者重复输入
 `run`；当前进程会继续自行监督。
+Semantic Agent Attempt 在预算门禁通过后、首个 Codex 进程启动前写入状态；Development 与 Reviewer
+Attempt 绑定当时的 Review Budget Window，Publication Attempt 则不绑定该窗口。一次 Attempt 可包含
+初始 Invocation、同 Thread 的 Output Repair、进程失败后的 successor Invocation、Human Blocker Resume
+以及显式 `--new-thread`；这些恢复都沿用同一 Attempt ID 和领域计数，不能重新获得预算。
 Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.started` 会在进程仍运行时
 立即保存。`history --json` 的 `agent_invocations` 保留每次调用的 Work Subject、Generation、
 输入指纹、Currentness Boundary、模式、requested/reported Thread、Output Attempt 数量、时间和
-有界错误；它不保存 Prompt、transcript 或 Acceptance Artifact。Ticket、Parent-only 和 Run Repair
+有界错误；`semantic_agent_attempts`、`output_attempts`、`budget_windows` 与
+`publication_operation_retries` 分别展示语义工作、输出修复、预算和外部发布操作重试，不把这些
+层级混成一个计数。每次公共 `resume` 另存独立授权事件；`status --json` 的 `latest_resume` 显示
+最近一次，`history --json` 的 `agent_resumes` 显示每次授权的原因、Thread、Attempt 与 successor
+关联，`resume_audit` 则显示总数和滚动摘要。审计保留每次 Resume 的完整小型事实且不限制次数，
+但不保存维护者消息或原始错误文本。它不保存 Prompt、transcript 或 Acceptance Artifact。
+Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中最多修复两次，且不增加领域 attempt；进程失败不会自动重试或替换
-Thread。`resume` 默认复用已保存 Thread，`--new-thread` 明确丢弃当前失败或 Human Blocker 阶段的
-Thread 身份并使用标准阶段 Prompt 新开 Thread。`--message` 只允许用于当前 Human Blocker；它 trim
+Thread。`resume` 默认复用已保存 Thread，`--new-thread` 只替换 Invocation/Thread，不替换 Semantic
+Attempt，并使用标准阶段 Prompt 新开 Thread。`--message` 只允许用于当前 Human Blocker；它 trim
 后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
@@ -132,19 +142,19 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | --- | --- | --- | --- |
 | `start` | 新 Run 或同一 Parent 的现有 Run | 创建或幂等返回本地 Run 记录及其受管 Run Branch，供集成或排障检查身份与状态 | 不推进自动生命周期；日常交付不以它替代 `run` |
 | `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 为同一 Generation 创建 successor Invocation；或为同一等待身份开启新监督窗口 | 超时恢复不创建 Worker、PR 或 merge；不吸收 stale 边界，也不绕过 Publisher 的 currentness/写入门禁 |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 在同一 Semantic Attempt 内创建 successor Invocation；或为同一等待身份开启新监督窗口 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
-| `status` / `history` | 任意已知 Run | 查看当前状态、允许的下一步与有界 Invocation 审计事实 | 不改变状态或恢复工作 |
+| `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
 | `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
-| `abandon` | 未完成 Run（包括人工边界） | 写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支，也不猜测外部 close 的 ownership |
+| `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
 ### Output Repair、Resume 与 Requeue
 
 三者按失败层级分开，不可替换：
 
 - **Output Repair**：同一个 Invocation 的 Codex 进程零退出、Thread 身份正确，但最终结构化输出不符合完整阶段 contract 时自动执行。它最多追加两次同 Thread、只读的输出请求；不创建新的 Invocation，也不增加领域 attempt。
-- **Resume**：进程、凭据、sandbox、timeout、signal、非零退出、缺少最终输出或 Thread mismatch 导致 `execution_failed`，或 Agent 成功给出 Human Blocker 时，由维护者显式恢复当前 Invocation。
+- **Resume**：进程、凭据、sandbox、timeout、signal、非零退出、缺少最终输出或 Thread mismatch 导致 `execution_failed`，或 Agent 成功给出 Human Blocker 时，由维护者显式在当前 Semantic Attempt 内启动 successor Invocation。
 - **Requeue**：Currentness Boundary 已经 stale 时替换整个 Job Generation。它不是失败进程的 retry；Ticket 与 Parent-only Change Job 只有在 `requeue_required` 才能执行，Run Acceptance 与 Final Run Publication 的漂移则回到 fresh Run Acceptance。
 
 默认 Resume 在仍 current 且保存了 Thread ID 时复用同一 Thread：
@@ -155,7 +165,8 @@ agent-run resume <run-id> --repo OWNER/REPO
 agent-run history <run-id> --repo OWNER/REPO --json
 ```
 
-只有维护者明确要丢弃当前 Invocation 上下文，或没有可恢复 Thread ID 时才使用新 Thread；新 Thread
+只有维护者明确要丢弃当前 Invocation 上下文，或没有可恢复 Thread ID 时才使用新 Thread；它仍属于
+原 Semantic Attempt，因此不会增加 Development、Reviewer 或 Publication 计数。新 Thread
 接收该阶段完整标准 Prompt，不会得到“接替上一位 Agent”的手工交接叙述：
 
 ```bash
@@ -226,6 +237,9 @@ Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；仅
 复用刚刚被阻塞的 Run Publication Thread，并要求它重新读取权威状态。Publisher 维护同一个
 Run Branch → 默认分支的最终 PR，并渲染 Parent Issue、Delivery Type 及每张已完成 Ticket 的链接；它将
 Parent/Graph revision、Run/default/PR head 与预期 merge tree 写入独立 Publication Record。
+Publication Agent 返回合法叙事时 Semantic Attempt 即完成；之后 GitHub 写入、读取与对账失败只增加
+独立且有界的 Publication Operation Retry。该重试耗尽后进入硬 `publication_pending` 边界，`resume`
+不会清零、绕过或重新生成叙事。
 Required Checks 全部通过（或没有配置）后状态才变为
 `run_approval_pending`；即使此时所有自动检查通过，也只有 `approve` 会执行普通 merge
 commit。合并结果与已验收的预期 merge tree 一致后，Publisher 记录可重试的 Parent
@@ -328,9 +342,13 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
   parent、tree 和标题；
 - 显式关闭 Primary Ticket并记录 Run、PR 与 integrated commit。
 
-每个 Ticket revision 最多允许十次产生真实 tree 变化的 Development Attempt。没有
-代码变化的 Attempt 不消耗预算，但该 Ticket 会停止自动重试，Controller 先完成其他
-可执行分支；预算耗尽后 Ticket 会移除 `ready-for-agent` 并增加 `ready-for-human`。
+每个 Ticket Review Budget Window 最多允许四次普通 Development Attempt 和三次 Reviewer
+Invocation。四次普通 Development 耗尽后，只有已发布 Ticket PR 首次出现由准确 CI Evidence
+证明可修复的 Required Checks 失败时，才额外允许一次 Final CI-fix。Development Attempt 在首次
+分配时占用预算；进程失败、Output Repair、Human Blocker Resume 和 `--new-thread` 只继续同一
+Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗尽且仍需修改时进入
+`modification_budget_exhausted`，维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
+额度耗尽后的 Candidate 则继续按 Fallback Publication Receipt 和实际 Required Checks 规则处理。
 
 ## 自托管开发
 
@@ -434,9 +452,11 @@ GitHub App 的创建、安装和私钥保管不属于 Controller 自动化范围
 
 ## 本地状态与清理
 
-耐久状态位于 `.agent-run/runs/`。稳定 Development Checkout 位于
+耐久状态位于 `.agent-run/runs/`。本协议要求 `semantic_attempt_protocol: 1`；旧 Run 不迁移、
+不兼容读取，也不会在拒绝前执行 lifecycle mutation，必须重新创建或明确清理。稳定 Development Checkout 位于
 `.agent-run/worktrees/`：Required Checks pending 或 Worker/Publisher 普通失败、超时、
-进程异常时保留，以恢复未提交成果；Development/Repair Codex 报告 Human Blocker 时也保留，供同一 Thread 在 `resume` 后重新核验并继续。Ticket 完成、非恢复性的明确终止或操作者显式取消后清理。
+进程异常或 Ctrl-C 时保留，以恢复未提交成果；Development/Repair Codex 报告 Human Blocker 时也保留，供同一 Thread 在 `resume` 后重新核验并继续。普通 cleanup 只有在 Git 元数据证明 checkout 属于本 Run 且 `git status --porcelain` 为空时才删除。tracked/untracked 修改、元数据缺失或归属不一致都 fail closed，并在 `status`、`run`、`resume` JSON 中给出路径、原因和恢复命令。
+`abandon` 在任何 GitHub mutation 之前执行同样的全 Run preflight；若维护者确认不再需要本地成果，必须显式使用 `abandon --discard-worktree`。Ticket 完成和明确 abandonment 才进入清理。
 Checkout 尚未准备完成时产生的部分目录也会清理。每轮独立 Validation Checkout 在验收
 结束后完整删除，允许验收期间创建构建、测试和诊断中间产物；Reviewer 只清理自身产物，不修改
 交付内容。Codex 的临时 schema、输出

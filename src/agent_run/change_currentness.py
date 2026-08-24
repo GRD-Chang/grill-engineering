@@ -150,7 +150,33 @@ def candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
         return False
     if not isinstance(record, dict) or not isinstance(candidate, str):
         return True
-    return record.get("reviewed_candidate_sha") != candidate
+    reviewed_candidate = record.get("reviewed_candidate_sha")
+    if reviewed_candidate == candidate:
+        return False
+    # During a repair cycle the latest Acceptance remains bounded history for
+    # the next Reviewer and fallback receipt; it is not authority for the new
+    # Candidate.  Accept that shape only when both persisted history indexes
+    # prove the exact prior Candidate and Artifact.
+    if (
+        job.get("phase")
+        not in {
+            "developing",
+            "repairing",
+            "committing_candidate",
+            "candidate",
+            "reviewing",
+        }
+        or reviewed_candidate != job.get("last_review_candidate_sha")
+    ):
+        return True
+    budget = job.get("review_budget")
+    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
+    latest = artifacts[-1] if isinstance(artifacts, list) and artifacts else None
+    return not (
+        isinstance(latest, dict)
+        and latest.get("candidate_sha") == reviewed_candidate
+        and latest.get("artifact") == record.get("artifact")
+    )
 
 
 def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:

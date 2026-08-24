@@ -401,6 +401,7 @@ class TicketDeliveryLoop:
             "acceptance_record",
             "publication_attempts",
             "publication_thread_id",
+            "publication_operation_retry",
             "last_publication_error",
             "repair_source",
             "ci_evidence",

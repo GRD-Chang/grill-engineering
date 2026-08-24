@@ -163,6 +163,16 @@ class DirectRunOperations:
 
     def accept(self, run_id: str) -> RunOutcome:
         refreshed, _ = self.controller.resume(run_id)
+        if _has_pending_stale_dirty_checkout(refreshed):
+            refreshed = DeliveryCleanupEngine(
+                git=self.git, states=self.states, github=self.publisher
+            ).resume(run_id)
+            if _has_pending_stale_dirty_checkout(refreshed):
+                return RunOutcome(
+                    kind=RunOutcomeKind.HUMAN_GATE,
+                    state=refreshed,
+                    next_step=None,
+                )
         acceptance = refreshed.get("run_acceptance")
         repair_wait = (
             isinstance(acceptance, dict)
@@ -201,6 +211,11 @@ class DirectRunOperations:
         if self._cannot_advance(refreshed):
             return self.classify(refreshed)
         publication = refreshed.get("run_publication")
+        if (
+            isinstance(publication, dict)
+            and publication.get("phase") == "publication_pending"
+        ):
+            return self.classify(refreshed)
         eligible = refreshed.get("status") == "run_publication_pending" or (
             isinstance(publication, dict)
             and refreshed.get("status")
@@ -429,6 +444,8 @@ class RunDriver:
 def _next_step(state: dict[str, Any]) -> RunStep | None:
     """Select the following step while translating persistent state to a result."""
 
+    if _has_pending_stale_dirty_checkout(state):
+        return RunStep.ACCEPT
     status = str(state.get("status"))
     if status in {
         "active",
@@ -450,18 +467,33 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
     if status == "waiting_merge":
         return RunStep.DELIVER
     publication = state.get("run_publication")
+    if status == "publication_pending":
+        return None
     if status == "run_publication_pending" or (
-        status in {"publication_pending", "waiting_checks", "waiting_external"}
+        status in {"waiting_checks", "waiting_external"}
         and isinstance(publication, dict)
         and publication.get("phase")
         in {"publication_pending", "waiting_checks", "waiting_external", "ready_for_approval"}
     ):
         return RunStep.PUBLISH
-    if status in {"publication_pending", "waiting_checks"}:
+    if status == "waiting_checks":
         return RunStep.DELIVER
     if status == "waiting_external":
         return RunStep.REQUEUE if isinstance(state.get("requeue_transition"), dict) else RunStep.DELIVER
     return None
+
+
+def _has_pending_stale_dirty_checkout(state: dict[str, Any]) -> bool:
+    cleanup = state.get("delivery_cleanup")
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "cleanup_pending":
+        return False
+    items = cleanup.get("items")
+    return isinstance(items, dict) and any(
+        isinstance(item, dict)
+        and item.get("status") != "completed"
+        and item.get("recovery_kind") == "stale_dirty_checkout"
+        for item in items.values()
+    )
 
 
 def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:

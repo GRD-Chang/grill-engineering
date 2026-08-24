@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from agent_run import cli_presentation, cli_surface
 from agent_run.agent_fixture import FixtureAgentBackend
@@ -18,13 +18,14 @@ from agent_run.agent_profiles import (
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
-from agent_run.git import GitError, GitRepository
+from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.error_safety import bounded_error
 from agent_run.external_supervision import (
@@ -122,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(revise)
     abandon = subcommands.add_parser("abandon", help="放弃交付运行并执行受限恢复与清理")
     abandon.add_argument("run_id", help="交付运行标识")
+    abandon.add_argument(
+        "--discard-worktree",
+        action="store_true",
+        help="不可恢复地丢弃该 Run 的 dirty Managed Development Checkout",
+    )
     _add_common_options(abandon)
     status = subcommands.add_parser("status", help="显示当前状态与下一条允许的操作")
     status.add_argument("run_id", help="交付运行标识")
@@ -165,6 +171,7 @@ def _main_with_parser(
     parsed = parser.parse_args(supplied_arguments)
     controller: Controller | None = None
     states: StateStore | FaultInjectingStateStore | None = None
+    github: Any = None
     precondition_failed = False
     try:
         creation_profile = (
@@ -268,11 +275,16 @@ def _main_with_parser(
             ):
                 cli_presentation._print_precondition_failure(current)
                 return 2
+            budget_checkpoint_resume = (
+                cli_surface._review_budget_checkpoint_count(current) == 1
+            )
             state, resumed = controller.resume(
                 parsed.run_id,
                 resume_human_blocker=current.get("status") != "supervision_timeout",
                 new_thread=parsed.new_thread,
                 human_response=parsed.message,
+                explicit_resume=True,
+                resume_budget_checkpoint=True,
             )
             if state.get("status") in {
                 "unsupported_scope_change",
@@ -305,7 +317,9 @@ def _main_with_parser(
                     )
                     agent_fixture = getattr(parsed, "agent_fixture", None)
                     agents = _agent_backend(parsed, profiles)
-                    publication_retried = _has_resumed_agent_phase(state)
+                    publication_retried = (
+                        _has_resumed_agent_phase(state) or budget_checkpoint_resume
+                    )
                     if publication_retried:
                         if state.get("delivery_type") == "parent_only":
                             state = ParentDeliveryEngine(
@@ -455,12 +469,18 @@ def _main_with_parser(
                     states=states,
                     github=publisher,
                     agents=agents,
-                ).abandon(parsed.run_id)
+                ).abandon(
+                    parsed.run_id,
+                    discard_worktree=parsed.discard_worktree,
+                )
             else:
                 state = (
                     refreshed
                     if parsed.command != "abandon"
-                    else publication.abandon(parsed.run_id)
+                    else publication.abandon(
+                        parsed.run_id,
+                        discard_worktree=parsed.discard_worktree,
+                    )
                 )
                 precondition_failed = parsed.command != "abandon"
             resumed = True
@@ -489,12 +509,55 @@ def _main_with_parser(
                 else current_diagnostics
             ),
             "scope_change": state.get("unsupported_scope_change"),
+            "delivery_cleanup": cli_presentation._public_delivery_cleanup(state),
             "next_action": cli_presentation._next_action(state),
         }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if precondition_failed:
             return 2
         return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
+    except KeyboardInterrupt:
+        run_id = getattr(parsed, "run_id", None)
+        if (
+            not isinstance(run_id, str)
+            and parsed.command == "run"
+            and states is not None
+            and github is not None
+        ):
+            repository = github.repository()
+            interrupted = states.find_run(repository.name_with_owner, parsed.parent)
+            if isinstance(interrupted, dict):
+                run_id = interrupted.get("run_id")
+        if controller is not None and isinstance(run_id, str):
+            controller.record_execution_failure(run_id, "controller_interrupted")
+        durable = (
+            states.load_run(run_id)
+            if states is not None and isinstance(run_id, str)
+            else None
+        )
+        print(
+            json.dumps(
+                {
+                    "result": "interrupted",
+                    "run_id": run_id,
+                    "status": "execution_failed",
+                    "diagnostics": [
+                        {
+                            "code": "controller_interrupted",
+                            "message": "控制器被中断；已保留 Managed Development Checkout 与当前 Semantic Agent Attempt",
+                        }
+                    ],
+                    "next_action": (
+                        cli_presentation._next_action(durable)
+                        if isinstance(durable, dict)
+                        else None
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 130
     except (
         CodexProcessError,
         GitError,
@@ -508,6 +571,7 @@ def _main_with_parser(
         incompatible_state = isinstance(error, IncompatibleRunStateError)
         if (
             not incompatible_state
+            and not isinstance(error, DirtyManagedCheckoutError)
             and controller is not None
             and isinstance(run_id, str)
         ):
@@ -536,18 +600,22 @@ def _main_with_parser(
             locator_code
             if locator_code is not None
             else (
-                "incompatible_run_state"
-                if incompatible_state
+                "dirty_managed_checkout"
+                if isinstance(error, DirtyManagedCheckoutError)
                 else (
-                    "multiple_unfinished_runs"
-                    if str(error).startswith("multiple unfinished Delivery Runs")
-                    else "command_failed"
+                    "incompatible_run_state"
+                    if incompatible_state
+                    else (
+                        "multiple_unfinished_runs"
+                        if str(error).startswith("multiple unfinished Delivery Runs")
+                        else "command_failed"
+                    )
                 )
             )
         )
         diagnostic_message = (
             str(error)
-            if locator_error
+            if locator_error or isinstance(error, DirtyManagedCheckoutError)
             else (
                 "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
                 "不会迁移、兼容读取或执行任何 mutation，请重新创建或清理该 Run"
@@ -599,6 +667,7 @@ def _main_with_parser(
                             }
                         ]
                         if locator_error
+                        or isinstance(error, DirtyManagedCheckoutError)
                         or incompatible_state
                         or durable_status not in {
                             "blocked",
@@ -878,7 +947,13 @@ def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
     invocation = state.get("active_agent_invocation")
     if (
         isinstance(invocation, dict)
-        and invocation.get("status") in {"failed", "resuming"}
+        and (
+            invocation.get("status") in {"failed", "resuming"}
+            or (
+                invocation.get("status") == "completed"
+                and invocation_attempt_is_pending(state, invocation)
+            )
+        )
         and invocation.get("role")
         in {
             "development",

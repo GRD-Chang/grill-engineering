@@ -76,6 +76,7 @@ class TicketDeliveryEngine:
             )
             preserve_checkout = False
             checkout_prepared = False
+            checkout_existed_before_attempt = checkout.exists()
             checkout_recoverable = self.git.ticket_checkout_matches(
                 checkout, str(job["ticket_branch"])
             )
@@ -100,6 +101,9 @@ class TicketDeliveryEngine:
                 preserve_checkout = result.get("status") in {
                     "waiting_checks",
                     "waiting_external",
+                    "requeue_required",
+                    "blocked",
+                    "ready_for_human",
                 } or (
                     job.get("blocked_reason") == "agent_requires_human"
                     and job.get("human_blocker_phase")
@@ -107,8 +111,11 @@ class TicketDeliveryEngine:
                 )
                 return result
             except KeyboardInterrupt:
-                # An explicit operator cancellation is a terminal cleanup
-                # request, unlike a recoverable Worker/process failure.
+                preserve_checkout = (
+                    checkout_existed_before_attempt
+                    or checkout_recoverable
+                    or checkout_prepared
+                )
                 raise
             except BaseException:
                 # Once the stable checkout is ready, any interrupted Worker or
@@ -116,12 +123,21 @@ class TicketDeliveryEngine:
                 # Abrupt process exits leave it behind too, so surfaced errors
                 # must preserve the same resume semantics.
                 preserve_checkout = (
-                    checkout_recoverable or checkout_prepared
+                    checkout_existed_before_attempt
+                    or checkout_recoverable
+                    or checkout_prepared
                 )
                 raise
             finally:
                 if not preserve_checkout:
-                    self.git.remove_worktree(checkout)
+                    self.git.remove_worktree(
+                        checkout,
+                        discard_worktree=not (
+                            checkout_existed_before_attempt
+                            or checkout_recoverable
+                            or checkout_prepared
+                        ),
+                    )
                     self._remove_empty_worktree_directories(checkout)
 
     def _ensure_ticket_branch(

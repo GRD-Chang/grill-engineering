@@ -1,18 +1,44 @@
-from __future__ import annotations
-
 """Publication-agent narrative and commit stage for Change Delivery."""
+
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
 
 from agent_run.agents import HumanBlockerResult, PublicationResult
-from agent_run.agent_invocation import canonical_fingerprint, invocation_event_recorder
+from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.artifacts import PublicationArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.external_supervision import is_github_convergence_error
 from agent_run.github import GitHubReadError
-from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.publication_operation_retry import begin_publication_operation_attempt
+from agent_run.semantic_attempt import (
+    allocate_semantic_attempt,
+    canonical_fingerprint,
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+)
+
+
+def _invalidate_stale_publication(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    checkout: Path,
+) -> None:
+    semantic_attempt = pending_semantic_attempt(job, role="publication")
+    if semantic_attempt is not None:
+        close_semantic_attempt(
+            job,
+            semantic_attempt,
+            outcome="currentness_invalidated",
+        )
+        detach_active_invocation(state, semantic_attempt)
+    stage._invalidate_stale(state, job, checkout)
+    stage.save(state)
+
 
 def publication(
     stage: ChangeDeliveryStage,
@@ -22,34 +48,38 @@ def publication(
 ) -> None:
     while True:
         if not stage._publication_is_current(state, job):
-            stage._invalidate_stale(state, job, checkout)
-            stage.save(state)
+            _invalidate_stale_publication(stage, state, job, checkout)
             return
+        semantic_attempt = pending_semantic_attempt(job, role="publication")
+        if semantic_attempt is None:
+            begin_publication_operation_attempt(job)
+            ordinal = int(job.get("publication_attempts", 0)) + 1
+            job["publication_attempts"] = ordinal
+            work_subject, generation = stage.adapter.invocation_identity(state, job)
+            semantic_attempt = allocate_semantic_attempt(
+                job,
+                role="publication",
+                work_subject=work_subject,
+                generation=generation,
+                currentness_boundary=stage._invocation_boundary(job),
+                ordinal=ordinal,
+            )
+        stage.save(state)
         try:
             request = stage.adapter.publication_request(state, job, checkout)
         except GitHubReadError as error:
             if not is_github_convergence_error(error.code):
                 raise
-            attempts = int(job.get("publication_attempts", 0)) + 1
-            job["publication_attempts"] = attempts
-            job["last_publication_error"] = str(error)
-            if stage.publication_budget_exhausted(attempts):
-                job["phase"] = "publication_pending"
-                state["status"] = "publication_pending"
-                state["terminal_kind"] = "publication_pending"
-                state["diagnostics"] = [
-                    publication_pending_diagnostic(
-                        subject_key="change_job", subject=stage.contract.label
-                    )
-                ]
-                stage.save(state)
+            if stage._record_publication_operation_failure(state, job, error):
                 return
-            stage.save(state)
             continue
-        job["publication_attempts"] = int(job.get("publication_attempts", 0)) + 1
-        stage.save(state)
         request["_invocation_event"] = stage._invocation_events(
-            state, job, request, role="publication", phase="publication"
+            state,
+            job,
+            request,
+            role="publication",
+            phase="publication",
+            semantic_attempt=semantic_attempt,
         )
         request["_currentness_check"] = lambda: stage._publication_is_current(
             state, job
@@ -100,9 +130,12 @@ def publication(
         break
     clear_current_human_blocker(job)
     if not stage._publication_is_current(state, job):
-        stage._invalidate_stale(state, job, checkout)
-        stage.save(state)
+        _invalidate_stale_publication(stage, state, job, checkout)
         return
+    semantic_attempt = pending_semantic_attempt(job, role="publication")
+    if semantic_attempt is None:
+        raise ValueError("Publication closeout is missing its Semantic Attempt")
+    close_semantic_attempt(job, semantic_attempt, outcome="publication_artifact")
     sha = stage.publisher.create_publication_commit(
         checkout, job, publication.commit_message
     )
@@ -132,16 +165,33 @@ def invocation_events(
     *,
     role: str = "publication",
     phase: str,
+    semantic_attempt: dict[str, Any],
 ) -> Callable[..., None]:
     work_subject, generation = stage.adapter.invocation_identity(state, job)
+    boundary = stage._invocation_boundary(job)
+    return invocation_event_recorder(
+        state,
+        role=role,
+        phase=phase,
+        work_subject=work_subject,
+        generation=generation,
+        invocation_input=request,
+        currentness_boundary=boundary,
+        semantic_attempt=semantic_attempt,
+        save=stage.save,
+    )
+
+
+def invocation_boundary(
+    job: dict[str, Any], *, candidate_tree: str | None = None
+) -> dict[str, Any]:
     boundary: dict[str, Any] = {
         "base_sha": str(job["base_sha"]),
     }
     if "candidate_sha" in job:
         boundary["candidate_sha"] = str(job["candidate_sha"])
-    acceptance = job.get("acceptance_record")
-    if isinstance(acceptance, dict) and "reviewed_candidate_tree" in acceptance:
-        boundary["candidate_tree"] = str(acceptance["reviewed_candidate_tree"])
+    if candidate_tree is not None:
+        boundary["candidate_tree"] = candidate_tree
     for key in ("effective_revision", "parent_revision", "ticket_graph_revision"):
         if key in job:
             boundary[key] = job[key]
@@ -152,16 +202,7 @@ def invocation_events(
         boundary["ticket_completion_records_fingerprint"] = canonical_fingerprint(
             job["ticket_completion_records"]
         )
-    return invocation_event_recorder(
-        state,
-        role=role,
-        phase=phase,
-        work_subject=work_subject,
-        generation=generation,
-        invocation_input=request,
-        currentness_boundary=boundary,
-        save=stage.save,
-    )
+    return boundary
 
 
 def invocation_identity(state: dict[str, Any], job: dict[str, Any]) -> tuple[str, int]:

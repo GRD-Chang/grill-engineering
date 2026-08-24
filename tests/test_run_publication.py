@@ -21,8 +21,10 @@ from run_publication_test_support import (
     CountingNarrativeRefreshPublisher,
     DelayedChecksRunPublisher,
     HumanThenRunPublicationAgents,
+    InterruptedFinalRefPublisher,
     RunPublicationAgents,
     UnknownNarrativeWritePublisher,
+    WaitingThenInterruptedChecksPublisher,
     _accepted_run,
 )
 
@@ -132,6 +134,10 @@ def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
     assert waiting["status"] == "waiting_external"
     assert waiting["terminal_kind"] == "waiting_external"
     assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert waiting["run_publication"]["publication_operation_retry"] == {
+        "attempts": 1,
+        "limit": 5,
+    }
     assert waiting["supervision_window"]["kind"] == "github_convergence"
     assert waiting["diagnostics"][0]["waiting_for"].endswith(
         "Required Checks observation"
@@ -165,6 +171,75 @@ def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
     assert len(resumed_prs) == 1
     assert resumed_prs[0]["title"] == original_title
     assert resumed_prs[0]["body"] == original_body
+
+
+def test_waiting_final_publication_counts_process_failures_to_hard_boundary(
+    git_repo: Path,
+) -> None:
+    state, states, git, _publisher = _accepted_run(git_repo)
+    publisher = WaitingThenInterruptedChecksPublisher(git_repo / "github.json", git)
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+    exhausted = engine.publish(str(state["run_id"]))
+    calls_at_exhaustion = publisher.required_check_calls
+    unchanged = engine.publish(str(state["run_id"]))
+
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert exhausted["status"] == "publication_pending"
+    assert exhausted["run_publication"]["publication_operation_retry"] == {
+        "attempts": 5,
+        "limit": 5,
+    }
+    assert calls_at_exhaustion == 1
+    assert publisher.interrupted_live_reads == 4
+    assert publisher.required_check_calls == calls_at_exhaustion
+    assert unchanged["status"] == "publication_pending"
+    assert len(agents.requests) == 1
+
+
+def test_final_ref_write_and_readback_stop_at_operation_retry_boundary(
+    git_repo: Path,
+) -> None:
+    state, states, git, _publisher = _accepted_run(git_repo)
+    publisher = InterruptedFinalRefPublisher(git_repo / "github.json", git)
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    result = engine.publish(str(state["run_id"]))
+    assert result["run_publication"]["publication_operation_retry"] == {
+        "attempts": 1,
+        "limit": 5,
+    }
+    for expected_attempts in range(2, 6):
+        result = engine.publish(str(state["run_id"]))
+        assert result["run_publication"]["publication_operation_retry"] == {
+            "attempts": expected_attempts,
+            "limit": 5,
+        }
+
+    calls_at_exhaustion = publisher.ref_calls
+    unchanged = engine.publish(str(state["run_id"]))
+    assert result["status"] == "publication_pending"
+    assert calls_at_exhaustion == 5
+    assert publisher.ref_calls == calls_at_exhaustion
+    assert unchanged["status"] == "publication_pending"
+    assert len(agents.requests) == 1
 
 def test_unknown_final_pr_narrative_write_does_not_replay(
     git_repo: Path,

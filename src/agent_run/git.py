@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,6 +23,11 @@ MANAGED_DELIVERY_BRANCH_PREFIXES = (
 
 def is_managed_delivery_branch(branch: str) -> bool:
     return branch.startswith(MANAGED_DELIVERY_BRANCH_PREFIXES)
+
+
+class DirtyManagedCheckoutError(GitError):
+    """A managed development checkout contains work not recorded in Git."""
+
 
 class GitRepository:
     def __init__(self, root: Path) -> None:
@@ -735,10 +741,55 @@ class GitRepository:
             "merge-base", "--is-ancestor", ancestor_sha, descendant_sha
         ).returncode == 0
 
-    def remove_worktree(self, checkout: Path) -> None:
+    def managed_checkout_dirty_reason(self, checkout: Path) -> str | None:
+        """Describe unsaved work in a registered Managed Development Checkout."""
+        if not checkout.exists() or not self.is_managed_development_checkout(checkout):
+            return None
+        top_level = self._run_in(checkout, "rev-parse", "--show-toplevel")
+        if (
+            top_level.returncode != 0
+            or Path(top_level.stdout.strip()).resolve() != checkout.resolve()
+        ):
+            return "Git metadata is missing or inconsistent"
+        status = self._run_in(
+            checkout, "status", "--porcelain=v1", "--untracked-files=all"
+        )
+        if status.returncode != 0:
+            raise GitError(
+                status.stderr.strip() or "could not inspect managed checkout"
+            )
+        entries = status.stdout.splitlines()
+        reasons: list[str] = []
+        if any(not entry.startswith("?? ") for entry in entries):
+            reasons.append("tracked modifications")
+        if any(entry.startswith("?? ") for entry in entries):
+            reasons.append("untracked files")
+        return " and ".join(reasons) or None
+
+    def require_clean_managed_checkout(self, checkout: Path) -> None:
+        reason = self.managed_checkout_dirty_reason(checkout)
+        if reason is None:
+            return
+        run_id = checkout.parent.name
+        raise DirtyManagedCheckoutError(
+            f"preserved dirty Managed Development Checkout {checkout.resolve()}: "
+            f"{reason}; inspect and retain or commit the work, then run "
+            f"agent-run resume {run_id}; to irreversibly discard it while abandoning "
+            f"the Run, use agent-run abandon {run_id} --discard-worktree"
+        )
+
+    def remove_worktree(
+        self, checkout: Path, *, discard_worktree: bool = False
+    ) -> None:
         if checkout.exists():
+            if not discard_worktree:
+                self.require_clean_managed_checkout(checkout)
             removed = self._run("worktree", "remove", "--force", str(checkout))
             if removed.returncode != 0:
+                if discard_worktree:
+                    shutil.rmtree(checkout)
+                    self._run("worktree", "prune")
+                    return
                 listed = self._run("worktree", "list", "--porcelain")
                 marker = f"worktree {checkout.resolve()}"
                 if listed.returncode != 0 or marker in listed.stdout.splitlines():
@@ -747,6 +798,13 @@ class GitRepository:
                     )
                 shutil.rmtree(checkout)
         self._run("worktree", "prune")
+
+    @staticmethod
+    def is_managed_development_checkout(checkout: Path) -> bool:
+        return (
+            checkout.name in {"parent", "run-repair"}
+            or re.fullmatch(r"ticket-[1-9][0-9]*", checkout.name) is not None
+        )
 
     def prune_worktrees(self) -> None:
         result = self._run("worktree", "prune")

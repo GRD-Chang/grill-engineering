@@ -58,6 +58,8 @@ class ChangeDeliveryStage(Protocol):
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None: ...
 
+    def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]: ...
+
     def _invocation_events(
         self,
         state: dict[str, Any],
@@ -66,6 +68,7 @@ class ChangeDeliveryStage(Protocol):
         *,
         role: str = "publication",
         phase: str,
+        semantic_attempt: dict[str, Any],
     ) -> Callable[..., None]: ...
 
     def _wait_for_initial_credential(
@@ -95,6 +98,10 @@ class ChangeDeliveryStage(Protocol):
         next_action: str | None = None,
     ) -> None: ...
 
+    def _record_publication_operation_failure(
+        self, state: dict[str, Any], job: dict[str, Any], error: Exception
+    ) -> bool: ...
+
     def modification_budget_exhausted(self, job: dict[str, Any]) -> bool: ...
 
     def review_budget_policy(self) -> ReviewBudgetPolicy: ...
@@ -114,5 +121,3 @@ class ChangeDeliveryStage(Protocol):
     ) -> int: ...
 
     def mark_review_invocation(self, job: dict[str, Any]) -> int: ...
-
-    def publication_budget_exhausted(self, attempts: int) -> bool: ...

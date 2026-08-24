@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_run.agent_profiles import AgentProfileStore
+from agent_run.agent_invocation import fail_interrupted_invocation
 from agent_run.change_currentness import (
     candidate_or_acceptance_is_inconsistent,
     has_currentness_facts,
     stale_change_job_reason,
     unknown_pr_mutation,
 )
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.error_safety import bounded_error
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
@@ -46,7 +48,9 @@ from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
     wait_for_recoverable_github_read,
 )
+from agent_run.resume_audit import append_explicit_resume_audit
 from agent_run.scope_changes import reconcile_structure
+from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -192,6 +196,8 @@ class Controller:
         new_thread: bool = False,
         human_response: str | None = None,
         message: str | None = None,
+        explicit_resume: bool = False,
+        resume_budget_checkpoint: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             try:
@@ -200,6 +206,14 @@ class Controller:
                 if not is_github_convergence_error(error.code):
                     raise
                 existing = self._load_run(run_id)
+                if explicit_resume:
+                    append_explicit_resume_audit(
+                        existing,
+                        new_thread=new_thread,
+                        human_response_supplied=(
+                            human_response is not None or message is not None
+                        ),
+                    )
                 wait_for_github_refresh(
                     existing,
                     code=error.code,
@@ -216,7 +230,22 @@ class Controller:
                 "deterministic_contradiction",
             }:
                 return existing, True
+            if explicit_resume:
+                append_explicit_resume_audit(
+                    existing,
+                    new_thread=new_thread,
+                    human_response_supplied=(
+                        human_response is not None or message is not None
+                    ),
+                )
             resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
+            existing_invocation = existing.get("active_agent_invocation")
+            resume_completed_invocation = (
+                existing.get("status") == "execution_failed"
+                and isinstance(existing_invocation, dict)
+                and existing_invocation.get("status") == "completed"
+                and invocation_attempt_is_pending(existing, existing_invocation)
+            )
             if resuming_supervision_timeout:
                 if new_thread or human_response is not None or message is not None:
                     raise ValueError(
@@ -262,6 +291,12 @@ class Controller:
             if state.get("status") == "requeue_required":
                 self.states.save_run(run_id, state)
                 return state, True
+            if state.get("terminal_kind") == "run_acceptance_stale":
+                # Refresh retired the exact blocked/failed Run Repair Attempt.
+                # The supplied Human response or Thread choice belongs to that
+                # stale identity and must not be applied to fresh Acceptance.
+                self.states.save_run(run_id, state)
+                return state, True
             if _is_currentness_human_blocker(state):
                 # A live Change PR no longer matches the persisted
                 # Generation. Do not repair invocations or touch a managed
@@ -285,7 +320,11 @@ class Controller:
             if human_response is not None:
                 human_response = _validated_human_response(human_response)
             resuming_run_acceptance = False
-            budget_resumed = _resume_review_budget_window(state)
+            budget_resumed = (
+                _resume_review_budget_window(state)
+                if resume_budget_checkpoint
+                else False
+            )
             if budget_resumed and human_response is not None:
                 raise ValueError("Review Budget resume does not accept a Human Blocker response")
             if budget_resumed:
@@ -303,7 +342,9 @@ class Controller:
                 else:
                     _clear_current_invocation_thread(state)
             else:
-                _restore_current_invocation_thread(state)
+                _restore_current_invocation_thread(
+                    state, allow_completed=resume_completed_invocation
+                )
             _mark_failed_invocation_resuming(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
@@ -545,6 +586,13 @@ class Controller:
                 and state.get("repository") != repository.name_with_owner
             ):
                 return False
+            active = state.get("active_agent_invocation")
+            if isinstance(active, dict) and isinstance(active.get("role"), str):
+                fail_interrupted_invocation(
+                    state,
+                    role=str(active["role"]),
+                    save=lambda _state: None,
+                )
             state.update(
                 {
                     "status": "execution_failed",
@@ -828,6 +876,21 @@ class Controller:
                 / str(state["run_id"])
                 / "run-repair"
             )
+            repair_branch = str(job["repair_branch"])
+            dirty_reason = self.publisher.git.managed_checkout_dirty_reason(checkout)
+            if dirty_reason is not None:
+                invalidate_stale_run_repair(state)
+                DeliveryCleanupEngine(
+                    git=self.publisher.git,
+                    states=self.states,
+                ).preserve_dirty_checkout(
+                    state,
+                    kind="run_repair",
+                    branch=repair_branch,
+                    checkout=checkout,
+                    reason=dirty_reason,
+                )
+                return
             self.publisher.git.remove_worktree(checkout)
             for directory in (checkout.parent, checkout.parent.parent):
                 try:
@@ -913,6 +976,7 @@ class Controller:
             "run_id": run_id,
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
+            "semantic_attempt_protocol": 1,
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
             "base": {"branch": repository.default_branch, "sha": base_sha},
@@ -931,6 +995,12 @@ class Controller:
             "currentness_resolution_pending": True,
             "active_agent_invocation": None,
             "agent_invocation_history": [],
+            "resume_audit": {
+                "total": 0,
+                "compacted": 0,
+                "rolling_digest": None,
+                "history": [],
+            },
             "status": "starting",
             "diagnostics": [],
             "created_at": now,
@@ -1387,11 +1457,20 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
         mirror.pop("publication_failure_resume", None)
 
 
-def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
+def _restore_current_invocation_thread(
+    state: dict[str, Any], *, allow_completed: bool = False
+) -> None:
     invocation = state.get("active_agent_invocation")
     if (
         not isinstance(invocation, dict)
-        or invocation.get("status") != "failed"
+        or invocation.get("status") not in {"failed", "completed", "resuming"}
+        or (
+            invocation.get("status") == "completed"
+            and not allow_completed
+        )
+        or not isinstance(invocation.get("semantic_attempt"), dict)
+        or invocation["semantic_attempt"].get("status") != "pending"
+        or not invocation_attempt_is_pending(state, invocation)
         or invocation.get("role")
         not in {
             "development",
@@ -1633,6 +1712,23 @@ def _resume_change_job(
         "reviewer_requires_human",
     }:
         return False
+    _resume_change_job_owner(value, human_response=human_response)
+    if ticket:
+        state["active_ticket_job"] = value
+        status = "active"
+    elif "ticket_number" in value:
+        status = "active"
+    else:
+        status = "parent_delivery_pending"
+    state.update(
+        {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
+    )
+    return True
+
+
+def _resume_change_job_owner(
+    value: dict[str, Any], *, human_response: str | None
+) -> None:
     blockers = _human_blockers(value)
     reviewer_resume = (
         value.get("blocked_reason") == "reviewer_requires_human"
@@ -1655,17 +1751,6 @@ def _resume_change_job(
     else:
         value.pop("review_human_blocker_resume", None)
     value.pop("blocked_reason", None)
-    if ticket:
-        state["active_ticket_job"] = value
-        status = "active"
-    elif "ticket_number" in value:
-        status = "active"
-    else:
-        status = "parent_delivery_pending"
-    state.update(
-        {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
-    )
-    return True
 
 
 def _resume_run_repair_human_blocker(
@@ -1675,7 +1760,7 @@ def _resume_run_repair_human_blocker(
     *,
     human_response: str | None,
 ) -> bool:
-    """Archive a Human-blocked Cycle and schedule a fresh delivery boundary."""
+    """Resume the blocked role inside the existing Run Repair Attempt."""
 
     if not isinstance(value, dict):
         return False
@@ -1684,70 +1769,13 @@ def _resume_run_repair_human_blocker(
         "reviewer_requires_human",
     }:
         return False
-    blockers = _human_blockers(value)
-    next_generation = int(run.get("repair_generation", 0)) + 1
-    request: dict[str, Any] = {
-        "repair_source": str(value.get("repair_source", "acceptance")),
-        "prior_human_blockers": blockers,
-    }
-    for key in ("human_feedback", "ci_evidence", "merge_conflict_evidence"):
-        if key in value:
-            request[key] = deepcopy(value[key])
-    append_human_response(
-        request, blockers, human_response, generation=next_generation
-    )
-
+    _resume_change_job_owner(value, human_response=human_response)
     cycle = run.get("repair_cycle")
     if isinstance(cycle, dict):
-        cycle.update(
-            {
-                "status": "human_blocked",
-                "ended_reason": str(value["blocked_reason"]),
-            }
-        )
-        history = run.setdefault("repair_cycle_history", [])
-        if not isinstance(history, list):
-            raise ValueError("repair_cycle_history must be an array")
-        generation = cycle.get("generation")
-        if not any(
-            isinstance(item, dict) and item.get("generation") == generation
-            for item in history
-        ):
-            history.append(deepcopy(cycle))
-            del history[:-32]
-
-    run_history = run.setdefault("candidate_acceptance_history", [])
-    job_history = value.get("candidate_acceptance_history", [])
-    if not isinstance(run_history, list) or not isinstance(job_history, list):
-        raise ValueError("candidate_acceptance_history must be an array")
-    run_history.extend(deepcopy(job_history))
-
-    discarded = run.setdefault("discarded_repair_thread_ids", [])
-    if not isinstance(discarded, list):
-        raise ValueError("discarded_repair_thread_ids must be an array")
-    for key in (
-        "development_thread_id",
-        "publication_thread_id",
-    ):
-        thread_id = value.get(key)
-        if isinstance(thread_id, str) and thread_id not in discarded:
-            discarded.append(thread_id)
-    for key in (
-        "development_thread_history",
-        "reviewer_thread_ids",
-        "publication_thread_history",
-    ):
-        thread_ids = value.get(key)
-        if isinstance(thread_ids, list):
-            for thread_id in thread_ids:
-                if isinstance(thread_id, str) and thread_id not in discarded:
-                    discarded.append(thread_id)
-
-    run["repair_request"] = request
+        cycle["status"] = "active"
+        cycle.pop("ended_reason", None)
     run["phase"] = "repairing"
     run.pop("blocked_reason", None)
-    run.pop("repair_job", None)
-    state["active_agent_invocation"] = None
     state.pop("requeue_required", None)
     state.update(
         {

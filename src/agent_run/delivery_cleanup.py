@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.delivery_protocol import GitHubPublisher
-from agent_run.git import GitRepository, is_managed_delivery_branch
+from agent_run.git import (
+    DirtyManagedCheckoutError,
+    GitRepository,
+    is_managed_delivery_branch,
+)
 from agent_run.state import StateStore
 
 
@@ -116,6 +120,34 @@ class DeliveryCleanupEngine:
                 return state
             return self._attempt(state)
 
+    def preserve_dirty_checkout(
+        self,
+        state: dict[str, Any],
+        *,
+        kind: str,
+        branch: str,
+        checkout: Path,
+        reason: str,
+    ) -> None:
+        """Expose a stale dirty checkout without attempting to delete it."""
+
+        self._schedule(
+            state,
+            kind=kind,
+            branch=branch,
+            checkout=checkout,
+        )
+        cleanup = self._cleanup(state)
+        item = self._mapping(self._mapping(cleanup, "items"), branch)
+        item.update(
+            {
+                "status": "cleanup_pending",
+                "last_error": reason,
+                "recovery_kind": "stale_dirty_checkout",
+            }
+        )
+        cleanup.update({"status": "cleanup_pending", "last_error": reason})
+
     def _schedule_completed_items(self, state: dict[str, Any]) -> None:
         jobs = state.get("ticket_jobs", {})
         if isinstance(jobs, dict):
@@ -211,6 +243,9 @@ class DeliveryCleanupEngine:
             for _ in range(MAX_AUTOMATIC_ATTEMPTS):
                 item["attempts"] = self._integer(item, "attempts") + 1
                 try:
+                    self.git.require_clean_managed_checkout(checkout)
+                    self.git.remove_worktree(checkout)
+                    self.git.delete_managed_delivery_branch(branch)
                     remote_delete = (
                         getattr(self.github, "delete_managed_branch", None)
                         if self.github is not None
@@ -218,8 +253,6 @@ class DeliveryCleanupEngine:
                     )
                     if callable(remote_delete):
                         remote_delete(branch)
-                    self.git.remove_worktree(checkout)
-                    self.git.delete_managed_delivery_branch(branch)
                 except (OSError, RuntimeError) as error:
                     item.update(
                         {"status": "cleanup_pending", "last_error": str(error)}
@@ -275,13 +308,43 @@ class DeliveryCleanupEngine:
         return value
 
 
-def remove_run_worktrees(
+def require_clean_run_worktrees(
     git: GitRepository, states: StateStore, run_id: str
 ) -> None:
     root = states.root / "worktrees" / run_id
+    if not root.exists():
+        return
+    dirty: list[tuple[Path, str]] = []
+    for checkout in sorted(root.iterdir()):
+        if not git.is_managed_development_checkout(checkout):
+            continue
+        reason = git.managed_checkout_dirty_reason(checkout)
+        if reason is not None:
+            dirty.append((checkout.resolve(), reason))
+    if not dirty:
+        return
+    details = "; ".join(f"{path}: {reason}" for path, reason in dirty)
+    raise DirtyManagedCheckoutError(
+        f"preserved dirty Managed Development Checkout(s): {details}; "
+        f"inspect and retain or commit the work, then run agent-run resume {run_id}; "
+        f"to irreversibly discard all Run worktrees, use "
+        f"agent-run abandon {run_id} --discard-worktree"
+    )
+
+
+def remove_run_worktrees(
+    git: GitRepository,
+    states: StateStore,
+    run_id: str,
+    *,
+    discard_worktree: bool = False,
+) -> None:
+    root = states.root / "worktrees" / run_id
+    if not discard_worktree:
+        require_clean_run_worktrees(git, states, run_id)
     if root.exists():
         for checkout in root.iterdir():
-            git.remove_worktree(checkout)
+            git.remove_worktree(checkout, discard_worktree=discard_worktree)
         try:
             root.rmdir()
         except OSError:

@@ -1083,6 +1083,15 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
     assert interrupted.returncode == 2
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(fixture_data["delivery"]["pull_requests"]) == 1
+    interrupted_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    interrupted_retry = interrupted_job["publication_operation_retry"]
+    publication_attempt = next(
+        attempt
+        for attempt in interrupted_job["semantic_attempt_history"]
+        if attempt["role"] == "publication"
+    )
+    assert interrupted_retry == {"attempts": 1, "limit": 5}
+    assert publication_attempt["publication_operation_retry"] == interrupted_retry
 
     recovered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -1091,6 +1100,86 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(fixture_data["delivery"]["pull_requests"]) == 2
     assert fixture_data["delivery"]["closed_issues"] == [3]
+    recovered_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    recovered_publication = next(
+        attempt
+        for attempt in recovered_job["semantic_attempt_history"]
+        if attempt["role"] == "publication"
+    )
+    assert recovered_job["publication_attempts"] == 1
+    assert recovered_publication["attempt_id"] == publication_attempt["attempt_id"]
+    assert recovered_publication["publication_operation_retry"] == interrupted_retry
+
+
+def test_incompatible_state_preserves_existing_publisher_ledger_and_worktree(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={"crash_after_ensure_ticket_pr_once": True},
+    )
+    agents = _run_agents(git_repo / "agents.json")
+
+    interrupted = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+    assert interrupted.returncode == 2
+    state = load_only_run_state(git_repo)
+    run_id = state["run_id"]
+    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
+    assert checkout.is_dir()
+    preserved = checkout / "legacy-recovery.txt"
+    preserved.write_text("do not clean or publish\n", encoding="utf-8")
+    state["schema_version"] = 1
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    state_before = state_path.read_text(encoding="utf-8")
+    fixture_before = fixture.read_text(encoding="utf-8")
+    delivery_before = json.loads(fixture_before)["delivery"]
+    assert len(delivery_before["pull_requests"]) == 1
+    assert delivery_before["pull_requests"][0]["number"] == 1
+    assert delivery_before["pull_requests"][0]["base_branch"] == state["run_branch"]
+    assert state["active_ticket_job"]["ticket_branch"] in delivery_before[
+        "published_branches"
+    ]
+    worktrees_before = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    rejected = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert rejected.returncode == 2
+    assert stdout_json(rejected)["status"] == "incompatible_run_state"
+    assert state_path.read_text(encoding="utf-8") == state_before
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+    assert preserved.read_text(encoding="utf-8") == "do not clean or publish\n"
+    assert (
+        subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=git_repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        == worktrees_before
+    )
 
 
 def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(

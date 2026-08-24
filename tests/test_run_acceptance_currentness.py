@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import subprocess
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.change_currentness import candidate_or_acceptance_is_inconsistent
 from agent_run.controller import Controller
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -16,15 +18,44 @@ from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_thread_identity import prior_thread_identities
 
 from conftest import write_fixture
-from test_cli import run_internal_stage, run_cli, stdout_json
+from test_cli import failed_invocation, run_internal_stage, run_cli, stdout_json
 
 from run_acceptance_test_support import (
     ScriptedRunAgents,
     _canonical_run_budget,
     _completed_run,
+    _human_artifact,
     _passing_artifact,
     _repair_artifact,
 )
+
+
+def test_prior_rejection_is_history_not_new_candidate_authority() -> None:
+    artifact = {"checks": {"e2e": {"status": "fail"}}}
+    job = {
+        "phase": "reviewing",
+        "candidate_sha": "candidate-3",
+        "last_review_candidate_sha": "candidate-2",
+        "acceptance_record": {
+            "reviewed_candidate_sha": "candidate-2",
+            "artifact": artifact,
+        },
+        "review_budget": {
+            "review_artifacts": [
+                {"candidate_sha": "candidate-2", "artifact": artifact}
+            ]
+        },
+    }
+
+    assert candidate_or_acceptance_is_inconsistent(job) is False
+    job["review_budget"]["review_artifacts"].append(
+        {"candidate_sha": "candidate-3", "artifact": {"checks": {}}}
+    )
+    assert candidate_or_acceptance_is_inconsistent(job) is True
+    job["review_budget"]["review_artifacts"].pop()
+    job["acceptance_record"]["artifact"] = {"checks": {}}
+    assert candidate_or_acceptance_is_inconsistent(job) is True
+
 
 def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     git_repo: Path,
@@ -150,7 +181,220 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
     assert pulls[0]["state"] == "OPEN"
 
-def test_run_repair_discards_an_inflight_development_after_parent_drift(
+
+def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    run_id = str(state["run_id"])
+    ticket_branch = f"agent-run/{run_id}/ticket-2"
+    state["ticket_jobs"]["2"]["ticket_branch"] = ticket_branch
+    git.ensure_run_branch(
+        ticket_branch, str(state["ticket_jobs"]["2"]["integrated_sha"])
+    )
+    publisher.ensure_run_repair_branch(
+        branch=ticket_branch, base_branch=str(state["run_branch"])
+    )
+    repair_branch = f"agent-run-repair/{run_id}/1"
+    publisher.ensure_run_repair_branch(
+        branch=repair_branch, base_branch=str(state["run_branch"])
+    )
+    checkout = states.root / "worktrees" / run_id / "run-repair"
+    git.prepare_ticket_checkout(
+        branch=repair_branch,
+        base_sha=str(state["run_branch"]),
+        checkout=checkout,
+    )
+    tracked = checkout / "pyproject.toml"
+    tracked.write_text(
+        tracked.read_text(encoding="utf-8") + "\n# preserved repair\n",
+        encoding="utf-8",
+    )
+    untracked = checkout / "run-repair.txt"
+    untracked.write_text("unfinished repair\n", encoding="utf-8")
+    invocation = failed_invocation(
+        work_subject=f"run-repair:{run_id}",
+        role="development",
+        phase="developing",
+    )
+    attempt = deepcopy(invocation["semantic_attempt"])
+    budget = _canonical_run_budget()
+    budget["development_attempts"] = 1
+    repair_job = {
+        "phase": "developing",
+        "review_budget": budget,
+        "review_budget_history": [],
+        "repair_generation": 1,
+        "repair_branch": repair_branch,
+        "base_sha": "stale-run-base",
+        "parent_revision": state["parent"]["revision"],
+        "ticket_graph_revision": state["ticket_graph"]["revision"],
+        "ticket_completion_records": [],
+        "repair_source": "acceptance",
+        "repair_mode": "squash",
+        "acceptance_artifact": _repair_artifact(),
+        "development_thread_id": "repair-old",
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+        "modification_attempts": 0,
+        "pending_attempt": 1,
+        "pending_attempt_kind": "ordinary",
+        "managed_checkout_head": git.checkout_head(checkout),
+        "pending_semantic_attempt": attempt,
+    }
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "reviewer_thread_ids": [],
+        "development_thread_history": [],
+        "repair_generation": 1,
+        "acceptance_artifact": _repair_artifact(),
+        "repair_job": repair_job,
+    }
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "diagnostics": [
+                {
+                    "code": "agent_invocation_failed",
+                    "message": "fixture failure",
+                }
+            ],
+            "active_agent_invocation": invocation,
+        }
+    )
+    states.save_run(run_id, state)
+    delivery_before = deepcopy(
+        json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    )
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--message",
+        "The old blocker has been resolved.",
+        "--new-thread",
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    output = stdout_json(resumed)
+    assert output["status"] == "run_acceptance_pending"
+    persisted = states.load_run(run_id)
+    assert persisted is not None
+    assert persisted["run_acceptance"]["phase"] == "pending"
+    assert "repair_job" not in persisted["run_acceptance"]
+    assert "repair_request" not in persisted["run_acceptance"]
+    assert persisted["active_agent_invocation"] is None
+    resume_event = persisted["resume_audit"]["history"][-1]
+    assert resume_event["semantic_attempt_id"] == attempt["attempt_id"]
+    assert resume_event["human_response_supplied"] is True
+    assert resume_event["new_thread"] is True
+    assert resume_event["successor_invocation_started_at"] is None
+    retired = persisted["retired_semantic_attempt_owners"][-1]
+    assert retired["work_subject"] == f"run-repair:{run_id}"
+    assert retired["semantic_attempt_history"][-1]["attempt_id"] == attempt[
+        "attempt_id"
+    ]
+    assert retired["semantic_attempt_history"][-1]["outcome"] == (
+        "currentness_invalidated"
+    )
+    assert tracked.read_text(encoding="utf-8").endswith("# preserved repair\n")
+    assert untracked.read_text(encoding="utf-8") == "unfinished repair\n"
+    cleanup = output["delivery_cleanup"]
+    assert cleanup["status"] == "cleanup_pending"
+    assert cleanup["items"][0]["checkout"] == str(checkout)
+    assert "agent-run run 1" in cleanup["items"][0]["recovery_action"]
+    assert "agent-run run 1" in output["next_action"]
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
+        delivery_before
+    )
+
+    no_agents = git_repo / "no-agents.json"
+    no_agents.write_text("{}", encoding="utf-8")
+    still_dirty = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(no_agents),
+    )
+    assert still_dirty.returncode == 0, still_dirty.stdout
+    dirty_state = states.load_run(run_id)
+    assert dirty_state is not None
+    assert dirty_state["run_acceptance"]["phase"] == "pending"
+    assert dirty_state["run_acceptance"]["acceptance_generation"] == 2
+    assert dirty_state["retired_semantic_attempt_owners"] == persisted[
+        "retired_semantic_attempt_owners"
+    ]
+    assert tracked.is_file()
+    assert untracked.is_file()
+
+    subprocess.run(
+        ["git", "checkout", "--", "pyproject.toml"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+    )
+    untracked.unlink()
+    fresh_agents = git_repo / "fresh-run-agents.json"
+    fresh_agents.write_text(
+        json.dumps(
+            {
+                "reviews": [
+                    {
+                        "thread_id": "fresh-run-reviewer",
+                        "artifact": _human_artifact(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    recovered = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(fresh_agents),
+    )
+
+    assert recovered.returncode == 2, recovered.stdout
+    recovered_state = states.load_run(run_id)
+    assert recovered_state is not None
+    assert recovered_state["status"] == "ready_for_human"
+    assert recovered_state["run_acceptance"]["phase"] == "ready_for_human"
+    assert recovered_state["run_acceptance"]["acceptance_generation"] == 2
+    assert recovered_state["delivery_cleanup"]["status"] == "completed"
+    assert not checkout.exists()
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{repair_branch}"],
+        cwd=git_repo,
+        check=False,
+    ).returncode == 1
+    recovered_delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert repair_branch not in recovered_delivery["published_branches"]
+    assert [
+        mutation
+        for mutation in recovered_delivery["mutations"]
+        if mutation.get("action") == "delete_managed_branch"
+        and mutation.get("branch") == repair_branch
+    ] == [{"action": "delete_managed_branch", "branch": repair_branch}]
+    assert recovered_state["retired_semantic_attempt_owners"] == persisted[
+        "retired_semantic_attempt_owners"
+    ]
+
+def test_run_repair_preserves_dirty_inflight_development_after_parent_drift(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -182,8 +426,18 @@ def test_run_repair_discards_an_inflight_development_after_parent_drift(
         "discarded_repair_thread_ids"
     ]
     assert git.resolve(str(state["run_branch"])) == original_head
+    repair_checkout = states.root / "worktrees" / str(state["run_id"]) / "run-repair"
+    assert (repair_checkout / "run-repair.txt").is_file()
+    cleanup = stale["delivery_cleanup"]
+    assert cleanup["status"] == "cleanup_pending"
+    assert cleanup["last_error"] == "untracked files"
+    retired = stale["retired_semantic_attempt_owners"][-1]
+    assert retired["work_subject"] == f"run-repair:{state['run_id']}"
+    assert retired["semantic_attempt_history"][-1]["outcome"] == (
+        "currentness_invalidated"
+    )
 
-def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
+def test_run_repair_preserves_dirty_inflight_development_after_final_pr_drift(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -240,6 +494,16 @@ def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
     assert stale["status"] == "run_acceptance_pending"
     assert stale["run_acceptance"]["phase"] == "pending"
     assert "repair_job" not in stale["run_acceptance"]
+    repair_checkout = states.root / "worktrees" / str(state["run_id"]) / "run-repair"
+    assert (repair_checkout / "run-repair.txt").is_file()
+    cleanup = stale["delivery_cleanup"]
+    assert cleanup["status"] == "cleanup_pending"
+    assert cleanup["last_error"] == "untracked files"
+    retired = stale["retired_semantic_attempt_owners"][-1]
+    assert retired["work_subject"] == f"run-repair:{state['run_id']}"
+    assert retired["semantic_attempt_history"][-1]["outcome"] == (
+        "currentness_invalidated"
+    )
 
 @pytest.mark.parametrize(
     "error",

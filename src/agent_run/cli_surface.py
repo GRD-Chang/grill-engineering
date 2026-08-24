@@ -11,6 +11,10 @@ from agent_run.state_contract import (
 )
 from agent_run.cli_presentation import _print_precondition_failure
 from agent_run.review_budget import budget_checkpoint_subjects
+from agent_run.semantic_attempt import (
+    invocation_attempt_is_pending,
+    invocation_is_explicitly_resumable,
+)
 
 
 def _run_to_human_gate(
@@ -49,8 +53,7 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
             "waiting_external",
         }
 
-    invocation = state.get("active_agent_invocation")
-    if isinstance(invocation, dict) and invocation.get("status") == "failed":
+    if invocation_is_explicitly_resumable(state):
         return True
     return (
         human_blocker_subject_count(state) == 1
@@ -72,7 +75,9 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
         # Deterministic publisher/check reconciliation retains its historical
         # lifecycle command recovery path.
         return not (
-            isinstance(invocation, dict) and invocation.get("status") == "failed"
+            isinstance(invocation, dict)
+            and invocation.get("status") in {"failed", "completed", "resuming"}
+            and invocation_attempt_is_pending(state, invocation)
         )
     if status in {
         "unsupported_scope_change",

@@ -22,6 +22,10 @@ from agent_run.run_currentness import (
     ticket_completion_records,
 )
 from agent_run.state import StateStore
+from agent_run.publication_operation_retry import (
+    record_publication_operation_failure,
+)
+from agent_run.publication_pending import publication_pending_diagnostic
 
 
 class RunPublicationShared:
@@ -143,6 +147,8 @@ class RunPublicationShared:
                 error.code
             ):
                 raise
+            if self._record_operation_failure(state, publication, error):
+                return None
             publication["phase"] = "waiting_external"
             wait_for_github_convergence(
                 state,
@@ -154,7 +160,33 @@ class RunPublicationShared:
             self._save(state)
             return None
 
-    def _publication_request(self, state: dict[str, Any], checkout: Path) -> dict[str, Any]:
+    def _record_operation_failure(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        error: Exception,
+    ) -> bool:
+        if not record_publication_operation_failure(publication, error):
+            return False
+        publication["phase"] = "publication_pending"
+        publication.pop("write_intent", None)
+        state.update(
+            {
+                "status": "publication_pending",
+                "terminal_kind": "publication_pending",
+                "diagnostics": [
+                    publication_pending_diagnostic(
+                        subject_key="delivery_run", subject=str(state["run_id"])
+                    )
+                ],
+            }
+        )
+        self._save(state)
+        return True
+
+    def _publication_request(
+        self, state: dict[str, Any], checkout: Path
+    ) -> dict[str, Any]:
         parent = self._mapping(state, "parent")
         publication = self._publication_state(state)
         run = self._mapping(state, "run_acceptance")

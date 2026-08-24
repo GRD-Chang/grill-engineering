@@ -6,8 +6,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_repair_cycle import escalate_repair, uses_merge_resolution
+from agent_run.semantic_attempt import (
+    close_semantic_attempt,
+    controller_reprepare_intent,
+    detach_active_invocation,
+    pending_semantic_attempt,
+)
 from agent_run.state_contract import require_candidate_acceptance_history
 
 if TYPE_CHECKING:
@@ -38,6 +45,22 @@ class RunRepairPromotion:
             self._preserve_stale_acceptance_repair(state, job, checkout)
             self._rebind_repair_to_default(state, job, current_default)
             return
+        dirty_reason = self.owner.git.managed_checkout_dirty_reason(checkout)
+        if dirty_reason is not None:
+            invalidate_stale_run_repair(state)
+            job["phase"] = "stale"
+            DeliveryCleanupEngine(
+                git=self.owner.git,
+                states=self.owner.states,
+                github=self.owner.github,
+            ).preserve_dirty_checkout(
+                state,
+                kind="run_repair",
+                branch=str(job["repair_branch"]),
+                checkout=checkout,
+                reason=dirty_reason,
+            )
+            return
         self.owner.git.remove_worktree(checkout)
         self.owner._remove_empty_directories(checkout)
         invalidate_stale_run_repair(state)
@@ -49,6 +72,12 @@ class RunRepairPromotion:
         """Freeze current work and revalidate it against an advanced default head."""
 
         prior_phase = str(job["phase"])
+        stale_attempt = pending_semantic_attempt(job)
+        if stale_attempt is not None:
+            close_semantic_attempt(
+                job, stale_attempt, outcome="currentness_invalidated"
+            )
+            detach_active_invocation(state, stale_attempt)
         publication_was_integrated = (
             isinstance(job.get("integrated_sha"), str)
             and job.get("integrated_publication_sha") == job.get("publication_sha")
@@ -154,6 +183,8 @@ class RunRepairPromotion:
             job["phase"] = "repairing"
         elif prior_phase != "committing_candidate" and isinstance(candidate_sha, str):
             job["phase"] = "candidate"
+        elif prior_phase == "committing_candidate":
+            job["controller_candidate_reprepare"] = controller_reprepare_intent(job)
         run = self.owner._run_state(state)
         run["phase"] = "repairing"
         self.owner._sync_repair_cycle_counters(run, job)
@@ -261,6 +292,7 @@ class RunRepairPromotion:
             ):
                 job["pending_attempt"] = int(job["modification_attempts"])
             job["phase"] = "committing_candidate"
+            job["controller_candidate_reprepare"] = controller_reprepare_intent(job)
             job.pop("merge_conflict_evidence", None)
             job.pop("integration_conflict_paths", None)
         else:

@@ -18,6 +18,7 @@ from agent_run.review_budget import (
     reset_budget,
 )
 from agent_run.change_delivery_required_checks import observe_required_checks
+from agent_run.publication_operation_retry import record_publication_operation_failure
 
 
 def _job_with_budget(
@@ -370,6 +371,11 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
         modification_budget_exhausted=lambda _job: True,
         review_budget_policy=lambda: TICKET_POLICY,
         _record_agent_run_status=lambda *_args, **_kwargs: None,
+        _record_publication_operation_failure=(
+            lambda _state, owner, failure: record_publication_operation_failure(
+                owner, failure
+            )
+        ),
         _reject_stale=lambda *_args, **_kwargs: None,
         save=lambda state: state,
     )
@@ -402,6 +408,11 @@ def test_success_required_checks_snapshot_read_is_supervised(error: BaseExceptio
             ),
         ),
         _record_agent_run_status=lambda *_args, **_kwargs: None,
+        _record_publication_operation_failure=(
+            lambda _state, owner, failure: record_publication_operation_failure(
+                owner, failure
+            )
+        ),
         _reject_stale=lambda *_args, **_kwargs: None,
         save=lambda state: state,
     )
@@ -415,3 +426,4 @@ def test_success_required_checks_snapshot_read_is_supervised(error: BaseExceptio
     assert state["diagnostics"][0]["code"] == (
         "github_checks_evidence_observation_pending"
     )
+    assert job["publication_operation_retry"] == {"attempts": 1, "limit": 5}

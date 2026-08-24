@@ -20,6 +20,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from agent_run.state_contract import IncompatibleRunStateError
+from agent_run.semantic_attempt import allocate_semantic_attempt
 from conftest import write_fixture
 from run_acceptance_test_support import _passing_artifact
 
@@ -228,6 +229,7 @@ def _prepared_resume(
             active_ticket.update(job)
         role = "publication"
         work_subject = "ticket:3"
+        attempt_owner = job
     elif subject_kind == "run_repair":
         state["run_acceptance"] = {
             "phase": "repairing",
@@ -244,6 +246,7 @@ def _prepared_resume(
         }
         role = "publication"
         work_subject = f"run-repair:{run_id}"
+        attempt_owner = state["run_acceptance"]["repair_job"]
     elif subject_kind == "final_publication":
         state["run_acceptance"] = {
             "phase": "accepted",
@@ -258,6 +261,7 @@ def _prepared_resume(
         }
         role = "final_publication"
         work_subject = f"run-publication:{run_id}"
+        attempt_owner = state["run_publication"]
     elif subject_kind == "parent_only":
         state["parent_job"] = {
             "phase": "accepted",
@@ -267,6 +271,7 @@ def _prepared_resume(
         }
         role = "publication"
         work_subject = f"parent-only:{run_id}"
+        attempt_owner = state["parent_job"]
     else:
         raise AssertionError(f"unsupported test subject: {subject_kind}")
 
@@ -289,6 +294,16 @@ def _prepared_resume(
     }
     if invocation_generation is not _MISSING:
         invocation["generation"] = invocation_generation
+    if type(invocation_generation) is int:
+        semantic_attempt = allocate_semantic_attempt(
+            attempt_owner,
+            role="publication",
+            work_subject=work_subject,
+            generation=invocation_generation,
+            currentness_boundary={},
+            ordinal=1,
+        )
+        invocation["semantic_attempt"] = dict(semantic_attempt)
     state["active_agent_invocation"] = invocation
     state["agent_invocation_history"] = []
     state["status"] = "execution_failed"
@@ -319,7 +334,7 @@ def test_resume_fails_closed_for_stale_publication_generation(
         lambda saved_run_id, _state: save_calls.append(saved_run_id),
     )
 
-    with pytest.raises(IncompatibleRunStateError, match="stale active"):
+    with pytest.raises(IncompatibleRunStateError, match="stale active|owner mismatch"):
         controller.resume(run_id, new_thread=new_thread)
 
     assert save_calls == []
@@ -366,7 +381,18 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
             "development_thread_id": "development-thread",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "pending_attempt": 1,
         }
+    )
+    job["review_budget"]["development_attempts"] = 1
+    semantic_attempt = allocate_semantic_attempt(
+        job,
+        role="development",
+        work_subject="ticket:3",
+        generation=1,
+        currentness_boundary={},
+        ordinal=1,
+        budget_window=1,
     )
     state.update(
         {
@@ -386,6 +412,7 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
                 "mode": "fresh",
                 "input_fingerprint": "sha256:" + "0" * 64,
                 "currentness_boundary": {},
+                "semantic_attempt": dict(semantic_attempt),
                 "status": "failed",
                 "requested_thread_id": "development-thread",
                 "reported_thread_id": "development-thread",

@@ -12,6 +12,7 @@ import pytest
 
 from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend, resolve_profiles
 from agent_run.agent_invocation import invocation_event_recorder
+from agent_run.semantic_attempt import allocate_semantic_attempt
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
@@ -287,6 +288,16 @@ def test_profiled_backend_records_binding_facts_before_agent_starts(tmp_path: Pa
 def test_invocation_history_contains_started_snapshot_before_completion() -> None:
     state: dict[str, Any] = {"run_id": "run-1", "agent_invocation_history": []}
     saved: list[dict[str, Any]] = []
+    attempt_owner: dict[str, Any] = {}
+    semantic_attempt = allocate_semantic_attempt(
+        attempt_owner,
+        role="publication",
+        work_subject="ticket:1",
+        generation=1,
+        currentness_boundary={"head_sha": "abc"},
+        ordinal=1,
+        budget_window=None,
+    )
     record = invocation_event_recorder(
         state,
         role="publication",
@@ -295,6 +306,7 @@ def test_invocation_history_contains_started_snapshot_before_completion() -> Non
         generation=1,
         invocation_input={"request": "value"},
         currentness_boundary={"head_sha": "abc"},
+        semantic_attempt=semantic_attempt,
         save=lambda value: saved.append(json.loads(json.dumps(value))),
     )
 

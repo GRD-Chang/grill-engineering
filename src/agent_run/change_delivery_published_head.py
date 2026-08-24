@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agent_run.change_delivery_branches import ensure_linked_branch_display
 from agent_run.change_delivery_contracts import (
@@ -17,7 +17,8 @@ from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
-from agent_run.github import MergeOutcomeUnknownError
+from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
+from agent_run.external_supervision import is_github_convergence_error
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
@@ -66,6 +67,23 @@ class PublishedHeadStage(ChangeDeliveryStage, Protocol):
 
     def modification_budget_exhausted(self, job: dict[str, Any]) -> bool: ...
 
+
+def _publication_operation(
+    stage: PublishedHeadStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    operation: Callable[[], Any],
+) -> tuple[bool, Any]:
+    try:
+        return False, operation()
+    except (GitHubReadError, OSError, TimeoutError) as error:
+        if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+            error.code
+        ):
+            raise
+        if stage._record_publication_operation_failure(state, job, error):
+            return True, None
+        raise
 
 def _sync_fallback_receipt_observation(
     job: dict[str, Any], pr_number: int
@@ -137,7 +155,7 @@ def publish_and_merge(
             candidate_tree=active_candidate_tree,
             location=f"ticket_jobs[{job.get('ticket_number', 'active')}]",
         )
-    if job.get("phase") != "merging":
+    if job.get("phase") not in {"merging", "merged"}:
         stage._reject_stale(
             state,
             job,
@@ -148,7 +166,14 @@ def publish_and_merge(
     branch = stage.contract.branch
     existing_pr = job.get("pr_number")
     if isinstance(existing_pr, int):
-        existing_live = stage.publisher.live_pull_request(state, job, existing_pr)
+        exhausted, existing_live = _publication_operation(
+            stage,
+            state,
+            job,
+            lambda: stage.publisher.live_pull_request(state, job, existing_pr),
+        )
+        if exhausted:
+            return True
         if existing_live.get("state") == "MERGED":
             integrated = existing_live.get("integrated_sha")
             if (
@@ -167,11 +192,24 @@ def publish_and_merge(
             live_head = existing_live.get("head_sha")
             if isinstance(live_head, str):
                 job["integrated_publication_sha"] = live_head
-            stage.github.sync_run_branch(
-                run_branch=stage.contract.base_branch,
-                integrated_sha=integrated,
+            exhausted, _ = _publication_operation(
+                stage,
+                state,
+                job,
+                lambda: stage.github.sync_run_branch(
+                    run_branch=stage.contract.base_branch,
+                    integrated_sha=integrated,
+                ),
             )
-            if not stage.publisher.after_merge(state, job, existing_live):
+            if exhausted:
+                return True
+            exhausted, after_merge = _publication_operation(
+                stage,
+                state,
+                job,
+                lambda: stage.publisher.after_merge(state, job, existing_live),
+            )
+            if exhausted or not after_merge:
                 return True
             job["phase"] = "completed"
             stage.save(state)
@@ -190,12 +228,19 @@ def publish_and_merge(
     stage._reject_stale(
         state, job, checkout, "Published-Head Gate rejected stale requirements"
     )
-    stage.github.verify_ticket_pr_before_publish(
-        branch=branch,
-        base_branch=stage.contract.base_branch,
-        expected_head_sha=str(job.get("published_sha", job["base_sha"])),
-        expected_base_sha=str(job["base_sha"]),
+    exhausted, _ = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.github.verify_ticket_pr_before_publish(
+            branch=branch,
+            base_branch=stage.contract.base_branch,
+            expected_head_sha=str(job.get("published_sha", job["base_sha"])),
+            expected_base_sha=str(job["base_sha"]),
+        ),
     )
+    if exhausted:
+        return True
     publish_intent = {
         "action": "publish_ticket_ref",
         "branch": branch,
@@ -205,11 +250,18 @@ def publish_and_merge(
     if job.get("ticket_write_intent") != publish_intent:
         job["ticket_write_intent"] = publish_intent
         stage.save(state)
-    stage.github.publish_branch(
-        branch,
-        str(job["publication_sha"]),
-        expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
+    exhausted, _ = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.github.publish_branch(
+            branch,
+            str(job["publication_sha"]),
+            expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
+        ),
     )
+    if exhausted:
+        return True
     job.pop("ticket_write_intent", None)
     job["published_sha"] = str(job["publication_sha"])
     stage.save(state)
@@ -229,7 +281,16 @@ def publish_and_merge(
     if job.get("ticket_write_intent") != pr_intent:
         job["ticket_write_intent"] = pr_intent
         stage.save(state)
-    pr_number = stage.publisher.ensure_pr(state, job, publication)
+    exhausted, pr_number = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.publisher.ensure_pr(state, job, publication),
+    )
+    if exhausted:
+        return True
+    if type(pr_number) is not int:
+        raise ValueError("Publisher returned an invalid Change PR number")
     job.pop("ticket_write_intent", None)
     job["pr_number"] = pr_number
     _sync_fallback_receipt_observation(job, pr_number)
@@ -240,7 +301,14 @@ def publish_and_merge(
         checkout,
         "Published-Head Gate rejected requirements changed while creating PR",
     )
-    created_live = stage.publisher.live_pull_request(state, job, pr_number)
+    exhausted, created_live = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.publisher.live_pull_request(state, job, pr_number),
+    )
+    if exhausted:
+        return True
     if created_live.get("state") == "MERGED":
         return stage._block(
             state,
@@ -290,7 +358,14 @@ def publish_and_merge(
             "Published-Head Gate rejected the final Required Checks snapshot",
         )
     checks = str(checks_value)
-    live = stage.publisher.live_pull_request(state, job, pr_number)
+    exhausted, live = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.publisher.live_pull_request(state, job, pr_number),
+    )
+    if exhausted:
+        return True
     fallback = job.get("publication_authority") == "fallback"
     acceptance = job.get("acceptance_record")
     receipt = job.get("fallback_publication_receipt")
@@ -457,15 +532,35 @@ def publish_and_merge(
     job["integrated_sha"] = integrated
     job["integrated_publication_sha"] = str(job["publication_sha"])
     stage.save(state)
-    stage.github.sync_run_branch(
-        run_branch=stage.contract.base_branch, integrated_sha=integrated
+    exhausted, _ = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.github.sync_run_branch(
+            run_branch=stage.contract.base_branch, integrated_sha=integrated
+        ),
     )
-    live_after_merge = stage.publisher.live_pull_request(state, job, pr_number)
+    if exhausted:
+        return True
+    exhausted, live_after_merge = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.publisher.live_pull_request(state, job, pr_number),
+    )
+    if exhausted:
+        return True
     if live_after_merge.get("state") != "MERGED":
         state["status"] = "waiting_merge"
         stage.save(state)
         return True
-    if not stage.publisher.after_merge(state, job, live_after_merge):
+    exhausted, after_merge = _publication_operation(
+        stage,
+        state,
+        job,
+        lambda: stage.publisher.after_merge(state, job, live_after_merge),
+    )
+    if exhausted or not after_merge:
         return True
     job["phase"] = "completed"
     stage.save(state)

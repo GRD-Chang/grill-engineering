@@ -1,27 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
+from copy import deepcopy
 from typing import Any, Callable
 
-
-def canonical_fingerprint(value: object) -> str:
-    """Return a deterministic digest without persisting the underlying input."""
-
-    if isinstance(value, dict):
-        value = {
-            str(key): item
-            for key, item in value.items()
-            if not str(key).startswith("_")
-        }
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
+from agent_run.resume_audit import bind_resume_to_successor
 
 
 def _sync_invocation_history(
@@ -74,6 +58,7 @@ def invocation_event_recorder(
     generation: int,
     invocation_input: dict[str, Any],
     currentness_boundary: dict[str, Any],
+    semantic_attempt: dict[str, Any],
     save: Callable[[dict[str, Any]], object],
 ) -> Callable[..., None]:
     """Persist the small, durable facts for one active Agent Invocation."""
@@ -81,6 +66,14 @@ def invocation_event_recorder(
     def record(kind: str, **facts: object) -> None:
         now = datetime.now(UTC).isoformat()
         if kind == "started":
+            resume_binding = bind_resume_to_successor(
+                state,
+                semantic_attempt=semantic_attempt,
+                successor_started_at=now,
+            )
+            resume_id, resume_sequence = (
+                resume_binding if resume_binding is not None else (None, None)
+            )
             invocation: dict[str, Any] = {
                 "work_subject": work_subject,
                 "generation": generation,
@@ -90,6 +83,7 @@ def invocation_event_recorder(
                 or ("resume" if facts.get("requested_thread_id") else "fresh"),
                 "input_fingerprint": canonical_fingerprint(invocation_input),
                 "currentness_boundary": dict(currentness_boundary),
+                "semantic_attempt": deepcopy(semantic_attempt),
                 "status": "running",
                 "requested_thread_id": facts.get("requested_thread_id"),
                 "reported_thread_id": None,
@@ -107,6 +101,8 @@ def invocation_event_recorder(
                 "error": None,
                 "return_code": None,
                 "signal": None,
+                "resume_id": resume_id,
+                "resume_sequence": resume_sequence,
             }
             state["active_agent_invocation"] = invocation
             _sync_invocation_history(state, invocation)
