@@ -52,6 +52,23 @@ def invocation_attempt_is_pending(
     )
 
 
+def invocation_is_explicitly_resumable(state: dict[str, Any]) -> bool:
+    """Return whether the active Invocation has one exact public Resume path."""
+
+    invocation = state.get("active_agent_invocation")
+    if not isinstance(invocation, dict) or not invocation_attempt_is_pending(
+        state, invocation
+    ):
+        return False
+    invocation_status = invocation.get("status")
+    if invocation_status == "resuming":
+        return True
+    return invocation_status in {"failed", "completed"} and (
+        state.get("status") == "execution_failed"
+        or state.get("github_refresh_pending") is True
+    )
+
+
 def canonical_fingerprint(value: object) -> str:
     """Return a deterministic digest without persisting private request fields."""
 

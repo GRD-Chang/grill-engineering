@@ -275,11 +275,16 @@ def _main_with_parser(
             ):
                 cli_presentation._print_precondition_failure(current)
                 return 2
+            budget_checkpoint_resume = (
+                cli_surface._review_budget_checkpoint_count(current) == 1
+            )
             state, resumed = controller.resume(
                 parsed.run_id,
                 resume_human_blocker=current.get("status") != "supervision_timeout",
                 new_thread=parsed.new_thread,
                 human_response=parsed.message,
+                explicit_resume=True,
+                resume_budget_checkpoint=True,
             )
             if state.get("status") in {
                 "unsupported_scope_change",
@@ -312,7 +317,9 @@ def _main_with_parser(
                     )
                     agent_fixture = getattr(parsed, "agent_fixture", None)
                     agents = _agent_backend(parsed, profiles)
-                    publication_retried = _has_resumed_agent_phase(state)
+                    publication_retried = (
+                        _has_resumed_agent_phase(state) or budget_checkpoint_resume
+                    )
                     if publication_retried:
                         if state.get("delivery_type") == "parent_only":
                             state = ParentDeliveryEngine(

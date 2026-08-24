@@ -102,7 +102,11 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 输入指纹、Currentness Boundary、模式、requested/reported Thread、Output Attempt 数量、时间和
 有界错误；`semantic_agent_attempts`、`output_attempts`、`budget_windows` 与
 `publication_operation_retries` 分别展示语义工作、输出修复、预算和外部发布操作重试，不把这些
-层级混成一个计数。它不保存 Prompt、transcript 或 Acceptance Artifact。Ticket、Parent-only 和 Run Repair
+层级混成一个计数。每次公共 `resume` 另存独立授权事件；`status --json` 的 `latest_resume` 显示
+最近一次，`history --json` 的 `agent_resumes` 显示保留期内的原因、Thread、Attempt 与 successor
+关联，`resume_audit` 则显示总数、压缩数和滚动摘要。审计仅保留最近 64 条明细但不限制 Resume
+次数，也不保存维护者消息或原始错误文本。它不保存 Prompt、transcript 或 Acceptance Artifact。
+Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中最多修复两次，且不增加领域 attempt；进程失败不会自动重试或替换
 Thread。`resume` 默认复用已保存 Thread，`--new-thread` 只替换 Invocation/Thread，不替换 Semantic
@@ -338,10 +342,13 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
   parent、tree 和标题；
 - 显式关闭 Primary Ticket并记录 Run、PR 与 integrated commit。
 
-每个 Ticket revision 最多允许十次产生真实 tree 变化的 Development Attempt。Attempt 在调用 Worker
-前分配，进程失败、Output Repair、Human Blocker Resume 和 `--new-thread` 都不会重复消耗；没有
-代码变化的 Attempt 不消耗代码修改预算，但该 Ticket 会停止自动重试，Controller 先完成其他
-可执行分支；预算耗尽后 Ticket 会移除 `ready-for-agent` 并增加 `ready-for-human`。
+每个 Ticket Review Budget Window 最多允许四次普通 Development Attempt 和三次 Reviewer
+Invocation。四次普通 Development 耗尽后，只有已发布 Ticket PR 首次出现由准确 CI Evidence
+证明可修复的 Required Checks 失败时，才额外允许一次 Final CI-fix。Development Attempt 在首次
+分配时占用预算；进程失败、Output Repair、Human Blocker Resume 和 `--new-thread` 只继续同一
+Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗尽且仍需修改时进入
+`modification_budget_exhausted`，维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
+额度耗尽后的 Candidate 则继续按 Fallback Publication Receipt 和实际 Required Checks 规则处理。
 
 ## 自托管开发
 

@@ -21,6 +21,25 @@ from agent_run.semantic_attempt import (
     pending_semantic_attempt,
 )
 
+
+def _invalidate_stale_publication(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    checkout: Path,
+) -> None:
+    semantic_attempt = pending_semantic_attempt(job, role="publication")
+    if semantic_attempt is not None:
+        close_semantic_attempt(
+            job,
+            semantic_attempt,
+            outcome="currentness_invalidated",
+        )
+        detach_active_invocation(state, semantic_attempt)
+    stage._invalidate_stale(state, job, checkout)
+    stage.save(state)
+
+
 def publication(
     stage: ChangeDeliveryStage,
     state: dict[str, Any],
@@ -29,16 +48,7 @@ def publication(
 ) -> None:
     while True:
         if not stage._publication_is_current(state, job):
-            semantic_attempt = pending_semantic_attempt(job, role="publication")
-            if semantic_attempt is not None:
-                close_semantic_attempt(
-                    job,
-                    semantic_attempt,
-                    outcome="currentness_invalidated",
-                )
-                detach_active_invocation(state, semantic_attempt)
-            stage._invalidate_stale(state, job, checkout)
-            stage.save(state)
+            _invalidate_stale_publication(stage, state, job, checkout)
             return
         try:
             request = stage.adapter.publication_request(state, job, checkout)
@@ -138,14 +148,7 @@ def publication(
         break
     clear_current_human_blocker(job)
     if not stage._publication_is_current(state, job):
-        semantic_attempt = pending_semantic_attempt(job, role="publication")
-        if semantic_attempt is not None:
-            close_semantic_attempt(
-                job, semantic_attempt, outcome="currentness_invalidated"
-            )
-            detach_active_invocation(state, semantic_attempt)
-        stage._invalidate_stale(state, job, checkout)
-        stage.save(state)
+        _invalidate_stale_publication(stage, state, job, checkout)
         return
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is None:

@@ -8,6 +8,7 @@ from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
     controller_reprepare_intent,
+    invocation_is_explicitly_resumable,
     pending_semantic_attempt,
     require_controller_reprepare_intent,
     require_semantic_attempt,
@@ -16,6 +17,31 @@ from agent_run.semantic_attempt import (
 
 def _boundary() -> dict[str, str]:
     return {"base_sha": "base", "candidate_sha": "candidate"}
+
+
+@pytest.mark.parametrize(
+    ("owner_key", "status"),
+    [
+        ("active_ticket_job", "active"),
+        ("parent_job", "parent_delivery_pending"),
+        ("run_acceptance", "run_acceptance_pending"),
+        ("run_publication", "run_publication_pending"),
+    ],
+)
+def test_resuming_exact_attempt_is_role_independently_resumable(
+    owner_key: str, status: str
+) -> None:
+    attempt = {"attempt_id": "sha256:" + "1" * 64}
+    state = {
+        "status": status,
+        owner_key: {"pending_semantic_attempt": attempt},
+        "active_agent_invocation": {
+            "status": "resuming",
+            "semantic_attempt": attempt,
+        },
+    }
+
+    assert invocation_is_explicitly_resumable(state) is True
 
 
 def test_pending_semantic_attempt_is_reused_without_advancing_ordinal() -> None:

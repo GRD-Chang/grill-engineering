@@ -310,12 +310,13 @@ def observe_required_checks(
         )
         if live_head_outcome is not None:
             return live_head_outcome, checks
-        job["required_checks_evidence"] = {
+        canonical_evidence = {
             **evidence,
             "pr_number": pr_number,
             "head_sha": str(job["publication_sha"]),
             "result": "fail",
         }
+        job["required_checks_evidence"] = canonical_evidence
         if not is_explicitly_repairable_code_failure(evidence):
             supervise_unrepairable_check_failure(
                 state,
@@ -334,7 +335,7 @@ def observe_required_checks(
                 {
                     "phase": "repairing",
                     "repair_source": "required_checks",
-                    "ci_evidence": evidence,
+                    "ci_evidence": canonical_evidence,
                     "next_attempt_kind": "final_ci_fix",
                     "final_ci_fix_failure_head": str(job["publication_sha"]),
                     "final_ci_fix_used_before_attempt": budget[

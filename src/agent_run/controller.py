@@ -47,6 +47,7 @@ from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
     wait_for_recoverable_github_read,
 )
+from agent_run.resume_audit import append_explicit_resume_audit
 from agent_run.scope_changes import reconcile_structure
 from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.state import StateStore
@@ -194,6 +195,8 @@ class Controller:
         new_thread: bool = False,
         human_response: str | None = None,
         message: str | None = None,
+        explicit_resume: bool = False,
+        resume_budget_checkpoint: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
             try:
@@ -202,6 +205,14 @@ class Controller:
                 if not is_github_convergence_error(error.code):
                     raise
                 existing = self._load_run(run_id)
+                if explicit_resume:
+                    append_explicit_resume_audit(
+                        existing,
+                        new_thread=new_thread,
+                        human_response_supplied=(
+                            human_response is not None or message is not None
+                        ),
+                    )
                 wait_for_github_refresh(
                     existing,
                     code=error.code,
@@ -218,6 +229,14 @@ class Controller:
                 "deterministic_contradiction",
             }:
                 return existing, True
+            if explicit_resume:
+                append_explicit_resume_audit(
+                    existing,
+                    new_thread=new_thread,
+                    human_response_supplied=(
+                        human_response is not None or message is not None
+                    ),
+                )
             resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
             existing_invocation = existing.get("active_agent_invocation")
             resume_completed_invocation = (
@@ -294,7 +313,11 @@ class Controller:
             if human_response is not None:
                 human_response = _validated_human_response(human_response)
             resuming_run_acceptance = False
-            budget_resumed = _resume_review_budget_window(state)
+            budget_resumed = (
+                _resume_review_budget_window(state)
+                if resume_budget_checkpoint
+                else False
+            )
             if budget_resumed and human_response is not None:
                 raise ValueError("Review Budget resume does not accept a Human Blocker response")
             if budget_resumed:
@@ -950,6 +973,12 @@ class Controller:
             "currentness_resolution_pending": True,
             "active_agent_invocation": None,
             "agent_invocation_history": [],
+            "resume_audit": {
+                "total": 0,
+                "compacted": 0,
+                "rolling_digest": None,
+                "history": [],
+            },
             "status": "starting",
             "diagnostics": [],
             "created_at": now,
@@ -1412,7 +1441,7 @@ def _restore_current_invocation_thread(
     invocation = state.get("active_agent_invocation")
     if (
         not isinstance(invocation, dict)
-        or invocation.get("status") not in {"failed", "completed"}
+        or invocation.get("status") not in {"failed", "completed", "resuming"}
         or (
             invocation.get("status") == "completed"
             and not allow_completed

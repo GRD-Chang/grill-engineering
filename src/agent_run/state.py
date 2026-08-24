@@ -13,6 +13,7 @@ from typing import Any
 
 from agent_run.error_safety import bounded_error
 from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.resume_audit import latest_resume_audit
 
 
 MAX_TIMELINE_EVENTS = 256
@@ -195,6 +196,10 @@ def _append_timeline_event(
         "output_attempt",
         "publication_operation_retry_attempts",
         "publication_operation_retry_limit",
+        "explicit_resume_sequence",
+        "explicit_resume_kind",
+        "explicit_resume_thread_id",
+        "explicit_resume_attempt_id",
         "result",
     ):
         value = marker.get(key)
@@ -256,6 +261,16 @@ def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
                 }
             )
             break
+    resume = latest_resume_audit(state)
+    if resume is not None:
+        projection.update(
+            {
+                "explicit_resume_sequence": resume.get("sequence"),
+                "explicit_resume_kind": resume.get("kind"),
+                "explicit_resume_thread_id": resume.get("thread_id"),
+                "explicit_resume_attempt_id": resume.get("semantic_attempt_id"),
+            }
+        )
     return projection
 
 

@@ -45,6 +45,16 @@ _ACTIVE_RUN_REPAIR_PHASES = frozenset(
         "blocked",
     }
 )
+_RESUME_AUDIT_KINDS = frozenset(
+    {
+        "agent_invocation",
+        "budget_checkpoint",
+        "github_refresh_retry",
+        "human_blocker",
+        "supervision_timeout",
+    }
+)
+_MAX_RESUME_AUDIT_EVENTS = 64
 _INTEGRATED_REVALIDATION_MERGE_PHASES = frozenset(
     {
         "developing",
@@ -120,6 +130,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         ("frontier", list),
         ("timeline", list),
         ("agent_invocation_history", list),
+        ("resume_audit", dict),
         ("diagnostics", list),
         ("status", str),
     ):
@@ -140,6 +151,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_active_run_repair_mode(state)
     _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
+    _require_resume_audit(state["resume_audit"])
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -165,6 +177,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         _require_invocation(
             invocation, f"agent_invocation_history[{index}]", str(state["run_id"])
         )
+    _require_resume_audit_invocation_links(state)
     active_ticket = state.get("active_ticket_job")
     if active_ticket is not None and not isinstance(active_ticket, dict):
         raise IncompatibleRunStateError(
@@ -443,6 +456,171 @@ def _require_ticket_graph(graph: dict[str, Any]) -> None:
         raise IncompatibleRunStateError("legacy state has an invalid ticket_graph.tickets")
 
 
+def _require_resume_audit(audit: dict[str, Any]) -> None:
+    total = audit.get("total")
+    compacted = audit.get("compacted")
+    history = audit.get("history")
+    digest = audit.get("rolling_digest")
+    if type(total) is not int or total < 0:
+        raise IncompatibleRunStateError("legacy state has an invalid resume_audit.total")
+    if type(compacted) is not int or compacted < 0:
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid resume_audit.compacted"
+        )
+    if not isinstance(history, list) or len(history) > _MAX_RESUME_AUDIT_EVENTS:
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid resume_audit.history"
+        )
+    if total != compacted + len(history):
+        raise IncompatibleRunStateError(
+            "legacy state has inconsistent Resume audit counters"
+        )
+    if (total == 0 and digest is not None) or (
+        total > 0
+        and (
+            not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        )
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid resume_audit.rolling_digest"
+        )
+    for index, event in enumerate(history):
+        location = f"resume_audit.history[{index}]"
+        if not isinstance(event, dict):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}"
+            )
+        expected_sequence = compacted + index + 1
+        if event.get("sequence") != expected_sequence:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.sequence"
+            )
+        for key in ("resume_id", "requested_at", "source_status"):
+            value = event.get(key)
+            if not isinstance(value, str) or not value or len(value) > 512:
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.{key}"
+                )
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", event["resume_id"]) is None:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.resume_id"
+            )
+        if event.get("kind") not in _RESUME_AUDIT_KINDS:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.kind"
+            )
+        for key in ("new_thread", "human_response_supplied"):
+            if not isinstance(event.get(key), bool):
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.{key}"
+                )
+        for key in (
+            "failure_code",
+            "work_subject",
+            "semantic_attempt_id",
+            "source_invocation_started_at",
+            "source_invocation_status",
+            "thread_id",
+            "successor_invocation_started_at",
+        ):
+            value = event.get(key)
+            if value is not None and (
+                not isinstance(value, str) or not value or len(value) > 512
+            ):
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.{key}"
+                )
+        generation = event.get("generation")
+        if generation is not None and (
+            type(generation) is not int or generation < 1
+        ):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.generation"
+            )
+
+
+def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
+    """Require retained Resume events and successor Invocations to agree."""
+
+    audit = state["resume_audit"]
+    history = audit["history"]
+    events_by_id: dict[str, dict[str, Any]] = {}
+    for event in history:
+        resume_id = event["resume_id"]
+        if resume_id in events_by_id:
+            raise IncompatibleRunStateError(
+                "legacy state has duplicate Resume audit identities"
+            )
+        events_by_id[resume_id] = event
+
+    invocations = state["agent_invocation_history"]
+    for event in history:
+        successor_started_at = event.get("successor_invocation_started_at")
+        if successor_started_at is None:
+            continue
+        attempt_id = event.get("semantic_attempt_id")
+        if not isinstance(attempt_id, str):
+            raise IncompatibleRunStateError(
+                "legacy state has a Resume successor without an Attempt identity"
+            )
+        matching = [
+            invocation
+            for invocation in invocations
+            if invocation.get("resume_id") == event["resume_id"]
+        ]
+        if len(matching) != 1:
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Resume successor relationship"
+            )
+        invocation = matching[0]
+        semantic_attempt = invocation.get("semantic_attempt")
+        if (
+            invocation.get("started_at") != successor_started_at
+            or invocation.get("resume_sequence") != event["sequence"]
+            or not isinstance(semantic_attempt, dict)
+            or semantic_attempt.get("attempt_id") != attempt_id
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an inconsistent Resume successor relationship"
+            )
+
+    retained_ids = set(events_by_id)
+    compacted = audit["compacted"]
+    linked_invocations = list(invocations)
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict):
+        linked_invocations.append(active)
+    for invocation in linked_invocations:
+        resume_id = invocation.get("resume_id")
+        if resume_id is None:
+            continue
+        if resume_id not in retained_ids:
+            resume_sequence = invocation.get("resume_sequence")
+            if (
+                type(resume_sequence) is not int
+                or resume_sequence < 1
+                or resume_sequence > compacted
+            ):
+                raise IncompatibleRunStateError(
+                    "legacy state has an Invocation bound to an unknown Resume"
+                )
+            continue
+        event = events_by_id[resume_id]
+        semantic_attempt = invocation.get("semantic_attempt")
+        if (
+            event.get("successor_invocation_started_at")
+            != invocation.get("started_at")
+            or event.get("sequence") != invocation.get("resume_sequence")
+            or not isinstance(semantic_attempt, dict)
+            or event.get("semantic_attempt_id")
+            != semantic_attempt.get("attempt_id")
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an Invocation bound to the wrong Resume"
+            )
+
+
 def _require_invocation(
     invocation: dict[str, Any], location: str, run_id: str
 ) -> None:
@@ -476,6 +654,22 @@ def _require_invocation(
     if invocation.get("status") not in {"running", "failed", "completed", "resuming"}:
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}.status"
+        )
+    resume_id = invocation.get("resume_id")
+    if resume_id is not None and (
+        not isinstance(resume_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", resume_id) is None
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.resume_id"
+        )
+    resume_sequence = invocation.get("resume_sequence")
+    if (resume_id is None and resume_sequence is not None) or (
+        resume_id is not None
+        and (type(resume_sequence) is not int or resume_sequence < 1)
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.resume_sequence"
         )
     role = invocation["role"]
     phase = invocation["phase"]

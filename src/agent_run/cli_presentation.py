@@ -8,8 +8,9 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.review_budget import RUN_POLICY, TICKET_POLICY
+from agent_run.resume_audit import latest_resume_audit
 from agent_run.semantic_attempt import semantic_attempt_subjects
-from agent_run.semantic_attempt import invocation_attempt_is_pending
+from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 
 def _print_precondition_failure(state: dict[str, object]) -> None:
     active = _active_ticket_job(state)
@@ -56,6 +57,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     )
     semantic_attempt = _current_semantic_attempt(state, active_invocation)
     delivery_cleanup = _public_delivery_cleanup(state)
+    latest_resume = latest_resume_audit(state)
     output = {
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
@@ -86,6 +88,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         ),
         "publication_operation_retry": _current_publication_operation_retry(state),
         "delivery_cleanup": delivery_cleanup,
+        "latest_resume": latest_resume,
         "supervision": public_supervision_snapshot(state),
     }
     if as_json:
@@ -174,6 +177,14 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
                     f"{item.get('checkout')}；{item.get('last_error')}；"
                     f"恢复={item.get('recovery_action')}"
                 )
+    if isinstance(latest_resume, dict):
+        print(
+            "最近显式 Resume: "
+            f"#{latest_resume.get('sequence')} {latest_resume.get('kind')}；"
+            f"Thread {latest_resume.get('thread_id') or 'none'}；"
+            f"Attempt {latest_resume.get('semantic_attempt_id') or 'none'}；"
+            f"failure={latest_resume.get('failure_code') or 'none'}"
+        )
     if isinstance(run_repair, dict):
         print(
             "运行修复: "
@@ -221,6 +232,11 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         raise ValueError("agent_invocation_history must be an array")
     semantic_attempts = _semantic_attempt_history(state)
     operation_retries = _publication_operation_retries(state)
+    resume_audit = state.get("resume_audit")
+    public_resume_audit = resume_audit if isinstance(resume_audit, dict) else {}
+    agent_resumes = public_resume_audit.get("history", [])
+    if not isinstance(agent_resumes, list):
+        raise ValueError("resume_audit.history must be an array")
     output = {
         "run_id": state.get("run_id"),
         "timeline": timeline,
@@ -239,6 +255,12 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         ],
         "budget_windows": _budget_windows(semantic_attempts),
         "publication_operation_retries": operation_retries,
+        "resume_audit": {
+            "total": public_resume_audit.get("total", 0),
+            "compacted": public_resume_audit.get("compacted", 0),
+            "rolling_digest": public_resume_audit.get("rolling_digest"),
+        },
+        "agent_resumes": agent_resumes,
         "supervision": public_supervision_snapshot(state),
     }
     if as_json:
@@ -285,6 +307,18 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
             f"{retry.get('work_subject')} "
             f"{retry.get('attempts')}/{retry.get('limit')}"
         )
+    for resume in agent_resumes:
+        if not isinstance(resume, dict):
+            continue
+        print(
+            "Explicit Resume "
+            f"#{resume.get('sequence')} {resume.get('kind')} "
+            f"status={resume.get('source_status')} "
+            f"failure={resume.get('failure_code')} "
+            f"Thread={resume.get('thread_id')} "
+            f"Attempt={resume.get('semantic_attempt_id')} "
+            f"new_thread={resume.get('new_thread')}"
+        )
     for event in timeline:
         if not isinstance(event, dict):
             continue
@@ -318,6 +352,14 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
                 "Publication Operation Retry="
                 f"{event.get('publication_operation_retry_attempts') or 'none'}/"
                 f"{event.get('publication_operation_retry_limit') or 'none'}"
+            )
+        if event.get("explicit_resume_sequence") is not None:
+            print(
+                "  Explicit Resume "
+                f"#{event.get('explicit_resume_sequence')} "
+                f"{event.get('explicit_resume_kind')}；"
+                f"Thread={event.get('explicit_resume_thread_id') or 'none'}；"
+                f"Attempt={event.get('explicit_resume_attempt_id') or 'none'}"
             )
         if event.get("kind") == "unsupported_scope_change":
             print(
@@ -578,17 +620,7 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run abandon {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
         return f"agent-run requeue {run_id}"
-    invocation = state.get("active_agent_invocation")
-    if (
-        (
-            status == "execution_failed"
-            or state.get("github_refresh_pending") is True
-        )
-        and isinstance(invocation, dict)
-        and invocation.get("status") in {"failed", "completed"}
-        and invocation_attempt_is_pending(state, invocation)
-        and isinstance(run_id, str)
-    ):
+    if invocation_is_explicitly_resumable(state) and isinstance(run_id, str):
         return f"agent-run resume {run_id}"
     if (
         status == "waiting_external"

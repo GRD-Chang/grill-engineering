@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.change_currentness import candidate_or_acceptance_is_inconsistent
 from agent_run.controller import Controller
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -25,6 +26,34 @@ from run_acceptance_test_support import (
     _passing_artifact,
     _repair_artifact,
 )
+
+
+def test_prior_rejection_is_history_not_new_candidate_authority() -> None:
+    artifact = {"checks": {"e2e": {"status": "fail"}}}
+    job = {
+        "phase": "reviewing",
+        "candidate_sha": "candidate-3",
+        "last_review_candidate_sha": "candidate-2",
+        "acceptance_record": {
+            "reviewed_candidate_sha": "candidate-2",
+            "artifact": artifact,
+        },
+        "review_budget": {
+            "review_artifacts": [
+                {"candidate_sha": "candidate-2", "artifact": artifact}
+            ]
+        },
+    }
+
+    assert candidate_or_acceptance_is_inconsistent(job) is False
+    job["review_budget"]["review_artifacts"].append(
+        {"candidate_sha": "candidate-3", "artifact": {"checks": {}}}
+    )
+    assert candidate_or_acceptance_is_inconsistent(job) is True
+    job["review_budget"]["review_artifacts"].pop()
+    job["acceptance_record"]["artifact"] = {"checks": {}}
+    assert candidate_or_acceptance_is_inconsistent(job) is True
+
 
 def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
     git_repo: Path,

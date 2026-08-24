@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any, Callable
 
 from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
+from agent_run.resume_audit import bind_resume_to_successor
 
 
 def _sync_invocation_history(
@@ -65,6 +66,14 @@ def invocation_event_recorder(
     def record(kind: str, **facts: object) -> None:
         now = datetime.now(UTC).isoformat()
         if kind == "started":
+            resume_binding = bind_resume_to_successor(
+                state,
+                semantic_attempt=semantic_attempt,
+                successor_started_at=now,
+            )
+            resume_id, resume_sequence = (
+                resume_binding if resume_binding is not None else (None, None)
+            )
             invocation: dict[str, Any] = {
                 "work_subject": work_subject,
                 "generation": generation,
@@ -92,6 +101,8 @@ def invocation_event_recorder(
                 "error": None,
                 "return_code": None,
                 "signal": None,
+                "resume_id": resume_id,
+                "resume_sequence": resume_sequence,
             }
             state["active_agent_invocation"] = invocation
             _sync_invocation_history(state, invocation)
