@@ -19,7 +19,6 @@ from agent_run.codex import CodexProcessError
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
 from agent_run.run_driver import DirectRunOperations, RunStep
-from agent_run.runner_promotion import PromotionVerification
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
