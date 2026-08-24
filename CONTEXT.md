@@ -65,12 +65,12 @@ Development 与 Repair 在当前 checkout 中承担完整交付整理责任：�
 _Avoid_: 用 `.gitignore` 隐藏交付、验证者修改交付、留下不应交付的中间产物、Codex 自行提交
 
 **Managed Development Checkout（受管开发工作区）**:
-Controller 为一个 Change Job 创建并在 Development Attempt、Repair 与 Resume 间复用的专属 worktree。它与主工作区、其他 Change Job 和一次性 Validation Checkout 隔离；系统只允许该 Job 的 Codex 整理其未提交内容，并在 Candidate 创建后交由 Publisher 写入 Git 历史。系统运行约束禁止向其中人工混入无关改动。
-_Avoid_: 主工作区、共享 scratch worktree、Validation Checkout
+Controller 为一个 Change Job 创建并在 Development Attempt、Repair 与 Resume 间复用的专属 worktree。它与主工作区、其他 Change Job 和一次性 Validation Checkout 隔离；系统只允许该 Job 的 Codex 整理其未提交内容，并在 Candidate 创建后交由 Publisher 写入 Git 历史。系统运行约束禁止向其中人工混入无关改动。普通 `run`、`resume` 或自动 cleanup 发现其中存在 tracked modifications 或 untracked files 时必须 fail closed，保留工作区并给出路径、保留原因与可执行恢复动作，不得因 `execution_failed`、`blocked`、预算检查点或状态合同错误自动强制删除。
+_Avoid_: 主工作区、共享 scratch worktree、Validation Checkout、以终态名称代替 dirty check、自动强制删除未提交交付成果
 
 **Development Attempt（开发尝试）**:
-Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内部规划、代码编辑和开发验证的一轮工作。同一 Change Job 的各次 Development Attempt 复用其 Development Thread，通过新的 Turn 接收最新版 Development Brief 与 Acceptance Artifact；它直接产出 worktree diff 与 Development Summary，不经过独立 Planning Phase。
-_Avoid_: Change Job、Plan Artifact、Acceptance Attempt
+Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内部规划、代码编辑和开发验证的一轮工作。同一 Change Job 的各次 Development Attempt 复用其 Development Thread，通过新的 Turn 接收最新版 Development Brief 与 Acceptance Artifact；它直接产出 worktree diff 与 Development Summary，不经过独立 Planning Phase。一次 Attempt 首次分配时只占用一次 Development Budget；为完成该 Attempt 而创建的 successor Invocation、同 Thread Resume 或 Output Repair 均不重复计费。
+_Avoid_: Change Job、Plan Artifact、Acceptance Attempt、Codex 进程启动次数
 
 **Development–Acceptance Engine（开发验收引擎）**:
 Controller 复用的单一自动变更循环：持久 Development Thread 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，正常 pass 或 Ticket 预算耗尽后的 Fallback Publication Receipt 允许 Publisher 推送普通 PR，随后等待 Required Checks、执行 Published-Head Gate，并按 Job 的合并策略完成合并；兜底 Ticket 只有在准确 head 形成 Deterministic Integration Record 后才取得合并权限。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文、批准策略和完成规则使用该引擎，不复制控制流；Parent-only 的人工批准只授予一次合并权限，批准后的重新核验、合并与恢复仍由该引擎执行。
@@ -304,8 +304,8 @@ _Avoid_: GitHub Approve、标签触发、永久授权
 _Avoid_: Parent Spec 静默改写、直接修改 Run Branch、无限自动重试
 
 **Final Abandon Command（最终放弃命令）**:
-维护者通过 `agent-run abandon <run-id>` 永久终止尚未进入默认分支的 Delivery Run 的显式命令。Controller 执行 Run Abandonment Recovery、关闭或标记未合并的自动化 PR，并保留完整审计证据；暂时等待或普通修复不能使用该命令。
-_Avoid_: 暂停、单 Ticket 阻塞、默认分支回滚
+维护者通过 `agent-run abandon <run-id>` 永久终止尚未进入默认分支的 Delivery Run 的显式命令。Controller 执行 Run Abandonment Recovery、关闭或标记未合并的自动化 PR，并保留完整审计证据；暂时等待或普通修复不能使用该命令。若任一 Managed Development Checkout 仍含 tracked modifications 或 untracked files，普通 `abandon` 必须在任何外部写入或删除前拒绝执行并报告准确路径；只有维护者额外显式给出 `--discard-worktree` 才授权不可恢复地删除这些未提交成果后继续放弃。
+_Avoid_: 暂停、单 Ticket 阻塞、默认分支回滚、将 `abandon` 默认解释为丢弃未提交成果
 
 **Ticket Squash Merge（Ticket 压缩合并）**:
 Publisher 在 Ticket PR 的 Published-Head Gate 通过后执行的固定合并方式。它使用 `--squash` 与 `--match-head-commit`，将 PR 公开分支上的 Publication 与 repair commits 作为一个新语义 commit 写入 Run Branch；首次推送前已压缩掉的本地 Candidate Commits 不会出现在 PR 页面。合并结果必须继续匹配 Ticket Integration Gate 绑定的 base、Publication tree 和语义标题。
@@ -453,7 +453,7 @@ _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的�
 **Agent Invocation（Agent 调用）**:
 Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
 Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output Attempt 前成为 active，
-并绑定 Work Subject、Generation、输入指纹、机械 Currentness Boundary 与实际 Thread Execution Binding；记录只保存输入指纹、有界边界事实、model、reasoning effort 与 Agent Profile Revision，
+并绑定 Work Subject、Generation、输入指纹、机械 Currentness Boundary、当前 Semantic Agent Attempt 与实际 Thread Execution Binding；记录只保存输入指纹、有界边界事实、model、reasoning effort 与 Agent Profile Revision，
 不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
 立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
 checkout 只读，且不增加领域 Development Attempt、Reviewer Invocation 或 Publication Attempt。进程失败、缺失或
@@ -461,9 +461,21 @@ checkout 只读，且不增加领域 Development Attempt、Reviewer Invocation �
 Thread，或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
 
+**Semantic Agent Attempt（语义 Agent 尝试）**:
+Development、Reviewer 或 Publication 角色针对一个准确 Work Subject、Job Generation、Currentness Boundary 与角色序号完成的一轮语义工作。它在首个 Codex 进程前分配，可跨越初始 Invocation、successor Invocation、Thread 替换与 Output Repair；执行失败、Human Blocker 或前台中断都不创建新 Attempt。Development 在分配时占用一次 Development Budget，Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget，Publication 在分配时计入一次 Publication Attempt；三者的 Resume 均不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须先继续该 pending Attempt，不得将它拒绝为预算耗尽。只有当前 Attempt 已形成完整角色结果，或其 Currentness Boundary 失效并按规则收口后，才能分配后继 Attempt。
+_Avoid_: Agent Invocation、Output Attempt、Codex 进程启动次数、Thread 序号
+
 **Reviewer Invocation（审查调用）**:
 Controller 为一个准确 Candidate tree 或 Run 预期合并结果启动、并成功形成合法 Acceptance Artifact 的一次顶层 Fresh Acceptance 或 Run Acceptance Agent Invocation。Reviewer 在该 Invocation 内自主读取项目、运行工具、派发 subagent，以及最多两次机械 Output Repair，都只计一次 Reviewer Invocation；新 Candidate 需要新 Reviewer Thread 且成功形成合法 Artifact 时才增加一次。进程、凭据、sandbox、timeout、signal、Thread 错配或最终输出仍不合法等执行失败不消耗 Review Budget，按 `execution_failed` 暂停且不会自动无限重试。Ticket 与 Run 分别按自己的 Review Budget Window 计数。
 _Avoid_: Reviewer 内部工具调用、subagent 数量、Output Attempt、Development Attempt、Required Check 重跑
+
+**Publication Attempt（发布尝试）**:
+Publication Codex 针对一个准确、仍 current 的发布边界生成合法发布 Artifact 的一轮语义工作。一次 Publication Attempt 可以包含初始 Agent Invocation、进程失败后的 successor Invocation 与最多两次 Output Repair；这些过程只用于完成同一语义 Attempt，不因再次启动 Codex 进程而重复计数。
+_Avoid_: Output Attempt、Codex 进程重试次数、Publication Context Fallback
+
+**Publication Operation Retry（发布操作重试）**:
+Controller 或 Publisher 在一次 Publication Attempt 内对 GitHub 读取收敛、带精确绑定的写入或结果对账进行的有界确定性重试。它按外部操作风险单独计数，不增加 Publication Attempt，也不被 Invocation Resume 清零或绕过。
+_Avoid_: Publication Attempt、Output Repair、无界 GitHub 重试
 
 **Agent Execution Profile（Agent 执行配置）**:
 Delivery Run 为未来创建的各顶层 Codex Thread 保存的 model 与 reasoning effort 选择，可以来自命名预设或用户自定义值。它只约束 Controller 直接启动的顶层 Codex，不约束这些 Codex 自行派发的 subagent。
@@ -490,7 +502,7 @@ _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
 维护者以 `agent-run resume <run-id>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
-successor Invocation。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
+successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
 但不把新 Attempt 伪装成旧窗口的额外轮次。若检查点保留了尚需修改代码的准确失败证据，successor Invocation 必须先把该证据交回原 Development Thread，产生新 Candidate 后才启动新窗口的 Reviewer 1；尤其是 Final CI-fix 后准确 PR head 的 Required Checks 再失败时，不得先审查未变化且已知 CI 失败的 Candidate。`--new-thread` 或无可恢复 Thread 时才以该阶段完整标准 Prompt
 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale
 时不启动 Codex，只进入 `requeue_required`。
@@ -556,8 +568,8 @@ _Avoid_: 隐式新增 Ticket、正文中的阻塞描述、普通相关 Issue
 _Avoid_: Ticket Content Revision、Ticket Graph Revision、Git commit
 
 **Deterministic Contradiction（确定性矛盾）**:
-Controller 已取得不能与当前 Change Job Record 和 Currentness Boundary 安全一致解释的权威事实时形成的 fail-closed 终态。它停止 Codex 与 Publisher mutation；操作者可以读取状态与历史或放弃 Delivery Run，但系统不从普通重试、等待或 Runner 更新推断恢复授权。
-_Avoid_: GitHub Convergence Wait、Supervision Timeout Pause、Human Blocker、Invocation Resume、自动恢复
+Controller 已取得不能与当前 Change Job Record 和 Currentness Boundary 安全一致解释的权威事实，或持久状态内的 Job、语义 Attempt 与 Active Invocation 已无法满足同一规范解释时形成的 fail-closed 终态。它停止 Codex、Publisher mutation 与自动 cleanup，保留受管工作区和诊断证据；操作者可以读取状态与历史或放弃 Delivery Run，但新 Runner 不自动改写历史不一致状态，也不从普通重试、等待或 Runner 更新推断恢复授权。
+_Avoid_: GitHub Convergence Wait、Supervision Timeout Pause、Human Blocker、Invocation Resume、自动恢复、历史状态迁移
 
 **Unsupported Scope Change（不支持的范围变化）**:
 运行中 observed Ticket Set 或 `blockedBy` Graph Revision 与 accepted revision 不一致时的 fail-closed 状态。Controller 保留 accepted/observed revision、变化摘要和 observed graph；该状态不运行 Codex、不新建 Thread、不 Requeue、不继续交付，也不执行 Publisher mutation。操作者只能查看状态/历史、恢复 GitHub 原图或放弃当前 Run。
