@@ -825,8 +825,9 @@ def test_public_activation_faults_preserve_existing_state(
     ) == before
 
 
-def test_public_sigint_cleans_candidate_probe_process_and_state(
-    tmp_path: Path,
+@pytest.mark.parametrize("termination_signal", [signal.SIGINT, signal.SIGTERM])
+def test_public_signal_cleans_candidate_probe_process_and_state(
+    tmp_path: Path, termination_signal: signal.Signals
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
@@ -867,7 +868,7 @@ def test_public_sigint_cleans_candidate_probe_process_and_state(
         time.sleep(0.02)
     assert pid_file.exists(), process.communicate(timeout=10)[1]
 
-    process.send_signal(signal.SIGINT)
+    process.send_signal(termination_signal)
     _stdout, stderr = process.communicate(timeout=30)
 
     assert process.returncode != 0, stderr
@@ -875,6 +876,271 @@ def test_public_sigint_cleans_candidate_probe_process_and_state(
     assert _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
     ) == before
+
+
+def test_public_signal_during_post_activation_cleanup_keeps_new_generation_complete(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    _install_a_and_b(source, home, fake_bin)
+    config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
+    before = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'c'\n", encoding="utf-8"
+    )
+    marker = tmp_path / "post-activation-cleanup-started"
+    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "            try:\n                warnings = [\n",
+            f"            try:\n                Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n                time.sleep(2)\n                warnings = [\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        }
+    )
+    process = subprocess.Popen(
+        [str(source / "install.sh")],
+        cwd=delivery,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 30
+    while not marker.exists() and time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    assert marker.exists(), process.communicate(timeout=10)[1]
+
+    process.send_signal(signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 0, stderr
+    assert "已保留新的 Active Runner" in stdout
+    after = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+    assert after["active"] != before["active"]
+    assert after["generation_links"]["previous"] == before["generation_links"]["current"]
+    assert after["profile"] == before["profile"]
+    assert after["app_profile"] == before["app_profile"]
+    assert after["locator"] == before["locator"]
+    assert after["delivery_state"] == before["delivery_state"]
+    assert after["staging"] == []
+
+
+def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    _install_a_and_b(source, home, fake_bin)
+    config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
+    before = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+    stale = _data_root(home) / "staging" / "candidate-stale"
+    stale.mkdir(parents=True)
+    (stale / "build-source-stale").write_text("stale", encoding="utf-8")
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'c'\n", encoding="utf-8"
+    )
+    marker = tmp_path / "preflight-started"
+    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "    _check_prerequisites(source)\n",
+            f"    Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n    time.sleep(2)\n    _check_prerequisites(source)\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        }
+    )
+    process = subprocess.Popen(
+        [str(source / "install.sh")],
+        cwd=delivery,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 30
+    while not marker.exists() and time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    assert marker.exists(), process.communicate(timeout=10)[1]
+
+    process.send_signal(signal.SIGTERM)
+    _stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 1, stderr
+    assert int(count.read_text(encoding="utf-8")) == 2
+    assert _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    ) == before
+
+
+def test_public_idempotent_signal_restores_profile_and_entry(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    marker = tmp_path / "idempotent-cleanup-started"
+    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer.write_text(
+        installer.read_text(encoding="utf-8").replace(
+            "            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                warnings = [\n",
+            f"            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                if os.environ.get('AGENT_RUN_TEST_IDEMPOTENT_SIGNAL') == '1':\n                    Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n                    time.sleep(2)\n                warnings = [\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    first = _run(source, home, fake_bin)
+    assert first.returncode == 0, first.stderr
+    data_root = _data_root(home)
+    active = data_root / "active"
+    generation = active.resolve()
+    before = {
+        "active": os.readlink(active),
+        "current": os.readlink(generation / "current"),
+        "previous": os.readlink(generation / "previous")
+        if (generation / "previous").is_symlink()
+        else None,
+        "snapshots": sorted(path.name for path in (data_root / "snapshots").iterdir()),
+        "generations": sorted(path.name for path in (data_root / "generations").iterdir()),
+    }
+    profile = home / ".profile"
+    stable_entry = home / ".local" / "bin" / "agent-run"
+    profile.unlink()
+    stable_entry.unlink()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "AGENT_RUN_TEST_IDEMPOTENT_SIGNAL": "1",
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        }
+    )
+    process = subprocess.Popen(
+        [str(source / "install.sh")],
+        cwd=source,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 30
+    while not marker.exists() and time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    assert marker.exists(), process.communicate(timeout=10)[1]
+
+    process.send_signal(signal.SIGTERM)
+    _stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 1, stderr
+    assert int(count.read_text(encoding="utf-8")) == 1
+    assert not profile.exists()
+    assert not stable_entry.exists() and not stable_entry.is_symlink()
+    assert os.readlink(active) == before["active"]
+    restored_generation = active.resolve()
+    assert os.readlink(restored_generation / "current") == before["current"]
+    assert (
+        os.readlink(restored_generation / "previous")
+        if (restored_generation / "previous").is_symlink()
+        else None
+    ) == before["previous"]
+    assert sorted(path.name for path in (data_root / "snapshots").iterdir()) == before[
+        "snapshots"
+    ]
+    assert sorted(path.name for path in (data_root / "generations").iterdir()) == before[
+        "generations"
+    ]
+    assert not list((data_root / "staging").iterdir())
+
+
+def test_public_reactivating_previous_snapshot_reprobes_before_activation(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    for version in ("a", "b"):
+        (source / "src" / "agent_run" / "__init__.py").write_text(
+            f"__version__ = '{version}'\n", encoding="utf-8"
+        )
+        result = _run(source, home, fake_bin)
+        assert result.returncode == 0, result.stderr
+    config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
+    before = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'a'\n", encoding="utf-8"
+    )
+    (tmp_path / "codex-behavior").write_text("wrong-result", encoding="utf-8")
+    failed = _run(source, home, fake_bin, cwd=delivery)
+
+    assert failed.returncode == 1, failed.stderr
+    assert "Traceback" not in failed.stderr
+    assert int(count.read_text(encoding="utf-8")) == 3
+    assert _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    ) == before
+
+    (tmp_path / "codex-behavior").write_text("success", encoding="utf-8")
+    reactivated = _run(source, home, fake_bin, cwd=delivery)
+
+    assert reactivated.returncode == 0, reactivated.stderr
+    assert int(count.read_text(encoding="utf-8")) == 4
+    assert _manifest(_active_snapshot(home))["source_provenance"]["kind"] == "source-directory"
+    after_reactivation = _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    )
+    assert after_reactivation["active"] != before["active"]
+    assert after_reactivation["generation_links"]["previous"] == before["generation_links"]["current"]
+
+    repeated = _run(source, home, fake_bin, cwd=delivery)
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert int(count.read_text(encoding="utf-8")) == 4
+    assert _managed_state_snapshot(
+        home, config=config, locator=locator, delivery=delivery
+    ) == after_reactivation
 
 
 def test_public_install_does_not_invoke_external_tool_sentinels(

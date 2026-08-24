@@ -71,6 +71,10 @@ class InstallerError(RuntimeError):
     """A bounded operational error from the source installer."""
 
 
+class InstallerInterrupted(BaseException):
+    """A signal-triggered interruption that still runs installer cleanup."""
+
+
 @dataclass(frozen=True)
 class InstallPaths:
     data_root: Path
@@ -114,13 +118,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
     paths = InstallPaths.from_environment()
     try:
         _reject_managed_paths_inside_source(paths, source)
-        with _management_lock(paths):
-            if parsed.rollback:
-                result = _rollback(paths)
-            elif parsed.uninstall:
-                result = _uninstall(paths)
-            else:
-                result = _install(paths, source)
+        with _handle_sigterm():
+            with _management_lock(paths):
+                if parsed.rollback:
+                    result = _rollback(paths)
+                elif parsed.uninstall:
+                    result = _uninstall(paths)
+                else:
+                    result = _install(paths, source)
+    except InstallerInterrupted:
+        print("agent-run install: interrupted", file=sys.stderr)
+        return 1
     except InstallerError as error:
         print(f"agent-run install: {error}", file=sys.stderr)
         return 1
@@ -146,6 +154,19 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _raise_interrupted(_signum: int, _frame: Any) -> None:
+    raise InstallerInterrupted()
+
+
+@contextmanager
+def _handle_sigterm() -> Iterator[None]:
+    previous = signal.signal(signal.SIGTERM, _raise_interrupted)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 @contextmanager
 def _management_lock(paths: InstallPaths) -> Iterator[None]:
     paths.data_root.mkdir(parents=True, exist_ok=True)
@@ -165,6 +186,13 @@ def _management_lock(paths: InstallPaths) -> Iterator[None]:
 
 
 def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
+    try:
+        return _install_transaction(paths, source)
+    finally:
+        _clear_staging(paths.staging)
+
+
+def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]:
     _check_source(source)
     source_provenance = _source_provenance(source)
     _check_managed_entry(paths, for_uninstall=False)
@@ -194,6 +222,8 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
                 raise InstallerError("已有 Snapshot 路径不是受管目录")
             _validate_snapshot(snapshot, identity)
             _remove_path(candidate)
+            if old_current != snapshot:
+                _run_candidate_probe(snapshot)
         else:
             _run_candidate_probe(candidate)
             _write_manifest(
@@ -218,16 +248,16 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
             try:
                 _ensure_profile(paths)
                 _ensure_stable_entry(paths)
+                warnings = [
+                    *pre_cleanup_warnings,
+                    *_cleanup_retired(paths, snapshot, old_previous, old_generation),
+                ]
+                return _install_result(snapshot, old_previous, warnings, idempotent=True)
             except BaseException:
                 _restore_profile(paths.profile, profile_backup)
                 if not entry_was_present and _is_managed_entry(paths):
                     paths.stable_entry.unlink(missing_ok=True)
                 raise
-            warnings = [
-                *pre_cleanup_warnings,
-                *_cleanup_retired(paths, snapshot, old_previous, old_generation),
-            ]
-            return _install_result(snapshot, old_previous, warnings, idempotent=True)
 
         generation: Path | None = None
         activation_warnings: list[str] = []
@@ -240,6 +270,24 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
                 previous=old_current,
                 old_generation=old_generation,
             )
+            try:
+                warnings = [
+                    *pre_cleanup_warnings,
+                    *activation_warnings,
+                    *_cleanup_retired(paths, snapshot, old_current, generation),
+                ]
+                return _install_result(snapshot, old_current, warnings, idempotent=False)
+            except (InstallerInterrupted, KeyboardInterrupt):
+                return _install_result(
+                    snapshot,
+                    old_current,
+                    [
+                        *pre_cleanup_warnings,
+                        *activation_warnings,
+                        "安装已完成，已保留新的 Active Runner",
+                    ],
+                    idempotent=False,
+                )
         except BaseException:
             _restore_profile(paths.profile, profile_backup)
             if generation is not None:
@@ -254,16 +302,9 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
             ):
                 _remove_path(snapshot)
             raise
-        warnings = [
-            *pre_cleanup_warnings,
-            *activation_warnings,
-            *_cleanup_retired(paths, snapshot, old_current, generation),
-        ]
-        return _install_result(snapshot, old_current, warnings, idempotent=False)
     finally:
         if candidate.exists() or candidate.is_symlink():
             _remove_path(candidate)
-        _clear_staging(paths.staging)
 
 
 def _rollback(paths: InstallPaths) -> dict[str, object]:
