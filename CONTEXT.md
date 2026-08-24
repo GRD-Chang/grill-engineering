@@ -8,9 +8,9 @@
 在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。它不持有 GitHub 写凭证，也不具备外部交付状态的变更权限。
 _Avoid_: GitHub Bot、Publisher、Mutation Authority
 
-**Worker 只读凭据续签（Worker Read Credential Renewal）**:
-一个最长三小时的 Codex Worker 通过临时 `gh` adapter 请求 GitHub 读取；Controller 以短期、只读的 GitHub App installation token 执行经过固定读取规则校验的请求。每次读取有界超时，Worker 结束或凭据续签耗尽时 Controller 会清理仍在执行的读取进程。Controller 在 token 即将失效时自动换发；换发出现短暂失败时在十分钟内有界重试。只有旧 token 已失效且重试仍失败，Worker 才以可恢复的凭据失败暂停。Worker 不获得 token、App 私钥或 Publisher 写凭据。
-_Avoid_: 延长 installation token 的有效期、向 Worker 暴露 App 私钥、无限重试、直接中断
+**Worker GitHub Read Broker（Worker GitHub 只读代理）**:
+Codex Worker 通过临时 `gh` adapter 提交绑定当前 Repository identity 的固定 GitHub 只读请求，由 Controller 默认使用宿主已登录的 `gh` 凭据执行；写请求、认证请求和其他仓库请求在宿主执行前拒绝。需要独立最小权限身份的操作者可以通过一次性 CLI 配置改用专用只读 GitHub App。App profile 一旦存在就明确选择 App provider；配置损坏、私钥不可读、签名或权限校验失败时有界失败，不得静默回退到宿主 `gh`。该持久配置只记录 App ID、Installation ID 与仓库外私钥文件的路径，私钥内容不复制，短期 installation token 不落盘；App 模式保留 token 到期前续签、短暂失败有界重试和过期读取重试。无论凭据来源如何，Worker 都不获得 token、App 私钥或 Publisher 写凭据，Controller 对每次读取设置有界超时并在 Worker 结束时清理仍在执行的读取进程。
+_Avoid_: 强制配置 GitHub App、每次导出环境变量、持久化 installation token、复制 App 私钥、向 Worker 暴露宿主凭据、允许任意 GitHub 请求、无限重试
 
 **Agent Artifact（Agent 产物）**:
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
@@ -129,6 +129,50 @@ _Avoid_: 固定每轮双开发侧预审、Controller 内部 Agent 编排器、Fi
 **Controller（控制器）**:
 本地 `agent-run` 单进程中的确定性编排层。它读取 GitHub 与本地事实、维护状态机和 Revision、选择可执行 Job、启动 Codex Threads、校验 Artifacts、执行预算与门禁，并调用 Publisher 完成允许的写操作；它不替 Agent 做需求、代码或修复方案的语义判断。
 _Avoid_: Codex Worker、独立 daemon、GitHub Mutation Authority
+
+**Runner Snapshot（Runner 固化快照）**:
+本机用于执行 Controller 的不可变代码快照。其 content identity 只对非 editable 安装后 `agent_run` runtime tree 的规范相对路径和文件内容计算 SHA-256；console entry、shebang、virtualenv 路径、Python 与系统库、缓存、日志、时间戳和 Runner Provenance 不进入该身份。源码可以来自正式发布、Git revision 或包含未提交修改的本地开发目录；来源不限制其生命周期权限。源目录后续变化不会影响既有快照，只有用户显式构建并激活另一快照才会改变调用使用的 Runner。
+_Avoid_: 可编辑源码环境、Git commit、当前源码目录
+
+**Runner Provenance（Runner 来源）**:
+说明一个 Runner Snapshot 的源码来自正式发布、Git revision 或本地源码快照的审计事实。它帮助用户理解和追溯 Runner，但不替代内容身份，也不单独决定该 Runner 能否执行生命周期命令。
+_Avoid_: Runner Snapshot、Runner 内容身份、Delivery Run currentness
+
+**Runner Generation（Runner 世代）**:
+一次管理动作准备并作为整体激活的完整指针集合，包含 current Runner Snapshot 与可选 previous Runner Snapshot。安装器必须先在 Active Runner 之外创建完整 Generation，再以同一文件系统上的原子切换选为 active；current、previous 或命令入口不得分别原地更新。构建、Compatibility Check 或切换失败时，旧 Generation 及其 current、previous 整体保持不变。
+_Avoid_: 分步更新 current 与 previous、半完成安装、可配置历史列表、每-Run Runner 绑定
+
+**Active Runner（当前 Runner）**:
+本机命令入口为 Controller 调用选择的完整 Runner Generation，并直接执行其中的 current Runner Snapshot。切换后启动的新进程使用新的 Active Runner；后续对既有 Delivery Run 的操作也使用该 Runner，系统不绑定旧 Snapshot、不迁移旧状态，也不承诺跨 Runner 状态兼容。管理动作不与已经运行的生命周期进程协调；清理或卸载 Snapshot 后，不保证旧进程还能继续加载代码、资源或启动子命令。
+_Avoid_: 当前 Git checkout、自动跟随源码、运行中热更新、每-Run Runner 绑定、状态兼容层
+
+**Runner Build（Runner 构建）**:
+用户在自己选择的源码目录中显式运行该目录的源码安装器，将目录当前实际内容冻结为候选 Runner Snapshot 的动作。构建忠实使用该目录内容，不审查其 Git 状态、可信等级或与既有 Delivery Run 的兼容性；执行所选源码的安装器与 build backend 等同于授予该源码当前用户级代码执行权限，安装位置与清理承诺只约束符合本项目合同的源码。
+_Avoid_: 自动跟随源码、来源审批、状态迁移、自动触发构建
+
+**Runner Compatibility Check（Runner 兼容性检查）**:
+源码安装器在激活候选 Snapshot 前发起的一次小型真实 Codex 调用，只确认当前调用链接受 Runner 使用的结构化输出 schema。结果不绑定 Codex 版本、不证明源码可信、不授权未来兼容，也不会在环境版本变化后自动重新检查；检查失败时保留原 Active Runner。
+_Avoid_: Promotion Audit、Codex 版本门禁、源码验收、状态兼容检查、长期信任证明
+
+**Runner Installation（Runner 安装）**:
+用户在所选源码目录显式执行 `./install.sh`，依次构建候选 Runner Snapshot、执行 Runner Compatibility Check、创建以新 Snapshot 为 current 且以可选旧 current 为 previous 的完整 Runner Generation，并在成功后原子切换 Active Runner 的动作。若候选 content identity 已经等于 Active current，安装器直接幂等成功：不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous。首次安装、切换 Git tag、拉取官方修改或构建本地未提交修改都使用同一动作；成功后固定只保留 Active Generation 引用的 current 与可选 previous，更早的 Generation 和 Snapshot 自动清理，失败时清理候选并保持旧 Generation 整体不变。切换后的清理失败只产生有界 warning，并由下一次管理动作重试，不回滚已经成功的 Active Runner。安装器只在 `~/.local/bin/agent-run` 缺失或仍是解析到受管 XDG root 的自有 symlink 时创建或替换入口；同名非受管路径使安装失败，不备份、不覆盖。用户级命令目录通过唯一边界标记的幂等受管块加入 shell PATH；安装器不安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件，也不执行 `sudo`。安装不修改既有 Delivery Run 状态，也不创建兼容或迁移路径。
+_Avoid_: 自动更新、重复 PATH 配置、系统包管理、`sudo`、源码热加载、可配置保留策略、无限快照历史、状态迁移、每-Run Runner 绑定
+
+**Source Runner Installer（源码 Runner 安装器）**:
+随每份源码树提供、只在显式执行 `./install.sh` 时运行的一次性安装程序。它把当前源码目录安装为候选 Snapshot；identity 已经等于 Active current 时直接幂等成功，否则调用 Runner Compatibility Check、创建完整 Runner Generation、切换 Active Runner，并只保留 current 与可选 previous Snapshot。安装完成后不驻留、不参与 Controller 调用，也不形成独立包、版本或更新生命周期。v0.1 的公开分发入口是 Git clone 或切换到用户选择的 Git revision 后运行该安装器，不要求 PyPI 或 pipx。
+_Avoid_: Runner Manager、常驻 Launcher、editable install、独立发布物、PyPI 前置条件
+
+**Runner Management Lock（Runner 管理锁）**:
+Source Runner Installer 用于串行化 install、rollback 与 uninstall 的固定用户级非阻塞互斥锁。管理动作必须在修改任何受管状态前取得同一个锁；竞争者立即失败且不修改状态。uninstall 永不删除该锁文件，避免持锁 inode 被路径上的新文件替换后形成第二把锁；重复 uninstall 在没有其他受管安装时仍幂等成功。
+_Avoid_: 等待锁、每种动作一把锁、删除并重建锁文件、协调运行中的生命周期进程
+
+**Runner Rollback（Runner 回退）**:
+用户在任一包含源码安装器的目录显式执行 `./install.sh --rollback`，创建交换 current 与 previous 的完整 Runner Generation 并原子切换 Active Runner 的动作。它不重新构建、不调用 Codex、不判断 Runner 或 Delivery Run 状态兼容性，也不修改任何 Delivery Run；没有 previous 时明确失败且旧 Generation 整体不变。
+_Avoid_: 状态迁移、兼容性检查、自动回退、下载历史版本、任意历史选择
+
+**Runner Uninstall（Runner 卸载）**:
+用户在任一包含源码安装器的目录显式执行 `./install.sh --uninstall`，删除全部受管 Runner Snapshot、Runner Generation、候选残留、内部 `active` 入口、本机受管 `agent-run` symlink 以及安装器添加的 PATH 受管配置。若用户已把公开入口替换为非受管路径，卸载保留该内容并以有界 operational error 报告清理未完成。它保留固定 Runner Management Lock、GitHub App 持久配置、全局 Run 定位状态和各目标仓库中的 `.agent-run` Delivery Run 数据；v0.1 不提供连带删除用户配置或运行数据的 purge 模式。
+_Avoid_: 删除 Delivery Run、删除 GitHub App 配置、删除非受管 shell 配置、`--purge`
 
 **Run 内部监督（In-Run Supervision）**:
 一次由维护者显式启动或恢复的 `agent-run run`，在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。GitHub 读取或对账的未知非零退出默认进入有界监督，Controller 只保存经脱敏、有界的错误证据，不从 `gh` stderr 推断网络、认证、权限、代理或其他具体原因。只有结构化远端事实已证明 Publisher intent、身份、head/base、检查、状态或关闭证据矛盾时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
