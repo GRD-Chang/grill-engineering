@@ -158,6 +158,8 @@ class FixtureAgentBackend:
             if notify is not None:
                 notify("failed", attempt_count=1, error=configured_error)
             raise ValueError(configured_error)
+        if step.get("keyboard_interrupt_after_writes") is True:
+            raise KeyboardInterrupt
         sandbox_error = step.get("sandbox_error_after_writes")
         if isinstance(sandbox_error, str):
             if notify is not None:

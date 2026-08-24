@@ -31,6 +31,11 @@ from agent_run.run_repair_delivery import (
     RunRepairPublisher,
 )
 from agent_run.run_thread_identity import prior_thread_identities
+from agent_run.semantic_attempt import (
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+)
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
@@ -123,6 +128,7 @@ class RunRepairLifecycle:
                     preserve_checkout = True
                     continue
                 except RunRepairJobRotationRequired as rotation:
+                    self._close_rebound_attempt(state, job)
                     job = rotate_repair_job(
                         run,
                         job,
@@ -146,6 +152,12 @@ class RunRepairLifecycle:
             return "waiting"
         finally:
             if job is not None and self._repair_checkout_is_active(job):
+                preserve_checkout = True
+            if (
+                job is not None
+                and job.get("phase") == "stale"
+                and self.owner.git.managed_checkout_dirty_reason(checkout) is not None
+            ):
                 preserve_checkout = True
             if not preserve_checkout:
                 self.owner.git.remove_worktree(checkout)
@@ -183,6 +195,7 @@ class RunRepairLifecycle:
         candidate = job.get("candidate_sha")
         if uses_merge_resolution(job) or not isinstance(candidate, str):
             return False
+        self._close_rebound_attempt(state, job)
         job.update(
             {
                 "repair_mode": "merge_resolution",
@@ -209,6 +222,16 @@ class RunRepairLifecycle:
         )
         self.owner._save(state)
         return True
+
+    @staticmethod
+    def _close_rebound_attempt(
+        state: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        attempt = pending_semantic_attempt(job)
+        if attempt is None:
+            return
+        close_semantic_attempt(job, attempt, outcome="currentness_invalidated")
+        detach_active_invocation(state, attempt)
 
     def _complete_squash_repair_conflict_conversion(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path

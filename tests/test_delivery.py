@@ -271,6 +271,13 @@ def test_change_publication_invocation_binds_subject_generation_and_currentness(
 ) -> None:
     state: dict[str, Any] = {"run_id": "run-1"}
     engine = object.__new__(ChangeDeliveryEngine)
+    engine.git = SimpleNamespace(
+        resolve=lambda revision: (
+            expected_boundary["candidate_tree"]
+            if revision.endswith("^{tree}")
+            else revision
+        )
+    )
     engine.save = lambda value: value
     invocation_identity = None
     if isinstance(job.get("repair_generation"), int):
@@ -290,7 +297,17 @@ def test_change_publication_invocation_binds_subject_generation_and_currentness(
     )
     request = {"acceptance_scope": "test", "_callback": object()}
 
-    event = engine._invocation_events(state, job, request, phase="publication")
+    semantic_attempt = {
+        "attempt_id": "semantic-attempt",
+        "role": "publication",
+    }
+    event = engine._invocation_events(
+        state,
+        job,
+        request,
+        phase="publication",
+        semantic_attempt=semantic_attempt,
+    )
     event("started", requested_thread_id=None, attempt_count=0)
     event("thread_started", reported_thread_id="publication-thread", attempt_count=1)
     event("completed", reported_thread_id="publication-thread", attempt_count=1)
@@ -1116,6 +1133,12 @@ class GitIntegrityRepairAgents(ScriptedAgents):
 
 class CancelledAgents(ScriptedAgents):
     def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+        (self.checkout / "README.md").write_text(
+            "tracked work before cancellation\n", encoding="utf-8"
+        )
+        (self.checkout / "untracked.txt").write_text(
+            "untracked work before cancellation\n", encoding="utf-8"
+        )
         raise KeyboardInterrupt
 
 
@@ -2192,7 +2215,7 @@ def test_agent_owned_clean_commit_routes_to_same_development_thread(
     assert git.commit_subject(candidate_sha) != agent_commit_message
 
 
-def test_cancelled_worker_cleans_stable_ticket_checkout(
+def test_cancelled_worker_preserves_dirty_stable_ticket_checkout(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2210,7 +2233,12 @@ def test_cancelled_worker_cleans_stable_ticket_checkout(
             agents=CancelledAgents(checkout),
         ).deliver(state["run_id"])
 
-    assert not checkout.exists()
+    assert (checkout / "README.md").read_text(encoding="utf-8") == (
+        "tracked work before cancellation\n"
+    )
+    assert (checkout / "untracked.txt").read_text(encoding="utf-8") == (
+        "untracked work before cancellation\n"
+    )
 
 
 def test_resume_reconciles_pr_merged_before_state_save(
@@ -3486,7 +3514,7 @@ def test_publication_success_rechecks_base_before_creating_a_commit(
     assert agents.publication_requests[1]["candidate_sha"] == job["candidate_sha"]
 
 
-def test_existing_pr_recovers_after_publication_pending_base_drift(
+def test_exhausted_publication_operation_retry_is_not_reopened_by_base_drift(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -3515,11 +3543,11 @@ def test_existing_pr_recovers_after_publication_pending_base_drift(
     _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
     publisher.fail_publication_context = False
 
-    completed = engine.deliver(state["run_id"])
+    still_pending = engine.deliver(state["run_id"])
 
-    assert completed["status"] == "ticket_completed"
-    assert completed["active_ticket_job"]["pr_number"] == publisher.pr_number
-    assert publisher.live_head == completed["active_ticket_job"]["publication_sha"]
+    assert still_pending["status"] == "publication_pending"
+    assert still_pending["active_ticket_job"]["pr_number"] == publisher.pr_number
+    assert publisher.live_head == old_published_sha
 
 
 def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(

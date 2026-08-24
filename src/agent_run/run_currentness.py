@@ -4,6 +4,12 @@ from copy import deepcopy
 from typing import Any, Protocol
 
 from agent_run.agent_invocation import canonical_fingerprint
+from agent_run.semantic_attempt import (
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+    retire_semantic_attempt_owner,
+)
 from agent_run.git import GitRepository
 from agent_run.graph import state_from_graph
 from agent_run.models import Repository
@@ -137,6 +143,10 @@ def ticket_completion_records_fingerprint(state: dict[str, Any]) -> str:
 def invalidate_run_acceptance(state: dict[str, Any]) -> dict[str, Any]:
     """Discard one stale Run Acceptance and its generation-local context."""
     run = _mapping(state.get("run_acceptance"), "run_acceptance")
+    pending_review = pending_semantic_attempt(run, role="reviewer")
+    if pending_review is not None:
+        close_semantic_attempt(run, pending_review, outcome="currentness_invalidated")
+        detach_active_invocation(state, pending_review)
     for key in (
         "acceptance_record",
         "acceptance_artifact",
@@ -155,6 +165,14 @@ def invalidate_run_acceptance(state: dict[str, Any]) -> dict[str, Any]:
         "merged",
         "abandoned",
     }:
+        pending_publication = pending_semantic_attempt(publication, role="publication")
+        if pending_publication is not None:
+            close_semantic_attempt(
+                publication,
+                pending_publication,
+                outcome="currentness_invalidated",
+            )
+            detach_active_invocation(state, pending_publication)
         publication["phase"] = "stale"
         publication.pop("approval_grant", None)
     return run
@@ -167,6 +185,12 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
     candidate_history: list[dict[str, Any]] = []
     run_history: list[dict[str, Any]] = []
     if isinstance(repair_job, dict):
+        pending = pending_semantic_attempt(repair_job)
+        if pending is not None:
+            close_semantic_attempt(
+                repair_job, pending, outcome="currentness_invalidated"
+            )
+            detach_active_invocation(state, pending)
         candidate_history = require_candidate_acceptance_history(
             repair_job.get("candidate_acceptance_history", []),
             "run_acceptance.repair_job.candidate_acceptance",
@@ -196,6 +220,13 @@ def invalidate_stale_run_repair(state: dict[str, Any]) -> dict[str, Any]:
                         discarded.append(value)
         if discarded:
             run["discarded_repair_thread_ids"] = discarded
+        retire_semantic_attempt_owner(
+            state,
+            repair_job,
+            owner_kind="run_repair",
+            work_subject=f"run-repair:{state['run_id']}",
+            generation=int(repair_job.get("repair_generation", 1)),
+        )
     run.pop("repair_job", None)
     run.pop("repair_request", None)
     state["active_agent_invocation"] = None

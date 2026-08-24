@@ -14,7 +14,11 @@ from agent_run.approval_grant import (
 )
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.change_delivery import ensure_change_branch_authority
-from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
+from agent_run.delivery_cleanup import (
+    DeliveryCleanupEngine,
+    remove_run_worktrees,
+    require_clean_run_worktrees,
+)
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.external_supervision import (
     is_github_convergence_error,
@@ -26,6 +30,11 @@ from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
 from agent_run.parent_delivery_loop import ParentDeliveryLoop
 from agent_run.state import StateStore
 from agent_run.review_budget import RUN_POLICY, new_budget, reset_budget
+from agent_run.semantic_attempt import (
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+)
 
 
 class ParentDeliveryEngine:
@@ -73,6 +82,7 @@ class ParentDeliveryEngine:
                 return state
             checkout = self.states.root / "worktrees" / run_id / "parent"
             preserve_checkout = False
+            checkout_existed_before_attempt = checkout.exists()
             prepared = self.git.ticket_checkout_matches(
                 checkout, str(job["parent_branch"])
             )
@@ -97,20 +107,31 @@ class ParentDeliveryEngine:
                     github=self.github,
                     agents=self.agents,
                 ).run(state, job, checkout)
-                preserve_checkout = result.get("status") == "waiting_checks" or (
+                preserve_checkout = result.get("status") in {
+                    "waiting_checks",
+                    "requeue_required",
+                    "blocked",
+                    "ready_for_human",
+                } or (
                     job.get("blocked_reason") == "agent_requires_human"
                     and job.get("human_blocker_phase")
                     in {"developing", "repairing"}
                 )
                 return result
             except KeyboardInterrupt:
+                preserve_checkout = checkout_existed_before_attempt or prepared
                 raise
             except BaseException:
-                preserve_checkout = prepared
+                preserve_checkout = checkout_existed_before_attempt or prepared
                 raise
             finally:
                 if not preserve_checkout:
-                    self.git.remove_worktree(checkout)
+                    self.git.remove_worktree(
+                        checkout,
+                        discard_worktree=not (
+                            checkout_existed_before_attempt or prepared
+                        ),
+                    )
                     self._remove_empty_worktree_directories(checkout)
 
     def approve(self, run_id: str) -> dict[str, Any]:
@@ -231,7 +252,7 @@ class ParentDeliveryEngine:
                 self._save(state)
             return state
 
-    def abandon(self, run_id: str) -> dict[str, Any]:
+    def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
             job = _mapping(state, "parent_job")
@@ -239,6 +260,8 @@ class ParentDeliveryEngine:
                 return state
             if job.get("phase") == "abandoned":
                 return state
+            if not discard_worktree:
+                require_clean_run_worktrees(self.git, self.states, run_id)
             abandonment = state.get("run_abandonment")
             if not isinstance(abandonment, dict):
                 pr_number = job.get("pr_number")
@@ -268,7 +291,12 @@ class ParentDeliveryEngine:
                 self.github.abandon_parent_pr(int(parent_pr["pr_number"]))
                 parent_pr["status"] = "completed"
                 self._save(state)
-            remove_run_worktrees(self.git, self.states, run_id)
+            remove_run_worktrees(
+                self.git,
+                self.states,
+                run_id,
+                discard_worktree=discard_worktree,
+            )
             abandonment["phase"] = "completed"
             job["phase"] = "abandoned"
             state.update(
@@ -340,6 +368,10 @@ class ParentDeliveryEngine:
     def _reset_for_revision(
         state: dict[str, Any], job: dict[str, Any], revision: str
     ) -> None:
+        pending = pending_semantic_attempt(job)
+        if pending is not None:
+            close_semantic_attempt(job, pending, outcome="currentness_invalidated")
+            detach_active_invocation(state, pending)
         reset_budget(job, RUN_POLICY)
         for key in (
             "candidate_sha",

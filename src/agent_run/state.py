@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.error_safety import bounded_error
+from agent_run.semantic_attempt import semantic_attempt_subjects
 
 
 MAX_TIMELINE_EVENTS = 256
@@ -143,9 +144,11 @@ def _append_timeline_event(
     state: dict[str, Any], previous: dict[str, Any] | None
 ) -> None:
     marker = _timeline_marker(state)
+    marker.update(_execution_timeline_projection(state))
     marker["result"] = _timeline_result(state)
     if previous is not None:
         previous_marker = _timeline_marker(previous)
+        previous_marker.update(_execution_timeline_projection(previous))
         previous_marker["result"] = _timeline_result(previous)
         if marker == previous_marker:
             return
@@ -183,16 +186,77 @@ def _append_timeline_event(
         "observed_graph_revision",
         "graph_change_summary",
         "next_action",
+        "semantic_attempt_id",
+        "semantic_attempt_role",
+        "semantic_attempt_ordinal",
+        "budget_window",
+        "agent_invocation_started_at",
+        "agent_invocation_status",
+        "output_attempt",
+        "publication_operation_retry_attempts",
+        "publication_operation_retry_limit",
         "result",
     ):
         value = marker.get(key)
-        if value is not None:
-            event[key] = (
-                deepcopy(value) if key == "graph_change_summary" else value
-            )
+        if value is not None or (key == "budget_window" and key in marker):
+            event[key] = deepcopy(value) if key == "graph_change_summary" else value
     if _event_matches_marker(timeline[-1] if timeline else None, marker):
         return
     timeline.append(event)
+
+
+def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
+    """Project independent Agent counters without storing unbounded payloads."""
+
+    projection: dict[str, object] = {}
+    invocation = state.get("active_agent_invocation")
+    invocation_attempt = (
+        invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
+    )
+    attempt = invocation_attempt if isinstance(invocation_attempt, dict) else None
+    subjects = semantic_attempt_subjects(state)
+    invocation_attempt_id = attempt.get("attempt_id") if attempt is not None else None
+    selected_subject: dict[str, Any] | None = None
+    for subject in subjects:
+        pending = subject.get("pending_semantic_attempt")
+        if not isinstance(pending, dict):
+            continue
+        if (
+            invocation_attempt_id is None
+            or pending.get("attempt_id") == invocation_attempt_id
+        ):
+            attempt = pending
+            selected_subject = subject
+            break
+    if attempt is not None:
+        projection.update(
+            {
+                "semantic_attempt_id": attempt.get("attempt_id"),
+                "semantic_attempt_role": attempt.get("role"),
+                "semantic_attempt_ordinal": attempt.get("ordinal"),
+                "budget_window": attempt.get("budget_window"),
+            }
+        )
+    if isinstance(invocation, dict):
+        projection.update(
+            {
+                "agent_invocation_started_at": invocation.get("started_at"),
+                "agent_invocation_status": invocation.get("status"),
+                "output_attempt": invocation.get("attempt_count"),
+            }
+        )
+    retry_subjects = [selected_subject] if selected_subject is not None else subjects
+    for subject in retry_subjects:
+        retry = subject.get("publication_operation_retry")
+        if isinstance(retry, dict):
+            projection.update(
+                {
+                    "publication_operation_retry_attempts": retry.get("attempts"),
+                    "publication_operation_retry_limit": retry.get("limit"),
+                }
+            )
+            break
+    return projection
 
 
 def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:

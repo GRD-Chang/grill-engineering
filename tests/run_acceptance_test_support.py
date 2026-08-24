@@ -5,6 +5,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from agent_run.semantic_attempt import canonical_fingerprint
+
 
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
@@ -84,7 +86,18 @@ def _failed_invocation(
     *, role: str, phase: str, work_subject: str, generation: int,
     requested_thread_id: str | None, reported_thread_id: str | None,
     currentness_boundary: dict[str, object] | None = None,
+    ordinal: int = 1,
 ) -> dict[str, object]:
+    boundary = currentness_boundary or {}
+    semantic_role = "reviewer" if role == "reviewer" else "publication"
+    identity = {
+        "role": semantic_role,
+        "work_subject": work_subject,
+        "generation": generation,
+        "currentness_boundary_fingerprint": canonical_fingerprint(boundary),
+        "ordinal": ordinal,
+        "budget_window": 1 if semantic_role == "reviewer" else None,
+    }
     return {
         "work_subject": work_subject,
         "generation": generation,
@@ -92,7 +105,12 @@ def _failed_invocation(
         "phase": phase,
         "mode": "fresh",
         "input_fingerprint": "fixture",
-        "currentness_boundary": currentness_boundary or {},
+        "currentness_boundary": boundary,
+        "semantic_attempt": {
+            "attempt_id": canonical_fingerprint(identity),
+            **identity,
+            "status": "pending",
+        },
         "status": "failed",
         "requested_thread_id": requested_thread_id,
         "reported_thread_id": reported_thread_id,

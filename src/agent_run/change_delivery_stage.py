@@ -58,6 +58,8 @@ class ChangeDeliveryStage(Protocol):
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None: ...
 
+    def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]: ...
+
     def _invocation_events(
         self,
         state: dict[str, Any],
@@ -66,6 +68,7 @@ class ChangeDeliveryStage(Protocol):
         *,
         role: str = "publication",
         phase: str,
+        semantic_attempt: dict[str, Any],
     ) -> Callable[..., None]: ...
 
     def _wait_for_initial_credential(

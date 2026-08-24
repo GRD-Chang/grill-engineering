@@ -8,7 +8,11 @@ from agent_run.approval_grant import (
     grant_authority,
     grant_matches,
 )
-from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
+from agent_run.delivery_cleanup import (
+    DeliveryCleanupEngine,
+    remove_run_worktrees,
+    require_clean_run_worktrees,
+)
 from agent_run.external_supervision import (
     ensure_supervision_window,
     is_github_convergence_error,
@@ -334,7 +338,7 @@ class RunPublicationApproval(RunPublicationShared):
             state["terminal_kind"] = "final_revision_requested"
             return self._save(state)
 
-    def abandon(self, run_id: str) -> dict[str, Any]:
+    def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
         with self.states.locked():
             state = self._load(run_id)
             if state.get("status") in {"completed", "abandoned"}:
@@ -344,6 +348,8 @@ class RunPublicationApproval(RunPublicationShared):
                 raise ValueError("a merged Run cannot be abandoned")
             if publication["phase"] == "abandoned":
                 return state
+            if not discard_worktree:
+                require_clean_run_worktrees(self.git, self.states, run_id)
             abandonment = state.get("run_abandonment")
             if not isinstance(abandonment, dict):
                 final_pr_number = publication.get("pr_number")
@@ -411,7 +417,12 @@ class RunPublicationApproval(RunPublicationShared):
                 self.github.abandon_run_pr(int(final_pr["pr_number"]))
                 final_pr["status"] = "completed"
                 self._save(state)
-            remove_run_worktrees(self.git, self.states, run_id)
+            remove_run_worktrees(
+                self.git,
+                self.states,
+                run_id,
+                discard_worktree=discard_worktree,
+            )
             abandonment["phase"] = "completed"
             publication["phase"] = "abandoned"
             state.update(

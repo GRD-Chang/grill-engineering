@@ -10,7 +10,7 @@ import pytest
 from agent_run.controller import Controller
 from agent_run.delivery_cleanup import DeliveryCleanupEngine, remove_run_worktrees
 from agent_run.delivery import TicketDeliveryEngine
-from agent_run.git import GitError, GitRepository
+from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
 from conftest import write_fixture
@@ -40,9 +40,11 @@ class PartialCheckoutGit(GitRepository):
         (checkout / "partial").write_text("leftover\n", encoding="utf-8")
         raise OSError("simulated partial checkout failure")
 
-    def remove_worktree(self, checkout: Path) -> None:
+    def remove_worktree(
+        self, checkout: Path, *, discard_worktree: bool = False
+    ) -> None:
         self.cleanup_called = True
-        super().remove_worktree(checkout)
+        super().remove_worktree(checkout, discard_worktree=discard_worktree)
 
 
 class FailingBranchCleanupGit(GitRepository):
@@ -61,6 +63,114 @@ class RecordingBranchPublisher:
 
     def delete_managed_branch(self, branch: str) -> None:
         self.deleted_branches.append(branch)
+
+
+def test_completed_ticket_cleanup_preserves_tracked_modifications(
+    git_repo: Path,
+) -> None:
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    run_id = "run-dirty-tracked"
+    branch = f"agent-run/{run_id}/ticket-3"
+    checkout = states.root / "worktrees" / run_id / "ticket-3"
+    git.prepare_ticket_checkout(
+        branch=branch,
+        base_sha=git.resolve("main"),
+        checkout=checkout,
+    )
+    (checkout / "README.md").write_text("unsaved delivery\n", encoding="utf-8")
+    state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    job = {
+        "ticket_number": 3,
+        "ticket_branch": branch,
+        "phase": "completed",
+        "integrated_sha": git.resolve(branch),
+    }
+    github = RecordingBranchPublisher()
+
+    result = DeliveryCleanupEngine(
+        git=git, states=states, github=github
+    ).complete_ticket(state, job)
+
+    cleanup = result["delivery_cleanup"]
+    item = cleanup["items"][branch]
+    assert cleanup["status"] == "cleanup_pending"
+    assert item["status"] == "cleanup_pending"
+    assert str(checkout) in item["last_error"]
+    assert "tracked modifications" in item["last_error"]
+    assert f"agent-run resume {run_id}" in item["last_error"]
+    assert checkout.exists()
+    assert git.resolve(branch)
+    assert github.deleted_branches == []
+
+
+def test_completed_ticket_cleanup_preserves_untracked_files(
+    git_repo: Path,
+) -> None:
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    run_id = "run-dirty-untracked"
+    branch = f"agent-run/{run_id}/ticket-3"
+    checkout = states.root / "worktrees" / run_id / "ticket-3"
+    git.prepare_ticket_checkout(
+        branch=branch,
+        base_sha=git.resolve("main"),
+        checkout=checkout,
+    )
+    (checkout / "unsaved.txt").write_text("unsaved delivery\n", encoding="utf-8")
+    state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    job = {
+        "ticket_number": 3,
+        "ticket_branch": branch,
+        "phase": "completed",
+        "integrated_sha": git.resolve(branch),
+    }
+
+    result = DeliveryCleanupEngine(git=git, states=states).complete_ticket(state, job)
+
+    item = result["delivery_cleanup"]["items"][branch]
+    assert item["status"] == "cleanup_pending"
+    assert "untracked files" in item["last_error"]
+    assert checkout.exists()
+    assert git.resolve(branch)
+
+
+def test_completed_ticket_cleanup_removes_clean_checkout(git_repo: Path) -> None:
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    run_id = "run-clean"
+    branch = f"agent-run/{run_id}/ticket-3"
+    checkout = states.root / "worktrees" / run_id / "ticket-3"
+    git.prepare_ticket_checkout(
+        branch=branch,
+        base_sha=git.resolve("main"),
+        checkout=checkout,
+    )
+    state = {"run_id": run_id, "status": "completed", "ticket_jobs": {}}
+    job = {
+        "ticket_number": 3,
+        "ticket_branch": branch,
+        "phase": "completed",
+        "integrated_sha": git.resolve(branch),
+    }
+
+    result = DeliveryCleanupEngine(git=git, states=states).complete_ticket(state, job)
+
+    assert result["delivery_cleanup"]["status"] == "completed"
+    assert not checkout.exists()
+    with pytest.raises(GitError):
+        git.resolve(branch)
+
+
+def test_validation_checkout_remains_disposable_when_dirty(git_repo: Path) -> None:
+    git = GitRepository(git_repo)
+    checkout = git_repo / ".agent-run" / "worktrees" / "run-1" / "validation-run-1"
+    git.prepare_validation_checkout(head_sha=git.resolve("main"), checkout=checkout)
+    (checkout / "validation.tmp").write_text("generated\n", encoding="utf-8")
+
+    git.remove_worktree(checkout)
+
+    assert not checkout.exists()
 
 
 def test_partial_checkout_is_cleaned_when_preparation_fails(
@@ -90,6 +200,30 @@ def test_partial_checkout_is_cleaned_when_preparation_fails(
 
     assert partial_git.cleanup_called
     assert not checkout.exists()
+
+
+def test_preexisting_inconsistent_ticket_checkout_is_preserved(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = states.root / "worktrees" / state["run_id"] / "ticket-3"
+    checkout.mkdir(parents=True)
+    evidence = checkout / "unsaved.txt"
+    evidence.write_text("must survive\n", encoding="utf-8")
+
+    with pytest.raises(GitError, match="existing ticket checkout does not match"):
+        TicketDeliveryEngine(
+            git=GitRepository(git_repo),
+            states=states,
+            github=ScriptedPublisher(git_repo),
+            agents=PassAgents(checkout),
+        ).deliver(state["run_id"])
+
+    assert evidence.read_text(encoding="utf-8") == "must survive\n"
 
 
 def test_completed_ticket_cleanup_retries_without_reopening_delivery(
@@ -319,6 +453,59 @@ def test_abandonment_prunes_missing_worktree_registry_entry(
         capture_output=True,
         check=True,
     ).stdout
+
+
+def test_abandonment_preflight_reports_every_dirty_managed_checkout(
+    git_repo: Path,
+) -> None:
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    root = states.root / "worktrees" / "run-1"
+    checkouts = [root / "ticket-2", root / "run-repair"]
+    branches = ["agent-run/run-1/ticket-2", "agent-run-repair/run-1/run"]
+    for checkout, branch in zip(checkouts, branches, strict=True):
+        git.prepare_ticket_checkout(
+            branch=branch,
+            base_sha=git.resolve("main"),
+            checkout=checkout,
+        )
+        (checkout / "unsaved.txt").write_text("unsaved\n", encoding="utf-8")
+
+    with pytest.raises(DirtyManagedCheckoutError) as caught:
+        remove_run_worktrees(git, states, "run-1")
+
+    assert all(str(checkout) in str(caught.value) for checkout in checkouts)
+    assert all(checkout.exists() for checkout in checkouts)
+
+    remove_run_worktrees(git, states, "run-1", discard_worktree=True)
+
+    assert all(not checkout.exists() for checkout in checkouts)
+
+
+def test_managed_checkout_with_missing_git_metadata_is_preserved(
+    git_repo: Path,
+) -> None:
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    checkout = states.root / "worktrees" / "run-1" / "ticket-2"
+    git.prepare_ticket_checkout(
+        branch="agent-run/run-1/ticket-2",
+        base_sha=git.resolve("main"),
+        checkout=checkout,
+    )
+    (checkout / "unsaved.txt").write_text("unsaved\n", encoding="utf-8")
+    (checkout / ".git").unlink()
+
+    with pytest.raises(
+        DirtyManagedCheckoutError, match="Git metadata is missing or inconsistent"
+    ):
+        remove_run_worktrees(git, states, "run-1")
+
+    assert (checkout / "unsaved.txt").is_file()
+
+    remove_run_worktrees(git, states, "run-1", discard_worktree=True)
+
+    assert not checkout.exists()
 
 
 def test_abandonment_keeps_recovery_pending_when_prune_fails(

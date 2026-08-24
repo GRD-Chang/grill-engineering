@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from agent_run.git import GitRepository
 from agent_run.state import StateStore
+from agent_run.semantic_attempt import (
+    allocate_semantic_attempt,
+    release_semantic_attempt,
+)
 from conftest import write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 
@@ -174,6 +180,101 @@ def human_blocker_step(thread_id: str) -> dict[str, object]:
         "thread_id": thread_id,
         "human_blockers": [HUMAN_BLOCKER],
     }
+
+
+def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    interrupted_agents = git_repo / "interrupted-last-attempt.json"
+    interrupted_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "ticket-last-attempt",
+                        "write_files": {"partial.txt": "preserve me\n"},
+                        "keyboard_interrupt_after_writes": True,
+                    }
+                ],
+                "publications": [],
+                "reviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+
+    interrupted = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(interrupted_agents),
+    )
+
+    assert interrupted.returncode == 130
+    assert stdout_json(interrupted)["status"] == "execution_failed"
+    state = load_only_run_state(git_repo)
+    job = state["active_ticket_job"]
+    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
+    assert (checkout / "partial.txt").read_text(encoding="utf-8") == "preserve me\n"
+    active = state["active_agent_invocation"]
+    boundary = deepcopy(active["currentness_boundary"])
+    release_semantic_attempt(job)
+    job["pending_attempt"] = 4
+    job["modification_attempts"] = 3
+    job["review_budget"]["development_attempts"] = 4
+    attempt = allocate_semantic_attempt(
+        job,
+        role="development",
+        work_subject=f"ticket:{job['ticket_number']}",
+        generation=job["ticket_branch_generation"],
+        currentness_boundary=boundary,
+        ordinal=4,
+        budget_window=job["review_budget"]["window"],
+    )
+    active["semantic_attempt"] = deepcopy(attempt)
+    state["ticket_jobs"]["3"] = deepcopy(job)
+    StateStore(git_repo / ".agent-run").save_run(run_id, state)
+
+    status = run_cli(git_repo, fixture, "status", run_id, "--json")
+    status_output = stdout_json(status)
+    assert status_output["semantic_agent_attempt"]["ordinal"] == 4
+    assert status_output["next_action"] == f"agent-run resume {run_id}"
+
+    recovery_data = final_run_agents()
+    recovery_data["developments"] = [
+        {
+            "expected_thread_id": "ticket-last-attempt",
+            "thread_id": "ticket-last-attempt",
+            "summary": "Completed the interrupted final budget attempt.",
+            "expected_files": {"partial.txt": "preserve me\n"},
+            "write_files": {"feature.txt": "done\n"},
+        }
+    ]
+    recovery_agents = git_repo / "recover-last-attempt.json"
+    recovery_agents.write_text(json.dumps(recovery_data), encoding="utf-8")
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    completed_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
+    assert completed_job["review_budget"]["development_attempts"] == 4
+    assert completed_job["modification_attempts"] == 4
+    assert any(
+        item["attempt_id"] == attempt["attempt_id"]
+        for item in completed_job["semantic_attempt_history"]
+    )
 
 
 def test_resume_human_blocker_records_bounded_response_and_reuses_development_thread(
@@ -871,6 +972,7 @@ def test_parent_only_publication_human_blocker_stops_before_pr_mutation(
     assert job["human_blocker_phase"] == "accepted"
     assert job["publication_thread_id"] == "parent-developer"
     assert job["publication_attempts"] == 1
+    pending_publication_attempt = job["pending_semantic_attempt"]["attempt_id"]
     assert "publication_sha" not in job
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
         "pull_requests"
@@ -900,7 +1002,10 @@ def test_parent_only_publication_human_blocker_stops_before_pr_mutation(
 
     assert resumed.returncode == 0, resumed.stderr
     resumed_job = load_only_run_state(git_repo)["parent_job"]
-    assert resumed_job["publication_attempts"] == 2
+    assert resumed_job["publication_attempts"] == 1
+    assert resumed_job["semantic_attempt_history"][-1]["attempt_id"] == (
+        pending_publication_attempt
+    )
     assert resumed_job["phase"] == "ready_for_approval"
 
 def test_parent_only_malformed_publication_is_execution_failed_and_resumes(
@@ -984,7 +1089,7 @@ def test_parent_only_malformed_publication_is_execution_failed_and_resumes(
     resumed_job = load_only_run_state(git_repo)["parent_job"]
     assert resumed_job["modification_attempts"] == 1
     assert resumed_job["validation_attempts"] == 1
-    assert resumed_job["publication_attempts"] == 2
+    assert resumed_job["publication_attempts"] == 1
     assert {
         "candidate_sha": resumed_job["candidate_sha"],
         "acceptance_record": resumed_job["acceptance_record"],
@@ -1514,6 +1619,80 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert replayed_fixture["delivery"]["mutations"] == frozen_mutations
     assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+
+
+def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-dirty-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-dirty",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-reviewer-dirty",
+                        "parent-feature.txt is present in the candidate.",
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "parent"
+    current = load_only_run_state(git_repo)
+    GitRepository(git_repo).prepare_ticket_checkout(
+        branch=current["parent_job"]["parent_branch"],
+        base_sha=current["parent_job"]["base_sha"],
+        checkout=checkout,
+    )
+    (checkout / "README.md").write_text("unsaved delivery\n", encoding="utf-8")
+    mutations_before = list(
+        json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["mutations"]
+    )
+
+    refused = run_cli(git_repo, fixture, "abandon", run_id)
+
+    assert refused.returncode == 2
+    refusal = stdout_json(refused)
+    assert refusal["diagnostics"][0]["code"] == "dirty_managed_checkout"
+    refusal_message = refusal["diagnostics"][0]["message"]
+    assert str(checkout) in refusal_message
+    assert "tracked modifications" in refusal_message
+    assert f"agent-run resume {run_id}" in refusal_message
+    assert (
+        json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["mutations"]
+        == mutations_before
+    )
+    assert checkout.exists()
+
+    discarded = run_cli(git_repo, fixture, "abandon", run_id, "--discard-worktree")
+
+    assert discarded.returncode == 0, discarded.stderr
+    assert stdout_json(discarded)["status"] == "abandoned"
+    assert not checkout.exists()
+    assert {"action": "close_parent_pr", "pr_number": 1} in json.loads(
+        fixture.read_text(encoding="utf-8")
+    )["delivery"]["mutations"]
 
 
 @pytest.mark.parametrize(
@@ -2570,7 +2749,7 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
 
     assert resumed.returncode == 0, resumed.stderr
     resumed_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
-    assert resumed_job["publication_attempts"] == 2
+    assert resumed_job["publication_attempts"] == 1
     assert resumed_job["phase"] == "completed"
 
 
@@ -2631,6 +2810,7 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     assert failed_job["publication_attempts"] == 1
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"] == []
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    original_invocation = failed_state["active_agent_invocation"]
     failed_state["active_agent_invocation"] = {
         "work_subject": "ticket:3",
         "generation": failed_job["ticket_branch_generation"],
@@ -2638,7 +2818,8 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
         "phase": "publication",
         "mode": "fresh",
         "input_fingerprint": "fixture",
-        "currentness_boundary": {},
+        "currentness_boundary": original_invocation["currentness_boundary"],
+        "semantic_attempt": failed_job["pending_semantic_attempt"],
         "status": "failed",
         "requested_thread_id": None,
         "reported_thread_id": "publication-thread-1",
@@ -2699,8 +2880,13 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
     completed_job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
     assert completed_job["modification_attempts"] == 1
     assert completed_job["validation_attempts"] == 1
-    assert completed_job["publication_attempts"] == 2
-    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 1
+    assert completed_job["publication_attempts"] == 1
+    assert (
+        len(
+            json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
+        )
+        == 1
+    )
     completed_state = load_only_run_state(git_repo)
     successor = completed_state["active_agent_invocation"]
     assert successor["status"] == "completed"
@@ -2814,6 +3000,7 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
     completed_ticket["publication_thread_id"] = "completed-ticket-publication"
     repair_job = failed_state["run_acceptance"]["repair_job"]
     repair_job["publication_thread_id"] = "run-repair-publication-1"
+    original_invocation = failed_state["active_agent_invocation"]
     failed_state["active_agent_invocation"] = {
         "work_subject": f"run-repair:{run_id}",
         "generation": repair_job["repair_generation"],
@@ -2821,7 +3008,8 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
         "phase": "publication",
         "mode": "fresh",
         "input_fingerprint": "fixture",
-        "currentness_boundary": {},
+        "currentness_boundary": original_invocation["currentness_boundary"],
+        "semantic_attempt": repair_job["pending_semantic_attempt"],
         "status": "failed",
         "requested_thread_id": None,
         "reported_thread_id": "run-repair-publication-1",

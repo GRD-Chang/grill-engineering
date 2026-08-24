@@ -202,6 +202,9 @@ def test_worker_failure_before_publication_artifact_is_not_retried(
     assert interrupted is not None
     assert interrupted["run_publication"]["phase"] == "publishing"
     assert interrupted["run_publication"]["publication_attempts"] == 1
+    pending_attempt_id = interrupted["run_publication"]["pending_semantic_attempt"][
+        "attempt_id"
+    ]
     assert agents.attempts == 1
     assert interrupted["run_acceptance"]["phase"] == "accepted"
 
@@ -214,7 +217,11 @@ def test_worker_failure_before_publication_artifact_is_not_retried(
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
     assert retried["status"] == "run_approval_pending"
-    assert retried["run_publication"]["publication_attempts"] == 2
+    assert retried["run_publication"]["publication_attempts"] == 1
+    assert (
+        retried["run_publication"]["semantic_attempt_history"][-1]["attempt_id"]
+        == pending_attempt_id
+    )
     assert retried["run_acceptance"]["phase"] == "accepted"
 
 def test_malformed_final_run_publication_is_not_retried(
@@ -532,7 +539,8 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
     assert history[-1]["status"] == "completed"
     assert history[-1]["attempt_count"] == 1
 
-def test_publish_run_retries_only_exhausted_final_run_publication(
+
+def test_publish_run_cannot_bypass_exhausted_final_run_operation_retry(
     git_repo: Path,
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -562,13 +570,17 @@ def test_publish_run_retries_only_exhausted_final_run_publication(
     )
 
     assert resumed.returncode == 0, resumed.stderr
-    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    assert stdout_json(resumed)["status"] == "publication_pending"
     recovered = states.load_run(str(state["run_id"]))
     assert recovered is not None
     assert recovered["run_acceptance"]["acceptance_record"] == acceptance
     assert recovered["run_publication"]["publication_attempts"] == 1
+    retry = recovered["run_publication"]["publication_operation_retry"]
+    assert retry["attempts"] == retry["limit"]
+    assert recovered["run_publication"]["artifact"]
 
-def test_recovered_publication_replaces_the_pending_terminal_kind(
+
+def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
     git_repo: Path,
 ) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
@@ -593,8 +605,8 @@ def test_recovered_publication_replaces_the_pending_terminal_kind(
     ).publish(str(state["run_id"]))
 
     assert pending["terminal_kind"] == "publication_pending"
-    assert waiting["status"] == "waiting_checks"
-    assert waiting["terminal_kind"] == "waiting_checks"
+    assert waiting["status"] == "publication_pending"
+    assert waiting["terminal_kind"] == "publication_pending"
 
 def test_final_run_publication_receives_only_role_required_facts(
     git_repo: Path,
@@ -841,7 +853,10 @@ def test_final_run_publication_invocation_binds_accepted_run_identity(
     }
     assert completed["agent_invocation_history"][-1] == invocation
 
-def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> None:
+
+def test_retries_publication_operation_without_a_fresh_narrative_agent(
+    git_repo: Path,
+) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     agents = RunPublicationAgents()
     publisher.data["delivery"]["crash_after_ensure_run_pr_once"] = True
@@ -857,7 +872,9 @@ def test_retries_publication_with_a_fresh_narrative_agent(git_repo: Path) -> Non
     retried = engine.publish(str(state["run_id"]))
 
     assert retried["status"] == "run_approval_pending"
-    assert len(agents.requests) == 2
+    assert len(agents.requests) == 1
+    assert retried["run_publication"]["publication_attempts"] == 1
+    assert retried["run_publication"]["publication_operation_retry"]["attempts"] == 1
 
 def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)

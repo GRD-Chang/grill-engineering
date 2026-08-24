@@ -132,6 +132,10 @@ def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
     assert waiting["status"] == "waiting_external"
     assert waiting["terminal_kind"] == "waiting_external"
     assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert waiting["run_publication"]["publication_operation_retry"] == {
+        "attempts": 1,
+        "limit": 5,
+    }
     assert waiting["supervision_window"]["kind"] == "github_convergence"
     assert waiting["diagnostics"][0]["waiting_for"].endswith(
         "Required Checks observation"

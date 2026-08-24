@@ -4,6 +4,7 @@ import argparse
 from typing import Any, Callable
 
 from agent_run.controller import Controller
+from agent_run.external_supervision import is_github_refresh_wait
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     human_blocker_subject_count,
@@ -11,6 +12,7 @@ from agent_run.state_contract import (
 )
 from agent_run.cli_presentation import _print_precondition_failure
 from agent_run.review_budget import budget_checkpoint_subjects
+from agent_run.semantic_attempt import invocation_attempt_is_pending
 
 
 def _run_to_human_gate(
@@ -50,7 +52,15 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         }
 
     invocation = state.get("active_agent_invocation")
-    if isinstance(invocation, dict) and invocation.get("status") == "failed":
+    if (
+        (
+            state.get("status") == "execution_failed"
+            or is_github_refresh_wait(state)
+        )
+        and isinstance(invocation, dict)
+        and invocation.get("status") in {"failed", "completed"}
+        and invocation_attempt_is_pending(state, invocation)
+    ):
         return True
     return (
         human_blocker_subject_count(state) == 1
@@ -72,7 +82,9 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
         # Deterministic publisher/check reconciliation retains its historical
         # lifecycle command recovery path.
         return not (
-            isinstance(invocation, dict) and invocation.get("status") == "failed"
+            isinstance(invocation, dict)
+            and invocation.get("status") in {"failed", "completed"}
+            and invocation_attempt_is_pending(state, invocation)
         )
     if status in {
         "unsupported_scope_change",

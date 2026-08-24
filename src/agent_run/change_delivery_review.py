@@ -14,6 +14,11 @@ from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.change_delivery_threads import record_reviewer as _record_reviewer
 from agent_run.credential_availability import clear_initial_credential_wait
+from agent_run.semantic_attempt import (
+    allocate_semantic_attempt,
+    close_semantic_attempt,
+    pending_semantic_attempt,
+)
 
 
 def review(
@@ -26,17 +31,41 @@ def review(
     # Any result retained for a prior base/candidate must not survive into
     # an interrupted fresh attempt.
     job.pop("pending_review_result", None)
-    attempt = int(job.get("validation_attempts", 0)) + 1
-    job["validation_attempts"] = attempt
+    pending_attempt = pending_semantic_attempt(job, role="reviewer")
+    attempt = (
+        int(pending_attempt["ordinal"])
+        if pending_attempt is not None
+        else int(job.get("validation_attempts", 0)) + 1
+    )
+    if pending_attempt is None:
+        job["validation_attempts"] = attempt
     stage._sync_attempts(state, job)
     job["phase"] = "reviewing"
+    work_subject, generation = stage.adapter.invocation_identity(state, job)
+    budget = job.get("review_budget")
+    if not isinstance(budget, dict) or type(budget.get("window")) is not int:
+        raise ValueError("Reviewer is missing its Review Budget Window")
+    semantic_attempt = allocate_semantic_attempt(
+        job,
+        role="reviewer",
+        work_subject=work_subject,
+        generation=generation,
+        currentness_boundary=stage._invocation_boundary(job),
+        ordinal=attempt,
+        budget_window=int(budget["window"]),
+    )
     stage.save(state)
     validation = checkout.parent / f"validation-{stage.contract.label}-{attempt}"
     try:
         stage.publisher.prepare_validation(checkout, job, validation)
         request = stage.adapter.review_request(state, job, validation)
         request["_invocation_event"] = stage._invocation_events(
-            state, job, request, role="fresh_acceptance", phase="reviewing"
+            state,
+            job,
+            request,
+            role="fresh_acceptance",
+            phase="reviewing",
+            semantic_attempt=semantic_attempt,
         )
         request["_currentness_check"] = lambda: stage._agent_is_current(state, job)
         if job.get("review_new_thread") is True:
@@ -61,7 +90,9 @@ def review(
         # identity must remain durable before a fresh output attempt.
         stage.save(state)
         raise
-    stage.mark_review_invocation(job)
+    if semantic_attempt.get("budget_consumed") is not True:
+        stage.mark_review_invocation(job)
+        semantic_attempt["budget_consumed"] = True
     job["pending_review_result"] = {
         "reviewer_thread_id": review.thread_id,
         "artifact": artifact.raw,
@@ -154,6 +185,10 @@ def complete_review(
             code="reviewer_requires_human",
         )
         return
+    semantic_attempt = pending_semantic_attempt(job, role="reviewer")
+    if semantic_attempt is None:
+        raise ValueError("Reviewer closeout is missing its Semantic Attempt")
+    close_semantic_attempt(job, semantic_attempt, outcome="acceptance_artifact")
     clear_current_human_blocker(job)
     if isinstance(existing_pr, int):
         stage._record_agent_run_status(

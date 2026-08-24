@@ -127,15 +127,33 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
     assert interrupted.returncode == 2
     interrupted_state = load_only_run_state(git_repo)
     active = interrupted_state.get("active_ticket_job")
+    invocation = interrupted_state.get("active_agent_invocation")
+    invocation_thread = (
+        invocation.get("reported_thread_id") or invocation.get("requested_thread_id")
+        if isinstance(invocation, dict)
+        else None
+    )
     expected_thread = (
         active.get("development_thread_id")
         if isinstance(active, dict)
         and isinstance(active.get("development_thread_id"), str)
-        else None
+        else (
+            invocation_thread
+            if isinstance(invocation, dict)
+            and invocation.get("role") == "development"
+            and isinstance(invocation_thread, str)
+            else None
+        )
     )
     recovery_agents = _write_agents(
         git_repo / "agents-recovery.json",
-        reviewer="reviewer-recovery",
+        reviewer=(
+            invocation_thread
+            if isinstance(invocation, dict)
+            and invocation.get("role") == "fresh_acceptance"
+            and isinstance(invocation_thread, str)
+            else "reviewer-recovery"
+        ),
         expected_thread_id=expected_thread,
     )
 
@@ -143,6 +161,53 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         git_repo,
         fixture,
         "deliver",
+        run_id,
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+
+    assert recovered.returncode == 0, recovered.stdout
+    _assert_exactly_once_delivery(git_repo, fixture)
+
+
+def test_public_resume_recovers_completed_invocation_with_pending_attempt(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _ticket()}
+    )
+    first_agents = _write_agents(
+        git_repo / "agents-first.json", reviewer="reviewer-first"
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+
+    interrupted = run_internal_stage(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(first_agents),
+        "--crash-after-save",
+        "8",
+    )
+
+    assert interrupted.returncode == 2
+    interrupted_state = load_only_run_state(git_repo)
+    invocation = interrupted_state["active_agent_invocation"]
+    assert interrupted_state["status"] == "execution_failed"
+    assert invocation["status"] == "completed"
+    assert invocation["semantic_attempt"]["status"] == "pending"
+    recovery_agents = _write_agents(
+        git_repo / "agents-recovery.json",
+        reviewer="reviewer-recovery",
+        expected_thread_id="developer-2",
+    )
+
+    recovered = run_cli(
+        git_repo,
+        fixture,
+        "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),

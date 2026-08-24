@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_run.agent_profiles import AgentProfileStore
+from agent_run.agent_invocation import fail_interrupted_invocation
 from agent_run.change_currentness import (
     candidate_or_acceptance_is_inconsistent,
     has_currentness_facts,
@@ -47,6 +48,7 @@ from agent_run.requeue_supervision import (
     wait_for_recoverable_github_read,
 )
 from agent_run.scope_changes import reconcile_structure
+from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -217,6 +219,13 @@ class Controller:
             }:
                 return existing, True
             resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
+            existing_invocation = existing.get("active_agent_invocation")
+            resume_completed_invocation = (
+                existing.get("status") == "execution_failed"
+                and isinstance(existing_invocation, dict)
+                and existing_invocation.get("status") == "completed"
+                and invocation_attempt_is_pending(existing, existing_invocation)
+            )
             if resuming_supervision_timeout:
                 if new_thread or human_response is not None or message is not None:
                     raise ValueError(
@@ -303,7 +312,9 @@ class Controller:
                 else:
                     _clear_current_invocation_thread(state)
             else:
-                _restore_current_invocation_thread(state)
+                _restore_current_invocation_thread(
+                    state, allow_completed=resume_completed_invocation
+                )
             _mark_failed_invocation_resuming(state)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
@@ -545,6 +556,13 @@ class Controller:
                 and state.get("repository") != repository.name_with_owner
             ):
                 return False
+            active = state.get("active_agent_invocation")
+            if isinstance(active, dict) and isinstance(active.get("role"), str):
+                fail_interrupted_invocation(
+                    state,
+                    role=str(active["role"]),
+                    save=lambda _state: None,
+                )
             state.update(
                 {
                     "status": "execution_failed",
@@ -913,6 +931,7 @@ class Controller:
             "run_id": run_id,
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
+            "semantic_attempt_protocol": 1,
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
             "base": {"branch": repository.default_branch, "sha": base_sha},
@@ -1387,11 +1406,20 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
         mirror.pop("publication_failure_resume", None)
 
 
-def _restore_current_invocation_thread(state: dict[str, Any]) -> None:
+def _restore_current_invocation_thread(
+    state: dict[str, Any], *, allow_completed: bool = False
+) -> None:
     invocation = state.get("active_agent_invocation")
     if (
         not isinstance(invocation, dict)
-        or invocation.get("status") != "failed"
+        or invocation.get("status") not in {"failed", "completed"}
+        or (
+            invocation.get("status") == "completed"
+            and not allow_completed
+        )
+        or not isinstance(invocation.get("semantic_attempt"), dict)
+        or invocation["semantic_attempt"].get("status") != "pending"
+        or not invocation_attempt_is_pending(state, invocation)
         or invocation.get("role")
         not in {
             "development",

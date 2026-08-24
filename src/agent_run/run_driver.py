@@ -201,6 +201,11 @@ class DirectRunOperations:
         if self._cannot_advance(refreshed):
             return self.classify(refreshed)
         publication = refreshed.get("run_publication")
+        if (
+            isinstance(publication, dict)
+            and publication.get("phase") == "publication_pending"
+        ):
+            return self.classify(refreshed)
         eligible = refreshed.get("status") == "run_publication_pending" or (
             isinstance(publication, dict)
             and refreshed.get("status")
@@ -450,14 +455,16 @@ def _next_step(state: dict[str, Any]) -> RunStep | None:
     if status == "waiting_merge":
         return RunStep.DELIVER
     publication = state.get("run_publication")
+    if status == "publication_pending":
+        return None
     if status == "run_publication_pending" or (
-        status in {"publication_pending", "waiting_checks", "waiting_external"}
+        status in {"waiting_checks", "waiting_external"}
         and isinstance(publication, dict)
         and publication.get("phase")
         in {"publication_pending", "waiting_checks", "waiting_external", "ready_for_approval"}
     ):
         return RunStep.PUBLISH
-    if status in {"publication_pending", "waiting_checks"}:
+    if status == "waiting_checks":
         return RunStep.DELIVER
     if status == "waiting_external":
         return RunStep.REQUEUE if isinstance(state.get("requeue_transition"), dict) else RunStep.DELIVER

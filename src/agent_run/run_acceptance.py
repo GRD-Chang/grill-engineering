@@ -49,6 +49,13 @@ from agent_run.review_budget import (
     new_budget,
     previous_review_context,
 )
+from agent_run.semantic_attempt import (
+    allocate_semantic_attempt,
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+    release_semantic_attempt,
+)
 
 
 _RUN_ACCEPTANCE_CREDENTIAL_SUBJECT = "run-acceptance"
@@ -165,7 +172,10 @@ class RunAcceptanceEngine:
                 if phase != "pending":
                     raise ValueError(f"unknown Run Acceptance phase: {phase}")
                 budget = ensure_budget(run, RUN_POLICY)
-                if int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit:
+                if (
+                    pending_semantic_attempt(run, role="reviewer") is None
+                    and int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit
+                ):
                     run["phase"] = "ready_for_human"
                     run["blocked_reason"] = "review_budget_exhausted"
                     budget["checkpoint_reason"] = "review_budget_exhausted"
@@ -190,8 +200,14 @@ class RunAcceptanceEngine:
             state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
         )
         run_head = self.git.resolve(str(state["run_branch"]))
-        validation_attempt = int(run.get("validation_attempts", 0)) + 1
-        run["validation_attempts"] = validation_attempt
+        pending_attempt = pending_semantic_attempt(run, role="reviewer")
+        validation_attempt = (
+            int(pending_attempt["ordinal"])
+            if pending_attempt is not None
+            else int(run.get("validation_attempts", 0)) + 1
+        )
+        if pending_attempt is None:
+            run["validation_attempts"] = validation_attempt
         run["phase"] = "reviewing"
         self._save(state)
         checkout = self._validation_checkout(state, validation_attempt)
@@ -225,6 +241,22 @@ class RunAcceptanceEngine:
             request = self._review_request(
                 state, run, checkout, run_head, default_head, expected_merge_tree
             )
+            boundary = run_currentness_boundary(
+                state,
+                reviewed_head_sha=run_head,
+                reviewed_default_base_sha=default_head,
+                expected_merge_tree=expected_merge_tree,
+            )
+            semantic_attempt = allocate_semantic_attempt(
+                run,
+                role="reviewer",
+                work_subject=f"run-acceptance:{state['run_id']}",
+                generation=int(run["acceptance_generation"]),
+                currentness_boundary=boundary,
+                ordinal=validation_attempt,
+                budget_window=int(ensure_budget(run, RUN_POLICY)["window"]),
+            )
+            self._save(state)
             if run.get("reviewer_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
             request["_invocation_event"] = invocation_event_recorder(
@@ -234,12 +266,8 @@ class RunAcceptanceEngine:
                 work_subject=f"run-acceptance:{state['run_id']}",
                 generation=int(run["acceptance_generation"]),
                 invocation_input=request,
-                currentness_boundary=run_currentness_boundary(
-                    state,
-                    reviewed_head_sha=run_head,
-                    reviewed_default_base_sha=default_head,
-                    expected_merge_tree=expected_merge_tree,
-                ),
+                currentness_boundary=boundary,
+                semantic_attempt=semantic_attempt,
                 save=self._save,
             )
             request["_currentness_check"] = lambda: (
@@ -261,7 +289,9 @@ class RunAcceptanceEngine:
                 # generation and make the next Driver pass retry only its
                 # first read credential, not an interrupted Worker attempt.
                 run["phase"] = "pending"
-                run["validation_attempts"] = validation_attempt - 1
+                if pending_attempt is None:
+                    run["validation_attempts"] = validation_attempt - 1
+                    release_semantic_attempt(run)
                 wait_for_initial_credential(
                     state,
                     work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT,
@@ -279,12 +309,18 @@ class RunAcceptanceEngine:
             # re-checking because the Reviewer did complete a valid audit even
             # when a live boundary refresh discards that verdict.
             artifact = AcceptanceArtifact.parse(review.artifact)
-            mark_review(run, RUN_POLICY)
+            if semantic_attempt.get("budget_consumed") is not True:
+                mark_review(run, RUN_POLICY)
+                semantic_attempt["budget_consumed"] = True
             # The reviewer has already consumed this identity even if a live
             # authority refresh discards its verdict.  Keep it unavailable to
             # the fresh Acceptance that follows a drift.
             self._record_reviewer(state, run, review.thread_id)
             if not request["_currentness_check"]():
+                close_semantic_attempt(
+                    run, semantic_attempt, outcome="currentness_invalidated"
+                )
+                detach_active_invocation(state, semantic_attempt)
                 run["phase"] = "pending"
                 self._save(state)
                 return False
@@ -322,6 +358,7 @@ class RunAcceptanceEngine:
             }
         )
         if artifact.is_accepted:
+            close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
             clear_current_human_blocker(run)
             run["phase"] = "accepted"
         elif artifact.requires_human:
@@ -347,6 +384,7 @@ class RunAcceptanceEngine:
                 }
             )
         else:
+            close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
             clear_current_human_blocker(run)
             budget = ensure_budget(run, RUN_POLICY)
             if int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit:

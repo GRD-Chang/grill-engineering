@@ -13,6 +13,7 @@ from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.controller import Controller, _resume_review_budget_window
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.run_currentness import run_currentness_boundary
 from agent_run.run_currentness import (
     ticket_completion_records,
     ticket_integration_records,
@@ -832,6 +833,9 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
         requested_thread_id=None,
         reported_thread_id="failed-run-reviewer",
     )
+    state["run_acceptance"]["pending_semantic_attempt"] = state[
+        "active_agent_invocation"
+    ]["semantic_attempt"]
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -870,7 +874,11 @@ def test_second_reviewer_attempt_keeps_the_run_acceptance_generation(
         generation=1,
         requested_thread_id=None,
         reported_thread_id="second-run-reviewer",
+        ordinal=2,
     )
+    state["run_acceptance"]["pending_semantic_attempt"] = state[
+        "active_agent_invocation"
+    ]["semantic_attempt"]
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -917,6 +925,14 @@ def test_resume_rejects_stale_run_invocation_before_agent_start(
         reported_thread_id="failed-thread",
         currentness_boundary={"reviewed_head_sha": "stale-head"},
     )
+    attempt_owner = (
+        state["run_publication"]
+        if role == "final_publication"
+        else state["run_acceptance"]
+    )
+    attempt_owner["pending_semantic_attempt"] = state["active_agent_invocation"][
+        "semantic_attempt"
+    ]
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -1150,6 +1166,12 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
         "development_thread_history": [],
         "reviewer_thread_ids": [],
     }
+    default_head = git.resolve("main")
+    run_head = git.resolve(str(state["run_branch"]))
+    expected_merge_tree = git.expected_merge_tree(
+        default_head_sha=default_head,
+        run_head_sha=run_head,
+    )
     state["active_agent_invocation"] = _failed_invocation(
         role="reviewer",
         phase="run_acceptance",
@@ -1157,7 +1179,16 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
         generation=1,
         requested_thread_id=None,
         reported_thread_id="failed-run-reviewer",
+        currentness_boundary=run_currentness_boundary(
+            state,
+            reviewed_head_sha=run_head,
+            reviewed_default_base_sha=default_head,
+            expected_merge_tree=expected_merge_tree,
+        ),
     )
+    state["run_acceptance"]["pending_semantic_attempt"] = state[
+        "active_agent_invocation"
+    ]["semantic_attempt"]
     state["status"] = "execution_failed"
     states.save_run(str(state["run_id"]), state)
 
@@ -1527,7 +1558,7 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
         if new_thread
         else ["blocked-run-reviewer"]
     )
-    assert len(set(agents.checkouts)) == 2
+    assert len(set(agents.checkouts)) == 1
     assert all(not checkout.exists() for checkout in agents.checkouts)
     assert run["human_blocker_history"] == [
         {

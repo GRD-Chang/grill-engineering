@@ -8,6 +8,8 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.review_budget import RUN_POLICY, TICKET_POLICY
+from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.semantic_attempt import invocation_attempt_is_pending
 
 def _print_precondition_failure(state: dict[str, object]) -> None:
     active = _active_ticket_job(state)
@@ -30,6 +32,7 @@ def _print_precondition_failure(state: dict[str, object]) -> None:
                 ],
                 "scope_change": state.get("unsupported_scope_change"),
                 "abandonment": state.get("run_abandonment"),
+                "delivery_cleanup": _public_delivery_cleanup(state),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -47,9 +50,12 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     invocation = state.get("active_agent_invocation")
     active_invocation = (
         invocation
-        if isinstance(invocation, dict) and invocation.get("status") == "running"
+        if isinstance(invocation, dict)
+        and invocation.get("status") in {"running", "failed", "resuming"}
         else None
     )
+    semantic_attempt = _current_semantic_attempt(state, active_invocation)
+    delivery_cleanup = _public_delivery_cleanup(state)
     output = {
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
@@ -69,6 +75,17 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
         "agent_invocation": active_invocation,
+        "semantic_agent_attempt": semantic_attempt,
+        "output_attempt": _output_attempt(active_invocation),
+        "budget_window": (
+            semantic_attempt.get("budget_window")
+            if isinstance(semantic_attempt, dict)
+            else (
+                review_budget.get("window") if isinstance(review_budget, dict) else None
+            )
+        ),
+        "publication_operation_retry": _current_publication_operation_retry(state),
+        "delivery_cleanup": delivery_cleanup,
         "supervision": public_supervision_snapshot(state),
     }
     if as_json:
@@ -111,6 +128,52 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         )
     else:
         print("当前 Codex: none")
+    if isinstance(semantic_attempt, dict):
+        print(
+            "Semantic Agent Attempt: "
+            f"{semantic_attempt.get('attempt_id')}；"
+            f"{semantic_attempt.get('role')}；"
+            f"ordinal {semantic_attempt.get('ordinal')}；"
+            f"{semantic_attempt.get('status')}"
+        )
+    else:
+        print("Semantic Agent Attempt: none")
+    if isinstance(active_invocation, dict):
+        print(
+            "Agent Invocation: "
+            f"{active_invocation.get('role')} {active_invocation.get('status')}"
+        )
+    else:
+        print("Agent Invocation: none")
+    output_attempt = output["output_attempt"]
+    print(
+        "Output Attempt: "
+        f"{output_attempt.get('attempt_count') if isinstance(output_attempt, dict) else 'none'}"
+    )
+    print(f"Budget Window: {output['budget_window'] or 'none'}")
+    operation_retry = output["publication_operation_retry"]
+    if isinstance(operation_retry, dict):
+        print(
+            "Publication Operation Retry: "
+            f"{operation_retry.get('attempts')}/{operation_retry.get('limit')}"
+        )
+    else:
+        print("Publication Operation Retry: none")
+    if isinstance(delivery_cleanup, dict):
+        print(
+            "Delivery Cleanup: "
+            f"{delivery_cleanup.get('status')}；{delivery_cleanup.get('last_error')}"
+        )
+        items = delivery_cleanup.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                print(
+                    "  Preserved Checkout: "
+                    f"{item.get('checkout')}；{item.get('last_error')}；"
+                    f"恢复={item.get('recovery_action')}"
+                )
     if isinstance(run_repair, dict):
         print(
             "运行修复: "
@@ -156,12 +219,26 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     invocations = state.get("agent_invocation_history", [])
     if not isinstance(invocations, list):
         raise ValueError("agent_invocation_history must be an array")
+    semantic_attempts = _semantic_attempt_history(state)
+    operation_retries = _publication_operation_retries(state)
     output = {
         "run_id": state.get("run_id"),
         "timeline": timeline,
         "next_action": _next_action(state),
         "abandonment": state.get("run_abandonment"),
         "agent_invocations": invocations,
+        "semantic_agent_attempts": semantic_attempts,
+        "output_attempts": [
+            {
+                "invocation_started_at": invocation.get("started_at"),
+                "work_subject": invocation.get("work_subject"),
+                "attempt_count": invocation.get("attempt_count"),
+            }
+            for invocation in invocations
+            if isinstance(invocation, dict)
+        ],
+        "budget_windows": _budget_windows(semantic_attempts),
+        "publication_operation_retries": operation_retries,
         "supervision": public_supervision_snapshot(state),
     }
     if as_json:
@@ -169,6 +246,14 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         return
     print(f"交付运行: {output['run_id']}")
     _print_supervision(output["supervision"])
+    for attempt in semantic_attempts:
+        print(
+            "Semantic Agent Attempt "
+            f"{attempt.get('attempt_id')} {attempt.get('role')} "
+            f"ordinal={attempt.get('ordinal')} "
+            f"Budget Window={attempt.get('budget_window') or 'none'} "
+            f"status={attempt.get('status')} outcome={attempt.get('outcome')}"
+        )
     for invocation in invocations:
         if not isinstance(invocation, dict):
             continue
@@ -184,7 +269,7 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         print(
             "Agent Invocation "
             f"{role_text} {invocation.get('status')} "
-            f"attempts={invocation.get('attempt_count')} "
+            f"Output Attempt={invocation.get('attempt_count')} "
             f"return_code={invocation.get('return_code')} "
             f"signal={invocation.get('signal')} "
             f"requested={invocation.get('requested_thread_id')} "
@@ -193,6 +278,12 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
             f"effort={invocation.get('reasoning_effort')} "
             f"profile_revision={invocation.get('profile_revision')} "
             f"error={invocation.get('error')}"
+        )
+    for retry in operation_retries:
+        print(
+            "Publication Operation Retry "
+            f"{retry.get('work_subject')} "
+            f"{retry.get('attempts')}/{retry.get('limit')}"
         )
     for event in timeline:
         if not isinstance(event, dict):
@@ -215,6 +306,19 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
             f"{event.get('at')} {_display_term(event.get('kind'))} "
             f"{_display_term(event.get('status'))} {detail}".rstrip()
         )
+        if event.get("semantic_attempt_id") is not None:
+            print(
+                "  Semantic Agent Attempt "
+                f"{event.get('semantic_attempt_id')} "
+                f"{event.get('semantic_attempt_role')} "
+                f"ordinal={event.get('semantic_attempt_ordinal')}；"
+                f"Agent Invocation {event.get('agent_invocation_status')}；"
+                f"Output Attempt={event.get('output_attempt')}；"
+                f"Budget Window={event.get('budget_window') or 'none'}；"
+                "Publication Operation Retry="
+                f"{event.get('publication_operation_retry_attempts') or 'none'}/"
+                f"{event.get('publication_operation_retry_limit') or 'none'}"
+            )
         if event.get("kind") == "unsupported_scope_change":
             print(
                 "  Ticket Graph: "
@@ -231,6 +335,181 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
                     f"移除依赖 {summary.get('removed_dependencies', [])}"
                 )
     print(f"下一步: {output['next_action']}")
+
+
+def _current_semantic_attempt(
+    state: dict[str, object], invocation: dict[str, object] | None
+) -> dict[str, object] | None:
+    invocation_attempt = (
+        invocation.get("semantic_attempt") if isinstance(invocation, dict) else None
+    )
+    invocation_attempt_id = (
+        invocation_attempt.get("attempt_id")
+        if isinstance(invocation_attempt, dict)
+        else None
+    )
+    pending_attempts = [
+        pending
+        for subject in semantic_attempt_subjects(state)
+        if isinstance((pending := subject.get("pending_semantic_attempt")), dict)
+    ]
+    if invocation_attempt_id is not None:
+        for attempt in pending_attempts:
+            if attempt.get("attempt_id") == invocation_attempt_id:
+                return attempt
+    return pending_attempts[0] if pending_attempts else None
+
+
+def _semantic_attempt_history(state: dict[str, object]) -> list[dict[str, object]]:
+    attempts: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for subject in semantic_attempt_subjects(state):
+        history = subject.get("semantic_attempt_history")
+        values = history if isinstance(history, list) else []
+        pending = subject.get("pending_semantic_attempt")
+        if isinstance(pending, dict):
+            values = [*values, pending]
+        for attempt in values:
+            if not isinstance(attempt, dict):
+                continue
+            attempt_id = attempt.get("attempt_id")
+            if not isinstance(attempt_id, str) or attempt_id in seen:
+                continue
+            seen.add(attempt_id)
+            attempts.append(attempt)
+    return attempts
+
+
+def _output_attempt(
+    invocation: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(invocation, dict):
+        return None
+    return {
+        "invocation_started_at": invocation.get("started_at"),
+        "attempt_count": invocation.get("attempt_count"),
+    }
+
+
+def _budget_windows(
+    attempts: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    windows: list[dict[str, object]] = []
+    seen: set[tuple[object, object, object]] = set()
+    for attempt in attempts:
+        window = attempt.get("budget_window")
+        if window is None:
+            continue
+        key = (attempt.get("work_subject"), attempt.get("role"), window)
+        if key in seen:
+            continue
+        seen.add(key)
+        windows.append(
+            {
+                "work_subject": attempt.get("work_subject"),
+                "role": attempt.get("role"),
+                "window": window,
+            }
+        )
+    return windows
+
+
+def _publication_operation_retry(
+    subject: dict[str, object],
+) -> dict[str, object] | None:
+    retry = subject.get("publication_operation_retry")
+    if not isinstance(retry, dict):
+        return None
+    work_subject: object = None
+    pending = subject.get("pending_semantic_attempt")
+    if isinstance(pending, dict):
+        work_subject = pending.get("work_subject")
+    if work_subject is None:
+        history = subject.get("semantic_attempt_history")
+        if isinstance(history, list):
+            for attempt in reversed(history):
+                if isinstance(attempt, dict) and attempt.get("role") == "publication":
+                    work_subject = attempt.get("work_subject")
+                    break
+    if work_subject is None and isinstance(subject.get("ticket_number"), int):
+        work_subject = f"ticket:{subject['ticket_number']}"
+    return {
+        "work_subject": work_subject,
+        "attempts": retry.get("attempts"),
+        "limit": retry.get("limit"),
+    }
+
+
+def _publication_operation_retries(
+    state: dict[str, object],
+) -> list[dict[str, object]]:
+    retries: list[dict[str, object]] = []
+    seen: set[tuple[object, object, object]] = set()
+    for subject in semantic_attempt_subjects(state):
+        retry = _publication_operation_retry(subject)
+        if retry is None:
+            continue
+        key = (retry["work_subject"], retry["attempts"], retry["limit"])
+        if key in seen:
+            continue
+        seen.add(key)
+        retries.append(retry)
+    return retries
+
+
+def _current_publication_operation_retry(
+    state: dict[str, object],
+) -> dict[str, object] | None:
+    current_attempt = _current_semantic_attempt(state, None)
+    current_id = current_attempt.get("attempt_id") if current_attempt else None
+    for subject in semantic_attempt_subjects(state):
+        pending = subject.get("pending_semantic_attempt")
+        if current_id is not None:
+            if not isinstance(pending, dict) or pending.get("attempt_id") != current_id:
+                continue
+            return _publication_operation_retry(subject)
+        retry = _publication_operation_retry(subject)
+        if retry is not None:
+            return retry
+    return None
+
+
+def _public_delivery_cleanup(
+    state: dict[str, object],
+) -> dict[str, object] | None:
+    cleanup = state.get("delivery_cleanup")
+    if not isinstance(cleanup, dict):
+        return None
+    raw_items = cleanup.get("items")
+    items: list[dict[str, object]] = []
+    recovery_action = f"agent-run resume {state.get('run_id')}"
+    if isinstance(raw_items, dict):
+        for key in sorted(raw_items, key=str):
+            item = raw_items[key]
+            if not isinstance(item, dict) or item.get("status") == "completed":
+                continue
+            item_recovery_action = recovery_action
+            if item.get("recovery_kind") == "stale_dirty_checkout":
+                item_recovery_action = (
+                    f"inspect/commit/salvage {item.get('checkout')}; then use "
+                    f"agent-run resume {state.get('run_id')} only to retire the stale checkout, "
+                    f"or agent-run abandon {state.get('run_id')} --discard-worktree"
+                )
+            items.append(
+                {
+                    "kind": item.get("kind"),
+                    "branch": item.get("branch"),
+                    "checkout": item.get("checkout"),
+                    "status": item.get("status"),
+                    "last_error": item.get("last_error"),
+                    "recovery_action": item_recovery_action,
+                }
+            )
+    return {
+        "status": cleanup.get("status"),
+        "last_error": cleanup.get("last_error"),
+        "items": items,
+    }
 
 
 def _print_supervision(wait: object) -> None:
@@ -268,6 +547,25 @@ def _next_action(state: dict[str, Any]) -> str:
     run_id = state.get("run_id")
     parent = state.get("parent")
     parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
+    cleanup = state.get("delivery_cleanup")
+    if (
+        isinstance(cleanup, dict)
+        and cleanup.get("status") == "cleanup_pending"
+        and isinstance(run_id, str)
+    ):
+        items = cleanup.get("items")
+        if isinstance(items, dict) and any(
+            isinstance(item, dict)
+            and item.get("status") != "completed"
+            and item.get("recovery_kind") == "stale_dirty_checkout"
+            for item in items.values()
+        ):
+            return (
+                "先检查、提交或转存 stale Managed Development Checkout；"
+                f"随后仅用 agent-run resume {run_id} 退休旧 checkout，"
+                f"或用 agent-run abandon {run_id} --discard-worktree 明确丢弃"
+            )
+        return f"agent-run resume {run_id}"
     if status in {"run_approval_pending", "parent_approval_pending"} and isinstance(
         run_id, str
     ):
@@ -280,6 +578,18 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run abandon {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
         return f"agent-run requeue {run_id}"
+    invocation = state.get("active_agent_invocation")
+    if (
+        (
+            status == "execution_failed"
+            or state.get("github_refresh_pending") is True
+        )
+        and isinstance(invocation, dict)
+        and invocation.get("status") in {"failed", "completed"}
+        and invocation_attempt_is_pending(state, invocation)
+        and isinstance(run_id, str)
+    ):
+        return f"agent-run resume {run_id}"
     if (
         status == "waiting_external"
         and isinstance(state.get("requeue_transition"), dict)
@@ -289,14 +599,6 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run run {parent_number}"
     if status == "supervision_timeout" and isinstance(run_id, str):
         return f"agent-run resume {run_id}"
-    invocation = state.get("active_agent_invocation")
-    if (
-        status == "execution_failed"
-        and isinstance(invocation, dict)
-        and invocation.get("status") == "failed"
-        and isinstance(run_id, str)
-    ):
-        return f"agent-run resume {run_id}"
     if (
         status in {"ready_for_human", "progress_exhausted"}
         and human_blocker_subject_count(state) == 1
@@ -305,11 +607,14 @@ def _next_action(state: dict[str, Any]) -> str:
         return f"agent-run resume {run_id}"
     if status in {"ready_for_human", "progress_exhausted", "blocked"}:
         return "处理诊断中的人工事项"
+    if status == "publication_pending":
+        return (
+            "检查已耗尽的 Publication Operation Retry；无法恢复时执行 agent-run abandon"
+        )
     if status in {
         "active",
         "ticket_completed",
         "parent_delivery_pending",
-        "publication_pending",
         "run_acceptance_pending",
         "run_publication_pending",
         "waiting_checks",

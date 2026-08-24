@@ -150,7 +150,7 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
     assert pulls[0]["state"] == "OPEN"
 
-def test_run_repair_discards_an_inflight_development_after_parent_drift(
+def test_run_repair_preserves_dirty_inflight_development_after_parent_drift(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -182,8 +182,18 @@ def test_run_repair_discards_an_inflight_development_after_parent_drift(
         "discarded_repair_thread_ids"
     ]
     assert git.resolve(str(state["run_branch"])) == original_head
+    repair_checkout = states.root / "worktrees" / str(state["run_id"]) / "run-repair"
+    assert (repair_checkout / "run-repair.txt").is_file()
+    cleanup = stale["delivery_cleanup"]
+    assert cleanup["status"] == "cleanup_pending"
+    assert cleanup["last_error"] == "untracked files"
+    retired = stale["retired_semantic_attempt_owners"][-1]
+    assert retired["work_subject"] == f"run-repair:{state['run_id']}"
+    assert retired["semantic_attempt_history"][-1]["outcome"] == (
+        "currentness_invalidated"
+    )
 
-def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
+def test_run_repair_preserves_dirty_inflight_development_after_final_pr_drift(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -240,6 +250,16 @@ def test_run_repair_discards_an_inflight_development_after_final_pr_drift(
     assert stale["status"] == "run_acceptance_pending"
     assert stale["run_acceptance"]["phase"] == "pending"
     assert "repair_job" not in stale["run_acceptance"]
+    repair_checkout = states.root / "worktrees" / str(state["run_id"]) / "run-repair"
+    assert (repair_checkout / "run-repair.txt").is_file()
+    cleanup = stale["delivery_cleanup"]
+    assert cleanup["status"] == "cleanup_pending"
+    assert cleanup["last_error"] == "untracked files"
+    retired = stale["retired_semantic_attempt_owners"][-1]
+    assert retired["work_subject"] == f"run-repair:{state['run_id']}"
+    assert retired["semantic_attempt_history"][-1]["outcome"] == (
+        "currentness_invalidated"
+    )
 
 @pytest.mark.parametrize(
     "error",

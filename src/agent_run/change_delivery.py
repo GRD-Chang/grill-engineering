@@ -19,6 +19,12 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
 from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.semantic_attempt import (
+    close_semantic_attempt,
+    detach_active_invocation,
+    pending_semantic_attempt,
+    release_semantic_attempt,
+)
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     can_start_development,
@@ -57,6 +63,7 @@ from agent_run.change_delivery_fallback import (
     previous_publication_authorization,
 )
 from agent_run.change_delivery_publication_agent import (
+    invocation_boundary,
     invocation_events,
     invocation_identity,
     publication,
@@ -120,16 +127,10 @@ class ChangeDeliveryEngine:
                 if phase in {"completed", "blocked"}:
                     return state
                 if phase == "publication_pending":
-                    # A new explicit delivery attempt is allowed to retry
-                    # publication only; the accepted Candidate and Fresh
-                    # Acceptance remain the durable boundary.
-                    job["phase"] = "accepted"
-                    job["publication_attempts"] = 0
-                    job.pop("last_publication_error", None)
-                    state["status"] = "active"
-                    state["diagnostics"] = []
-                    self.save(state)
-                    continue
+                    # Operation Retry exhaustion is an independent hard
+                    # boundary. Resume must not reset it or regenerate the
+                    # already-counted semantic narrative.
+                    return state
                 if phase == "merged":
                     live = self.publisher.live_pull_request(
                         state, job, int(job["pr_number"])
@@ -156,7 +157,9 @@ class ChangeDeliveryEngine:
                     if not self._commit_candidate(state, job, checkout):
                         return state
                 if job["phase"] == "candidate":
-                    if self.review_budget_exhausted_for_review(job):
+                    if pending_semantic_attempt(
+                        job, role="reviewer"
+                    ) is None and self.review_budget_exhausted_for_review(job):
                         if self._prepare_ticket_fallback(state, job):
                             continue
                         checkpoint_code = (
@@ -226,10 +229,8 @@ class ChangeDeliveryEngine:
         except _TerminalChangeJob:
             return state
         except InitialCredentialUnavailable as error:
-            self._refund_unstarted_credential_invocation(job)
-            self._wait_for_initial_credential(
-                state, job, http_status=error.http_status
-            )
+            self._refund_unstarted_credential_invocation(state, job)
+            self._wait_for_initial_credential(state, job, http_status=error.http_status)
             return state
 
     def _can_resume_integrated_publication(self, job: dict[str, Any]) -> bool:
@@ -261,7 +262,9 @@ class ChangeDeliveryEngine:
         attempt_kind = str(job.get("next_attempt_kind", "ordinary"))
         if attempt_kind not in {"ordinary", "final_ci_fix"}:
             raise ValueError(f"unknown Development attempt kind: {attempt_kind}")
-        if not can_start_development(
+        if pending_semantic_attempt(
+            job, role="development"
+        ) is None and not can_start_development(
             job, self.review_budget_policy(), attempt_kind=attempt_kind
         ):
             self._checkpoint_budget(
@@ -330,10 +333,26 @@ class ChangeDeliveryEngine:
         *,
         role: str = "publication",
         phase: str,
+        semantic_attempt: dict[str, Any],
     ) -> Callable[..., None]:
         return invocation_events(
-            self, state, job, request, role=role, phase=phase
+            self,
+            state,
+            job,
+            request,
+            role=role,
+            phase=phase,
+            semantic_attempt=semantic_attempt,
         )
+
+    def _invocation_boundary(self, job: dict[str, Any]) -> dict[str, Any]:
+        candidate_sha = job.get("candidate_sha")
+        candidate_tree = (
+            self.git.resolve(f"{candidate_sha}^{{tree}}")
+            if isinstance(candidate_sha, str)
+            else None
+        )
+        return invocation_boundary(job, candidate_tree=candidate_tree)
 
     @staticmethod
     def _invocation_identity(
@@ -372,10 +391,28 @@ class ChangeDeliveryEngine:
     def modification_budget_exhausted(self, job: dict[str, Any]) -> bool:
         return not can_start_development(job, self.review_budget_policy())
 
-    def _refund_unstarted_credential_invocation(self, job: dict[str, Any]) -> None:
+    def _refund_unstarted_credential_invocation(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> None:
         budget = ensure_budget(job, self.review_budget_policy())
+        semantic_attempt = pending_semantic_attempt(job)
+        if semantic_attempt is None:
+            return
+        active = state.get("active_agent_invocation")
+        bound_attempt = (
+            active.get("semantic_attempt") if isinstance(active, dict) else None
+        )
         if (
-            job.get("phase") in {"developing", "repairing"}
+            isinstance(active, dict)
+            and active.get("status") == "resuming"
+            and isinstance(bound_attempt, dict)
+            and bound_attempt.get("attempt_id") == semantic_attempt.get("attempt_id")
+        ):
+            return
+        semantic_role = semantic_attempt.get("role")
+        if (
+            semantic_role == "development"
+            and job.get("phase") in {"developing", "repairing"}
             and isinstance(job.get("pending_attempt"), int)
             and job["pending_attempt"] > int(job.get("modification_attempts", 0))
         ):
@@ -385,6 +422,18 @@ class ChangeDeliveryEngine:
                 budget["development_attempts"] -= 1
             job.pop("pending_attempt", None)
             job.pop("pending_attempt_kind", None)
+            release_semantic_attempt(job)
+        elif semantic_role == "reviewer" and job.get("phase") == "reviewing":
+            job["validation_attempts"] = max(
+                0, int(job.get("validation_attempts", 0)) - 1
+            )
+            job["phase"] = "candidate"
+            release_semantic_attempt(job)
+        elif semantic_role == "publication" and job.get("phase") == "accepted":
+            job["publication_attempts"] = max(
+                0, int(job.get("publication_attempts", 0)) - 1
+            )
+            release_semantic_attempt(job)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
         policy = policy_for_subject(self.contract.label)
@@ -546,6 +595,12 @@ class ChangeDeliveryEngine:
         message: str,
     ) -> None:
         if not self._agent_is_current(state, job):
+            pending_attempt = pending_semantic_attempt(job)
+            if pending_attempt is not None:
+                close_semantic_attempt(
+                    job, pending_attempt, outcome="currentness_invalidated"
+                )
+                detach_active_invocation(state, pending_attempt)
             if self.adapter.stale_disposition is StaleDisposition.FRESH_RUN_ACCEPTANCE:
                 self._invalidate_stale(state, job, checkout)
                 self.save(state)

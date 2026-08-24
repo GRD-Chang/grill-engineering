@@ -125,6 +125,8 @@ def _retired_record(subject: str, job: dict[str, Any]) -> dict[str, Any]:
         ),
         "review_budget": deepcopy(job.get("review_budget")),
         "review_budget_history": deepcopy(job.get("review_budget_history", [])),
+        "semantic_attempt_history": deepcopy(job.get("semantic_attempt_history", [])),
+        "pending_semantic_attempt": deepcopy(job.get("pending_semantic_attempt")),
     }
     return record
 

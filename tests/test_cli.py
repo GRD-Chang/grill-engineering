@@ -20,6 +20,7 @@ from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
 from agent_run.run_driver import DirectRunOperations, RunStep
 from agent_run.runner_promotion import PromotionVerification
+from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 from conftest import write_fixture
@@ -80,6 +81,302 @@ def test_status_exposes_current_candidate_and_pr_in_top_level_and_budget(
     assert output["pr_number"] == 17
     assert output["review_budget"]["candidate_sha"] == "CANDIDATE-1"
     assert output["review_budget"]["pr_number"] == 17
+
+
+def test_status_distinguishes_semantic_invocation_output_budget_and_publication_retry(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    attempt = {
+        "attempt_id": "attempt-publication-2",
+        "role": "publication",
+        "work_subject": "ticket:3",
+        "generation": 2,
+        "currentness_boundary_fingerprint": "sha256:boundary",
+        "ordinal": 2,
+        "budget_window": None,
+        "status": "pending",
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "publication",
+        "status": "failed",
+        "attempt_count": 3,
+        "started_at": "2026-08-24T00:00:00+00:00",
+        "semantic_attempt": deepcopy(attempt),
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "execution_failed",
+        "active_ticket_job": {
+            "ticket_number": 3,
+            "phase": "publication_pending",
+            "pending_semantic_attempt": deepcopy(attempt),
+            "publication_operation_retry": {"attempts": 2, "limit": 4},
+        },
+        "active_agent_invocation": invocation,
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["semantic_agent_attempt"] == attempt
+    assert output["agent_invocation"] == invocation
+    assert output["output_attempt"] == {
+        "invocation_started_at": "2026-08-24T00:00:00+00:00",
+        "attempt_count": 3,
+    }
+    assert output["budget_window"] is None
+    assert output["publication_operation_retry"] == {
+        "work_subject": "ticket:3",
+        "attempts": 2,
+        "limit": 4,
+    }
+
+    cli.cli_presentation._print_status(state, as_json=False)
+    human = capsys.readouterr().out
+    assert "Semantic Agent Attempt: attempt-publication-2" in human
+    assert "Agent Invocation: publication failed" in human
+    assert "Output Attempt: 3" in human
+    assert "Budget Window: none" in human
+    assert "Publication Operation Retry: 2/4" in human
+
+
+def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = {
+        "attempt_id": "attempt-development-1",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "currentness_boundary_fingerprint": "sha256:first",
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "budget_consumed": True,
+        "outcome": "candidate",
+    }
+    pending = {
+        "attempt_id": "attempt-reviewer-1",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "currentness_boundary_fingerprint": "sha256:second",
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "pending",
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "reviewer",
+        "status": "failed",
+        "attempt_count": 2,
+        "started_at": "2026-08-24T00:01:00+00:00",
+        "semantic_attempt": deepcopy(pending),
+    }
+    mirrored_job = {
+        "ticket_number": 3,
+        "phase": "reviewing",
+        "semantic_attempt_history": [deepcopy(completed)],
+        "pending_semantic_attempt": deepcopy(pending),
+        "publication_operation_retry": {"attempts": 1, "limit": 3},
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "execution_failed",
+        "timeline": [
+            {
+                "at": "2026-08-24T00:01:00+00:00",
+                "kind": "ticket_phase",
+                "status": "execution_failed",
+                "semantic_attempt_id": "attempt-reviewer-1",
+                "semantic_attempt_role": "reviewer",
+                "semantic_attempt_ordinal": 1,
+                "budget_window": 1,
+                "agent_invocation_started_at": "2026-08-24T00:01:00+00:00",
+                "agent_invocation_status": "failed",
+                "output_attempt": 2,
+                "publication_operation_retry_attempts": 1,
+                "publication_operation_retry_limit": 3,
+            }
+        ],
+        "active_ticket_job": deepcopy(mirrored_job),
+        "ticket_jobs": {"3": deepcopy(mirrored_job)},
+        "agent_invocation_history": [invocation],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["semantic_agent_attempts"] == [completed, pending]
+    assert output["agent_invocations"] == [invocation]
+    assert output["output_attempts"] == [
+        {
+            "invocation_started_at": "2026-08-24T00:01:00+00:00",
+            "work_subject": "ticket:3",
+            "attempt_count": 2,
+        }
+    ]
+    assert output["budget_windows"] == [
+        {"work_subject": "ticket:3", "role": "development", "window": 1},
+        {"work_subject": "ticket:3", "role": "reviewer", "window": 1},
+    ]
+    assert output["publication_operation_retries"] == [
+        {"work_subject": "ticket:3", "attempts": 1, "limit": 3}
+    ]
+
+    cli.cli_presentation._print_history(state, as_json=False)
+    human = capsys.readouterr().out
+    assert "Semantic Agent Attempt attempt-reviewer-1 reviewer ordinal=1" in human
+    assert "Agent Invocation failed" in human
+    assert "Output Attempt=2" in human
+    assert "Budget Window=1" in human
+    assert "Publication Operation Retry=1/3" in human
+
+
+def test_timeline_projects_semantic_invocation_output_and_retry_counters(
+    tmp_path: Path,
+) -> None:
+    attempt = {
+        "attempt_id": "attempt-publication-2",
+        "role": "publication",
+        "work_subject": "ticket:3",
+        "generation": 2,
+        "currentness_boundary_fingerprint": "sha256:boundary",
+        "ordinal": 2,
+        "budget_window": None,
+        "status": "pending",
+    }
+    state: dict[str, Any] = {
+        "run_id": "run-1",
+        "status": "execution_failed",
+        "active_ticket_job": {
+            "ticket_number": 3,
+            "phase": "publication_pending",
+            "pending_semantic_attempt": attempt,
+            "publication_operation_retry": {"attempts": 2, "limit": 4},
+        },
+        "active_agent_invocation": {
+            "work_subject": "ticket:3",
+            "role": "publication",
+            "status": "failed",
+            "attempt_count": 1,
+            "started_at": "2026-08-24T00:00:00+00:00",
+            "semantic_attempt": deepcopy(attempt),
+        },
+        "timeline": [],
+    }
+    store = StateStore(tmp_path)
+
+    store.save_run("run-1", state)
+    state["active_agent_invocation"]["attempt_count"] = 2
+    store.save_run("run-1", state)
+
+    timeline = store.load_run("run-1")["timeline"]
+    assert [event["output_attempt"] for event in timeline] == [1, 2]
+    assert timeline[-1] | {"at": "ignored"} == {
+        "at": "ignored",
+        "kind": "ticket_phase",
+        "status": "execution_failed",
+        "ticket": 3,
+        "worker": "发布工作代理",
+        "phase": "publication_pending",
+        "semantic_attempt_id": "attempt-publication-2",
+        "semantic_attempt_role": "publication",
+        "semantic_attempt_ordinal": 2,
+        "budget_window": None,
+        "agent_invocation_started_at": "2026-08-24T00:00:00+00:00",
+        "agent_invocation_status": "failed",
+        "output_attempt": 2,
+        "publication_operation_retry_attempts": 2,
+        "publication_operation_retry_limit": 4,
+    }
+
+
+def test_status_exposes_preserved_dirty_checkout_and_recovery_action(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "completed",
+        "diagnostics": [],
+        "delivery_cleanup": {
+            "status": "cleanup_pending",
+            "last_error": "preserved dirty checkout",
+            "items": {
+                "agent-run/ticket-3": {
+                    "kind": "ticket",
+                    "branch": "agent-run/ticket-3",
+                    "checkout": "/repo/.agent-run/worktrees/run-1/ticket-3",
+                    "attempts": 3,
+                    "status": "cleanup_pending",
+                    "last_error": "tracked modifications; agent-run resume run-1",
+                }
+            },
+        },
+    }
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["delivery_cleanup"] == {
+        "status": "cleanup_pending",
+        "last_error": "preserved dirty checkout",
+        "items": [
+            {
+                "kind": "ticket",
+                "branch": "agent-run/ticket-3",
+                "checkout": "/repo/.agent-run/worktrees/run-1/ticket-3",
+                "status": "cleanup_pending",
+                "last_error": "tracked modifications; agent-run resume run-1",
+                "recovery_action": "agent-run resume run-1",
+            }
+        ],
+    }
+    assert output["next_action"] == "agent-run resume run-1"
+
+    cli.cli_presentation._print_status(state, as_json=False)
+    human = capsys.readouterr().out
+    assert "/repo/.agent-run/worktrees/run-1/ticket-3" in human
+    assert "tracked modifications" in human
+    assert "agent-run resume run-1" in human
+
+
+def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    checkout = "/repo/.agent-run/worktrees/run-1/run-repair"
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "run_acceptance_pending",
+        "diagnostics": [],
+        "delivery_cleanup": {
+            "status": "cleanup_pending",
+            "last_error": "untracked files",
+            "items": {
+                "agent-run-repair/run-1/1": {
+                    "kind": "run_repair",
+                    "branch": "agent-run-repair/run-1/1",
+                    "checkout": checkout,
+                    "attempts": 0,
+                    "status": "cleanup_pending",
+                    "last_error": "untracked files",
+                    "recovery_kind": "stale_dirty_checkout",
+                }
+            },
+        },
+    }
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    recovery = output["delivery_cleanup"]["items"][0]["recovery_action"]
+    assert f"inspect/commit/salvage {checkout}" in recovery
+    assert "resume run-1 only to retire" in recovery
+    assert "abandon run-1 --discard-worktree" in recovery
+    assert output["next_action"].startswith("先检查、提交或转存 stale")
 
 
 @pytest.mark.parametrize("command", ["deliver", "accept-run", "publish-run"])
@@ -239,22 +536,21 @@ def run_internal_stage(
         isinstance(current, dict)
         and current.get("status") == "execution_failed"
         and isinstance(invocation, dict)
-        and invocation.get("status") == "failed"
+        and invocation.get("status") in {"failed", "completed"}
     ):
-        state = current
-    else:
-        try:
-            state = operations.dispatch(step, run_id).state
-        except (
-            CodexProcessError,
-            GitHubReadError,
-            OSError,
-            ValueError,
-            WorkerSandboxError,
-        ) as error:
-            assert controller.record_execution_failure(run_id, str(error))
-            state = states.load_current_run(run_id)
-            assert state is not None
+        controller.resume(run_id)
+    try:
+        state = operations.dispatch(step, run_id).state
+    except (
+        CodexProcessError,
+        GitHubReadError,
+        OSError,
+        ValueError,
+        WorkerSandboxError,
+    ) as error:
+        assert controller.record_execution_failure(run_id, str(error))
+        state = states.load_current_run(run_id)
+        assert state is not None
     active_ticket = state.get("active_ticket_job")
     output = {
         "result": "resumed",
@@ -328,6 +624,25 @@ def failed_invocation(
     generation: int = 1,
     status: str = "failed",
 ) -> dict[str, Any]:
+    semantic_role = (
+        "development"
+        if role == "development"
+        else "reviewer" if role in {"fresh_acceptance", "reviewer"} else "publication"
+    )
+    boundary_fingerprint = canonical_fingerprint({})
+    identity = {
+        "role": semantic_role,
+        "work_subject": work_subject,
+        "generation": generation,
+        "currentness_boundary_fingerprint": boundary_fingerprint,
+        "ordinal": 1,
+        "budget_window": 1 if semantic_role in {"development", "reviewer"} else None,
+    }
+    semantic_attempt = {
+        "attempt_id": canonical_fingerprint(identity),
+        **identity,
+        "status": "pending",
+    }
     return {
         "work_subject": work_subject,
         "generation": generation,
@@ -336,6 +651,7 @@ def failed_invocation(
         "mode": "fresh",
         "input_fingerprint": "fixture",
         "currentness_boundary": {},
+        "semantic_attempt": semantic_attempt,
         "status": status,
         "requested_thread_id": None,
         "reported_thread_id": None,
@@ -1218,12 +1534,17 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
         state["status"] = status
         state.update(additions)
         if state.get("active_agent_invocation") is not None:
+            invocation = state["active_agent_invocation"]
+            assert isinstance(invocation, dict)
             state["ticket_jobs"]["2"].update(
                 {
                     "ticket_branch_generation": 1,
                     "phase": "developing",
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "pending_semantic_attempt": deepcopy(
+                        invocation["semantic_attempt"]
+                    ),
                 }
             )
         state_path.write_text(json.dumps(state), encoding="utf-8")

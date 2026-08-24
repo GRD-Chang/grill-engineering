@@ -19,6 +19,11 @@ from agent_run.ticket_phase import TicketPhase
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization as require_active_ticket_publication_authorization,
 )
+from agent_run.semantic_attempt import (
+    require_controller_reprepare_intent,
+    require_semantic_attempt,
+    require_semantic_attempt_record,
+)
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
@@ -96,6 +101,13 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Review Budget protocol"
         )
+    if (
+        type(state.get("semantic_attempt_protocol")) is not int
+        or state.get("semantic_attempt_protocol") != 1
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Semantic Agent Attempt protocol"
+        )
     for key, expected in (
         ("run_id", str),
         ("repository", str),
@@ -127,6 +139,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_candidate_acceptance_histories(state)
     _require_active_run_repair_mode(state)
     _require_integrated_revalidation_merge(state)
+    _require_semantic_attempt_owners(state)
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -455,6 +468,11 @@ def _require_invocation(
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}.currentness_boundary"
         )
+    semantic_attempt = invocation.get("semantic_attempt")
+    if not isinstance(semantic_attempt, dict):
+        raise IncompatibleRunStateError(
+            f"legacy state is missing canonical {location}.semantic_attempt"
+        )
     if invocation.get("status") not in {"running", "failed", "completed", "resuming"}:
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}.status"
@@ -472,6 +490,33 @@ def _require_invocation(
     if role not in allowed_phases or phase not in allowed_phases[role]:
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location} role or phase"
+        )
+    semantic_role = (
+        "development"
+        if role == "development"
+        else "reviewer" if role in {"fresh_acceptance", "reviewer"} else "publication"
+    )
+    try:
+        require_semantic_attempt(
+            semantic_attempt,
+            role=semantic_role,
+            work_subject=str(work_subject),
+            generation=int(invocation["generation"]),
+            currentness_boundary=invocation["currentness_boundary"],
+            budget_window=semantic_attempt.get("budget_window"),
+        )
+    except (TypeError, ValueError) as error:
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.semantic_attempt: {error}"
+        ) from error
+    if semantic_role in {"development", "reviewer"}:
+        if type(semantic_attempt.get("budget_window")) is not int:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.semantic_attempt budget window"
+            )
+    elif semantic_attempt.get("budget_window") is not None:
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.semantic_attempt budget window"
         )
     if invocation["mode"] not in {"fresh", "resume", "new-thread"}:
         raise IncompatibleRunStateError(f"legacy state has an invalid {location}.mode")
@@ -565,6 +610,7 @@ def _require_active_invocation_identity(
             raise IncompatibleRunStateError(
                 "legacy state has a stale active Ticket Invocation"
             )
+        _require_pending_invocation_attempt(job, invocation)
         return
     if subject == f"parent-only:{run_id}":
         job = state.get("parent_job")
@@ -593,6 +639,293 @@ def _require_active_invocation_identity(
         and not _change_owner_phase_is_current(invocation, job)
     ):
         raise IncompatibleRunStateError("legacy state has a stale active Invocation")
+    if subject == f"run-acceptance:{run_id}":
+        owner = state.get("run_acceptance")
+    elif subject == f"run-publication:{run_id}":
+        owner = state.get("run_publication")
+    else:
+        owner = job
+    _require_pending_invocation_attempt(owner, invocation)
+
+
+def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
+    """Reject owner-local Attempt contradictions even without an active pointer."""
+
+    run_id = str(state["run_id"])
+    owners: list[tuple[str, dict[str, Any], set[str], str, int]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        for key, value in jobs.items():
+            if isinstance(value, dict) and type(value.get("ticket_number")) is int:
+                owners.append(
+                    (
+                        f"ticket_jobs[{key}]",
+                        value,
+                        {"development", "reviewer", "publication"},
+                        f"ticket:{value['ticket_number']}",
+                        int(value.get("ticket_branch_generation", 1)),
+                    )
+                )
+    active_ticket = state.get("active_ticket_job")
+    if (
+        isinstance(active_ticket, dict)
+        and type(active_ticket.get("ticket_number")) is int
+    ):
+        owners.append(
+            (
+                "active_ticket_job",
+                active_ticket,
+                {"development", "reviewer", "publication"},
+                f"ticket:{active_ticket['ticket_number']}",
+                int(active_ticket.get("ticket_branch_generation", 1)),
+            )
+        )
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        owners.append(
+            (
+                "parent_job",
+                parent,
+                {"development", "reviewer", "publication"},
+                f"parent-only:{run_id}",
+                int(parent.get("parent_generation", 1)),
+            )
+        )
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        owners.append(
+            (
+                "run_acceptance",
+                acceptance,
+                {"reviewer"},
+                f"run-acceptance:{run_id}",
+                int(acceptance.get("acceptance_generation", 1)),
+            )
+        )
+        repair = acceptance.get("repair_job")
+        if isinstance(repair, dict):
+            owners.append(
+                (
+                    "run_acceptance.repair_job",
+                    repair,
+                    {"development", "reviewer", "publication"},
+                    f"run-repair:{run_id}",
+                    int(repair.get("repair_generation", 1)),
+                )
+            )
+    publication = state.get("run_publication")
+    if isinstance(publication, dict):
+        owners.append(
+            (
+                "run_publication",
+                publication,
+                {"publication"},
+                f"run-publication:{run_id}",
+                int(
+                    acceptance.get("acceptance_generation", 1)
+                    if isinstance(acceptance, dict)
+                    else 1
+                ),
+            )
+        )
+    retired = state.get("retired_semantic_attempt_owners", [])
+    if not isinstance(retired, list) or len(retired) > 64:
+        raise IncompatibleRunStateError(
+            "legacy state has invalid retired Semantic Agent Attempt owners"
+        )
+    for index, owner in enumerate(retired):
+        if (
+            not isinstance(owner, dict)
+            or owner.get("owner_kind") != "run_repair"
+            or owner.get("work_subject") != f"run-repair:{run_id}"
+            or type(owner.get("generation")) is not int
+            or int(owner["generation"]) < 1
+            or owner.get("pending_semantic_attempt") is not None
+        ):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid retired Semantic Agent Attempt owner at index {index}"
+            )
+        owners.append(
+            (
+                f"retired_semantic_attempt_owners[{index}]",
+                owner,
+                {"development", "reviewer", "publication"},
+                f"run-repair:{run_id}",
+                int(owner["generation"]),
+            )
+        )
+    _require_controller_reprepare_state(state, acceptance)
+    records_by_id: dict[str, dict[str, Any]] = {}
+    for location, owner, roles, work_subject, generation in owners:
+        pending = owner.get("pending_semantic_attempt")
+        if pending is not None:
+            if not isinstance(pending, dict):
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.pending_semantic_attempt"
+                )
+            _require_owner_attempt(
+                pending,
+                location=f"{location}.pending_semantic_attempt",
+                status="pending",
+                roles=roles,
+                work_subject=work_subject,
+                maximum_generation=generation,
+                owner=owner,
+                require_current=True,
+            )
+            _require_unique_attempt_record(records_by_id, pending, location)
+        history = owner.get("semantic_attempt_history", [])
+        if not isinstance(history, list):
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid {location}.semantic_attempt_history"
+            )
+        for index, attempt in enumerate(history):
+            if not isinstance(attempt, dict):
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.semantic_attempt_history[{index}]"
+                )
+            item_location = f"{location}.semantic_attempt_history[{index}]"
+            _require_owner_attempt(
+                attempt,
+                location=item_location,
+                status="completed",
+                roles=roles,
+                work_subject=work_subject,
+                maximum_generation=generation,
+                owner=owner,
+                require_current=False,
+            )
+            _require_unique_attempt_record(records_by_id, attempt, item_location)
+
+
+def _require_owner_attempt(
+    attempt: dict[str, Any],
+    *,
+    location: str,
+    status: str,
+    roles: set[str],
+    work_subject: str,
+    maximum_generation: int,
+    owner: dict[str, Any],
+    require_current: bool,
+) -> None:
+    try:
+        require_semantic_attempt_record(attempt, expected_status=status)
+    except ValueError as error:
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}: {error}"
+        ) from error
+    generation = int(attempt["generation"])
+    if (
+        attempt["role"] not in roles
+        or attempt["work_subject"] != work_subject
+        or generation > maximum_generation
+        or (require_current and generation != maximum_generation)
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an owner mismatch at {location}"
+        )
+    budget_window = attempt.get("budget_window")
+    if attempt["role"] == "publication":
+        if budget_window is not None:
+            raise IncompatibleRunStateError(
+                f"legacy state has an invalid Publication Budget Window at {location}"
+            )
+        return
+    budget = owner.get("review_budget")
+    current_window = budget.get("window") if isinstance(budget, dict) else None
+    if (
+        type(current_window) is not int
+        or type(budget_window) is not int
+        or budget_window > current_window
+        or (require_current and budget_window != current_window)
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid Review Budget Window at {location}"
+        )
+
+
+def _require_unique_attempt_record(
+    records: dict[str, dict[str, Any]], attempt: dict[str, Any], location: str
+) -> None:
+    attempt_id = str(attempt["attempt_id"])
+    previous = records.get(attempt_id)
+    if previous is not None and previous != attempt:
+        raise IncompatibleRunStateError(
+            f"legacy state has conflicting Semantic Agent Attempt mirrors at {location}"
+        )
+    records[attempt_id] = attempt
+
+
+def _require_pending_invocation_attempt(
+    owner: object, invocation: dict[str, Any]
+) -> None:
+    if not isinstance(owner, dict):
+        raise IncompatibleRunStateError(
+            "legacy state has an active Invocation without an Attempt owner"
+        )
+    pending = owner.get("pending_semantic_attempt")
+    bound = invocation.get("semantic_attempt")
+    if (
+        not isinstance(pending, dict)
+        or not isinstance(bound, dict)
+        or pending.get("attempt_id") != bound.get("attempt_id")
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has inconsistent pending Semantic Agent Attempt and active Invocation"
+        )
+    budget_window = pending.get("budget_window")
+    if budget_window is not None:
+        budget = owner.get("review_budget")
+        if not isinstance(budget, dict) or budget.get("window") != budget_window:
+            raise IncompatibleRunStateError(
+                "legacy state has a pending Semantic Agent Attempt in the wrong Budget Window"
+            )
+
+
+def _require_controller_reprepare_state(
+    state: dict[str, Any], acceptance: object
+) -> None:
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    marker_owners: list[object] = [state.get("active_ticket_job"), state.get("parent_job")]
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        marker_owners.extend(jobs.values())
+    for owner in marker_owners:
+        if isinstance(owner, dict) and "controller_candidate_reprepare" in owner:
+            raise IncompatibleRunStateError(
+                "legacy state has Controller Candidate reprepare authority outside Run Repair"
+            )
+    if not isinstance(repair, dict):
+        return
+    marker_present = "controller_candidate_reprepare" in repair
+    pending = repair.get("pending_semantic_attempt")
+    if repair.get("phase") == "committing_candidate" and pending is None:
+        if not marker_present:
+            raise IncompatibleRunStateError(
+                "legacy state is missing Controller Candidate reprepare authority"
+            )
+    if not marker_present:
+        return
+    if pending is not None:
+        raise IncompatibleRunStateError(
+            "legacy state mixes Controller Candidate reprepare with a pending Semantic Agent Attempt"
+        )
+    active = state.get("active_agent_invocation")
+    if (
+        isinstance(active, dict)
+        and active.get("status") in {"running", "failed", "resuming"}
+        and active.get("work_subject") == f"run-repair:{state['run_id']}"
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state mixes Controller Candidate reprepare with an active Agent Invocation"
+        )
+    try:
+        require_controller_reprepare_intent(repair)
+    except ValueError as error:
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid Controller Candidate reprepare intent: {error}"
+        ) from error
 
 
 def _acceptance_generation(acceptance: object) -> int | None:

@@ -16,6 +16,8 @@ from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import StateStore
+from agent_run.semantic_attempt import allocate_semantic_attempt
+from agent_run.review_budget import new_budget
 from conftest import write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import passing_acceptance
@@ -63,6 +65,72 @@ def test_legacy_branch_authority_state_is_rejected_before_reuse(
     assert not resumed
     assert replacement["branch_authority_protocol"] == 2
     assert states.load_current_run(str(replacement["run_id"])) is not None
+
+
+@pytest.mark.parametrize("legacy_protocol", [None, 0, 1.0, "1"])
+def test_legacy_semantic_attempt_state_is_rejected_before_reuse(
+    git_repo: Path, legacy_protocol: object
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    state, _ = controller.start(1)
+    if legacy_protocol is None:
+        state.pop("semantic_attempt_protocol")
+    else:
+        state["semantic_attempt_protocol"] = legacy_protocol
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="Semantic Agent Attempt"):
+        controller.resume(str(state["run_id"]))
+
+
+def test_pending_semantic_attempt_owner_mismatch_is_rejected_without_invocation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    state, _ = controller.start(1)
+    job = state["ticket_jobs"]["2"]
+    job["review_budget"] = new_budget()
+    job["review_budget_history"] = []
+    allocate_semantic_attempt(
+        job,
+        role="development",
+        work_subject="ticket:999",
+        generation=1,
+        currentness_boundary={"base_sha": state["base"]["sha"]},
+        ordinal=1,
+        budget_window=job["review_budget"]["window"],
+    )
+    state["active_ticket_job"] = dict(job)
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="owner mismatch"):
+        controller.resume(str(state["run_id"]))
+
+
+def test_controller_reprepare_authority_is_rejected_outside_run_repair(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    state, _ = controller.start(1)
+    state["ticket_jobs"]["2"]["controller_candidate_reprepare"] = {
+        "kind": "controller_currentness_reprepare"
+    }
+    states.save_run(str(state["run_id"]), state)
+
+    with pytest.raises(IncompatibleRunStateError, match="outside Run Repair"):
+        controller.resume(str(state["run_id"]))
 
 
 def _publication(number: int) -> dict[str, str]:
