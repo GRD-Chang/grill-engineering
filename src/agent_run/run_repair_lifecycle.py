@@ -16,7 +16,7 @@ from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.git import MergeConflictError
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import (
-    end_human_blocked_repair_cycle,
+    pause_human_blocked_repair_cycle,
     repair_checkout_is_active,
     rotate_repair_job,
     start_repair_cycle,
@@ -143,7 +143,7 @@ class RunRepairLifecycle:
                     preserve_checkout = True
                     continue
                 self._sync_repair_cycle_counters(run, job)
-                end_human_blocked_repair_cycle(run, job)
+                pause_human_blocked_repair_cycle(run, job)
                 self.owner._save(state)
                 preserve_checkout = self._repair_checkout_is_active(job)
                 break

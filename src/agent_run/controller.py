@@ -291,6 +291,12 @@ class Controller:
             if state.get("status") == "requeue_required":
                 self.states.save_run(run_id, state)
                 return state, True
+            if state.get("terminal_kind") == "run_acceptance_stale":
+                # Refresh retired the exact blocked/failed Run Repair Attempt.
+                # The supplied Human response or Thread choice belongs to that
+                # stale identity and must not be applied to fresh Acceptance.
+                self.states.save_run(run_id, state)
+                return state, True
             if _is_currentness_human_blocker(state):
                 # A live Change PR no longer matches the persisted
                 # Generation. Do not repair invocations or touch a managed
@@ -1706,6 +1712,23 @@ def _resume_change_job(
         "reviewer_requires_human",
     }:
         return False
+    _resume_change_job_owner(value, human_response=human_response)
+    if ticket:
+        state["active_ticket_job"] = value
+        status = "active"
+    elif "ticket_number" in value:
+        status = "active"
+    else:
+        status = "parent_delivery_pending"
+    state.update(
+        {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
+    )
+    return True
+
+
+def _resume_change_job_owner(
+    value: dict[str, Any], *, human_response: str | None
+) -> None:
     blockers = _human_blockers(value)
     reviewer_resume = (
         value.get("blocked_reason") == "reviewer_requires_human"
@@ -1728,17 +1751,6 @@ def _resume_change_job(
     else:
         value.pop("review_human_blocker_resume", None)
     value.pop("blocked_reason", None)
-    if ticket:
-        state["active_ticket_job"] = value
-        status = "active"
-    elif "ticket_number" in value:
-        status = "active"
-    else:
-        status = "parent_delivery_pending"
-    state.update(
-        {"status": status, "terminal_kind": "waiting_human", "diagnostics": []}
-    )
-    return True
 
 
 def _resume_run_repair_human_blocker(
@@ -1748,7 +1760,7 @@ def _resume_run_repair_human_blocker(
     *,
     human_response: str | None,
 ) -> bool:
-    """Archive a Human-blocked Cycle and schedule a fresh delivery boundary."""
+    """Resume the blocked role inside the existing Run Repair Attempt."""
 
     if not isinstance(value, dict):
         return False
@@ -1757,70 +1769,13 @@ def _resume_run_repair_human_blocker(
         "reviewer_requires_human",
     }:
         return False
-    blockers = _human_blockers(value)
-    next_generation = int(run.get("repair_generation", 0)) + 1
-    request: dict[str, Any] = {
-        "repair_source": str(value.get("repair_source", "acceptance")),
-        "prior_human_blockers": blockers,
-    }
-    for key in ("human_feedback", "ci_evidence", "merge_conflict_evidence"):
-        if key in value:
-            request[key] = deepcopy(value[key])
-    append_human_response(
-        request, blockers, human_response, generation=next_generation
-    )
-
+    _resume_change_job_owner(value, human_response=human_response)
     cycle = run.get("repair_cycle")
     if isinstance(cycle, dict):
-        cycle.update(
-            {
-                "status": "human_blocked",
-                "ended_reason": str(value["blocked_reason"]),
-            }
-        )
-        history = run.setdefault("repair_cycle_history", [])
-        if not isinstance(history, list):
-            raise ValueError("repair_cycle_history must be an array")
-        generation = cycle.get("generation")
-        if not any(
-            isinstance(item, dict) and item.get("generation") == generation
-            for item in history
-        ):
-            history.append(deepcopy(cycle))
-            del history[:-32]
-
-    run_history = run.setdefault("candidate_acceptance_history", [])
-    job_history = value.get("candidate_acceptance_history", [])
-    if not isinstance(run_history, list) or not isinstance(job_history, list):
-        raise ValueError("candidate_acceptance_history must be an array")
-    run_history.extend(deepcopy(job_history))
-
-    discarded = run.setdefault("discarded_repair_thread_ids", [])
-    if not isinstance(discarded, list):
-        raise ValueError("discarded_repair_thread_ids must be an array")
-    for key in (
-        "development_thread_id",
-        "publication_thread_id",
-    ):
-        thread_id = value.get(key)
-        if isinstance(thread_id, str) and thread_id not in discarded:
-            discarded.append(thread_id)
-    for key in (
-        "development_thread_history",
-        "reviewer_thread_ids",
-        "publication_thread_history",
-    ):
-        thread_ids = value.get(key)
-        if isinstance(thread_ids, list):
-            for thread_id in thread_ids:
-                if isinstance(thread_id, str) and thread_id not in discarded:
-                    discarded.append(thread_id)
-
-    run["repair_request"] = request
+        cycle["status"] = "active"
+        cycle.pop("ended_reason", None)
     run["phase"] = "repairing"
     run.pop("blocked_reason", None)
-    run.pop("repair_job", None)
-    state["active_agent_invocation"] = None
     state.pop("requeue_required", None)
     state.update(
         {

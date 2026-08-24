@@ -45,13 +45,17 @@ def start_repair_cycle(run: dict[str, Any], generation: int) -> None:
 
 def repair_checkout_is_active(job: dict[str, Any]) -> bool:
     phase = job.get("phase")
-    return phase in _ACTIVE_CHECKOUT_PHASES
+    return phase in _ACTIVE_CHECKOUT_PHASES or (
+        phase == "blocked"
+        and job.get("blocked_reason") == "agent_requires_human"
+        and job.get("human_blocker_phase") in {"developing", "repairing"}
+    )
 
 
-def end_human_blocked_repair_cycle(
+def pause_human_blocked_repair_cycle(
     run: dict[str, Any], job: dict[str, Any]
 ) -> None:
-    """End the current Cycle without carrying its delivery boundary forward."""
+    """Pause the current Cycle until the same blocked Attempt is resumed."""
 
     reason = job.get("blocked_reason")
     if job.get("phase") != "blocked" or reason not in {

@@ -1311,8 +1311,10 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     assert "candidate_sha" not in repair
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
     old_generation = repair["repair_generation"]
+    old_attempt = deepcopy(repair["pending_semantic_attempt"])
+    old_budget = deepcopy(repair["review_budget"])
     old_checkout = Path(str(repair["repair_checkout"]))
-    assert not old_checkout.exists()
+    assert old_checkout.exists()
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert delivery["pull_requests"] == []
     status = stdout_json(
@@ -1339,33 +1341,21 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     )
 
     resumed_run = resumed["run_acceptance"]
-    assert "repair_job" not in resumed_run
-    assert resumed_run["repair_cycle_history"][-1]["generation"] == old_generation
-    assert resumed_run["repair_cycle_history"][-1]["status"] == "human_blocked"
-    assert resumed_run.get("candidate_acceptance_history", []) == []
-    resuming_agents = FreshCycleRunAgents()
-    resuming_agents._reviews = [_passing_artifact()]
-    completed = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=resuming_agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    completed_run = completed["run_acceptance"]
-    assert completed_run["repair_cycle"]["generation"] == old_generation + 1
-    assert completed_run["repair_cycle"]["status"] == "promoted"
-    assert resuming_agents.development_requests[0]["thread_id"] is None
-    assert resuming_agents.development_requests[0]["human_response_history"] == [
+    resumed_job = resumed_run["repair_job"]
+    assert resumed_job["repair_generation"] == old_generation
+    assert resumed_job["phase"] == "developing"
+    assert resumed_job["pending_semantic_attempt"] == old_attempt
+    assert resumed_job["review_budget"] == old_budget
+    assert resumed_job["development_thread_id"] == "run-repair-development-blocked"
+    assert resumed_job["human_response_history"] == [
         {
-            "generation": old_generation + 1,
+            "generation": old_generation,
             "human_blockers": repair["human_blockers"],
             "response": "Issue read access has been granted.",
         }
     ]
-    assert "run-repair-development-blocked" in completed_run[
-        "discarded_repair_thread_ids"
-    ]
+    assert resumed_run["repair_cycle"]["status"] == "active"
+    assert resumed_run.get("repair_cycle_history", []) == []
 
 def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     git_repo: Path,
@@ -1391,6 +1381,8 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert repair["blocked_reason"] == "reviewer_requires_human"
     assert repair["reviewer_thread_ids"][-1] == "run-reviewer-2"
     old_generation = repair["repair_generation"]
+    old_attempt = deepcopy(repair["pending_semantic_attempt"])
+    old_budget = deepcopy(repair["review_budget"])
     old_candidate = repair["candidate_sha"]
     old_checkout = Path(str(repair["repair_checkout"]))
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
@@ -1413,28 +1405,16 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
         human_response="The review dependency is now available.",
     )
     resumed_run = resumed["run_acceptance"]
-    assert "repair_job" not in resumed_run
-    assert resumed_run["repair_cycle_history"][-1]["generation"] == old_generation
-    assert resumed_run["candidate_acceptance_history"][-1]["candidate_sha"] == (
-        old_candidate
-    )
-    resuming_agents = FreshCycleRunAgents()
-    resuming_agents._reviews = [_passing_artifact()]
-    completed = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=resuming_agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    completed_run = completed["run_acceptance"]
-    assert completed_run["repair_cycle"]["generation"] == old_generation + 1
-    assert resuming_agents.development_requests[0]["thread_id"] is None
-    assert resuming_agents.development_requests[0]["human_response_history"][0][
-        "generation"
-    ] == old_generation + 1
-    assert resuming_agents.development_requests[0]["thread_id"] is None
-    assert "run-reviewer-2" in completed_run["discarded_repair_thread_ids"]
+    resumed_job = resumed_run["repair_job"]
+    assert resumed_job["repair_generation"] == old_generation
+    assert resumed_job["phase"] == "candidate"
+    assert resumed_job["candidate_sha"] == old_candidate
+    assert resumed_job["pending_semantic_attempt"] == old_attempt
+    assert resumed_job["review_budget"] == old_budget
+    assert resumed_job["reviewer_thread_ids"][-1] == "run-reviewer-2"
+    assert resumed_job["review_human_blocker_resume"] is True
+    assert resumed_run["repair_cycle"]["status"] == "active"
+    assert resumed_run.get("repair_cycle_history", []) == []
 
 def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
     git_repo: Path,
@@ -1469,6 +1449,8 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
     assert repair["publication_attempts"] == 1
     assert "publication_sha" not in repair
     old_generation = repair["repair_generation"]
+    old_attempt = deepcopy(repair["pending_semantic_attempt"])
+    old_budget = deepcopy(repair["review_budget"])
     old_candidate = repair["candidate_sha"]
     old_checkout = Path(str(repair["repair_checkout"]))
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
@@ -1495,30 +1477,16 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
         human_response="Publication access has been restored.",
     )
     resumed_run = resumed["run_acceptance"]
-    assert "repair_job" not in resumed_run
-    assert resumed_run["repair_cycle_history"][-1]["generation"] == old_generation
-    assert resumed_run["candidate_acceptance_history"][-1]["candidate_sha"] == (
-        old_candidate
-    )
-    resuming_agents = FreshCycleRunAgents()
-    resuming_agents._reviews = [_passing_artifact()]
-    completed = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=resuming_agents,
-        github=FixtureGitHubPublisher(fixture, git),
-    ).accept(str(state["run_id"]))
-
-    completed_run = completed["run_acceptance"]
-    assert completed_run["repair_cycle"]["generation"] == old_generation + 1
-    assert resuming_agents.development_requests[0]["thread_id"] is None
-    assert resuming_agents.development_requests[0]["human_response_history"][0][
-        "generation"
-    ] == old_generation + 1
-    assert resuming_agents.development_requests[0]["thread_id"] is None
-    assert "run-repair-publication-blocked" in completed_run[
-        "discarded_repair_thread_ids"
-    ]
+    resumed_job = resumed_run["repair_job"]
+    assert resumed_job["repair_generation"] == old_generation
+    assert resumed_job["phase"] == "accepted"
+    assert resumed_job["candidate_sha"] == old_candidate
+    assert resumed_job["pending_semantic_attempt"] == old_attempt
+    assert resumed_job["review_budget"] == old_budget
+    assert resumed_job["publication_attempts"] == 1
+    assert resumed_job["publication_thread_id"] == "run-repair-publication-blocked"
+    assert resumed_run["repair_cycle"]["status"] == "active"
+    assert resumed_run.get("repair_cycle_history", []) == []
 
 def test_run_acceptance_rejects_ticket_or_previous_reviewer_identity(
     git_repo: Path,
