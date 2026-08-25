@@ -172,6 +172,27 @@ def _manifest(snapshot: Path) -> dict[str, object]:
     return loaded
 
 
+def test_snapshot_entrypoints_rewrite_candidate_paths_inside_wrappers(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "data" / "agent-run" / "staging" / "candidate-123"
+    snapshot = tmp_path / "data" / "agent-run" / "snapshots" / "sha256:test"
+    bin_directory = snapshot / "bin"
+    bin_directory.mkdir(parents=True)
+    wrapper = bin_directory / "agent-run"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"exec '{candidate}/bin/python' -m agent_run.cli \"$@\"\n",
+        encoding="utf-8",
+    )
+
+    runner_installer._rewrite_snapshot_entrypoints(snapshot, candidate)
+
+    rewritten = wrapper.read_text(encoding="utf-8")
+    assert str(candidate) not in rewritten
+    assert str(snapshot) in rewritten
+
+
 def _file_tree(root: Path) -> dict[str, bytes]:
     if not root.exists():
         return {}
@@ -263,6 +284,10 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
     assert int(count.read_text()) == 1
     assert (home / ".local" / "bin" / "agent-run").is_symlink()
+    public_entry = (home / ".local" / "bin" / "agent-run").resolve()
+    assert str(_data_root(home) / "staging") not in public_entry.read_text(
+        encoding="utf-8"
+    )
     command = subprocess.run(
         [str(home / ".local" / "bin" / "agent-run"), "--help"],
         cwd=tmp_path,
@@ -1303,6 +1328,80 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
     assert uninstall.returncode == 0, uninstall.stderr
     assert profile_path.read_text(encoding="utf-8") == "before\n"
     assert profile_path.stat().st_mode & 0o777 == 0o644
+
+
+def test_install_result_names_public_entry_and_login_shell_refresh(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    fake_bin, _count, _status_file = _fake_codex(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(source, home, fake_bin)
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["entry"] == str(home / ".local" / "bin" / "agent-run")
+    assert "重新打开登录 shell" in output["path_notice"]
+
+
+@pytest.mark.parametrize("interrupt_stage", ["source", "paths", "install"])
+def test_keyboard_interrupt_is_reported_as_a_bounded_install_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interrupt_stage: str,
+) -> None:
+    source = _source_tree(tmp_path)
+    home = tmp_path / "home"
+    environment = {
+        "HOME": str(home),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "PATH": str(tmp_path / "bin"),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    if interrupt_stage == "source":
+        original_resolve = Path.resolve
+
+        def interrupt_source_resolve(
+            path: Path, *args: object, **kwargs: object
+        ) -> Path:
+            if path == source:
+                raise KeyboardInterrupt()
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", interrupt_source_resolve)
+    elif interrupt_stage == "paths":
+
+        def interrupt_paths() -> runner_installer.InstallPaths:
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(
+            runner_installer.InstallPaths, "from_environment", interrupt_paths
+        )
+    else:
+
+        def interrupt_install(
+            _paths: runner_installer.InstallPaths, _source: Path
+        ) -> dict[str, object]:
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(runner_installer, "_install", interrupt_install)
+
+    result = runner_installer.main(["--source", str(source)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "agent-run install: interrupted" in captured.err
+    assert "Traceback" not in captured.err
+    managed_root = home / "data" / "agent-run"
+    assert not (managed_root / "active").exists()
+    assert not (home / ".local" / "bin" / "agent-run").exists()
+    assert not (home / ".profile").exists()
 
 
 def test_post_activation_failure_restores_old_generation(

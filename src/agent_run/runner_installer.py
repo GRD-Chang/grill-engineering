@@ -114,9 +114,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         code = error.code
         return code if isinstance(code, int) else int(code) if isinstance(code, str) else 1
-    source = Path(parsed.source).resolve()
-    paths = InstallPaths.from_environment()
     try:
+        source = Path(parsed.source).resolve()
+        paths = InstallPaths.from_environment()
         _reject_managed_paths_inside_source(paths, source)
         with _handle_sigterm():
             with _management_lock(paths):
@@ -126,7 +126,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     result = _uninstall(paths)
                 else:
                     result = _install(paths, source)
-    except InstallerInterrupted:
+    except (InstallerInterrupted, KeyboardInterrupt):
         print("agent-run install: interrupted", file=sys.stderr)
         return 1
     except InstallerError as error:
@@ -252,7 +252,9 @@ def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]
                     *pre_cleanup_warnings,
                     *_cleanup_retired(paths, snapshot, old_previous, old_generation),
                 ]
-                return _install_result(snapshot, old_previous, warnings, idempotent=True)
+                return _install_result(
+                    paths, snapshot, old_previous, warnings, idempotent=True
+                )
             except BaseException:
                 _restore_profile(paths.profile, profile_backup)
                 if not entry_was_present and _is_managed_entry(paths):
@@ -276,9 +278,12 @@ def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]
                     *activation_warnings,
                     *_cleanup_retired(paths, snapshot, old_current, generation),
                 ]
-                return _install_result(snapshot, old_current, warnings, idempotent=False)
+                return _install_result(
+                    paths, snapshot, old_current, warnings, idempotent=False
+                )
             except (InstallerInterrupted, KeyboardInterrupt):
                 return _install_result(
+                    paths,
                     snapshot,
                     old_current,
                     [
@@ -736,14 +741,15 @@ def _manifest_identity(snapshot: Path) -> str:
 
 def _rewrite_snapshot_entrypoints(snapshot: Path, old_candidate: Path) -> None:
     bin_directory = snapshot / "bin"
+    old_path = os.fsencode(str(old_candidate))
+    new_path = os.fsencode(str(snapshot))
     for entry in bin_directory.iterdir():
         if entry.is_symlink() or not entry.is_file():
             continue
         content = entry.read_bytes()
-        old_prefix = f"#!{old_candidate}".encode()
-        new_prefix = f"#!{snapshot}".encode()
-        if content.startswith(old_prefix):
-            entry.write_bytes(new_prefix + content[len(old_prefix) :])
+        rewritten = content.replace(old_path, new_path)
+        if rewritten != content:
+            entry.write_bytes(rewritten)
 
 
 def _read_active(paths: InstallPaths) -> tuple[Path | None, Path | None, Path | None]:
@@ -979,6 +985,7 @@ def _atomic_write(path: Path, content: str | bytes, *, mode: int | None) -> None
 
 
 def _install_result(
+    paths: InstallPaths,
     snapshot: Path,
     previous: Path | None,
     warnings: list[str],
@@ -990,7 +997,8 @@ def _install_result(
         "content_identity": _manifest_identity(snapshot),
         "active_snapshot": _manifest_identity(snapshot),
         "previous_snapshot": _manifest_identity(previous) if previous is not None else None,
-        "entry": str(snapshot.parents[1] / "active" / "current" / "bin" / "agent-run"),
+        "entry": str(paths.stable_entry),
+        "path_notice": "已更新用户级 PATH；请重新打开登录 shell 后使用 agent-run",
         "idempotent": idempotent,
         "warning": warnings or None,
     }
