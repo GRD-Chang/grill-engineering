@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import shutil
 import subprocess
 import sys
@@ -14,8 +13,18 @@ from pathlib import Path
 from typing import Any, Sequence
 
 try:
+    from agent_run.process_cleanup import (
+        capture_process_scope,
+        child_subreaper,
+        terminate_process_group,
+    )
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
+    from process_cleanup import (  # type: ignore[import-not-found, no-redef]
+        capture_process_scope,
+        child_subreaper,
+        terminate_process_group,
+    )
     from runner_runtime import (  # type: ignore[import-not-found, no-redef]
         RuntimeTreeError,
         find_runtime_package,
@@ -53,6 +62,10 @@ class RunnerProbeBackend:
         self.timeout_seconds = timeout_seconds
 
     def check(self, candidate: Path) -> dict[str, str]:
+        with child_subreaper():
+            return self._check(candidate)
+
+    def _check(self, candidate: Path) -> dict[str, str]:
         _require_runtime_package(candidate)
         with tempfile.TemporaryDirectory(prefix="agent-run-probe-") as temporary_name:
             temporary = Path(temporary_name)
@@ -89,6 +102,8 @@ class RunnerProbeBackend:
                 '完成条件是只返回精确 JSON 对象 {"status":"ok"}，不得增加任何字段。'
                 '唯一交付物是这个 JSON 对象。'
             )
+            process: subprocess.Popen[str] | None = None
+            adopted_baseline = capture_process_scope()
             try:
                 process = subprocess.Popen(
                     command,
@@ -105,34 +120,42 @@ class RunnerProbeBackend:
                 try:
                     process.communicate(input=prompt, timeout=self.timeout_seconds)
                 except subprocess.TimeoutExpired as error:
-                    _terminate_process_group(process)
                     raise RunnerProbeError("Codex Compatibility Check timed out") from error
+                if process.returncode != 0:
+                    raise RunnerProbeError("Codex Compatibility Check returned a non-zero exit")
+                if not output_path.is_file():
+                    raise RunnerProbeError("Codex Compatibility Check produced no final output")
+                try:
+                    output_size = output_path.stat().st_size
+                except OSError as error:
+                    raise RunnerProbeError(
+                        "Codex Compatibility Check produced no final output"
+                    ) from error
+                if output_size > MAX_FINAL_OUTPUT_BYTES:
+                    raise RunnerProbeError("Codex Compatibility Check final output is too large")
+                with output_path.open("rb") as output_file:
+                    final_output = output_file.read(MAX_FINAL_OUTPUT_BYTES + 1)
+                if len(final_output) > MAX_FINAL_OUTPUT_BYTES:
+                    raise RunnerProbeError("Codex Compatibility Check final output is too large")
+                try:
+                    loaded: object = json.loads(final_output.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise RunnerProbeError("Codex Compatibility Check returned invalid JSON") from error
+                if loaded != {"status": "ok"}:
+                    raise RunnerProbeError("Codex Compatibility Check rejected the required schema")
             except subprocess.TimeoutExpired as error:
                 raise RunnerProbeError("Codex Compatibility Check timed out") from error
             except OSError as error:
                 raise RunnerProbeError("could not start Codex Compatibility Check") from error
-            if process.returncode != 0:
-                raise RunnerProbeError("Codex Compatibility Check returned a non-zero exit")
-            if not output_path.is_file():
-                raise RunnerProbeError("Codex Compatibility Check produced no final output")
-            try:
-                output_size = output_path.stat().st_size
-            except OSError as error:
-                raise RunnerProbeError(
-                    "Codex Compatibility Check produced no final output"
-                ) from error
-            if output_size > MAX_FINAL_OUTPUT_BYTES:
-                raise RunnerProbeError("Codex Compatibility Check final output is too large")
-            with output_path.open("rb") as output_file:
-                final_output = output_file.read(MAX_FINAL_OUTPUT_BYTES + 1)
-            if len(final_output) > MAX_FINAL_OUTPUT_BYTES:
-                raise RunnerProbeError("Codex Compatibility Check final output is too large")
-            try:
-                loaded: object = json.loads(final_output.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise RunnerProbeError("Codex Compatibility Check returned invalid JSON") from error
-            if loaded != {"status": "ok"}:
-                raise RunnerProbeError("Codex Compatibility Check rejected the required schema")
+            finally:
+                if process is not None:
+                    terminate_process_group(
+                        process,
+                        adopted_baseline=adopted_baseline,
+                        same_process_group=(
+                            os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") == "1"
+                        ),
+                    )
         return {"result": "passed"}
 
 
@@ -150,29 +173,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
-
-
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") == "1":
-        try:
-            os.killpg(os.getpgrp(), signal.SIGKILL)
-        except OSError:
-            try:
-                process.kill()
-            except OSError:
-                pass
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            process.kill()
-        except OSError:
-            pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
 
 
 def _require_runtime_package(candidate: Path) -> Path:

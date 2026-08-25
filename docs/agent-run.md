@@ -407,6 +407,47 @@ Runner，直接从 source 或 editable checkout 运行生产生命周期不受�
 branch、fork、dirty source 或非官方 provenance 被旧 gate 拒绝。目标仓库的 Required Checks、Worker
 读取权限、Publisher 写凭据和运行状态合同仍按本文件前文执行。
 
+## 开源用户 Quickstart 与 doctor
+
+源码仓库只负责构建 Runner，目标交付仓库负责保存 `.agent-run`、Delivery Run 和 Run Branch；两者
+应当是两个目录。稳定使用先选择 release tag，开发者才选择 branch、fork 或 dirty source：
+
+```bash
+git clone https://github.com/GRD-Chang/grill-engineering.git
+cd grill-engineer
+git checkout <release-tag>
+./install.sh
+
+# 重新打开登录 shell 后，可在任意目录执行
+agent-run doctor --json
+cd /path/to/delivery-repository
+agent-run doctor
+agent-run run <parent-issue> --repo OWNER/REPO
+```
+
+`agent-run doctor` 是可选、只读的诊断入口，不要求当前目录是 Git 仓库。它报告 Python 版本、Git、Codex、
+宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker read provider；JSON
+输出只包含 Python 版本、路径、状态、provider 和布尔值等非敏感信息。缺少依赖只报告问题，不安装软件、不
+修复 PATH、不触发生命周期，也不修改 shell、auth profile、Run locator、Delivery Run、Thread、PR、
+branch 或目标仓库 `.agent-run`。
+
+后续更新仍从源码目录显式执行 `./install.sh`。如果当前为 A，安装 B 后保留 B/A，再安装 C 后只保留
+C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失败会保留旧 Active。一次回退执行
+`./install.sh --rollback`，它不重建、不调用 Codex、不检查或修改 Delivery Run；卸载执行
+`./install.sh --uninstall`，它清理受管 Runner、入口和 PATH 块但保留固定 `install.lock`、App profile、
+私钥、Run locator 和目标仓库 `.agent-run`。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
+的同名入口会被保留并报告清理未完成。
+
+没有 App profile 时 Worker read provider 默认是 host `gh`；`agent-run auth status`、
+`agent-run auth app configure --app-id <id> --installation-id <id> --private-key /secure/app.pem` 和
+`agent-run auth app remove` 是可选的公开配置路径。status 不显示 token 或私钥，remove 不删除用户的
+私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
+凭据隔离约束，Publisher 仍使用宿主写身份。
+
+v0.1 只支持 Linux/WSL、用户级 `~/.profile` 和单用户安装。用户必须自行提供 CPython 3.11+、`venv`、
+`pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
+系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher、自动更新和跨平台支持不属于本版本。
+
 ## 本地状态与清理
 
 耐久状态位于 `.agent-run/runs/`。本协议要求 `semantic_attempt_protocol: 1`；旧 Run 不迁移、

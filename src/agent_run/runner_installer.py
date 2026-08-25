@@ -29,8 +29,18 @@ if __name__ == "__main__":
     sys.dont_write_bytecode = True
 
 try:
+    from agent_run.process_cleanup import (
+        capture_process_scope,
+        child_subreaper,
+        terminate_process_group as _terminate_process_group,
+    )
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
+    from process_cleanup import (  # type: ignore[import-not-found, no-redef]
+        capture_process_scope,
+        child_subreaper,
+        terminate_process_group as _terminate_process_group,
+    )
     from runner_runtime import (  # type: ignore[import-not-found, no-redef]
         RuntimeTreeError,
         find_runtime_package,
@@ -108,6 +118,11 @@ class InstallPaths:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
+    with child_subreaper():
+        return _main(arguments)
+
+
+def _main(arguments: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     try:
         parsed = parser.parse_args(list(arguments) if arguments is not None else None)
@@ -449,6 +464,7 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
 
 
 def _run_pip_install(python: Path, source: Path) -> int:
+    adopted_baseline = capture_process_scope()
     try:
         process = subprocess.Popen(
             [
@@ -469,14 +485,15 @@ def _run_pip_install(python: Path, source: Path) -> int:
     except OSError as error:
         raise InstallerError("Python package build or non-editable installation failed") from error
     try:
-        return_code = process.wait(timeout=15 * 60)
-    except subprocess.TimeoutExpired as error:
-        _terminate_process_group(process)
-        raise InstallerError("Python package build or non-editable installation timed out") from error
-    except BaseException:
-        _terminate_process_group(process)
-        raise
-    return return_code
+        try:
+            return_code = process.wait(timeout=15 * 60)
+        except subprocess.TimeoutExpired as error:
+            raise InstallerError(
+                "Python package build or non-editable installation timed out"
+            ) from error
+        return return_code
+    finally:
+        _terminate_process_group(process, adopted_baseline=adopted_baseline)
 
 
 def _run_candidate_probe(candidate: Path) -> None:
@@ -490,6 +507,7 @@ def _run_candidate_probe(candidate: Path) -> None:
             probe_environment.pop(variable, None)
         probe_environment["TMPDIR"] = str(empty_directory)
         probe_environment["AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP"] = "1"
+        adopted_baseline = capture_process_scope()
         try:
             process = subprocess.Popen(
                 [str(python), "-m", "agent_run.runner_probe", str(candidate)],
@@ -501,25 +519,33 @@ def _run_candidate_probe(candidate: Path) -> None:
             )
         except OSError as error:
             raise InstallerError("无法启动候选 Runner Compatibility Check") from error
-        output, error_output = _read_candidate_probe_output(
-            process, timeout_seconds=_CANDIDATE_PROBE_TIMEOUT_SECONDS
-        )
-        if process.returncode != 0:
-            raise InstallerError(_safe_candidate_probe_error(error_output))
         try:
-            loaded: object = json.loads(output)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise InstallerError("Runner Compatibility Check produced invalid output") from error
-        if loaded != {"result": "passed"}:
-            raise InstallerError("Runner Compatibility Check produced an invalid result")
+            output, error_output = _read_candidate_probe_output(
+                process,
+                timeout_seconds=_CANDIDATE_PROBE_TIMEOUT_SECONDS,
+                adopted_baseline=adopted_baseline,
+            )
+            if process.returncode != 0:
+                raise InstallerError(_safe_candidate_probe_error(error_output))
+            try:
+                loaded: object = json.loads(output)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise InstallerError("Runner Compatibility Check produced invalid output") from error
+            if loaded != {"result": "passed"}:
+                raise InstallerError("Runner Compatibility Check produced an invalid result")
+        finally:
+            _terminate_process_group(process, adopted_baseline=adopted_baseline)
 
 
 def _read_candidate_probe_output(
-    process: subprocess.Popen[Any], *, timeout_seconds: float
+    process: subprocess.Popen[Any],
+    *,
+    timeout_seconds: float,
+    adopted_baseline: set[int] | None = None,
 ) -> tuple[bytes, bytes]:
     streams = {"stdout": process.stdout, "stderr": process.stderr}
     if any(stream is None for stream in streams.values()):
-        _terminate_process_group(process)
+        _terminate_process_group(process, adopted_baseline=adopted_baseline)
         raise InstallerError("Runner Compatibility Check failed")
     deadline = time.monotonic() + timeout_seconds
     buffers = {name: bytearray() for name in streams}
@@ -531,11 +557,11 @@ def _read_candidate_probe_output(
             while selector.get_map():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    _terminate_process_group(process)
+                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
                     raise InstallerError("Runner Compatibility Check timed out")
                 events = selector.select(timeout=remaining)
                 if not events:
-                    _terminate_process_group(process)
+                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
                     raise InstallerError("Runner Compatibility Check timed out")
                 for key, _mask in events:
                     stream = cast(Any, key.fileobj)
@@ -550,23 +576,23 @@ def _read_candidate_probe_output(
                     )
                     buffers[name].extend(chunk)
                     if len(buffers[name]) > _MAX_CANDIDATE_PROBE_OUTPUT_BYTES:
-                        _terminate_process_group(process)
+                        _terminate_process_group(process, adopted_baseline=adopted_baseline)
                         raise InstallerError("Runner Compatibility Check output is too large")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _terminate_process_group(process)
+            _terminate_process_group(process, adopted_baseline=adopted_baseline)
             raise InstallerError("Runner Compatibility Check timed out")
         try:
             process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as error:
-            _terminate_process_group(process)
+            _terminate_process_group(process, adopted_baseline=adopted_baseline)
             raise InstallerError("Runner Compatibility Check timed out") from error
         return bytes(buffers["stdout"]), bytes(buffers["stderr"])
     except (OSError, subprocess.SubprocessError) as error:
-        _terminate_process_group(process)
+        _terminate_process_group(process, adopted_baseline=adopted_baseline)
         raise InstallerError("Runner Compatibility Check failed") from error
     except BaseException:
-        _terminate_process_group(process)
+        _terminate_process_group(process, adopted_baseline=adopted_baseline)
         raise
     finally:
         for stream in streams.values():
@@ -583,20 +609,6 @@ def _safe_candidate_probe_error(error_output: bytes) -> str:
     if detail.startswith(prefix) and detail.removeprefix(prefix) in _SAFE_CANDIDATE_PROBE_ERRORS:
         return detail.removeprefix(prefix)
     return "Runner Compatibility Check returned a non-zero exit"
-
-
-def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            process.kill()
-        except OSError:
-            pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
 
 
 def _runtime_package(candidate: Path) -> Path:
@@ -671,6 +683,7 @@ def _git_status(source: Path, *arguments: str) -> bool | None:
 
 
 def _git_has_changes(source: Path) -> bool | None:
+    adopted_baseline = capture_process_scope()
     try:
         process = subprocess.Popen(
             [
@@ -710,6 +723,7 @@ def _git_has_changes(source: Path) -> bool | None:
         return None
     finally:
         output.close()
+        _terminate_process_group(process, adopted_baseline=adopted_baseline)
 
 
 def _write_manifest(snapshot: Path, manifest: dict[str, object]) -> None:

@@ -68,6 +68,7 @@ def _fake_codex(
     behavior_file = tmp_path / "codex-behavior"
     behavior_file.write_text(behavior, encoding="utf-8")
     pid_file = tmp_path / "codex-pid"
+    descendant_pid_file = tmp_path / "codex-descendant-pid"
     cwd_file = tmp_path / "codex-cwd"
     path_file = tmp_path / "codex-path"
     script = directory / "codex"
@@ -82,6 +83,7 @@ def _fake_codex(
         f"status_file = pathlib.Path({str(status_file)!r})\n"
         f"behavior_file = pathlib.Path({str(behavior_file)!r})\n"
         f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        f"descendant_pid_file = pathlib.Path({str(descendant_pid_file)!r})\n"
         f"cwd_file = pathlib.Path({str(cwd_file)!r})\n"
         f"path_file = pathlib.Path({str(path_file)!r})\n"
         "current = int(count.read_text() if count.exists() else '0')\n"
@@ -102,6 +104,21 @@ def _fake_codex(
         "    time.sleep(130)\n"
         "if behavior == 'sleep':\n"
         "    time.sleep(2)\n"
+        "if behavior == 'fork-setsid':\n"
+        "    if '--output-last-message' not in sys.argv:\n"
+        "        sys.exit(0)\n"
+        "    child = os.fork()\n"
+        "    if child == 0:\n"
+        "        descendant_pid_file.write_text(str(os.getpid()))\n"
+        "        os.setsid()\n"
+        "        time.sleep(30)\n"
+        "    for _ in range(100):\n"
+        "        if descendant_pid_file.exists():\n"
+        "            break\n"
+        "        time.sleep(0.01)\n"
+        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "    output.write_text(json.dumps({'status': status_file.read_text()}))\n"
+        "    os._exit(0)\n"
         "schema = pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1])\n"
         "assert json.loads(schema.read_text()) == {\n"
         "    'type': 'object',\n"
@@ -128,24 +145,99 @@ def _run(
     *arguments: str,
     path: str | None = None,
     cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    environment.update(
+    process_environment = (
+        os.environ.copy() if environment is None else environment.copy()
+    )
+    process_environment.update(
         {
             "HOME": str(home),
             "XDG_DATA_HOME": str(home / "data"),
             "XDG_CONFIG_HOME": str(home / "config"),
-            "PATH": path if path is not None else f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "XDG_STATE_HOME": str(home / "state"),
+            "PATH": path
+            if path is not None
+            else f"{fake_bin}{os.pathsep}{process_environment.get('PATH', '')}",
         }
     )
     return subprocess.run(
         [str(source / "install.sh"), *arguments],
         cwd=cwd or source,
-        env=environment,
+        env=process_environment,
         text=True,
         capture_output=True,
         check=False,
     )
+
+
+def _isolated_quickstart_environment(
+    tmp_path: Path, fake_bin: Path
+) -> tuple[dict[str, str], Path, list[Path]]:
+    tool_directory = tmp_path / "approved-tools"
+    tool_directory.mkdir()
+    sentinel_directory = tmp_path / "sentinels"
+    sentinel_directory.mkdir()
+    markers: list[Path] = []
+
+    for name in ("bash", "sh", "git", "dirname", "python3"):
+        executable = (
+            sys.executable if name == "python3" else shutil.which(name, path=os.defpath)
+        )
+        assert executable is not None, f"{name} is required by quickstart smoke"
+        (tool_directory / name).symlink_to(executable)
+    (tool_directory / "codex").symlink_to(fake_bin / "codex")
+
+    for name, output in (
+        ("gh", ""),
+        ("openssl", "OpenSSL 3.0\n"),
+        ("bwrap", "bubblewrap 0.8\n"),
+    ):
+        executable = tool_directory / name
+        executable.write_text(
+            "#!/bin/sh\n"
+            + (
+                "if [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then exit 0; fi\n"
+                "if [ \"$#\" -eq 2 ] && [ \"$1\" = auth ] && [ \"$2\" = status ]; then exit 0; fi\n"
+                "exit 97\n"
+                if name == "gh"
+                else f"printf '%s' {output!r}\n"
+            ),
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    for command_name in (
+        "sudo",
+        "apt",
+        "apt-get",
+        "dnf",
+        "yum",
+        "pacman",
+        "apk",
+        "pipx",
+    ):
+        marker = sentinel_directory / f"{command_name}.called"
+        markers.append(marker)
+        command = sentinel_directory / command_name
+        command.write_text(
+            "#!/bin/sh\n"
+            f"printf called > {str(marker)!r}\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        command.chmod(0o755)
+
+    isolated_path = os.pathsep.join((str(sentinel_directory), str(tool_directory)))
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "XDG_DATA_HOME": str(tmp_path / "home" / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "home" / "config"),
+        "XDG_STATE_HOME": str(tmp_path / "home" / "state"),
+        "TMPDIR": str(tmp_path / "tmp"),
+        "PATH": isolated_path,
+    }
+    return environment, tool_directory, markers
 
 
 def _path_without_codex(tmp_path: Path) -> str:
@@ -393,6 +485,49 @@ def test_probe_timeout_terminates_its_process_group(
 
     with pytest.raises(RunnerProbeError, match="timed out"):
         RunnerProbeBackend(timeout_seconds=0.05).check(tmp_path / "candidate")
+
+
+def test_probe_success_terminates_descendants_after_codex_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
+    candidate.mkdir(parents=True)
+    (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    child_pid_file = tmp_path / "child.pid"
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import pathlib\n"
+        "import sys\n"
+        "import time\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.setsid()\n"
+        f"    pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "else:\n"
+        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "    output.write_text(json.dumps({'status': 'ok'}))\n"
+        "    os._exit(0)\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    try:
+        assert RunnerProbeBackend(timeout_seconds=2).check(tmp_path / "candidate") == {
+            "result": "passed"
+        }
+        _assert_process_gone(child_pid_file)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
 
 
 def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files(
@@ -1330,6 +1465,179 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
     assert profile_path.stat().st_mode & 0o777 == 0o644
 
 
+def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source_tree(tmp_path, real_install=True)
+    fake_bin, count, _status_file = _fake_codex(tmp_path, behavior="fork-setsid")
+    isolated_environment, tool_directory, markers = (
+        _isolated_quickstart_environment(tmp_path, fake_bin)
+    )
+    isolated_path = isolated_environment["PATH"]
+    home = Path(isolated_environment["HOME"])
+    home.mkdir()
+    probe_tmp = Path(isolated_environment["TMPDIR"])
+    probe_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(probe_tmp))
+    shell = tool_directory / "bash"
+
+    assert shutil.which("agent-run", path=isolated_path) is None
+    pre_login = subprocess.run(
+        [str(shell), "--noprofile", "-c", "command -v agent-run"],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert pre_login.returncode == 1, pre_login.stderr
+    assert pre_login.stdout.strip() == ""
+
+    installed = _run(
+        source,
+        home,
+        fake_bin,
+        path=isolated_path,
+        environment=isolated_environment,
+    )
+    assert installed.returncode == 0, installed.stderr
+    assert (tmp_path / "codex-path").read_text(encoding="utf-8") == isolated_path
+    _assert_process_gone(tmp_path / "codex-descendant-pid")
+    assert not [marker for marker in markers if marker.exists()]
+
+    delivery = tmp_path / "delivery"
+    delivery.mkdir()
+    git = str(tool_directory / "git")
+    subprocess.run(
+        [git, "init", "-q", "-b", "main"],
+        cwd=delivery,
+        env=isolated_environment,
+        check=True,
+    )
+    subprocess.run(
+        [git, "config", "user.name", "Agent Run Quickstart Tests"],
+        cwd=delivery,
+        env=isolated_environment,
+        check=True,
+    )
+    subprocess.run(
+        [git, "config", "user.email", "agent-run-quickstart@example.invalid"],
+        cwd=delivery,
+        env=isolated_environment,
+        check=True,
+    )
+    (delivery / "README.md").write_text("# target\n", encoding="utf-8")
+    subprocess.run(
+        [git, "add", "README.md"], cwd=delivery, env=isolated_environment, check=True
+    )
+    subprocess.run(
+        [git, "commit", "-qm", "initial target"],
+        cwd=delivery,
+        env=isolated_environment,
+        check=True,
+    )
+    fixture = write_fixture(
+        delivery / "github.json",
+        issues={
+            "2": {
+                "number": 2,
+                "title": "Target ticket",
+                "body": "Run the target repository.",
+                "state": "OPEN",
+                "labels": ["ready-for-agent"],
+                "blocked_by": [],
+            }
+        },
+    )
+
+    entry_lookup = subprocess.run(
+        [str(shell), "--login", "-c", "command -v agent-run"],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert entry_lookup.returncode == 0, entry_lookup.stderr
+    entry = Path(entry_lookup.stdout.strip())
+    assert entry == home / ".local" / "bin" / "agent-run"
+
+    doctor = subprocess.run(
+        [
+            str(shell),
+            "--login",
+            "-c",
+            'cd "$1" && agent-run doctor --json',
+            "agent-run-quickstart",
+            str(delivery),
+        ],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert doctor.returncode == 0, doctor.stderr
+    doctor_report = json.loads(doctor.stdout)
+    assert doctor_report["checks"]["path"]["status"] == "ok"
+
+    first_run = subprocess.run(
+        [
+            str(shell),
+            "--login",
+            "-c",
+            'cd "$1" && agent-run start 1 --github-fixture "$2"',
+            "agent-run-quickstart",
+            str(delivery),
+            str(fixture),
+        ],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert first_run.returncode == 0, first_run.stderr
+    assert json.loads(first_run.stdout)["run_id"]
+    target_state_before_uninstall = _file_tree(delivery / ".agent-run")
+
+    count_before_repeat = int(count.read_text(encoding="utf-8"))
+    repeated = _run(
+        source,
+        home,
+        fake_bin,
+        path=isolated_path,
+        environment=isolated_environment,
+    )
+    assert repeated.returncode == 0, repeated.stderr
+    _assert_process_gone(tmp_path / "codex-descendant-pid")
+    assert int(count.read_text(encoding="utf-8")) == count_before_repeat
+    profile = (home / ".profile").read_text(encoding="utf-8")
+    assert profile.count("# >>> agent-run managed PATH >>>") == 1
+    assert profile.count("# <<< agent-run managed PATH <<<") == 1
+    assert len(list((_data_root(home) / "snapshots").iterdir())) == 1
+
+    uninstalled = _run(
+        source,
+        home,
+        fake_bin,
+        "--uninstall",
+        path=isolated_path,
+        environment=isolated_environment,
+    )
+    assert uninstalled.returncode == 0, uninstalled.stderr
+    assert not (home / ".local" / "bin" / "agent-run").exists()
+    assert (_data_root(home) / "install.lock").exists()
+    assert not (_data_root(home) / "active").exists()
+    assert not (_data_root(home) / "snapshots").exists()
+    assert not (_data_root(home) / "generations").exists()
+    assert not (_data_root(home) / "staging").exists()
+    profile_path = home / ".profile"
+    if profile_path.exists():
+        profile = profile_path.read_text(encoding="utf-8")
+        assert "# >>> agent-run managed PATH >>>" not in profile
+        assert "# <<< agent-run managed PATH <<<" not in profile
+    assert _file_tree(delivery / ".agent-run") == target_state_before_uninstall
+    assert not [marker for marker in markers if marker.exists()]
+    assert not list(probe_tmp.iterdir())
+
+
 def test_install_result_names_public_entry_and_login_shell_refresh(
     tmp_path: Path,
 ) -> None:
@@ -2169,7 +2477,42 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     (source / "src" / "agent_run" / "__init__.py").write_text(
         "__version__ = 'third'\n", encoding="utf-8"
     )
-    assert _run(source, home, fake_bin).returncode == 0
+    installed_with_incompatible_state = _run(source, home, fake_bin)
+    assert installed_with_incompatible_state.returncode == 0, installed_with_incompatible_state.stderr
+    rejected_after_install = subprocess.run(
+        [str(entry), "run", "1", "--github-fixture", str(fixture)],
+        cwd=delivery,
+        env=cli_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected_after_install.returncode == 2
+    assert json.loads(rejected_after_install.stdout)["status"] == "incompatible_run_state"
+    assert state_path.read_bytes() == before
+    assert locator_path.read_bytes() == locator_before
+    assert {
+        path.relative_to(delivery / ".agent-run"): path.read_bytes()
+        for path in (delivery / ".agent-run").rglob("*")
+        if path.is_file()
+    } == target_files_before
+    assert sorted(
+        path.relative_to(delivery / ".agent-run")
+        for path in (delivery / ".agent-run").rglob("*")
+    ) == target_paths_before
+
+    rolled_back_with_incompatible_state = _run(source, home, fake_bin, "--rollback")
+    assert rolled_back_with_incompatible_state.returncode == 0, rolled_back_with_incompatible_state.stderr
+    rejected_after_rollback = subprocess.run(
+        [str(entry), "run", "1", "--github-fixture", str(fixture)],
+        cwd=delivery,
+        env=cli_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected_after_rollback.returncode == 2
+    assert json.loads(rejected_after_rollback.stdout)["status"] == "incompatible_run_state"
     assert state_path.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {

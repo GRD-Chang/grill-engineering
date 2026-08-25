@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from conftest import write_fixture
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
+_DOCTOR_TIMEOUT_TEST_LIMIT_SECONDS = 5
 
 
 def _canonical_run_budget() -> dict[str, object]:
@@ -42,6 +44,7 @@ def _canonical_run_budget() -> dict[str, object]:
 def test_lifecycle_help_describes_operator_boundaries() -> None:
     help_text = build_parser().format_help()
 
+    assert "doctor" in help_text
     assert "推进正常 Job Loop，停在需要操作者处理的边界" in help_text
     assert "恢复失败/Human Blocker Invocation 或监督超时窗口" in help_text
     assert "仅从 requeue_required 创建新的 Change Job Generation" in help_text
@@ -52,6 +55,486 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
         assert internal_command not in help_text
         with pytest.raises(SystemExit):
             build_parser().parse_args([internal_command, "run-id"])
+
+
+def test_public_operator_docs_describe_the_v01_quickstart() -> None:
+    documents = [
+        (PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
+        (PROJECT_ROOT / "docs" / "agent-run.md").read_text(encoding="utf-8"),
+    ]
+
+    for document in documents:
+        assert "./install.sh" in document
+        assert "release tag" in document
+        assert "agent-run doctor" in document
+        assert "auth app configure" in document
+        assert "--rollback" in document
+        assert "--uninstall" in document
+        assert "Linux/WSL" in document
+        assert "目标交付仓库" in document
+
+
+def test_doctor_reports_host_readiness_without_mutating_user_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, output in {
+        "git": "git version 2.0\n",
+        "codex": "GH_TOKEN=doctor-secret\n",
+        "openssl": "OpenSSL 3.0\n",
+        "bwrap": "bubblewrap 0.8\n",
+    }.items():
+        executable = fake_bin / name
+        executable.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' {output!r}\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+    gh = fake_bin / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = --version ] && exit 0\n"
+        "[ \"$1\" = auth ] && exit 0\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o700)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / "config"
+    data = home / "data"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+    monkeypatch.setenv("PATH", str(fake_bin))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+    assert output["result"] == "doctor"
+    assert output["status"] == "issues"
+    assert output["checks"]["git"]["status"] == "ok"
+    assert output["checks"]["codex"]["status"] == "ok"
+    assert output["checks"]["openssl"]["status"] == "ok"
+    assert output["checks"]["bubblewrap"]["status"] == "ok"
+    assert output["checks"]["github"]["logged_in"] is True
+    assert output["checks"]["active_runner"]["status"] == "missing"
+    assert output["checks"]["path"]["agent_run"] is None
+    assert output["checks"]["worker_read_provider"] == {
+        "provider": "host",
+        "status": "ok",
+    }
+    assert "doctor-secret" not in output_text
+    assert not config.exists()
+    assert not data.exists()
+
+
+def test_doctor_does_not_fallback_when_app_profile_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    profile = config / "github-app.json"
+    profile.write_text("{not-json}\n", encoding="utf-8")
+    profile.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+    assert output["checks"]["worker_read_provider"] == {
+        "provider": "app",
+        "status": "invalid",
+    }
+    assert "not-json" not in output_text
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("app_id", "9" * 5000),
+        ("installation_id", "9" * 5000),
+        ("app_id", "not-a-number"),
+        ("installation_id", "-1"),
+    ],
+)
+def test_doctor_reports_invalid_app_identifiers_without_unbounded_conversion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+    value: str,
+) -> None:
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    config.chmod(0o700)
+    profile = {
+        "app_id": "123",
+        "installation_id": "456",
+        "private_key_path": str(tmp_path / "secret-key.pem"),
+    }
+    profile[field] = value
+    profile_path = config / "github-app.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    profile_path.chmod(0o600)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    output_text = captured.out
+    output = json.loads(output_text)
+    assert {
+        "python",
+        "git",
+        "codex",
+        "github",
+        "openssl",
+        "bubblewrap",
+        "active_runner",
+        "path",
+    } <= output["checks"].keys()
+    assert output["checks"]["worker_read_provider"] == {
+        "provider": "app",
+        "status": "invalid",
+    }
+    assert "command_failed" not in output_text
+    assert "blocked" not in output_text
+    assert "Traceback" not in output_text
+    assert "secret-key.pem" not in output_text
+    assert "Traceback" not in captured.err
+
+
+def test_doctor_detects_a_non_managed_agent_run_path_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    conflicting_entry = fake_bin / "agent-run"
+    conflicting_entry.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    conflicting_entry.chmod(0o700)
+    home = tmp_path / "home"
+    home.mkdir()
+    user_bin = home / ".local" / "bin"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", os.pathsep.join((str(fake_bin), str(user_bin))))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["checks"]["path"] == {
+        "agent_run": str(conflicting_entry),
+        "status": "conflict",
+        "user_bin_on_path": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("path_state", "human_detail"),
+    [
+        ("ok", "agent-run 可用"),
+        ("needs_refresh", "需要刷新登录 shell"),
+        ("conflict", "检测到非受管同名入口"),
+        ("invalid", "受管入口无效"),
+        ("missing", "未找到 agent-run 入口"),
+    ],
+)
+def test_doctor_classifies_managed_path_states_and_human_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    path_state: str,
+    human_detail: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    user_bin = home / ".local" / "bin"
+    managed_target = home / "data" / "agent-run" / "active" / "current" / "bin" / "agent-run"
+    managed_target.parent.mkdir(parents=True)
+    managed_target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    managed_target.chmod(0o700)
+    stable_entry = user_bin / "agent-run"
+
+    if path_state in {"ok", "needs_refresh", "conflict"}:
+        user_bin.mkdir(parents=True)
+        stable_entry.symlink_to(managed_target)
+    elif path_state == "invalid":
+        user_bin.mkdir(parents=True)
+        stable_entry.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stable_entry.chmod(0o700)
+
+    path_entries: list[str] = []
+    if path_state == "conflict":
+        conflict_bin = tmp_path / "conflict-bin"
+        conflict_bin.mkdir()
+        conflicting_entry = conflict_bin / "agent-run"
+        conflicting_entry.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        conflicting_entry.chmod(0o700)
+        path_entries.append(str(conflict_bin))
+    if path_state == "ok" or path_state == "invalid":
+        path_entries.append(str(user_bin))
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / "data"))
+    monkeypatch.setenv("PATH", os.pathsep.join(path_entries))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"]["path"]["status"] == path_state
+
+    assert main(["doctor"]) == 0
+    human = capsys.readouterr().out
+    assert human_detail in human
+    if path_state in {"conflict", "invalid"}:
+        assert "agent-run 可用" not in human
+
+
+def test_doctor_reports_a_corrupt_app_key_as_invalid_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is required to exercise corrupt key validation")
+    key = tmp_path / "app.pem"
+    key.write_text("not-a-private-key\n", encoding="utf-8")
+    key.chmod(0o600)
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    (config / "github-app.json").write_text(
+        json.dumps(
+            {
+                "app_id": "123",
+                "installation_id": "456",
+                "private_key_path": str(key),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config / "github-app.json").chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", str(Path(openssl).parent))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "issues"
+    assert output["checks"]["worker_read_provider"] == {
+        "provider": "app",
+        "status": "invalid",
+    }
+
+
+def test_doctor_rejects_a_zero_exit_openssl_probe_without_a_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    openssl = fake_bin / "openssl"
+    openssl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    openssl.chmod(0o700)
+    key = tmp_path / "app.pem"
+    key.write_text("not-used-by-fake-openssl\n", encoding="utf-8")
+    key.chmod(0o600)
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    config.chmod(0o700)
+    profile = config / "github-app.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "app_id": "123",
+                "installation_id": "456",
+                "private_key_path": str(key),
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", str(fake_bin))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+    assert output["checks"]["worker_read_provider"] == {
+        "provider": "app",
+        "status": "invalid",
+    }
+    assert "not-used-by-fake-openssl" not in output_text
+
+
+def test_doctor_reports_a_broken_managed_entry_as_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    stable_entry = home / ".local" / "bin" / "agent-run"
+    target = home / "data" / "agent-run" / "active" / "current" / "bin" / "agent-run"
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o700)
+    stable_entry.parent.mkdir(parents=True)
+    stable_entry.symlink_to(target)
+    target.unlink()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / "data"))
+    monkeypatch.setenv("PATH", str(stable_entry.parent))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"]["path"]["status"] == "invalid"
+
+
+def test_doctor_accepts_a_real_private_key_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is required to exercise valid key validation")
+    key = tmp_path / "app.pem"
+    subprocess.run(
+        [openssl, "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(key)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    key.chmod(0o600)
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    config.chmod(0o700)
+    profile = config / "github-app.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "app_id": "123",
+                "installation_id": "456",
+                "private_key_path": str(key),
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", str(Path(openssl).parent))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["checks"]["worker_read_provider"] == {
+        "provider": "app",
+        "status": "ok",
+    }
+
+
+def test_doctor_reaps_a_timed_out_dependency_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    child_pid = tmp_path / "child.pid"
+    probe = tmp_path / "git"
+    probe.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([{sys.executable!r}, '-c', 'import time; time.sleep(30)'])\n"
+        f"Path({str(child_pid)!r}).write_text(str(child.pid))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    probe.chmod(0o700)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    started = time.monotonic()
+    assert main(["doctor", "--json"]) == 0
+    elapsed = time.monotonic() - started
+    output = json.loads(capsys.readouterr().out)
+
+    assert elapsed < _DOCTOR_TIMEOUT_TEST_LIMIT_SECONDS
+    assert output["checks"]["git"]["status"] == "timeout"
+    child = int(child_pid.read_text(encoding="utf-8"))
+    for _ in range(20):
+        proc_stat = Path(f"/proc/{child}/stat")
+        if not proc_stat.exists():
+            break
+        process_state = proc_stat.read_text(encoding="utf-8").split()[2]
+        if process_state == "Z":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("timed-out doctor probe left its child process running")
+
+
+def test_doctor_reaps_descendants_after_a_probe_exits_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    child_pid = tmp_path / "child.pid"
+    probe = tmp_path / "git"
+    probe.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([{sys.executable!r}, '-c', 'import time; time.sleep(30)'])\n"
+        f"Path({str(child_pid)!r}).write_text(str(child.pid))\n",
+        encoding="utf-8",
+    )
+    probe.chmod(0o700)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["checks"]["git"]["status"] == "ok"
+    child = int(child_pid.read_text(encoding="utf-8"))
+    for _ in range(20):
+        proc_stat = Path(f"/proc/{child}/stat")
+        if not proc_stat.exists():
+            break
+        process_state = proc_stat.read_text(encoding="utf-8").split()[2]
+        if process_state == "Z":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("normally completed doctor probe left its child process running")
 
 
 def test_status_exposes_current_candidate_and_pr_in_top_level_and_budget(

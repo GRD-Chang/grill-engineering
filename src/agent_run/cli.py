@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from agent_run import cli_presentation, cli_surface
+from agent_run import doctor
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_profiles import (
     AgentProfileStore,
@@ -72,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,auth}",
+        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,auth,doctor}",
     )
     start = subcommands.add_parser(
         "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
@@ -163,6 +164,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--private-key", required=True, help="仓库外私钥文件的绝对路径"
     )
     auth_app_commands.add_parser("remove", help="移除专用 App 并恢复宿主 gh")
+    doctor_command = subcommands.add_parser(
+        "doctor", help="只读检查本机依赖、Active Runner、PATH 与 Worker read provider"
+    )
+    doctor_command.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -188,6 +193,8 @@ def _main_with_parser(
         )
         if parsed.command == "auth":
             return _auth_command(parsed)
+        if parsed.command == "doctor":
+            return doctor.run(as_json=parsed.as_json)
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
         if parsed.command in {"status", "history"}:

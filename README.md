@@ -56,6 +56,29 @@ trust，不要求 clean checkout、detached SHA、`origin/main` ancestor 或 pro
 editable checkout 运行生产生命周期不受支持，但 Active Runner 不会因 branch、fork、dirty source
 或非官方 provenance 被旧 gate 拒绝。
 
+### 首次运行、更新与诊断
+
+源码目录和目标交付仓库是两个不同角色。首次安装完成并重新打开登录 shell 后，从任意目录检查
+本机状态，再进入目标仓库运行：
+
+```bash
+agent-run doctor
+cd /path/to/delivery-repository
+agent-run doctor
+agent-run run <parent-issue> --repo OWNER/REPO
+```
+
+`doctor` 可以从任意目录调用，只读报告 Python 版本、Git、Codex、宿主 `gh` 登录、OpenSSL、Linux
+`bubblewrap`、Active Runner、PATH 和当前 Worker read provider。缺少依赖只会显示为问题，不会
+安装、修复、触发生命周期或改写任何仓库和用户配置；需要脚本消费时使用 `agent-run doctor --json`。
+
+要重复构建，回到源码目录再次执行 `./install.sh`。安装 B 后 Active 是 B、previous 是 A；再安装
+C 后只保留 C/B。相同源码重复执行是幂等的，候选构建或 Compatibility Check 失败会保留原 Active。
+需要回退时在源码目录执行 `./install.sh --rollback`；它只交换 Active 与 previous，不调用 Codex，
+也不读取或修改 Delivery Run。确认不再使用本机 Runner 后执行 `./install.sh --uninstall`；它保留
+固定安装锁、Run locator、App profile、私钥文件和目标仓库 `.agent-run`。卸载后重新打开登录 shell
+以取得 PATH 变化，重复卸载安全成功。
+
 ## 目标仓库前置条件
 
 运行生命周期命令仍需要目标仓库具备：
@@ -82,6 +105,15 @@ agent-run auth app configure \
 agent-run auth app remove
 ```
 
+没有 App profile 时默认使用宿主 `gh`；有效 App profile 存在时明确使用 App provider，损坏或不可读
+时不会静默回退。`agent-run auth status` 只显示 provider 和非敏感状态，`auth app remove` 删除
+profile 并恢复 host `gh`，不会删除私钥文件。Worker 永远不会看到宿主 token、App 私钥或 Publisher
+凭据。
+
+v0.1 支持 Linux/WSL 的用户级 `~/.profile` PATH 管理，需要用户自行提供 CPython 3.11+、`venv`、
+`pip`、Codex CLI、Git、OpenSSL、已登录的 `gh` 和 Linux `bubblewrap`。不提供 Windows、macOS、
+系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher 或自动更新。
+
 ## 开发
 
 editable 安装仅用于本仓库开发和测试，不是普通用户的安装入口：
@@ -101,6 +133,7 @@ agent-run start <parent-issue> --repo OWNER/REPO
 agent-run run <parent-issue> --repo OWNER/REPO
 agent-run status <run-id>
 agent-run history <run-id>
+agent-run doctor [--json]
 agent-run approve <run-id> --repo OWNER/REPO
 ```
 

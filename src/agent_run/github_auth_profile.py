@@ -22,6 +22,18 @@ class GitHubAppProfile:
     private_key_path: Path
 
 
+_MAX_NUMERIC_IDENTIFIER_DIGITS = 64
+
+
+def _is_positive_decimal_identifier(value: str) -> bool:
+    """在不进行无界整数转换的情况下校验 GitHub 数字标识。"""
+    if not value or len(value) > _MAX_NUMERIC_IDENTIFIER_DIGITS:
+        return False
+    if not value.isascii() or not value.isdigit():
+        return False
+    return any(character != "0" for character in value)
+
+
 class GitHubAppProfileStore:
     """Atomically manage the user-level GitHub App profile."""
 
@@ -215,9 +227,9 @@ class GitHubAppProfileStore:
     ) -> GitHubAppProfile:
         normalized_app_id = app_id.strip()
         normalized_installation_id = installation_id.strip()
-        if not normalized_app_id.isdigit() or int(normalized_app_id) <= 0:
+        if not _is_positive_decimal_identifier(normalized_app_id):
             raise GitHubAuthProfileError("App ID 必须是正整数")
-        if not normalized_installation_id.isdigit() or int(normalized_installation_id) <= 0:
+        if not _is_positive_decimal_identifier(normalized_installation_id):
             raise GitHubAuthProfileError("Installation ID 必须是正整数")
         candidate = Path(private_key_path).expanduser()
         if not candidate.is_absolute():
