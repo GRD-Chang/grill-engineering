@@ -8,6 +8,8 @@ v0.1 的公开安装入口是取得 Git 仓库源码，并在用户选择的 tag
 
 安装器只存在于源码树并在用户显式调用时运行；安装完成后不驻留，不参与 Controller 生命周期，也不形成独立 Manager、Launcher、Python 包或版本。install、rollback 与 uninstall 在修改受管状态前必须取得同一个固定用户级非阻塞互斥锁；竞争者立即失败且不修改状态，uninstall 永不删除锁文件，避免替换持锁 inode 后出现第二把锁。官方更新由用户先通过 Git 选择或取得新源码再重新运行安装器，本地自开发使用同一入口。`./install.sh --rollback` 只通过新的完整 Generation 原子交换 current 与 previous，不重建、不调用 Codex、不判断状态兼容性，也不改变 Delivery Run。`./install.sh --uninstall` 删除全部受管 Snapshot、Generation、候选残留、内部 `active` 入口、公开命令 symlink 和安装器添加的 PATH 受管配置，但保留固定锁、GitHub App 配置、全局 Run 定位状态与仓库内 Delivery Run 数据；重复 uninstall 幂等成功，v0.1 不提供 purge 模式。v0.1 不要求 PyPI 或 pipx；以后增加 PyPI 只增加分发渠道，不改变 Snapshot 与显式安装语义。
 
+生产生命周期的规范入口是安装后得到的 Active Runner；直接从 source 或 editable checkout 运行生产生命周期不受支持。这个入口边界不构成旧 promotion gate：Active Runner 不会因 branch、fork、dirty source 或非官方 provenance 被拒绝。
+
 ## Considered Options
 
 - PyPI wheel + pipx 作为首发主入口：普通安装命令更短，但第一版需要额外维护包名、发布身份和 release workflow，而预期用户已经使用 Git 与 GitHub，因此暂缓。

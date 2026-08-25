@@ -19,7 +19,6 @@ from agent_run.codex import CodexProcessError
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
 from agent_run.run_driver import DirectRunOperations, RunStep
-from agent_run.runner_promotion import PromotionVerification
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
@@ -48,10 +47,7 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
     assert "仅从 requeue_required 创建新的 Change Job Generation" in help_text
     assert "显示当前状态与下一条允许的操作" in help_text
     assert "显示有界 Invocation 与状态时间线" in help_text
-    assert (
-        "从不可变 Runner 执行一次真实 Structured Outputs promotion handshake"
-        in " ".join(help_text.split())
-    )
+    assert "promotion-handshake" not in help_text
     for internal_command in ("deliver", "accept-run", "publish-run"):
         assert internal_command not in help_text
         with pytest.raises(SystemExit):
@@ -409,44 +405,29 @@ def test_removed_stage_commands_are_rejected_by_the_real_cli(command: str) -> No
     assert "invalid choice" in result.stderr
 
 
-def test_promotion_preflight_failure_returns_a_cli_error(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_removed_promotion_command_is_rejected_by_the_public_cli(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(PROJECT_ROOT)
 
-    assert main(["promotion-handshake", "not-a-sha", "--audit-file", str(tmp_path / "audit.json")]) == 2
+    with pytest.raises(SystemExit) as error:
+        main(["promotion-handshake", "not-a-sha"])
 
-    output = json.loads(capsys.readouterr().out)
-    assert output["result"] == "error"
-    assert output["status"] == "blocked"
+    assert error.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
-def test_immutable_runner_blocks_start_without_a_promotion_audit(
+def test_source_runner_fixture_allows_lifecycle_commands_without_promotion_gate(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    immutable_runner = PromotionVerification(
-        runner_commit_sha="a" * 40,
-        runner_python="/runner/bin/python",
-        runner_module="/runner/lib/python/site-packages/agent_run/__init__.py",
-        runner_package_sha256="sha256:runner-package",
-    )
     monkeypatch.chdir(git_repo)
-    monkeypatch.setattr(cli, "current_immutable_runner", lambda: immutable_runner)
-    monkeypatch.setattr(
-        cli,
-        "require_promotion_audit",
-        lambda verification, audit_file, codex_version: (_ for _ in ()).throw(
-            ValueError("immutable Runner has no promotion audit")
-        ),
-    )
 
-    assert main(["start", "1", "--github-fixture", str(fixture)]) == 2
-    assert not (git_repo / ".agent-run").exists()
+    assert main(["start", "1", "--github-fixture", str(fixture)]) == 0
 
 
-def test_source_runner_rejects_production_lifecycle_commands(
-    git_repo: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+def test_source_checkout_cannot_run_production_lifecycle_without_active_runner(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(git_repo)
 
@@ -455,6 +436,7 @@ def test_source_runner_rejects_production_lifecycle_commands(
     output = json.loads(capsys.readouterr().out)
     assert output["result"] == "error"
     assert output["status"] == "blocked"
+    assert not (git_repo / ".agent-run").exists()
 
 
 def issue(

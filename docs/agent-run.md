@@ -350,105 +350,46 @@ Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗�
 `modification_budget_exhausted`，维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
 额度耗尽后的 Candidate 则继续按 Fallback Publication Receipt 和实际 Required Checks 规则处理。
 
-## 自托管开发
+## Source Runner 安装
 
-使用 `agent-run` 开发本仓库时，运行中的 Controller 必须来自已验证且固定的 commit，
-不得从正在被 Worker 修改的 editable checkout 导入代码。推荐把 Runner 安装到按 commit
-SHA 命名的独立 Python 环境，并从专用干净 clone 启动。每次 Invocation 使用当前已 promotion 的
-Runner；Run 的连续性由持久化状态和 GitHub 的精确 head/base 事实保证，而不由 Runner 版本锁定。
-`main` 合入修复后可立即创建下一版 Runner，并由新版继续未完成 Run。#34–#39 是
-已废弃的执行序列，不得作为 Runner 的来源、行为基线、验收证据或恢复对象；只以 #42 及其原生
-Sub-issues 的最终 merged commit 为准。
+v0.1 的公开入口是用户在所选源码目录执行一次 `./install.sh`。release tag 是稳定使用路径；
+branch、fork、dirty source 和没有 Git metadata 的目录也按当前实际文件构建。安装器要求 CPython
+3.11+、`venv`、`pip` 和源码声明的 Python build backend；它不执行 `sudo`、系统包管理器、
+`pipx`、daemon、cron 或后台更新。
 
-### Immutable Runner promotion gate
+安装流程在用户级 `$XDG_DATA_HOME/agent-run/`（未设置时 `~/.local/share/agent-run/`）中创建
+隔离的 non-editable Runner Snapshot，按 `agent_run` runtime tree 的规范路径和文件内容计算
+SHA-256 identity，并写入有界 manifest 与 Runner Provenance。源码目录之后的修改不会改变已安装
+Snapshot。manifest 只用于识别和解释，不是 source trust、签名或生命周期授权。
 
-Promotion 只能从已经合入 `origin/main` 的**完整 40 位 commit SHA**进行。不要用可变 branch 名、
-正在开发的 checkout、未合并 PR head、旧失败 Run 或任何 #34–#39 记录代替。以下流程在新、干净
-checkout 执行；示例中的路径必须位于仓库和 Worker checkout 之外：
+激活前由独立 `RunnerProbeBackend` 在空临时目录调用当前 PATH 中的 `codex exec --output-schema`。
+它只接受根对象、禁止额外字段且 `status` 为 `ok` 的固定结果，不复用 Worker、GitHub、bubblewrap
+或既有 publication handshake，不读取 Codex 版本，也不写长期 audit。Codex、构建或文件系统失败
+会清理候选并保留原 Active/previous、Run locator、用户配置和仓库 `.agent-run`。
 
-```bash
-RUNNER_SOURCE=/path/to/clean/grill-engineer
-git -C "$RUNNER_SOURCE" fetch origin main
-RUNNER_SHA="$(git -C "$RUNNER_SOURCE" rev-parse origin/main)"
-test "${#RUNNER_SHA}" -eq 40
-git -C "$RUNNER_SOURCE" merge-base --is-ancestor "$RUNNER_SHA" origin/main
-
-RUNNER_ROOT=/path/outside/the/repository/agent-run-runners
-RUNNER="$RUNNER_ROOT/$RUNNER_SHA"
-RUNNER_CHECKOUT=/path/outside/the/repository/agent-run-sources/$RUNNER_SHA
-git -C "$RUNNER_SOURCE" worktree add --detach "$RUNNER_CHECKOUT" "$RUNNER_SHA"
-test "$(git -C "$RUNNER_CHECKOUT" rev-parse HEAD)" = "$RUNNER_SHA"
-test -z "$(git -C "$RUNNER_CHECKOUT" status --porcelain)"
-python -m venv "$RUNNER"
-"$RUNNER/bin/python" -m pip install --no-deps "$RUNNER_CHECKOUT"
-"$RUNNER/bin/python" -c 'import agent_run; print(agent_run.__file__)'
-```
-
-`pip install` 不能使用 `-e/--editable`。最后一条必须解析到该 Runner 环境的 `site-packages`，而不是
-`RUNNER_SOURCE` 或 `RUNNER_CHECKOUT`。完成后从这个仍干净、detached 且精确 SHA 的 checkout 让 Runner
-执行一次真实 Structured Outputs promotion handshake；命令会拒绝 source/editable 环境、脏 checkout、
-非该 SHA 的 HEAD、未合入 `origin/main` 的 SHA 或已有 audit 文件：
+Active Runner 由完整 generation symlink 原子选择，generation 内的 `current` 与可选 `previous`
+成对保存；系统只保留当前和紧邻上一个 Snapshot。相同 Active identity 的重复安装不会重新 probe
+或创建重复 Snapshot。管理操作共享固定、非阻塞的用户级 `install.lock`，卸载不会删除该锁；旧
+generation/Snapshot 的清理失败只写出有界 warning，并在后续安装重试。
 
 ```bash
-AUDIT_FILE="$RUNNER_ROOT/promotions/$RUNNER_SHA.json"
-cd "$RUNNER_CHECKOUT"
-"$RUNNER/bin/agent-run" promotion-handshake "$RUNNER_SHA" --audit-file "$AUDIT_FILE"
+./install.sh
+./install.sh --rollback
+./install.sh --uninstall
 ```
 
-该命令必须与
-Controller 完全使用同一 Codex CLI、`publication_or_human_blocker_schema()`、bubblewrap readonly
-checkout 与 GitHub App 只读凭据边界。握手只要求服务端接受 schema；`publication` 与
-`human_blocker` 的完整语义分支仍由离线测试覆盖。API 返回 schema rejection 时结果为 **failed**；
-认证、网络或 rate limit 结果为 **inconclusive**，绝不是 green。只有 **passed** 才可以把该 Runner
-用于新的 self-hosting Run。这个条件由除只读 `status`/`history` 外的 lifecycle 命令强制执行：从不可变 Runner 启动时，它只接受
-`$RUNNER_ROOT/promotions/$RUNNER_SHA.json` 中与当前 Runner 身份完全一致、且 verdict、sandbox、凭据
-脱敏和 thread ID 都为 passed 的审计记录；缺失、损坏、失败或不匹配都将拒绝启动。审计目录是维护者
-受限的信任边界：有能力篡改 Runner 或审计文件的宿主操作者不在这项本地门禁的威胁模型内。
-从 source/editable checkout 运行 lifecycle 命令同样会被拒绝；仅隐藏的 GitHub fixture 测试路径可例外。
+rollback 只交换 `current`/`previous`，不重建、不 probe、不检查或修改 Delivery Run；没有 previous
+时失败且 Active 不变。uninstall 删除受管 Snapshot、generation、入口和 `~/.profile` 中唯一的
+受管 PATH 块，保留固定锁、GitHub App profile、Run locator、私钥文件和目标仓库 `.agent-run`。
+同名非受管 `~/.local/bin/agent-run` 永不覆盖；用户替换入口时保留用户内容并报告清理未完成。
 
-每次 attempt 都要保存一条小型 JSON 或 Markdown 审计记录（不得保存 Prompt、完整 stdout、transcript、
-token 或私钥），至少包含：
-
-```text
-runner_commit_sha: <40-char SHA>
-runner_python: <absolute Runner Python path>
-runner_module: <installed agent_run module path>
-runner_package_sha256: <sha256 of installed Runner package>
-codex_cli_version: <codex --version；无法取得时为 unavailable 且 attempt failed>
-publication_schema_sha256: <sha256 of canonical schema JSON>
-started_at_utc: <RFC 3339>
-finished_at_utc: <RFC 3339>
-credential_redaction: passed | failed
-handshake_verdict: passed | failed | inconclusive
-thread_id_present: true | false
-bounded_error: <redacted error or null>
-```
-
-将记录写在 Runner 环境旁的受限审计目录或运行维护系统中。不得把它作为 Run state、Issue 评论或
-PR 叙事的一部分。凭据边界或真实 handshake 任一项未通过时，删除半成品 Runner，保留小型脱敏
-记录，并停止 promotion；通过后才可删除 detached `RUNNER_CHECKOUT`。不要用本地 schema 测试、
-模拟 Agent Fixture 或 Codex 的非结构化成功代替。
-
-仓库 CI 的 Required Check 名称是 `quality`。GitHub Ruleset 应覆盖默认分支以及 Ticket PR、
-Run Repair PR 所针对的 Run Branch。没有 Required Checks 时 Controller 会按无托管 CI 继续，
-因此正式自托管前必须核验目标分支确实应用了该 Ruleset，而不是只确认 workflow 文件存在。
-
-当前版本建议拆分两个 Active branch Ruleset：
-
-- 默认分支规则显式包含 `refs/heads/main`，要求 PR 和 `quality`，禁止 force push 与删除；
-- Run Branch 规则显式包含 `refs/heads/agent-run/**/run`，要求 `quality`，但允许分支创建时
-  暂无 status check，并允许交付完成后的受控删除。
-
-不要使用 `~DEFAULT_BRANCH` 代替显式 `main`；当前 Controller 只特殊支持 `~ALL`。Required
-Check 暂时选择 Any source，不绑定 GitHub Actions App：当前版本遇到非空 `integration_id`
-会以 `github_unsupported_ruleset` 安全拒绝继续。Any source 允许具备写权限的其他主体提交同名
-status，因此仍应限制仓库写权限，并保持 Worker 只持有短期只读 App token。Ruleset 启用前先
-让 `quality` 在仓库中成功运行一次，启用后再通过 API 读回实际条件和 Required Check。
-
-GitHub App 的创建、安装和私钥保管不属于 Controller 自动化范围。App 必须只授予
-`actions: read`、`checks: read`、`contents: read`、`issues: read`、`metadata: read`、
-`pull_requests: read` 和 `statuses: read`，私钥保存在仓库和 Runner checkout 之外；Publisher
-继续使用独立的宿主 `gh` 写凭据。
+安装完成后，稳定入口只是指向 Active Snapshot console entry 的 symlink；安装器不驻留、不启动
+Manager/Launcher/daemon。安装、更新、rollback 和 uninstall 不迁移、修改或绑定 Delivery Run。
+生命周期命令不再要求完整 SHA、clean detached checkout、`origin/main` ancestor、Codex 版本绑定
+或长期 promotion audit；旧 promotion 命令不是公开入口。规范生命周期入口是安装后得到的 Active
+Runner，直接从 source 或 editable checkout 运行生产生命周期不受支持；Active Runner 不会因
+branch、fork、dirty source 或非官方 provenance 被旧 gate 拒绝。目标仓库的 Required Checks、Worker
+读取权限、Publisher 写凭据和运行状态合同仍按本文件前文执行。
 
 ## 本地状态与清理
 

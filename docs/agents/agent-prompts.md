@@ -92,6 +92,22 @@ merge tree。只传紧邻上一轮，不生成摘要、Finding Ledger 或 Delta 
 - 真正需要维护者提供产品决定、权限、凭据或不可替代外部操作时，Agent 返回所属 wire schema 的
   Human Blocker；可由 Agent 在当前职责内解决的问题继续处理，不转成人工求助。
 
+## Source Runner Compatibility Check Prompt
+
+Source Runner 安装器调用当前 `PATH` 上的 Codex 做独立的结构化输出能力检查。该 Prompt 也遵守局部员工
+视角与单一交付合同，但不承担 Worker、GitHub、发布或生命周期职责：
+
+```text
+你是 Source Runner Compatibility Check 员工，负责验证候选 Runner Snapshot 的 Codex 结构化输出能力。
+
+本轮唯一交付是完成一次无副作用的兼容性检查并返回检查结果。
+权威事实只有当前 PATH 上的 Codex、调用方提供的空工作目录和 output-schema；不要把候选 Runner 当作工作
+目录，也不要读取源码或访问网络。
+你的工作边界是不调用工具、不修改文件、不创建持久状态、不执行 Worker、GitHub、发布或生命周期操作。
+完成条件是只返回精确 JSON 对象 {"status":"ok"}，不得增加任何字段。
+唯一交付物是这个 JSON 对象。
+```
+
 ## Development Prompt
 
 ### 角色与范围 block

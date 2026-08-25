@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -34,14 +35,6 @@ from agent_run.external_supervision import (
     is_proven_github_state_contradiction,
 )
 from agent_run.run_driver import DirectRunOperations, RunDriver
-from agent_run.runner_promotion import (
-    codex_cli_version,
-    current_immutable_runner,
-    promotion_audit_file,
-    require_promotion_audit,
-    run_promotion_handshake,
-    verify_immutable_runner,
-)
 from agent_run.run_locator import RunLocatorError, RunLocatorIndex
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.state_contract import IncompatibleRunStateError
@@ -75,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,promotion-handshake}",
+        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure}",
     )
     start = subcommands.add_parser(
         "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
@@ -146,16 +139,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(configure)
     _add_profile_options(configure)
     configure.add_argument("--json", action="store_true", dest="as_json")
-    promotion = subcommands.add_parser(
-        "promotion-handshake",
-        help="从不可变 Runner 执行一次真实 Structured Outputs promotion handshake",
-    )
-    promotion.add_argument(
-        "runner_sha", help="已合入 origin/main 的完整 40 位 commit SHA"
-    )
-    promotion.add_argument(
-        "--audit-file", required=True, help="新建的脱敏 promotion 审计 JSON 路径"
-    )
     return parser
 
 
@@ -189,15 +172,6 @@ def _main_with_parser(
                 cli_presentation._print_history(state, as_json=parsed.as_json)
             return 0
         git = GitRepository.discover(Path.cwd())
-        if parsed.command == "promotion-handshake":
-            verification = verify_immutable_runner(git.root, parsed.runner_sha)
-            record = run_promotion_handshake(
-                checkout=git.root,
-                audit_file=Path(parsed.audit_file),
-                verification=verification,
-            )
-            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
-            return 0 if record["handshake_verdict"] == "passed" else 2
         state_root = (
             Path(parsed.state_dir).resolve()
             if parsed.state_dir
@@ -223,22 +197,9 @@ def _main_with_parser(
             locator=RunLocatorIndex.default(),
             profiles=profiles,
         )
-        runner_verification = current_immutable_runner()
-        if runner_verification is None:
-            if fixture_path is None:
-                raise ValueError(
-                    "self-hosting lifecycle commands require an immutable promoted Runner"
-                )
-        else:
-            active_codex_version = codex_cli_version()
-            if active_codex_version is None:
-                raise ValueError(
-                    "could not determine Codex CLI version for promotion audit"
-                )
-            require_promotion_audit(
-                runner_verification,
-                promotion_audit_file(runner_verification),
-                active_codex_version,
+        if fixture_path is None and not _running_active_runner():
+            raise ValueError(
+                "self-hosting lifecycle commands require an installed Active Runner"
             )
         if parsed.command in {"resume", "requeue", "approve", "revise", "abandon"}:
             _require_profile(profiles, parsed.run_id)
@@ -682,6 +643,21 @@ def _main_with_parser(
             )
         )
     return 2
+
+
+def _running_active_runner() -> bool:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if not data_home:
+        data_home = str(Path.home() / ".local" / "share")
+    active_current = (
+        Path(data_home).expanduser() / "agent-run" / "active" / "current"
+    ).resolve()
+    current_file = Path(__file__).resolve()
+    try:
+        current_file.relative_to(active_current)
+    except ValueError:
+        return False
+    return True
 
 
 def _foreground_supervisor(parsed: argparse.Namespace) -> ExternalSupervisor:
