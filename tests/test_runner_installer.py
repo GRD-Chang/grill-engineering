@@ -148,6 +148,16 @@ def _run(
     )
 
 
+def _path_without_codex(tmp_path: Path) -> str:
+    directory = tmp_path / "path-without-codex"
+    directory.mkdir()
+    (directory / "python3").symlink_to(sys.executable)
+    dirname = shutil.which("dirname")
+    assert dirname is not None
+    (directory / "dirname").symlink_to(dirname)
+    return str(directory)
+
+
 def _data_root(home: Path) -> Path:
     return home / "data" / "agent-run"
 
@@ -314,7 +324,7 @@ def test_missing_codex_preserves_no_active_runner(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
 
-    result = _run(source, home, fake_bin, path="/usr/bin:/bin")
+    result = _run(source, home, fake_bin, path=_path_without_codex(tmp_path))
 
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
@@ -776,7 +786,7 @@ def test_public_install_failures_preserve_existing_state(
     if failure == "build":
         (source / ".agent-run-test-build-failure").touch()
     elif failure == "missing_codex":
-        path = "/usr/bin:/bin"
+        path = _path_without_codex(tmp_path)
     elif failure == "not_logged_in":
         (tmp_path / "codex-behavior").write_text("not-logged-in", encoding="utf-8")
     elif failure == "nonzero":
