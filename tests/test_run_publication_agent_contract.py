@@ -672,8 +672,14 @@ def test_final_run_publication_receives_only_role_required_facts(
     request = agents.requests[0]
     assert callable(request.pop("_invocation_event"))
     assert callable(request.pop("_currentness_check"))
-    assert set(request) == {"acceptance_artifact", "checkout", "parent_issue_url"}
+    assert set(request) == {
+        "acceptance_artifact",
+        "checkout",
+        "parent_issue_url",
+        "repository",
+    }
     assert request["parent_issue_url"].endswith("/issues/1")
+    assert request["repository"] == "example/project"
 
 
 def test_publication_prompts_and_run_repair_requests_keep_integration_records_with_reviewers(

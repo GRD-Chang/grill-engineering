@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 import re
 import shutil
 import threading
@@ -29,6 +30,11 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.github_auth import mint_read_only_installation_credential
+from agent_run.github import _repository_hint_from_origin
+from agent_run.github_auth_profile import (
+    GitHubAppProfileStore,
+    load_github_app_profile,
+)
 from agent_run.error_safety import bounded_error
 from agent_run.execution_binding import emit_execution_binding
 from agent_run.worker_sandbox import (
@@ -40,6 +46,7 @@ from agent_run.worker_sandbox import (
 )
 from agent_run.worker_credentials import (
     CredentialProvider,
+    HostGitHubReadChannel,
     InitialCredentialUnavailable,
     WorkerCredentialChannel,
     WorkerCredentialError,
@@ -71,7 +78,7 @@ class CodexCliBackend:
     def __init__(
         self,
         executable: str = "codex",
-        credential_provider: CredentialProvider = mint_read_only_installation_credential,
+        credential_provider: CredentialProvider | None = None,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
@@ -86,6 +93,7 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
+            repository=_optional_string(request, "repository"),
             schema=development_or_human_blocker_schema(),
             output_name="Development result",
             validate=parse_development_wire_result,
@@ -253,6 +261,7 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=thread_id,
+            repository=_optional_string(request, "repository"),
         )
         artifact = _json_object(output, "Publication Artifact")
         blockers = parse_human_blockers(artifact)
@@ -275,6 +284,7 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
+            repository=_optional_string(request, "repository"),
             artifact_validator=lambda artifact: PublicationArtifact.parse(
                 artifact, delivery_run="final-run"
             ),
@@ -290,6 +300,7 @@ class CodexCliBackend:
         prompt: str,
         checkout: Path,
         thread_id: str | None,
+        repository: str | None,
         artifact_validator: Callable[[dict[str, Any]], object] | None = None,
     ) -> tuple[str, str]:
         def validate_publication(artifact: object) -> object:
@@ -306,6 +317,7 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=thread_id,
+            repository=repository,
             schema=publication_or_human_blocker_schema(),
             output_name="Publication Artifact",
             validate=validate_publication,
@@ -391,6 +403,7 @@ class CodexCliBackend:
             prompt=prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
+            repository=_optional_string(request, "repository"),
             schema=acceptance_schema(),
             output_name="Acceptance Artifact",
             validate=lambda value: AcceptanceArtifact.parse(value),
@@ -412,6 +425,7 @@ class CodexCliBackend:
         prompt: str,
         checkout: Path,
         thread_id: str | None,
+        repository: str | None = None,
         schema: dict[str, Any],
         output_name: str,
         validate: Callable[[object], object],
@@ -462,6 +476,7 @@ class CodexCliBackend:
                     prompt=attempt_prompt,
                     checkout=checkout,
                     thread_id=current_thread,
+                    repository=repository,
                     schema=schema,
                     writable_checkout=initial_writable_checkout and attempt == 1,
                     model=model,
@@ -616,6 +631,7 @@ class CodexCliBackend:
         prompt: str,
         checkout: Path,
         thread_id: str | None,
+        repository: str | None = None,
         schema: dict[str, Any] | None = None,
         writable_checkout: bool = True,
         model: str | None = None,
@@ -667,17 +683,51 @@ class CodexCliBackend:
                 real_gh = shutil.which("gh", path=environment.get("PATH"))
                 if real_gh is None:
                     raise WorkerSandboxError("gh is required for Worker GitHub reads")
+                profile = (
+                    load_github_app_profile()
+                    if self.credential_provider is None
+                    else None
+                )
+                if self.credential_provider is None:
+                    repository = repository or _repository_hint_from_origin(checkout)
+                else:
+                    repository = None
+                if self.credential_provider is None and repository is None:
+                    raise WorkerSandboxError(
+                        "当前 GitHub repository identity 不可确定，已拒绝 Worker GitHub read"
+                    )
+                hidden_paths = _worker_hidden_paths(profile)
+                if repository is not None:
+                    environment["GH_REPO"] = repository
                 credential_exhausted = threading.Event()
                 credential_failure: list[str] = []
                 def report_credential_exhausted(message: str) -> None:
                     credential_failure.append(message)
                     credential_exhausted.set()
-                with WorkerCredentialChannel(
-                    self.credential_provider,
-                    gh_executable=real_gh,
-                    gh_environment=environment,
-                    on_exhausted=report_credential_exhausted,
-                ) as credentials:
+
+                if self.credential_provider is not None:
+                    channel: HostGitHubReadChannel | WorkerCredentialChannel = WorkerCredentialChannel(
+                        self.credential_provider,
+                        gh_executable=real_gh,
+                        gh_environment=environment,
+                        repository=repository,
+                        on_exhausted=report_credential_exhausted,
+                    )
+                elif profile is None:
+                    channel = HostGitHubReadChannel(
+                        gh_executable=real_gh,
+                        gh_environment=dict(os.environ),
+                        repository=repository,
+                    )
+                else:
+                    channel = WorkerCredentialChannel(
+                        lambda: mint_read_only_installation_credential(profile),
+                        gh_executable=real_gh,
+                        gh_environment=environment,
+                        repository=repository,
+                        on_exhausted=report_credential_exhausted,
+                    )
+                with channel as credentials:
                     try:
                         credentials.start(temporary / "credential.sock")
                     except WorkerCredentialError as error:
@@ -696,15 +746,21 @@ class CodexCliBackend:
                         temporary=temporary,
                         writable_checkout=writable_checkout,
                         environment=environment,
+                        hidden_paths=hidden_paths,
                     )
                     worker_options: dict[str, Any] = {
                         "cwd": checkout,
                         "prompt": prompt,
                         "environment": environment,
                         "timeout": 3 * 60 * 60,
-                        "abort_event": credential_exhausted,
-                        "abort_reason": lambda: credential_failure[0],
                     }
+                    if self.credential_provider is not None or profile is not None:
+                        worker_options.update(
+                            {
+                                "abort_event": credential_exhausted,
+                                "abort_reason": lambda: credential_failure[0],
+                            }
+                        )
                     if on_thread is not None and "on_stdout_line" in inspect.signature(
                         run_worker_process
                     ).parameters:
@@ -1321,6 +1377,19 @@ def _publication_human_blocker_instruction() -> str:
         '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`。'
         "不要把可自行修复的问题作为 Human Blocker。"
     )
+
+
+def _worker_hidden_paths(profile: object) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for variable in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
+        value = os.environ.get(variable)
+        if value:
+            paths.append(Path(value))
+    paths.append(GitHubAppProfileStore().path)
+    private_key_path = getattr(profile, "private_key_path", None)
+    if isinstance(private_key_path, Path):
+        paths.append(private_key_path)
+    return tuple(paths)
 
 
 def _optional_string(data: dict[str, Any], key: str) -> str | None:

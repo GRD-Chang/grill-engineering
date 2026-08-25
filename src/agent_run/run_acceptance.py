@@ -553,6 +553,7 @@ class RunAcceptanceEngine:
                 state, int(self._mapping(state, "parent")["number"])
             ),
             "run_id": state["run_id"],
+            "repository": str(state["repository"]),
             "parent": dict(self._mapping(state, "parent")),
             "ticket_graph": self._mapping(state, "ticket_graph"),
             "ticket_completion_records": ticket_completion_records(state),

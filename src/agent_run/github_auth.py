@@ -15,6 +15,7 @@ from agent_run.worker_credentials import (
     WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS,
     safe_http_status,
 )
+from agent_run.github_auth_profile import GitHubAppProfile
 
 
 class GitHubCredentialError(RuntimeError):
@@ -34,22 +35,17 @@ _REQUIRED_READ_PERMISSIONS = {
 }
 
 
-def mint_read_only_installation_token() -> str:
-    return mint_read_only_installation_credential().token
+def mint_read_only_installation_token(profile: GitHubAppProfile) -> str:
+    return mint_read_only_installation_credential(profile).token
 
 
-def mint_read_only_installation_credential() -> ReadCredential:
-    app_id = os.environ.get("AGENT_RUN_GITHUB_APP_ID", "").strip()
-    installation_id = os.environ.get(
-        "AGENT_RUN_GITHUB_APP_INSTALLATION_ID", ""
-    ).strip()
-    private_key = os.environ.get(
-        "AGENT_RUN_GITHUB_APP_PRIVATE_KEY", ""
-    ).strip()
-    if not app_id or not installation_id.isdigit() or not private_key:
-        raise GitHubCredentialError(
-            "GitHub App ID, installation ID, and private key are required"
-        )
+def mint_read_only_installation_credential(profile: GitHubAppProfile) -> ReadCredential:
+    app_id = profile.app_id
+    installation_id = profile.installation_id
+    try:
+        private_key = profile.private_key_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise GitHubCredentialError("GitHub App private key is unavailable") from error
     app_jwt = _create_app_jwt(app_id, private_key)
     request = urllib.request.Request(
         (

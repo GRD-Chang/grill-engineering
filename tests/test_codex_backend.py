@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.cli import main
 from agent_run.codex import (
     CodexCliBackend,
     CodexProcessError,
@@ -31,6 +32,7 @@ from agent_run.github_auth import (
     mint_read_only_installation_credential,
     mint_read_only_installation_token,
 )
+from agent_run.github_auth_profile import GitHubAppProfile
 from agent_run.worker_sandbox import (
     WorkerSandboxError,
     bubblewrap_command,
@@ -126,11 +128,12 @@ def test_initial_credential_failure_preserves_only_a_safe_http_status(
 
 
 def test_github_app_token_mint_extracts_only_the_http_status(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_ID", "123")
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_INSTALLATION_ID", "456")
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_PRIVATE_KEY", "private-key")
+    private_key = tmp_path / "private.pem"
+    private_key.write_text("private-key", encoding="utf-8")
+    private_key.chmod(0o600)
+    profile = GitHubAppProfile("123", "456", private_key)
     monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *_: "jwt")
 
     def reject(*_args: object, **_kwargs: object) -> object:
@@ -144,7 +147,7 @@ def test_github_app_token_mint_extracts_only_the_http_status(
 
     monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", reject)
     with pytest.raises(GitHubCredentialError) as raised:
-        mint_read_only_installation_credential()
+        mint_read_only_installation_credential(profile)
 
     assert raised.value.http_status == 429
     assert "private-response" not in str(raised.value)
@@ -1668,7 +1671,7 @@ def test_live_codex_backend_reports_token_mint_failure(
 
 
 def test_controller_mints_token_with_exact_read_permissions(
-    monkeypatch: Any,
+    tmp_path: Path, monkeypatch: Any,
 ) -> None:
     permissions = {
         "actions": "read",
@@ -1697,13 +1700,14 @@ def test_controller_mints_token_with_exact_read_permissions(
         captured["body"] = json.loads(request.data)
         return response
 
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_ID", "123")
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_INSTALLATION_ID", "456")
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_PRIVATE_KEY", "private-key")
+    private_key = tmp_path / "private.pem"
+    private_key.write_text("private-key", encoding="utf-8")
+    private_key.chmod(0o600)
+    profile = GitHubAppProfile("123", "456", private_key)
     monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *_: "jwt")
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
-    token = mint_read_only_installation_token()
+    token = mint_read_only_installation_token(profile)
 
     assert token == "minted-reader"
     assert captured == {
@@ -1745,7 +1749,7 @@ def test_controller_mints_token_with_exact_read_permissions(
     ],
 )
 def test_controller_rejects_minted_token_with_different_permissions(
-    monkeypatch: Any, permissions: dict[str, str]
+    tmp_path: Path, monkeypatch: Any, permissions: dict[str, str]
 ) -> None:
     response = io.BytesIO(
         json.dumps(
@@ -1756,9 +1760,10 @@ def test_controller_rejects_minted_token_with_different_permissions(
             }
         ).encode()
     )
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_ID", "123")
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_INSTALLATION_ID", "456")
-    monkeypatch.setenv("AGENT_RUN_GITHUB_APP_PRIVATE_KEY", "private-key")
+    private_key = tmp_path / "private.pem"
+    private_key.write_text("private-key", encoding="utf-8")
+    private_key.chmod(0o600)
+    profile = GitHubAppProfile("123", "456", private_key)
     monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *_: "jwt")
     monkeypatch.setattr(
         "urllib.request.urlopen",
@@ -1766,7 +1771,7 @@ def test_controller_rejects_minted_token_with_different_permissions(
     )
 
     with pytest.raises(GitHubCredentialError, match="exact.*permissions"):
-        mint_read_only_installation_token()
+        mint_read_only_installation_token(profile)
 
 
 def test_app_jwt_is_rs256_and_cleans_temporary_key(
@@ -2363,70 +2368,30 @@ def test_worker_gh_adapter_retries_one_expired_read_with_a_renewed_token(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    certificate = tmp_path / "localhost.crt"
-    private_key = tmp_path / "localhost.key"
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(private_key),
-            "-out",
-            str(certificate),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=localhost",
-            "-addext",
-            "subjectAltName=DNS:localhost",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    authorizations: list[str] = []
-
-    class IssueHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            authorization = self.headers.get("Authorization", "")
-            authorizations.append(authorization)
-            if authorization == "token reader-one" and len(authorizations) > 1:
-                body = json.dumps({"message": "Bad credentials"}).encode()
-                self.send_response(401)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if authorization not in {"token reader-one", "token reader-two"}:
-                self.send_response(403)
-                self.end_headers()
-                return
-            body = json.dumps({"number": 3}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *args: object) -> None:
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), IssueHandler)
-    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tls.load_cert_chain(certificate, private_key)
-    server.socket = tls.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     issued = iter(
         (
             ReadCredential("reader-one", time.time() + 3600),
             ReadCredential("reader-two", time.time() + 3600),
         )
     )
+    token_seen = tmp_path / "token-seen"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        f"seen = pathlib.Path({str(token_seen)!r})\n"
+        "token = os.environ.get('GH_TOKEN', '')\n"
+        "with seen.open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(token + '\\n')\n"
+        "if token == 'reader-one' and len(seen.read_text(encoding='utf-8').splitlines()) > 1:\n"
+        "    print('Bad credentials', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "if token not in {'reader-one', 'reader-two'}:\n"
+        "    raise SystemExit(2)\n"
+        "print('3')\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o700)
     worker = tmp_path / "codex-worker"
     worker.write_text(
         """#!/usr/bin/env python3
@@ -2453,29 +2418,226 @@ print('{"type":"thread.started","thread_id":"credential-e2e-thread"}')
         encoding="utf-8",
     )
     worker.chmod(0o700)
-    monkeypatch.setenv("GH_HOST", f"localhost:{server.server_port}")
-    monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
+    monkeypatch.setenv("GH_HOST", "github.com")
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("AGENT_RUN_TEST_HOST_PID", str(os.getpid()))
-    try:
-        output, thread_id = CodexCliBackend(
-            executable=str(worker), credential_provider=lambda: next(issued)
-        )._invoke(
-            prompt="controlled credential-renewal E2E",
-            checkout=git_repo,
-            thread_id=None,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+    output, thread_id = CodexCliBackend(
+        executable=str(worker), credential_provider=lambda: next(issued)
+    )._invoke(
+        prompt="controlled credential-renewal E2E",
+        checkout=git_repo,
+        thread_id=None,
+    )
 
     assert json.loads(output)["result_kind"] == "development"
     assert thread_id == "credential-e2e-thread"
-    assert authorizations == [
-        "token reader-one",
-        "token reader-one",
-        "token reader-two",
+    assert token_seen.read_text(encoding="utf-8").splitlines() == [
+        "reader-one",
+        "reader-one",
+        "reader-two",
     ]
+
+
+def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = tmp_path / "gh-calls"
+    host_gh = tmp_path / "gh"
+    host_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(calls)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        "if sys.argv[1:2] == ['auth']:\n"
+        "    raise SystemExit(3)\n"
+        "print('host-read')\n",
+        encoding="utf-8",
+    )
+    host_gh.chmod(0o700)
+    host_config = tmp_path / "host-gh-config"
+    host_config.mkdir()
+    xdg_config = tmp_path / "config"
+    xdg_config.mkdir()
+    worker = tmp_path / "codex-worker"
+    worker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys\n"
+        "if 'GH_TOKEN' in os.environ or 'GH_ENTERPRISE_TOKEN' in os.environ:\n"
+        "    raise RuntimeError('Worker received a host token')\n"
+        f"if os.environ.get('GH_CONFIG_DIR') in {{{str(host_config)!r}, {str(xdg_config)!r}}}:\n"
+        "    raise RuntimeError('Worker received the host GH_CONFIG_DIR')\n"
+        "subprocess.run(['gh', 'issue', 'view', '3'], check=True)\n"
+        "for rejected_args in (\n"
+        "    ['repo', 'view', '--json', 'name', 'other-owner/other-repository'],\n"
+        "    ['api', '--template', 'repos/example/project',\n"
+        "     'repos/other-owner/other-repository/issues'],\n"
+        "    ['issue', 'list', '--repo=other-owner/other-repository'],\n"
+        "    ['issue', 'list', '-R', 'other-owner/other-repository'],\n"
+        "    ['issue', 'list', '--repo', 'HOST/OWNER/REPO'],\n"
+        "    ['api', '--hostname', 'outside.example',\n"
+        "     'repos/example/project/issues'],\n"
+        "    ['api', 'repos/example/project/../../other-owner/other-repository/issues'],\n"
+        "    ['api', 'repos/example/project/%2e%2e/other-owner/other-repository/issues'],\n"
+        "    ['api', 'repos/{owner}/{repo}/../../other-owner/other-repository/issues'],\n"
+        "    ['auth', 'status'],\n"
+        "):\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'rejected request unexpectedly succeeded: {rejected_args!r}')\n"
+        "output = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "with open(output, 'w', encoding='utf-8') as result:\n"
+        "    json.dump({'result_kind': 'development', 'summary': 'ok', 'human_blockers': None}, result)\n"
+        "print('{\"type\":\"thread.started\",\"thread_id\":\"host-broker-thread\"}')\n",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(host_config))
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GH_ENTERPRISE_TOKEN", raising=False)
+
+    output, thread_id = CodexCliBackend(executable=str(worker))._invoke(
+        prompt="controlled host broker",
+        checkout=git_repo,
+        thread_id=None,
+        repository="example/project",
+    )
+
+    assert json.loads(output)["result_kind"] == "development"
+    assert thread_id == "host-broker-thread"
+    assert calls.read_text(encoding="utf-8") == "issue view 3"
+
+
+def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/fork/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    xdg_config = tmp_path / "config"
+    host_config = tmp_path / "host-gh-config"
+    host_config.mkdir()
+    (host_config / "hosts.yml").write_text("host-gh-secret", encoding="utf-8")
+    private_key = tmp_path / "app.pem"
+    generated_key = subprocess.run(
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:1024",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    private_key.write_bytes(generated_key.stdout)
+    private_key.chmod(0o600)
+
+    calls = tmp_path / "gh-calls"
+    token_seen = tmp_path / "token-seen"
+    host_gh = tmp_path / "gh"
+    host_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        f"with pathlib.Path({str(calls)!r}).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        f"pathlib.Path({str(token_seen)!r}).write_text(os.environ.get('GH_TOKEN', ''), encoding='utf-8')\n"
+        "print('app-read')\n",
+        encoding="utf-8",
+    )
+    host_gh.chmod(0o700)
+    observations = tmp_path / "worker-observations.json"
+    profile_path = xdg_config / "agent-run" / "github-app.json"
+    worker = tmp_path / "codex-worker"
+    worker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        f"profile = Path({str(profile_path)!r})\n"
+        f"private_key = Path({str(private_key)!r})\n"
+        f"host_config = Path({str(host_config / 'hosts.yml')!r})\n"
+        "def contains(path, marker):\n"
+        "    try:\n"
+        "        return marker in path.read_text(encoding='utf-8')\n"
+        "    except OSError:\n"
+        "        return False\n"
+        "observed = {\n"
+        "    'token': 'GH_TOKEN' in os.environ or 'GH_ENTERPRISE_TOKEN' in os.environ,\n"
+        "    'profile': contains(profile, 'app_id'),\n"
+        "    'private_key': contains(private_key, 'BEGIN'),\n"
+        "    'host_config': contains(host_config, 'host-gh-secret'),\n"
+        "    'host_gh_config_env': os.environ.get('GH_CONFIG_DIR') == "
+        f"{str(host_config)!r},\n"
+        "}\n"
+        f"Path({str(observations)!r}).write_text(json.dumps(observed), encoding='utf-8')\n"
+        "subprocess.run(['gh', 'issue', 'view', '3'], check=True)\n"
+        "for rejected_args in (\n"
+        "    ['repo', 'view', '--json', 'name', 'other-owner/other-repository'],\n"
+        "    ['api', '--template', 'repos/example/project',\n"
+        "     'repos/other-owner/other-repository/issues'],\n"
+        "    ['issue', 'list', '--repo=other-owner/other-repository'],\n"
+        "    ['issue', 'list', '-R', 'other-owner/other-repository'],\n"
+        "    ['issue', 'list', '--repo', 'HOST/OWNER/REPO'],\n"
+        "    ['api', '--hostname', 'outside.example',\n"
+        "     'repos/example/project/issues'],\n"
+        "    ['api', 'repos/example/project/../../other-owner/other-repository/issues'],\n"
+        "    ['api', 'repos/example/project/%2e%2e/other-owner/other-repository/issues'],\n"
+        "    ['api', 'repos/{owner}/{repo}/../../other-owner/other-repository/issues'],\n"
+        "    ['auth', 'status'],\n"
+        "):\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'rejected request unexpectedly succeeded: {rejected_args!r}')\n"
+        "output = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "Path(output).write_text(json.dumps({'result_kind': 'development', 'summary': 'ok', 'human_blockers': None}), encoding='utf-8')\n"
+        "print('{\"type\":\"thread.started\",\"thread_id\":\"app-broker-thread\"}')\n",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(host_config))
+    monkeypatch.setattr(
+        "agent_run.codex.mint_read_only_installation_credential",
+        lambda _profile: ReadCredential("app-reader", time.time() + 3600),
+    )
+
+    assert main(
+        [
+            "auth",
+            "app",
+            "configure",
+            "--app-id",
+            "123",
+            "--installation-id",
+            "456",
+            "--private-key",
+            str(private_key),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    result = CodexCliBackend(executable=str(worker)).develop(
+        {"checkout": str(git_repo), "repository": "example/project"}
+    )
+
+    assert result.summary == "ok"
+    assert json.loads(observations.read_text(encoding="utf-8")) == {
+        "token": False,
+        "profile": False,
+        "private_key": False,
+        "host_config": False,
+        "host_gh_config_env": False,
+    }
+    assert calls.read_text(encoding="utf-8") == "issue view 3\n"
+    assert token_seen.read_text(encoding="utf-8") == "app-reader"
 
 
 def test_worker_credential_channel_reports_a_recoverable_renewal_pause(
@@ -2677,6 +2839,68 @@ def test_worker_gh_adapter_allows_github_repository_selector() -> None:
     assert _is_allowed_gh_read(
         ["issue", "list", "--repo", "owner/repository"]
     )
+    assert _is_allowed_gh_read(
+        ["issue", "list", "--repo", "owner/repository"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["issue", "list", "--repo", "other-owner/other-repository"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["api", "repos/other-owner/other-repository/issues"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["repo", "view", "other-owner/other-repository"],
+        repository="owner/repository",
+    )
+    assert _is_allowed_gh_read(
+        ["repo", "view", "--json", "name", "owner/repository"],
+        repository="owner/repository",
+    )
+    assert _is_allowed_gh_read(
+        ["repo", "view", "owner/repository", "--json", "name"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["repo", "view", "--json", "name", "other-owner/other-repository"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["api", "--template", "repos/owner/repository", "repos/other-owner/other-repository/issues"],
+        repository="owner/repository",
+    )
+    assert _is_allowed_gh_read(
+        ["api", "--template", "repos/other-owner/other-repository", "repos/owner/repository/issues"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["api", "--hostname", "outside.example", "repos/owner/repository/issues"],
+        repository="owner/repository",
+    )
+    for endpoint in (
+        "repos/owner/repository/../../other-owner/other-repository/issues",
+        "repos/owner/repository/%2e%2e/other-owner/other-repository/issues",
+        "repos/{owner}/{repo}/../../other-owner/other-repository/issues",
+        "repos/owner/repository/%2e%2e%2fother-owner/other-repository/issues",
+    ):
+        assert not _is_allowed_gh_read(
+            ["api", endpoint], repository="owner/repository"
+        )
+    assert _is_allowed_gh_read(
+        ["api", "repos/owner/repository/issues?state=open"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["issue", "list", "--repo", "HOST/OWNER/REPO"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(
+        ["issue", "view", "https://github.com/other-owner/other-repository/issues/1"],
+        repository="owner/repository",
+    )
+    assert not _is_allowed_gh_read(["search", "issues", "bug"], repository="owner/repository")
 
 
 def test_worker_gh_response_timeout_covers_a_renewal_and_retry() -> None:
@@ -2751,8 +2975,15 @@ run_worker_process(
     controller.wait(timeout=5)
 
     assert controller.returncode not in {None, 0}
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("background Worker process survived SIGINT cleanup")
 
 
 def test_successful_worker_cleans_background_processes(

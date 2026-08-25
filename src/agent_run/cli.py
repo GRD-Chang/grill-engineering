@@ -21,6 +21,10 @@ from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.github_auth_profile import (
+    GitHubAuthProfileError,
+    GitHubAppProfileStore,
+)
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.run_orchestration import DeliveryRunEngine
@@ -68,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure}",
+        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,auth}",
     )
     start = subcommands.add_parser(
         "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
@@ -139,6 +143,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(configure)
     _add_profile_options(configure)
     configure.add_argument("--json", action="store_true", dest="as_json")
+    auth = subcommands.add_parser("auth", help="配置 Worker 的 GitHub 只读身份")
+    auth_commands = auth.add_subparsers(
+        dest="auth_command", required=True, metavar="{status,app}"
+    )
+    auth_commands.add_parser("status", help="显示当前 Worker GitHub 只读身份")
+    auth_app = auth_commands.add_parser("app", help="管理专用只读 GitHub App")
+    auth_app_commands = auth_app.add_subparsers(
+        dest="auth_app_command", required=True, metavar="{configure,remove}"
+    )
+    configure_app = auth_app_commands.add_parser(
+        "configure", help="保存 GitHub App ID、Installation ID 和私钥路径"
+    )
+    configure_app.add_argument("--app-id", required=True, help="GitHub App ID")
+    configure_app.add_argument(
+        "--installation-id", required=True, help="GitHub App Installation ID"
+    )
+    configure_app.add_argument(
+        "--private-key", required=True, help="仓库外私钥文件的绝对路径"
+    )
+    auth_app_commands.add_parser("remove", help="移除专用 App 并恢复宿主 gh")
     return parser
 
 
@@ -162,6 +186,8 @@ def _main_with_parser(
             if parsed.command in {"start", "run"}
             else None
         )
+        if parsed.command == "auth":
+            return _auth_command(parsed)
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
         if parsed.command in {"status", "history"}:
@@ -895,6 +921,64 @@ def _configure_profile(parsed: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _auth_command(parsed: argparse.Namespace) -> int:
+    store = GitHubAppProfileStore()
+    try:
+        if parsed.auth_command == "status":
+            configured = store.load() is not None
+            print(
+                json.dumps(
+                    {
+                        "app_profile": "configured"
+                        if configured
+                        else "not_configured",
+                        "provider": "app" if configured else "host",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if parsed.auth_app_command == "configure":
+            store.configure(
+                app_id=parsed.app_id,
+                installation_id=parsed.installation_id,
+                private_key_path=parsed.private_key,
+            )
+            print(json.dumps({"provider": "app", "result": "configured"}, sort_keys=True))
+            return 0
+        if parsed.auth_app_command == "remove":
+            store.remove()
+            print(
+                json.dumps(
+                    {
+                        "app_profile": "not_configured",
+                        "provider": "host",
+                        "result": "removed",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        raise ValueError("未知 GitHub auth 命令")
+    except GitHubAuthProfileError as error:
+        print(
+            json.dumps(
+                {
+                    "result": "error",
+                    "status": "invalid_auth_profile",
+                    "diagnostics": [
+                        {"code": "github_auth_profile_invalid", "message": bounded_error(str(error))}
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
 
 
 def _profile_state_root(parsed: argparse.Namespace) -> Path:

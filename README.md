@@ -70,6 +70,18 @@ Runner 安装本身不访问 GitHub、目标仓库或 GitHub App；Compatibility
 结构化输出链路。完整生命周期、权限边界和恢复语义见
 [`docs/agent-run.md`](docs/agent-run.md)。
 
+Worker 默认复用宿主已经登录的 `gh` 进行固定只读请求。需要独立只读身份时，可从任意目录一次性配置
+GitHub App；配置只保存元数据和仓库外私钥路径，不复制私钥或 installation token：
+
+```bash
+agent-run auth status
+agent-run auth app configure \
+  --app-id <app-id> \
+  --installation-id <installation-id> \
+  --private-key /secure/agent-run-app.pem
+agent-run auth app remove
+```
+
 ## 开发
 
 editable 安装仅用于本仓库开发和测试，不是普通用户的安装入口：

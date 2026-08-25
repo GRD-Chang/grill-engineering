@@ -194,6 +194,7 @@ class RunPublicationShared:
             "parent_issue_url": (
                 f"https://github.com/{state['repository']}/issues/{int(parent['number'])}"
             ),
+            "repository": str(state["repository"]),
             "checkout": str(checkout),
             "acceptance_artifact": self._mapping(run, "acceptance_artifact"),
         }

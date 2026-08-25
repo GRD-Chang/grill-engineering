@@ -39,11 +39,25 @@ agent-run requeue <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
 agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
 agent-run abandon <run-id> [--discard-worktree] --repo OWNER/REPO
-AGENT_RUN_GITHUB_APP_ID=<app-id> \
-AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
-AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
-  agent-run run <parent-issue> --repo OWNER/REPO
 ```
+
+### GitHub 只读身份
+
+没有 App profile 时，Worker GitHub Read Broker 默认使用宿主已经登录的 `gh`，不会启动登录、刷新或
+读取 `gh auth token`。需要独立最小权限身份时，一次性保存 App 元数据和仓库外私钥路径：
+
+```bash
+agent-run auth status
+agent-run auth app configure \
+  --app-id <app-id> \
+  --installation-id <installation-id> \
+  --private-key /secure/agent-run-app.pem
+agent-run auth app remove
+```
+
+配置文件位于 XDG 用户配置目录，只保存 App ID、Installation ID 和解析后的私钥绝对路径；私钥内容与
+短期 installation token 不会复制或落盘。App profile 存在但损坏或私钥不可用时会 fail closed，不会回退
+到宿主 `gh`。`auth` 命令可以从任意目录执行，不经过 Git discovery 或生命周期门禁。
 
 ### 顶层 Codex 执行配置
 
@@ -285,15 +299,17 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 
 ## 权限边界
 
-Controller 使用专属 GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数
-创建短期 installation token。创建请求只申请 `actions: read`、`checks: read`、
+没有 App profile 时，Controller 在现有 allowlist 校验后直接使用宿主 `gh` 执行固定只读请求；它不调用
+`gh auth login`、`gh auth refresh` 或 `gh auth token`。存在有效 App profile 时，Controller 使用专属
+GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数创建短期 installation token。创建请求只申请
+`actions: read`、`checks: read`、
 `contents: read`、`issues: read`、`metadata: read`、`pull_requests: read` 和
 `statuses: read`，且只接受 GitHub 在同一响应中返回完全一致 permissions 的 token。这些只读
 权限使独立验收可以通过 `gh pr checks` 读取 GitHub Actions 产生的远端 Checks 与 commit
 statuses，确认 Hosted CI 结果。
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
 Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个最长三小时的 Worker 通过仅在本次 invocation 存活的
-临时 Controller-owned `gh` adapter 按读取请求获取 token；token、App 私钥和 Publisher
+临时 Controller-owned `gh` adapter 按读取请求获取宿主身份或短期 token；宿主 token、App 私钥和 Publisher
 凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
 请求，拒绝外部 hostname、写入参数和携带请求体的 API 调用；单次 Controller 读取有界超时，
 Worker 结束或凭据续签耗尽时会清理尚未结束的读取进程。adapter 在到期认证读取失败时仅
