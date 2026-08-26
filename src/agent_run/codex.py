@@ -29,7 +29,7 @@ from agent_run.artifacts import (
     parse_human_blockers,
     parse_publication_wire_result,
 )
-from agent_run.github_auth import mint_read_only_installation_credential
+from agent_run.github_auth import _GitHubAppCredentialProvider
 from agent_run.github import _repository_hint_from_origin
 from agent_run.github_auth_profile import (
     GitHubAppProfileStore,
@@ -721,7 +721,7 @@ class CodexCliBackend:
                     )
                 else:
                     channel = WorkerCredentialChannel(
-                        lambda: mint_read_only_installation_credential(profile),
+                        _GitHubAppCredentialProvider(profile),
                         gh_executable=real_gh,
                         gh_environment=environment,
                         repository=repository,

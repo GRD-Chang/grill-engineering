@@ -64,6 +64,301 @@ class ReadCredential:
 CredentialProvider = Callable[[], ReadCredential | str]
 
 
+_READ_OUTPUT_VALUE_FLAGS = frozenset({"--jq", "--json", "--template", "-q", "-t"})
+_READ_REPOSITORY_VALUE_FLAGS = frozenset({"--repo", "-R"})
+_READ_COMMANDS: dict[
+    tuple[str, str], tuple[frozenset[str], frozenset[str], int, bool]
+] = {
+    ("issue", "view"): (frozenset(), frozenset({"--comments", "-c"}), 1, True),
+    (
+        "issue",
+        "list",
+    ): (
+        frozenset(
+            {
+                "--app",
+                "-a",
+                "--assignee",
+                "-A",
+                "--author",
+                "--label",
+                "-l",
+                "--limit",
+                "-L",
+                "--mention",
+                "--milestone",
+                "-m",
+                "--search",
+                "-S",
+                "--state",
+                "-s",
+            }
+        ),
+        frozenset(),
+        0,
+        True,
+    ),
+    ("search", "issues"): (
+        frozenset(
+            {
+                "--app",
+                "--assignee",
+                "--author",
+                "--closed",
+                "--commenter",
+                "--comments",
+                "--created",
+                "--interactions",
+                "--involves",
+                "--label",
+                "--language",
+                "--limit",
+                "--match",
+                "--mentions",
+                "--milestone",
+                "--order",
+                "--owner",
+                "--project",
+                "--reactions",
+                "--repo",
+                "--sort",
+                "--state",
+                "--team-mentions",
+                "--updated",
+                "--visibility",
+            }
+        ),
+        frozenset(
+            {
+                "--archived",
+                "--include-prs",
+                "--locked",
+                "--no-assignee",
+                "--no-label",
+                "--no-milestone",
+                "--no-project",
+            }
+        ),
+        1,
+        True,
+    ),
+    ("search", "prs"): (
+        frozenset(
+            {
+                "--app",
+                "--assignee",
+                "--author",
+                "--base",
+                "--checks",
+                "--closed",
+                "--commenter",
+                "--comments",
+                "--created",
+                "--head",
+                "--interactions",
+                "--involves",
+                "--label",
+                "--language",
+                "--limit",
+                "--match",
+                "--mentions",
+                "--milestone",
+                "--merged-at",
+                "--order",
+                "--owner",
+                "--project",
+                "--reactions",
+                "--repo",
+                "--review",
+                "--review-requested",
+                "--reviewed-by",
+                "--sort",
+                "--state",
+                "--team-mentions",
+                "--updated",
+                "--visibility",
+            }
+        ),
+        frozenset(
+            {
+                "--archived",
+                "--draft",
+                "--locked",
+                "--merged",
+                "--no-assignee",
+                "--no-label",
+                "--no-milestone",
+                "--no-project",
+            }
+        ),
+        1,
+        True,
+    ),
+    ("search", "repos"): (
+        frozenset(
+            {
+                "--created",
+                "--followers",
+                "--forks",
+                "--good-first-issues",
+                "--help-wanted-issues",
+                "--include-forks",
+                "--language",
+                "--license",
+                "--limit",
+                "--match",
+                "--number-topics",
+                "--order",
+                "--owner",
+                "--size",
+                "--sort",
+                "--stars",
+                "--topic",
+                "--updated",
+                "--visibility",
+            }
+        ),
+        frozenset({"--archived"}),
+        1,
+        False,
+    ),
+    ("search", "commits"): (
+        frozenset(
+            {
+                "--author",
+                "--author-date",
+                "--author-email",
+                "--author-name",
+                "--committer",
+                "--committer-date",
+                "--committer-email",
+                "--committer-name",
+                "--hash",
+                "--limit",
+                "--order",
+                "--owner",
+                "--parent",
+                "--repo",
+                "--sort",
+                "--tree",
+                "--visibility",
+            }
+        ),
+        frozenset({"--merge"}),
+        1,
+        True,
+    ),
+    ("search", "code"): (
+        frozenset(
+            {
+                "--extension",
+                "--filename",
+                "--language",
+                "--limit",
+                "--match",
+                "--owner",
+                "--repo",
+                "--size",
+            }
+        ),
+        frozenset(),
+        1,
+        True,
+    ),
+    ("pr", "view"): (frozenset(), frozenset({"--comments", "-c"}), 1, True),
+    (
+        "pr",
+        "list",
+    ): (
+        frozenset(
+            {
+                "--app",
+                "-a",
+                "--assignee",
+                "-A",
+                "--author",
+                "--base",
+                "-B",
+                "--head",
+                "-H",
+                "--label",
+                "-l",
+                "--limit",
+                "-L",
+                "--search",
+                "-S",
+                "--state",
+                "-s",
+            }
+        ),
+        frozenset({"--draft", "-d"}),
+        0,
+        True,
+    ),
+    ("pr", "checks"): (
+        frozenset({"--interval", "-i"}),
+        frozenset({"--fail-fast", "--required"}),
+        1,
+        True,
+    ),
+    ("repo", "view"): (frozenset({"--branch", "-b"}), frozenset(), 1, False),
+    ("run", "view"): (
+        frozenset({"--attempt", "-a", "--job", "-j"}),
+        frozenset({"--exit-status", "--log", "--log-failed", "--verbose", "-v"}),
+        1,
+        True,
+    ),
+    ("run", "list"): (
+        frozenset(
+            {
+                "--branch",
+                "-b",
+                "--commit",
+                "-c",
+                "--created",
+                "--event",
+                "-e",
+                "--limit",
+                "-L",
+                "--status",
+                "-s",
+                "--user",
+                "-u",
+                "--workflow",
+                "-w",
+            }
+        ),
+        frozenset({"--all", "-a"}),
+        0,
+        True,
+    ),
+    ("workflow", "view"): (
+        frozenset({"--ref", "-r"}),
+        frozenset({"--yaml", "-y"}),
+        1,
+        True,
+    ),
+    ("workflow", "list"): (
+        frozenset({"--limit", "-L"}),
+        frozenset({"--all", "-a"}),
+        0,
+        True,
+    ),
+}
+
+_READ_COMMANDS_REQUIRING_POSITIONAL = frozenset(
+    {("run", "view"), ("workflow", "view"), ("search", "code")}
+)
+
+
+@dataclass(frozen=True)
+class _ParsedReadArguments:
+    """The positionals and repository selectors consumed by one read parse."""
+
+    positionals: tuple[str, ...]
+    repository_selectors: tuple[str, ...]
+
+
 class WorkerCredentialChannel:
     """Serve renewable read tokens over a temporary per-Worker Unix socket."""
 
@@ -131,14 +426,31 @@ class WorkerCredentialChannel:
             self._closed = True
             self._credential = None
             self._condition.notify_all()
+        provider_cancellable = self._cancel_provider()
         if self._socket is not None:
             self._socket.close()
         self._terminate_active_gh_processes()
         for thread in (self._server_thread, self._renewal_thread):
             if thread is not None:
-                thread.join(timeout=0.1)
+                thread.join(
+                    timeout=(
+                        1.0
+                        if provider_cancellable and thread is self._renewal_thread
+                        else 0.1
+                    )
+                )
         if self._socket_path is not None:
             self._socket_path.unlink(missing_ok=True)
+
+    def _cancel_provider(self) -> bool:
+        cancel = getattr(self._provider, "cancel", None)
+        if not callable(cancel):
+            return False
+        try:
+            cancel()
+        except Exception:
+            return False
+        return True
 
     def __enter__(self) -> WorkerCredentialChannel:
         return self
@@ -658,6 +970,15 @@ def _is_allowed_gh_read(
 ) -> bool:
     if not arguments:
         return False
+    if any(
+        argument == "--web"
+        or argument.startswith("--web=")
+        or argument in {"--help", "-h"}
+        for argument in arguments
+    ):
+        return False
+    if arguments[0] == "search":
+        return _is_allowed_search_read(arguments, repository=repository)
     if _has_external_repository(arguments, repository=repository):
         return False
     if arguments[0] == "api":
@@ -665,15 +986,157 @@ def _is_allowed_gh_read(
         return endpoint is not None and not _is_external_url(endpoint) and (
             repository is None or _api_endpoint_targets_repository(endpoint, repository)
         )
-    commands = {
-        "issue": {"view", "list"}, "pr": {"view", "list", "checks"},
-        "repo": {"view"}, "run": {"view", "list"}, "workflow": {"view", "list"},
-    }
-    if repository is not None and arguments[0] in {"search", "status"}:
-        return _has_repository_selector(arguments, repository)
-    return arguments[0] in {"search", "status"} or (
-        len(arguments) > 1 and arguments[0] in commands and arguments[1] in commands[arguments[0]]
+    if arguments[0] == "status":
+        if repository is not None:
+            return False
+        return _has_allowed_read_arguments(
+            arguments[1:],
+            value_flags=frozenset({"--exclude", "-e", "--org", "-o"}),
+            boolean_flags=frozenset(),
+            min_positionals=0,
+            max_positionals=0,
+            accepts_repository_selector=False,
+        )
+    if len(arguments) < 2:
+        return False
+    command = _READ_COMMANDS.get((arguments[0], arguments[1]))
+    if command is None:
+        return False
+    value_flags, boolean_flags, max_positionals, accepts_repository_selector = command
+    return _has_allowed_read_arguments(
+        arguments[2:],
+        value_flags=value_flags,
+        boolean_flags=boolean_flags,
+        min_positionals=(
+            1 if (arguments[0], arguments[1]) in _READ_COMMANDS_REQUIRING_POSITIONAL else 0
+        ),
+        max_positionals=max_positionals,
+        accepts_repository_selector=accepts_repository_selector,
     )
+
+
+def _is_allowed_search_read(
+    arguments: list[str], *, repository: str | None
+) -> bool:
+    if len(arguments) < 2:
+        return False
+    command = _READ_COMMANDS.get((arguments[0], arguments[1]))
+    if command is None:
+        return False
+    value_flags, boolean_flags, max_positionals, accepts_repository_selector = command
+    parsed = _parse_allowed_read_arguments(
+        arguments[2:],
+        value_flags=value_flags,
+        boolean_flags=boolean_flags,
+        min_positionals=(
+            1
+            if (arguments[0], arguments[1]) in _READ_COMMANDS_REQUIRING_POSITIONAL
+            else 0
+        ),
+        max_positionals=max_positionals,
+        accepts_repository_selector=accepts_repository_selector,
+    )
+    if parsed is None or any(_is_external_url(value) for value in parsed.positionals):
+        return False
+    if not parsed.repository_selectors:
+        return repository is None
+    if repository is None:
+        return all(_is_github_repository(selector) for selector in parsed.repository_selectors)
+    return all(
+        _is_github_repository(selector)
+        and _same_repository(selector, repository)
+        for selector in parsed.repository_selectors
+    )
+
+
+def _has_allowed_read_arguments(
+    arguments: list[str],
+    *,
+    value_flags: frozenset[str],
+    boolean_flags: frozenset[str],
+    min_positionals: int,
+    max_positionals: int,
+    accepts_repository_selector: bool,
+) -> bool:
+    return (
+        _parse_allowed_read_arguments(
+            arguments,
+            value_flags=value_flags,
+            boolean_flags=boolean_flags,
+            min_positionals=min_positionals,
+            max_positionals=max_positionals,
+            accepts_repository_selector=accepts_repository_selector,
+        )
+        is not None
+    )
+
+
+def _parse_allowed_read_arguments(
+    arguments: list[str],
+    *,
+    value_flags: frozenset[str],
+    boolean_flags: frozenset[str],
+    min_positionals: int,
+    max_positionals: int,
+    accepts_repository_selector: bool,
+) -> _ParsedReadArguments | None:
+    allowed_value_flags = set(_READ_OUTPUT_VALUE_FLAGS | value_flags)
+    if accepts_repository_selector:
+        allowed_value_flags.update(_READ_REPOSITORY_VALUE_FLAGS)
+    positionals: list[str] = []
+    repository_selectors: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            return None
+        if argument in allowed_value_flags:
+            if index + 1 >= len(arguments) or arguments[index + 1] == "--web":
+                return None
+            if argument in _READ_REPOSITORY_VALUE_FLAGS:
+                repository_selectors.append(arguments[index + 1])
+            index += 2
+            continue
+        if argument.startswith("--") and "=" in argument:
+            name, _, value = argument.partition("=")
+            if name in allowed_value_flags:
+                if name in _READ_REPOSITORY_VALUE_FLAGS:
+                    repository_selectors.append(value)
+                index += 1
+                continue
+            if name not in boolean_flags or value.casefold() not in {"true", "false"}:
+                return None
+            index += 1
+            continue
+        if argument in boolean_flags:
+            index += 1
+            continue
+        if argument.startswith("--"):
+            return None
+        if argument.startswith("-"):
+            short_value_flag = next(
+                (
+                    flag
+                    for flag in allowed_value_flags
+                    if len(flag) == 2
+                    and argument.startswith(flag)
+                    and argument != flag
+                ),
+                None,
+            )
+            if short_value_flag is None:
+                return None
+            if short_value_flag in _READ_REPOSITORY_VALUE_FLAGS:
+                repository_selectors.append(argument[len(short_value_flag) :])
+            index += 1
+            continue
+        positionals.append(argument)
+        if len(positionals) > max_positionals:
+            return None
+        index += 1
+    if not min_positionals <= len(positionals) <= max_positionals:
+        return None
+    return _ParsedReadArguments(tuple(positionals), tuple(repository_selectors))
 
 
 def _is_get_api_request(arguments: list[str]) -> bool:
@@ -686,7 +1149,6 @@ def _api_endpoint(arguments: list[str]) -> str | None:
     """Return the positional endpoint after consuming real ``gh api`` flags."""
 
     value_flags = {
-        "--cache",
         "--header",
         "--jq",
         "--method",
@@ -791,26 +1253,8 @@ def _has_external_repository(
     return False
 
 
-def _has_repository_selector(arguments: list[str], repository: str) -> bool:
-    for index, argument in enumerate(arguments):
-        if argument in {"--repo", "-R"} and index + 1 < len(arguments):
-            selector = arguments[index + 1]
-            if _is_github_repository(selector) and _same_repository(selector, repository):
-                return True
-        if argument.startswith("--repo="):
-            selector = argument.removeprefix("--repo=")
-            if _is_github_repository(selector) and _same_repository(selector, repository):
-                return True
-        if argument.startswith("-R") and argument != "-R":
-            selector = argument[2:]
-            if _is_github_repository(selector) and _same_repository(selector, repository):
-                return True
-    return False
-
-
 def _repo_view_target(arguments: list[str]) -> tuple[str | None, bool]:
     value_flags = {"--branch", "--jq", "--json", "--template", "-b", "-q", "-t"}
-    boolean_flags = {"--web", "--help"}
     targets: list[str] = []
     index = 2
     while index < len(arguments):
@@ -821,9 +1265,6 @@ def _repo_view_target(arguments: list[str]) -> tuple[str | None, bool]:
             index += 2
             continue
         if any(argument.startswith(flag + "=") for flag in value_flags):
-            index += 1
-            continue
-        if argument in boolean_flags:
             index += 1
             continue
         if argument.startswith("-"):

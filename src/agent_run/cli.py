@@ -931,8 +931,8 @@ def _configure_profile(parsed: argparse.Namespace) -> int:
 
 
 def _auth_command(parsed: argparse.Namespace) -> int:
-    store = GitHubAppProfileStore()
     try:
+        store = GitHubAppProfileStore()
         if parsed.auth_command == "status":
             configured = store.load() is not None
             print(

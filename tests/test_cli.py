@@ -134,6 +134,45 @@ def test_doctor_reports_host_readiness_without_mutating_user_state(
     assert not data.exists()
 
 
+@pytest.mark.parametrize(
+    ("openssl_script", "expected_status"),
+    [
+        (None, "missing"),
+        (
+            '#!/bin/sh\n[ "$1" = version ] && exit 7\nexit 0\n',
+            "unavailable",
+        ),
+        (
+            f"#!{sys.executable}\nimport time\ntime.sleep(30)\n",
+            "timeout",
+        ),
+    ],
+)
+def test_doctor_classifies_bounded_openssl_probe_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    openssl_script: str | None,
+    expected_status: str,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    if openssl_script is not None:
+        openssl = fake_bin / "openssl"
+        openssl.write_text(openssl_script, encoding="utf-8")
+        openssl.chmod(0o700)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("PATH", str(fake_bin))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["doctor", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["checks"]["openssl"]["status"] == expected_status
+
+
 def test_doctor_does_not_fallback_when_app_profile_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

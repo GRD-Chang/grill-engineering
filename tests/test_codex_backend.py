@@ -28,6 +28,7 @@ from agent_run.codex import (
 from agent_run.agents import PublicationResult
 from agent_run.github_auth import (
     GitHubCredentialError,
+    _GitHubAppCredentialProvider,
     _create_app_jwt,
     mint_read_only_installation_credential,
     mint_read_only_installation_token,
@@ -57,6 +58,63 @@ PASS_EVIDENCE = {
     "standards": "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。",
     "spec": "已核对的验收标准：请求中的全部验收标准；覆盖结论：候选完整覆盖。",
 }
+
+
+_UNSAFE_GH_READ_ARGUMENTS = (
+    ["issue", "view", "3", "--web"],
+    ["issue", "view", "3", "-w"],
+    ["issue", "list", "--web"],
+    ["issue", "list", "-w"],
+    ["pr", "view", "3", "--web"],
+    ["pr", "view", "3", "-w"],
+    ["pr", "list", "--web"],
+    ["pr", "list", "-w"],
+    ["pr", "checks", "3", "--web"],
+    ["pr", "checks", "3", "-w"],
+    ["pr", "checks", "3", "--watch"],
+    ["repo", "view", "--web"],
+    ["repo", "view", "-w"],
+    ["run", "view", "3", "--web"],
+    ["run", "view", "3", "-w"],
+    ["workflow", "view", "build.yml", "--web"],
+    ["workflow", "view", "build.yml", "-w"],
+    ["search", "issues", "query", "--web=true"],
+    ["search", "issues", "query", "-wquery"],
+    ["search", "issues", "query", "--help"],
+    ["search", "issues", "query", "--unknown"],
+    ["status", "--help"],
+    ["status", "--unknown"],
+    ["run", "view"],
+    ["workflow", "view"],
+    ["search", "code"],
+)
+
+
+_API_CACHE_ARGUMENTS = (
+    ["api", "--cache", "1h", "repos/example/project/issues"],
+    ["api", "--cache=1h", "repos/example/project/issues"],
+    ["api", "repos/example/project/issues", "--cache", "1h"],
+    ["api", "repos/example/project/issues", "--cache=1h"],
+)
+
+
+_SEARCH_BROKER_VALID_ARGUMENTS = tuple(
+    ["search", kind, "query", "--repo", "example/project"]
+    for kind in ("issues", "prs", "commits", "code")
+)
+_SEARCH_BROKER_REJECT_ARGUMENTS = tuple(
+    arguments
+    for kind in ("issues", "prs", "commits", "code")
+    for arguments in (
+        ["search", kind, "query"],
+        ["search", kind, "query", "--repo", "other-owner/other-repository"],
+        ["search", kind, "query", "--repo=other-owner/other-repository"],
+        ["search", kind, "query", "-Rother-owner/other-repository"],
+        ["search", kind, "--template", "--repo", "example/project"],
+        ["search", kind, "--limit", "--repo", "example/project"],
+        ["search", kind, "-q", "--repo", "example/project"],
+    )
+)
 
 
 def passing_acceptance_artifact() -> dict[str, object]:
@@ -2442,11 +2500,25 @@ def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = tmp_path / "gh-calls"
+    cache_marker = tmp_path / "gh-cache-marker"
+    browser_calls = tmp_path / "browser-calls"
+    browser = tmp_path / "browser"
+    browser.write_text(
+        "#!/usr/bin/env python3\n"
+        f"from pathlib import Path\nPath({str(browser_calls)!r}).write_text('invoked')\n",
+        encoding="utf-8",
+    )
+    browser.chmod(0o700)
     host_gh = tmp_path / "gh"
     host_gh.write_text(
         "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(calls)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        "import os, pathlib, subprocess, sys\n"
+        f"with pathlib.Path({str(calls)!r}).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if any(argument == '--cache' or argument.startswith('--cache=') for argument in sys.argv[1:]):\n"
+        f"    pathlib.Path({str(cache_marker)!r}).write_text('cached')\n"
+        "if '--web' in sys.argv[1:] or '-w' in sys.argv[1:]:\n"
+        "    subprocess.run([os.environ['BROWSER']], check=True)\n"
         "if sys.argv[1:2] == ['auth']:\n"
         "    raise SystemExit(3)\n"
         "print('host-read')\n",
@@ -2466,6 +2538,9 @@ def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
         f"if os.environ.get('GH_CONFIG_DIR') in {{{str(host_config)!r}, {str(xdg_config)!r}}}:\n"
         "    raise RuntimeError('Worker received the host GH_CONFIG_DIR')\n"
         "subprocess.run(['gh', 'issue', 'view', '3'], check=True)\n"
+        "subprocess.run(['gh', 'api', 'repos/example/project/issues/3'], check=True)\n"
+        f"for allowed_args in {_SEARCH_BROKER_VALID_ARGUMENTS!r}:\n"
+        "    subprocess.run(['gh', *allowed_args], check=True)\n"
         "for rejected_args in (\n"
         "    ['repo', 'view', '--json', 'name', 'other-owner/other-repository'],\n"
         "    ['api', '--template', 'repos/example/project',\n"
@@ -2483,6 +2558,18 @@ def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
         "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
         "    if rejected.returncode == 0:\n"
         "        raise RuntimeError(f'rejected request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"for rejected_args in {_SEARCH_BROKER_REJECT_ARGUMENTS!r}:\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'search request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"for rejected_args in {_UNSAFE_GH_READ_ARGUMENTS!r}:\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'unsafe request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"for rejected_args in {_API_CACHE_ARGUMENTS!r}:\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'cache request unexpectedly succeeded: {rejected_args!r}')\n"
         "output = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
         "with open(output, 'w', encoding='utf-8') as result:\n"
         "    json.dump({'result_kind': 'development', 'summary': 'ok', 'human_blockers': None}, result)\n"
@@ -2491,6 +2578,7 @@ def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
     )
     worker.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("BROWSER", str(browser))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
     monkeypatch.setenv("GH_CONFIG_DIR", str(host_config))
     monkeypatch.delenv("GH_TOKEN", raising=False)
@@ -2505,7 +2593,15 @@ def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
 
     assert json.loads(output)["result_kind"] == "development"
     assert thread_id == "host-broker-thread"
-    assert calls.read_text(encoding="utf-8") == "issue view 3"
+    assert calls.read_text(encoding="utf-8") == (
+        "issue view 3\napi repos/example/project/issues/3\n"
+        + "".join(
+            " ".join(arguments) + "\n"
+            for arguments in _SEARCH_BROKER_VALID_ARGUMENTS
+        )
+    )
+    assert not cache_marker.exists()
+    assert not browser_calls.exists()
 
 
 def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
@@ -2540,13 +2636,26 @@ def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
     private_key.chmod(0o600)
 
     calls = tmp_path / "gh-calls"
+    cache_marker = tmp_path / "gh-cache-marker"
+    browser_calls = tmp_path / "browser-calls"
+    browser = tmp_path / "browser"
+    browser.write_text(
+        "#!/usr/bin/env python3\n"
+        f"from pathlib import Path\nPath({str(browser_calls)!r}).write_text('invoked')\n",
+        encoding="utf-8",
+    )
+    browser.chmod(0o700)
     token_seen = tmp_path / "token-seen"
     host_gh = tmp_path / "gh"
     host_gh.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, pathlib, sys\n"
+        "import os, pathlib, subprocess, sys\n"
         f"with pathlib.Path({str(calls)!r}).open('a', encoding='utf-8') as stream:\n"
         "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if any(argument == '--cache' or argument.startswith('--cache=') for argument in sys.argv[1:]):\n"
+        f"    pathlib.Path({str(cache_marker)!r}).write_text('cached')\n"
+        "if '--web' in sys.argv[1:] or '-w' in sys.argv[1:]:\n"
+        "    subprocess.run([os.environ['BROWSER']], check=True)\n"
         f"pathlib.Path({str(token_seen)!r}).write_text(os.environ.get('GH_TOKEN', ''), encoding='utf-8')\n"
         "print('app-read')\n",
         encoding="utf-8",
@@ -2577,6 +2686,9 @@ def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
         "}\n"
         f"Path({str(observations)!r}).write_text(json.dumps(observed), encoding='utf-8')\n"
         "subprocess.run(['gh', 'issue', 'view', '3'], check=True)\n"
+        "subprocess.run(['gh', 'api', 'repos/example/project/issues/3'], check=True)\n"
+        f"for allowed_args in {_SEARCH_BROKER_VALID_ARGUMENTS!r}:\n"
+        "    subprocess.run(['gh', *allowed_args], check=True)\n"
         "for rejected_args in (\n"
         "    ['repo', 'view', '--json', 'name', 'other-owner/other-repository'],\n"
         "    ['api', '--template', 'repos/example/project',\n"
@@ -2594,6 +2706,18 @@ def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
         "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
         "    if rejected.returncode == 0:\n"
         "        raise RuntimeError(f'rejected request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"for rejected_args in {_SEARCH_BROKER_REJECT_ARGUMENTS!r}:\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'search request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"for rejected_args in {_UNSAFE_GH_READ_ARGUMENTS!r}:\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'unsafe request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"for rejected_args in {_API_CACHE_ARGUMENTS!r}:\n"
+        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
+        "    if rejected.returncode == 0:\n"
+        "        raise RuntimeError(f'cache request unexpectedly succeeded: {rejected_args!r}')\n"
         "output = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
         "Path(output).write_text(json.dumps({'result_kind': 'development', 'summary': 'ok', 'human_blockers': None}), encoding='utf-8')\n"
         "print('{\"type\":\"thread.started\",\"thread_id\":\"app-broker-thread\"}')\n",
@@ -2602,11 +2726,12 @@ def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
     worker.chmod(0o700)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("BROWSER", str(browser))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
     monkeypatch.setenv("GH_CONFIG_DIR", str(host_config))
     monkeypatch.setattr(
-        "agent_run.codex.mint_read_only_installation_credential",
-        lambda _profile: ReadCredential("app-reader", time.time() + 3600),
+        "agent_run.github_auth.mint_read_only_installation_credential",
+        lambda _profile, **_options: ReadCredential("app-reader", time.time() + 3600),
     )
 
     assert main(
@@ -2636,8 +2761,16 @@ def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
         "host_config": False,
         "host_gh_config_env": False,
     }
-    assert calls.read_text(encoding="utf-8") == "issue view 3\n"
+    assert calls.read_text(encoding="utf-8") == (
+        "issue view 3\napi repos/example/project/issues/3\n"
+        + "".join(
+            " ".join(arguments) + "\n"
+            for arguments in _SEARCH_BROKER_VALID_ARGUMENTS
+        )
+    )
     assert token_seen.read_text(encoding="utf-8") == "app-reader"
+    assert not cache_marker.exists()
+    assert not browser_calls.exists()
 
 
 def test_worker_credential_channel_reports_a_recoverable_renewal_pause(
@@ -2804,6 +2937,302 @@ def test_closing_channel_does_not_wait_for_a_blocked_renewal_provider(
     assert not closer.is_alive()
 
 
+def test_app_credential_channel_close_reclaims_a_blocked_signer_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_path = tmp_path / "openssl-invocations"
+    parent_pid_path = tmp_path / "signer.pid"
+    child_pid_path = tmp_path / "signer-child.pid"
+    signer = tmp_path / "openssl"
+    signer.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import pathlib\n"
+        "import sys\n"
+        "import time\n"
+        f"invocation_path = pathlib.Path({str(invocation_path)!r})\n"
+        "count = int(invocation_path.read_text()) + 1 if invocation_path.exists() else 1\n"
+        "invocation_path.write_text(str(count))\n"
+        "if count <= 2:\n"
+        "    sys.stdout.buffer.write(b'signature')\n"
+        "    sys.stdout.flush()\n"
+        "    raise SystemExit(0)\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.setsid()\n"
+        f"    pathlib.Path({str(child_pid_path)!r}).write_text(str(os.getpid()))\n"
+        "    time.sleep(60)\n"
+        "    raise SystemExit(0)\n"
+        f"pathlib.Path({str(parent_pid_path)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    signer.chmod(0o700)
+    monkeypatch.setenv(
+        "PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", "")
+    )
+
+    permissions = {
+        "actions": "read",
+        "checks": "read",
+        "contents": "read",
+        "issues": "read",
+        "metadata": "read",
+        "pull_requests": "read",
+        "statuses": "read",
+    }
+
+    def fake_urlopen(_request: Any, timeout: float) -> io.BytesIO:
+        assert timeout == 15.0
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "token": "reader",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "permissions": permissions,
+                }
+            ).encode()
+        )
+
+    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", fake_urlopen)
+    profile = GitHubAppProfile("123", "456", tmp_path / "private.pem")
+    profile.private_key_path.write_text("private-key", encoding="utf-8")
+    profile.private_key_path.chmod(0o600)
+    credentials = WorkerCredentialChannel(
+        _GitHubAppCredentialProvider(profile),
+        renewal_margin=10**12,
+        gh_executable="/bin/true",
+        gh_environment={"PATH": os.environ["PATH"]},
+    )
+    socket_path = tmp_path / "credential.sock"
+    unrelated: subprocess.Popen[str] | None = None
+    renewal_thread: threading.Thread | None = None
+
+    try:
+        credentials.start(socket_path)
+        renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not (
+                parent_pid_path.exists() and child_pid_path.exists()
+            ):
+                time.sleep(0.02)
+            assert parent_pid_path.exists()
+            assert child_pid_path.exists()
+            assert int(invocation_path.read_text(encoding="utf-8")) >= 3
+            assert renewal_thread is not None
+
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"]
+            )
+            credentials.close()
+            assert unrelated.poll() is None
+        finally:
+            if renewal_thread is not None and renewal_thread.is_alive():
+                credentials.close()
+    finally:
+        if unrelated is not None and unrelated.poll() is None:
+            unrelated.terminate()
+        if unrelated is not None:
+            unrelated.wait(timeout=5)
+
+    assert renewal_thread is not None
+    assert not renewal_thread.is_alive()
+    assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
+    assert not credentials._active_gh_processes  # noqa: SLF001 - lifecycle seam
+    assert not socket_path.exists()
+    for pid_path in (parent_pid_path, child_pid_path):
+        pid = int(pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+def test_app_credential_channel_close_after_network_timeout_joins_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_key = tmp_path / "private.pem"
+    private_key.write_text("private-key", encoding="utf-8")
+    private_key.chmod(0o600)
+    profile = GitHubAppProfile("123", "456", private_key)
+    timeout_seen = threading.Event()
+    calls = 0
+
+    def fake_jwt(*_arguments: Any, **_options: Any) -> str:
+        return "jwt"
+
+    def fake_urlopen(_request: Any, *, timeout: float) -> io.BytesIO:
+        nonlocal calls
+        assert timeout == 15.0
+        calls += 1
+        if calls > 1:
+            timeout_seen.set()
+            time.sleep(1.5)
+            raise socket.timeout("issuer timeout")
+        return io.BytesIO(
+            json.dumps(
+                {
+                    "token": "reader",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "permissions": {
+                        "actions": "read",
+                        "checks": "read",
+                        "contents": "read",
+                        "issues": "read",
+                        "metadata": "read",
+                        "pull_requests": "read",
+                        "statuses": "read",
+                    },
+                }
+            ).encode()
+        )
+
+    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", fake_jwt)
+    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", fake_urlopen)
+    credentials = WorkerCredentialChannel(
+        _GitHubAppCredentialProvider(profile),
+        renewal_margin=10**12,
+        gh_executable="/bin/true",
+    )
+    socket_path = tmp_path / "credential.sock"
+    renewal_thread: threading.Thread | None = None
+    try:
+        credentials.start(socket_path)
+        assert timeout_seen.wait(timeout=2)
+        renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
+    finally:
+        credentials.close()
+
+    assert calls >= 2
+    assert renewal_thread is not None
+    assert not renewal_thread.is_alive()
+    assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
+    assert not socket_path.exists()
+
+
+def test_app_credential_channel_close_interrupts_network_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    certificate = tmp_path / "localhost.crt"
+    private_key = tmp_path / "localhost.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(private_key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    response_started = threading.Event()
+    release_response = threading.Event()
+    calls = 0
+    body = json.dumps(
+        {
+            "token": "reader",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "permissions": {
+                "actions": "read",
+                "checks": "read",
+                "contents": "read",
+                "issues": "read",
+                "metadata": "read",
+                "pull_requests": "read",
+                "statuses": "read",
+            },
+        }
+    ).encode()
+
+    class BlockingTokenHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            nonlocal calls
+            calls += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if calls == 1:
+                self.wfile.write(body)
+                return
+            response_started.set()
+            release_response.wait(timeout=30)
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), BlockingTokenHandler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(certificate, private_key)
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    original_request = urllib.request.Request
+
+    def local_request(url: str, *arguments: Any, **options: Any) -> Any:
+        return original_request(
+            url.replace(
+                "https://api.github.com",
+                f"https://localhost:{server.server_port}",
+                1,
+            ),
+            *arguments,
+            **options,
+        )
+
+    monkeypatch.setattr("agent_run.github_auth.urllib.request.Request", local_request)
+    monkeypatch.setattr(
+        "agent_run.github_auth._create_app_jwt",
+        lambda *_arguments, **_options: "jwt",
+    )
+    monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
+    profile = GitHubAppProfile("123", "456", tmp_path / "private.pem")
+    profile.private_key_path.write_text("private-key", encoding="utf-8")
+    profile.private_key_path.chmod(0o600)
+    credentials = WorkerCredentialChannel(
+        _GitHubAppCredentialProvider(profile),
+        renewal_margin=10**12,
+        gh_executable="/bin/true",
+    )
+    socket_path = tmp_path / "credential.sock"
+    renewal_thread: threading.Thread | None = None
+    try:
+        credentials.start(socket_path)
+        assert response_started.wait(timeout=2)
+        renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
+        close_started = time.monotonic()
+        credentials.close()
+        assert time.monotonic() - close_started < 3
+    finally:
+        release_response.set()
+        if renewal_thread is not None and renewal_thread.is_alive():
+            credentials.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert calls >= 2
+    assert renewal_thread is not None
+    assert not renewal_thread.is_alive()
+    assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
+    assert not socket_path.exists()
+
+
 def test_worker_gh_adapter_rejects_token_and_write_commands() -> None:
     for arguments in (
         ["auth", "token"],
@@ -2820,19 +3249,49 @@ def test_worker_gh_adapter_rejects_token_and_write_commands() -> None:
         ["api", "https://outside.example/collect"],
         ["api", "https:outside.example/collect"],
         ["api", "//outside.example/collect"],
+        ["issue", "view", "1", "--help"],
+        ["issue", "view", "1", "--unknown"],
+        ["pr", "checks", "1", "--watch"],
         ["issue", "list", "--repo", "outside.example/owner/repository"],
         ["issue", "list", "--repo=outside.example/owner/repository"],
         ["pr", "view", "-Routside.example/owner/repository"],
+        *_UNSAFE_GH_READ_ARGUMENTS,
+        *_API_CACHE_ARGUMENTS,
     ):
         assert not _is_allowed_gh_read(arguments)
     for arguments in (
         ["issue", "view", "1"],
         ["pr", "checks", "1"],
         ["run", "view", "1"],
+        ["run", "list", "-w", "build.yml"],
+        ["issue", "view", "1", "--comments=false"],
+        ["pr", "list", "--draft=true"],
+        ["run", "list", "--all=false"],
+        ["status"],
+        ["status", "--org", "example"],
+        ["search", "issues", "query"],
+        ["search", "code", "query", "--repo", "owner/repository"],
         ["api", "repos/example/project/issues/1"],
         ["api", "repos/example/project/issues/1", "--method=GET"],
     ):
         assert _is_allowed_gh_read(arguments)
+
+
+def test_worker_gh_search_requires_a_real_current_repository_selector() -> None:
+    for arguments in _SEARCH_BROKER_REJECT_ARGUMENTS:
+        assert not _is_allowed_gh_read(arguments, repository="example/project")
+    for arguments in _SEARCH_BROKER_VALID_ARGUMENTS:
+        assert _is_allowed_gh_read(arguments, repository="example/project")
+
+    for kind in ("issues", "prs", "commits", "code"):
+        assert _is_allowed_gh_read(
+            ["search", kind, "--repo=example/project", "query"],
+            repository="example/project",
+        )
+        assert _is_allowed_gh_read(
+            ["search", kind, "query", "-Rexample/project"],
+            repository="example/project",
+        )
 
 
 def test_worker_gh_adapter_allows_github_repository_selector() -> None:
@@ -2901,6 +3360,10 @@ def test_worker_gh_adapter_allows_github_repository_selector() -> None:
         repository="owner/repository",
     )
     assert not _is_allowed_gh_read(["search", "issues", "bug"], repository="owner/repository")
+    assert not _is_allowed_gh_read(["status"], repository="owner/repository")
+    assert not _is_allowed_gh_read(
+        ["status", "--org", "example"], repository="owner/repository"
+    )
 
 
 def test_worker_gh_response_timeout_covers_a_renewal_and_retry() -> None:
@@ -3071,11 +3534,7 @@ def test_stdout_callback_error_terminates_hanging_worker(tmp_path: Path) -> None
 
 
 def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
-    before = {
-        thread.name
-        for thread in threading.enumerate()
-        if thread.name.startswith("agent-run-worker-")
-    }
+    process_ids: list[int] = []
 
     with pytest.raises(WorkerSandboxError, match="timed out"):
         run_worker_process(
@@ -3085,14 +3544,16 @@ def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
             environment={"PATH": "/usr/bin:/bin"},
             timeout=0.1,
             on_stdout_line=lambda _line: None,
+            on_process_started=process_ids.append,
         )
 
-    after = {
+    assert len(process_ids) == 1
+    reader_threads = {
         thread.name
         for thread in threading.enumerate()
-        if thread.name.startswith("agent-run-worker-")
+        if thread.name.startswith(f"agent-run-worker-{process_ids[0]}-")
     }
-    assert after == before
+    assert not reader_threads
 
 
 def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(

@@ -55,7 +55,7 @@ def _collect() -> dict[str, object]:
         "python": _python_check(),
         "git": _tool_check("git"),
         "codex": _tool_check("codex"),
-        "openssl": _tool_check("openssl"),
+        "openssl": _tool_check("openssl", version_arguments=("version",)),
         "bubblewrap": _tool_check("bwrap"),
         "github": _github_check(),
         "active_runner": _active_runner_check(),
@@ -85,11 +85,13 @@ def _python_check() -> dict[str, object]:
     }
 
 
-def _tool_check(command: str) -> dict[str, object]:
+def _tool_check(
+    command: str, *, version_arguments: tuple[str, ...] = ("--version",)
+) -> dict[str, object]:
     executable = shutil.which(command)
     if executable is None:
         return {"status": "missing", "path": None}
-    returncode, timed_out = _run_bounded_probe([executable, "--version"])
+    returncode, timed_out = _run_bounded_probe([executable, *version_arguments])
     if returncode is None:
         return {
             "status": "timeout" if timed_out else "unavailable",
