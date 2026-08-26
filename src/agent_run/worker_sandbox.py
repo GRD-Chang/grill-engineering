@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from agent_run.worker_credentials import WORKER_GH_RESPONSE_TIMEOUT_SECONDS
@@ -20,6 +20,7 @@ class WorkerSandboxError(RuntimeError):
 def worker_environment(
     gh_config: Path, github_read_token: str
 ) -> dict[str, str]:
+    _validate_inherited_github_host()
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -37,6 +38,7 @@ def worker_environment(
             "AGENT_RUN_GITHUB_APP_PRIVATE_KEY",
             "AGENT_RUN_GITHUB_READ_PERMISSIONS",
             "AGENT_RUN_GITHUB_READ_TOKEN",
+            "GH_HOST",
         }
     }
     environment["PATH"] = _without_inherited_gh_adapters(
@@ -46,6 +48,7 @@ def worker_environment(
     environment.update(
         {
             "GH_CONFIG_DIR": str(gh_config),
+            "XDG_CONFIG_HOME": str(gh_config.parent),
             "GH_TOKEN": github_read_token,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": "/bin/false",
@@ -60,6 +63,12 @@ def worker_environment(
         }
     )
     return environment
+
+
+def _validate_inherited_github_host() -> None:
+    host = os.environ.get("GH_HOST", "").strip()
+    if host and host.casefold() != "github.com":
+        raise WorkerSandboxError("Worker GitHub read host is not authorized")
 
 
 def _without_inherited_gh_adapters(path: str) -> str:
@@ -156,6 +165,7 @@ def bubblewrap_command(
     temporary: Path,
     writable_checkout: bool,
     environment: dict[str, str],
+    hidden_paths: Sequence[Path] = (),
 ) -> list[str]:
     _reject_credentialed_http_remotes(checkout, environment)
     executable = shutil.which("bwrap")
@@ -198,8 +208,50 @@ def bubblewrap_command(
     git_credentials = home / ".git-credentials"
     if git_credentials.exists():
         arguments.extend(["--ro-bind", "/dev/null", str(git_credentials)])
+    _mask_worker_paths(
+        arguments,
+        hidden_paths,
+        checkout=checkout,
+        temporary=temporary,
+    )
     arguments.extend(["--chdir", str(checkout), "--", *command])
     return arguments
+
+
+def _mask_worker_paths(
+    arguments: list[str],
+    hidden_paths: Sequence[Path],
+    *,
+    checkout: Path,
+    temporary: Path,
+) -> None:
+    checkout_root = checkout.resolve()
+    temporary_root = temporary.resolve()
+    paths: set[Path] = set()
+    for candidate in hidden_paths:
+        try:
+            resolved = Path(candidate).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved in {checkout_root, temporary_root}:
+            continue
+        paths.add(resolved)
+
+    directories = sorted(
+        (path for path in paths if path.is_dir()),
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    mounted_directories: list[Path] = []
+    for directory in directories:
+        if any(parent in mounted_directories for parent in directory.parents):
+            continue
+        arguments.extend(["--tmpfs", str(directory)])
+        mounted_directories.append(directory)
+
+    for path in sorted(paths - set(directories), key=str):
+        if any(directory in path.parents for directory in mounted_directories):
+            continue
+        arguments.extend(["--ro-bind", "/dev/null", str(path)])
 
 
 def _reject_credentialed_http_remotes(

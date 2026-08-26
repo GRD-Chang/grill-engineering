@@ -39,11 +39,25 @@ agent-run requeue <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
 agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
 agent-run abandon <run-id> [--discard-worktree] --repo OWNER/REPO
-AGENT_RUN_GITHUB_APP_ID=<app-id> \
-AGENT_RUN_GITHUB_APP_INSTALLATION_ID=<installation-id> \
-AGENT_RUN_GITHUB_APP_PRIVATE_KEY="$(cat /secure/agent-run-app.pem)" \
-  agent-run run <parent-issue> --repo OWNER/REPO
 ```
+
+### GitHub 只读身份
+
+没有 App profile 时，Worker GitHub Read Broker 默认使用宿主已经登录的 `gh`，不会启动登录、刷新或
+读取 `gh auth token`。需要独立最小权限身份时，一次性保存 App 元数据和仓库外私钥路径：
+
+```bash
+agent-run auth status
+agent-run auth app configure \
+  --app-id <app-id> \
+  --installation-id <installation-id> \
+  --private-key /secure/agent-run-app.pem
+agent-run auth app remove
+```
+
+配置文件位于 XDG 用户配置目录，只保存 App ID、Installation ID 和解析后的私钥绝对路径；私钥内容与
+短期 installation token 不会复制或落盘。App profile 存在但损坏或私钥不可用时会 fail closed，不会回退
+到宿主 `gh`。`auth` 命令可以从任意目录执行，不经过 Git discovery 或生命周期门禁。
 
 ### 顶层 Codex 执行配置
 
@@ -285,15 +299,17 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 
 ## 权限边界
 
-Controller 使用专属 GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数
-创建短期 installation token。创建请求只申请 `actions: read`、`checks: read`、
+没有 App profile 时，Controller 在现有 allowlist 校验后直接使用宿主 `gh` 执行固定只读请求；它不调用
+`gh auth login`、`gh auth refresh` 或 `gh auth token`。存在有效 App profile 时，Controller 使用专属
+GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数创建短期 installation token。创建请求只申请
+`actions: read`、`checks: read`、
 `contents: read`、`issues: read`、`metadata: read`、`pull_requests: read` 和
 `statuses: read`，且只接受 GitHub 在同一响应中返回完全一致 permissions 的 token。这些只读
 权限使独立验收可以通过 `gh pr checks` 读取 GitHub Actions 产生的远端 Checks 与 commit
 statuses，确认 Hosted CI 结果。
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
 Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个最长三小时的 Worker 通过仅在本次 invocation 存活的
-临时 Controller-owned `gh` adapter 按读取请求获取 token；token、App 私钥和 Publisher
+临时 Controller-owned `gh` adapter 按读取请求获取宿主身份或短期 token；宿主 token、App 私钥和 Publisher
 凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
 请求，拒绝外部 hostname、写入参数和携带请求体的 API 调用；单次 Controller 读取有界超时，
 Worker 结束或凭据续签耗尽时会清理尚未结束的读取进程。adapter 在到期认证读取失败时仅
@@ -390,6 +406,47 @@ Manager/Launcher/daemon。安装、更新、rollback 和 uninstall 不迁移、�
 Runner，直接从 source 或 editable checkout 运行生产生命周期不受支持；Active Runner 不会因
 branch、fork、dirty source 或非官方 provenance 被旧 gate 拒绝。目标仓库的 Required Checks、Worker
 读取权限、Publisher 写凭据和运行状态合同仍按本文件前文执行。
+
+## 开源用户 Quickstart 与 doctor
+
+源码仓库只负责构建 Runner，目标交付仓库负责保存 `.agent-run`、Delivery Run 和 Run Branch；两者
+应当是两个目录。稳定使用先选择 release tag，开发者才选择 branch、fork 或 dirty source：
+
+```bash
+git clone https://github.com/GRD-Chang/grill-engineering.git
+cd grill-engineer
+git checkout <release-tag>
+./install.sh
+
+# 重新打开登录 shell 后，可在任意目录执行
+agent-run doctor --json
+cd /path/to/delivery-repository
+agent-run doctor
+agent-run run <parent-issue> --repo OWNER/REPO
+```
+
+`agent-run doctor` 是可选、只读的诊断入口，不要求当前目录是 Git 仓库。它报告 Python 版本、Git、Codex、
+宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker read provider；JSON
+输出只包含 Python 版本、路径、状态、provider 和布尔值等非敏感信息。缺少依赖只报告问题，不安装软件、不
+修复 PATH、不触发生命周期，也不修改 shell、auth profile、Run locator、Delivery Run、Thread、PR、
+branch 或目标仓库 `.agent-run`。
+
+后续更新仍从源码目录显式执行 `./install.sh`。如果当前为 A，安装 B 后保留 B/A，再安装 C 后只保留
+C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失败会保留旧 Active。一次回退执行
+`./install.sh --rollback`，它不重建、不调用 Codex、不检查或修改 Delivery Run；卸载执行
+`./install.sh --uninstall`，它清理受管 Runner、入口和 PATH 块但保留固定 `install.lock`、App profile、
+私钥、Run locator 和目标仓库 `.agent-run`。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
+的同名入口会被保留并报告清理未完成。
+
+没有 App profile 时 Worker read provider 默认是 host `gh`；`agent-run auth status`、
+`agent-run auth app configure --app-id <id> --installation-id <id> --private-key /secure/app.pem` 和
+`agent-run auth app remove` 是可选的公开配置路径。status 不显示 token 或私钥，remove 不删除用户的
+私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
+凭据隔离约束，Publisher 仍使用宿主写身份。
+
+v0.1 只支持 Linux/WSL、用户级 `~/.profile` 和单用户安装。用户必须自行提供 CPython 3.11+、`venv`、
+`pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
+系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher、自动更新和跨平台支持不属于本版本。
 
 ## 本地状态与清理
 
