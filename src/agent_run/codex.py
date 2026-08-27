@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-import shutil
 import threading
 import tempfile
 from pathlib import Path
@@ -42,6 +41,7 @@ from agent_run.worker_sandbox import (
     bubblewrap_command,
     create_gh_access_adapter,
     run_worker_process,
+    _worker_gh_targets,
     worker_credential_environment,
 )
 from agent_run.worker_credentials import (
@@ -680,9 +680,13 @@ class CodexCliBackend:
                 environment = worker_credential_environment(
                     temporary / "gh", adapter_directory
                 )
-                real_gh = shutil.which("gh", path=environment.get("PATH"))
-                if real_gh is None:
+                gh_targets = _worker_gh_targets(environment, cwd=checkout)
+                real_gh_path = _controller_gh_target(
+                    gh_targets, checkout=checkout, temporary=temporary
+                )
+                if real_gh_path is None:
                     raise WorkerSandboxError("gh is required for Worker GitHub reads")
+                real_gh = str(real_gh_path)
                 profile = (
                     load_github_app_profile()
                     if self.credential_provider is None
@@ -747,6 +751,8 @@ class CodexCliBackend:
                         writable_checkout=writable_checkout,
                         environment=environment,
                         hidden_paths=hidden_paths,
+                        gh_adapter=adapter_directory / "gh",
+                        gh_targets=gh_targets,
                     )
                     worker_options: dict[str, Any] = {
                         "cwd": checkout,
@@ -774,6 +780,15 @@ class CodexCliBackend:
                 raise CodexProcessError(str(error)) from error
             if result.returncode != 0:
                 message = _terminal_error(result.stdout, result.stderr)
+                if _looks_like_worker_gh_binding_failure(
+                    result.stdout,
+                    result.stderr,
+                    gh_targets=gh_targets,
+                    gh_adapter=adapter_directory / "gh",
+                ):
+                    message = (
+                        "worker_gh_binding_failed: Codex worker did not start"
+                    )
                 signal_number = -result.returncode if result.returncode < 0 else None
                 if thread_id is not None:
                     raise _CodexThreadResumeError(
@@ -801,6 +816,53 @@ class CodexCliBackend:
             if actual_thread is None:
                 raise CodexProcessError("Codex worker did not report a Thread ID")
             return output_path.read_text(encoding="utf-8"), actual_thread
+
+
+def _looks_like_worker_gh_binding_failure(
+    stdout: str,
+    stderr: str,
+    *,
+    gh_targets: tuple[Path, ...],
+    gh_adapter: Path,
+) -> bool:
+    """Classify bubblewrap mount failures before the Codex payload starts."""
+
+    if stdout.strip():
+        return False
+    message = stderr.lstrip().casefold()
+    if not message.startswith("bwrap:"):
+        return False
+    if not any(
+        marker in message
+        for marker in (
+            "can't bind",
+            "cannot bind",
+            "bind mount",
+            "can't open source",
+            "cannot open source",
+            "can't create file at",
+            "cannot create file at",
+            "can't mkdir parents for",
+            "cannot mkdir parents for",
+        )
+    ):
+        return False
+    return any(
+        str(path).casefold() in message
+        for path in (*gh_targets, gh_adapter)
+    )
+
+
+def _controller_gh_target(
+    targets: tuple[Path, ...], *, checkout: Path, temporary: Path
+) -> Path | None:
+    """Select a host-owned target, never a Worker-writable path."""
+
+    worker_writable_roots = (checkout.resolve(), temporary.resolve())
+    for target in targets:
+        if not any(target.is_relative_to(root) for root in worker_writable_roots):
+            return target
+    return None
 
 
 def _thread_id(output: str) -> str | None:

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import shutil
 import socket
 import ssl
 import subprocess
@@ -835,7 +836,10 @@ def test_codex_worker_environment_excludes_publisher_credentials(
     assert "AGENT_RUN_GITHUB_READ_PERMISSIONS" not in captured
     assert captured["GIT_TERMINAL_PROMPT"] == "0"
     assert captured["GIT_CONFIG_KEY_0"] == "credential.helper"
-    assert captured["PATH"].split(os.pathsep)[0].endswith("gh-adapter")
+    assert not any(
+        Path(entry).name == "gh-adapter"
+        for entry in captured["PATH"].split(os.pathsep)
+    )
     assert "--dangerously-bypass-approvals-and-sandbox" in captured_arguments
     assert "--sandbox" not in captured_arguments
     assert gh_config is not None and not gh_config.exists()
@@ -855,6 +859,260 @@ def test_worker_environment_ignores_inherited_agent_run_gh_adapter(
 
     assert str(stale_adapter) not in environment["PATH"].split(os.pathsep)
     assert environment["GH_TOKEN"] == "reader-secret"
+
+
+def test_controller_does_not_use_worker_writable_gh_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    checkout_gh = checkout / "gh"
+    checkout_gh.write_text("#!/bin/sh\n", encoding="utf-8")
+    checkout_gh.chmod(0o700)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("CODEX_INSTALL_DIR", str(checkout))
+
+    with pytest.raises(CodexProcessError, match="gh is required"):
+        CodexCliBackend(credential_provider=lambda: "reader")._invoke(
+            prompt="do not use checkout gh",
+            checkout=checkout,
+            thread_id=None,
+        )
+
+
+def test_codex_backend_binds_symlinked_path_and_codex_install_gh(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = tmp_path / "gh-calls"
+    real_gh = tmp_path / "real-gh"
+    real_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "if os.environ.get('GH_TOKEN') != 'reader-secret':\n"
+        "    raise SystemExit('broker did not receive the reader token')\n"
+        "if sys.argv[1:] != ['issue', 'view', '3']:\n"
+        "    raise SystemExit(f'unexpected gh arguments: {sys.argv[1:]!r}')\n"
+        f"with open({str(calls)!r}, 'a', encoding='utf-8') as stream:\n"
+        "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "print('broker-read')\n",
+        encoding="utf-8",
+    )
+    real_gh.chmod(0o700)
+    path_directory = tmp_path / "path-bin"
+    path_directory.mkdir()
+    path_gh = path_directory / "gh"
+    path_gh.symlink_to(real_gh)
+    duplicate_directory = tmp_path / "duplicate-bin"
+    duplicate_directory.mkdir()
+    duplicate_gh = duplicate_directory / "gh"
+    duplicate_gh.symlink_to("../real-gh")
+    codex_directory = tmp_path / "codex-bin"
+    codex_directory.mkdir()
+    codex_real_gh = tmp_path / "codex-real-gh"
+    codex_real_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    codex_real_gh.chmod(0o700)
+    codex_gh = codex_directory / "gh"
+    codex_gh.symlink_to("../codex-real-gh")
+    missing_directory = tmp_path / "missing-bin"
+    non_executable_directory = tmp_path / "non-executable-bin"
+    non_executable_directory.mkdir()
+    non_executable_gh = non_executable_directory / "gh"
+    non_executable_gh.write_text("not executable", encoding="utf-8")
+    non_executable_gh.chmod(0o600)
+    missing_gh = missing_directory / "gh"
+    invalid_user_path = "~agent_run_missing_user/bin"
+    real_gh_before = real_gh.stat()
+    real_gh_contents = real_gh.read_bytes()
+    worker = tmp_path / "codex-worker"
+    worker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys\n"
+        "for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'):\n"
+        "    if key in os.environ:\n"
+        "        raise RuntimeError(f'Worker received {key}')\n"
+        f"if os.path.exists({str(missing_gh)!r}):\n"
+        "    raise RuntimeError('missing gh candidate was mounted')\n"
+        f"if os.access({str(non_executable_gh)!r}, os.X_OK):\n"
+        "    raise RuntimeError('non-executable gh candidate was mounted')\n"
+        f"os.environ['PATH'] = {str(codex_directory)!r} + os.pathsep + os.environ['PATH']\n"
+        "commands = [\n"
+        "    ['gh', 'issue', 'view', '3'],\n"
+        f"    [{str(path_gh)!r}, 'issue', 'view', '3'],\n"
+        f"    [{str(duplicate_gh)!r}, 'issue', 'view', '3'],\n"
+        f"    [{str(real_gh)!r}, 'issue', 'view', '3'],\n"
+        f"    [{str(codex_gh)!r}, 'issue', 'view', '3'],\n"
+        "]\n"
+        "for command in commands:\n"
+        "    subprocess.run(command, check=True)\n"
+        "output = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "with open(output, 'w', encoding='utf-8') as result:\n"
+        "    json.dump({'result_kind': 'development', 'summary': 'ok', 'human_blockers': None}, result)\n"
+        "print('{\"type\":\"thread.started\",\"thread_id\":\"symlink-thread\"}')\n",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    monkeypatch.setenv("GH_HOST", "github.com")
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join(
+            (
+                invalid_user_path,
+                str(missing_directory),
+                str(non_executable_directory),
+                str(path_directory),
+                str(duplicate_directory),
+                os.defpath,
+            )
+        ),
+    )
+    monkeypatch.setenv("CODEX_INSTALL_DIR", str(codex_directory))
+
+    output, thread_id = CodexCliBackend(
+        executable=str(worker), credential_provider=lambda: "reader-secret"
+    )._invoke(
+        prompt="symlink binding",
+        checkout=git_repo,
+        thread_id=None,
+    )
+
+    assert json.loads(output)["result_kind"] == "development"
+    assert thread_id == "symlink-thread"
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "issue view 3",
+        "issue view 3",
+        "issue view 3",
+        "issue view 3",
+        "issue view 3",
+    ]
+    assert real_gh.read_bytes() == real_gh_contents
+    assert real_gh.stat().st_ino == real_gh_before.st_ino
+
+
+@pytest.mark.parametrize("failure_shape", ("target-directory", "parent-file"))
+def test_worker_gh_binding_failure_stops_codex_before_payload(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_shape: str,
+) -> None:
+    target_directory = tmp_path / "gh-bin"
+    target_directory.mkdir()
+    target = target_directory / "gh"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    target.chmod(0o700)
+    worker = tmp_path / "codex-worker"
+    marker = tmp_path / "payload-started"
+    worker.write_text(
+        f"#!/bin/sh\ntouch {marker}\n",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    invocation_temp = Path(tempfile.mkdtemp(prefix="a159-", dir="/tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", str(invocation_temp))
+    monkeypatch.setenv("PATH", str(target_directory) + os.pathsep + os.defpath)
+    monkeypatch.setenv("CODEX_INSTALL_DIR", str(tmp_path / "codex-install"))
+    stop_watcher = threading.Event()
+    target_changed = threading.Event()
+
+    def change_selected_target() -> None:
+        deadline = time.monotonic() + 5
+        while not stop_watcher.is_set() and time.monotonic() < deadline:
+            try:
+                adapter_files = tuple(
+                    candidate
+                    for candidate in invocation_temp.rglob("gh")
+                    if candidate != target
+                    and candidate.is_file()
+                    and os.access(candidate, os.X_OK)
+                )
+            except OSError:
+                adapter_files = ()
+            if adapter_files:
+                target.unlink()
+                if failure_shape == "target-directory":
+                    target.mkdir()
+                else:
+                    target.parent.rmdir()
+                    target.parent.write_text("not a directory", encoding="utf-8")
+                target_changed.set()
+                return
+            time.sleep(0.001)
+
+    try:
+        watcher = threading.Thread(target=change_selected_target, daemon=True)
+        watcher.start()
+        try:
+            with pytest.raises(CodexProcessError, match="worker_gh_binding_failed"):
+                CodexCliBackend(executable=str(worker), credential_provider=lambda: "reader")._invoke(
+                    prompt="binding failure",
+                    checkout=git_repo,
+                    thread_id=None,
+                )
+        finally:
+            stop_watcher.set()
+            watcher.join(timeout=5)
+    finally:
+        invocation_temp.rmdir()
+
+    assert target_changed.is_set()
+    assert not marker.exists()
+
+
+def test_non_gh_bwrap_failure_stays_execution_failure(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_directory = tmp_path / "gh-bin"
+    target_directory.mkdir()
+    target = target_directory / "gh"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    target.chmod(0o700)
+    worker = tmp_path / "codex-worker"
+    marker = tmp_path / "payload-started"
+    worker.write_text(
+        f"#!/bin/sh\ntouch {marker}\n",
+        encoding="utf-8",
+    )
+    worker.chmod(0o700)
+    bwrap_directory = tmp_path / "bwrap-bin"
+    bwrap_directory.mkdir()
+    bwrap_wrapper = bwrap_directory / "bwrap"
+    real_bwrap = shutil.which("bwrap")
+    assert real_bwrap is not None
+    bwrap_wrapper.write_text(
+        "#!/bin/sh\n"
+        "mv \"$TEST_BWRAP_SOURCE\" \"$TEST_BWRAP_BACKUP\"\n"
+        "\"$TEST_BWRAP_REAL\" \"$@\"\n"
+        "status=$?\n"
+        "mv \"$TEST_BWRAP_BACKUP\" \"$TEST_BWRAP_SOURCE\"\n"
+        "exit $status\n",
+        encoding="utf-8",
+    )
+    bwrap_wrapper.chmod(0o700)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    codex_home_backup = tmp_path / "codex-home-backup"
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((str(bwrap_directory), str(target_directory), os.defpath)),
+    )
+    monkeypatch.setenv("CODEX_INSTALL_DIR", str(tmp_path / "codex-install"))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("TEST_BWRAP_SOURCE", str(codex_home))
+    monkeypatch.setenv("TEST_BWRAP_BACKUP", str(codex_home_backup))
+    monkeypatch.setenv("TEST_BWRAP_REAL", real_bwrap)
+
+    with pytest.raises(CodexProcessError) as raised:
+        CodexCliBackend(executable=str(worker), credential_provider=lambda: "reader")._invoke(
+            prompt="non-gh binding failure",
+            checkout=git_repo,
+            thread_id=None,
+        )
+
+    assert "worker_gh_binding_failed" not in str(raised.value)
+    assert "bwrap" in str(raised.value).casefold()
+    assert codex_home.is_dir()
+    assert not codex_home_backup.exists()
+    assert not marker.exists()
 
 
 def test_codex_worker_uses_three_hour_wall_clock_limit(
