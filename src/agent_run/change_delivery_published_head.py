@@ -18,7 +18,11 @@ from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
-from agent_run.external_supervision import is_github_convergence_error
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
@@ -125,13 +129,23 @@ def publish_and_merge(
     branch = stage.contract.branch
     existing_pr = job.get("pr_number")
     if isinstance(existing_pr, int):
-        exhausted, existing_live = _publication_operation(
-            stage,
-            state,
-            job,
-            lambda: stage.publisher.live_pull_request(state, job, existing_pr),
-        )
-        if exhausted:
+        try:
+            existing_live = stage.publisher.live_pull_request(
+                state, job, existing_pr
+            )
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
+            wait_for_github_convergence(
+                state,
+                code="github_pr_head_observation_pending",
+                message=str(error),
+                waiting_for=f"Change PR #{existing_pr} live identity observation",
+            )
+            ensure_supervision_window(state)
+            stage.save(state)
             return True
         if existing_live.get("state") == "MERGED":
             integrated = existing_live.get("integrated_sha")
@@ -147,7 +161,8 @@ def publish_and_merge(
                 )
             if not isinstance(integrated, str) or not integrated:
                 raise ValueError("merged Change Job PR is missing integrated SHA")
-            job["integrated_sha"] = integrated
+            integrated_sha = integrated
+            job["integrated_sha"] = integrated_sha
             live_head = existing_live.get("head_sha")
             if isinstance(live_head, str):
                 job["integrated_publication_sha"] = live_head
@@ -157,7 +172,7 @@ def publish_and_merge(
                 job,
                 lambda: stage.github.sync_run_branch(
                     run_branch=stage.contract.base_branch,
-                    integrated_sha=integrated,
+                    integrated_sha=integrated_sha,
                 ),
             )
             if exhausted:

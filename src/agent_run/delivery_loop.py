@@ -246,6 +246,18 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     ) -> bool:
         return False
 
+    def resume_after_required_checks_failure(
+        self, state: dict[str, Any], _job: dict[str, Any]
+    ) -> bool:
+        state.update(
+            {
+                "status": "ticket_delivery_pending",
+                "terminal_kind": None,
+                "diagnostics": [],
+            }
+        )
+        return False
+
     def linked_issue_number(
         self, _state: dict[str, Any], job: dict[str, Any]
     ) -> int:

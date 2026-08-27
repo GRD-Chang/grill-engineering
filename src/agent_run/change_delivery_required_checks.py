@@ -18,20 +18,18 @@ from agent_run.required_checks import (
     supervise_unrepairable_check_failure,
 )
 from agent_run.review_budget import can_start_development, ensure_budget
-from agent_run.required_checks_observation import read_required_checks_observation
+from agent_run.required_checks_observation import (
+    failure_evidence_matches_observation,
+    read_required_checks_observation,
+)
 
 
 def _resume_change_delivery_after_evidence(
-    stage: ChangeDeliveryStage, state: dict[str, Any]
-) -> None:
-    if stage.contract.label == "parent-only":
-        status = "parent_delivery_pending"
-    elif stage.contract.label.startswith("run-repair-"):
-        status = "run_acceptance_pending"
-    else:
-        status = "ticket_delivery_pending"
-    state.update({"status": status, "terminal_kind": None, "diagnostics": []})
+    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]
+) -> bool:
+    should_yield = stage.adapter.resume_after_required_checks_failure(state, job)
     clear_supervision_window(state)
+    return should_yield
 
 
 def _expected_publication_base_sha(job: dict[str, Any]) -> str | None:
@@ -67,56 +65,6 @@ def _live_publication_identity_matches(
         and live.get("base_sha") == expected_base_sha
         and live.get("base_repository") == repository
     )
-
-
-def _failure_evidence_matches_observation(
-    observation: dict[str, Any],
-    evidence: object,
-    *,
-    pr_number: int,
-    head_sha: str,
-) -> bool:
-    """Require one converged Observation and matching failed-check facts."""
-
-    if not isinstance(evidence, dict):
-        return False
-    for key, expected in {
-        "pr_number": pr_number,
-        "head_sha": head_sha,
-        "result": "fail",
-    }.items():
-        if key in evidence and evidence[key] != expected:
-            return False
-    observed_checks = observation.get("checks")
-    evidence_checks = evidence.get("checks")
-    if not isinstance(observed_checks, list) or not isinstance(evidence_checks, list):
-        return False
-    terminal_buckets = {"pass", "fail", "cancel", "skipping", "neutral"}
-    if any(
-        not isinstance(check, dict)
-        or str(check.get("bucket", "")).lower() not in terminal_buckets
-        for check in observed_checks
-    ):
-        return False
-
-    def failed_identities(
-        checks: list[object],
-    ) -> list[tuple[str, str, str]] | None:
-        identities: list[tuple[str, str, str]] = []
-        for check in checks:
-            if not isinstance(check, dict):
-                return None
-            if str(check.get("bucket", "")).lower() not in {"fail", "cancel"}:
-                continue
-            values = tuple(check.get(key) for key in ("workflow", "name", "link"))
-            if not all(isinstance(value, str) and value.strip() for value in values):
-                return None
-            identities.append((str(values[0]), str(values[1]), str(values[2])))
-        return sorted(identities)
-
-    observed_failures = failed_identities(observed_checks)
-    evidence_failures = failed_identities(evidence_checks)
-    return bool(observed_failures) and observed_failures == evidence_failures
 
 
 def _verify_live_publication_identity(
@@ -356,9 +304,9 @@ def observe_required_checks(
                         "ci_evidence": evidence,
                     }
                 )
-            _resume_change_delivery_after_evidence(stage, state)
+            should_yield = _resume_change_delivery_after_evidence(stage, state, job)
             stage.save(state)
-            return False, checks
+            return should_yield, checks
         try:
             evidence = stage.github.required_check_evidence(
                 pr_number, expected_head_sha=str(job["publication_sha"])
@@ -399,7 +347,7 @@ def observe_required_checks(
             "head_sha": str(job["publication_sha"]),
             "result": "fail",
         }
-        if not _failure_evidence_matches_observation(
+        if not failure_evidence_matches_observation(
             observation,
             evidence,
             pr_number=pr_number,
@@ -449,9 +397,10 @@ def observe_required_checks(
                     "next_attempt_kind": "ordinary",
                 }
             )
-        _resume_change_delivery_after_evidence(stage, state)
+        should_yield = _resume_change_delivery_after_evidence(stage, state, job)
         stage.save(state)
-        return False, checks
+        return should_yield, checks
     if checks not in {"none", "pass"}:
         raise ValueError(f"unknown Required Checks state: {checks}")
+    clear_supervision_window(state)
     return None, checks

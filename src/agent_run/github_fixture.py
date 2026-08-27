@@ -892,6 +892,7 @@ class FixtureGitHubPublisher:
         delivery["check_position"] = position + 1
         self._save()
         self._inject_revision_drift("required_checks")
+        self._inject_default_base_drift_after_required_checks()
         if value in {"skipping", "neutral"}:
             return "pass"
         return value
@@ -1733,6 +1734,37 @@ class FixtureGitHubPublisher:
         else:
             raise ValueError("fixture drift kind is invalid")
         configured["injected"] = True
+        self._save()
+
+    def _inject_default_base_drift_after_required_checks(self) -> None:
+        key = "default_base_drift_after_required_checks_once"
+        if not bool(self._delivery().get(key)):
+            return
+        self._delivery()[key] = False
+        base_branch = _string(self.data, "default_branch")
+        base_sha = self.git.resolve(base_branch)
+        tree_sha = self.git.resolve(f"{base_sha}^{{tree}}")
+        created = subprocess.run(
+            [
+                "git",
+                "commit-tree",
+                tree_sha,
+                "-p",
+                base_sha,
+                "-m",
+                "test: advance default base during Required Checks snapshot",
+            ],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", f"refs/heads/{base_branch}", created, base_sha],
+            cwd=self.git.root,
+            check=True,
+        )
+        self.data["default_head_sha"] = created
         self._save()
 
 

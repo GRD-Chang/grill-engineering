@@ -5,6 +5,11 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
+from agent_run.approval_grant import (
+    acceptance_fingerprint,
+    grant_authority,
+    grant_matches,
+)
 from agent_run.change_delivery import (
     MAX_PUBLICATION_CONTEXT_ATTEMPTS,
     ChangeDeliveryAdapter,
@@ -17,6 +22,7 @@ from agent_run.change_delivery import (
 )
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
+from agent_run.github import MergeOutcomeUnknownError
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.review_budget import RUN_POLICY, ensure_budget, previous_review_context
@@ -189,8 +195,23 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         )
 
     def requires_explicit_approval(
-        self, _state: dict[str, Any], _job: dict[str, Any]
+        self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
+        return not grant_matches(
+            job.get("approval_grant"), parent_approval_grant_authority(state, job)
+        )
+
+    def resume_after_required_checks_failure(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool:
+        job.pop("approval_grant", None)
+        state.update(
+            {
+                "status": "parent_delivery_pending",
+                "terminal_kind": None,
+                "diagnostics": [],
+            }
+        )
         return True
 
     def linked_issue_number(
@@ -272,22 +293,23 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
         self.owner._invalidate_stale(state, job, checkout)
 
     def after_merge(
-        self, _state: dict[str, Any], _job: dict[str, Any], _live: dict[str, Any]
+        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
     ) -> bool:
-        return True
+        return self.owner._complete_after_merge(state, job, live)
 
     def merge(
-        self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]
+        self, _state: dict[str, Any], job: dict[str, Any], _publication: dict[str, Any]
     ) -> str:
-        return self.owner.github.squash_merge(
-            pr_number=int(job["pr_number"]),
-            expected_head_sha=str(job["publication_sha"]),
-            run_branch=str(_mapping(state, "base")["branch"]),
-            commit_message=str(publication["commit_message"]),
-        )
+        try:
+            return self.owner.github.normal_merge(
+                pr_number=int(job["pr_number"]),
+                expected_head_sha=str(job["publication_sha"]),
+            )
+        except OSError as error:
+            raise MergeOutcomeUnknownError(str(error)) from error
 
     def merge_description(self, _job: dict[str, Any]) -> str:
-        return "squash merge"
+        return "normal merge"
 
     def escalate(
         self, state: dict[str, Any], job: dict[str, Any], code: str
@@ -386,6 +408,49 @@ class ParentDeliveryLoop:
         state["status"] = "parent_delivery_pending"
         state["diagnostics"] = []
 
+    def _complete_after_merge(
+        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
+    ) -> bool:
+        base_sha = str(job["base_sha"])
+        publication_sha = str(job["publication_sha"])
+        integrated = live.get("integrated_sha")
+        if (
+            not isinstance(integrated, str)
+            or live.get("head_sha") != publication_sha
+            or live.get("base_branch") != _mapping(state, "base").get("branch")
+            or live.get("integrated_parents") != [base_sha, publication_sha]
+        ):
+            job.update(
+                {
+                    "phase": "blocked",
+                    "blocked_reason": "parent_merged_result_mismatch",
+                }
+            )
+            state["status"] = "blocked"
+            state["diagnostics"] = [
+                {
+                    "code": "parent_merged_result_mismatch",
+                    "message": "Merged Parent PR does not match the approved publication",
+                }
+            ]
+            self._save(state)
+            return False
+        job["integrated_sha"] = integrated
+        self._save(state)
+        self.github.close_parent_issue(
+            parent_number=int(_mapping(state, "parent")["number"]),
+            run_id=str(state["run_id"]),
+            pr_number=int(job["pr_number"]),
+            integrated_sha=integrated,
+            delivery_type="Parent-only",
+        )
+        job["phase"] = "completed"
+        state["status"] = "completed"
+        state["terminal_kind"] = "completed"
+        state["diagnostics"] = []
+        self._save(state)
+        return True
+
     @staticmethod
     def _escalate(state: dict[str, Any], job: dict[str, Any], code: str) -> None:
         job["blocked_reason"] = code
@@ -405,6 +470,23 @@ def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{key} must be an object")
     return value
+
+
+def parent_approval_grant_authority(
+    state: dict[str, Any], job: dict[str, Any]
+) -> dict[str, object]:
+    return grant_authority(
+        repository=str(state["repository"]),
+        pr_number=int(job["pr_number"]),
+        head_branch=str(job["parent_branch"]),
+        head_sha=str(job["publication_sha"]),
+        base_branch=str(_mapping(state, "base")["branch"]),
+        base_sha=str(job["base_sha"]),
+        acceptance_fingerprint=acceptance_fingerprint(
+            _mapping(job, "acceptance_record"),
+            _mapping(job, "acceptance_artifact"),
+        ),
+    )
 
 
 def _parent(state: dict[str, Any]) -> dict[str, Any]:

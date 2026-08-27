@@ -359,6 +359,17 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
         },
         "review_budget_history": [],
     }
+    repair_resumes: list[tuple[dict[str, object], dict[str, object]]] = []
+
+    def resume_after_required_checks_failure(
+        state: dict[str, object], repair_job: dict[str, object]
+    ) -> bool:
+        repair_resumes.append((state, repair_job))
+        state.update(
+            {"status": "adapter_resumed", "terminal_kind": None, "diagnostics": []}
+        )
+        return False
+
     stage = SimpleNamespace(
         contract=SimpleNamespace(
             label="ticket-1", branch="ticket-1", base_branch="run-1"
@@ -383,7 +394,12 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
                 "base_repository": "example/project",
             }
         ),
-        adapter=SimpleNamespace(classify_required_check_failures=True),
+        adapter=SimpleNamespace(
+            classify_required_check_failures=True,
+            resume_after_required_checks_failure=(
+                resume_after_required_checks_failure
+            ),
+        ),
         modification_budget_exhausted=lambda _job: True,
         review_budget_policy=lambda: TICKET_POLICY,
         _record_agent_run_status=lambda *_args, **_kwargs: None,
@@ -397,9 +413,13 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
         save=lambda state: state,
     )
 
+    state: dict[str, object] = {
+        "status": "active",
+        "repository": "example/project",
+    }
     outcome, checks = observe_required_checks(
         stage,
-        {"status": "active", "repository": "example/project"},
+        state,
         job,
         Path("."),
         11,
@@ -410,6 +430,13 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
     assert job["phase"] == "repairing"
     assert job["next_attempt_kind"] == "final_ci_fix"
     assert job["final_ci_fix_failure_head"] == "candidate-head"
+    assert repair_resumes == [(state, job)]
+    assert state == {
+        "status": "adapter_resumed",
+        "repository": "example/project",
+        "terminal_kind": None,
+        "diagnostics": [],
+    }
 
 
 @pytest.mark.parametrize(
