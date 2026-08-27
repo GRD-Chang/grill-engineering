@@ -92,10 +92,58 @@ def worker_credential_environment(
     environment = worker_environment(gh_config, "placeholder")
     environment.pop("GH_TOKEN", None)
     adapter_directory.mkdir(parents=True, exist_ok=True)
-    environment["PATH"] = str(adapter_directory) + os.pathsep + environment.get(
-        "PATH", os.defpath
-    )
     return environment
+
+
+def _worker_gh_targets(
+    environment: dict[str, str], *, cwd: Path
+) -> tuple[Path, ...]:
+    """Find the real ``gh`` files that the Worker command environment may use.
+
+    The command tool may put ``CODEX_INSTALL_DIR`` in front of the inherited
+    PATH after the Worker starts.  Collecting both locations before creating
+    the bubblewrap command lets the namespace cover either resolution without
+    changing PATH precedence or probing the command tool at runtime.
+    """
+
+    path = environment.get("PATH", os.defpath)
+    worker_cwd = cwd.absolute()
+    directories = []
+    for entry in path.split(os.pathsep):
+        directory = Path(entry or ".")
+        directories.append(
+            directory if directory.is_absolute() else worker_cwd / directory
+        )
+    codex_install_dir = environment.get("CODEX_INSTALL_DIR")
+    if codex_install_dir:
+        codex_directory: Path | None
+        try:
+            codex_directory = Path(codex_install_dir).expanduser()
+        except (OSError, RuntimeError):
+            codex_directory = None
+        if codex_directory is not None:
+            directories.append(
+                codex_directory
+                if codex_directory.is_absolute()
+                else worker_cwd / codex_directory
+            )
+    else:
+        directories.append(Path.home() / ".local" / "bin")
+
+    targets: list[Path] = []
+    for directory in directories:
+        candidate = directory / "gh"
+        try:
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                continue
+            target = candidate.resolve(strict=True)
+            if not target.is_file() or not os.access(target, os.X_OK):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        if target not in targets:
+            targets.append(target)
+    return tuple(targets)
 
 
 def create_gh_access_adapter(
@@ -166,6 +214,8 @@ def bubblewrap_command(
     writable_checkout: bool,
     environment: dict[str, str],
     hidden_paths: Sequence[Path] = (),
+    gh_adapter: Path | None = None,
+    gh_targets: Sequence[Path] = (),
 ) -> list[str]:
     _reject_credentialed_http_remotes(checkout, environment)
     executable = shutil.which("bwrap")
@@ -214,6 +264,13 @@ def bubblewrap_command(
         checkout=checkout,
         temporary=temporary,
     )
+    if gh_targets:
+        if gh_adapter is None:
+            raise WorkerSandboxError(
+                "worker_gh_binding_failed: adapter is unavailable"
+            )
+        for target in gh_targets:
+            arguments.extend(["--ro-bind", str(gh_adapter), str(target)])
     arguments.extend(["--chdir", str(checkout), "--", *command])
     return arguments
 
