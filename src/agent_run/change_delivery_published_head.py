@@ -22,6 +22,9 @@ from agent_run.external_supervision import is_github_convergence_error
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
+from agent_run.required_checks_observation import (
+    sync_fallback_receipt_observation,
+)
 
 
 class PublishedHeadStage(ChangeDeliveryStage, Protocol):
@@ -84,50 +87,6 @@ def _publication_operation(
         if stage._record_publication_operation_failure(state, job, error):
             return True, None
         raise
-
-def _sync_fallback_receipt_observation(
-    job: dict[str, Any], pr_number: int
-) -> bool:
-    """Persist the exact PR/check observation used by an active fallback gate."""
-
-    if job.get("publication_authority") != "fallback":
-        return False
-    receipt = job.get("fallback_publication_receipt")
-    publication_sha = job.get("publication_sha")
-    checks = job.get("required_checks")
-    if (
-        not isinstance(receipt, dict)
-        or not isinstance(publication_sha, str)
-        or not publication_sha.strip()
-        or checks not in {"none", "pass", "pending", "unknown", "fail"}
-    ):
-        return False
-    evidence = job.get("required_checks_evidence")
-    if not isinstance(evidence, dict):
-        evidence = {"checks": []}
-    else:
-        evidence = deepcopy(evidence)
-    evidence.update(
-        {
-            "pr_number": pr_number,
-            "head_sha": publication_sha,
-            "result": checks,
-        }
-    )
-    changed = (
-        receipt.get("pr_number") != pr_number
-        or receipt.get("publication_sha") != publication_sha
-        or receipt.get("required_checks_evidence") != evidence
-    )
-    receipt.update(
-        {
-            "pr_number": pr_number,
-            "publication_sha": publication_sha,
-            "required_checks_evidence": evidence,
-        }
-    )
-    return changed
-
 
 def publish_and_merge(
     stage: PublishedHeadStage,
@@ -293,7 +252,7 @@ def publish_and_merge(
         raise ValueError("Publisher returned an invalid Change PR number")
     job.pop("ticket_write_intent", None)
     job["pr_number"] = pr_number
-    _sync_fallback_receipt_observation(job, pr_number)
+    sync_fallback_receipt_observation(job, pr_number)
     stage.save(state)
     stage._reject_stale(
         state,
@@ -338,9 +297,6 @@ def publish_and_merge(
     check_outcome, _checks = observe_required_checks(
         stage, state, job, checkout, pr_number
     )
-    receipt_changed = _sync_fallback_receipt_observation(job, pr_number)
-    if receipt_changed:
-        stage.save(state)
     if check_outcome is not None:
         return check_outcome
     checks_value = job.get("required_checks")

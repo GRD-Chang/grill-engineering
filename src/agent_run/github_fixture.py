@@ -819,6 +819,9 @@ class FixtureGitHubPublisher:
         }
 
     def required_checks(self, pr_number: int) -> str:
+        return self._next_required_checks_result(pr_number)
+
+    def _next_required_checks_result(self, pr_number: int) -> str:
         delivery = self._delivery()
         pull = self._pull(pr_number)
         run_failures = delivery.get("run_required_checks_read_failures", [])
@@ -865,12 +868,23 @@ class FixtureGitHubPublisher:
                 "change_pr_head_drift",
                 "Required Checks snapshot does not match the expected PR head",
             )
+        result = self._next_required_checks_result(pr_number)
+        actual_head_sha = str(self.live_pull_request(pr_number)["head_sha"])
+        if actual_head_sha != expected_head_sha:
+            raise GitHubReadError(
+                "change_pr_head_drift",
+                "Required Checks snapshot does not match the expected PR head",
+            )
         configured = self._delivery().get("required_check_evidence")
         checks = configured.get("checks", []) if isinstance(configured, dict) else []
+        if result == "none":
+            checks = []
+        elif not checks:
+            checks = [{"name": "fixture-required-check", "bucket": result}]
         return {
             "pr_number": pr_number,
             "head_sha": expected_head_sha,
-            "result": "observed",
+            "result": result,
             "checks": deepcopy(checks) if isinstance(checks, list) else [],
         }
 

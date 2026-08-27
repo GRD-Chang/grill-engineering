@@ -686,6 +686,12 @@ class GhGitHubPublisher:
                 pr_number, "bucket,state,name,link,workflow,description"
             )
         ]
+        live = self.live_pull_request(pr_number)
+        if live.get("head_sha") != expected_head_sha:
+            raise GitHubReadError(
+                "change_pr_head_drift",
+                "Required Checks snapshot does not match the expected PR head",
+            )
         buckets = {str(check.get("bucket", "")).lower() for check in checks}
         result = (
             "none"

@@ -26,6 +26,13 @@ class ChangeDeliveryStage(Protocol):
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]: ...
 
+    def commit_required_checks_observation(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        pr_number: int,
+    ) -> dict[str, Any]: ...
+
     def _reject_stale(
         self,
         state: dict[str, Any],
@@ -99,6 +106,10 @@ class ChangeDeliveryStage(Protocol):
     ) -> None: ...
 
     def _record_publication_operation_failure(
+        self, state: dict[str, Any], job: dict[str, Any], error: Exception
+    ) -> bool: ...
+
+    def _record_publication_operation_failure_in_memory(
         self, state: dict[str, Any], job: dict[str, Any], error: Exception
     ) -> bool: ...
 

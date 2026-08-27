@@ -414,7 +414,13 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     assert job["pending_attempt_kind"] == "final_ci_fix"
     assert job["review_budget"]["development_attempts"] == 4
     assert job["review_budget"]["final_ci_fix_used"] is True
-    assert job["ci_evidence"] == job["required_checks_evidence"]
+    assert job["required_checks_evidence"]["result"] == "fail"
+    assert job["required_checks_evidence"]["head_sha"] == job["publication_sha"]
+    assert job["ci_evidence"]["result"] == "fail"
+    assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
+    assert job["ci_evidence"]["checks"][0]["job"]["head_sha"] == job[
+        "publication_sha"
+    ]
     assert job["ci_evidence"]["pr_number"] == job["pr_number"]
     assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
     assert job["ci_evidence"]["result"] == "fail"

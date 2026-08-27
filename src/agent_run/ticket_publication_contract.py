@@ -9,6 +9,7 @@ from agent_run.ticket_acceptance_contract import (
 from agent_run.ticket_fallback_contract import (
     _require_fallback_integration_authorization,
 )
+from agent_run.required_checks_observation import REQUIRED_CHECK_RESULTS
 
 
 _ACTIVE_TICKET_PUBLICATION_PHASES = frozenset(
@@ -84,7 +85,7 @@ def require_active_ticket_publication_authorization(
                 raise IncompatibleRunStateError(
                     f"incompatible_run_state: {location}.pr_number is invalid before publication"
                 )
-            if checks not in {"none", "pass", "pending", "unknown", "fail"}:
+            if checks not in REQUIRED_CHECK_RESULTS:
                 raise IncompatibleRunStateError(
                     f"incompatible_run_state: {location}.required_checks is invalid before publication"
                 )
