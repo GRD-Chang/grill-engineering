@@ -16,6 +16,43 @@ from agent_run.required_checks import annotate_configured_code_failures
 from agent_run.revisions import effective_revision_from_graph
 
 
+def _fixture_required_check_identity(bucket: str) -> dict[str, str]:
+    return {
+        "name": "fixture-required-check",
+        "workflow": "fixture-ci",
+        "bucket": bucket,
+        "link": "https://example.invalid/checks/fixture",
+    }
+
+
+def _fixture_observation_check(
+    result: str, source: dict[str, Any] | None = None
+) -> dict[str, str]:
+    check = _fixture_required_check_identity(result)
+    if source is not None:
+        for key in ("name", "workflow", "link"):
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                check[key] = value
+    check["state"] = {
+        "pass": "SUCCESS",
+        "pending": "PENDING",
+        "unknown": "UNKNOWN",
+        "fail": "FAILURE",
+    }[result]
+    return check
+
+
+def _fixture_check_for_head(
+    source: dict[str, Any], head_sha: str
+) -> dict[str, Any]:
+    check = dict(source)
+    job = check.get("job")
+    if isinstance(job, dict) and job.get("head_sha") == "$CURRENT_HEAD":
+        check["job"] = {**job, "head_sha": head_sha}
+    return check
+
+
 class FixtureGitHubReader:
     """供黑盒测试使用的确定性 GitHub 只读适配器。"""
 
@@ -876,16 +913,38 @@ class FixtureGitHubPublisher:
                 "Required Checks snapshot does not match the expected PR head",
             )
         configured = self._delivery().get("required_check_evidence")
-        checks = configured.get("checks", []) if isinstance(configured, dict) else []
+        configured_checks = (
+            configured.get("checks", []) if isinstance(configured, dict) else []
+        )
         if result == "none":
+            checks: list[object] = []
+        elif (
+            result == "fail"
+            and isinstance(configured_checks, list)
+            and configured_checks
+        ):
+            if all(isinstance(check, dict) for check in configured_checks):
+                checks = [
+                    _fixture_check_for_head(check, actual_head_sha)
+                    for check in configured_checks
+                ]
+            else:
+                checks = deepcopy(configured_checks)
+        else:
             checks = []
-        elif not checks:
-            checks = [{"name": "fixture-required-check", "bucket": result}]
+            if isinstance(configured_checks, list):
+                checks = [
+                    _fixture_observation_check(result, check)
+                    for check in configured_checks
+                    if isinstance(check, dict)
+                ]
+            if not checks:
+                checks = [_fixture_observation_check(result)]
         return {
             "pr_number": pr_number,
             "head_sha": expected_head_sha,
             "result": result,
-            "checks": deepcopy(checks) if isinstance(checks, list) else [],
+            "checks": checks,
         }
 
     def required_check_evidence(
@@ -900,11 +959,8 @@ class FixtureGitHubPublisher:
                 "pr_number": pr_number,
                 "checks": [
                     {
-                        "name": "fixture-required-check",
-                        "workflow": "fixture-ci",
-                        "bucket": "fail",
+                        **_fixture_required_check_identity("fail"),
                         "description": "The fixture required check failed.",
-                        "link": "https://example.invalid/checks/fixture",
                     }
                 ],
             }
@@ -948,12 +1004,9 @@ class FixtureGitHubPublisher:
                 "pr_number": pr_number,
                 "checks": [
                     {
-                        "name": "fixture-required-check",
-                        "workflow": "fixture-ci",
-                        "bucket": "fail",
+                        **_fixture_required_check_identity("fail"),
                         "state": "FAILURE",
                         "description": "The fixture required check failed.",
-                        "link": "https://example.invalid/checks/fixture",
                         "job": {
                             "id": 1,
                             "head_sha": actual_head_sha,
@@ -977,13 +1030,9 @@ class FixtureGitHubPublisher:
         if isinstance(checks, list) and all(
             isinstance(check, dict) for check in checks
         ):
-            normalized_checks: list[dict[str, Any]] = []
-            for raw in checks:
-                check = dict(raw)
-                job = check.get("job")
-                if isinstance(job, dict) and job.get("head_sha") == "$CURRENT_HEAD":
-                    check["job"] = {**job, "head_sha": actual_head_sha}
-                normalized_checks.append(check)
+            normalized_checks = [
+                _fixture_check_for_head(check, actual_head_sha) for check in checks
+            ]
             evidence["checks"] = annotate_configured_code_failures(
                 normalized_checks,
                 self.path.parent,

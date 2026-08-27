@@ -209,6 +209,7 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     job.pop("deterministic_integration_record", None)
     job.pop("required_checks", None)
     job.pop("required_checks_mode", None)
+    job.pop("final_ci_fix_failure_head", None)
     return cast(ReviewBudget, job["review_budget"])
 
 

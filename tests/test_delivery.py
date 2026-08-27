@@ -604,7 +604,35 @@ class ScriptedPublisher:
         assert self.live_pull_request(pr_number)["head_sha"] == expected_head_sha
         result = self.checks[min(self.check_position, len(self.checks) - 1)]
         self.check_position += 1
-        checks = [] if result == "none" else [{"name": "test", "bucket": result}]
+        configured = self.failed_check_evidence.get("checks")
+        if result == "fail" and isinstance(configured, list):
+            checks = [
+                {
+                    key: check[key]
+                    for key in (
+                        "name",
+                        "workflow",
+                        "bucket",
+                        "state",
+                        "description",
+                        "link",
+                    )
+                    if key in check
+                }
+                for check in configured
+                if isinstance(check, dict)
+            ]
+        elif result == "none":
+            checks = []
+        else:
+            checks = [
+                {
+                    "name": "test",
+                    "workflow": "ci",
+                    "bucket": result,
+                    "link": "https://example.invalid/checks/test",
+                }
+            ]
         return {
             "pr_number": pr_number,
             "head_sha": expected_head_sha,
@@ -2539,7 +2567,7 @@ def test_live_effective_revision_drift_blocks_merge(
 
 
 def test_failed_required_check_evidence_reaches_development_thread(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
@@ -2549,6 +2577,28 @@ def test_failed_required_check_evidence_reaches_development_thread(
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
     publisher.checks = ["fail", "pass"]
+    original_snapshot = publisher.required_checks_snapshot
+
+    def snapshot_with_passing_sibling(
+        pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        observation = original_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+        if observation["result"] == "fail":
+            observation["checks"].append(
+                {
+                    "name": "lint",
+                    "workflow": "ci",
+                    "bucket": "pass",
+                    "link": "https://example.invalid/checks/lint",
+                }
+            )
+        return observation
+
+    monkeypatch.setattr(
+        publisher, "required_checks_snapshot", snapshot_with_passing_sibling
+    )
     agents = CheckRepairAgents(checkout)
 
     result = TicketDeliveryEngine(
@@ -2686,36 +2736,125 @@ def test_ticket_required_check_head_drift_blocks_before_failed_evidence(
 
 
 @pytest.mark.parametrize(
-    "check",
+    "checks",
     [
-        {
-            "name": "cancelled-test",
-            "workflow": "ci",
-            "bucket": "cancel",
-            "state": "CANCELLED",
-            "description": "The job was cancelled.",
-            "link": "https://example.invalid/checks/cancelled",
-        },
-        {
-            "name": "platform-test",
-            "workflow": "ci",
-            "bucket": "fail",
-            "state": "FAILURE",
-            "description": "The runner platform timed out.",
-            "link": "https://example.invalid/checks/platform",
-        },
-        {
-            "name": "unknown-test",
-            "workflow": "ci",
-            "bucket": "fail",
-            "description": "No authoritative conclusion was reported.",
-            "link": "https://example.invalid/checks/unknown",
-        },
+        [
+            {
+                "name": "cancelled-test",
+                "workflow": "ci",
+                "bucket": "cancel",
+                "state": "CANCELLED",
+                "description": "The job was cancelled.",
+                "link": "https://example.invalid/checks/cancelled",
+            }
+        ],
+        [
+            {
+                "name": "platform-test",
+                "workflow": "ci",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The runner platform timed out.",
+                "link": "https://example.invalid/checks/platform",
+            }
+        ],
+        [
+            {
+                "name": "unknown-test",
+                "workflow": "ci",
+                "bucket": "fail",
+                "description": "No authoritative conclusion was reported.",
+                "link": "https://example.invalid/checks/unknown",
+            }
+        ],
+        [
+            {
+                "name": "runner-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The runner setup failed.",
+                "link": "https://example.invalid/checks/runner",
+                "job": {
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [
+                        {
+                            "name": "Set up job",
+                            "status": "completed",
+                            "conclusion": "failure",
+                        }
+                    ],
+                },
+            }
+        ],
+        [
+            {
+                "name": "lint-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "An unconfigured lint step failed.",
+                "link": "https://example.invalid/checks/lint",
+                "job": {
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [
+                        {
+                            "name": "Run lint",
+                            "status": "completed",
+                            "conclusion": "failure",
+                        }
+                    ],
+                },
+            }
+        ],
+        [
+            {
+                "name": "test",
+                "workflow": "ci",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "repairability": "code_failure",
+                "description": "The configured test step failed.",
+                "link": "https://example.invalid/checks/test",
+            },
+            {
+                "name": "runner-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The runner setup also failed.",
+                "link": "https://example.invalid/checks/runner",
+            },
+        ],
+        [
+            {
+                "name": "incomplete-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The Actions job detail is incomplete.",
+                "link": "https://example.invalid/checks/incomplete",
+                "job": {
+                    "status": "in_progress",
+                    "conclusion": None,
+                },
+            }
+        ],
     ],
-    ids=("cancelled", "platform", "unknown"),
+    ids=(
+        "cancelled",
+        "platform",
+        "unknown",
+        "runner",
+        "unconfigured-step",
+        "mixed",
+        "incomplete",
+    ),
 )
 def test_ticket_non_repairable_required_check_failure_is_supervised(
-    git_repo: Path, check: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    git_repo: Path, checks: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2728,7 +2867,7 @@ def test_ticket_non_repairable_required_check_failure_is_supervised(
     publisher.checks = ["fail"]
     publisher.failed_check_evidence = {
         "pr_number": publisher.pr_number,
-        "checks": [check],
+        "checks": checks,
     }
     agents = CheckRepairAgents(checkout)
 
@@ -2741,7 +2880,125 @@ def test_ticket_non_repairable_required_check_failure_is_supervised(
     assert completed["supervision_window"]["kind"] == "github_convergence"
     assert job["phase"] == "waiting_checks"
     assert job["modification_attempts"] == 1
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["final_ci_fix_used"] is False
     assert len(agents.development_requests) == 1
+    assert "next_attempt_kind" not in job
+    assert completed["diagnostics"][0]["code"] == (
+        "github_check_failure_not_repairable"
+    )
+
+
+def test_ticket_mixed_pending_required_checks_are_supervised(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail"]
+    original_snapshot = publisher.required_checks_snapshot
+
+    def mixed_snapshot(pr_number: int, *, expected_head_sha: str) -> dict[str, Any]:
+        observation = original_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+        observation["checks"].append(
+            {"name": "integration", "bucket": "pending", "state": "IN_PROGRESS"}
+        )
+        return observation
+
+    monkeypatch.setattr(publisher, "required_checks_snapshot", mixed_snapshot)
+    agents = CheckRepairAgents(checkout)
+
+    completed = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "waiting_external"
+    assert job["phase"] == "waiting_checks"
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["final_ci_fix_used"] is False
+    assert len(agents.development_requests) == 1
+    assert "next_attempt_kind" not in job
+    assert completed["diagnostics"][0]["code"] == (
+        "github_check_failure_not_repairable"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pr_number", 999),
+        ("head_sha", "stale-head"),
+        ("result", "pass"),
+        (
+            "checks",
+            [
+                {
+                    "name": "test",
+                    "workflow": "other-ci",
+                    "bucket": "fail",
+                    "state": "FAILURE",
+                    "repairability": "code_failure",
+                    "description": "The test job failed.",
+                    "link": "https://example.invalid/checks/test",
+                }
+            ],
+        ),
+    ],
+)
+def test_ticket_conflicting_failure_evidence_is_supervised(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail"]
+    publisher.failed_check_evidence = {
+        **publisher.failed_check_evidence,
+        field: value,
+    }
+    if field == "checks":
+        original_snapshot = publisher.required_checks_snapshot
+
+        def mismatched_snapshot(
+            pr_number: int, *, expected_head_sha: str
+        ) -> dict[str, Any]:
+            observation = original_snapshot(
+                pr_number, expected_head_sha=expected_head_sha
+            )
+            observation["checks"][0]["workflow"] = "ci"
+            return observation
+
+        monkeypatch.setattr(
+            publisher, "required_checks_snapshot", mismatched_snapshot
+        )
+    agents = CheckRepairAgents(checkout)
+
+    completed = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "waiting_external"
+    assert job["phase"] == "waiting_checks"
+    assert job["review_budget"]["final_ci_fix_used"] is False
+    assert len(agents.development_requests) == 1
+    assert "next_attempt_kind" not in job
     assert completed["diagnostics"][0]["code"] == (
         "github_check_failure_not_repairable"
     )

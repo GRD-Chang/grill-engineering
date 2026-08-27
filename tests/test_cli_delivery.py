@@ -203,6 +203,137 @@ def repairable_required_check_failure() -> dict[str, object]:
     }
 
 
+def test_public_run_completes_one_supervised_fallback_final_ci_fix(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={
+            "required_checks": ["pending", "pending", "fail", "pass", "pass"],
+            "required_check_evidence": {
+                "pr_number": 1,
+                "checks": [repairable_required_check_failure()],
+            },
+        },
+    )
+    agent_data = final_run_agents()
+    agent_data["developments"] = [
+        {
+            "expected_thread_id": None,
+            "thread_id": "ticket-final-ci",
+            "summary": "Completed ordinary Development 1.",
+            "write_files": {"feature.txt": "attempt 1\n"},
+        },
+        *[
+            {
+                "expected_thread_id": "ticket-final-ci",
+                "thread_id": "ticket-final-ci",
+                "summary": f"Completed ordinary Development {ordinal}.",
+                "write_files": {"feature.txt": f"attempt {ordinal}\n"},
+            }
+            for ordinal in (2, 3, 4)
+        ],
+        {
+            "expected_thread_id": "ticket-final-ci",
+            "thread_id": "ticket-final-ci",
+            "summary": "Completed the one-shot Final CI-fix.",
+            "write_files": {"feature.txt": "final ci fix\n"},
+        },
+    ]
+    agent_data["publications"] = [publication(), publication()]
+    agent_data["reviews"] = [
+        repair_acceptance("ticket-reviewer-1"),
+        repair_acceptance("ticket-reviewer-2"),
+        repair_acceptance("ticket-reviewer-3"),
+    ]
+    agents = git_repo / "fallback-final-ci-fix.json"
+    agents.write_text(json.dumps(agent_data), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    job = state["ticket_jobs"]["3"]
+    assert job["phase"] == "completed"
+    assert job["development_thread_id"] == "ticket-final-ci"
+    assert job["review_budget"]["development_attempts"] == 4
+    assert job["review_budget"]["reviewer_invocations"] == 3
+    assert job["review_budget"]["final_ci_fix_used"] is True
+    assert job["modification_attempts"] == 5
+    assert job["attempt_kind"] == "final_ci_fix"
+    final_observation = job["required_checks_evidence"]
+    assert final_observation["result"] == "pass"
+    assert final_observation["head_sha"] == job["publication_sha"]
+    assert final_observation["checks"] == [
+        {
+            "name": "quality",
+            "workflow": "CI",
+            "bucket": "pass",
+            "state": "SUCCESS",
+            "link": "https://example.invalid/checks/quality",
+        }
+    ]
+    assert job["ci_evidence"]["result"] == "fail"
+    assert job["ci_evidence"]["pr_number"] == job["pr_number"]
+    assert job["ci_evidence"]["head_sha"] != job["publication_sha"]
+    development_attempts = [
+        attempt
+        for attempt in job["semantic_attempt_history"]
+        if attempt["role"] == "development"
+    ]
+    assert [attempt["ordinal"] for attempt in development_attempts] == [1, 2, 3, 4, 5]
+    assert (
+        sum(attempt["outcome"] == "candidate" for attempt in development_attempts) == 5
+    )
+    receipt = job["fallback_publication_receipt"]
+    assert receipt["final_ci_fix_used"] is True
+    assert receipt["final_ci_fix_failure_head"] != job["publication_sha"]
+    assert receipt["required_check_failure_evidence"]["head_sha"] == receipt[
+        "final_ci_fix_failure_head"
+    ]
+    failure_check = receipt["required_check_failure_evidence"]["checks"][0]
+    assert failure_check["bucket"] == "fail"
+    assert failure_check["state"] == "FAILURE"
+    assert failure_check["job"]["head_sha"] == receipt["final_ci_fix_failure_head"]
+    previous_authorization = receipt["previous_publication_authorization"]
+    assert previous_authorization["authority"] == "fallback"
+    assert previous_authorization["publication_sha"] == receipt[
+        "final_ci_fix_failure_head"
+    ]
+    previous_observation = previous_authorization["fallback_receipt"][
+        "required_checks_evidence"
+    ]
+    assert previous_observation["result"] == "fail"
+    assert previous_observation["head_sha"] == receipt["final_ci_fix_failure_head"]
+    assert previous_observation["checks"][0]["job"]["head_sha"] == receipt[
+        "final_ci_fix_failure_head"
+    ]
+    assert receipt["repair_delta"] == [{"status": "M", "path": "feature.txt"}]
+    assert receipt["required_checks_evidence"]["result"] == "pass"
+    assert receipt["required_checks_evidence"]["head_sha"] == job["publication_sha"]
+    assert receipt["required_checks_evidence"]["checks"] == final_observation["checks"]
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    ticket_prs = [
+        pull
+        for pull in fixture_data["delivery"]["pull_requests"]
+        if pull.get("primary_ticket") == 3
+    ]
+    assert len(ticket_prs) == 1
+    assert ticket_prs[0]["state"] == "MERGED"
+    assert ticket_prs[0]["head_sha"] == job["publication_sha"]
+    assert fixture_data["delivery"]["check_position"] >= 5
+    assert fixture_data["supervision_clock"] > 0
+
+
 def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
     git_repo: Path,
 ) -> None:
@@ -548,6 +679,13 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     assert job_before["blocked_reason"] == "modification_budget_exhausted"
     assert job_before.get("pending_semantic_attempt") is None
     assert job_before["review_budget"]["window"] == 1
+    assert job_before["review_budget"]["development_attempts"] == 4
+    assert job_before["review_budget"]["final_ci_fix_used"] is True
+    assert job_before["modification_attempts"] == 5
+    first_failure_head = job_before["final_ci_fix_failure_head"]
+    latest_failure_head = job_before["publication_sha"]
+    assert latest_failure_head != first_failure_head
+    assert job_before["ci_evidence"]["head_sha"] == latest_failure_head
     budget_before = json.dumps(job_before["review_budget"], sort_keys=True)
     budget_history_before = json.dumps(
         job_before["review_budget_history"], sort_keys=True
@@ -630,6 +768,11 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     completed_job = completed["ticket_jobs"]["3"]
     assert completed_job["review_budget"]["window"] == 2
     assert completed_job["review_budget"]["development_attempts"] == 1
+    assert "final_ci_fix_failure_head" not in completed_job
+    assert completed_job["ci_evidence"]["head_sha"] == latest_failure_head
+    assert completed_job["review_budget_history"][0][
+        "final_ci_fix_failure_head"
+    ] == first_failure_head
     resume_event = completed["resume_audit"]["history"][-1]
     assert resume_event["kind"] == "budget_checkpoint"
     assert resume_event["semantic_attempt_id"] is not None
