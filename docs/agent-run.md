@@ -309,8 +309,12 @@ GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数创建短
 statuses，确认 Hosted CI 结果。
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
 Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个最长三小时的 Worker 通过仅在本次 invocation 存活的
-临时 Controller-owned `gh` adapter 按读取请求获取宿主身份或短期 token；宿主 token、App 私钥和 Publisher
-凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
+普通 `gh` 命令入口按读取请求获取宿主身份或短期 token；Worker 不需要知道该入口背后的 adapter、socket、PATH 或挂载机制。Execution Guard
+只检查 Worker PATH 与 Codex command-tool 的有效前置目录（`CODEX_INSTALL_DIR`，未设置时为 `~/.local/bin`），将其中当前存在且可执行的 `gh` 解析为去重的 canonical target，并由 bubblewrap
+在 Worker mount namespace 内把同一个 invocation-local adapter 只读绑定到这些 target。新 adapter 不再 prepend 到 PATH，只清理继承环境中失效的旧 adapter 项；
+bubblewrap 的原子挂载就是启动保障，不增加 sandbox launcher、`samefile`、私有 probe 或持久状态。它不扫描 PATH 外文件，也不拦截 shell alias/function
+或 Agent 主动取得的替代客户端；任一绑定失败都在 Codex 启动前以 `worker_gh_binding_failed` 执行失败结束。Controller 位于该 namespace 外，
+继续使用原始真实 `gh` 或专用 GitHub App；宿主 token、App 私钥和 Publisher 凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
 请求，拒绝外部 hostname、写入参数和携带请求体的 API 调用；单次 Controller 读取有界超时，
 Worker 结束或凭据续签耗尽时会清理尚未结束的读取进程。adapter 在到期认证读取失败时仅
 续签并重试该读取一次；续签使用十分钟有界退避，耗尽后以
@@ -329,6 +333,9 @@ SSH、scp-like 与本地 remote 保持可用，权威 config 不会被改写。�
 Worker 误写权威历史，不承诺抵抗恶意进程、主动搜索其他宿主凭据、宿主污染或数据外泄。
 Codex 可以返回 Development Summary、Publication Artifact 或 Acceptance Artifact，
 但发布动作只能由 Publisher 执行。
+
+普通测试使用 fake broker、fake `gh` 和本地 bubblewrap，不调用真实 Codex。真实 Codex command-tool
+compatibility acceptance 只允许显式 opt-in，不进入普通 pytest、每轮 Development 或常规 CI。
 
 Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证，并根据实际
 改动风险选择 self-preflight、定向 Reviewer 或 `skill:code-review`。低风险局部改动不固定
