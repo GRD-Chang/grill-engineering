@@ -255,6 +255,39 @@ def ensure_supervision_window(
     return _supervision_window(state, boundary, now=now())
 
 
+def supervision_window_matches(
+    state: dict[str, Any],
+    window: dict[str, object],
+    *,
+    boundary: WaitingBoundary | None = None,
+) -> bool:
+    """Whether a persisted window still belongs to the supplied state."""
+
+    current_boundary = boundary if boundary is not None else waiting_boundary(state)
+    window_kind = window.get("kind")
+    if isinstance(window_kind, str) and window_kind in {
+        "required_checks",
+        "github_convergence",
+    } and (current_boundary is None or current_boundary.kind != window_kind):
+        # A refresh can temporarily project a wait to another lifecycle
+        # status.  The persisted window kind is the boundary being resumed;
+        # use it to compare the stable delivery identity without resetting
+        # the deadline or following a replaced frontier.
+        current_boundary = WaitingBoundary(
+            kind=window_kind,
+            budget_seconds=(
+                CHECKS_BUDGET_SECONDS
+                if window_kind == "required_checks"
+                else GITHUB_CONVERGENCE_BUDGET_SECONDS
+            ),
+            waiting_for=_waiting_object(state),
+        )
+    return (
+        current_boundary is not None
+        and window.get("identity") == _window_identity(state, current_boundary)
+    )
+
+
 def _last_external_error(state: dict[str, Any]) -> dict[str, str] | None:
     diagnostics = state.get("diagnostics")
     if not isinstance(diagnostics, list) or not diagnostics:
@@ -498,7 +531,6 @@ def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
     subject: dict[str, object] = {
         "run_id": state.get("run_id"),
         "kind": boundary.kind,
-        "phase": _phase(state),
         "run_branch": state.get("run_branch"),
     }
     base = state.get("base")
@@ -533,7 +565,6 @@ def _window_identity(state: dict[str, Any], boundary: WaitingBoundary) -> str:
         repair_identity = {
             item: repair.get(item)
             for item in (
-                "phase",
                 "repair_generation",
                 "pr_number",
                 "base_sha",

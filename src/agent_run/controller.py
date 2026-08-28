@@ -26,6 +26,8 @@ from agent_run.external_supervision import (
     is_github_convergence_error,
     is_github_refresh_wait,
     restore_supervision_wait,
+    supervision_window_matches,
+    waiting_boundary,
     wait_for_github_convergence,
     wait_for_github_refresh,
 )
@@ -701,23 +703,33 @@ class Controller:
                 repository.default_branch, repository.default_head_sha
             )
             graph = self.github.delivery_graph(parent_number)
+            previous_boundary = waiting_boundary(state)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
             supervision_window = state.get("supervision_window")
-            if isinstance(supervision_window, dict):
-                # Graph reconciliation is deliberately about GitHub-owned
-                # delivery facts.  A foreground wait deadline is local Run
-                # ownership and must survive a refresh that temporarily
-                # projects the lifecycle back to ``active``.
-                refreshed["supervision_window"] = deepcopy(supervision_window)
             credential_availability = state.get("credential_availability")
             if isinstance(credential_availability, dict):
                 # The first-mint retry record is also Controller-owned local
-                # state, not a GitHub graph fact.  Retain it while a refresh
-                # temporarily projects the Run back to its normal phase.
+                # state, not a GitHub graph fact.  Retain it before checking
+                # whether the supervision window still has the same identity.
                 refreshed["credential_availability"] = deepcopy(
                     credential_availability
                 )
+            if (
+                isinstance(supervision_window, dict)
+                and supervision_window_matches(
+                    refreshed, supervision_window, boundary=previous_boundary
+                )
+            ):
+                # Graph reconciliation is deliberately about GitHub-owned
+                # delivery facts.  A foreground wait deadline is local Run
+                # ownership and must survive a refresh that temporarily
+                # projects the same lifecycle back to ``active``.  A window
+                # for a completed or replaced Change Job must not leak into
+                # the next frontier item.
+                refreshed["supervision_window"] = deepcopy(supervision_window)
+            else:
+                refreshed.pop("supervision_window", None)
             refreshed.pop("currentness_resolution_pending", None)
             if state.get("status") == "requeue_required":
                 if check_requeue_currentness:

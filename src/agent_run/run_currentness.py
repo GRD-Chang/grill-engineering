@@ -17,6 +17,7 @@ from agent_run.scope_changes import reconcile_structure
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
 )
+from agent_run.external_supervision import supervision_window_matches, waiting_boundary
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.state_contract import require_candidate_acceptance_history
 
@@ -44,14 +45,22 @@ def refresh_run_currentness(
     )
     supervision_window = state.get("supervision_window")
     credential_availability = state.get("credential_availability")
+    previous_boundary = waiting_boundary(state)
     state.update(reconcile_structure(state, projected))
     # Currentness reconciliation owns GitHub-derived Run facts.  Foreground
     # supervision and initial credential availability are local Controller
     # facts, so never let a projection erase their in-flight deadline.
-    if isinstance(supervision_window, dict):
-        state["supervision_window"] = deepcopy(supervision_window)
     if isinstance(credential_availability, dict):
         state["credential_availability"] = deepcopy(credential_availability)
+    if (
+        isinstance(supervision_window, dict)
+        and supervision_window_matches(
+            state, supervision_window, boundary=previous_boundary
+        )
+    ):
+        state["supervision_window"] = deepcopy(supervision_window)
+    else:
+        state.pop("supervision_window", None)
     return None if state.get("status") == "unsupported_scope_change" else default_head
 
 
