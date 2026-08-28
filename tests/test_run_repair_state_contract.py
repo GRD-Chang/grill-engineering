@@ -116,6 +116,84 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
         require_current_run_state(state)
 
 
+def test_waiting_run_repair_requires_an_exact_head_observation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "waiting_checks",
+            "repair_mode": "squash",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+            "pr_number": 17,
+            "publication_sha": "repair-head",
+        },
+    }
+
+    with pytest.raises(IncompatibleRunStateError, match="required_checks_evidence"):
+        require_current_run_state(state)
+
+
+def test_legacy_projection_conflict_is_rejected_by_state_validation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "developing",
+            "repair_mode": "squash",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+            "required_checks": "fail",
+            "required_checks_mode": "configured",
+            "required_checks_evidence": {
+                "pr_number": 17,
+                "head_sha": "repair-head",
+                "result": "pass",
+                "checks": [],
+            },
+        },
+    }
+
+    with pytest.raises(IncompatibleRunStateError, match="conflicts with Observation"):
+        require_current_run_state(state)
+
+
+def test_fallback_receipt_observation_without_job_observation_is_incompatible(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["active_ticket_job"] = {
+        "phase": "candidate",
+        "fallback_publication_receipt": {
+            "pr_number": 17,
+            "publication_sha": "candidate-head",
+            "required_checks_evidence": {
+                "pr_number": 17,
+                "head_sha": "candidate-head",
+                "result": "fail",
+                "checks": [],
+            },
+        },
+    }
+
+    with pytest.raises(IncompatibleRunStateError, match="without the Job Observation"):
+        require_current_run_state(state)
+
+
 def _integrated_revalidation_merge() -> dict[str, str]:
     return {
         "base_sha": "base-sha",

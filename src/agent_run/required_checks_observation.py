@@ -7,9 +7,92 @@ from typing import Any
 
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.github import GitHubReadError
+from agent_run.state_errors import IncompatibleRunStateError
 
 
 REQUIRED_CHECK_RESULTS = frozenset({"none", "pass", "pending", "unknown", "fail"})
+
+
+def require_required_checks_observation(
+    value: object,
+    *,
+    location: str,
+    expected_pr_number: int | None = None,
+    expected_head_sha: str | None = None,
+    allowed_results: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Validate one durable, exact-head Required Checks Observation."""
+
+    if not isinstance(value, dict):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location} must be an object"
+        )
+    pr_number = value.get("pr_number")
+    if type(pr_number) is not int or pr_number < 1:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.pr_number is invalid"
+        )
+    if expected_pr_number is not None and pr_number != expected_pr_number:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.pr_number is not bound to the expected PR"
+        )
+    head_sha = value.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha.strip():
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.head_sha is invalid"
+        )
+    if expected_head_sha is not None and head_sha != expected_head_sha:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.head_sha is not bound to the expected head"
+        )
+    result = value.get("result")
+    accepted_results = (
+        REQUIRED_CHECK_RESULTS if allowed_results is None else allowed_results
+    )
+    if result not in accepted_results:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.result is invalid"
+        )
+    checks = value.get("checks")
+    if not isinstance(checks, list) or not all(
+        isinstance(check, dict) for check in checks
+    ):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.checks is invalid"
+        )
+    return value
+
+
+def validate_legacy_required_checks_projection(
+    owner: dict[str, Any],
+    *,
+    location: str,
+    observation: object,
+) -> None:
+    """Accept a legacy projection only when its canonical Observation agrees."""
+
+    has_result = "required_checks" in owner
+    has_mode = "required_checks_mode" in owner
+    if not has_result and not has_mode:
+        return
+    if not has_result or not has_mode:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location} has an incomplete Required Checks projection"
+        )
+    canonical = require_required_checks_observation(
+        observation,
+        location=f"{location}.required_checks_evidence",
+    )
+    expected_result = canonical["result"]
+    expected_mode = "not_configured" if expected_result == "none" else "configured"
+    if owner.get("required_checks") != expected_result:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.required_checks conflicts with Observation"
+        )
+    if owner.get("required_checks_mode") != expected_mode:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.required_checks_mode conflicts with Observation"
+        )
 
 
 def read_required_checks_observation(
@@ -142,6 +225,17 @@ def sync_fallback_receipt_observation(
 def bind_new_publication_head(job: dict[str, Any], publication_sha: str) -> None:
     """Clear the old Observation while retaining CI failure provenance."""
 
+    clear_required_checks_observation(job)
+    receipt = job.get("fallback_publication_receipt")
+    if isinstance(receipt, dict):
+        receipt["publication_sha"] = publication_sha
+        if isinstance(job.get("pr_number"), int):
+            receipt["pr_number"] = job["pr_number"]
+
+
+def clear_required_checks_observation(job: dict[str, Any]) -> None:
+    """Remove current Observation data without touching failure provenance."""
+
     for key in (
         "required_checks_evidence",
         "required_checks_observation_status",
@@ -151,7 +245,4 @@ def bind_new_publication_head(job: dict[str, Any], publication_sha: str) -> None
         job.pop(key, None)
     receipt = job.get("fallback_publication_receipt")
     if isinstance(receipt, dict):
-        receipt["publication_sha"] = publication_sha
         receipt.pop("required_checks_evidence", None)
-        if isinstance(job.get("pr_number"), int):
-            receipt["pr_number"] = job["pr_number"]

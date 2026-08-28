@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from agent_run.review_budget import RUN_POLICY, ensure_budget
+from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 _ACTIVE_CHECKOUT_PHASES = frozenset(
@@ -159,6 +160,7 @@ def rotate_repair_job(
     del completed_repairs[:-32]
 
     rotated = dict(job)
+    clear_required_checks_observation(rotated)
     trigger = rotated.get("repair_trigger")
     if isinstance(trigger, dict):
         trigger = dict(trigger)
@@ -179,8 +181,6 @@ def rotate_repair_job(
         "pending_attempt",
         "integrated_revalidation_merge",
         "deterministic_integration_record",
-        "required_checks",
-        "required_checks_mode",
     ):
         rotated.pop(key, None)
     rotated.update(

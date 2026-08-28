@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.change_delivery_fallback import (
+    preserve_required_checks_publication_authorization,
+)
 from agent_run.external_supervision import (
     clear_supervision_window,
     ensure_supervision_window,
@@ -19,6 +22,7 @@ from agent_run.required_checks import (
 )
 from agent_run.review_budget import can_start_development, ensure_budget
 from agent_run.required_checks_observation import (
+    clear_required_checks_observation,
     failure_evidence_matches_observation,
     read_required_checks_observation,
 )
@@ -27,6 +31,9 @@ from agent_run.required_checks_observation import (
 def _resume_change_delivery_after_evidence(
     stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]
 ) -> bool:
+    if job.get("phase") != "waiting_checks":
+        preserve_required_checks_publication_authorization(job)
+        clear_required_checks_observation(job)
     should_yield = stage.adapter.resume_after_required_checks_failure(state, job)
     clear_supervision_window(state)
     return should_yield
@@ -207,10 +214,6 @@ def observe_required_checks(
         "Published-Head Gate rejected requirements changed while reading checks",
     )
     job["required_checks_evidence"] = observation
-    job["required_checks"] = checks
-    job["required_checks_mode"] = (
-        "not_configured" if checks == "none" else "configured"
-    )
     stage._record_agent_run_status(
         pr_number,
         job,

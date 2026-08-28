@@ -12,6 +12,10 @@ from agent_run.review_budget import (
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
 )
+from agent_run.required_checks_observation import (
+    require_required_checks_observation,
+    validate_legacy_required_checks_projection,
+)
 from agent_run.state_errors import (
     IncompatibleRunStateError as IncompatibleRunStateError,
 )
@@ -143,6 +147,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
     require_completed_ticket_integration_records(state)
+    _require_required_checks_observations(state)
     _require_review_budget_windows(state)
     active_ticket = state.get("active_ticket_job")
     if isinstance(active_ticket, dict):
@@ -214,6 +219,113 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid ticket_graph.revision"
         )
+
+
+def _require_required_checks_observations(state: dict[str, Any]) -> None:
+    """Validate every persisted Required Checks Observation at its owner boundary."""
+
+    owners: list[tuple[str, dict[str, Any]]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        owners.extend(
+            (f"ticket_jobs[{key}]", job)
+            for key, job in jobs.items()
+            if isinstance(job, dict)
+        )
+    for key in ("active_ticket_job", "parent_job", "run_acceptance", "run_publication"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            owners.append((key, value))
+            if key == "run_acceptance" and isinstance(value.get("repair_job"), dict):
+                owners.append(("run_acceptance.repair_job", value["repair_job"]))
+
+    for location, owner in list(owners):
+        history = owner.get("review_budget_history")
+        if isinstance(history, list):
+            owners.extend(
+                (f"{location}.review_budget_history[{owner_index}]", snapshot)
+                for owner_index, snapshot in enumerate(history)
+                if isinstance(snapshot, dict)
+            )
+
+    for location, owner in owners:
+        evidence = owner.get("required_checks_evidence")
+        validate_legacy_required_checks_projection(
+            owner,
+            location=location,
+            observation=evidence,
+        )
+        record = owner.get("record")
+        record_pr = record.get("pr_number") if isinstance(record, dict) else None
+        record_head = record.get("pr_head_sha") if isinstance(record, dict) else None
+        pr_number = owner.get("pr_number")
+        if type(pr_number) is not int or pr_number < 1:
+            pr_number = record_pr
+        publication_sha = owner.get("publication_sha")
+        if not isinstance(publication_sha, str) or not publication_sha.strip():
+            publication_sha = record_head
+
+        if owner.get("phase") == "waiting_checks":
+            if type(pr_number) is not int or pr_number < 1:
+                raise IncompatibleRunStateError(
+                    f"incompatible_run_state: {location}.pr_number is required while waiting for Required Checks"
+                )
+            if not isinstance(publication_sha, str) or not publication_sha.strip():
+                raise IncompatibleRunStateError(
+                    f"incompatible_run_state: {location}.publication_sha is required while waiting for Required Checks"
+                )
+            require_required_checks_observation(
+                evidence,
+                location=f"{location}.required_checks_evidence",
+                expected_pr_number=pr_number,
+                expected_head_sha=publication_sha,
+            )
+        elif evidence is not None:
+            require_required_checks_observation(
+                evidence,
+                location=f"{location}.required_checks_evidence",
+                expected_pr_number=pr_number if type(pr_number) is int else None,
+                expected_head_sha=(
+                    publication_sha
+                    if isinstance(publication_sha, str) and publication_sha.strip()
+                    else None
+                ),
+            )
+
+        receipt = owner.get("fallback_publication_receipt")
+        if not isinstance(receipt, dict):
+            continue
+        receipt_evidence = receipt.get("required_checks_evidence")
+        if receipt_evidence is None:
+            continue
+        if evidence is None and owner.get("phase") not in {
+            "developing",
+            "repairing",
+            "committing_candidate",
+        }:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.fallback_publication_receipt has an Observation without the Job Observation"
+            )
+        receipt_pr = receipt.get("pr_number")
+        if type(receipt_pr) is not int or receipt_pr < 1:
+            receipt_pr = pr_number
+        receipt_head = receipt.get("publication_sha")
+        if not isinstance(receipt_head, str) or not receipt_head.strip():
+            receipt_head = publication_sha
+        require_required_checks_observation(
+            receipt_evidence,
+            location=f"{location}.fallback_publication_receipt.required_checks_evidence",
+            expected_pr_number=receipt_pr if type(receipt_pr) is int else None,
+            expected_head_sha=(
+                receipt_head
+                if isinstance(receipt_head, str) and receipt_head.strip()
+                else None
+            ),
+        )
+        if evidence is not None and receipt_evidence != evidence:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.fallback_publication_receipt does not share the Job Observation"
+            )
 
 
 def require_candidate_acceptance_history(

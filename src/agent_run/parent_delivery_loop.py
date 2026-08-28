@@ -26,6 +26,7 @@ from agent_run.github import MergeOutcomeUnknownError
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.review_budget import RUN_POLICY, ensure_budget, previous_review_context
+from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 class ParentDeliveryAdapter(ChangeDeliveryAdapter):
@@ -375,6 +376,7 @@ class ParentDeliveryLoop:
         base_branch = str(_mapping(state, "base")["branch"])
         base_sha = self.git.resolve(base_branch)
         self.git.reset_checkout_to_base(checkout, base_branch)
+        clear_required_checks_observation(job)
         for key in (
             "candidate_sha",
             "publication",
@@ -391,8 +393,6 @@ class ParentDeliveryLoop:
             "publication_authority",
             "fallback_publication_receipt",
             "deterministic_integration_record",
-            "required_checks",
-            "required_checks_mode",
             "next_attempt_kind",
             "last_review_candidate_sha",
             "final_ci_fix_failure_head",

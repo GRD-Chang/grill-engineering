@@ -17,6 +17,7 @@ from agent_run.scope_changes import reconcile_structure
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
 )
+from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.state_contract import require_candidate_acceptance_history
 
 
@@ -174,6 +175,7 @@ def invalidate_run_acceptance(state: dict[str, Any]) -> dict[str, Any]:
             )
             detach_active_invocation(state, pending_publication)
         publication["phase"] = "stale"
+        clear_required_checks_observation(publication)
         publication.pop("approval_grant", None)
     return run
 

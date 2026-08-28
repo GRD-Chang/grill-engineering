@@ -545,8 +545,8 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     assert job["pending_attempt_kind"] == "final_ci_fix"
     assert job["review_budget"]["development_attempts"] == 4
     assert job["review_budget"]["final_ci_fix_used"] is True
-    assert job["required_checks_evidence"]["result"] == "fail"
-    assert job["required_checks_evidence"]["head_sha"] == job["publication_sha"]
+    assert "required_checks_evidence" not in job
+    assert "required_checks_evidence" not in job["fallback_publication_receipt"]
     assert job["ci_evidence"]["result"] == "fail"
     assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
     assert job["ci_evidence"]["checks"][0]["job"]["head_sha"] == job[
@@ -589,6 +589,9 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     assert completed_job["review_budget"]["development_attempts"] == 4
     assert completed_job["review_budget"]["final_ci_fix_used"] is True
     assert completed_job["modification_attempts"] == 5
+    assert completed_job["fallback_publication_receipt"][
+        "required_checks_evidence"
+    ]["head_sha"] == completed_job["publication_sha"]
     assert any(
         attempt["attempt_id"] == pending["attempt_id"]
         and attempt["outcome"] == "candidate"
@@ -2013,9 +2016,7 @@ def test_parent_only_approve_queues_only_exact_repairable_failure(
     job = load_only_run_state(git_repo)["parent_job"]
     assert job["phase"] == "repairing"
     assert job["repair_source"] == "required_checks"
-    assert job["required_checks_evidence"]["result"] == "fail"
-    assert job["required_checks_evidence"]["pr_number"] == job["pr_number"]
-    assert job["required_checks_evidence"]["head_sha"] == job["publication_sha"]
+    assert "required_checks_evidence" not in job
     assert job["ci_evidence"]["result"] == "fail"
     assert job["ci_evidence"]["pr_number"] == job["pr_number"]
     assert job["ci_evidence"]["head_sha"] == job["publication_sha"]

@@ -26,7 +26,10 @@ from agent_run.publication_operation_retry import (
     record_publication_operation_failure,
 )
 from agent_run.publication_pending import publication_pending_diagnostic
-from agent_run.required_checks_observation import read_required_checks_observation
+from agent_run.required_checks_observation import (
+    clear_required_checks_observation,
+    read_required_checks_observation,
+)
 
 
 class RunPublicationShared:
@@ -120,6 +123,7 @@ class RunPublicationShared:
             "abandoned",
         }:
             publication["phase"] = "stale"
+            clear_required_checks_observation(publication)
             publication.pop("approval_grant", None)
         state.update(
             {

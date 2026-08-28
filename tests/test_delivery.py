@@ -2040,9 +2040,10 @@ def test_ticket_review_budget_fallback_publishes_without_acceptance_record(
     assert "acceptance_artifact" not in fallback_publication
     assert "ci_evidence" not in fallback_publication
     assert job["deterministic_integration_record"]["source"] == "fallback"
-    assert job["deterministic_integration_record"]["required_checks_mode"] == (
-        "not_configured"
-    )
+    assert "required_checks" not in job
+    assert "required_checks_mode" not in job
+    assert "required_checks" not in job["deterministic_integration_record"]
+    assert "required_checks_mode" not in job["deterministic_integration_record"]
     integration = job["deterministic_integration_record"]
     assert integration["integrated_sha"] == job["integrated_sha"]
     assert integration["integrated_publication_sha"] == job["publication_sha"]
@@ -2097,6 +2098,74 @@ def test_fallback_pending_observation_is_one_contract_valid_commit(
     assert receipt["required_checks_evidence"] == job["required_checks_evidence"]
     assert receipt["required_checks_evidence"] is not job["required_checks_evidence"]
     require_current_run_state(states.observation_commits[0])
+
+
+def test_final_ci_fix_candidate_save_clears_receipt_observation_before_resume(
+    git_repo: Path,
+) -> None:
+    class CrashAfterFinalCiFixCandidateSave(StateStore):
+        crashed = False
+
+        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+            job = state.get("active_ticket_job")
+            is_final_ci_fix_candidate = (
+                not self.crashed
+                and isinstance(job, dict)
+                and job.get("phase") == "candidate"
+                and job.get("attempt_kind") == "final_ci_fix"
+            )
+            super().save_run(run_id, state)
+            if is_final_ci_fix_candidate:
+                self.crashed = True
+                raise SimulatedProcessCrash(
+                    "simulated crash after Final CI-fix Candidate save"
+                )
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = CrashAfterFinalCiFixCandidateSave(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail", "pass"]
+    agents = AlwaysRejectAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    )
+
+    with pytest.raises(SimulatedProcessCrash, match="Final CI-fix Candidate"):
+        engine.deliver(state["run_id"])
+
+    interrupted = states.load_current_run(state["run_id"])
+    assert interrupted is not None
+    interrupted_job = interrupted["active_ticket_job"]
+    assert interrupted_job["phase"] == "candidate"
+    assert interrupted_job["attempt_kind"] == "final_ci_fix"
+    assert "required_checks_evidence" not in interrupted_job
+    receipt = interrupted_job["fallback_publication_receipt"]
+    assert "required_checks_evidence" not in receipt
+    assert interrupted_job["ci_evidence"]["result"] == "fail"
+    assert interrupted_job["final_ci_fix_failure_head"] == interrupted_job[
+        "ci_evidence"
+    ]["head_sha"]
+    previous = receipt["previous_publication_authorization"]
+    assert previous["publication_sha"] == interrupted_job["final_ci_fix_failure_head"]
+    assert previous["fallback_receipt"]["required_checks_evidence"]["head_sha"] == (
+        interrupted_job["final_ci_fix_failure_head"]
+    )
+    require_current_run_state(interrupted)
+
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    completed_job = completed["active_ticket_job"]
+    assert completed_job["required_checks_evidence"]["head_sha"] == completed_job[
+        "publication_sha"
+    ]
+    assert completed_job["fallback_publication_receipt"][
+        "required_checks_evidence"
+    ]["head_sha"] == completed_job["publication_sha"]
 
 
 @pytest.mark.parametrize("crash_timing", ["before", "after"])
@@ -3895,7 +3964,7 @@ def test_required_checks_snapshot_state_change_cannot_publish_as_pass(
     job = waiting["active_ticket_job"]
     assert waiting["status"] == "waiting_checks"
     assert job["phase"] == "waiting_checks"
-    assert job["required_checks"] == "pending"
+    assert "required_checks" not in job
     assert job["required_checks_evidence"]["result"] == "pending"
     assert "deterministic_integration_record" not in job
     assert publisher.merged_sha is None

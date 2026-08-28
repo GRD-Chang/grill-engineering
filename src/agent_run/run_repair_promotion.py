@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
-from agent_run.required_checks_observation import bind_new_publication_head
+from agent_run.required_checks_observation import (
+    bind_new_publication_head,
+    clear_required_checks_observation,
+)
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_repair_cycle import escalate_repair, uses_merge_resolution
 from agent_run.semantic_attempt import (
@@ -133,6 +136,7 @@ class RunRepairPromotion:
             stale_keys.extend(("publication", "publication_sha"))
         for key in stale_keys:
             job.pop(key, None)
+        clear_required_checks_observation(job)
         candidate_sha = job.get("candidate_sha")
         squash_candidate_sha = job.get("integration_squash_candidate_sha")
         finding_snapshot_sha = job.get("integration_finding_snapshot_sha")
@@ -195,6 +199,7 @@ class RunRepairPromotion:
             "abandoned",
         }:
             publication["phase"] = "stale"
+            clear_required_checks_observation(publication)
             for key in ("artifact", "write_intent", "approval_grant"):
                 publication.pop(key, None)
         state.update(

@@ -21,6 +21,7 @@ from agent_run.parent_delivery_loop import (
 )
 from agent_run.state import StateStore
 from agent_run.review_budget import RUN_POLICY, new_budget, reset_budget
+from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
     detach_active_invocation,
@@ -268,6 +269,7 @@ class ParentDeliveryEngine:
             close_semantic_attempt(job, pending, outcome="currentness_invalidated")
             detach_active_invocation(state, pending)
         reset_budget(job, RUN_POLICY)
+        clear_required_checks_observation(job)
         for key in (
             "candidate_sha",
             "publication",
@@ -289,8 +291,6 @@ class ParentDeliveryEngine:
             "publication_authority",
             "fallback_publication_receipt",
             "deterministic_integration_record",
-            "required_checks",
-            "required_checks_mode",
             "next_attempt_kind",
             "last_review_candidate_sha",
             "final_ci_fix_failure_head",

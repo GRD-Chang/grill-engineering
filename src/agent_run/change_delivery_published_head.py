@@ -18,6 +18,7 @@ from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
+from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.external_supervision import (
     ensure_supervision_window,
     is_github_convergence_error,
@@ -27,7 +28,9 @@ from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
 from agent_run.required_checks_observation import (
+    require_required_checks_observation,
     sync_fallback_receipt_observation,
+    validate_legacy_required_checks_projection,
 )
 
 
@@ -314,21 +317,28 @@ def publish_and_merge(
     )
     if check_outcome is not None:
         return check_outcome
-    checks_value = job.get("required_checks")
     required_checks_evidence = job.get("required_checks_evidence")
-    if (
-        checks_value not in {"none", "pass"}
-        or not isinstance(required_checks_evidence, dict)
-        or required_checks_evidence.get("head_sha") != job["publication_sha"]
-        or required_checks_evidence.get("result") != checks_value
-    ):
+    validate_legacy_required_checks_projection(
+        job,
+        location="active_ticket_job",
+        observation=required_checks_evidence,
+    )
+    try:
+        required_checks_evidence = require_required_checks_observation(
+            required_checks_evidence,
+            location="active_ticket_job.required_checks_evidence",
+            expected_pr_number=pr_number,
+            expected_head_sha=str(job["publication_sha"]),
+            allowed_results=frozenset({"none", "pass"}),
+        )
+    except IncompatibleRunStateError:
         return stage._block(
             state,
             job,
             "published_head_mismatch",
             "Published-Head Gate rejected the final Required Checks snapshot",
         )
-    checks = str(checks_value)
+    checks = str(required_checks_evidence["result"])
     exhausted, live = _publication_operation(
         stage,
         state,
@@ -400,8 +410,6 @@ def publish_and_merge(
         "candidate_sha": str(job["candidate_sha"]),
         "candidate_tree": candidate_tree,
         "publication_sha": str(job["publication_sha"]),
-        "required_checks_mode": str(job.get("required_checks_mode", "configured")),
-        "required_checks": checks,
         "required_checks_evidence": required_checks_evidence,
         "pr": {
             "number": pr_number,

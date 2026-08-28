@@ -6,9 +6,13 @@ from typing import Any
 import pytest
 
 from agent_run.github import GitHubReadError
+from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.required_checks_observation import (
     bind_new_publication_head,
+    clear_required_checks_observation,
     read_required_checks_observation,
+    require_required_checks_observation,
+    validate_legacy_required_checks_projection,
 )
 
 
@@ -130,3 +134,90 @@ def test_new_publication_head_clears_observation_but_keeps_failure_provenance() 
     assert receipt["publication_sha"] == "successor-head"
     assert receipt["pr_number"] == 17
     assert "required_checks_evidence" not in receipt
+
+
+def test_clear_observation_clears_fallback_receipt_but_keeps_failure_provenance() -> None:
+    observation = {
+        "pr_number": 17,
+        "head_sha": "failed-head",
+        "result": "fail",
+        "checks": [{"name": "quality", "bucket": "fail"}],
+    }
+    failure_evidence = {**observation, "repairability": "code_failure"}
+    receipt = {
+        "publication_sha": "failed-head",
+        "required_checks_evidence": dict(observation),
+        "required_check_failure_evidence": failure_evidence,
+        "final_ci_fix_failure_head": "failed-head",
+    }
+    job = {
+        "required_checks_evidence": observation,
+        "ci_evidence": failure_evidence,
+        "final_ci_fix_failure_head": "failed-head",
+        "fallback_publication_receipt": receipt,
+    }
+
+    clear_required_checks_observation(job)
+
+    assert "required_checks_evidence" not in job
+    assert "required_checks_evidence" not in receipt
+    assert job["ci_evidence"] is failure_evidence
+    assert job["final_ci_fix_failure_head"] == "failed-head"
+    assert receipt["required_check_failure_evidence"] is failure_evidence
+    assert receipt["final_ci_fix_failure_head"] == "failed-head"
+
+
+def test_matching_legacy_projection_is_accepted_but_not_required() -> None:
+    observation = {
+        "pr_number": 17,
+        "head_sha": "candidate-head",
+        "result": "pass",
+        "checks": [{"name": "quality", "bucket": "pass"}],
+    }
+    owner = {
+        "required_checks": "pass",
+        "required_checks_mode": "configured",
+        "required_checks_evidence": observation,
+    }
+
+    require_required_checks_observation(
+        observation,
+        location="job.required_checks_evidence",
+        expected_pr_number=17,
+        expected_head_sha="candidate-head",
+    )
+    validate_legacy_required_checks_projection(
+        owner, location="job", observation=observation
+    )
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        {
+            "required_checks": "fail",
+            "required_checks_mode": "configured",
+            "required_checks_evidence": {
+                "pr_number": 17,
+                "head_sha": "candidate-head",
+                "result": "pass",
+                "checks": [],
+            },
+        },
+        {
+            "required_checks": "pass",
+            "required_checks_mode": "configured",
+        },
+    ],
+)
+def test_legacy_projection_requires_a_matching_canonical_observation(
+    owner: dict[str, object],
+) -> None:
+    observation = owner.get("required_checks_evidence")
+    if not isinstance(observation, dict):
+        observation = None
+
+    with pytest.raises(IncompatibleRunStateError, match="incompatible_run_state"):
+        validate_legacy_required_checks_projection(
+            owner, location="job", observation=observation
+        )

@@ -371,9 +371,7 @@ def test_live_identity_drift_after_failure_evidence_cannot_start_repair(
 
     assert result["status"] == "run_acceptance_pending"
     assert result["run_publication"]["phase"] == "stale"
-    assert result["run_publication"]["required_checks_evidence"]["head_sha"] == (
-        git.resolve(str(state["run_branch"]))
-    )
+    assert "required_checks_evidence" not in result["run_publication"]
     assert "repair_request" not in result["run_acceptance"]
     assert "repair_job" not in result["run_acceptance"]
     assert (

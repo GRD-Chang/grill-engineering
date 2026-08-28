@@ -12,6 +12,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping, TypedDict, cast
 
+from agent_run.required_checks_observation import clear_required_checks_observation
+
 
 TICKET_DEVELOPMENT_LIMIT = 4
 TICKET_REVIEW_LIMIT = 3
@@ -201,14 +203,13 @@ def reset_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudge
     history.append(snapshot)
     next_window = int(current["window"]) + 1
     job["review_budget"] = new_budget(window=next_window)
+    clear_required_checks_observation(job)
     job["modification_attempts"] = 0
     job["validation_attempts"] = 0
     job.pop("last_review_candidate_sha", None)
     job.pop("publication_authority", None)
     job.pop("fallback_publication_receipt", None)
     job.pop("deterministic_integration_record", None)
-    job.pop("required_checks", None)
-    job.pop("required_checks_mode", None)
     job.pop("final_ci_fix_failure_head", None)
     return cast(ReviewBudget, job["review_budget"])
 
