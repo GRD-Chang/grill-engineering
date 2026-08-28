@@ -77,7 +77,7 @@ Controller 复用的单一自动变更循环：持久 Development Thread 修改 
 _Avoid_: Ticket 专用流水线、Run Repair 专用流水线、动态 Agent 编排
 
 **Review Optimization Policy（审查优化策略）**:
-降低 Token 与审查重复时遵循的变更优先级：能通过更准确的角色、范围和完成条件解决的问题优先只调整 Prompt；Prompt 无法机械保证的预算、currentness、结构化证据与路由才在现有 Controller 和 Artifact seam 上小幅补足；Development–Acceptance Engine、Candidate/PR/Required Checks/Run Branch 阶段、Publisher Mutation Authority 与最终 Run Acceptance 权威保持不变。Ticket、Run 与 Parent-only 的每次 Reviewer Invocation 都按 Prompt 调用 `code-review` skill，并自主决定本轮需要定向复核还是全量审核。每个新 Review Budget Window 的 Reviewer 1 建立当前基线；Ticket Reviewer 2–3 以及 Run/Parent-only Reviewer 2–5 只额外获得紧邻上一轮 Acceptance Artifact 的完整原始内容及其角色化 review identity，Prompt 建议优先参考其中的问题及当前修复，但不要求逐项 closure，也不限制 Reviewer 的检查顺序、范围或新问题发现。Controller 不解析 Findings、不判断哪些已关闭、不生成 Finding Ledger，也不要求 Development 为每个 Finding 提交 disposition。每次 Reviewer 仍对准确当前 Candidate 或预期合并结果负责，并只交付新的 Acceptance Artifact；旧结论不能直接授权新 tree。
+降低 Token 与审查重复时遵循的变更优先级：能通过更准确的角色、范围和完成条件解决的问题优先只调整 Prompt；Prompt 无法机械保证的预算、currentness、结构化证据与路由才在现有 Controller 和 Artifact seam 上小幅补足；Development–Acceptance Engine、Candidate/PR/Required Checks/Run Branch 阶段、Publisher Mutation Authority 与最终 Run Acceptance 权威保持不变。Ticket、Run 与 Parent-only 的每次 Reviewer Invocation 都按 Prompt 调用 `code-review` skill，并自主决定本轮需要定向复核还是全量审核。每个新 Review Budget Window 的 Reviewer 1 建立当前基线；后续 Reviewer 直到有效 Run Policy Snapshot 推导出的本层上限，只额外获得紧邻上一轮 Acceptance Artifact 的完整原始内容及其角色化 review identity，Prompt 建议优先参考其中的问题及当前修复，但不要求逐项 closure，也不限制 Reviewer 的检查顺序、范围或新问题发现。Controller 不解析 Findings、不判断哪些已关闭、不生成 Finding Ledger，也不要求 Development 为每个 Finding 提交 disposition。每次 Reviewer 仍对准确当前 Candidate 或预期合并结果负责，并只交付新的 Acceptance Artifact；旧结论不能直接授权新 tree。
 _Avoid_: 为成本优化复制流水线、用 Prompt 假装实现硬门禁、无必要重写成熟状态机、破坏 currentness 或发布权威
 
 **Predecessor Defect Repair（前序缺陷修复）**:
@@ -187,7 +187,7 @@ Run 内部监督按远端状态类别采用有限等待预算。预算内保持�
 _Avoid_: 无限占用进程、把超时吞成 pass、把正常 pending 伪装成需要外部授权的 Human Blocker
 
 **监督超时暂停（Supervision Timeout Pause）**:
-可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据并退出，等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在超时暂停时显示 `agent-run resume <run-id>`；同一 Parent 的显式 `run` 也可重新读取权威状态并开始新的对应等待窗口。活跃前台进程仍自行监督，维护者不应据此重复输入命令。超时 `resume` 不接受 Human Response 或新的 Agent Thread，且不会创建 Worker、PR 或 merge。
+可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据并退出，等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在超时暂停时显示使用 Lifecycle Parent Selector 的 `agent-run resume <parent-issue>`；同一 Parent 的显式 `run` 也可重新读取权威状态并开始新的对应等待窗口。活跃前台进程仍自行监督，维护者不应据此重复输入命令。超时 `resume` 不接受 Human Response 或新的 Agent Thread，且不会创建 Worker、PR 或 merge。
 _Avoid_: execution_failed、Human Blocker、常驻 watcher、无界单次进程
 
 **Ticket 关闭归属（Ticket Close Ownership）**:
@@ -227,7 +227,7 @@ _Avoid_: 启动授权、依赖已解除、完成状态
 _Avoid_: 默认分支、Ticket Branch、永久集成分支
 
 **Parent-only Delivery（仅 Parent 交付）**:
-当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Acceptance、Required Checks 和 Published-Head Gate；其 Job Contract 复用最终交付级 Review Budget 机制，最多五次 Reviewer Invocation。每次 Reviewer 都调用 `code-review` skill；每个窗口的 Reviewer 1 建立完整 Parent 基线，Reviewer 2–5 只额外获得上一轮 Acceptance Artifact 的完整原始内容、其 reviewed base/Candidate identity 和优先参考上轮问题的 Prompt 倾向，并自主决定审查范围；第五次失败进入 Review Budget Checkpoint，且不允许 Deterministic Ticket Fallback。`agent-run approve <run-id>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
+当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Acceptance、Required Checks 和 Published-Head Gate；每个预算窗口按有效 Run Policy Snapshot 的 Parent-only 轮数 `N` 允许最多 `N` 次 Development 与 `N` 次 Reviewer Invocation，并严格组成 `Development N → Reviewer N` 的完整配对，内置默认 `N=10`。每次 Reviewer 都调用 `code-review` skill；Reviewer 1 建立完整 Parent 基线，Reviewer 2–N 只额外获得上一轮 Acceptance Artifact 的完整原始内容、其 reviewed base/Candidate identity 和优先参考上轮问题的 Prompt 倾向，并自主决定审查范围；Reviewer N 仍失败时进入 Review Budget Checkpoint。Parent-only 直接面向默认分支且没有后继 Run Acceptance，因此不允许 Deterministic Ticket Fallback，也不允许任何未经当前 Reviewer 验收的新 Candidate 进入 Publication。`agent-run approve <run-id>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
 _Avoid_: Run Branch、Final Run PR、跳过独立验收、自动合并
 
 **Ticket PR（Ticket 拉取请求）**:
@@ -244,7 +244,7 @@ _Avoid_: 最终集成 PR、多 Ticket PR、默认分支 PR
 _Avoid_: Ticket PR、squash 整个 Delivery Run、自动合入默认分支
 
 **Run Acceptance（运行整体验收）**:
-全部 Ticket Completion 后、首次创建 Run PR 前以及任何 Run Branch 或默认分支更新后执行的独立整体验收，也是 Delivery Run 的最终自动完成权威。它的对象是准确默认分支 head `D` 与准确 Run Branch head `R` 的预期合并结果：该结果必须可合并且满足完整 Parent Spec。正常 Attempt 使用全新 YOLO Reviewer Thread 和独立 Validation Checkout，要求调用 `code-review` skill，并针对 Parent Spec、Run Feedback Revisions、完整 Ticket Set、`D`、`R`、预期合并结果、累计 diff 和各 Ticket 集成证据进行检查；每个 Run Review Budget Window 最多启动五次 Run Reviewer Invocation，第五次仍有可修复 Finding 时不自动开始下一次 Run Repair，而是进入 Review Budget Checkpoint。Reviewer 1 的 Prompt 要求建立完整 Parent 级基线；Reviewer 2–5 只额外收到上一轮 Acceptance Artifact 的完整原始内容及其 default base、Run head 与 expected merge tree identity，Prompt 建议优先参考上轮问题和当前 Repair，但 Reviewer 自主决定检查顺序、范围以及是否全量审核。维护者显式 `resume` 后开启有编号的新窗口，先将第五次 Findings 交给 Run Repair，再由新窗口的 Reviewer 1 验收修复后的新 Candidate。Human Blocker 的恢复可继续刚被阻塞的 Thread，普通 Finding 修复后的新 Candidate 仍由全新 Reviewer Thread 验收；每次都重新创建一次性 Validation Checkout 并核验边界。完整 Acceptance 输出不合法时最多进行两次同 Thread、只读 Output Repair。Run Reviewer 不复用任何 Development Thread 或 Ticket Reviewer Thread，重点检查跨 Ticket 交互、整体需求遗漏、局部实现累计偏离、集成回归以及所有 Deterministic Integration Record 中保留的 Reviewer Artifact 和后续 Development 事实；`D`、`R` 或有效需求 Revision 漂移都会使结论失效，只有通过后才允许生成或刷新 Run PR Narrative。
+全部 Ticket Completion 后、首次创建 Run PR 前以及任何 Run Branch 或默认分支更新后执行的独立整体验收，也是 Delivery Run 的最终自动完成权威。它的对象是准确默认分支 head `D` 与准确 Run Branch head `R` 的预期合并结果：该结果必须可合并且满足完整 Parent Spec。正常 Attempt 使用全新 YOLO Reviewer Thread 和独立 Validation Checkout，要求调用 `code-review` skill，并针对 Parent Spec、Run Feedback Revisions、完整 Ticket Set、`D`、`R`、预期合并结果、累计 diff 和各 Ticket 集成证据进行检查；有效 Run Policy Snapshot 的 Run Repair 轮数 `N` 推导每个窗口最多 `N` 次 Run Development 与包含初始验收的 `N+1` 次 Run Reviewer Invocation，内置默认 `N=10`。Reviewer N+1 仍有可修复 Finding 时不自动开始下一次 Run Repair，而是进入 Review Budget Checkpoint。Reviewer 1 的 Prompt 要求建立完整 Parent 级基线；Reviewer 2–N+1 只额外收到上一轮 Acceptance Artifact 的完整原始内容及其 default base、Run head 与 expected merge tree identity，Prompt 建议优先参考上轮问题和当前 Repair，但 Reviewer 自主决定检查顺序、范围以及是否全量审核。维护者显式 `resume` 后开启有编号的新窗口，先将 Reviewer N+1 的 Findings 交给 Run Repair，再由新窗口的 Reviewer 1 验收修复后的新 Candidate。Human Blocker 的恢复可继续刚被阻塞的 Thread，普通 Finding 修复后的新 Candidate 仍由全新 Reviewer Thread 验收；每次都重新创建一次性 Validation Checkout 并核验边界。完整 Acceptance 输出不合法时最多进行两次同 Thread、只读 Output Repair。Run Reviewer 不复用任何 Development Thread 或 Ticket Reviewer Thread，重点检查跨 Ticket 交互、整体需求遗漏、局部实现累计偏离、集成回归以及所有 Deterministic Integration Record 中保留的 Reviewer Artifact 和后续 Development 事实；`D`、`R` 或有效需求 Revision 漂移都会使结论失效，只有通过后才允许生成或刷新 Run PR Narrative。
 _Avoid_: Ticket Fresh Acceptance、简单汇总各票 pass、最终人工验收、只审 Repair diff
 
 **Candidate Run Acceptance（候选运行整体验收）**:
@@ -272,7 +272,7 @@ Repair Cycle 中一次可发布修复使用 Change Job Contract 创建的 Develo
 _Avoid_: Ticket Job、整个 Delivery Run 唯一 PR、独立修复流水线
 
 **Repair Cycle（修复周期）**:
-为解决同一准确 Run Acceptance、Run PR CI 或默认分支合并冲突问题而连续执行的有界修复工作；一个 Cycle 可依次包含多个 Run Repair Job，但任一时刻只允许一个活跃 Job。它在可修复 Finding、可修复 CI 失败或 Git conflict 出现时以零次修改开始；每当 Repair Codex 产出一个含实际交付树修改的新 repair Candidate，`code_modification_attempts` 加一，最多十次。冲突检测、worktree 准备、Reviewer 重跑、Required Checks 重试和无交付树修改的调查不计数。Candidate 或 repair PR 的 Required Check 只有同时得到 GitHub `FAILURE` 结论、准确绑定当前 PR head 的 completed Actions job，并由 job steps 证明失败仅发生在仓库 `pyproject.toml` 的 `tool.agent-run.required-checks.code-failure-steps` 所列 `workflow::name::step`，才被视为已明确且可由本次代码修复并返回同一 Cycle；pending、未知、缺少或矛盾的 job/step 事实、未配置 step、cancelled、runner 或暂时平台错误只进入 Controller 监督，不消耗预算。默认分支漂移以及已集成 Job 的 revalidation Finding 都不结束 Cycle 或重置预算；Candidate 被提升为正式 Run Acceptance、需要人工决定、预算耗尽，或 Run Branch/Parent/Graph/Ticket Completion 漂移时结束 Cycle。
+为解决同一准确 Run Acceptance、Run PR CI 或默认分支合并冲突问题而连续执行的有界修复工作；一个 Cycle 可依次包含多个 Run Repair Job，但任一时刻只允许一个活跃 Job。它在可修复 Finding、可修复 CI 失败或 Git conflict 出现时以零次修改开始；每当 Repair Codex 产出一个含实际交付树修改的新 repair Candidate，`code_modification_attempts` 加一，最多达到有效 Run Policy Snapshot 的 Run Repair 轮数 `N`，内置默认 `N=10`。冲突检测、worktree 准备、Reviewer 重跑、Required Checks 重试和无交付树修改的调查不计数。Candidate 或 repair PR 的 Required Check 只有同时得到 GitHub `FAILURE` 结论、准确绑定当前 PR head 的 completed Actions job，并由 job steps 证明失败仅发生在仓库 `pyproject.toml` 的 `tool.agent-run.required-checks.code-failure-steps` 所列 `workflow::name::step`，才被视为已明确且可由本次代码修复并返回同一 Cycle；pending、未知、缺少或矛盾的 job/step 事实、未配置 step、cancelled、runner 或暂时平台错误只进入 Controller 监督，不消耗预算。默认分支漂移以及已集成 Job 的 revalidation Finding 都不结束 Cycle 或重置预算；Candidate 被提升为正式 Run Acceptance、需要人工决定、预算耗尽，或 Run Branch/Parent/Graph/Ticket Completion 漂移时结束 Cycle。
 _Avoid_: 用 Delivery Run 的历史累计修改数作为当前预算、把流程重试计作代码修改、base 漂移重置同一问题的预算
 
 **Run Repair PR（运行修复拉取请求）**:
@@ -284,7 +284,7 @@ _Avoid_: Run PR、Ticket PR、将冲突解法 squash 到旧 Run head、直接推
 _Avoid_: Agent 自行提交 merge、squash resolution tree、隐式 rebase Run Branch、把冲突只当作文本补丁
 
 **Run Acceptance Repair Loop（运行验收修复循环）**:
-Run Acceptance 或已创建 Run PR 的 CI 产生可自动修复问题后，Controller 创建 Repair Cycle 与首个 Run Repair Job，并将原始 Acceptance Artifact 或 CI Failure Evidence 交给复用的 Run Repair Thread。Development–Acceptance Engine 产出 Candidate；Candidate Run Acceptance 以完整 Parent 范围检查准确 default head 与 Candidate 的预期合并结果。repair PR 的 Required Checks 与 Published-Head Gate 通过并合入 Run Branch 后，Controller 只有在 Candidate tree、repair base、实际 Run Branch tree、default head、Parent、Graph 与 Ticket Completion 均严格保持一致时，才将该 Candidate Acceptance 提升为正式 Run Acceptance。已受控合入后若仅 default head 前进，Controller 在同一 Cycle/worktree 重新预演和验收：新的 Finding 轮转新 Job/branch/PR 并继续消耗同一预算；其他 promotion 边界失配则废弃 Candidate，进入新的 Run Acceptance Generation。Git 冲突修复使用 Merge-resolution Candidate 与普通 merge，其他 repair 使用 squash merge。该循环持续到 promotion、需要人工决策或当前 Repair Cycle 耗尽十次实际代码修复预算。
+Run Acceptance 或已创建 Run PR 的 CI 产生可自动修复问题后，Controller 创建 Repair Cycle 与首个 Run Repair Job，并将原始 Acceptance Artifact 或 CI Failure Evidence 交给复用的 Run Repair Thread。Development–Acceptance Engine 产出 Candidate；Candidate Run Acceptance 以完整 Parent 范围检查准确 default head 与 Candidate 的预期合并结果。repair PR 的 Required Checks 与 Published-Head Gate 通过并合入 Run Branch 后，Controller 只有在 Candidate tree、repair base、实际 Run Branch tree、default head、Parent、Graph 与 Ticket Completion 均严格保持一致时，才将该 Candidate Acceptance 提升为正式 Run Acceptance。已受控合入后若仅 default head 前进，Controller 在同一 Cycle/worktree 重新预演和验收：新的 Finding 轮转新 Job/branch/PR 并继续消耗同一预算；其他 promotion 边界失配则废弃 Candidate，进入新的 Run Acceptance Generation。Git 冲突修复使用 Merge-resolution Candidate 与普通 merge，其他 repair 使用 squash merge。该循环持续到 promotion、需要人工决策或当前 Repair Cycle 耗尽策略规定的 `N` 次实际代码修复预算。
 _Avoid_: 复用不等价的旧 Reviewer、直接修改 Run Branch、仅修复局部 Ticket diff、对同一已验收树无条件重跑 Reviewer
 
 **Run Feedback Revision（运行反馈版本）**:
@@ -300,7 +300,7 @@ _Avoid_: Ticket 级确认、自动 merge 默认分支、Agent 语义范围判断
 _Avoid_: GitHub Approve、标签触发、永久授权
 
 **Final Revision Command（最终修改命令）**:
-维护者通过 `agent-run revise <run-id> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启新的十次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，Run 必须 fail closed 为 Unsupported Scope Change。
+维护者通过 `agent-run revise <run-id> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启按有效 Run Policy Snapshot 配置的 `N` 次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，Run 必须 fail closed 为 Unsupported Scope Change。
 _Avoid_: Parent Spec 静默改写、直接修改 Run Branch、无限自动重试
 
 **Final Abandon Command（最终放弃命令）**:
@@ -388,8 +388,8 @@ Candidate Commit 进入 Run Branch、供下游 Ticket 使用前形成的有界�
 _Avoid_: Ticket 最终验收、把确定性兜底伪装成 Reviewer pass、缩小 Run Acceptance、隐藏门禁模式
 
 **Deterministic Ticket Fallback（Ticket 确定性集成兜底）**:
-每组配对的 Ticket Development 与 Review Budget Window 最多包含四次 Development Attempt 与三次 Reviewer Invocation：初始 Development 1 后执行 Reviewer 1；失败则 Development 2 后执行 Reviewer 2；再次失败则 Development 3 后执行 Reviewer 3；第三次仍失败且仍有普通 Development 名额时执行最后一次 Development 4。Finding、Git Integrity 或可修复 Required Check 失败通常复用这一条时间线，实际发生的 Development 和 Reviewer 分别消耗对应统一预算；每个新 Candidate 只要仍有 Reviewer 名额就使用下一次 Reviewer，三次名额已耗尽才不再审查。若其他失败已提前耗尽四次 Development，任一 Reviewer 的失败 Findings 都不得以未修复 Candidate 进入兜底，而是直接以 `modification_budget_exhausted` 等待人工 `resume`。只有最后一次 Reviewer Artifact 已作为后续 Development Brief 输入并产生新 Candidate、且 Review 名额确已耗尽时，才能进入 Deterministic Ticket Fallback；Controller 不判断其中哪些 Findings 已关闭。该 Candidate 不运行 Controller 本地代码 Validation、changed-surface 命令或 `git diff --check` 代码门禁；Controller 只保留 Git Integrity Check，并以 Fallback Publication Receipt 复用现有 Publication 阶段创建或更新普通 Ticket PR，不增加 provisional PR 类型或并行流水线。Controller 在准确 PR head 上读取 Required Checks Observation：`result=pass` 表示配置的必需检查全部通过；`result=none` 表示仓库没有配置必需检查，形成 Deterministic Integration Record 时不得声称运行过 CI，并允许 Published-Head Gate 合入 Run Branch。唯一预算例外是 Final CI-fix Allowance：四次普通 Development 已耗尽后，任一已发布 Ticket PR 首次出现经 CI Failure Evidence 分类确认的可修复 Required Checks 失败时，可允许同一 Development Thread 额外执行一次 `attempt_kind=final_ci_fix`。修复后的新 Candidate 先通过 Git Integrity；仍有 Reviewer 名额时必须使用下一次 Fresh Acceptance，Reviewer 通过后再更新 PR 并运行准确新 head 的 CI；Reviewer 名额已耗尽时不创建额外 Reviewer，直接按 Fallback Publication Receipt 更新 PR 并运行 CI。Reviewer 失败、准确新 head 再次出现可修复 CI 失败或 Final CI-fix 后 Git Integrity 失败都等待人工 `resume`。其他 Git Integrity 或可修复 Required Check 失败按普通 Development Attempt 和四次预算处理；pending、未知、证据不完整或矛盾、未配置 code-failure step、cancelled、runner 与暂时平台错误只进入有界 Controller 监督，不启动 Agent 或消耗 Development/Review 预算。该路径适用于所有 Ticket，并将已使用 Reviewer Artifacts、最后一次 Reviewer Artifact 之后的 Development Summary 与代码 delta、Final CI-fix 使用情况及 Required Checks Observation 保留给 Run Acceptance，不产生或伪造 Fresh Acceptance pass。
-_Avoid_: Controller 本地代码 Validation、changed-surface 配置、独立 validation-fix/Git-fix、多个 Final CI-fix、超过三次 Reviewer、还有 Reviewer 名额却跳过审查、把未配置 CI 记为通过、伪造 Acceptance Artifact、伪造失败 Findings、把 Run Branch 集成当作默认分支交付
+每组配对的 Ticket Development 与 Review Budget Window 按有效 Run Policy Snapshot 的 Ticket Review 轮数 `N` 最多包含 `N+1` 次 Development Attempt 与 `N` 次 Reviewer Invocation，内置默认 `N=3`：初始 Development 1 后执行 Reviewer 1；每次失败都由下一次 Development 处理，并在仍有 Reviewer 名额时进入下一次 Reviewer；Reviewer N 仍失败且仍有普通 Development 名额时执行最后一次 Development N+1。Finding、Git Integrity 或可修复 Required Check 失败通常复用这一条时间线，实际发生的 Development 和 Reviewer 分别消耗对应统一预算；每个新 Candidate 只要仍有 Reviewer 名额就使用下一次 Reviewer，`N` 次名额已耗尽才不再审查。若其他失败已提前耗尽 `N+1` 次 Development，任一 Reviewer 的失败 Findings 都不得以未修复 Candidate 进入兜底，而是直接以 `modification_budget_exhausted` 等待人工 `resume`。只有最后一次 Reviewer Artifact 已作为后续 Development Brief 输入并产生新 Candidate、且 Review 名额确已耗尽时，才能进入 Deterministic Ticket Fallback；Controller 不判断其中哪些 Findings 已关闭。该 Candidate 不运行 Controller 本地代码 Validation、changed-surface 命令或 `git diff --check` 代码门禁；Controller 只保留 Git Integrity Check，并以 Fallback Publication Receipt 复用现有 Publication 阶段创建或更新普通 Ticket PR，不增加 provisional PR 类型或并行流水线。Controller 在准确 PR head 上读取 Required Checks Observation：`result=pass` 表示配置的必需检查全部通过；`result=none` 表示仓库没有配置必需检查，形成 Deterministic Integration Record 时不得声称运行过 CI，并允许 Published-Head Gate 合入 Run Branch。唯一预算例外是 Final CI-fix Allowance：`N+1` 次普通 Development 已耗尽后，任一已发布 Ticket PR 首次出现经 CI Failure Evidence 分类确认的可修复 Required Checks 失败时，可允许同一 Development Thread 额外执行一次 `attempt_kind=final_ci_fix`。修复后的新 Candidate 先通过 Git Integrity；仍有 Reviewer 名额时必须使用下一次 Fresh Acceptance，Reviewer 通过后再更新 PR 并运行准确新 head 的 CI；Reviewer 名额已耗尽时不创建额外 Reviewer，直接按 Fallback Publication Receipt 更新 PR 并运行 CI。Reviewer 失败、准确新 head 再次出现可修复 CI 失败或 Final CI-fix 后 Git Integrity 失败都等待人工 `resume`。其他 Git Integrity 或可修复 Required Check 失败按普通 Development Attempt 和 `N+1` 次预算处理；pending、未知、证据不完整或矛盾、未配置 code-failure step、cancelled、runner 与暂时平台错误只进入有界 Controller 监督，不启动 Agent 或消耗 Development/Review 预算。该路径适用于所有 Ticket，并将已使用 Reviewer Artifacts、最后一次 Reviewer Artifact 之后的 Development Summary 与代码 delta、Final CI-fix 使用情况及 Required Checks Observation 保留给 Run Acceptance，不产生或伪造 Fresh Acceptance pass。
+_Avoid_: Controller 本地代码 Validation、changed-surface 配置、独立 validation-fix/Git-fix、多个 Final CI-fix、超过策略上限的 Reviewer、还有 Reviewer 名额却跳过审查、把未配置 CI 记为通过、伪造 Acceptance Artifact、伪造失败 Findings、把 Run Branch 集成当作默认分支交付
 
 **Fallback Publication Receipt（兜底发布凭据）**:
 Ticket Review 预算耗尽后，Controller 为准确 base、Candidate SHA/tree、Effective Revision、配对的 Development/Review Budget Window、已使用的 Reviewer Invocations 及其准确 Artifact/Reviewed Candidate、最后一次 Reviewer Artifact、随后 Development Attempt 的 Summary 与代码 delta、`final_ci_fix_used` 及适用时的原 CI 失败证据与修复 delta，以及 Publication 前适用的 Git Integrity 结果形成的不可变发布凭据。Controller 只记录这些原始事实，不判断 Findings 的 closure 状态。它只授权 Publisher 沿现有 Publication 阶段创建或更新普通 Ticket PR，以便 GitHub 对准确 head 运行 Required Checks；推送、live head 与合并阶段仍分别执行当时适用的 Git Integrity Check。它不构成 Ticket Integration Gate、Acceptance Record、测试通过证据或进入 Run Branch 的权限。任何新 Candidate、base/head 或 Revision 变化都使旧凭据失效并要求生成后继凭据。
@@ -416,14 +416,12 @@ _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方�
 _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
 
 **Human Blocker（人工阻塞）**:
-顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 以一个或多个 `blocked` lane 的 evidence 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；可选的不可变 Human Response 仅绑定当前 Job Generation，按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。恢复成功后当前 blocker 告警会清除，原始 blocker/response 尝试按顺序保留。
+顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 以一个或多个 `blocked` lane 的 evidence 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；维护者可不附加响应直接授权 Agent 重新核验，也可提供仅绑定当前 Job Generation 的不可变 Human Response，后者按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。任何当前顶层 Work Subject（包括 Ticket/Parent-only Change Job、Run Acceptance 与 Run Publication）产生 Human Blocker 都建立 Run-wide Operator Gate；恢复成功后当前 blocker 告警和全局门禁会清除，原始 blocker/response 尝试按顺序保留。
 _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
 **Human Response（人工响应）**:
-维护者通过 `agent-run resume <run-id> --message "..."` 为当前 Human Blocker 提供的原样、不可变
-上下文。它 trim 后必须非空且最多 8 KiB，按顺序只绑定当前 Job Generation，进入后续 Development 与
-Fresh Acceptance；它不适用于 `execution_failed`、不修改 Issue、不触发 Requeue，也不等同于 Run
-Feedback Revision。替换 Generation 从空序列开始。
+维护者通过 `agent-run resume <parent-issue> --message "..."` 为当前 Human Blocker 提供的原样、不可变
+上下文。Controller 只做 trim 后非空和最多 8 KiB 两项机械输入边界，不判断内容正确性、不检测敏感信息，也不改写、过滤或摘要；通过边界后的文本原样按顺序绑定当前 Job Generation，进入后续 Development 与 Fresh Acceptance。它不适用于 `execution_failed`、不修改 Issue、不触发 Requeue，也不等同于 Run Feedback Revision。替换 Generation 从空序列开始。
 _Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
 
 **Review Finding（审查发现）**:
@@ -431,7 +429,7 @@ Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和�
 _Avoid_: 风格意见、无证据猜测、实现方案命令
 
 **Acceptance Repair Loop（验收修复循环）**:
-Fresh Acceptance 要求修改时，Controller 将原始 Acceptance Artifact 作为新的 Development Brief 输入，在同一 Change Job、working branch 与 Development Thread 上开始新的 Development Attempt。修复后必须重新自测、通过 Git 完整性检查并创建新 Candidate；Review 预算尚未耗尽时，由新的 Fresh Acceptance Reviewer Thread 验收。Ticket 的第三次 Reviewer Invocation 仍失败且仍有普通 Development 名额时，下一次 Development 处理其 Findings 后改走 Deterministic Ticket Fallback；若四次 Development 已因其他失败提前耗尽，则不得发布未修复 Candidate，直接以 `modification_budget_exhausted` 等待人工 `resume`。Run 的第五次 Reviewer Invocation 仍失败时进入 Review Budget Checkpoint。Reviewer 本身不修改代码。
+Fresh Acceptance 要求修改时，Controller 将原始 Acceptance Artifact 作为新的 Development Brief 输入，在同一 Change Job、working branch 与 Development Thread 上开始新的 Development Attempt。修复后必须重新自测、通过 Git 完整性检查并创建新 Candidate；Review 预算尚未耗尽时，由新的 Fresh Acceptance Reviewer Thread 验收。Ticket 的 Reviewer N 仍失败且仍有普通 Development 名额时，下一次 Development 处理其 Findings 后改走 Deterministic Ticket Fallback；若 `N+1` 次 Development 已因其他失败提前耗尽，则不得发布未修复 Candidate，直接以 `modification_budget_exhausted` 等待人工 `resume`。Run 的 Reviewer N+1 仍失败时进入 Review Budget Checkpoint；这里的 `N` 均来自对应层级的有效 Run Policy Snapshot。Reviewer 本身不修改代码。
 _Avoid_: Reviewer 直接修复、创建新 Ticket Job、复用旧验收结论
 
 **Published-Head Gate（已发布 Head 门禁）**:
@@ -451,12 +449,48 @@ Required Checks Observation 为 `fail` 后，Controller 针对同一准确 PR he
 _Avoid_: Required Checks Observation、pending evidence、汇总结果、未绑定 head 的失败日志
 
 **Hosted CI Gate（托管 CI 门禁）**:
-任何 Published PR 推送后由 GitHub Ruleset 或 branch protection 针对 live head SHA 声明的 Required Checks 自动测试门禁，适用于 Ticket PR、Run Repair PR 和 Run PR。Controller 直接读取适用于 PR base 的 GitHub 配置及准确 PR head 上的 Required Checks Observation，不把存在 workflow 文件本身当作必过门禁，普通非必需 Check 不参与自动门禁，Publisher 不得使用 Ruleset bypass 权限绕过 Required Checks。Ticket PR 存在 Required Checks 时必须全部通过，并复用 Run Repair 已有的 CI Failure Evidence 分类：只有 GitHub 已给出 `FAILURE`、completed Actions job 准确绑定当前 PR head，且 job steps 证明失败只发生在仓库 `pyproject.toml` 的 `tool.agent-run.required-checks.code-failure-steps` 所列 `workflow::name::step` 时，才保存 CI Failure Evidence 并以 `repair_source=required_checks` 返回现有 Ticket Development Thread。四次普通 Development 尚未耗尽时按普通 Development Attempt 计数；已经耗尽时只可使用一次 Final CI-fix Allowance，额外 Development 标记 `attempt_kind=final_ci_fix`。Final CI-fix 新 Candidate 仍有 Reviewer 名额时必须执行下一次 Fresh Acceptance，没有名额时才不审查并直接重新发布；无论哪条路径，准确新 head 再次出现可修复 CI 失败即等待人工 `resume`。pending、未知、缺少或矛盾的 job/step 事实、未配置 code-failure step、cancelled、runner 与暂时平台错误只进入 Controller 的 Required Checks 有界监督，不启动 Agent，也不消耗 Development、Review 或 Final CI-fix 额度；监督到期进入 Supervision Timeout Pause，可由 `run` 或 `resume` 继续读取，但不创建新预算窗口。Ticket PR 的 Observation 为 `result=none` 时按仓库无强制 CI 处理，不触发 Development、Final CI-fix、暂停或人工 `resume`，也不宣称 CI 运行或通过。Ticket 新 Candidate 使旧 Acceptance、Fallback Publication Receipt、Deterministic Integration Record 与 Required Checks Observation 失效，并按剩余 Reviewer/Development/Final CI-fix 额度继续。Run Repair PR、Run PR 与 Parent-only PR 的失败仍按各自既有 Job Contract、CI Failure Evidence 分类、Repair Cycle 和 Controller 监督规则处理，不由本次 Ticket 优化改写。
-_Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acceptance、独立 Ticket CI-fix 阶段、多个 Final CI-fix、超过三次 Reviewer、还有 Reviewer 名额却跳过审查、把 `result=none` 伪装成 CI pass、把 Ticket 策略隐式扩展到 Run
+任何 Published PR 推送后由 GitHub Ruleset 或 branch protection 针对 live head SHA 声明的 Required Checks 自动测试门禁，适用于 Ticket PR、Run Repair PR 和 Run PR。Controller 直接读取适用于 PR base 的 GitHub 配置及准确 PR head 上的 Required Checks Observation，不把存在 workflow 文件本身当作必过门禁，普通非必需 Check 不参与自动门禁，Publisher 不得使用 Ruleset bypass 权限绕过 Required Checks。Ticket PR 存在 Required Checks 时必须全部通过，并复用 Run Repair 已有的 CI Failure Evidence 分类：只有 GitHub 已给出 `FAILURE`、completed Actions job 准确绑定当前 PR head，且 job steps 证明失败只发生在仓库 `pyproject.toml` 的 `tool.agent-run.required-checks.code-failure-steps` 所列 `workflow::name::step` 时，才保存 CI Failure Evidence 并以 `repair_source=required_checks` 返回现有 Ticket Development Thread。有效 Run Policy Snapshot 推导的 `N+1` 次普通 Development 尚未耗尽时按普通 Development Attempt 计数；已经耗尽时只可使用一次 Final CI-fix Allowance，额外 Development 标记 `attempt_kind=final_ci_fix`。Final CI-fix 新 Candidate 仍有 Reviewer 名额时必须执行下一次 Fresh Acceptance，没有名额时才不审查并直接重新发布；无论哪条路径，准确新 head 再次出现可修复 CI 失败即等待人工 `resume`。pending、未知、缺少或矛盾的 job/step 事实、未配置 code-failure step、cancelled、runner 与暂时平台错误只进入 Controller 的 Required Checks 有界监督，不启动 Agent，也不消耗 Development、Review 或 Final CI-fix 额度；监督到期进入 Supervision Timeout Pause，可由 `run` 或 `resume` 继续读取，但不创建新预算窗口。Ticket PR 的 Observation 为 `result=none` 时按仓库无强制 CI 处理，不触发 Development、Final CI-fix、暂停或人工 `resume`，也不宣称 CI 运行或通过。Ticket 新 Candidate 使旧 Acceptance、Fallback Publication Receipt、Deterministic Integration Record 与 Required Checks Observation 失效，并按剩余 Reviewer/Development/Final CI-fix 额度继续。Run Repair PR、Run PR 与 Parent-only PR 的失败仍按各自既有 Job Contract、CI Failure Evidence 分类、Repair Cycle 和 Controller 监督规则处理，不由本次 Ticket 优化改写。
+_Avoid_: Development Codex 自测、Controller 本地测试执行器、Fresh Acceptance、独立 Ticket CI-fix 阶段、多个 Final CI-fix、超过策略上限的 Reviewer、还有 Reviewer 名额却跳过审查、把 `result=none` 伪装成 CI pass、把 Ticket 策略隐式扩展到 Run
 
 **Acceptance Record（验收记录）**:
 Development–Acceptance Engine 在独立验收后本地持久化的权威记录，将唯一一份 Acceptance Artifact 绑定到 acceptance scope、reviewed base、已验收 Candidate 或 Run head、对应 tree 或预期合并结果、有效 Revision 和 Reviewer 身份。Controller 从 Artifact 的三个 lane 推导通过、返工或人工阻塞；正常验收路径只有仍然 current 的三个 lane 全部 `pass` 可以授权 Publication。Ticket Review 预算耗尽后的 Fallback Publication Receipt 是只授权创建或更新 PR 的显式例外，不构成 Acceptance Record，也不授权合并。后续 Attempt 替换当前 Record，历史只按恢复需要有界保留，GitHub 只接收简洁的 Agent Run Status 投影。
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
+
+**Delivery Progress View（交付进度视图）**:
+`status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
+_Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
+
+**Operator Action View（操作者动作视图）**:
+Delivery Progress View 在 Run 需要维护者介入时采用的统一区块，固定说明准确类型、所在 Ticket/Parent Issue 或 Run 对象与阶段、原因、已保留成果、整个 Run 已暂停，以及唯一允许的下一步；Human Blocker 额外显示触发阻塞的 Agent 角色、模型、推理强度与本轮时长。Human Blocker、Review Budget Checkpoint、Execution Failure、Supervision Timeout Pause、Requeue Required 与最终批准继续保留各自真实语义，不因共享版式而被统称为 Human Blocker。
+_Avoid_: 把所有暂停叫作 Human Blocker、只显示内部状态码、缺少恢复动作、声称其他 Ticket 仍在推进
+
+**Run-wide Operator Gate（运行级人工门禁）**:
+当前顶层 Work Subject（包括 Ticket/Parent-only Change Job、Run Acceptance 与 Run Publication）到达任何必须由维护者明确处理的状态时建立的 Delivery Run 全局暂停；它在 Controller 选择另一个 Ticket 或进入下一顶层阶段前生效，保留准确阻塞对象和现有成果，并只允许该门禁对应的恢复或终止动作。Human Blocker、Review Budget Checkpoint、Execution Failure、确定性外部矛盾及其他 Operator Action View 状态都建立该门禁；普通 Ticket DAG 依赖、triage 不可领取状态和仍在监督预算内的异步等待不是人工门禁，Controller 仍可选择其他符合条件的 Ticket。新规范 Run 不积累多个 Ticket 人工门禁；当前门禁解除且原 Work Subject 恢复或收口后，Controller 才选择下一个 Ticket 或顶层阶段。
+_Avoid_: Ticket 局部人工门禁、门禁期间切换 frontier、把普通依赖等待当作人工门禁、积累多个待选 blocker
+
+**Human Run Selector（人类运行选择器）**:
+操作者为只读 `status`、`history` 与 Run 发现命令选择 Delivery Run 的面向用户身份。当前仓库仅有一个进行中 Run 时可省略选择参数；当前仓库内可用 `--parent <issue-number>` 选择 Parent，任意目录可用 `--repo <owner/name> --parent <issue-number>` 组成跨项目选择器，`runs` 可按当前仓库或显式 `--repo` 列出候选。若同一仓库与 Parent 仍匹配多个 Run 或多个本地 clone，Controller 不根据最近时间猜测，而是显示仓库工作目录、Parent、状态与开始时间并要求进一步消歧。完整不透明 Run ID 与显式 `--state-dir` 继续用于自动化、精确排障和歧义恢复，但不是普通用户需要记忆或默认展示的身份。
+_Avoid_: 把 Parent Issue 当成全局唯一身份、全局 `latest` 猜测、要求用户记住哈希式 Run ID、模糊前缀匹配
+
+**Lifecycle Parent Selector（生命周期 Parent 选择器）**:
+操作者为当前仓库中的 mutation 命令选择 Delivery Run 的现有用户合同：`run` 与 `resume` 都以位置参数形式接收 Parent Issue number，并可用显式 repository identity 校验目标；`resume` 只允许匹配一个已存在且处于可恢复人工门禁的 Run，不创建新 Run，也不根据最近时间猜测。完整不透明 Run ID 只保留给自动化、精确排障和歧义恢复，不是普通恢复流程的必填身份。
+_Avoid_: 为 resume 另造 `--parent` 语法、把 Parent Issue 当成跨仓库身份、resume 隐式创建 Run、最近 Run 猜测
+
+**Machine Audit View（机器审计视图）**:
+`status --json` 与 `history --json` 提供的稳定机器可读视图，保留诊断、自动化和精确审计所需的内部身份、版本绑定、调用记录与计数层级。
+_Avoid_: 默认交付进度视图、面向用户的叙事摘要
+
+**Operator Display Time（操作者显示时间）**:
+Delivery Progress View 中的事件时间使用执行 `status` 或 `history` 的设备本地时区渲染，并明确标注所用时区；设备时区不可用时回退到 UTC 并明确提示。
+_Avoid_: 直接展示持久化 UTC、无时区时间、根据仓库推断时区
+
+**Delivery Policy（交付策略）**:
+操作者拥有的语义轮次与按角色 Invocation Deadline 规则，来源优先级为内置默认、用户级默认和单次命令覆盖；仓库内容不能自行扩大操作者的 Agent 成本或运行时长。Ticket、Parent-only 与 Run 继续复用同一预算记录、门禁和恢复机制，但分别用与自身时间线匹配的轮次推导策略：Ticket Review 轮数 `N` 推导 Development 上限 `N+1`，前 `N` 组 Development/Review 配对后保留最后一次无 Review 的 Development Fallback；Run Repair 轮数 `N` 推导 Development 上限 `N` 与包含初始验收的 Reviewer 上限 `N+1`；Parent-only 轮数 `N` 推导 Development 与 Reviewer 都为 `N`。内置默认分别为 Ticket Review 3、Run Repair 10、Parent-only 10。Invocation Deadline 的内置默认是 Development 5 小时、Review 2 小时、Publication 1 小时，并允许用户级默认和单次命令按角色覆盖。
+_Avoid_: 独立配置出无法闭环的 Development/Review 组合、仓库级资源预算、动态读取的运行中策略、Agent 自选预算
+
+**Run Policy Snapshot（运行策略快照）**:
+Delivery Run 创建或维护者显式开启新预算窗口时解析并保存的准确 Delivery Policy；已开始的预算窗口不因外部默认配置变化而改变。本策略与 Invocation Deadline 采用一次明确的规范状态协议切换：缺少 Policy Snapshot 的旧 Run 不迁移、不兼容推进，也不根据旧 Attempt 或当前默认值反推策略；只有按新协议创建的 Run 可以继续生命周期命令。
+_Avoid_: 每次命令重新读取默认值、追溯改写已消耗预算、推断或迁移旧 Run、仓库隐式覆盖
 
 **Agent Invocation（Agent 调用）**:
 Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
@@ -464,7 +498,7 @@ Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output At
 并绑定 Work Subject、Generation、输入指纹、机械 Currentness Boundary、当前 Semantic Agent Attempt 与实际 Thread Execution Binding；记录只保存输入指纹、有界边界事实、model、reasoning effort 与 Agent Profile Revision，
 不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
 立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
-checkout 只读，且不增加领域 Development Attempt、Reviewer Invocation 或 Publication Attempt。进程失败、缺失或
+checkout 只读，且不增加领域 Development Attempt、Reviewer Invocation 或 Publication Attempt。一个 Invocation 只有一个覆盖初始 Output Attempt 与其 Output Repair 的按角色总 Deadline；Development 默认五小时，Review 默认两小时，Publication 默认一小时，均可由 Run Policy Snapshot 中的角色覆盖值替代。successor Invocation 获得新的完整角色 Deadline，但仍可属于同一个 Semantic Agent Attempt。进程失败、缺失或
 不匹配的 Thread 只结束当前 Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原
 Thread，或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
@@ -509,7 +543,7 @@ Publication attempt，也不适用于进程、凭据、sandbox、timeout、signa
 _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
-维护者以 `agent-run resume <run-id>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
+维护者以 `agent-run resume <parent-issue>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
 successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
 但不把新 Attempt 伪装成旧窗口的额外轮次。若检查点保留了尚需修改代码的准确失败证据，successor Invocation 必须先把该证据交回原 Development Thread，产生新 Candidate 后才启动新窗口的 Reviewer 1；尤其是 Final CI-fix 后准确 PR head 的 Required Checks 再失败时，不得先审查未变化且已知 CI 失败的 Candidate。`--new-thread` 或无可恢复 Thread 时才以该阶段完整标准 Prompt
 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale
@@ -517,28 +551,28 @@ successor Invocation。若失败 Invocation 属于一次已分配且尚未收口
 _Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
 
 **Review Budget Checkpoint（审查预算检查点）**:
-Run 或 Parent-only 已到达当前 Review Budget Window 的自动边界，且仍有明确失败证据时形成的 `ready-for-human` 暂停。Controller 保留当前 Candidate、准确 Findings、Thread、PR 与所有旧窗口用量，不自动启动下一次 Development 或 Reviewer。维护者显式执行 `agent-run resume <run-id>` 即表示允许继续：在 Currentness Boundary 仍有效时同时开启该层级新的 Review Budget Window 和新的代码修复预算窗口，先把未解决证据交回原 Development Thread 修复；历史用量不删除，只是新窗口从零开始。Ticket 用尽三次 Reviewer Invocation 且最后 Findings 已由后续 Development 处理产生新 Candidate 时，直接进入 Deterministic Ticket Fallback，不进入本 Checkpoint。Reviewer Finding 或 Git Integrity 失败时已无普通 Development 名额、可修复 CI 失败时普通 Development 与 Final CI-fix 均不可用、Final CI-fix 后 Reviewer 失败，或该修复后的准确新 head 再次出现可修复 CI 失败，才以 `modification_budget_exhausted` 等待人工恢复；其他 CI 状态只进入有界监督。
+Run 或 Parent-only 已到达当前 Review Budget Window 的自动边界，且仍有明确失败证据时形成的 `ready-for-human` 暂停。Controller 保留当前 Candidate、准确 Findings、Thread、PR 与所有旧窗口用量，不自动启动下一次 Development 或 Reviewer。维护者显式执行 `agent-run resume <parent-issue>` 即表示允许继续：在 Currentness Boundary 仍有效时同时开启该层级新的 Review Budget Window 和新的代码修复预算窗口，先把未解决证据交回原 Development Thread 修复；历史用量不删除，只是新窗口从零开始。Ticket 用尽有效 Policy Snapshot 的 `N` 次 Reviewer Invocation 且最后 Findings 已由后续 Development 处理产生新 Candidate 时，直接进入 Deterministic Ticket Fallback，不进入本 Checkpoint。Reviewer Finding 或 Git Integrity 失败时已无普通 Development 名额、可修复 CI 失败时普通 Development 与 Final CI-fix 均不可用、Final CI-fix 后 Reviewer 失败，或该修复后的准确新 head 再次出现可修复 CI 失败，才以 `modification_budget_exhausted` 等待人工恢复；其他 CI 状态只进入有界监督。
 _Avoid_: Ticket Review 预算耗尽、Human Blocker、自动续期、清零历史、Resume 后先重审未修改 Candidate
 
 **Ticket Review Budget Window（Ticket 审查预算窗口）**:
-同一 Ticket Job Generation 内一次明确授权的、最多三次 Reviewer Invocation 的审计单元。初始 Development 后的 Reviewer 1，以及任何 Finding、Git Integrity 或可修复 Required Check 失败后产生新 Candidate 时仍可使用的 Reviewer 2 和 Reviewer 3 消耗该窗口；第三次仍失败后的最终 Development、Review 名额耗尽后的 PR/Required Checks 兜底、Final CI-fix 与 Required Checks 等待都不增加 Reviewer 次数。任何新 Candidate 尚有名额时必须使用下一次 Reviewer；名额耗尽且最近 Reviewer Findings 已由后续 Development 处理时直接改走 Deterministic Ticket Fallback，不暂停为 `review_budget_exhausted`。若其他失败已提前耗尽四次 Development，Reviewer 失败后没有普通 Development 名额，则不得把该未修复 Candidate 兜底发布；Final CI-fix 不能转用于 Reviewer Finding 或 Git Integrity 失败。已发布 PR 的可修复 CI 失败通常返回普通 Development Attempt，并受统一四次 Development 预算约束；普通预算耗尽时可使用一次 Final CI-fix，修复后的新 Candidate 仍按剩余 Reviewer 名额决定是否 Fresh Acceptance。没有适用额度、Final CI-fix 后 Reviewer 失败或准确新 head 再次出现可修复 CI 失败时以 `modification_budget_exhausted` 等待 `resume`；其他 CI 状态只进入有界监督。恢复后同时创建有编号的新 Ticket Review 与 Development 窗口并重置 Final CI-fix Allowance。既有用量与证据继续保留而不被清零或覆盖。
+同一 Ticket Job Generation 内一次明确授权的、最多 `N` 次 Reviewer Invocation 的审计单元；`N` 来自有效 Run Policy Snapshot，内置默认 `N=3`。初始 Development 后的 Reviewer 1，以及任何 Finding、Git Integrity 或可修复 Required Check 失败后产生新 Candidate 时仍可使用的 Reviewer 2 至 Reviewer N 消耗该窗口；Reviewer N 仍失败后的最终 Development、Review 名额耗尽后的 PR/Required Checks 兜底、Final CI-fix 与 Required Checks 等待都不增加 Reviewer 次数。任何新 Candidate 尚有名额时必须使用下一次 Reviewer；名额耗尽且最近 Reviewer Findings 已由后续 Development 处理时直接改走 Deterministic Ticket Fallback，不暂停为 `review_budget_exhausted`。若其他失败已提前耗尽 `N+1` 次 Development，Reviewer 失败后没有普通 Development 名额，则不得把该未修复 Candidate 兜底发布；Final CI-fix 不能转用于 Reviewer Finding 或 Git Integrity 失败。已发布 PR 的可修复 CI 失败通常返回普通 Development Attempt，并受统一 `N+1` 次 Development 预算约束；普通预算耗尽时可使用一次 Final CI-fix，修复后的新 Candidate 仍按剩余 Reviewer 名额决定是否 Fresh Acceptance。没有适用额度、Final CI-fix 后 Reviewer 失败或准确新 head 再次出现可修复 CI 失败时以 `modification_budget_exhausted` 等待 `resume`；其他 CI 状态只进入有界监督。恢复后同时创建有编号的新 Ticket Review 与 Development 窗口并重置 Final CI-fix Allowance。既有用量与证据继续保留而不被清零或覆盖。
 _Avoid_: 两次 Repair Cycle、Reviewer 内部 subagent、Required Check 重跑、独立 validation-fix/Git-fix、多个 Final CI-fix、隐式续期
 
 **Run Review Budget Window（Run 审查预算窗口）**:
-同一 Run Acceptance Generation 内一次明确授权的、最多五次 Run Reviewer Invocation 的审计单元。每个新 Candidate 或新的准确预期合并结果接受完整 Run Acceptance 时消耗一次；Reviewer 内部工作、Output Repair、执行失败、等待和确定性 currentness 检查不计数。每次 Reviewer 都调用 `code-review` skill。Reviewer 1 建立完整基线；Reviewer 2–5 只额外获得上一轮 Acceptance Artifact 的完整原始内容及其 default base、Run head 与 expected merge tree identity，Prompt 建议优先参考上轮问题和当前 Repair，但 Reviewer 自主决定检查顺序、范围以及是否全量审核。第五次仍产生可修复 Finding 时进入 Review Budget Checkpoint，不使用 Ticket 的确定性集成兜底；维护者显式 `resume` 可在 Currentness Boundary 仍有效时创建有编号的新五次窗口，先修复第五次 Findings，再由新窗口 Reviewer 1 验收；所有旧窗口的用量、Findings 与修复历史继续保留。该 Prompt 优化不改变 Run Acceptance、CI Failure Evidence、Repair Cycle、Publication 或合并状态机。Parent-only Delivery 复用同一预算、上一轮 Artifact 完整内容注入倾向与失败语义，只由 Job Contract 提供 Parent-only 范围。
-_Avoid_: Ticket Review Budget Window、十次代码修改预算、第五次失败后自动 Repair、第六次隐式 Reviewer
+同一 Run Acceptance Generation 内一次明确授权的、最多 `N+1` 次 Run Reviewer Invocation 与 `N` 次 Run Development 的审计单元；`N` 来自有效 Run Policy Snapshot 的 Run Repair 轮数，内置默认 `N=10`。初始 Run Reviewer 不依赖 Run Development；每次 Run Development 都必须属于一个包含后继 Reviewer 的完整 Run Repair Round。每个新 Candidate 或新的准确预期合并结果接受完整 Run Acceptance 时消耗一次；Reviewer 已形成合法 Acceptance Artifact 后即消耗额度，即使随后因 Currentness Boundary 漂移而废弃该结论。Reviewer 内部工作、Output Repair、执行失败、等待和未启动 Reviewer 的确定性 currentness 检查不计数。每次 Reviewer 都调用 `code-review` skill。Reviewer 1 建立完整基线；Reviewer 2–N+1 只额外获得上一轮 Acceptance Artifact 的完整原始内容及其 default base、Run head 与 expected merge tree identity，Prompt 建议优先参考上轮问题和当前 Repair，但 Reviewer 自主决定检查顺序、范围以及是否全量审核。Reviewer N+1 仍产生可修复 Finding 时进入 Review Budget Checkpoint，不使用 Ticket 的确定性集成兜底；维护者显式 `resume` 可在 Currentness Boundary 仍有效时创建有编号的新窗口，先修复 Reviewer N+1 的 Findings，再由新窗口 Reviewer 1 验收；所有旧窗口的用量、Findings 与修复历史继续保留。该 Prompt 优化不改变 Run Acceptance、CI Failure Evidence、Repair Cycle、Publication 或合并状态机。Parent-only 复用相同的预算记录、门禁、Artifact 和 Resume 机制，只使用等量 Development/Reviewer 的配对推导策略，而不复用本窗口的 `N+1` Reviewer 拓扑。
+_Avoid_: Ticket Review Budget Window、把 `N` 次 Development 与 `N+1` 次 Reviewer 混成一个计数、Reviewer N+1 失败后自动 Repair、隐式额外 Reviewer
 
 **Ticket Development Budget（Ticket 开发预算）**:
-一个 Ticket Job 的每个 Ticket Development Budget Window 对初始开发以及 Finding、Git Integrity 和可修复 Required Check 失败后实际启动的普通 Development Attempt 提供统一四次上限。等待 CI、失败检查本身、重复读取状态、基础设施或未知 CI 状态以及对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的 Development Attempt 才计数；不存在 validation-fix 或 Git-fix 专用额度。普通四次预算耗尽后，任一已发布 Ticket PR 首次出现可修复 Required Checks 失败可使用一次 Final CI-fix Allowance；它仍复用 Development Thread，以 `attempt_kind=final_ci_fix` 独立记录，但不增加 Reviewer 额度。新 Candidate 尚有 Reviewer 名额时必须审查，没有名额时才直接重新发布并运行 CI。没有适用 Final CI-fix、额外修复后的 Reviewer 失败或准确新 head 再次出现可修复 CI 失败时，Ticket 转为 `ready-for-human`，保留 Candidate、PR、findings、失败证据与历史；不可归因于代码的 CI 状态只走有界监督。只有维护者显式 Resume 才能创建有编号的新 Review 与 Development 窗口并重置 Final CI-fix Allowance；Controller 继续推进不依赖该 Ticket 的其他任务。
+一个 Ticket Job 的每个 Ticket Development Budget Window 对初始开发以及 Finding、Git Integrity 和可修复 Required Check 失败后实际启动的普通 Development Attempt 提供统一 `N+1` 次上限；`N` 是有效 Run Policy Snapshot 的 Ticket Review 轮数，内置默认 `N=3`。等待 CI、失败检查本身、重复读取状态、基础设施或未知 CI 状态以及对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的 Development Attempt 才计数；不存在 validation-fix 或 Git-fix 专用额度。普通 `N+1` 次预算耗尽后，任一已发布 Ticket PR 首次出现可修复 Required Checks 失败可使用一次 Final CI-fix Allowance；它仍复用 Development Thread，以 `attempt_kind=final_ci_fix` 独立记录，但不增加 Reviewer 额度。新 Candidate 尚有 Reviewer 名额时必须审查，没有名额时才直接重新发布并运行 CI。没有适用 Final CI-fix、额外修复后的 Reviewer 失败或准确新 head 再次出现可修复 CI 失败时，Ticket 转为 `ready-for-human`，保留 Candidate、PR、findings、失败证据与历史，并建立 Run-wide Operator Gate；不可归因于代码的 CI 状态只走有界监督。只有维护者显式 Resume 才能创建有编号的新 Review 与 Development 窗口并重置 Final CI-fix Allowance；门禁解除并收口该 Ticket 后，Controller 才能选择其他任务。
 _Avoid_: CI 等待次数、同一 SHA 重复审查、无限重试
 
 **Ticket Development Budget Window（Ticket 开发预算窗口）**:
-同一 Ticket Job Generation 内一次明确授权的、最多四次普通 Development Attempt 加一次条件式 Final CI-fix 的审计单元，初始 Development 1 计入普通四次。它由持久的窗口编号、普通 Development 消耗次数和 `final_ci_fix_used` 表达；Final CI-fix 在四次普通 Development 耗尽后任一已发布 Ticket PR 首次出现经 CI Failure Evidence 分类确认的可修复 Required Checks 失败时可用，不能转给 Finding、Git Integrity、基础设施或其他失败。它不增加 Reviewer 额度：修复后的新 Candidate 有剩余 Reviewer 就使用，没有才跳过。新的窗口只能由维护者显式执行 `agent-run resume <run-id>` 在 `modification_budget_exhausted` 边界创建，并复用仍 current 的 Job、PR、branch、Candidate、findings 和历史；Currentness Boundary 已 stale 时只允许 `requeue` 创建新 Generation。
+同一 Ticket Job Generation 内一次明确授权的、最多 `N+1` 次普通 Development Attempt 加一次条件式 Final CI-fix 的审计单元；`N` 是有效 Run Policy Snapshot 的 Ticket Review 轮数，内置默认 `N=3`，初始 Development 1 计入普通预算。它由持久的窗口编号、普通 Development 消耗次数和 `final_ci_fix_used` 表达；Final CI-fix 在 `N+1` 次普通 Development 耗尽后任一已发布 Ticket PR 首次出现经 CI Failure Evidence 分类确认的可修复 Required Checks 失败时可用，不能转给 Finding、Git Integrity、基础设施或其他失败。它不增加 Reviewer 额度：修复后的新 Candidate 有剩余 Reviewer 就使用，没有才跳过。新的窗口只能由维护者显式执行 `agent-run resume <parent-issue>` 在 `modification_budget_exhausted` 边界创建，并复用仍 current 的 Job、PR、branch、Candidate、findings 和历史；Currentness Boundary 已 stale 时只允许 `requeue` 创建新 Generation。
 _Avoid_: Job Generation、CI 等待窗口、隐式自动续期
 
 **Ticket Resume Command（Ticket 恢复命令）**:
-维护者通过 `agent-run resume <run-id>` 恢复当前 failed 或 Human Blocker Invocation；在
-`modification_budget_exhausted` 边界，该显式命令会同时新建有编号的 Ticket Review Budget Window 与 Ticket Development Budget Window，并重置该新窗口的 Final CI-fix Allowance。Ticket 用尽三次 Reviewer Invocation 本身不产生 `review_budget_exhausted`；最后 Findings 已由后续 Development 处理出新 Candidate 时自动进入 Deterministic Ticket Fallback，没有普通 Development 名额处理 Findings 时则产生 `modification_budget_exhausted`。
+维护者通过 `agent-run resume <parent-issue>` 恢复当前 failed 或 Human Blocker Invocation；在
+`modification_budget_exhausted` 边界，该显式命令会同时新建有编号的 Ticket Review Budget Window 与 Ticket Development Budget Window，并重置该新窗口的 Final CI-fix Allowance。Ticket 用尽有效 Run Policy Snapshot 的 `N` 次 Reviewer Invocation 本身不产生 `review_budget_exhausted`；最后 Findings 已由后续 Development 处理出新 Candidate 时自动进入 Deterministic Ticket Fallback，没有普通 Development 名额处理 Findings 时则产生 `modification_budget_exhausted`。
 若该边界保存了 Reviewer Finding、Git Integrity 或 Required Checks 失败证据，新窗口先启动普通 Development Attempt，并将准确原始证据交回原 Development Thread；只有产出新 Candidate 后才由新窗口 Reviewer 1 建立基线。Final CI-fix 后准确新 head CI 再失败也遵循此顺序，不审查未修改的失败 Candidate。
 若 preflight
 发现 Ticket Content Revision、Parent Revision 或适用 base 已变化，Controller 不启动 Codex，也不
@@ -548,8 +582,8 @@ Thread；它不重置既有窗口的消耗记录。
 _Avoid_: 隐式 Requeue、无内容变化重试、Run Feedback Revision
 
 **Progress Exhaustion（推进耗尽）**:
-Delivery Run 中已不存在可激活的 Ticket Job，但 Ticket Set 尚未全部完成的状态。单张 Ticket 转为 `ready-for-human` 不会立即造成推进耗尽；Controller 仍应完成所有不依赖该 Ticket 的可执行工作，只有进入推进耗尽后才汇总阻塞项并请求人工介入。
-_Avoid_: 单 Ticket 失败、正常依赖等待、最终整体验收
+Delivery Run 在没有 Run-wide Operator Gate 的前提下，已不存在可激活的 Ticket Job，但 Ticket Set 尚未全部完成的状态。它只汇总普通 DAG dependency、triage 不可领取或其他不要求维护者立即处理却使 frontier 为空的事实；任何 Ticket 已进入 Human Blocker、Review Budget Checkpoint、Execution Failure 或其他 Operator Action View 状态时，Controller 必须立即建立 Run-wide Operator Gate，不能先继续独立 Ticket，也不能把该门禁延迟到 Progress Exhaustion。
+_Avoid_: Run-wide Operator Gate、单 Ticket 人工门禁、最终整体验收
 
 **Ticket Content Revision（Ticket 内容版本）**:
 一张 Ticket 当前标题和正文的稳定版本指纹。Agent Artifact 必须绑定该指纹；指纹变化会使基于旧内容产生的 Plan、代码候选和验收结论失效，但不会改变 Ticket Job 身份。若 Ticket Graph Revision 未变化，Controller 停在 `requeue_required`，只有维护者显式 `requeue` 才会从最新权威事实创建新的 Job Generation；Issue 评论可由 Codex 阅读，但不属于权威需求且不触发 Revision。
