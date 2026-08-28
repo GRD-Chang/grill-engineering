@@ -6,13 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
-from agent_run.approval_grant import (
-    acceptance_fingerprint,
-    create_grant,
-    grant_authority,
-    grant_matches,
-)
-from agent_run.artifacts import AcceptanceArtifact
+from agent_run.approval_grant import create_grant, grant_matches
 from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.delivery_cleanup import (
     DeliveryCleanupEngine,
@@ -20,16 +14,14 @@ from agent_run.delivery_cleanup import (
     require_clean_run_worktrees,
 )
 from agent_run.delivery_protocol import GitHubPublisher
-from agent_run.external_supervision import (
-    is_github_convergence_error,
-    ensure_supervision_window,
-    wait_for_github_convergence,
-)
 from agent_run.git import GitRepository
-from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
-from agent_run.parent_delivery_loop import ParentDeliveryLoop
+from agent_run.parent_delivery_loop import (
+    ParentDeliveryLoop,
+    parent_approval_grant_authority,
+)
 from agent_run.state import StateStore
 from agent_run.review_budget import RUN_POLICY, new_budget, reset_budget
+from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
     detach_active_invocation,
@@ -62,22 +54,6 @@ class ParentDeliveryEngine:
             }:
                 return state
             job = self._job(state)
-            if job["phase"] == "merging":
-                try:
-                    live = self.github.live_pull_request(int(job["pr_number"]))
-                except (OSError, GitHubReadError) as error:
-                    if isinstance(error, GitHubReadError) and not is_github_convergence_error(
-                        error.code
-                    ):
-                        raise
-                    return self._wait_for_merge_convergence(state, job, str(error))
-                if live.get("state") == "MERGED":
-                    return self._complete_after_merge(state, job, live)
-                job["phase"] = "ready_for_approval"
-                state["status"] = "parent_approval_pending"
-                state["diagnostics"] = []
-                self._save(state)
-                return state
             if job["phase"] in {"completed", "ready_for_approval"}:
                 return state
             checkout = self.states.root / "worktrees" / run_id / "parent"
@@ -107,6 +83,11 @@ class ParentDeliveryEngine:
                     github=self.github,
                     agents=self.agents,
                 ).run(state, job, checkout)
+                if result.get("status") == "completed":
+                    preserve_checkout = True
+                    return DeliveryCleanupEngine(
+                        git=self.git, states=self.states, github=self.github
+                    ).complete_parent(result)
                 preserve_checkout = result.get("status") in {
                     "waiting_checks",
                     "requeue_required",
@@ -144,97 +125,20 @@ class ParentDeliveryEngine:
                 raise ValueError("Parent-only delivery is not awaiting approval")
             if state.get("status") == "unsupported_scope_change":
                 return state
-            base = _mapping(state, "base")
-            pr_number = int(job["pr_number"])
-            live = self.github.live_pull_request(pr_number)
-            if live.get("state") == "OPEN":
-                if not self._acceptance_is_current(state, job):
-                    self._reset_for_revision(
-                        state, job, str(_mapping(state, "parent")["revision"])
-                    )
-                    self._save(state)
-                    return state
-                if self.git.resolve(str(base["branch"])) != job.get("base_sha"):
-                    return self._block(
-                        state,
-                        job,
-                        "parent_default_branch_drift",
-                        "Default branch advanced after Parent Fresh Validation",
-                    )
-                if (
-                    live.get("head_sha") != job.get("publication_sha")
-                    or live.get("base_branch") != base.get("branch")
-                    or live.get("base_sha") != job.get("base_sha")
-                    or live.get("mergeable") is not True
-                ):
-                    return self._block(
-                        state,
-                        job,
-                        "parent_published_head_mismatch",
-                        "Parent PR no longer matches the accepted publication",
-                    )
-                authority = self._approval_grant_authority(state, job)
+            if job.get("phase") == "ready_for_approval":
+                authority = parent_approval_grant_authority(state, job)
                 if not grant_matches(job.get("approval_grant"), authority):
                     job["approval_grant"] = create_grant(authority)
-                    self._save(state)
-                checks = self.github.required_checks(pr_number)
-                if checks == "pending":
-                    job["phase"] = "waiting_checks"
-                    state["status"] = "waiting_checks"
-                    state["diagnostics"] = []
-                    ensure_supervision_window(state)
-                    self._save(state)
-                    self._record_status(pr_number, job, checks, "wait for Required Checks")
-                    return state
-                if checks == "fail":
-                    job.pop("approval_grant", None)
-                    job.update(
-                        {
-                            "phase": "repairing",
-                            "repair_source": "required_checks",
-                            "ci_evidence": self.github.required_check_evidence(pr_number),
-                        }
-                    )
-                    state["status"] = "parent_delivery_pending"
-                    state["diagnostics"] = []
-                    self._save(state)
-                    self._record_status(pr_number, job, checks, "repair failed Required Checks")
-                    return state
-                if checks not in {"none", "pass"}:
-                    raise ValueError(f"unknown Required Checks state: {checks}")
-                if not grant_matches(job.get("approval_grant"), authority):
-                    return self._block(
-                        state,
-                        job,
-                        "approval_grant_mismatch",
-                        "Parent approval no longer matches the accepted publication",
-                    )
-                job["phase"] = "merging"
+                job["phase"] = "waiting_checks"
+                state.update(
+                    {
+                        "status": "parent_delivery_pending",
+                        "terminal_kind": None,
+                        "diagnostics": [],
+                    }
+                )
                 self._save(state)
-                try:
-                    integrated = self.github.normal_merge(
-                        pr_number=pr_number,
-                        expected_head_sha=str(job["publication_sha"]),
-                    )
-                except (MergeOutcomeUnknownError, OSError, GitHubReadError) as error:
-                    if isinstance(error, GitHubReadError) and not is_github_convergence_error(
-                        error.code
-                    ):
-                        raise
-                    return self._wait_for_merge_convergence(state, job, str(error))
-                job["integrated_sha"] = integrated
-                self._save(state)
-                try:
-                    live = self.github.live_pull_request(pr_number)
-                except (OSError, GitHubReadError) as error:
-                    if isinstance(error, GitHubReadError) and not is_github_convergence_error(
-                        error.code
-                    ):
-                        raise
-                    return self._wait_for_merge_convergence(state, job, str(error))
-            if live.get("state") != "MERGED":
-                raise ValueError("Parent PR was not merged after explicit approval")
-            return self._complete_after_merge(state, job, live)
+        return self.deliver(run_id)
 
     def recover_closeout(self, run_id: str) -> dict[str, Any]:
         with self.states.locked():
@@ -242,15 +146,7 @@ class ParentDeliveryEngine:
             job = _mapping(state, "parent_job")
             if job.get("phase") != "merging":
                 return state
-            live = self.github.live_pull_request(int(job["pr_number"]))
-            if live.get("state") == "MERGED":
-                return self._complete_after_merge(state, job, live)
-            if live.get("state") == "OPEN":
-                job["phase"] = "ready_for_approval"
-                state["status"] = "parent_approval_pending"
-                state["diagnostics"] = []
-                self._save(state)
-            return state
+        return self.deliver(run_id)
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
         with self.states.locked():
@@ -373,6 +269,7 @@ class ParentDeliveryEngine:
             close_semantic_attempt(job, pending, outcome="currentness_invalidated")
             detach_active_invocation(state, pending)
         reset_budget(job, RUN_POLICY)
+        clear_required_checks_observation(job)
         for key in (
             "candidate_sha",
             "publication",
@@ -394,8 +291,6 @@ class ParentDeliveryEngine:
             "publication_authority",
             "fallback_publication_receipt",
             "deterministic_integration_record",
-            "required_checks",
-            "required_checks_mode",
             "next_attempt_kind",
             "last_review_candidate_sha",
             "final_ci_fix_failure_head",
@@ -423,128 +318,15 @@ class ParentDeliveryEngine:
             except OSError:
                 pass
 
-    def _complete_after_merge(
-        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
-    ) -> dict[str, Any]:
-        base_sha = str(job["base_sha"])
-        publication_sha = str(job["publication_sha"])
-        integrated = live.get("integrated_sha")
-        if (
-            not isinstance(integrated, str)
-            or live.get("head_sha") != publication_sha
-            or live.get("base_branch") != _mapping(state, "base").get("branch")
-            or live.get("integrated_parents") != [base_sha, publication_sha]
-        ):
-            return self._block(
-                state,
-                job,
-                "parent_merged_result_mismatch",
-                "Merged Parent PR does not match the approved publication",
-            )
-        job["integrated_sha"] = integrated
-        self._save(state)
-        self.github.close_parent_issue(
-            parent_number=int(_mapping(state, "parent")["number"]),
-            run_id=str(state["run_id"]),
-            pr_number=int(job["pr_number"]),
-            integrated_sha=integrated,
-            delivery_type="Parent-only",
-        )
-        job["phase"] = "completed"
-        state["status"] = "completed"
-        state["terminal_kind"] = "completed"
-        state["diagnostics"] = []
-        self._save(state)
-        return DeliveryCleanupEngine(
-            git=self.git, states=self.states, github=self.github
-        ).complete_parent(state)
-
-    def _acceptance_is_current(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> bool:
-        acceptance = job.get("acceptance_record")
-        candidate = job.get("candidate_sha")
-        if not isinstance(acceptance, dict) or not isinstance(candidate, str):
-            return False
-        return (
-            acceptance.get("reviewed_base_sha") == job.get("base_sha")
-            and acceptance.get("reviewed_candidate_sha") == candidate
-            and acceptance.get("reviewed_candidate_tree")
-            == self.git.resolve(f"{candidate}^{{tree}}")
-            and acceptance.get("effective_revision") == job.get("effective_revision")
-            and _mapping(state, "parent").get("revision")
-            == job.get("effective_revision")
-        )
-
-    def _approval_grant_authority(
-        self, state: dict[str, Any], job: dict[str, Any]
-    ) -> dict[str, object]:
-        return grant_authority(
-            repository=str(state["repository"]),
-            pr_number=int(job["pr_number"]),
-            head_branch=str(job["parent_branch"]),
-            head_sha=str(job["publication_sha"]),
-            base_branch=str(_mapping(state, "base")["branch"]),
-            base_sha=str(job["base_sha"]),
-            acceptance_fingerprint=acceptance_fingerprint(
-                _mapping(job, "acceptance_record"),
-                _mapping(job, "acceptance_artifact"),
-            ),
-        )
-
     def has_current_approval_grant(self, run_id: str) -> bool:
         with self.states.locked():
             state = self._load(run_id)
             job = _mapping(state, "parent_job")
             try:
-                authority = self._approval_grant_authority(state, job)
+                authority = parent_approval_grant_authority(state, job)
             except (KeyError, TypeError, ValueError):
                 return False
             return grant_matches(job.get("approval_grant"), authority)
-
-    def _record_status(
-        self, pr_number: int, job: dict[str, Any], checks: str, next_action: str
-    ) -> None:
-        artifact = _mapping(job, "acceptance_artifact")
-        raw_checks = _mapping(artifact, "checks")
-        self.github.record_agent_run_status(
-            pr_number,
-            {
-                "scope": "parent-only",
-                "base_sha": str(job["base_sha"]),
-                "candidate_sha": str(job["candidate_sha"]),
-                "validation_outcome": AcceptanceArtifact.parse(artifact).outcome,
-                "lane_statuses": {
-                    lane: str(_mapping(raw_checks, lane)["status"])
-                    for lane in ("e2e", "standards", "spec")
-                },
-                "required_checks": checks,
-                "next_action": next_action,
-            },
-        )
-
-    def _block(
-        self, state: dict[str, Any], job: dict[str, Any], code: str, message: str
-    ) -> dict[str, Any]:
-        job.pop("approval_grant", None)
-        job.update({"phase": "blocked", "blocked_reason": code})
-        state["status"] = "blocked"
-        state["diagnostics"] = [{"code": code, "message": message}]
-        self._save(state)
-        return state
-
-    def _wait_for_merge_convergence(
-        self, state: dict[str, Any], job: dict[str, Any], message: str
-    ) -> dict[str, Any]:
-        job["phase"] = "merging"
-        wait_for_github_convergence(
-            state,
-            code="merge_outcome_unknown",
-            message=message,
-            waiting_for="Parent-only merge/readback reconciliation",
-        )
-        ensure_supervision_window(state)
-        return self._save(state)
 
     def _save(self, state: dict[str, Any]) -> dict[str, Any]:
         self.states.save_run(str(state["run_id"]), state)

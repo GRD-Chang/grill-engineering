@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.state_errors import IncompatibleRunStateError
+from agent_run.required_checks_observation import (
+    require_required_checks_observation,
+    validate_legacy_required_checks_projection,
+)
 from agent_run.ticket_acceptance_contract import (
     require_completed_accepted_ticket_authorization,
 )
@@ -96,39 +100,28 @@ def _require_deterministic_integration_record(
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.final_ci_fix_used is invalid"
         )
-    mode = record.get("required_checks_mode")
-    if mode == "configured":
-        expected_checks = "pass"
-    elif mode == "not_configured":
-        expected_checks = "none"
-    else:
-        raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.required_checks_mode is invalid"
-        )
-    if record.get("required_checks") != expected_checks:
-        raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.required_checks is invalid"
-        )
     evidence = record.get("required_checks_evidence")
-    if not isinstance(evidence, dict):
-        raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.required_checks_evidence is invalid"
-        )
-    if evidence.get("pr_number") != pr_number:
-        raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.required_checks_evidence.pr_number is invalid"
-        )
     publication_sha = record["publication_sha"]
-    if evidence.get("head_sha") != publication_sha:
-        raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.required_checks_evidence.head_sha is invalid"
+    require_required_checks_observation(
+        evidence,
+        location=f"{location}.required_checks_evidence",
+        expected_pr_number=pr_number,
+        expected_head_sha=publication_sha,
+        allowed_results=frozenset({"none", "pass"}),
+    )
+    required_checks_origin = record.get("required_checks_origin")
+    if required_checks_origin is not None:
+        require_required_checks_observation(
+            required_checks_origin,
+            location=f"{location}.required_checks_origin",
+            expected_pr_number=pr_number,
+            allowed_results=frozenset({"fail"}),
         )
-    if evidence.get("result") != expected_checks or not isinstance(
-        evidence.get("checks"), list
-    ) or not all(isinstance(check, dict) for check in evidence["checks"]):
-        raise IncompatibleRunStateError(
-            f"incompatible_run_state: {location}.required_checks_evidence is invalid"
-        )
+    validate_legacy_required_checks_projection(
+        record,
+        location=location,
+        observation=evidence,
+    )
     pr = record.get("pr")
     if not isinstance(pr, dict):
         raise IncompatibleRunStateError(

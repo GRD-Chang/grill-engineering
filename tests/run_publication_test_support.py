@@ -73,13 +73,17 @@ class DelayedChecksRunPublisher(FixtureGitHubPublisher):
         super().__init__(*args, **kwargs)
         self.read_failures = 1
 
-    def required_checks(self, pr_number: int) -> str:
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
         if self.read_failures:
             self.read_failures -= 1
             raise GitHubReadError(
                 "github_timeout", "final PR checks have not converged"
             )
-        return super().required_checks(pr_number)
+        return super().required_checks_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
 
 
 class WaitingThenInterruptedChecksPublisher(FixtureGitHubPublisher):
@@ -95,14 +99,18 @@ class WaitingThenInterruptedChecksPublisher(FixtureGitHubPublisher):
             raise OSError("final PR live read process interrupted")
         return super().live_pull_request(pr_number)
 
-    def required_checks(self, pr_number: int) -> str:
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
         self.required_check_calls += 1
         if self.required_check_calls == 1:
             self.interrupt_live_reads = True
             raise GitHubReadError(
                 "github_timeout", "final PR checks have not converged"
             )
-        return super().required_checks(pr_number)
+        return super().required_checks_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
 
 
 class InterruptedFinalRefPublisher(FixtureGitHubPublisher):

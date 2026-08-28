@@ -352,6 +352,30 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     state, states, git = _completed_run(git_repo)
     candidate_sha = git.resolve(str(state["run_branch"]))
     state["status"] = run_status
+    repair_job = {
+        "phase": job_phase,
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_mode": "squash",
+        "candidate_sha": candidate_sha,
+        "acceptance_record": {
+            "reviewed_candidate_sha": candidate_sha,
+            "artifact": _passing_artifact(),
+        },
+    }
+    if job_phase == "waiting_checks":
+        repair_job.update(
+            {
+                "pr_number": 1,
+                "publication_sha": candidate_sha,
+                "required_checks_evidence": {
+                    "pr_number": 1,
+                    "head_sha": candidate_sha,
+                    "result": "pending",
+                    "checks": [{"name": "quality", "bucket": "pending"}],
+                },
+            }
+        )
     state["run_acceptance"] = {
         "phase": "repairing",
         "review_budget": _canonical_run_budget(),
@@ -363,17 +387,7 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
             "code_modification_attempts": 1,
             "validation_attempts": 1,
         },
-        "repair_job": {
-            "phase": job_phase,
-            "review_budget": _canonical_run_budget(),
-            "review_budget_history": [],
-            "repair_mode": "squash",
-            "candidate_sha": candidate_sha,
-            "acceptance_record": {
-                "reviewed_candidate_sha": candidate_sha,
-                "artifact": _passing_artifact(),
-            },
-        },
+        "repair_job": repair_job,
     }
     states.save_run(str(state["run_id"]), state)
 

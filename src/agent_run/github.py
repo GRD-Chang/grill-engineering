@@ -21,6 +21,32 @@ class MergeOutcomeUnknownError(RuntimeError):
     """A merge write may have succeeded, but GitHub has not converged yet."""
 
 
+def _merge_identity_matches(
+    live: dict[str, Any],
+    *,
+    expected_head_sha: str,
+    expected_head_branch: str | None,
+    expected_head_repository: str | None,
+    expected_base_branch: str | None,
+    expected_base_sha: str | None,
+    expected_base_repository: str | None,
+) -> bool:
+    """Check the complete PR identity supplied to a merge authority."""
+
+    expected = {
+        "head_sha": expected_head_sha,
+        "head_branch": expected_head_branch,
+        "head_repository": expected_head_repository,
+        "base_branch": expected_base_branch,
+        "base_sha": expected_base_sha,
+        "base_repository": expected_base_repository,
+    }
+    return all(
+        value is None or live.get(key) == value
+        for key, value in expected.items()
+    )
+
+
 class GhGitHubReader:
     def __init__(
         self,

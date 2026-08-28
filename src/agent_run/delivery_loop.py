@@ -30,6 +30,7 @@ from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 from agent_run.review_budget import previous_review_context
+from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> None:
@@ -246,6 +247,18 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     ) -> bool:
         return False
 
+    def resume_after_required_checks_failure(
+        self, state: dict[str, Any], _job: dict[str, Any]
+    ) -> bool:
+        state.update(
+            {
+                "status": "ticket_delivery_pending",
+                "terminal_kind": None,
+                "diagnostics": [],
+            }
+        )
+        return False
+
     def linked_issue_number(
         self, _state: dict[str, Any], job: dict[str, Any]
     ) -> int:
@@ -396,6 +409,7 @@ class TicketDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         self.git.reset_checkout_to_base(checkout, str(state["run_branch"]))
+        clear_required_checks_observation(job)
         for key in (
             "candidate_sha",
             "publication",
@@ -408,11 +422,10 @@ class TicketDeliveryLoop:
             "last_publication_error",
             "repair_source",
             "ci_evidence",
+            "required_checks_origin",
             "publication_authority",
             "fallback_publication_receipt",
             "deterministic_integration_record",
-            "required_checks",
-            "required_checks_mode",
             "next_attempt_kind",
             "last_review_candidate_sha",
             "final_ci_fix_failure_head",

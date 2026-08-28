@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from agent_run.review_budget import RUN_POLICY, ensure_budget
+from agent_run.required_checks_observation import clear_required_checks_observation
 
 
 _ACTIVE_CHECKOUT_PHASES = frozenset(
@@ -144,19 +145,22 @@ def rotate_repair_job(
     completed_repairs = run.setdefault("completed_repair_jobs", [])
     if not isinstance(completed_repairs, list):
         raise ValueError("completed_repair_jobs must be a list")
-    completed_repairs.append(
-        {
-            "phase": "completed",
-            "repair_branch": job["repair_branch"],
-            "pr_number": job["pr_number"],
-            "integrated_sha": job["integrated_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "acceptance_state": "revalidation_finding",
-        }
-    )
+    completed = {
+        "phase": "completed",
+        "repair_branch": job["repair_branch"],
+        "pr_number": job["pr_number"],
+        "integrated_sha": job["integrated_sha"],
+        "candidate_sha": job["candidate_sha"],
+        "acceptance_state": "revalidation_finding",
+    }
+    origin = job.get("required_checks_origin")
+    if isinstance(origin, dict):
+        completed["ci_evidence"] = deepcopy(origin)
+    completed_repairs.append(completed)
     del completed_repairs[:-32]
 
     rotated = dict(job)
+    clear_required_checks_observation(rotated)
     trigger = rotated.get("repair_trigger")
     if isinstance(trigger, dict):
         trigger = dict(trigger)
@@ -177,8 +181,6 @@ def rotate_repair_job(
         "pending_attempt",
         "integrated_revalidation_merge",
         "deterministic_integration_record",
-        "required_checks",
-        "required_checks_mode",
     ):
         rotated.pop(key, None)
     rotated.update(

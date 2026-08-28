@@ -268,7 +268,7 @@ def test_run_routes_pending_final_run_check_failure_through_repair(
         issues={"3": ticket()},
         delivery={
             "required_checks": ["none", "pending", "fail", "pass", "pass"],
-            "required_check_evidence": {"pr_number": 1, "checks": [code_failure]},
+            "required_check_evidence": {"pr_number": 2, "checks": [code_failure]},
         },
     )
     agents = run_agents(git_repo / "agents.json")

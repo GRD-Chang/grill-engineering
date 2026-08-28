@@ -10,10 +10,51 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
-from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
+from agent_run.github import (
+    GitHubReadError,
+    MergeOutcomeUnknownError,
+    _merge_identity_matches,
+)
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 from agent_run.required_checks import annotate_configured_code_failures
 from agent_run.revisions import effective_revision_from_graph
+
+
+def _fixture_required_check_identity(bucket: str) -> dict[str, str]:
+    return {
+        "name": "fixture-required-check",
+        "workflow": "fixture-ci",
+        "bucket": bucket,
+        "link": "https://example.invalid/checks/fixture",
+    }
+
+
+def _fixture_observation_check(
+    result: str, source: dict[str, Any] | None = None
+) -> dict[str, str]:
+    check = _fixture_required_check_identity(result)
+    if source is not None:
+        for key in ("name", "workflow", "link"):
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                check[key] = value
+    check["state"] = {
+        "pass": "SUCCESS",
+        "pending": "PENDING",
+        "unknown": "UNKNOWN",
+        "fail": "FAILURE",
+    }[result]
+    return check
+
+
+def _fixture_check_for_head(
+    source: dict[str, Any], head_sha: str
+) -> dict[str, Any]:
+    check = dict(source)
+    job = check.get("job")
+    if isinstance(job, dict) and job.get("head_sha") == "$CURRENT_HEAD":
+        check["job"] = {**job, "head_sha": head_sha}
+    return check
 
 
 class FixtureGitHubReader:
@@ -508,12 +549,53 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("record_run_publication")
 
-    def normal_merge(self, *, pr_number: int, expected_head_sha: str) -> str:
+    def normal_merge(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_head_branch: str | None = None,
+        expected_head_repository: str | None = None,
+        expected_base_branch: str | None = None,
+        expected_base_sha: str | None = None,
+        expected_base_repository: str | None = None,
+    ) -> str:
         pull = self._pull(pr_number)
         if pull.get("state") == "MERGED":
             return str(pull["integrated_sha"])
+        configured_override = self._delivery().pop(
+            "normal_merge_live_identity_override", None
+        )
+        if configured_override is not None:
+            if not isinstance(configured_override, dict) or (
+                set(configured_override)
+                - {"head_repository", "base_repository", "base_branch", "base_sha"}
+                or not all(
+                    isinstance(value, str)
+                    for value in configured_override.values()
+                )
+            ):
+                raise ValueError(
+                    "fixture normal_merge_live_identity_override must contain "
+                    "identity strings"
+                )
+            self._normal_merge_live_identity_override = configured_override
+            self._save()
         live = self.live_pull_request(pr_number)
-        if live["head_sha"] != expected_head_sha or not live["mergeable"]:
+        identity_matches = _merge_identity_matches(
+            live,
+            expected_head_sha=expected_head_sha,
+            expected_head_branch=expected_head_branch,
+            expected_head_repository=expected_head_repository,
+            expected_base_branch=expected_base_branch,
+            expected_base_sha=expected_base_sha,
+            expected_base_repository=expected_base_repository,
+        )
+        if live.get("state") != "OPEN" or not identity_matches:
+            raise GitHubReadError(
+                "foreign_run_pr", "fixture Final Run PR does not match merge identity"
+            )
+        if not live["mergeable"]:
             raise ValueError("fixture final merge does not match expected open head")
         base = self.git.resolve(str(pull["base_branch"]))
         result = subprocess.run(
@@ -819,19 +901,31 @@ class FixtureGitHubPublisher:
         }
 
     def required_checks(self, pr_number: int) -> str:
+        return self._next_required_checks_result(pr_number)
+
+    def _next_required_checks_result(self, pr_number: int) -> str:
         delivery = self._delivery()
         pull = self._pull(pr_number)
-        run_failures = delivery.get("run_required_checks_read_failures", [])
-        if "primary_ticket" not in pull and isinstance(run_failures, list) and run_failures:
-            configured = run_failures.pop(0)
+        failure_key = (
+            "ticket_required_checks_read_failures"
+            if "primary_ticket" in pull
+            else "run_required_checks_read_failures"
+        )
+        read_failures = delivery.get(failure_key, [])
+        if isinstance(read_failures, list) and read_failures:
+            configured = read_failures.pop(0)
             self._save()
             if not isinstance(configured, dict):
                 raise ValueError(
-                    "fixture run_required_checks_read_failures must contain objects"
+                    f"fixture {failure_key} must contain objects"
                 )
             raise GitHubReadError(
                 str(configured.get("code", "github_read_failed")),
-                str(configured.get("message", "Final Run Required Checks read failed")),
+                str(
+                    configured.get(
+                        "message", "Required Checks read did not converge"
+                    )
+                ),
             )
         sequence = delivery.get("required_checks", ["none"])
         if not isinstance(sequence, list) or not all(
@@ -852,6 +946,7 @@ class FixtureGitHubPublisher:
         delivery["check_position"] = position + 1
         self._save()
         self._inject_revision_drift("required_checks")
+        self._inject_default_base_drift_after_required_checks()
         if value in {"skipping", "neutral"}:
             return "pass"
         return value
@@ -865,13 +960,46 @@ class FixtureGitHubPublisher:
                 "change_pr_head_drift",
                 "Required Checks snapshot does not match the expected PR head",
             )
+        result = self._next_required_checks_result(pr_number)
+        actual_head_sha = str(self.live_pull_request(pr_number)["head_sha"])
+        if actual_head_sha != expected_head_sha:
+            raise GitHubReadError(
+                "change_pr_head_drift",
+                "Required Checks snapshot does not match the expected PR head",
+            )
         configured = self._delivery().get("required_check_evidence")
-        checks = configured.get("checks", []) if isinstance(configured, dict) else []
+        configured_checks = (
+            configured.get("checks", []) if isinstance(configured, dict) else []
+        )
+        if result == "none":
+            checks: list[object] = []
+        elif (
+            result == "fail"
+            and isinstance(configured_checks, list)
+            and configured_checks
+        ):
+            if all(isinstance(check, dict) for check in configured_checks):
+                checks = [
+                    _fixture_check_for_head(check, actual_head_sha)
+                    for check in configured_checks
+                ]
+            else:
+                checks = deepcopy(configured_checks)
+        else:
+            checks = []
+            if isinstance(configured_checks, list):
+                checks = [
+                    _fixture_observation_check(result, check)
+                    for check in configured_checks
+                    if isinstance(check, dict)
+                ]
+            if not checks:
+                checks = [_fixture_observation_check(result)]
         return {
             "pr_number": pr_number,
             "head_sha": expected_head_sha,
-            "result": "observed",
-            "checks": deepcopy(checks) if isinstance(checks, list) else [],
+            "result": result,
+            "checks": checks,
         }
 
     def required_check_evidence(
@@ -886,11 +1014,8 @@ class FixtureGitHubPublisher:
                 "pr_number": pr_number,
                 "checks": [
                     {
-                        "name": "fixture-required-check",
-                        "workflow": "fixture-ci",
-                        "bucket": "fail",
+                        **_fixture_required_check_identity("fail"),
                         "description": "The fixture required check failed.",
-                        "link": "https://example.invalid/checks/fixture",
                     }
                 ],
             }
@@ -934,12 +1059,9 @@ class FixtureGitHubPublisher:
                 "pr_number": pr_number,
                 "checks": [
                     {
-                        "name": "fixture-required-check",
-                        "workflow": "fixture-ci",
-                        "bucket": "fail",
+                        **_fixture_required_check_identity("fail"),
                         "state": "FAILURE",
                         "description": "The fixture required check failed.",
-                        "link": "https://example.invalid/checks/fixture",
                         "job": {
                             "id": 1,
                             "head_sha": actual_head_sha,
@@ -963,13 +1085,9 @@ class FixtureGitHubPublisher:
         if isinstance(checks, list) and all(
             isinstance(check, dict) for check in checks
         ):
-            normalized_checks: list[dict[str, Any]] = []
-            for raw in checks:
-                check = dict(raw)
-                job = check.get("job")
-                if isinstance(job, dict) and job.get("head_sha") == "$CURRENT_HEAD":
-                    check["job"] = {**job, "head_sha": actual_head_sha}
-                normalized_checks.append(check)
+            normalized_checks = [
+                _fixture_check_for_head(check, actual_head_sha) for check in checks
+            ]
             evidence["checks"] = annotate_configured_code_failures(
                 normalized_checks,
                 self.path.parent,
@@ -1044,6 +1162,12 @@ class FixtureGitHubPublisher:
             "state": reported_state,
             "integrated_sha": pull.get("integrated_sha"),
         }
+        configured_override = getattr(
+            self, "_normal_merge_live_identity_override", None
+        )
+        if isinstance(configured_override, dict):
+            result.update(configured_override)
+            del self._normal_merge_live_identity_override
         integrated = pull.get("integrated_sha")
         if isinstance(integrated, str) and isinstance(live_head, str):
             result.update(
@@ -1670,6 +1794,37 @@ class FixtureGitHubPublisher:
         else:
             raise ValueError("fixture drift kind is invalid")
         configured["injected"] = True
+        self._save()
+
+    def _inject_default_base_drift_after_required_checks(self) -> None:
+        key = "default_base_drift_after_required_checks_once"
+        if not bool(self._delivery().get(key)):
+            return
+        self._delivery()[key] = False
+        base_branch = _string(self.data, "default_branch")
+        base_sha = self.git.resolve(base_branch)
+        tree_sha = self.git.resolve(f"{base_sha}^{{tree}}")
+        created = subprocess.run(
+            [
+                "git",
+                "commit-tree",
+                tree_sha,
+                "-p",
+                base_sha,
+                "-m",
+                "test: advance default base during Required Checks snapshot",
+            ],
+            cwd=self.git.root,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", f"refs/heads/{base_branch}", created, base_sha],
+            cwd=self.git.root,
+            check=True,
+        )
+        self.data["default_head_sha"] = created
         self._save()
 
 

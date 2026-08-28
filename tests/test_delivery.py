@@ -40,8 +40,8 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.parent_delivery_loop import ParentDeliveryAdapter, ParentDeliveryLoop
 from agent_run.revisions import effective_revision
 from agent_run.requeue import requeue_change_job
-from agent_run.state import StateStore
-from agent_run.state_contract import IncompatibleRunStateError
+from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
 from agent_run.run_repair_delivery import RunRepairAdapter
 from agent_run.review_budget import TICKET_POLICY
 
@@ -496,6 +496,7 @@ class ScriptedPublisher:
         self.acceptance_records: list[dict[str, Any]] = []
         self.agent_run_statuses: list[dict[str, Any]] = []
         self.live_head: str | None = None
+        self.branch: str | None = None
         self.base_branch: str | None = None
         self.escalated: list[int] = []
         self.revision_override: str | None = None
@@ -576,6 +577,7 @@ class ScriptedPublisher:
     ) -> int:
         del expected_head_sha, expected_base_sha
         self.created_prs += 1
+        self.branch = branch
         self.base_branch = base_branch
         self.pr_bodies.append(body)
         self.pr_titles.append(title)
@@ -595,6 +597,49 @@ class ScriptedPublisher:
         self.check_position += 1
         return value
 
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        assert pr_number == self.pr_number
+        assert self.live_pull_request(pr_number)["head_sha"] == expected_head_sha
+        result = self.checks[min(self.check_position, len(self.checks) - 1)]
+        self.check_position += 1
+        configured = self.failed_check_evidence.get("checks")
+        if result == "fail" and isinstance(configured, list):
+            checks = [
+                {
+                    key: check[key]
+                    for key in (
+                        "name",
+                        "workflow",
+                        "bucket",
+                        "state",
+                        "description",
+                        "link",
+                    )
+                    if key in check
+                }
+                for check in configured
+                if isinstance(check, dict)
+            ]
+        elif result == "none":
+            checks = []
+        else:
+            checks = [
+                {
+                    "name": "test",
+                    "workflow": "ci",
+                    "bucket": result,
+                    "link": "https://example.invalid/checks/test",
+                }
+            ]
+        return {
+            "pr_number": pr_number,
+            "head_sha": expected_head_sha,
+            "result": result,
+            "checks": checks,
+        }
+
     def required_check_evidence(
         self, pr_number: int, *, expected_head_sha: str | None = None
     ) -> dict[str, Any]:
@@ -604,7 +649,9 @@ class ScriptedPublisher:
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
         result = {
+            "head_branch": self.branch,
             "head_sha": self.live_head,
+            "head_repository": "example/project",
             "base_branch": self.base_branch,
             "base_sha": (
                 subprocess.run(
@@ -617,7 +664,9 @@ class ScriptedPublisher:
                 if self.base_branch
                 else None
             ),
+            "base_repository": "example/project",
             "mergeable": True,
+            "state": "OPEN",
         }
         if self.merged_sha is not None and self.merged_head is not None:
             result.update(
@@ -1306,11 +1355,48 @@ class CheckReadFailsOncePublisher(ScriptedPublisher):
         super().__init__(repo)
         self.check_read_failures = 1
 
-    def required_checks(self, pr_number: int) -> str:
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
         if self.check_read_failures:
             self.check_read_failures -= 1
             raise TimeoutError("simulated Required Checks timeout")
-        return super().required_checks(pr_number)
+        return super().required_checks_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+
+
+class CheckReadFailsNTimesPublisher(ScriptedPublisher):
+    def __init__(self, repo: Path, failures: int) -> None:
+        super().__init__(repo)
+        self.check_read_failures = failures
+
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        if self.check_read_failures:
+            self.check_read_failures -= 1
+            raise TimeoutError("simulated repeated Required Checks timeout")
+        return super().required_checks_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+
+
+class SnapshotReadFailsAfterPendingPublisher(ScriptedPublisher):
+    def __init__(self, repo: Path) -> None:
+        super().__init__(repo)
+        self.checks = ["pending"]
+        self.snapshot_calls = 0
+
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        self.snapshot_calls += 1
+        if self.snapshot_calls == 2:
+            raise TimeoutError("simulated repeated snapshot timeout")
+        return super().required_checks_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
 
 
 class SnapshotChangesAfterInitialPassPublisher(ScriptedPublisher):
@@ -1333,15 +1419,38 @@ class SnapshotChangesAfterInitialPassPublisher(ScriptedPublisher):
         }
 
 
+class ContradictorySnapshotPublisher(ScriptedPublisher):
+    def __init__(
+        self, repo: Path, *, result: str, checks: list[dict[str, str]]
+    ) -> None:
+        super().__init__(repo)
+        self.snapshot_result = result
+        self.snapshot_checks = checks
+
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        return {
+            "pr_number": pr_number,
+            "head_sha": expected_head_sha,
+            "result": self.snapshot_result,
+            "checks": deepcopy(self.snapshot_checks),
+        }
+
+
 class LiveHeadDriftsBeforeFailedEvidencePublisher(ScriptedPublisher):
     def __init__(self, repo: Path) -> None:
         super().__init__(repo)
         self.failed_evidence_calls = 0
         self.drift_live_read = False
 
-    def required_checks(self, pr_number: int) -> str:
-        result = super().required_checks(pr_number)
-        if result == "fail":
+    def required_checks_snapshot(
+        self, pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        result = super().required_checks_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+        if result["result"] == "fail":
             self.drift_live_read = True
         return result
 
@@ -1420,6 +1529,20 @@ class CheckRepairAgents(PassAgents):
                 target.read_text(encoding="utf-8") + "ci repaired\n",
                 encoding="utf-8",
             )
+        return result
+
+
+class RequiredCheckThenAcceptanceFindingAgents(CheckRepairAgents):
+    def review(self, request: dict[str, Any]) -> ReviewResult:
+        result = super().review(request)
+        if self.review_count == 2:
+            result.artifact["checks"]["e2e"] = {
+                "status": "fail",
+                "evidence": "The repaired candidate still misses an acceptance requirement.",
+                "findings": [
+                    "问题：修复候选仍缺少验收标记；证据：独立复验未发现标记；必须修复：补齐验收标记；复验：重新检查候选文件。"
+                ],
+            }
         return result
 
 
@@ -1966,9 +2089,10 @@ def test_ticket_review_budget_fallback_publishes_without_acceptance_record(
     assert "acceptance_artifact" not in fallback_publication
     assert "ci_evidence" not in fallback_publication
     assert job["deterministic_integration_record"]["source"] == "fallback"
-    assert job["deterministic_integration_record"]["required_checks_mode"] == (
-        "not_configured"
-    )
+    assert "required_checks" not in job
+    assert "required_checks_mode" not in job
+    assert "required_checks" not in job["deterministic_integration_record"]
+    assert "required_checks_mode" not in job["deterministic_integration_record"]
     integration = job["deterministic_integration_record"]
     assert integration["integrated_sha"] == job["integrated_sha"]
     assert integration["integrated_publication_sha"] == job["publication_sha"]
@@ -1981,6 +2105,232 @@ def test_ticket_review_budget_fallback_publishes_without_acceptance_record(
     assert github.escalated == []
     assert github.created_prs == 1
     assert github.closed_issues == [3]
+
+
+def test_fallback_pending_observation_is_one_contract_valid_commit(
+    git_repo: Path,
+) -> None:
+    class ObservationRecordingStateStore(StateStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.observation_commits: list[dict[str, Any]] = []
+
+        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+            job = state.get("active_ticket_job")
+            if isinstance(job, dict) and isinstance(
+                job.get("required_checks_evidence"), dict
+            ):
+                require_current_run_state(state)
+                self.observation_commits.append(deepcopy(state))
+            super().save_run(run_id, state)
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = ObservationRecordingStateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    github = ScriptedPublisher(git_repo)
+    github.checks = ["pending"]
+
+    waiting = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=github,
+        agents=AlwaysRejectAgents(checkout),
+    ).deliver(state["run_id"])
+
+    assert waiting["status"] == "waiting_checks"
+    assert len(states.observation_commits) == 1
+    job = waiting["active_ticket_job"]
+    receipt = job["fallback_publication_receipt"]
+    assert receipt["required_checks_evidence"] == job["required_checks_evidence"]
+    assert receipt["required_checks_evidence"] is not job["required_checks_evidence"]
+    require_current_run_state(states.observation_commits[0])
+
+
+def test_final_ci_fix_candidate_save_clears_receipt_observation_before_resume(
+    git_repo: Path,
+) -> None:
+    class CrashAfterFinalCiFixCandidateSave(StateStore):
+        crashed = False
+
+        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+            job = state.get("active_ticket_job")
+            is_final_ci_fix_candidate = (
+                not self.crashed
+                and isinstance(job, dict)
+                and job.get("phase") == "candidate"
+                and job.get("attempt_kind") == "final_ci_fix"
+            )
+            super().save_run(run_id, state)
+            if is_final_ci_fix_candidate:
+                self.crashed = True
+                raise SimulatedProcessCrash(
+                    "simulated crash after Final CI-fix Candidate save"
+                )
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = CrashAfterFinalCiFixCandidateSave(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail", "pass"]
+    agents = AlwaysRejectAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    )
+
+    with pytest.raises(SimulatedProcessCrash, match="Final CI-fix Candidate"):
+        engine.deliver(state["run_id"])
+
+    interrupted = states.load_current_run(state["run_id"])
+    assert interrupted is not None
+    interrupted_job = interrupted["active_ticket_job"]
+    assert interrupted_job["phase"] == "candidate"
+    assert interrupted_job["attempt_kind"] == "final_ci_fix"
+    assert "required_checks_evidence" not in interrupted_job
+    receipt = interrupted_job["fallback_publication_receipt"]
+    assert "required_checks_evidence" not in receipt
+    assert interrupted_job["ci_evidence"]["result"] == "fail"
+    assert interrupted_job["final_ci_fix_failure_head"] == interrupted_job[
+        "ci_evidence"
+    ]["head_sha"]
+    previous = receipt["previous_publication_authorization"]
+    assert previous["publication_sha"] == interrupted_job["final_ci_fix_failure_head"]
+    assert previous["fallback_receipt"]["required_checks_evidence"]["head_sha"] == (
+        interrupted_job["final_ci_fix_failure_head"]
+    )
+    require_current_run_state(interrupted)
+
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    completed_job = completed["active_ticket_job"]
+    assert completed_job["required_checks_evidence"]["head_sha"] == completed_job[
+        "publication_sha"
+    ]
+    assert completed_job["fallback_publication_receipt"][
+        "required_checks_evidence"
+    ]["head_sha"] == completed_job["publication_sha"]
+
+
+@pytest.mark.parametrize("crash_timing", ["before", "after"])
+def test_fallback_observation_commit_resumes_without_duplicate_work(
+    git_repo: Path, crash_timing: str
+) -> None:
+    class CandidateRecordingGit(GitRepository):
+        candidate_commit_calls = 0
+
+        def commit_candidate(
+            self,
+            checkout: Path,
+            *,
+            ticket_number: int,
+            attempt: int,
+            expected_head: str | None = None,
+            candidate_intent: dict[str, object] | None = None,
+        ) -> str | None:
+            self.candidate_commit_calls += 1
+            return super().commit_candidate(
+                checkout,
+                ticket_number=ticket_number,
+                attempt=attempt,
+                expected_head=expected_head,
+                candidate_intent=candidate_intent,
+            )
+
+    class PullRequestRecordingPublisher(ScriptedPublisher):
+        def __init__(self, repo: Path) -> None:
+            super().__init__(repo)
+            self.external_pr_numbers: set[int] = set()
+
+        def ensure_ticket_pr(self, **kwargs: Any) -> int:
+            pr_number = super().ensure_ticket_pr(**kwargs)
+            self.external_pr_numbers.add(pr_number)
+            return pr_number
+
+    class CrashAroundObservationStateStore(StateStore):
+        crashed = False
+
+        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+            job = state.get("active_ticket_job")
+            is_observation_commit = (
+                not self.crashed
+                and isinstance(job, dict)
+                and isinstance(job.get("required_checks_evidence"), dict)
+            )
+            if is_observation_commit and crash_timing == "before":
+                self.crashed = True
+                raise SimulatedProcessCrash(
+                    "simulated crash before atomic Observation commit"
+                )
+            super().save_run(run_id, state)
+            if is_observation_commit:
+                self.crashed = True
+                raise SimulatedProcessCrash(
+                    "simulated crash after atomic Observation commit"
+                )
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = CrashAroundObservationStateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    github = PullRequestRecordingPublisher(git_repo)
+    github.checks = ["pending", "pass"]
+    agents = AlwaysRejectAgents(checkout)
+    git = CandidateRecordingGit(git_repo)
+    engine = TicketDeliveryEngine(
+        git=git, states=states, github=github, agents=agents
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        engine.deliver(state["run_id"])
+
+    interrupted = states.load_current_run(state["run_id"])
+    assert interrupted is not None
+    require_current_run_state(interrupted)
+    interrupted_job = interrupted["active_ticket_job"]
+    interrupted_receipt = interrupted_job["fallback_publication_receipt"]
+    if crash_timing == "before":
+        assert interrupted["status"] == "active"
+        assert interrupted_job["phase"] == "publishing"
+        assert "required_checks_evidence" not in interrupted_job
+        assert "required_checks_evidence" not in interrupted_receipt
+    else:
+        assert interrupted["status"] == "waiting_checks"
+        assert interrupted_job["phase"] == "waiting_checks"
+        assert interrupted_receipt["required_checks_evidence"] == (
+            interrupted_job["required_checks_evidence"]
+        )
+    candidate_sha = interrupted_job["candidate_sha"]
+    pr_number = interrupted_job["pr_number"]
+    review_budget = deepcopy(interrupted_job["review_budget"])
+    modification_attempts = interrupted_job["modification_attempts"]
+    development_thread_ids = list(agents.development_thread_ids)
+    review_count = agents.review_count
+    reviewer_thread_ids = list(agents.reviewer_thread_ids)
+    publication_requests = len(agents.publication_requests)
+    candidate_commit_calls = git.candidate_commit_calls
+
+    completed = engine.deliver(state["run_id"])
+
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "ticket_completed"
+    assert job["candidate_sha"] == candidate_sha
+    assert job["pr_number"] == pr_number
+    assert job["review_budget"] == review_budget
+    assert job["modification_attempts"] == modification_attempts
+    assert github.external_pr_numbers == {pr_number}
+    assert git.candidate_commit_calls == candidate_commit_calls
+    assert agents.development_thread_ids == development_thread_ids
+    assert agents.review_count == review_count
+    assert agents.reviewer_thread_ids == reviewer_thread_ids
+    assert len(agents.publication_requests) == publication_requests
 
 
 def test_ci_sourced_fallback_receipt_preserves_failure_source_and_authority() -> None:
@@ -2106,6 +2456,12 @@ def test_acceptance_repair_supersedes_stale_ci_fallback_evidence() -> None:
     )
     acceptance_artifact = {"checks": {"spec": {"status": "fail"}}}
     stale_ci = {"head_sha": "old-head", "checks": [{"name": "old-tests"}]}
+    required_checks_origin = {
+        "pr_number": 7,
+        "head_sha": "old-head",
+        "result": "fail",
+        "checks": [{"name": "old-tests", "bucket": "fail"}],
+    }
     job: dict[str, Any] = {
         "base_sha": "base",
         "candidate_sha": "candidate",
@@ -2113,6 +2469,7 @@ def test_acceptance_repair_supersedes_stale_ci_fallback_evidence() -> None:
         "effective_revision": "revision",
         "acceptance_artifact": acceptance_artifact,
         "ci_evidence": stale_ci,
+        "required_checks_origin": required_checks_origin,
         "repair_source": "acceptance",
         "review_budget": {
             "window": 1,
@@ -2131,6 +2488,7 @@ def test_acceptance_repair_supersedes_stale_ci_fallback_evidence() -> None:
     assert receipt["failure_evidence_source"] == "acceptance"
     assert receipt["failure_evidence"] == acceptance_artifact
     assert receipt["failure_evidence"] != stale_ci
+    assert receipt["required_checks_origin"] == required_checks_origin
 
 
 def test_no_change_attempt_does_not_consume_modification_budget(
@@ -2335,7 +2693,7 @@ def test_live_effective_revision_drift_blocks_merge(
 
 
 def test_failed_required_check_evidence_reaches_development_thread(
-    git_repo: Path,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
@@ -2345,6 +2703,28 @@ def test_failed_required_check_evidence_reaches_development_thread(
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
     publisher.checks = ["fail", "pass"]
+    original_snapshot = publisher.required_checks_snapshot
+
+    def snapshot_with_passing_sibling(
+        pr_number: int, *, expected_head_sha: str
+    ) -> dict[str, Any]:
+        observation = original_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+        if observation["result"] == "fail":
+            observation["checks"].append(
+                {
+                    "name": "lint",
+                    "workflow": "ci",
+                    "bucket": "pass",
+                    "link": "https://example.invalid/checks/lint",
+                }
+            )
+        return observation
+
+    monkeypatch.setattr(
+        publisher, "required_checks_snapshot", snapshot_with_passing_sibling
+    )
     agents = CheckRepairAgents(checkout)
 
     result = TicketDeliveryEngine(
@@ -2355,9 +2735,15 @@ def test_failed_required_check_evidence_reaches_development_thread(
     ).deliver(state["run_id"])
 
     assert result["status"] == "ticket_completed"
-    assert agents.development_requests[1]["ci_evidence"] == (
-        publisher.failed_check_evidence
-    )
+    ci_evidence = agents.development_requests[1]["ci_evidence"]
+    assert ci_evidence["checks"] == publisher.failed_check_evidence["checks"]
+    assert ci_evidence["pr_number"] == publisher.pr_number
+    assert ci_evidence["head_sha"]
+    assert ci_evidence["result"] == "fail"
+    assert result["active_ticket_job"]["required_checks_origin"] == ci_evidence
+    assert result["active_ticket_job"]["deterministic_integration_record"][
+        "required_checks_origin"
+    ] == ci_evidence
     assert agents.development_requests[1]["repair_source"] == ("required_checks")
     assert len(agents.publication_requests) == 2
     assert agents.publication_requests[1]["existing_pr"] == {
@@ -2370,6 +2756,35 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert len(publisher.pr_bodies) == 2
     assert len(publisher.agent_run_statuses) == 1
     assert publisher.agent_run_statuses[0]["validation_outcome"] == "pass"
+
+
+def test_required_check_origin_survives_acceptance_repair_and_final_record(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail", "pass"]
+    agents = RequiredCheckThenAcceptanceFindingAgents(checkout)
+
+    completed = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    job = completed["active_ticket_job"]
+    origin = job["required_checks_origin"]
+    assert origin["pr_number"] == job["pr_number"]
+    assert origin["head_sha"] != job["publication_sha"]
+    assert origin["result"] == "fail"
+    assert origin["checks"] == publisher.failed_check_evidence["checks"]
+    assert "ci_evidence" not in job
+    assert job["deterministic_integration_record"]["required_checks_origin"] == origin
+    assert agents.review_count == 3
 
 
 def test_ticket_required_check_failure_uses_exact_head_repair_evidence(
@@ -2480,36 +2895,125 @@ def test_ticket_required_check_head_drift_blocks_before_failed_evidence(
 
 
 @pytest.mark.parametrize(
-    "check",
+    "checks",
     [
-        {
-            "name": "cancelled-test",
-            "workflow": "ci",
-            "bucket": "cancel",
-            "state": "CANCELLED",
-            "description": "The job was cancelled.",
-            "link": "https://example.invalid/checks/cancelled",
-        },
-        {
-            "name": "platform-test",
-            "workflow": "ci",
-            "bucket": "fail",
-            "state": "FAILURE",
-            "description": "The runner platform timed out.",
-            "link": "https://example.invalid/checks/platform",
-        },
-        {
-            "name": "unknown-test",
-            "workflow": "ci",
-            "bucket": "fail",
-            "description": "No authoritative conclusion was reported.",
-            "link": "https://example.invalid/checks/unknown",
-        },
+        [
+            {
+                "name": "cancelled-test",
+                "workflow": "ci",
+                "bucket": "cancel",
+                "state": "CANCELLED",
+                "description": "The job was cancelled.",
+                "link": "https://example.invalid/checks/cancelled",
+            }
+        ],
+        [
+            {
+                "name": "platform-test",
+                "workflow": "ci",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The runner platform timed out.",
+                "link": "https://example.invalid/checks/platform",
+            }
+        ],
+        [
+            {
+                "name": "unknown-test",
+                "workflow": "ci",
+                "bucket": "fail",
+                "description": "No authoritative conclusion was reported.",
+                "link": "https://example.invalid/checks/unknown",
+            }
+        ],
+        [
+            {
+                "name": "runner-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The runner setup failed.",
+                "link": "https://example.invalid/checks/runner",
+                "job": {
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [
+                        {
+                            "name": "Set up job",
+                            "status": "completed",
+                            "conclusion": "failure",
+                        }
+                    ],
+                },
+            }
+        ],
+        [
+            {
+                "name": "lint-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "An unconfigured lint step failed.",
+                "link": "https://example.invalid/checks/lint",
+                "job": {
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "steps": [
+                        {
+                            "name": "Run lint",
+                            "status": "completed",
+                            "conclusion": "failure",
+                        }
+                    ],
+                },
+            }
+        ],
+        [
+            {
+                "name": "test",
+                "workflow": "ci",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "repairability": "code_failure",
+                "description": "The configured test step failed.",
+                "link": "https://example.invalid/checks/test",
+            },
+            {
+                "name": "runner-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The runner setup also failed.",
+                "link": "https://example.invalid/checks/runner",
+            },
+        ],
+        [
+            {
+                "name": "incomplete-test",
+                "workflow": "CI",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "description": "The Actions job detail is incomplete.",
+                "link": "https://example.invalid/checks/incomplete",
+                "job": {
+                    "status": "in_progress",
+                    "conclusion": None,
+                },
+            }
+        ],
     ],
-    ids=("cancelled", "platform", "unknown"),
+    ids=(
+        "cancelled",
+        "platform",
+        "unknown",
+        "runner",
+        "unconfigured-step",
+        "mixed",
+        "incomplete",
+    ),
 )
 def test_ticket_non_repairable_required_check_failure_is_supervised(
-    git_repo: Path, check: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    git_repo: Path, checks: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -2522,7 +3026,7 @@ def test_ticket_non_repairable_required_check_failure_is_supervised(
     publisher.checks = ["fail"]
     publisher.failed_check_evidence = {
         "pr_number": publisher.pr_number,
-        "checks": [check],
+        "checks": checks,
     }
     agents = CheckRepairAgents(checkout)
 
@@ -2535,7 +3039,125 @@ def test_ticket_non_repairable_required_check_failure_is_supervised(
     assert completed["supervision_window"]["kind"] == "github_convergence"
     assert job["phase"] == "waiting_checks"
     assert job["modification_attempts"] == 1
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["final_ci_fix_used"] is False
     assert len(agents.development_requests) == 1
+    assert "next_attempt_kind" not in job
+    assert completed["diagnostics"][0]["code"] == (
+        "github_check_failure_not_repairable"
+    )
+
+
+def test_ticket_mixed_pending_required_checks_are_supervised(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail"]
+    original_snapshot = publisher.required_checks_snapshot
+
+    def mixed_snapshot(pr_number: int, *, expected_head_sha: str) -> dict[str, Any]:
+        observation = original_snapshot(
+            pr_number, expected_head_sha=expected_head_sha
+        )
+        observation["checks"].append(
+            {"name": "integration", "bucket": "pending", "state": "IN_PROGRESS"}
+        )
+        return observation
+
+    monkeypatch.setattr(publisher, "required_checks_snapshot", mixed_snapshot)
+    agents = CheckRepairAgents(checkout)
+
+    completed = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "waiting_external"
+    assert job["phase"] == "waiting_checks"
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["final_ci_fix_used"] is False
+    assert len(agents.development_requests) == 1
+    assert "next_attempt_kind" not in job
+    assert completed["diagnostics"][0]["code"] == (
+        "github_check_failure_not_repairable"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pr_number", 999),
+        ("head_sha", "stale-head"),
+        ("result", "pass"),
+        (
+            "checks",
+            [
+                {
+                    "name": "test",
+                    "workflow": "other-ci",
+                    "bucket": "fail",
+                    "state": "FAILURE",
+                    "repairability": "code_failure",
+                    "description": "The test job failed.",
+                    "link": "https://example.invalid/checks/test",
+                }
+            ],
+        ),
+    ],
+)
+def test_ticket_conflicting_failure_evidence_is_supervised(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail"]
+    publisher.failed_check_evidence = {
+        **publisher.failed_check_evidence,
+        field: value,
+    }
+    if field == "checks":
+        original_snapshot = publisher.required_checks_snapshot
+
+        def mismatched_snapshot(
+            pr_number: int, *, expected_head_sha: str
+        ) -> dict[str, Any]:
+            observation = original_snapshot(
+                pr_number, expected_head_sha=expected_head_sha
+            )
+            observation["checks"][0]["workflow"] = "ci"
+            return observation
+
+        monkeypatch.setattr(
+            publisher, "required_checks_snapshot", mismatched_snapshot
+        )
+    agents = CheckRepairAgents(checkout)
+
+    completed = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    ).deliver(state["run_id"])
+
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "waiting_external"
+    assert job["phase"] == "waiting_checks"
+    assert job["review_budget"]["final_ci_fix_used"] is False
+    assert len(agents.development_requests) == 1
+    assert "next_attempt_kind" not in job
     assert completed["diagnostics"][0]["code"] == (
         "github_check_failure_not_repairable"
     )
@@ -2571,6 +3193,8 @@ def test_ticket_failed_required_check_evidence_read_is_supervised(
     assert interrupted is not None
     job = interrupted["active_ticket_job"]
     assert job["modification_attempts"] == 1
+    assert job["required_checks_evidence"]["result"] == "fail"
+    assert job["phase"] == "waiting_checks"
     assert "ci_evidence" not in job
     assert agents.development_thread_ids == [None]
 
@@ -2761,8 +3385,9 @@ def test_publication_replacement_thread_is_rejected(
     assert publisher.created_prs == 0
 
 
-def test_published_head_gate_rejects_live_base_sha_drift(
-    git_repo: Path,
+@pytest.mark.parametrize("check_result", ["pass", "pending"])
+def test_required_checks_reject_live_base_sha_drift_before_progress(
+    git_repo: Path, check_result: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
@@ -2771,6 +3396,7 @@ def test_published_head_gate_rejects_live_base_sha_drift(
     ).start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = LiveBaseDriftPublisher(git_repo)
+    publisher.checks = [check_result]
 
     result = TicketDeliveryEngine(
         git=GitRepository(git_repo),
@@ -2785,6 +3411,7 @@ def test_published_head_gate_rejects_live_base_sha_drift(
         "blocked: Published-Head Gate rejected live PR state"
     )
     assert publisher.closed_issues == []
+    assert "required_checks_evidence" not in result["active_ticket_job"]
 
 
 def test_persisted_closed_unmerged_pr_blocks_without_creating_another(
@@ -3317,8 +3944,19 @@ def test_publication_worker_failure_is_not_retried_or_marked_pending(
 def test_required_checks_timeout_waits_without_starting_a_repair(
     git_repo: Path,
 ) -> None:
+    class SnapshotRecordingStateStore(StateStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.snapshot_failure_commits: list[dict[str, Any]] = []
+
+        def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+            job = state.get("active_ticket_job")
+            if isinstance(job, dict) and state.get("status") == "waiting_external":
+                self.snapshot_failure_commits.append(deepcopy(state))
+            super().save_run(run_id, state)
+
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = StateStore(git_repo / ".agent-run")
+    states = SnapshotRecordingStateStore(git_repo / ".agent-run")
     state, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).start(1)
@@ -3337,6 +3975,15 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
     job = waiting["active_ticket_job"]
     assert waiting["status"] == "waiting_external"
     assert job["phase"] == "publishing"
+    assert "required_checks_evidence" not in job
+    assert len(states.snapshot_failure_commits) == 1
+    assert states.snapshot_failure_commits[0]["status"] == "waiting_external"
+    assert "publication_operation_retry" not in states.snapshot_failure_commits[0][
+        "active_ticket_job"
+    ]
+    assert "last_publication_error" not in states.snapshot_failure_commits[0][
+        "active_ticket_job"
+    ]
     assert "repair_source" not in job
     assert job["modification_attempts"] == 1
     assert agents.development_thread_ids == [None]
@@ -3349,6 +3996,79 @@ def test_required_checks_timeout_waits_without_starting_a_repair(
     assert completed["active_ticket_job"]["modification_attempts"] == 1
     assert agents.development_thread_ids == [None]
     assert agents.review_count == 1
+
+
+def test_repeated_required_checks_reads_share_supervision_without_publication_retry(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PassAgents(checkout)
+    publisher = CheckReadFailsNTimesPublisher(git_repo, failures=5)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents
+    )
+
+    waiting_states = [engine.deliver(state["run_id"]) for _ in range(5)]
+
+    assert all(item["status"] == "waiting_external" for item in waiting_states)
+    assert all(
+        item["active_ticket_job"]["phase"] == "publishing"
+        and "publication_operation_retry" not in item["active_ticket_job"]
+        and "last_publication_error" not in item["active_ticket_job"]
+        for item in waiting_states
+    )
+    completed = engine.deliver(state["run_id"])
+
+    assert completed["status"] == "ticket_completed"
+    assert publisher.merged_sha is not None
+    assert completed["active_ticket_job"]["pr_number"] == publisher.pr_number
+    assert len(agents.publication_requests) == 1
+    assert completed["active_ticket_job"]["publication_attempts"] == 1
+    assert completed["active_ticket_job"]["review_budget"] == waiting_states[0][
+        "active_ticket_job"
+    ]["review_budget"]
+
+
+def test_same_head_snapshot_timeout_preserves_observation_without_progress(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = PassAgents(checkout)
+    publisher = SnapshotReadFailsAfterPendingPublisher(git_repo)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher,
+        agents=agents,
+    )
+
+    waiting = engine.deliver(state["run_id"])
+    previous = deepcopy(waiting["active_ticket_job"]["required_checks_evidence"])
+    development_requests = len(agents.development_requests)
+    review_count = agents.review_count
+
+    unavailable = engine.deliver(state["run_id"])
+
+    job = unavailable["active_ticket_job"]
+    assert unavailable["status"] == "waiting_external"
+    assert unavailable["diagnostics"][0]["code"] == (
+        "github_checks_observation_pending"
+    )
+    assert job["required_checks_evidence"] == previous
+    assert job["phase"] == "waiting_checks"
+    assert len(agents.development_requests) == development_requests
+    assert agents.review_count == review_count
+    assert publisher.merged_sha is None
 
 
 def test_required_checks_snapshot_state_change_cannot_publish_as_pass(
@@ -3374,9 +4094,46 @@ def test_required_checks_snapshot_state_change_cannot_publish_as_pass(
     job = waiting["active_ticket_job"]
     assert waiting["status"] == "waiting_checks"
     assert job["phase"] == "waiting_checks"
-    assert job["required_checks"] == "pending"
+    assert "required_checks" not in job
     assert job["required_checks_evidence"]["result"] == "pending"
     assert "deterministic_integration_record" not in job
+    assert publisher.merged_sha is None
+
+
+@pytest.mark.parametrize(
+    ("result", "checks"),
+    [
+        ("pass", []),
+        ("pass", [{"name": "quality", "bucket": "fail"}]),
+        ("none", [{"name": "quality", "bucket": "pass"}]),
+        ("pending", [{"name": "quality", "bucket": "pass"}]),
+        ("fail", [{"name": "quality", "bucket": "pending"}]),
+        ("unknown", []),
+    ],
+)
+def test_published_head_gate_fails_closed_on_required_checks_contradictions(
+    git_repo: Path, result: str, checks: list[dict[str, str]]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ContradictorySnapshotPublisher(
+        git_repo, result=result, checks=checks
+    )
+
+    blocked = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=publisher,
+        agents=PassAgents(checkout),
+    ).deliver(state["run_id"])
+
+    assert blocked["status"] == "blocked"
+    assert blocked["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert blocked["active_ticket_job"]["phase"] == "blocked"
     assert publisher.merged_sha is None
 
 

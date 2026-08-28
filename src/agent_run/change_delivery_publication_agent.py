@@ -20,6 +20,7 @@ from agent_run.semantic_attempt import (
     detach_active_invocation,
     pending_semantic_attempt,
 )
+from agent_run.required_checks_observation import bind_new_publication_head
 
 
 def _invalidate_stale_publication(
@@ -139,6 +140,7 @@ def publication(
     sha = stage.publisher.create_publication_commit(
         checkout, job, publication.commit_message
     )
+    bind_new_publication_head(job, sha)
     job.update(
         {
             "publication": {

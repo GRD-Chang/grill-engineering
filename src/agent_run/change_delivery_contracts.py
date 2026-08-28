@@ -66,6 +66,12 @@ class ChangeDeliveryAdapter(Protocol):
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool: ...
 
+    def resume_after_required_checks_failure(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool:
+        """Restore consumer state and return whether this invocation must yield."""
+        ...
+
     def linked_issue_number(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> int | None: ...

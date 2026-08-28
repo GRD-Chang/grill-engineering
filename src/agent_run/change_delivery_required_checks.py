@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-"""Required Check observation and Run-only repair classification."""
+"""Exact-head Required Checks observation and repair classification."""
 
-from pathlib import Path
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.change_delivery_fallback import (
+    preserve_required_checks_publication_authorization,
+)
 from agent_run.external_supervision import (
+    clear_supervision_window,
     ensure_supervision_window,
     is_github_convergence_error,
     wait_for_github_convergence,
@@ -18,71 +22,97 @@ from agent_run.required_checks import (
     supervise_unrepairable_check_failure,
 )
 from agent_run.review_budget import can_start_development, ensure_budget
+from agent_run.required_checks_observation import (
+    clear_required_checks_observation,
+    failure_evidence_matches_observation,
+    read_required_checks_observation,
+)
 
 
-def _snapshot_result(snapshot: dict[str, Any], initial_result: str) -> str:
-    result = snapshot.get("result")
-    if result == "observed":
-        # The fixture adapter uses this marker for a detailed evidence
-        # payload, not for an aggregate Required Checks result. Real GitHub
-        # snapshots return one of the canonical aggregate states below.
-        return initial_result
-    if result not in {"none", "pass", "pending", "fail", "unknown"}:
-        raise ValueError("Required Checks snapshot result is invalid")
-    return str(result)
+def _clear_required_checks_read_retry(job: dict[str, Any]) -> None:
+    """Keep Required Checks convergence out of Publication Operation Retry."""
+
+    job.pop("publication_operation_retry", None)
+    job.pop("last_publication_error", None)
 
 
-def _required_checks_snapshot(
-    stage: ChangeDeliveryStage,
-    job: dict[str, Any],
-    pr_number: int,
-    initial_result: str,
-) -> dict[str, Any]:
-    expected_head = str(job["publication_sha"])
-    snapshot_reader = getattr(stage.github, "required_checks_snapshot", None)
-    if callable(snapshot_reader):
-        snapshot = snapshot_reader(pr_number, expected_head_sha=expected_head)
-        if not isinstance(snapshot, dict):
-            raise ValueError("Required Checks snapshot must be an object")
-        snapshot = deepcopy(snapshot)
-        if snapshot.get("head_sha") != expected_head:
-            raise GitHubReadError(
-                "change_pr_head_drift",
-                "Required Checks snapshot does not match the expected PR head",
-            )
-        result = _snapshot_result(snapshot, initial_result)
+def _set_required_checks_repair_evidence(
+    job: dict[str, Any], evidence: dict[str, Any]
+) -> None:
+    """Keep the failed PR/head as immutable provenance for Change Delivery."""
+
+    job["ci_evidence"] = deepcopy(evidence)
+    if not isinstance(job.get("required_checks_origin"), dict):
+        job["required_checks_origin"] = deepcopy(evidence)
+
+
+def _resume_change_delivery_after_evidence(
+    stage: ChangeDeliveryStage, state: dict[str, Any], job: dict[str, Any]
+) -> bool:
+    if job.get("phase") != "waiting_checks":
+        preserve_required_checks_publication_authorization(job)
+        clear_required_checks_observation(job)
+    should_yield = stage.adapter.resume_after_required_checks_failure(state, job)
+    clear_supervision_window(state)
+    return should_yield
+
+
+def _expected_publication_base_sha(job: dict[str, Any]) -> str | None:
+    if job.get("publication_authority") == "fallback":
+        value = job.get("base_sha")
     else:
-        snapshot = {"checks": []}
-        result = initial_result
-    snapshot.update(
-        {
-            "pr_number": pr_number,
-            "head_sha": expected_head,
-            "result": result,
-        }
+        acceptance = job.get("acceptance_record")
+        value = (
+            acceptance.get("reviewed_base_sha")
+            if isinstance(acceptance, dict)
+            else None
+        )
+    return value if isinstance(value, str) and value else None
+
+
+def _live_publication_identity_matches(
+    stage: ChangeDeliveryStage,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    live: dict[str, Any],
+) -> bool:
+    repository = state.get("repository")
+    expected_base_sha = _expected_publication_base_sha(job)
+    return (
+        isinstance(repository, str)
+        and bool(repository)
+        and expected_base_sha is not None
+        and live.get("state") in {None, "OPEN"}
+        and live.get("head_branch") == stage.contract.branch
+        and live.get("head_sha") == job.get("publication_sha")
+        and live.get("head_repository") == repository
+        and live.get("base_branch") == stage.contract.base_branch
+        and live.get("base_sha") == expected_base_sha
+        and live.get("base_repository") == repository
     )
-    return snapshot
 
 
-def _verify_live_publication_head(
+def _verify_live_publication_identity(
     stage: ChangeDeliveryStage,
     state: dict[str, Any],
     job: dict[str, Any],
     pr_number: int,
     checks: str,
 ) -> bool | None:
-    """Confirm the PR head before reading failure evidence.
+    """Confirm the complete live PR identity around Required Check reads.
 
     Required Check APIs can briefly report jobs for a previous PR head.  The
     Publisher seam owns the supervised live PR read, so failure evidence is
     never accepted from that ambiguous interval.
     """
 
-    expected_head = str(job["publication_sha"])
     try:
         live = stage.publisher.live_pull_request(state, job, pr_number)
     except (GitHubReadError, OSError, TimeoutError) as error:
-        if isinstance(error, GitHubReadError) and error.code == "change_pr_head_drift":
+        if isinstance(error, GitHubReadError) and error.code in {
+            "change_pr_head_drift",
+            "change_pr_identity_mismatch",
+        }:
             stage._record_agent_run_status(
                 pr_number,
                 job,
@@ -93,31 +123,31 @@ def _verify_live_publication_head(
                 state,
                 job,
                 "published_head_mismatch",
-                "Live PR head drifted before Required Check failure evidence was read",
+                "Live PR identity drifted while Required Checks were observed",
             )
         if isinstance(error, GitHubReadError) and not is_github_convergence_error(
             error.code
         ):
             raise
-        if stage._record_publication_operation_failure(state, job, error):
-            return True
         stage._record_agent_run_status(
             pr_number,
             job,
             "unavailable",
-            next_action="retry live PR head observation before Required Check evidence",
+            next_action="retry live PR identity observation",
         )
         wait_for_github_convergence(
             state,
             code="github_pr_head_observation_pending",
-            message="GitHub live PR head observation has not converged",
-            waiting_for=(f"Ticket PR #{pr_number} live head observation"),
+            message="GitHub live PR identity observation has not converged",
+            waiting_for=(f"Change PR #{pr_number} live identity observation"),
         )
         ensure_supervision_window(state)
         stage.save(state)
         return True
 
-    if not isinstance(live, dict) or live.get("head_sha") != expected_head:
+    if not isinstance(live, dict) or not _live_publication_identity_matches(
+        stage, state, job, live
+    ):
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -128,7 +158,7 @@ def _verify_live_publication_head(
             state,
             job,
             "published_head_mismatch",
-            "Live PR head drifted before Required Check failure evidence was read",
+            "Live PR identity drifted while Required Checks were observed",
         )
     return None
 
@@ -140,92 +170,70 @@ def observe_required_checks(
     checkout: Path,
     pr_number: int,
 ) -> tuple[bool | None, str]:
+    _clear_required_checks_read_retry(job)
     checks = "unavailable"
     try:
-        checks = stage.github.required_checks(pr_number)
+        observation = read_required_checks_observation(
+            stage.github,
+            pr_number,
+            expected_head_sha=str(job["publication_sha"]),
+        )
     except (GitHubReadError, OSError, TimeoutError) as error:
+        if isinstance(error, GitHubReadError) and error.code in {
+            "change_pr_head_drift",
+            "change_pr_identity_mismatch",
+        }:
+            stage._record_agent_run_status(
+                pr_number,
+                job,
+                "unavailable",
+                next_action="blocked: Published-Head Gate rejected live PR state",
+            )
+            return stage._block(
+                state,
+                job,
+                "published_head_mismatch",
+                "Required Checks snapshot did not match the published PR identity",
+            ), checks
         if isinstance(error, GitHubReadError) and not is_github_convergence_error(
             error.code
         ):
             raise
-        if stage._record_publication_operation_failure(state, job, error):
-            return True, checks
         stage._record_agent_run_status(
             pr_number,
             job,
             "unavailable",
             next_action="retry Required Checks observation",
         )
-        state.update(
-            {
-                "status": "waiting_external",
-                "terminal_kind": "waiting_external",
-                "diagnostics": [
-                    {
-                        "code": "github_checks_observation_pending",
-                        "message": "GitHub Required Checks read has not converged",
-                        "waiting_for": f"Ticket PR #{pr_number} Required Checks observation",
-                    }
-                ],
-            }
+        wait_for_github_convergence(
+            state,
+            code="github_checks_observation_pending",
+            message="GitHub Required Checks read has not converged",
+            waiting_for=f"Change PR #{pr_number} Required Checks observation",
         )
+        ensure_supervision_window(state)
         stage.save(state)
         return True, checks
+    except ValueError:
+        return stage._block(
+            state,
+            job,
+            "published_head_mismatch",
+            "Required Checks snapshot contradicted its check buckets",
+        ), checks
+    checks = str(observation["result"])
+    live_identity_outcome = _verify_live_publication_identity(
+        stage, state, job, pr_number, checks
+    )
+    if live_identity_outcome is not None:
+        return live_identity_outcome, checks
     stage._reject_stale(
         state,
         job,
         checkout,
         "Published-Head Gate rejected requirements changed while reading checks",
     )
-    job["required_checks"] = checks
-    job["required_checks_mode"] = (
-        "not_configured" if checks == "none" else "configured"
-    )
-    if checks in {"none", "pass"}:
-        try:
-            job["required_checks_evidence"] = _required_checks_snapshot(
-                stage, job, pr_number, checks
-            )
-        except (GitHubReadError, OSError, TimeoutError) as error:
-            if isinstance(error, GitHubReadError) and error.code == "change_pr_head_drift":
-                stage._record_agent_run_status(
-                    pr_number,
-                    job,
-                    checks,
-                    next_action="blocked: Published-Head Gate rejected live PR state",
-                )
-                return stage._block(
-                    state,
-                    job,
-                    "published_head_mismatch",
-                    "Required Checks snapshot did not match the published PR head",
-                ), checks
-            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
-                error.code
-            ):
-                raise
-            if stage._record_publication_operation_failure(state, job, error):
-                return True, checks
-            stage._record_agent_run_status(
-                pr_number,
-                job,
-                "unavailable",
-                next_action="retry Required Checks evidence observation",
-            )
-            wait_for_github_convergence(
-                state,
-                code="github_checks_evidence_observation_pending",
-                message="GitHub Required Checks evidence has not converged",
-                waiting_for=(f"Ticket PR #{pr_number} Required Checks evidence"),
-            )
-            ensure_supervision_window(state)
-            stage.save(state)
-            return True, checks
-        checks = str(job["required_checks_evidence"]["result"])
-        job["required_checks"] = checks
-        job["required_checks_mode"] = (
-            "not_configured" if checks == "none" else "configured"
-        )
+    job["required_checks_evidence"] = observation
     stage._record_agent_run_status(
         pr_number,
         job,
@@ -237,7 +245,10 @@ def observe_required_checks(
     if checks == "pending":
         job["phase"] = "waiting_checks"
         state["status"] = "waiting_checks"
-        stage.save(state)
+        state["terminal_kind"] = "waiting_checks"
+        state["diagnostics"] = []
+        ensure_supervision_window(state)
+        stage.commit_required_checks_observation(state, job, pr_number)
         return True, checks
     if checks == "unknown":
         job["phase"] = "waiting_checks"
@@ -245,13 +256,23 @@ def observe_required_checks(
             state,
             code="github_checks_observation_unknown",
             message="GitHub Required Checks returned an unknown state",
-            waiting_for=f"Ticket PR #{pr_number} Required Checks observation",
+            waiting_for=f"Change PR #{pr_number} Required Checks observation",
         )
         ensure_supervision_window(state)
-        stage.save(state)
+        stage.commit_required_checks_observation(state, job, pr_number)
         return True, checks
     if checks == "fail":
-        live_head_outcome = _verify_live_publication_head(
+        job["phase"] = "waiting_checks"
+        wait_for_github_convergence(
+            state,
+            code="github_check_evidence_observation_pending",
+            message="GitHub Required Check failure evidence has not converged",
+            waiting_for=f"Change PR #{pr_number} failed Required Check evidence",
+        )
+        ensure_supervision_window(state)
+    stage.commit_required_checks_observation(state, job, pr_number)
+    if checks == "fail":
+        live_head_outcome = _verify_live_publication_identity(
             stage, state, job, pr_number, checks
         )
         if live_head_outcome is not None:
@@ -264,20 +285,18 @@ def observe_required_checks(
                     error, GitHubReadError
                 ) and not is_github_convergence_error(error.code):
                     raise
-                if stage._record_publication_operation_failure(state, job, error):
-                    return True, checks
                 wait_for_github_convergence(
                     state,
                     code="github_check_evidence_observation_pending",
                     message="GitHub Required Check failure evidence has not converged",
                     waiting_for=(
-                        f"Ticket PR #{pr_number} failed Required Check evidence"
+                        f"Change PR #{pr_number} failed Required Check evidence"
                     ),
                 )
                 ensure_supervision_window(state)
                 stage.save(state)
                 return True, checks
-            live_head_outcome = _verify_live_publication_head(
+            live_head_outcome = _verify_live_publication_identity(
                 stage, state, job, pr_number, checks
             )
             if live_head_outcome is not None:
@@ -288,7 +307,6 @@ def observe_required_checks(
                 "head_sha": str(job["publication_sha"]),
                 "result": "fail",
             }
-            job["required_checks_evidence"] = evidence
             if stage.modification_budget_exhausted(job):
                 job.update(
                     {
@@ -301,11 +319,12 @@ def observe_required_checks(
                     {
                         "phase": "repairing",
                         "repair_source": "required_checks",
-                        "ci_evidence": evidence,
                     }
                 )
+            _set_required_checks_repair_evidence(job, evidence)
+            should_yield = _resume_change_delivery_after_evidence(stage, state, job)
             stage.save(state)
-            return False, checks
+            return should_yield, checks
         try:
             evidence = stage.github.required_check_evidence(
                 pr_number, expected_head_sha=str(job["publication_sha"])
@@ -315,8 +334,6 @@ def observe_required_checks(
                 error.code
             ):
                 raise
-            if stage._record_publication_operation_failure(state, job, error):
-                return True, checks
             stage._record_agent_run_status(
                 pr_number,
                 job,
@@ -327,12 +344,12 @@ def observe_required_checks(
                 state,
                 code="github_check_evidence_observation_pending",
                 message="GitHub Required Check failure evidence has not converged",
-                waiting_for=(f"Ticket PR #{pr_number} failed Required Check evidence"),
+                waiting_for=(f"Change PR #{pr_number} failed Required Check evidence"),
             )
             ensure_supervision_window(state)
             stage.save(state)
             return True, checks
-        live_head_outcome = _verify_live_publication_head(
+        live_head_outcome = _verify_live_publication_identity(
             stage, state, job, pr_number, checks
         )
         if live_head_outcome is not None:
@@ -343,8 +360,13 @@ def observe_required_checks(
             "head_sha": str(job["publication_sha"]),
             "result": "fail",
         }
-        job["required_checks_evidence"] = canonical_evidence
-        if not is_explicitly_repairable_code_failure(evidence):
+        if not failure_evidence_matches_observation(
+            observation,
+            evidence,
+            pr_number=pr_number,
+            head_sha=str(job["publication_sha"]),
+        ) or not is_explicitly_repairable_code_failure(evidence):
+            job["ci_evidence"] = canonical_evidence
             supervise_unrepairable_check_failure(
                 state,
                 job,
@@ -362,7 +384,6 @@ def observe_required_checks(
                 {
                     "phase": "repairing",
                     "repair_source": "required_checks",
-                    "ci_evidence": canonical_evidence,
                     "next_attempt_kind": "final_ci_fix",
                     "final_ci_fix_failure_head": str(job["publication_sha"]),
                     "final_ci_fix_used_before_attempt": budget[
@@ -375,6 +396,7 @@ def observe_required_checks(
                 {
                     "phase": "escalating",
                     "escalation_code": "modification_budget_exhausted",
+                    "repair_source": "required_checks",
                 }
             )
         else:
@@ -382,12 +404,14 @@ def observe_required_checks(
                 {
                     "phase": "repairing",
                     "repair_source": "required_checks",
-                    "ci_evidence": evidence,
                     "next_attempt_kind": "ordinary",
                 }
             )
+        _set_required_checks_repair_evidence(job, canonical_evidence)
+        should_yield = _resume_change_delivery_after_evidence(stage, state, job)
         stage.save(state)
-        return False, checks
+        return should_yield, checks
     if checks not in {"none", "pass"}:
         raise ValueError(f"unknown Required Checks state: {checks}")
+    clear_supervision_window(state)
     return None, checks

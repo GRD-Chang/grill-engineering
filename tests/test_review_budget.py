@@ -18,7 +18,6 @@ from agent_run.review_budget import (
     reset_budget,
 )
 from agent_run.change_delivery_required_checks import observe_required_checks
-from agent_run.publication_operation_retry import record_publication_operation_failure
 
 
 def _job_with_budget(
@@ -344,7 +343,9 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
     }
     job: dict[str, object] = {
         "phase": "waiting_checks",
+        "base_sha": "base-head",
         "publication_sha": "candidate-head",
+        "acceptance_record": {"reviewed_base_sha": "base-head"},
         "modification_attempts": 4,
         "validation_attempts": 2,
         "review_budget": {
@@ -357,31 +358,70 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
         },
         "review_budget_history": [],
     }
+    repair_resumes: list[tuple[dict[str, object], dict[str, object]]] = []
+
+    def resume_after_required_checks_failure(
+        state: dict[str, object], repair_job: dict[str, object]
+    ) -> bool:
+        repair_resumes.append((state, repair_job))
+        state.update(
+            {"status": "adapter_resumed", "terminal_kind": None, "diagnostics": []}
+        )
+        return False
+
     stage = SimpleNamespace(
+        contract=SimpleNamespace(
+            label="ticket-1", branch="ticket-1", base_branch="run-1"
+        ),
         github=SimpleNamespace(
-            required_checks=lambda _pr: "fail",
+            required_checks_snapshot=lambda _pr, expected_head_sha: {
+                "pr_number": 11,
+                "head_sha": expected_head_sha,
+                "result": "fail",
+                "checks": [dict(check) for check in evidence["checks"]],
+            },
             required_check_evidence=lambda _pr, expected_head_sha: evidence,
         ),
         publisher=SimpleNamespace(
             live_pull_request=lambda _state, _job, _pr: {
-                "head_sha": "candidate-head"
+                "state": "OPEN",
+                "head_branch": "ticket-1",
+                "head_sha": "candidate-head",
+                "head_repository": "example/project",
+                "base_branch": "run-1",
+                "base_sha": "base-head",
+                "base_repository": "example/project",
             }
         ),
-        adapter=SimpleNamespace(classify_required_check_failures=True),
+        adapter=SimpleNamespace(
+            classify_required_check_failures=True,
+            resume_after_required_checks_failure=(
+                resume_after_required_checks_failure
+            ),
+        ),
         modification_budget_exhausted=lambda _job: True,
         review_budget_policy=lambda: TICKET_POLICY,
         _record_agent_run_status=lambda *_args, **_kwargs: None,
-        _record_publication_operation_failure=(
+        _record_publication_operation_failure_in_memory=(
             lambda _state, owner, failure: record_publication_operation_failure(
                 owner, failure
             )
         ),
         _reject_stale=lambda *_args, **_kwargs: None,
+        commit_required_checks_observation=lambda state, _job, _pr: state,
         save=lambda state: state,
     )
 
+    state: dict[str, object] = {
+        "status": "active",
+        "repository": "example/project",
+    }
     outcome, checks = observe_required_checks(
-        stage, {"status": "active"}, job, Path("."), 11
+        stage,
+        state,
+        job,
+        Path("."),
+        11,
     )
 
     assert outcome is False
@@ -389,6 +429,13 @@ def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> No
     assert job["phase"] == "repairing"
     assert job["next_attempt_kind"] == "final_ci_fix"
     assert job["final_ci_fix_failure_head"] == "candidate-head"
+    assert repair_resumes == [(state, job)]
+    assert state == {
+        "status": "adapter_resumed",
+        "repository": "example/project",
+        "terminal_kind": None,
+        "diagnostics": [],
+    }
 
 
 @pytest.mark.parametrize(
@@ -402,17 +449,11 @@ def test_success_required_checks_snapshot_read_is_supervised(error: BaseExceptio
     }
     stage = SimpleNamespace(
         github=SimpleNamespace(
-            required_checks=lambda _pr: "pass",
             required_checks_snapshot=lambda _pr, expected_head_sha: (_ for _ in ()).throw(
                 error
             ),
         ),
         _record_agent_run_status=lambda *_args, **_kwargs: None,
-        _record_publication_operation_failure=(
-            lambda _state, owner, failure: record_publication_operation_failure(
-                owner, failure
-            )
-        ),
         _reject_stale=lambda *_args, **_kwargs: None,
         save=lambda state: state,
     )
@@ -421,9 +462,10 @@ def test_success_required_checks_snapshot_read_is_supervised(error: BaseExceptio
     outcome, checks = observe_required_checks(stage, state, job, Path("."), 11)
 
     assert outcome is True
-    assert checks == "pass"
+    assert checks == "unavailable"
     assert state["status"] == "waiting_external"
     assert state["diagnostics"][0]["code"] == (
-        "github_checks_evidence_observation_pending"
+        "github_checks_observation_pending"
     )
-    assert job["publication_operation_retry"] == {"attempts": 1, "limit": 5}
+    assert "publication_operation_retry" not in job
+    assert "last_publication_error" not in job

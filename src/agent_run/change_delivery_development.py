@@ -9,6 +9,9 @@ from uuid import uuid4
 from agent_run.agents import HumanBlockerResult
 from agent_run.artifacts import clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.change_delivery_fallback import (
+    preserve_required_checks_publication_authorization,
+)
 from agent_run.change_delivery_threads import (
     record_development_thread as _record_development_thread,
 )
@@ -18,6 +21,7 @@ from agent_run.credential_availability import (
     wait_for_initial_credential as wait_for_initial_credential_state,
 )
 from agent_run.git_errors import GitError, GitIntegrityError
+from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -235,6 +239,8 @@ def commit_candidate(
             "no_code_changes",
             "Development Attempt produced no code changes",
         )
+    preserve_required_checks_publication_authorization(job)
+    clear_required_checks_observation(job)
     job.update(
         {
             "candidate_sha": candidate,
@@ -289,7 +295,7 @@ def _route_git_integrity_repair(
     job["git_integrity_evidence"] = evidence
     job["repair_source"] = "git_integrity"
     job.pop("ci_evidence", None)
-    job.pop("required_checks_evidence", None)
+    clear_required_checks_observation(job)
     job.pop("final_ci_fix_failure_head", None)
     job["phase"] = "repairing"
     job["managed_checkout_head"] = expected_head
