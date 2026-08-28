@@ -203,6 +203,192 @@ def repairable_required_check_failure() -> dict[str, object]:
     }
 
 
+def test_public_run_completes_one_supervised_fallback_final_ci_fix(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={
+            "required_checks": ["pending", "pending", "fail", "pass", "pass"],
+            "required_check_evidence": {
+                "pr_number": 1,
+                "checks": [repairable_required_check_failure()],
+            },
+        },
+    )
+    agent_data = final_run_agents()
+    agent_data["developments"] = [
+        {
+            "expected_thread_id": None,
+            "thread_id": "ticket-final-ci",
+            "summary": "Completed ordinary Development 1.",
+            "write_files": {"feature.txt": "attempt 1\n"},
+        },
+        *[
+            {
+                "expected_thread_id": "ticket-final-ci",
+                "thread_id": "ticket-final-ci",
+                "summary": f"Completed ordinary Development {ordinal}.",
+                "write_files": {"feature.txt": f"attempt {ordinal}\n"},
+            }
+            for ordinal in (2, 3, 4)
+        ],
+        {
+            "expected_thread_id": "ticket-final-ci",
+            "thread_id": "ticket-final-ci",
+            "summary": "Completed the one-shot Final CI-fix.",
+            "write_files": {"feature.txt": "final ci fix\n"},
+        },
+    ]
+    agent_data["publications"] = [publication(), publication()]
+    agent_data["reviews"] = [
+        repair_acceptance("ticket-reviewer-1"),
+        repair_acceptance("ticket-reviewer-2"),
+        repair_acceptance("ticket-reviewer-3"),
+    ]
+    agents = git_repo / "fallback-final-ci-fix.json"
+    agents.write_text(json.dumps(agent_data), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    job = state["ticket_jobs"]["3"]
+    assert job["phase"] == "completed"
+    assert job["development_thread_id"] == "ticket-final-ci"
+    assert job["review_budget"]["development_attempts"] == 4
+    assert job["review_budget"]["reviewer_invocations"] == 3
+    assert job["review_budget"]["final_ci_fix_used"] is True
+    assert job["modification_attempts"] == 5
+    assert job["attempt_kind"] == "final_ci_fix"
+    final_observation = job["required_checks_evidence"]
+    assert final_observation["result"] == "pass"
+    assert final_observation["head_sha"] == job["publication_sha"]
+    assert final_observation["checks"] == [
+        {
+            "name": "quality",
+            "workflow": "CI",
+            "bucket": "pass",
+            "state": "SUCCESS",
+            "link": "https://example.invalid/checks/quality",
+        }
+    ]
+    assert job["ci_evidence"]["result"] == "fail"
+    assert job["ci_evidence"]["pr_number"] == job["pr_number"]
+    assert job["ci_evidence"]["head_sha"] != job["publication_sha"]
+    development_attempts = [
+        attempt
+        for attempt in job["semantic_attempt_history"]
+        if attempt["role"] == "development"
+    ]
+    assert [attempt["ordinal"] for attempt in development_attempts] == [1, 2, 3, 4, 5]
+    assert (
+        sum(attempt["outcome"] == "candidate" for attempt in development_attempts) == 5
+    )
+    receipt = job["fallback_publication_receipt"]
+    assert receipt["final_ci_fix_used"] is True
+    assert receipt["final_ci_fix_failure_head"] != job["publication_sha"]
+    assert receipt["required_check_failure_evidence"]["head_sha"] == receipt[
+        "final_ci_fix_failure_head"
+    ]
+    failure_check = receipt["required_check_failure_evidence"]["checks"][0]
+    assert failure_check["bucket"] == "fail"
+    assert failure_check["state"] == "FAILURE"
+    assert failure_check["job"]["head_sha"] == receipt["final_ci_fix_failure_head"]
+    previous_authorization = receipt["previous_publication_authorization"]
+    assert previous_authorization["authority"] == "fallback"
+    assert previous_authorization["publication_sha"] == receipt[
+        "final_ci_fix_failure_head"
+    ]
+    previous_observation = previous_authorization["fallback_receipt"][
+        "required_checks_evidence"
+    ]
+    assert previous_observation["result"] == "fail"
+    assert previous_observation["head_sha"] == receipt["final_ci_fix_failure_head"]
+    assert previous_observation["checks"][0]["job"]["head_sha"] == receipt[
+        "final_ci_fix_failure_head"
+    ]
+    assert receipt["repair_delta"] == [{"status": "M", "path": "feature.txt"}]
+    assert receipt["required_checks_evidence"]["result"] == "pass"
+    assert receipt["required_checks_evidence"]["head_sha"] == job["publication_sha"]
+    assert receipt["required_checks_evidence"]["checks"] == final_observation["checks"]
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    ticket_prs = [
+        pull
+        for pull in fixture_data["delivery"]["pull_requests"]
+        if pull.get("primary_ticket") == 3
+    ]
+    assert len(ticket_prs) == 1
+    assert ticket_prs[0]["state"] == "MERGED"
+    assert ticket_prs[0]["head_sha"] == job["publication_sha"]
+    assert fixture_data["delivery"]["check_position"] >= 5
+    assert fixture_data["supervision_clock"] > 0
+
+
+def test_ticket_required_checks_read_timeout_resumes_without_publication_retry(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={
+            "required_checks": ["pass"],
+            "ticket_required_checks_read_failures": [
+                {"code": "github_timeout", "message": "ticket checks unavailable"}
+                for _ in range(32)
+            ],
+        },
+        supervision_clock_multiplier=120,
+    )
+    agents = git_repo / "ticket-required-check-timeout-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert paused.returncode == 2
+    paused_state = load_only_run_state(git_repo)
+    assert paused_state["status"] == "supervision_timeout"
+    job = paused_state["active_ticket_job"]
+    assert job["phase"] == "publishing"
+    assert "publication_operation_retry" not in job
+    assert "last_publication_error" not in job
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]) == 1
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["ticket_required_checks_read_failures"] = []
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        str(paused_state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    completed = load_only_run_state(git_repo)
+    assert completed["ticket_jobs"]["3"]["phase"] == "completed"
+    assert completed["ticket_jobs"]["3"]["publication_attempts"] == 1
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]) == 2
+
+
 def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
     git_repo: Path,
 ) -> None:
@@ -414,7 +600,13 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     assert job["pending_attempt_kind"] == "final_ci_fix"
     assert job["review_budget"]["development_attempts"] == 4
     assert job["review_budget"]["final_ci_fix_used"] is True
-    assert job["ci_evidence"] == job["required_checks_evidence"]
+    assert "required_checks_evidence" not in job
+    assert "required_checks_evidence" not in job["fallback_publication_receipt"]
+    assert job["ci_evidence"]["result"] == "fail"
+    assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
+    assert job["ci_evidence"]["checks"][0]["job"]["head_sha"] == job[
+        "publication_sha"
+    ]
     assert job["ci_evidence"]["pr_number"] == job["pr_number"]
     assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
     assert job["ci_evidence"]["result"] == "fail"
@@ -452,6 +644,9 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     assert completed_job["review_budget"]["development_attempts"] == 4
     assert completed_job["review_budget"]["final_ci_fix_used"] is True
     assert completed_job["modification_attempts"] == 5
+    assert completed_job["fallback_publication_receipt"][
+        "required_checks_evidence"
+    ]["head_sha"] == completed_job["publication_sha"]
     assert any(
         attempt["attempt_id"] == pending["attempt_id"]
         and attempt["outcome"] == "candidate"
@@ -542,6 +737,13 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     assert job_before["blocked_reason"] == "modification_budget_exhausted"
     assert job_before.get("pending_semantic_attempt") is None
     assert job_before["review_budget"]["window"] == 1
+    assert job_before["review_budget"]["development_attempts"] == 4
+    assert job_before["review_budget"]["final_ci_fix_used"] is True
+    assert job_before["modification_attempts"] == 5
+    first_failure_head = job_before["final_ci_fix_failure_head"]
+    latest_failure_head = job_before["publication_sha"]
+    assert latest_failure_head != first_failure_head
+    assert job_before["ci_evidence"]["head_sha"] == latest_failure_head
     budget_before = json.dumps(job_before["review_budget"], sort_keys=True)
     budget_history_before = json.dumps(
         job_before["review_budget_history"], sort_keys=True
@@ -624,6 +826,11 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     completed_job = completed["ticket_jobs"]["3"]
     assert completed_job["review_budget"]["window"] == 2
     assert completed_job["review_budget"]["development_attempts"] == 1
+    assert "final_ci_fix_failure_head" not in completed_job
+    assert completed_job["ci_evidence"]["head_sha"] == latest_failure_head
+    assert completed_job["review_budget_history"][0][
+        "final_ci_fix_failure_head"
+    ] == first_failure_head
     resume_event = completed["resume_audit"]["history"][-1]
     assert resume_event["kind"] == "budget_checkpoint"
     assert resume_event["semantic_attempt_id"] is not None
@@ -1725,7 +1932,7 @@ def test_resume_freezes_parent_closeout_assets_after_graph_drift(
     ]
 
 
-def test_parent_only_approve_rechecks_required_checks_before_merge(
+def test_parent_only_approve_supervises_unrepairable_required_checks(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -1752,17 +1959,430 @@ def test_parent_only_approve_rechecks_required_checks_before_merge(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert delivered.returncode == 0, delivered.stderr
+    before_state = load_only_run_state(git_repo)
+    before = before_state["parent_job"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
+    nonrepairable = repairable_required_check_failure()
+    nonrepairable_job = nonrepairable["job"]
+    assert isinstance(nonrepairable_job, dict)
+    nonrepairable["job"] = {
+        **nonrepairable_job,
+        "steps": [
+            {
+                "name": "Provision runner",
+                "status": "completed",
+                "conclusion": "failure",
+                "number": 1,
+            }
+        ],
+    }
     data["delivery"]["required_checks"] = ["none", "fail"]
+    data["delivery"]["required_check_evidence"] = {
+        "pr_number": 1,
+        "checks": [nonrepairable],
+    }
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    approval = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert approval.returncode == 0, approval.stderr
+    assert stdout_json(approval)["status"] == "waiting_external"
+    state = load_only_run_state(git_repo)
+    job = state["parent_job"]
+    assert job["phase"] == "waiting_checks"
+    assert job["required_checks_evidence"] == {
+        "pr_number": job["pr_number"],
+        "head_sha": job["publication_sha"],
+        "result": "fail",
+        "checks": job["ci_evidence"]["checks"],
+    }
+    assert state["diagnostics"][0]["code"] == (
+        "github_check_failure_not_repairable"
+    )
+    assert {
+        "candidate_sha": job["candidate_sha"],
+        "development_thread_id": job["development_thread_id"],
+        "modification_attempts": job["modification_attempts"],
+        "validation_attempts": job["validation_attempts"],
+        "review_budget": job["review_budget"],
+    } == {
+        "candidate_sha": before["candidate_sha"],
+        "development_thread_id": before["development_thread_id"],
+        "modification_attempts": before["modification_attempts"],
+        "validation_attempts": before["validation_attempts"],
+        "review_budget": before["review_budget"],
+    }
+    assert state["agent_invocation_history"] == before_state[
+        "agent_invocation_history"
+    ]
+    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]
+    assert len(pulls) == 1
+    assert pulls[0]["state"] == "OPEN"
+
+
+def test_parent_only_approve_queues_only_exact_repairable_failure(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"].update(
+        {
+            "required_checks": ["fail"],
+            "check_position": 0,
+            "required_check_evidence": {
+                "pr_number": 1,
+                "checks": [repairable_required_check_failure()],
+            },
+        }
+    )
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
     approval = run_cli(git_repo, fixture, "approve", run_id)
 
     assert approval.returncode == 0, approval.stderr
     assert stdout_json(approval)["status"] == "parent_delivery_pending"
+    job = load_only_run_state(git_repo)["parent_job"]
+    assert job["phase"] == "repairing"
+    assert job["repair_source"] == "required_checks"
+    assert "required_checks_evidence" not in job
+    assert job["ci_evidence"]["result"] == "fail"
+    assert job["ci_evidence"]["pr_number"] == job["pr_number"]
+    assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
+    assert "approval_grant" not in job
+
+
+@pytest.mark.parametrize("check_result", ["pass", "none"])
+def test_parent_only_approve_blocks_default_base_drift_before_merge(
+    git_repo: Path, check_result: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    before = load_only_run_state(git_repo)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"].update(
+        {
+            "required_checks": [check_result],
+            "check_position": 0,
+            "default_base_drift_after_required_checks_once": True,
+        }
+    )
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    approval = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert approval.returncode == 2
+    assert stdout_json(approval)["status"] == "blocked"
     state = load_only_run_state(git_repo)
-    assert state["parent_job"]["phase"] == "repairing"
-    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "OPEN"
+    assert state["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert state["parent_job"]["phase"] == "blocked"
+    assert "integrated_sha" not in state["parent_job"]
+    assert state["parent_job"]["publication_sha"] == before["parent_job"][
+        "publication_sha"
+    ]
+    pull = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ][0]
+    assert pull["state"] == "OPEN"
+    assert "integrated_sha" not in pull
+
+
+def test_parent_only_approve_blocks_head_drift_before_merge(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"].update(
+        {"required_checks": ["pass"], "live_head_override": "f" * 40}
+    )
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    approval = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert approval.returncode == 2
+    assert stdout_json(approval)["status"] == "blocked"
+    state = load_only_run_state(git_repo)
+    assert state["diagnostics"][0]["code"] == "published_head_mismatch"
+    assert "integrated_sha" not in state["parent_job"]
+    pull = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ][0]
+    assert pull["state"] == "OPEN"
+
+
+@pytest.mark.parametrize(
+    "identity_override",
+    [
+        {"head_repository": "foreign/project"},
+        {"base_repository": "foreign/project"},
+        {"base_branch": "foreign-main"},
+        {"base_sha": "f" * 40},
+    ],
+    ids=("head-repository", "base-repository", "base-branch", "base-sha"),
+)
+def test_parent_only_final_merge_rechecks_complete_pr_identity(
+    git_repo: Path, identity_override: dict[str, str]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
+    )
+    assert delivered.returncode == 0, delivered.stderr
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["required_checks"] = ["pass"]
+    data["delivery"]["check_position"] = 0
+    data["delivery"]["normal_merge_live_identity_override"] = identity_override
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
+    state = load_only_run_state(git_repo)
+    assert state["diagnostics"][0]["code"] == "foreign_run_pr"
+    assert state["parent_job"]["phase"] == "merging"
+    assert state["parent_job"]["approval_grant"]
+    pull = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ][0]
+    assert pull["state"] == "OPEN"
+    assert "integrated_sha" not in pull
+
+
+@pytest.mark.parametrize(
+    "waiting_case",
+    [
+        "pending",
+        "unknown",
+        "live_unavailable",
+        "snapshot_unavailable",
+        "evidence_unavailable",
+    ],
+)
+def test_parent_only_approve_waits_and_recovers_without_duplicate_delivery(
+    git_repo: Path, waiting_case: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    before_state = load_only_run_state(git_repo)
+    before = before_state["parent_job"]
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    if waiting_case in {"pending", "unknown"}:
+        data["delivery"]["required_checks"] = [waiting_case]
+        data["delivery"]["check_position"] = 0
+    elif waiting_case == "live_unavailable":
+        data["delivery"]["open_live_pull_request_failures"] = [
+            {
+                "scope": "parent_only",
+                "code": "github_timeout",
+                "message": "live PR unavailable",
+            }
+        ]
+    elif waiting_case == "snapshot_unavailable":
+        data["delivery"]["run_required_checks_read_failures"] = [
+            {"code": "github_timeout", "message": "snapshot unavailable"}
+        ]
+    else:
+        data["delivery"].update(
+            {
+                "required_checks": ["fail"],
+                "check_position": 0,
+                "required_check_evidence": {
+                    "pr_number": 1,
+                    "checks": [repairable_required_check_failure()],
+                },
+                "required_check_evidence_failures": [
+                    {
+                        "scope": "parent_only",
+                        "code": "github_timeout",
+                        "message": "failure evidence unavailable",
+                    }
+                ],
+            }
+        )
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    approval = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert approval.returncode == 0, approval.stderr
+    expected_status = "waiting_checks" if waiting_case == "pending" else "waiting_external"
+    assert stdout_json(approval)["status"] == expected_status
+    waiting = load_only_run_state(git_repo)
+    waiting_job = waiting["parent_job"]
+    assert waiting_job["phase"] == "waiting_checks"
+    if waiting_case not in {"live_unavailable", "snapshot_unavailable"}:
+        expected_result = (
+            "fail" if waiting_case == "evidence_unavailable" else waiting_case
+        )
+        assert waiting_job["required_checks_evidence"]["result"] == expected_result
+        assert waiting_job["required_checks_evidence"]["head_sha"] == (
+            waiting_job["publication_sha"]
+        )
+    assert {
+        "candidate_sha": waiting_job["candidate_sha"],
+        "development_thread_id": waiting_job["development_thread_id"],
+        "modification_attempts": waiting_job["modification_attempts"],
+        "validation_attempts": waiting_job["validation_attempts"],
+        "review_budget": waiting_job["review_budget"],
+    } == {
+        "candidate_sha": before["candidate_sha"],
+        "development_thread_id": before["development_thread_id"],
+        "modification_attempts": before["modification_attempts"],
+        "validation_attempts": before["validation_attempts"],
+        "review_budget": before["review_budget"],
+    }
+    assert waiting["agent_invocation_history"] == before_state[
+        "agent_invocation_history"
+    ]
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"].update({"required_checks": ["pass"], "check_position": 0})
+    data["delivery"].pop("open_live_pull_request_failures", None)
+    data["delivery"].pop("run_required_checks_read_failures", None)
+    data["delivery"].pop("required_check_evidence_failures", None)
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    recovered = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert stdout_json(recovered)["status"] == "completed"
+    completed_job = load_only_run_state(git_repo)["parent_job"]
+    assert completed_job["candidate_sha"] == before["candidate_sha"]
+    assert completed_job["development_thread_id"] == before["development_thread_id"]
+    assert completed_job["modification_attempts"] == before["modification_attempts"]
+    assert completed_job["validation_attempts"] == before["validation_attempts"]
+    assert "supervision_window" not in load_only_run_state(git_repo)
+    pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]
+    assert len(pulls) == 1
+    assert pulls[0]["state"] == "MERGED"
 
 
 def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision(

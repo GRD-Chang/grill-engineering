@@ -30,6 +30,7 @@ from agent_run.required_checks import (
     is_explicitly_repairable_code_failure,
     supervise_unrepairable_check_failure,
 )
+from agent_run.required_checks_observation import failure_evidence_matches_observation
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.run_publication_shared import RunPublicationShared
@@ -607,36 +608,30 @@ class RunPublicationFlow(RunPublicationShared):
         self.github.record_run_publication(pr_number, record)
         publication.update({"pr_number": pr_number, "record": record})
         publication.pop("last_publication_error", None)
-        try:
-            checks = self.github.required_checks(pr_number)
-        except (GitHubReadError, OSError, TimeoutError) as error:
-            if isinstance(error, GitHubReadError):
-                if not is_github_convergence_error(error.code):
-                    raise
-                code = error.code
-                message = error.message
-            else:
-                code = "github_checks_observation_failed"
-                message = str(error)
-            if self._record_operation_failure(state, publication, error):
-                return state
-            publication["phase"] = "waiting_external"
-            wait_for_github_convergence(
-                state,
-                code=code,
-                message=message,
-                waiting_for=f"Run PR #{pr_number} Required Checks observation",
-            )
-            ensure_supervision_window(state)
-            return self._save(state)
+        observation = self._observe_required_checks(
+            state, run, publication, pr_number, run_head
+        )
+        if observation is None:
+            return state
+        checks = str(observation["result"])
         self._record_agent_run_status(pr_number, run, run_head, checks)
         if checks == "fail":
+            self._save(state)
             evidence = self._required_check_evidence(
                 state, publication, pr_number, run_head
             )
             if evidence is None:
                 return state
-            if is_explicitly_repairable_code_failure(evidence):
+            if not self._revalidate_final_run_pr_before_repair(
+                state, publication, pr_number, run_head
+            ):
+                return state
+            if failure_evidence_matches_observation(
+                observation,
+                evidence,
+                pr_number=pr_number,
+                head_sha=run_head,
+            ) and is_explicitly_repairable_code_failure(evidence):
                 self._queue_repair(
                     state,
                     repair_source="required_checks",
@@ -655,12 +650,7 @@ class RunPublicationFlow(RunPublicationShared):
             state["terminal_kind"] = "waiting_checks"
             state["diagnostics"] = []
         elif checks == "unknown":
-            unknown = GitHubReadError(
-                "github_checks_observation_unknown",
-                "GitHub Required Checks returned an unknown state",
-            )
-            if self._record_operation_failure(state, publication, unknown):
-                return state
+            publication["required_checks_observation_status"] = "unknown"
             publication["phase"] = "waiting_external"
             wait_for_github_convergence(
                 state,

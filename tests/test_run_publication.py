@@ -134,10 +134,7 @@ def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
     assert waiting["status"] == "waiting_external"
     assert waiting["terminal_kind"] == "waiting_external"
     assert waiting["run_publication"]["phase"] == "waiting_external"
-    assert waiting["run_publication"]["publication_operation_retry"] == {
-        "attempts": 1,
-        "limit": 5,
-    }
+    assert "publication_operation_retry" not in waiting["run_publication"]
     assert waiting["supervision_window"]["kind"] == "github_convergence"
     assert waiting["diagnostics"][0]["waiting_for"].endswith(
         "Required Checks observation"
@@ -173,6 +170,86 @@ def test_final_required_checks_read_failure_is_supervised_without_rewriting_pr(
     assert resumed_prs[0]["body"] == original_body
 
 
+def test_repeated_required_checks_snapshot_unavailability_stays_supervised(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["run_required_checks_read_failures"] = [
+        {"code": "github_timeout", "message": "required checks unavailable"}
+        for _ in range(6)
+    ]
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+    for _ in range(5):
+        waiting = engine.publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["run_publication"]["phase"] == "waiting_external"
+    assert "publication_operation_retry" not in waiting["run_publication"]
+    final_prs = [
+        pull
+        for pull in publisher.data["delivery"]["pull_requests"]
+        if pull.get("scope") == "final_run"
+    ]
+    assert len(final_prs) == 1
+    assert len(agents.requests) == 1
+
+    resumed = engine.publish(str(state["run_id"]))
+
+    assert resumed["status"] == "run_approval_pending"
+    assert resumed["run_publication"]["phase"] == "ready_for_approval"
+    assert "publication_operation_retry" not in resumed["run_publication"]
+    assert len(agents.requests) == 1
+
+
+def test_first_unknown_required_checks_observation_does_not_create_operation_retry(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["unknown"]
+    agents = RunPublicationAgents()
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    waiting = engine.publish(str(state["run_id"]))
+
+    assert waiting["status"] == "waiting_external"
+    assert waiting["run_publication"]["required_checks_observation_status"] == "unknown"
+    assert "publication_operation_retry" not in waiting["run_publication"]
+
+    waiting["run_publication"]["publication_operation_retry"] = {
+        "attempts": 4,
+        "limit": 5,
+    }
+    waiting["run_publication"]["last_publication_error"] = "legacy read aggregate"
+    publication_attempts = waiting["run_publication"]["semantic_attempt_history"]
+    publication_attempts[-1]["publication_operation_retry"] = dict(
+        waiting["run_publication"]["publication_operation_retry"]
+    )
+    states.save_run(str(state["run_id"]), waiting)
+    publisher.data["delivery"]["required_checks"] = ["none"]
+    resumed = engine.publish(str(state["run_id"]))
+
+    assert resumed["status"] == "run_approval_pending"
+    assert "required_checks_observation_status" not in resumed["run_publication"]
+    assert "publication_operation_retry" not in resumed["run_publication"]
+
+
 def test_waiting_final_publication_counts_process_failures_to_hard_boundary(
     git_repo: Path,
 ) -> None:
@@ -200,7 +277,7 @@ def test_waiting_final_publication_counts_process_failures_to_hard_boundary(
         "limit": 5,
     }
     assert calls_at_exhaustion == 1
-    assert publisher.interrupted_live_reads == 4
+    assert publisher.interrupted_live_reads == 5
     assert publisher.required_check_calls == calls_at_exhaustion
     assert unchanged["status"] == "publication_pending"
     assert len(agents.requests) == 1

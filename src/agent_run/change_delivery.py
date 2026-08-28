@@ -85,6 +85,10 @@ from agent_run.change_delivery_threads import (
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
+from agent_run.required_checks_observation import (
+    sync_fallback_receipt_observation,
+)
+from agent_run.state_contract import require_current_run_state
 
 
 class ChangeDeliveryEngine:
@@ -116,6 +120,18 @@ class ChangeDeliveryEngine:
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         return self.state_store.save(state)
+
+    def commit_required_checks_observation(
+        self,
+        state: dict[str, Any],
+        job: dict[str, Any],
+        pr_number: int,
+    ) -> dict[str, Any]:
+        """Validate and atomically persist one complete Observation commit."""
+
+        sync_fallback_receipt_observation(job, pr_number)
+        require_current_run_state(state)
+        return self.save(state)
 
     def run(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -483,6 +499,15 @@ class ChangeDeliveryEngine:
     def _record_publication_operation_failure(
         self, state: dict[str, Any], job: dict[str, Any], error: Exception
     ) -> bool:
+        exhausted = self._record_publication_operation_failure_in_memory(
+            state, job, error
+        )
+        self.save(state)
+        return exhausted
+
+    def _record_publication_operation_failure_in_memory(
+        self, state: dict[str, Any], job: dict[str, Any], error: Exception
+    ) -> bool:
         exhausted = record_publication_operation_failure(job, error)
         if exhausted:
             job["phase"] = "publication_pending"
@@ -497,7 +522,6 @@ class ChangeDeliveryEngine:
                     ],
                 }
             )
-        self.save(state)
         return exhausted
 
     def _wait_for_merge_reconciliation(

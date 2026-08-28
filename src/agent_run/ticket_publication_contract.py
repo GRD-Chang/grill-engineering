@@ -9,6 +9,10 @@ from agent_run.ticket_acceptance_contract import (
 from agent_run.ticket_fallback_contract import (
     _require_fallback_integration_authorization,
 )
+from agent_run.required_checks_observation import (
+    require_required_checks_observation,
+    validate_legacy_required_checks_projection,
+)
 
 
 _ACTIVE_TICKET_PUBLICATION_PHASES = frozenset(
@@ -73,7 +77,6 @@ def require_active_ticket_publication_authorization(
             )
         publication_sha = job.get("publication_sha")
         pr_number = job.get("pr_number")
-        checks = job.get("required_checks")
         evidence = job.get("required_checks_evidence")
         if phase in _PUBLISHED_TICKET_AUTHORITY_PHASES:
             if not isinstance(publication_sha, str) or not publication_sha.strip():
@@ -84,23 +87,12 @@ def require_active_ticket_publication_authorization(
                 raise IncompatibleRunStateError(
                     f"incompatible_run_state: {location}.pr_number is invalid before publication"
                 )
-            if checks not in {"none", "pass", "pending", "unknown", "fail"}:
-                raise IncompatibleRunStateError(
-                    f"incompatible_run_state: {location}.required_checks is invalid before publication"
-                )
-            if not isinstance(evidence, dict) or evidence.get("pr_number") != pr_number:
-                raise IncompatibleRunStateError(
-                    f"incompatible_run_state: {location}.required_checks_evidence is invalid before publication"
-                )
-            if (
-                evidence.get("head_sha") != publication_sha
-                or evidence.get("result") != checks
-                or not isinstance(evidence.get("checks"), list)
-                or not all(isinstance(check, dict) for check in evidence["checks"])
-            ):
-                raise IncompatibleRunStateError(
-                    f"incompatible_run_state: {location}.required_checks_evidence is not bound to the published head"
-                )
+            require_required_checks_observation(
+                evidence,
+                location=f"{location}.required_checks_evidence",
+                expected_pr_number=pr_number,
+                expected_head_sha=publication_sha,
+            )
         elif publication_sha is not None and (
             not isinstance(publication_sha, str) or not publication_sha.strip()
         ):
@@ -135,6 +127,11 @@ def require_active_ticket_publication_authorization(
             active_record,
             location,
             require_publication_facts=phase in _PUBLISHED_TICKET_AUTHORITY_PHASES,
+        )
+        validate_legacy_required_checks_projection(
+            job,
+            location=location,
+            observation=evidence,
         )
         return
     if authority not in {None, "accepted"}:
@@ -174,3 +171,26 @@ def require_active_ticket_publication_authorization(
         },
         location,
     )
+    evidence = job.get("required_checks_evidence")
+    validate_legacy_required_checks_projection(
+        job,
+        location=location,
+        observation=evidence,
+    )
+    if phase in _PUBLISHED_TICKET_AUTHORITY_PHASES:
+        publication_sha = job.get("publication_sha")
+        pr_number = job.get("pr_number")
+        if not isinstance(publication_sha, str) or not publication_sha.strip():
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.publication_sha is invalid before publication"
+            )
+        if type(pr_number) is not int or pr_number < 1:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.pr_number is invalid before publication"
+            )
+        require_required_checks_observation(
+            evidence,
+            location=f"{location}.required_checks_evidence",
+            expected_pr_number=pr_number,
+            expected_head_sha=publication_sha,
+        )

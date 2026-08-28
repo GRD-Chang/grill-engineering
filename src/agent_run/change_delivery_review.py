@@ -14,6 +14,7 @@ from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.change_delivery_threads import record_reviewer as _record_reviewer
 from agent_run.credential_availability import clear_initial_credential_wait
+from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -130,11 +131,10 @@ def complete_review(
     if not artifact.is_accepted:
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
-        job.pop("required_checks_evidence", None)
     elif previous_repair_source != "required_checks":
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
-        job.pop("required_checks_evidence", None)
+    clear_required_checks_observation(job)
     budget = job.get("review_budget")
     if isinstance(budget, dict):
         candidate_sha = str(job["candidate_sha"])

@@ -9,6 +9,7 @@ from agent_run.external_supervision import (
     is_github_convergence_error,
     public_supervision_snapshot,
     restore_supervision_wait,
+    supervision_window_matches,
     wait_for_github_convergence,
     wait_for_github_refresh,
     waiting_boundary,
@@ -117,6 +118,53 @@ def test_each_waiting_object_gets_its_own_budget_window() -> None:
     assert supervisor.before_retry(first)
     now[0] = CHECKS_BUDGET_SECONDS
     assert supervisor.before_retry(second)
+
+
+def test_supervision_window_does_not_follow_a_new_ticket_frontier() -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "waiting_checks",
+        "active_ticket_job": {
+            "ticket_number": 151,
+            "pr_number": 166,
+            "phase": "waiting_checks",
+            "publication_sha": "old-head",
+        },
+    }
+
+    window = ensure_supervision_window(state, now=lambda: 10.0)
+    assert window is not None
+    previous_boundary = waiting_boundary(state)
+    assert previous_boundary is not None
+
+    state.update(
+        {
+            "status": "active",
+            "active_ticket_job": {"ticket_number": 152},
+        }
+    )
+
+    assert not supervision_window_matches(
+        state, window, boundary=previous_boundary
+    )
+
+
+def test_credential_wait_window_survives_worker_phase_projection() -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "waiting_external",
+        "credential_availability": {
+            "change_job": "run-acceptance",
+            "phase": "run_acceptance",
+            "failure_class": "credential_unavailable",
+        },
+    }
+
+    window = ensure_supervision_window(state, now=lambda: 10.0)
+    assert window is not None
+    state["status"] = "run_acceptance_pending"
+
+    assert supervision_window_matches(state, window)
 
 
 @pytest.mark.parametrize(
@@ -416,6 +464,8 @@ def test_unproven_github_read_failures_remain_reconcilable(code: str) -> None:
         "ambiguous_run_pr",
         "invalid_parent",
         "stale_run_pr",
+        "change_pr_identity_mismatch",
+        "change_pr_head_drift",
     ],
 )
 def test_proven_github_state_contradictions_do_not_enter_supervision(code: str) -> None:

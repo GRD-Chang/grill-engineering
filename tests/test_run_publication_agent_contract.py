@@ -77,7 +77,7 @@ def _accepted_run_with_integration(
                     "pr_number": 11,
                     "head_sha": integrated,
                     "result": "pass",
-                    "checks": [],
+                    "checks": [{"name": "quality", "bucket": "pass"}],
                 },
                 "pr": {
                     "number": 11,
@@ -633,7 +633,7 @@ def test_final_run_publication_receives_only_role_required_facts(
             "pr_number": 11,
             "head_sha": "published",
             "result": "pass",
-            "checks": [],
+            "checks": [{"name": "quality", "bucket": "pass"}],
         },
         "pr": {
             "number": 11,
@@ -717,7 +717,7 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
                     "pr_number": 11,
                     "head_sha": "published",
                     "result": "pass",
-                    "checks": [],
+                    "checks": [{"name": "quality", "bucket": "pass"}],
                 },
                 "pr": {
                     "number": 11,

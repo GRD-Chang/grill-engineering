@@ -520,7 +520,7 @@ def test_run_supervises_repair_pr_failed_check_evidence_reads(
     checkout = Path(str(job["repair_checkout"]))
     assert paused_state["status"] == "supervision_timeout"
     assert paused_state["supervision_wait"]["retry_count"] >= 2
-    assert job["phase"] == "publishing"
+    assert job["phase"] == "waiting_checks"
     assert job["modification_attempts"] == 1
     assert run["repair_cycle"]["code_modification_attempts"] == 1
     assert job["development_thread_id"] == "run-repair-developer-1"

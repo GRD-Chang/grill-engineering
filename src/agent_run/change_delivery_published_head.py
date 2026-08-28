@@ -18,9 +18,19 @@ from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
-from agent_run.external_supervision import is_github_convergence_error
+from agent_run.state_errors import IncompatibleRunStateError
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
+)
+from agent_run.required_checks_observation import (
+    require_required_checks_observation,
+    sync_fallback_receipt_observation,
+    validate_legacy_required_checks_projection,
 )
 
 
@@ -85,50 +95,6 @@ def _publication_operation(
             return True, None
         raise
 
-def _sync_fallback_receipt_observation(
-    job: dict[str, Any], pr_number: int
-) -> bool:
-    """Persist the exact PR/check observation used by an active fallback gate."""
-
-    if job.get("publication_authority") != "fallback":
-        return False
-    receipt = job.get("fallback_publication_receipt")
-    publication_sha = job.get("publication_sha")
-    checks = job.get("required_checks")
-    if (
-        not isinstance(receipt, dict)
-        or not isinstance(publication_sha, str)
-        or not publication_sha.strip()
-        or checks not in {"none", "pass", "pending", "unknown", "fail"}
-    ):
-        return False
-    evidence = job.get("required_checks_evidence")
-    if not isinstance(evidence, dict):
-        evidence = {"checks": []}
-    else:
-        evidence = deepcopy(evidence)
-    evidence.update(
-        {
-            "pr_number": pr_number,
-            "head_sha": publication_sha,
-            "result": checks,
-        }
-    )
-    changed = (
-        receipt.get("pr_number") != pr_number
-        or receipt.get("publication_sha") != publication_sha
-        or receipt.get("required_checks_evidence") != evidence
-    )
-    receipt.update(
-        {
-            "pr_number": pr_number,
-            "publication_sha": publication_sha,
-            "required_checks_evidence": evidence,
-        }
-    )
-    return changed
-
-
 def publish_and_merge(
     stage: PublishedHeadStage,
     state: dict[str, Any],
@@ -166,13 +132,23 @@ def publish_and_merge(
     branch = stage.contract.branch
     existing_pr = job.get("pr_number")
     if isinstance(existing_pr, int):
-        exhausted, existing_live = _publication_operation(
-            stage,
-            state,
-            job,
-            lambda: stage.publisher.live_pull_request(state, job, existing_pr),
-        )
-        if exhausted:
+        try:
+            existing_live = stage.publisher.live_pull_request(
+                state, job, existing_pr
+            )
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
+            wait_for_github_convergence(
+                state,
+                code="github_pr_head_observation_pending",
+                message=str(error),
+                waiting_for=f"Change PR #{existing_pr} live identity observation",
+            )
+            ensure_supervision_window(state)
+            stage.save(state)
             return True
         if existing_live.get("state") == "MERGED":
             integrated = existing_live.get("integrated_sha")
@@ -188,7 +164,8 @@ def publish_and_merge(
                 )
             if not isinstance(integrated, str) or not integrated:
                 raise ValueError("merged Change Job PR is missing integrated SHA")
-            job["integrated_sha"] = integrated
+            integrated_sha = integrated
+            job["integrated_sha"] = integrated_sha
             live_head = existing_live.get("head_sha")
             if isinstance(live_head, str):
                 job["integrated_publication_sha"] = live_head
@@ -198,7 +175,7 @@ def publish_and_merge(
                 job,
                 lambda: stage.github.sync_run_branch(
                     run_branch=stage.contract.base_branch,
-                    integrated_sha=integrated,
+                    integrated_sha=integrated_sha,
                 ),
             )
             if exhausted:
@@ -293,7 +270,7 @@ def publish_and_merge(
         raise ValueError("Publisher returned an invalid Change PR number")
     job.pop("ticket_write_intent", None)
     job["pr_number"] = pr_number
-    _sync_fallback_receipt_observation(job, pr_number)
+    sync_fallback_receipt_observation(job, pr_number)
     stage.save(state)
     stage._reject_stale(
         state,
@@ -338,26 +315,30 @@ def publish_and_merge(
     check_outcome, _checks = observe_required_checks(
         stage, state, job, checkout, pr_number
     )
-    receipt_changed = _sync_fallback_receipt_observation(job, pr_number)
-    if receipt_changed:
-        stage.save(state)
     if check_outcome is not None:
         return check_outcome
-    checks_value = job.get("required_checks")
     required_checks_evidence = job.get("required_checks_evidence")
-    if (
-        checks_value not in {"none", "pass"}
-        or not isinstance(required_checks_evidence, dict)
-        or required_checks_evidence.get("head_sha") != job["publication_sha"]
-        or required_checks_evidence.get("result") != checks_value
-    ):
+    validate_legacy_required_checks_projection(
+        job,
+        location="active_ticket_job",
+        observation=required_checks_evidence,
+    )
+    try:
+        required_checks_evidence = require_required_checks_observation(
+            required_checks_evidence,
+            location="active_ticket_job.required_checks_evidence",
+            expected_pr_number=pr_number,
+            expected_head_sha=str(job["publication_sha"]),
+            allowed_results=frozenset({"none", "pass"}),
+        )
+    except IncompatibleRunStateError:
         return stage._block(
             state,
             job,
             "published_head_mismatch",
             "Published-Head Gate rejected the final Required Checks snapshot",
         )
-    checks = str(checks_value)
+    checks = str(required_checks_evidence["result"])
     exhausted, live = _publication_operation(
         stage,
         state,
@@ -429,8 +410,6 @@ def publish_and_merge(
         "candidate_sha": str(job["candidate_sha"]),
         "candidate_tree": candidate_tree,
         "publication_sha": str(job["publication_sha"]),
-        "required_checks_mode": str(job.get("required_checks_mode", "configured")),
-        "required_checks": checks,
         "required_checks_evidence": required_checks_evidence,
         "pr": {
             "number": pr_number,
@@ -453,6 +432,11 @@ def publish_and_merge(
         else None,
         "review_budget": deepcopy(job.get("review_budget")),
     }
+    required_checks_origin = job.get("required_checks_origin")
+    if isinstance(required_checks_origin, dict):
+        integration_record["required_checks_origin"] = deepcopy(
+            required_checks_origin
+        )
     effective_revision = job.get("effective_revision")
     if isinstance(effective_revision, str) and effective_revision:
         integration_record["effective_revision"] = effective_revision

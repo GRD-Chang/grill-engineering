@@ -145,6 +145,23 @@ def previous_publication_authorization(
     }
 
 
+def preserve_required_checks_publication_authorization(
+    job: dict[str, Any],
+) -> None:
+    """Keep the failed publication as explicit provenance before invalidation."""
+
+    if job.get("repair_source") != "required_checks":
+        return
+    receipt = job.get("fallback_publication_receipt")
+    if not isinstance(receipt, dict) or not isinstance(
+        receipt.get("required_checks_evidence"), dict
+    ):
+        return
+    authorization = previous_publication_authorization(job)
+    if authorization is not None:
+        receipt["previous_publication_authorization"] = authorization
+
+
 def prepare_ticket_fallback(
     stage: FallbackStage, state: dict[str, Any], job: dict[str, Any]
 ) -> bool:
@@ -211,11 +228,18 @@ def prepare_ticket_fallback(
         job.get("acceptance_record"), dict
     ):
         previous_authority = "acceptance"
-    previous_authorization_snapshot = (
-        previous_publication_authorization(job)
-        if repair_source == "required_checks"
+    existing_previous_authorization = (
+        previous_receipt.get("previous_publication_authorization")
+        if isinstance(previous_receipt, dict)
         else None
     )
+    previous_authorization_snapshot = None
+    if repair_source == "required_checks":
+        previous_authorization_snapshot = (
+            deepcopy(existing_previous_authorization)
+            if isinstance(existing_previous_authorization, dict)
+            else previous_publication_authorization(job)
+        )
     if repair_source == "required_checks" and previous_authorization_snapshot is None:
         return False
     required_check_failure_head = (
@@ -264,6 +288,9 @@ def prepare_ticket_fallback(
         "previous_publication_authorization": previous_authorization_snapshot,
         "git_integrity": git_integrity,
     }
+    required_checks_origin = job.get("required_checks_origin")
+    if isinstance(required_checks_origin, dict):
+        receipt["required_checks_origin"] = deepcopy(required_checks_origin)
     job["fallback_publication_receipt"] = receipt
     job["publication_authority"] = "fallback"
     job.pop("acceptance_record", None)

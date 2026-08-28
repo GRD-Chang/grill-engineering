@@ -5,10 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.controller import Controller
+from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.graph import state_from_graph
 from agent_run.revisions import ticket_graph_revision
+from agent_run.run_currentness import refresh_run_currentness
 from agent_run.state import StateStore
 from conftest import write_fixture
 
@@ -22,6 +24,76 @@ def _ticket(number: int) -> dict[str, Any]:
         "labels": ["ready-for-agent"],
         "blocked_by": [],
     }
+
+
+def test_refresh_drops_supervision_window_when_frontier_ticket_changes(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"151": _ticket(151), "152": _ticket(152)},
+    )
+    reader = FixtureGitHubReader(fixture)
+    controller = Controller(
+        reader,
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    old_job = {
+        "ticket_number": 151,
+        "phase": "waiting_checks",
+        "pr_number": 166,
+        "publication_sha": "old-head",
+    }
+    state["active_ticket_job"] = old_job
+    state["ticket_jobs"]["151"] = old_job
+    state["status"] = "waiting_checks"
+    assert ensure_supervision_window(state, now=lambda: 10.0) is not None
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["issues"]["151"]["state"] = "CLOSED"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refreshed = controller._refresh(state, 1)  # noqa: SLF001 - refresh boundary
+
+    assert refreshed["active_ticket_job"]["ticket_number"] == 152
+    assert "supervision_window" not in refreshed
+
+
+def test_run_currentness_drops_supervision_window_when_frontier_ticket_changes(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"151": _ticket(151), "152": _ticket(152)},
+    )
+    reader = FixtureGitHubReader(fixture)
+    controller = Controller(
+        reader,
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    old_job = {
+        "ticket_number": 151,
+        "phase": "waiting_checks",
+        "pr_number": 166,
+        "publication_sha": "old-head",
+    }
+    state["active_ticket_job"] = old_job
+    state["ticket_jobs"]["151"] = old_job
+    state["status"] = "waiting_checks"
+    assert ensure_supervision_window(state, now=lambda: 10.0) is not None
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["issues"]["151"]["state"] = "CLOSED"
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refresh_run_currentness(state, reader=reader, git=GitRepository(git_repo))
+
+    assert state["active_ticket_job"]["ticket_number"] == 152
+    assert "supervision_window" not in state
 
 
 def test_ticket_graph_revision_ignores_parent_execution_order(

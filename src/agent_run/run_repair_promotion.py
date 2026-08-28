@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.required_checks_observation import (
+    bind_new_publication_head,
+    clear_required_checks_observation,
+)
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_repair_cycle import escalate_repair, uses_merge_resolution
 from agent_run.semantic_attempt import (
@@ -132,6 +136,7 @@ class RunRepairPromotion:
             stale_keys.extend(("publication", "publication_sha"))
         for key in stale_keys:
             job.pop(key, None)
+        clear_required_checks_observation(job)
         candidate_sha = job.get("candidate_sha")
         squash_candidate_sha = job.get("integration_squash_candidate_sha")
         finding_snapshot_sha = job.get("integration_finding_snapshot_sha")
@@ -194,6 +199,7 @@ class RunRepairPromotion:
             "abandoned",
         }:
             publication["phase"] = "stale"
+            clear_required_checks_observation(publication)
             for key in ("artifact", "write_intent", "approval_grant"):
                 publication.pop(key, None)
         state.update(
@@ -438,6 +444,31 @@ class RunRepairPromotion:
             if thread_id and thread_id not in history:
                 history.append(thread_id)
         run["development_thread_history"] = history
+        required_check_failure = None
+        origin = job.get("required_checks_origin")
+        if origin is not None:
+            if not isinstance(origin, dict):
+                raise ValueError("required-check repair provenance must be an object")
+            required_check_failure = deepcopy(origin)
+        elif job.get("repair_source") == "required_checks":
+            evidence = self.owner._mapping(job, "ci_evidence")
+            trigger = self.owner._mapping(job, "repair_trigger")
+            failure_pr_number = trigger.get("pr_number")
+            failure_head_sha = trigger.get("head_sha")
+            if not isinstance(failure_pr_number, int) or not isinstance(
+                failure_head_sha, str
+            ) or not failure_head_sha:
+                raise ValueError(
+                    "required-check repair provenance has invalid PR identity"
+                )
+            required_check_failure = deepcopy(evidence)
+            required_check_failure.update(
+                {
+                    "pr_number": failure_pr_number,
+                    "head_sha": failure_head_sha,
+                    "result": "fail",
+                }
+            )
         run.update(
             {
                 "modification_attempts": int(job["modification_attempts"]),
@@ -473,6 +504,8 @@ class RunRepairPromotion:
             "candidate_sha": job["candidate_sha"],
             "acceptance_state": "promoted",
         }
+        if required_check_failure is not None:
+            completed["ci_evidence"] = required_check_failure
         run["candidate_acceptance_history"] = [
             *run_history,
             *deepcopy(candidate_history),
@@ -490,6 +523,9 @@ class RunRepairPromotion:
         }:
             # The existing Final Run PR, if any, must receive a refreshed
             # narrative after the promoted boundary is durable.
+            bind_new_publication_head(
+                publication_state, str(run["publication_sha"])
+            )
             publication_state["phase"] = "stale"
             for key in ("artifact", "write_intent", "approval_grant"):
                 publication_state.pop(key, None)
