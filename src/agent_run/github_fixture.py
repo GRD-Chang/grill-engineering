@@ -563,6 +563,24 @@ class FixtureGitHubPublisher:
         pull = self._pull(pr_number)
         if pull.get("state") == "MERGED":
             return str(pull["integrated_sha"])
+        configured_override = self._delivery().pop(
+            "normal_merge_live_identity_override", None
+        )
+        if configured_override is not None:
+            if not isinstance(configured_override, dict) or (
+                set(configured_override)
+                - {"head_repository", "base_repository", "base_branch", "base_sha"}
+                or not all(
+                    isinstance(value, str)
+                    for value in configured_override.values()
+                )
+            ):
+                raise ValueError(
+                    "fixture normal_merge_live_identity_override must contain "
+                    "identity strings"
+                )
+            self._normal_merge_live_identity_override = configured_override
+            self._save()
         live = self.live_pull_request(pr_number)
         identity_matches = _merge_identity_matches(
             live,
@@ -888,17 +906,26 @@ class FixtureGitHubPublisher:
     def _next_required_checks_result(self, pr_number: int) -> str:
         delivery = self._delivery()
         pull = self._pull(pr_number)
-        run_failures = delivery.get("run_required_checks_read_failures", [])
-        if "primary_ticket" not in pull and isinstance(run_failures, list) and run_failures:
-            configured = run_failures.pop(0)
+        failure_key = (
+            "ticket_required_checks_read_failures"
+            if "primary_ticket" in pull
+            else "run_required_checks_read_failures"
+        )
+        read_failures = delivery.get(failure_key, [])
+        if isinstance(read_failures, list) and read_failures:
+            configured = read_failures.pop(0)
             self._save()
             if not isinstance(configured, dict):
                 raise ValueError(
-                    "fixture run_required_checks_read_failures must contain objects"
+                    f"fixture {failure_key} must contain objects"
                 )
             raise GitHubReadError(
                 str(configured.get("code", "github_read_failed")),
-                str(configured.get("message", "Final Run Required Checks read failed")),
+                str(
+                    configured.get(
+                        "message", "Required Checks read did not converge"
+                    )
+                ),
             )
         sequence = delivery.get("required_checks", ["none"])
         if not isinstance(sequence, list) or not all(
@@ -1135,6 +1162,12 @@ class FixtureGitHubPublisher:
             "state": reported_state,
             "integrated_sha": pull.get("integrated_sha"),
         }
+        configured_override = getattr(
+            self, "_normal_merge_live_identity_override", None
+        )
+        if isinstance(configured_override, dict):
+            result.update(configured_override)
+            del self._normal_merge_live_identity_override
         integrated = pull.get("integrated_sha")
         if isinstance(integrated, str) and isinstance(live_head, str):
             result.update(

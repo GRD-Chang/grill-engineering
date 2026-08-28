@@ -109,6 +109,14 @@ def _require_deterministic_integration_record(
         expected_head_sha=publication_sha,
         allowed_results=frozenset({"none", "pass"}),
     )
+    required_checks_origin = record.get("required_checks_origin")
+    if required_checks_origin is not None:
+        require_required_checks_observation(
+            required_checks_origin,
+            location=f"{location}.required_checks_origin",
+            expected_pr_number=pr_number,
+            allowed_results=frozenset({"fail"}),
+        )
     validate_legacy_required_checks_projection(
         record,
         location=location,

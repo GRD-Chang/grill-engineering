@@ -79,6 +79,41 @@ def test_rejects_incomplete_snapshot_shapes(snapshot: object, error: str) -> Non
 
 
 @pytest.mark.parametrize(
+    ("result", "checks"),
+    [
+        ("pass", [{"name": "quality", "bucket": "fail"}]),
+        ("pass", []),
+        ("none", [{"name": "quality", "bucket": "pass"}]),
+        ("pending", [{"name": "quality", "bucket": "pass"}]),
+        ("fail", [{"name": "quality", "bucket": "pending"}]),
+        ("unknown", []),
+    ],
+)
+def test_rejects_result_and_check_bucket_contradictions(
+    result: str, checks: list[dict[str, str]]
+) -> None:
+    snapshot = {
+        "pr_number": 17,
+        "head_sha": "candidate-head",
+        "result": result,
+        "checks": checks,
+    }
+    github = SimpleNamespace(required_checks_snapshot=lambda *_args, **_kwargs: snapshot)
+
+    with pytest.raises(ValueError, match="result conflicts"):
+        read_required_checks_observation(
+            github, 17, expected_head_sha="candidate-head"
+        )
+    with pytest.raises(IncompatibleRunStateError, match="result conflicts"):
+        require_required_checks_observation(
+            snapshot,
+            location="job.required_checks_evidence",
+            expected_pr_number=17,
+            expected_head_sha="candidate-head",
+        )
+
+
+@pytest.mark.parametrize(
     ("pr_number", "head_sha", "code"),
     [
         (18, "candidate-head", "change_pr_identity_mismatch"),

@@ -265,6 +265,23 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
         if not isinstance(publication_sha, str) or not publication_sha.strip():
             publication_sha = record_head
 
+        required_checks_origin = owner.get("required_checks_origin")
+        if required_checks_origin is not None:
+            origin_pr_number = pr_number
+            repair_trigger = owner.get("repair_trigger")
+            if isinstance(repair_trigger, dict) and type(
+                repair_trigger.get("pr_number")
+            ) is int:
+                origin_pr_number = repair_trigger["pr_number"]
+            require_required_checks_observation(
+                required_checks_origin,
+                location=f"{location}.required_checks_origin",
+                expected_pr_number=(
+                    origin_pr_number if type(origin_pr_number) is int else None
+                ),
+                allowed_results=frozenset({"fail"}),
+            )
+
         if owner.get("phase") == "waiting_checks":
             if type(pr_number) is not int or pr_number < 1:
                 raise IncompatibleRunStateError(

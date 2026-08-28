@@ -18,7 +18,6 @@ from agent_run.review_budget import (
     reset_budget,
 )
 from agent_run.change_delivery_required_checks import observe_required_checks
-from agent_run.publication_operation_retry import record_publication_operation_failure
 
 
 def _job_with_budget(
@@ -455,11 +454,6 @@ def test_success_required_checks_snapshot_read_is_supervised(error: BaseExceptio
             ),
         ),
         _record_agent_run_status=lambda *_args, **_kwargs: None,
-        _record_publication_operation_failure_in_memory=(
-            lambda _state, owner, failure: record_publication_operation_failure(
-                owner, failure
-            )
-        ),
         _reject_stale=lambda *_args, **_kwargs: None,
         save=lambda state: state,
     )
@@ -473,4 +467,5 @@ def test_success_required_checks_snapshot_read_is_supervised(error: BaseExceptio
     assert state["diagnostics"][0]["code"] == (
         "github_checks_observation_pending"
     )
-    assert job["publication_operation_retry"] == {"attempts": 1, "limit": 5}
+    assert "publication_operation_retry" not in job
+    assert "last_publication_error" not in job

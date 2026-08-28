@@ -4,6 +4,7 @@ from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.review_budget import TICKET_POLICY
+from agent_run.required_checks_observation import require_required_checks_observation
 from agent_run.state_errors import IncompatibleRunStateError
 from agent_run.ticket_acceptance_contract import (
     _require_accepted_integration_authorization,
@@ -83,6 +84,14 @@ def _require_fallback_integration_authorization(
             raise IncompatibleRunStateError(
                 f"incompatible_run_state: {location}.fallback_receipt checks are not bound to the published head"
             )
+    required_checks_origin = authorization.get("required_checks_origin")
+    if required_checks_origin is not None:
+        require_required_checks_observation(
+            required_checks_origin,
+            location=f"{location}.fallback_receipt.required_checks_origin",
+            expected_pr_number=record["pr_number"],
+            allowed_results=frozenset({"fail"}),
+        )
     expected_budget_keys = {
         "window",
         "development_attempts",

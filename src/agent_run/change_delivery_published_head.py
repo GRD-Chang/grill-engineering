@@ -432,6 +432,11 @@ def publish_and_merge(
         else None,
         "review_budget": deepcopy(job.get("review_budget")),
     }
+    required_checks_origin = job.get("required_checks_origin")
+    if isinstance(required_checks_origin, dict):
+        integration_record["required_checks_origin"] = deepcopy(
+            required_checks_origin
+        )
     effective_revision = job.get("effective_revision")
     if isinstance(effective_revision, str) and effective_revision:
         integration_record["effective_revision"] = effective_revision

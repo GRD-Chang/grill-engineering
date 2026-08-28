@@ -161,12 +161,53 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
                 "pr_number": 17,
                 "head_sha": "repair-head",
                 "result": "pass",
-                "checks": [],
+                "checks": [{"name": "quality", "bucket": "pass"}],
             },
         },
     }
 
     with pytest.raises(IncompatibleRunStateError, match="conflicts with Observation"):
+        require_current_run_state(state)
+
+
+@pytest.mark.parametrize(
+    ("result", "checks"),
+    [
+        ("pass", []),
+        ("pass", [{"name": "quality", "bucket": "fail"}]),
+        ("none", [{"name": "quality", "bucket": "pass"}]),
+        ("pending", [{"name": "quality", "bucket": "pass"}]),
+        ("fail", [{"name": "quality", "bucket": "pending"}]),
+        ("unknown", []),
+    ],
+)
+def test_state_contract_rejects_required_checks_result_bucket_contradictions(
+    git_repo: Path, result: str, checks: list[dict[str, str]]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "waiting_checks",
+            "repair_mode": "squash",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+            "pr_number": 17,
+            "publication_sha": "repair-head",
+            "required_checks_evidence": {
+                "pr_number": 17,
+                "head_sha": "repair-head",
+                "result": result,
+                "checks": checks,
+            },
+        },
+    }
+
+    with pytest.raises(IncompatibleRunStateError, match="result conflicts"):
         require_current_run_state(state)
 
 

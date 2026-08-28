@@ -370,6 +370,33 @@ def test_run_acceptance_cli_reports_incompatible_missing_integration_record(
     assert states.load_run(str(state["run_id"])) == state_before
 
 
+@pytest.mark.parametrize(
+    ("result", "checks"),
+    [
+        ("pass", []),
+        ("pass", [{"name": "quality", "bucket": "fail"}]),
+        ("none", [{"name": "quality", "bucket": "pass"}]),
+        ("pending", [{"name": "quality", "bucket": "pass"}]),
+        ("fail", [{"name": "quality", "bucket": "pending"}]),
+        ("unknown", []),
+    ],
+)
+def test_integration_record_rejects_required_checks_result_bucket_contradictions(
+    git_repo: Path, result: str, checks: list[dict[str, str]]
+) -> None:
+    state, _states, _git = _completed_run(git_repo)
+    record = state["ticket_jobs"]["2"]["deterministic_integration_record"]
+    assert isinstance(record, dict)
+    evidence = record["required_checks_evidence"]
+    assert isinstance(evidence, dict)
+    evidence.update({"result": result, "checks": checks})
+
+    with pytest.raises(
+        IncompatibleRunStateError, match="required_checks_evidence"
+    ):
+        require_completed_ticket_integration_records(state)
+
+
 @pytest.mark.parametrize("source", ["accepted", "fallback"])
 def test_completed_ticket_integration_record_rejects_source_evidence_drift(
     git_repo: Path, source: str

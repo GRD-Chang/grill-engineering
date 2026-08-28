@@ -299,12 +299,19 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
         return self.owner._complete_after_merge(state, job, live)
 
     def merge(
-        self, _state: dict[str, Any], job: dict[str, Any], _publication: dict[str, Any]
+        self, state: dict[str, Any], job: dict[str, Any], _publication: dict[str, Any]
     ) -> str:
         try:
+            base = _mapping(state, "base")
+            repository = str(state["repository"])
             return self.owner.github.normal_merge(
                 pr_number=int(job["pr_number"]),
                 expected_head_sha=str(job["publication_sha"]),
+                expected_head_branch=str(job["parent_branch"]),
+                expected_head_repository=repository,
+                expected_base_branch=str(base["branch"]),
+                expected_base_sha=str(job["base_sha"]),
+                expected_base_repository=repository,
             )
         except OSError as error:
             raise MergeOutcomeUnknownError(str(error)) from error
@@ -390,6 +397,7 @@ class ParentDeliveryLoop:
             "approval_grant",
             "repair_source",
             "ci_evidence",
+            "required_checks_origin",
             "publication_authority",
             "fallback_publication_receipt",
             "deterministic_integration_record",

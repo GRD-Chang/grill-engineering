@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Exact-head Required Checks observation and repair classification."""
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,23 @@ from agent_run.required_checks_observation import (
     failure_evidence_matches_observation,
     read_required_checks_observation,
 )
+
+
+def _clear_required_checks_read_retry(job: dict[str, Any]) -> None:
+    """Keep Required Checks convergence out of Publication Operation Retry."""
+
+    job.pop("publication_operation_retry", None)
+    job.pop("last_publication_error", None)
+
+
+def _set_required_checks_repair_evidence(
+    job: dict[str, Any], evidence: dict[str, Any]
+) -> None:
+    """Keep the failed PR/head as immutable provenance for Change Delivery."""
+
+    job["ci_evidence"] = deepcopy(evidence)
+    if not isinstance(job.get("required_checks_origin"), dict):
+        job["required_checks_origin"] = deepcopy(evidence)
 
 
 def _resume_change_delivery_after_evidence(
@@ -111,9 +129,6 @@ def _verify_live_publication_identity(
             error.code
         ):
             raise
-        if stage._record_publication_operation_failure_in_memory(state, job, error):
-            stage.save(state)
-            return True
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -155,6 +170,7 @@ def observe_required_checks(
     checkout: Path,
     pr_number: int,
 ) -> tuple[bool | None, str]:
+    _clear_required_checks_read_retry(job)
     checks = "unavailable"
     try:
         observation = read_required_checks_observation(
@@ -183,9 +199,6 @@ def observe_required_checks(
             error.code
         ):
             raise
-        if stage._record_publication_operation_failure_in_memory(state, job, error):
-            stage.save(state)
-            return True, checks
         stage._record_agent_run_status(
             pr_number,
             job,
@@ -201,6 +214,13 @@ def observe_required_checks(
         ensure_supervision_window(state)
         stage.save(state)
         return True, checks
+    except ValueError:
+        return stage._block(
+            state,
+            job,
+            "published_head_mismatch",
+            "Required Checks snapshot contradicted its check buckets",
+        ), checks
     checks = str(observation["result"])
     live_identity_outcome = _verify_live_publication_identity(
         stage, state, job, pr_number, checks
@@ -265,11 +285,6 @@ def observe_required_checks(
                     error, GitHubReadError
                 ) and not is_github_convergence_error(error.code):
                     raise
-                if stage._record_publication_operation_failure_in_memory(
-                    state, job, error
-                ):
-                    stage.save(state)
-                    return True, checks
                 wait_for_github_convergence(
                     state,
                     code="github_check_evidence_observation_pending",
@@ -304,9 +319,9 @@ def observe_required_checks(
                     {
                         "phase": "repairing",
                         "repair_source": "required_checks",
-                        "ci_evidence": evidence,
                     }
                 )
+            _set_required_checks_repair_evidence(job, evidence)
             should_yield = _resume_change_delivery_after_evidence(stage, state, job)
             stage.save(state)
             return should_yield, checks
@@ -319,11 +334,6 @@ def observe_required_checks(
                 error.code
             ):
                 raise
-            if stage._record_publication_operation_failure_in_memory(
-                state, job, error
-            ):
-                stage.save(state)
-                return True, checks
             stage._record_agent_run_status(
                 pr_number,
                 job,
@@ -374,7 +384,6 @@ def observe_required_checks(
                 {
                     "phase": "repairing",
                     "repair_source": "required_checks",
-                    "ci_evidence": canonical_evidence,
                     "next_attempt_kind": "final_ci_fix",
                     "final_ci_fix_failure_head": str(job["publication_sha"]),
                     "final_ci_fix_used_before_attempt": budget[
@@ -388,7 +397,6 @@ def observe_required_checks(
                     "phase": "escalating",
                     "escalation_code": "modification_budget_exhausted",
                     "repair_source": "required_checks",
-                    "ci_evidence": canonical_evidence,
                 }
             )
         else:
@@ -396,10 +404,10 @@ def observe_required_checks(
                 {
                     "phase": "repairing",
                     "repair_source": "required_checks",
-                    "ci_evidence": canonical_evidence,
                     "next_attempt_kind": "ordinary",
                 }
             )
+        _set_required_checks_repair_evidence(job, canonical_evidence)
         should_yield = _resume_change_delivery_after_evidence(stage, state, job)
         stage.save(state)
         return should_yield, checks

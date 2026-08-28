@@ -11,6 +11,37 @@ from agent_run.state_errors import IncompatibleRunStateError
 
 
 REQUIRED_CHECK_RESULTS = frozenset({"none", "pass", "pending", "unknown", "fail"})
+_KNOWN_CHECK_BUCKETS = frozenset(
+    {"fail", "cancel", "pending", "pass", "skipping", "neutral"}
+)
+
+
+def derive_required_checks_result(checks: object) -> str:
+    """Derive the aggregate result from the supporting check buckets."""
+
+    if not isinstance(checks, list) or not all(
+        isinstance(check, dict) for check in checks
+    ):
+        raise ValueError("Required Checks snapshot checks must contain objects")
+    if not checks:
+        return "none"
+    buckets: set[str] = set()
+    for check in checks:
+        bucket = check.get("bucket")
+        if not isinstance(bucket, str) or not bucket.strip():
+            raise ValueError("Required Checks snapshot check bucket is invalid")
+        buckets.add(bucket.lower())
+    if buckets - _KNOWN_CHECK_BUCKETS:
+        return "unknown"
+    if buckets & {"fail", "cancel"}:
+        return "fail"
+    if "pending" in buckets:
+        return "pending"
+    return "pass"
+
+
+def _result_matches_check_buckets(result: object, checks: list[dict[str, Any]]) -> bool:
+    return result == derive_required_checks_result(checks)
 
 
 def require_required_checks_observation(
@@ -59,6 +90,16 @@ def require_required_checks_observation(
     ):
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.checks is invalid"
+        )
+    try:
+        matches = _result_matches_check_buckets(result, checks)
+    except ValueError as error:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.checks is invalid: {error}"
+        ) from None
+    if not matches:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.result conflicts with check buckets"
         )
     return value
 
@@ -131,6 +172,12 @@ def read_required_checks_observation(
         isinstance(check, dict) for check in checks
     ):
         raise ValueError("Required Checks snapshot checks must contain objects")
+    try:
+        matches = _result_matches_check_buckets(result, checks)
+    except ValueError:
+        raise
+    if not matches:
+        raise ValueError("Required Checks snapshot result conflicts with check buckets")
     return deepcopy(snapshot)
 
 

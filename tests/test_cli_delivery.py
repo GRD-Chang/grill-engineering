@@ -334,6 +334,61 @@ def test_public_run_completes_one_supervised_fallback_final_ci_fix(
     assert fixture_data["supervision_clock"] > 0
 
 
+def test_ticket_required_checks_read_timeout_resumes_without_publication_retry(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"3": ticket()},
+        delivery={
+            "required_checks": ["pass"],
+            "ticket_required_checks_read_failures": [
+                {"code": "github_timeout", "message": "ticket checks unavailable"}
+                for _ in range(32)
+            ],
+        },
+        supervision_clock_multiplier=120,
+    )
+    agents = git_repo / "ticket-required-check-timeout-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert paused.returncode == 2
+    paused_state = load_only_run_state(git_repo)
+    assert paused_state["status"] == "supervision_timeout"
+    job = paused_state["active_ticket_job"]
+    assert job["phase"] == "publishing"
+    assert "publication_operation_retry" not in job
+    assert "last_publication_error" not in job
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]) == 1
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["ticket_required_checks_read_failures"] = []
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        str(paused_state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    completed = load_only_run_state(git_repo)
+    assert completed["ticket_jobs"]["3"]["phase"] == "completed"
+    assert completed["ticket_jobs"]["3"]["publication_attempts"] == 1
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ]) == 2
+
+
 def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
     git_repo: Path,
 ) -> None:
@@ -2126,6 +2181,67 @@ def test_parent_only_approve_blocks_head_drift_before_merge(git_repo: Path) -> N
         "pull_requests"
     ][0]
     assert pull["state"] == "OPEN"
+
+
+@pytest.mark.parametrize(
+    "identity_override",
+    [
+        {"head_repository": "foreign/project"},
+        {"base_repository": "foreign/project"},
+        {"base_branch": "foreign-main"},
+        {"base_sha": "f" * 40},
+    ],
+    ids=("head-repository", "base-repository", "base-branch", "base-sha"),
+)
+def test_parent_only_final_merge_rechecks_complete_pr_identity(
+    git_repo: Path, identity_override: dict[str, str]
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-only-agents.json"
+    agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "parent-developer-1",
+                        "summary": "Implemented the standalone parent request.",
+                        "write_files": {"parent-feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance("parent-reviewer-1", "candidate passed")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
+    )
+    assert delivered.returncode == 0, delivered.stderr
+
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["delivery"]["required_checks"] = ["pass"]
+    data["delivery"]["check_position"] = 0
+    data["delivery"]["normal_merge_live_identity_override"] = identity_override
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    failed = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert failed.returncode == 2
+    assert stdout_json(failed)["status"] == "deterministic_contradiction"
+    state = load_only_run_state(git_repo)
+    assert state["diagnostics"][0]["code"] == "foreign_run_pr"
+    assert state["parent_job"]["phase"] == "merging"
+    assert state["parent_job"]["approval_grant"]
+    pull = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ][0]
+    assert pull["state"] == "OPEN"
+    assert "integrated_sha" not in pull
 
 
 @pytest.mark.parametrize(

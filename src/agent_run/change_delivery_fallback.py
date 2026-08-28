@@ -288,6 +288,9 @@ def prepare_ticket_fallback(
         "previous_publication_authorization": previous_authorization_snapshot,
         "git_integrity": git_integrity,
     }
+    required_checks_origin = job.get("required_checks_origin")
+    if isinstance(required_checks_origin, dict):
+        receipt["required_checks_origin"] = deepcopy(required_checks_origin)
     job["fallback_publication_receipt"] = receipt
     job["publication_authority"] = "fallback"
     job.pop("acceptance_record", None)

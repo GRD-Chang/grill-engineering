@@ -422,6 +422,7 @@ class TicketDeliveryLoop:
             "last_publication_error",
             "repair_source",
             "ci_evidence",
+            "required_checks_origin",
             "publication_authority",
             "fallback_publication_receipt",
             "deterministic_integration_record",
