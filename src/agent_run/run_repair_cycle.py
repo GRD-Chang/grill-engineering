@@ -144,16 +144,18 @@ def rotate_repair_job(
     completed_repairs = run.setdefault("completed_repair_jobs", [])
     if not isinstance(completed_repairs, list):
         raise ValueError("completed_repair_jobs must be a list")
-    completed_repairs.append(
-        {
-            "phase": "completed",
-            "repair_branch": job["repair_branch"],
-            "pr_number": job["pr_number"],
-            "integrated_sha": job["integrated_sha"],
-            "candidate_sha": job["candidate_sha"],
-            "acceptance_state": "revalidation_finding",
-        }
-    )
+    completed = {
+        "phase": "completed",
+        "repair_branch": job["repair_branch"],
+        "pr_number": job["pr_number"],
+        "integrated_sha": job["integrated_sha"],
+        "candidate_sha": job["candidate_sha"],
+        "acceptance_state": "revalidation_finding",
+    }
+    origin = job.get("required_checks_origin")
+    if isinstance(origin, dict):
+        completed["ci_evidence"] = deepcopy(origin)
+    completed_repairs.append(completed)
     del completed_repairs[:-32]
 
     rotated = dict(job)

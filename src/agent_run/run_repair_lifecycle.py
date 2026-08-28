@@ -431,7 +431,11 @@ class RunRepairLifecycle:
             evidence = repair_request.get("ci_evidence")
             if not isinstance(evidence, dict):
                 raise ValueError("required-check repair evidence must be an object")
-            job["ci_evidence"] = evidence
+            job["ci_evidence"] = deepcopy(evidence)
+            origin = deepcopy(evidence)
+            origin["head_sha"] = base_sha
+            origin["result"] = "fail"
+            job["required_checks_origin"] = origin
         if repair_source == "merge_conflict":
             evidence = repair_request.get("merge_conflict_evidence")
             if not isinstance(evidence, str) or not evidence.strip():

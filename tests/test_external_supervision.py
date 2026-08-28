@@ -416,6 +416,8 @@ def test_unproven_github_read_failures_remain_reconcilable(code: str) -> None:
         "ambiguous_run_pr",
         "invalid_parent",
         "stale_run_pr",
+        "change_pr_identity_mismatch",
+        "change_pr_head_drift",
     ],
 )
 def test_proven_github_state_contradictions_do_not_enter_supervision(code: str) -> None:

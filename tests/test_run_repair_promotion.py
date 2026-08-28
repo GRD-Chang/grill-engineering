@@ -12,6 +12,7 @@ from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
+from agent_run.run_publication import RunPublicationEngine
 from agent_run.state_contract import IncompatibleRunStateError
 
 
@@ -23,6 +24,8 @@ from run_acceptance_test_support import (
     _passing_artifact,
     _repair_artifact,
 )
+from run_publication_test_support import RunPublicationAgents, _accepted_run
+
 
 def _malformed_candidate_history() -> list[dict[str, object]]:
     return [{"candidate_sha": "candidate", "artifact": {"result_kind": "acceptance"}}]
@@ -670,3 +673,142 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     assert second["run_acceptance"]["development_thread_history"] == [thread_id]
     assert second["run_publication"]["pr_number"] == final_pr
     assert len(second["run_acceptance"]["completed_repair_jobs"]) == 1
+
+
+def test_required_check_repair_promotion_clears_old_observation_and_archives_provenance(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    old_head = git.resolve(str(state["run_branch"]))
+    publisher.ensure_final_run_ref(
+        branch=str(state["run_branch"]), expected_head_sha=old_head
+    )
+    final_pr = publisher.ensure_run_pr(
+        branch=str(state["run_branch"]),
+        base_branch="main",
+        expected_head_sha=old_head,
+        expected_base_sha=git.resolve("main"),
+        title="Final Run",
+        body="Original final Run narrative.",
+    )
+    failure_evidence = publisher.required_check_evidence(
+        final_pr, expected_head_sha=old_head
+    )
+    old_observation = {
+        "pr_number": final_pr,
+        "head_sha": old_head,
+        "result": "fail",
+        "checks": deepcopy(failure_evidence["checks"]),
+    }
+    state["run_publication"] = {
+        "phase": "ready_for_approval",
+        "pr_number": final_pr,
+        "required_checks_evidence": old_observation,
+        "artifact": {"pr_body_markdown": "Original final Run narrative."},
+        "approval_grant": {"fingerprint": "old-observation"},
+    }
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "reviewer_thread_ids": [],
+        "development_thread_history": [],
+        "acceptance_artifact": _repair_artifact(),
+        "repair_request": {
+            "repair_source": "required_checks",
+            "ci_evidence": failure_evidence,
+        },
+    }
+    states.save_run(str(state["run_id"]), state)
+
+    repair_agents = ScriptedRunAgents()
+    repair_agents._reviews = [_passing_artifact()]
+    promoted = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=repair_agents,
+        github=publisher,
+        default_head_sha=git.resolve("main"),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert promoted["status"] == "run_publication_pending"
+    publication = promoted["run_publication"]
+    assert publication["phase"] == "stale"
+    assert "required_checks_evidence" not in publication
+    assert "required_checks_observation_status" not in publication
+    completed = promoted["run_acceptance"]["completed_repair_jobs"][-1]
+    archived = completed["ci_evidence"]
+    assert archived["pr_number"] == final_pr
+    assert archived["head_sha"] == old_head
+    assert archived["result"] == "fail"
+    assert archived["checks"] == failure_evidence["checks"]
+    assert archived["checks"][0]["job"]["head_sha"] == old_head
+    assert archived["checks"][0]["job"]["steps"][0]["conclusion"] == "failure"
+    assert promoted["run_acceptance"]["publication_sha"] != old_head
+
+    reloaded = states.load_current_run(str(state["run_id"]))
+    assert reloaded is not None
+    assert "required_checks_evidence" not in reloaded["run_publication"]
+    assert reloaded["run_acceptance"]["completed_repair_jobs"][-1][
+        "ci_evidence"
+    ] == archived
+
+
+def test_required_check_origin_survives_acceptance_repair_before_promotion(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["fail", "pass"]
+    publisher._save()
+
+    failed = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+    final_pr = int(failed["run_publication"]["pr_number"])
+    old_head = git.resolve(str(state["run_branch"]))
+    failure_evidence = publisher.required_check_evidence(
+        final_pr, expected_head_sha=old_head
+    )
+
+    class TwoRoundRepairAgents(ScriptedRunAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            result = super().develop(request)
+            if len(self.development_requests) == 2:
+                checkout = Path(str(request["checkout"]))
+                (checkout / "follow-up-repair.txt").write_text(
+                    "second repair\n", encoding="utf-8"
+                )
+            return result
+
+    agents = TwoRoundRepairAgents()
+    agents._reviews = [_candidate_finding_artifact(), _passing_artifact()]
+    result = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=publisher,
+        default_head_sha=git.resolve("main"),
+    ).accept(str(state["run_id"]))
+
+    assert result["status"] == "run_publication_pending"
+    assert result["run_acceptance"]["phase"] == "accepted"
+    assert len(agents.development_requests) == 2
+    assert len(agents.review_requests) == 2
+    archived = result["run_acceptance"]["completed_repair_jobs"][-1]["ci_evidence"]
+    assert archived == {
+        **failure_evidence,
+        "head_sha": old_head,
+        "result": "fail",
+    }
+    assert result["run_publication"]["phase"] == "stale"
+    assert "required_checks_evidence" not in result["run_publication"]

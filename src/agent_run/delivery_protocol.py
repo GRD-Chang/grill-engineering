@@ -77,7 +77,15 @@ class GitHubPublisher(Protocol):
     ) -> None: ...
 
     def normal_merge(
-        self, *, pr_number: int, expected_head_sha: str
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_head_branch: str | None = None,
+        expected_head_repository: str | None = None,
+        expected_base_branch: str | None = None,
+        expected_base_sha: str | None = None,
+        expected_base_repository: str | None = None,
     ) -> str: ...
 
     def close_parent_issue(

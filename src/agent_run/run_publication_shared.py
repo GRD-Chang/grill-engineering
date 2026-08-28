@@ -26,6 +26,7 @@ from agent_run.publication_operation_retry import (
     record_publication_operation_failure,
 )
 from agent_run.publication_pending import publication_pending_diagnostic
+from agent_run.required_checks_observation import read_required_checks_observation
 
 
 class RunPublicationShared:
@@ -147,8 +148,6 @@ class RunPublicationShared:
                 error.code
             ):
                 raise
-            if self._record_operation_failure(state, publication, error):
-                return None
             publication["phase"] = "waiting_external"
             wait_for_github_convergence(
                 state,
@@ -159,6 +158,151 @@ class RunPublicationShared:
             ensure_supervision_window(state)
             self._save(state)
             return None
+
+    def _revalidate_final_run_pr_before_repair(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        expected_head_sha: str,
+    ) -> bool:
+        """Require the live Final Run PR to still own the failed Run head."""
+
+        return self._revalidate_final_run_pr(
+            state,
+            publication,
+            pr_number,
+            expected_head_sha,
+            waiting_for=f"Run PR #{pr_number} identity before Required Check repair",
+            observation_status="unavailable",
+        )
+
+    def _revalidate_final_run_pr_before_merge(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        expected_head_sha: str,
+    ) -> bool:
+        """Require the reviewed Final Run PR boundary immediately before merge."""
+
+        return self._revalidate_final_run_pr(
+            state,
+            publication,
+            pr_number,
+            expected_head_sha,
+            waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            observation_status="unavailable",
+        )
+
+    def _revalidate_final_run_pr(
+        self,
+        state: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        waiting_for: str,
+        observation_status: str | None,
+    ) -> bool:
+        """Re-read the full PR identity at a side-effect authority boundary."""
+
+        try:
+            live = self.github.live_pull_request(pr_number)
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
+            if observation_status is not None:
+                publication["required_checks_observation_status"] = observation_status
+            publication["phase"] = "waiting_external"
+            if isinstance(error, GitHubReadError):
+                code = error.code
+                message = error.message
+            else:
+                code = "github_final_run_pr_revalidation_failed"
+                message = str(error)
+            wait_for_github_convergence(
+                state,
+                code=code,
+                message=message,
+                waiting_for=waiting_for,
+            )
+            ensure_supervision_window(state)
+            self._save(state)
+            return False
+
+        if not (
+            live.get("state") == "OPEN"
+            and self._final_pr_has_expected_identity(
+                live=live,
+                run_head=expected_head_sha,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=self.default_head_sha,
+            )
+        ):
+            self._invalidate_for_fresh_acceptance(state)
+            return False
+        return True
+
+    def _observe_required_checks(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        publication: dict[str, Any],
+        pr_number: int,
+        expected_head_sha: str,
+    ) -> dict[str, Any] | None:
+        """Persist one exact-head Required Checks observation or wait for it."""
+
+        try:
+            observation = read_required_checks_observation(
+                self.github,
+                pr_number,
+                expected_head_sha=expected_head_sha,
+            )
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if isinstance(error, GitHubReadError) and error.code in {
+                "change_pr_identity_mismatch",
+                "change_pr_head_drift",
+            }:
+                self._invalidate_for_fresh_acceptance(state)
+                return None
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
+            self._record_agent_run_status(
+                pr_number, run, expected_head_sha, "unavailable"
+            )
+            publication["required_checks_observation_status"] = "unavailable"
+            publication["phase"] = "waiting_external"
+            if isinstance(error, GitHubReadError):
+                code = error.code
+                message = error.message
+            else:
+                code = "github_checks_observation_failed"
+                message = str(error)
+            wait_for_github_convergence(
+                state,
+                code=code,
+                message=message,
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+            self._save(state)
+            return None
+        prior_observation_status = publication.get(
+            "required_checks_observation_status"
+        )
+        publication["required_checks_evidence"] = observation
+        publication.pop("required_checks_observation_status", None)
+        if prior_observation_status in {"unavailable", "unknown"}:
+            publication.pop("publication_operation_retry", None)
+            publication.pop("last_publication_error", None)
+        return observation
 
     def _record_operation_failure(
         self,
@@ -254,6 +398,7 @@ class RunPublicationShared:
             "fail": "repair failed Required Checks",
             "pending": "wait for Required Checks",
             "unknown": "retry Required Checks observation",
+            "unavailable": "retry Required Checks observation",
         }.get(checks, "await explicit maintainer approval")
         self.github.record_agent_run_status(
             pr_number,

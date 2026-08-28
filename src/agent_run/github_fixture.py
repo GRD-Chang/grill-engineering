@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
-from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
+from agent_run.github import (
+    GitHubReadError,
+    MergeOutcomeUnknownError,
+    _merge_identity_matches,
+)
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 from agent_run.required_checks import annotate_configured_code_failures
 from agent_run.revisions import effective_revision_from_graph
@@ -545,12 +549,35 @@ class FixtureGitHubPublisher:
         self._save()
         self._crash_once("record_run_publication")
 
-    def normal_merge(self, *, pr_number: int, expected_head_sha: str) -> str:
+    def normal_merge(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_head_branch: str | None = None,
+        expected_head_repository: str | None = None,
+        expected_base_branch: str | None = None,
+        expected_base_sha: str | None = None,
+        expected_base_repository: str | None = None,
+    ) -> str:
         pull = self._pull(pr_number)
         if pull.get("state") == "MERGED":
             return str(pull["integrated_sha"])
         live = self.live_pull_request(pr_number)
-        if live["head_sha"] != expected_head_sha or not live["mergeable"]:
+        identity_matches = _merge_identity_matches(
+            live,
+            expected_head_sha=expected_head_sha,
+            expected_head_branch=expected_head_branch,
+            expected_head_repository=expected_head_repository,
+            expected_base_branch=expected_base_branch,
+            expected_base_sha=expected_base_sha,
+            expected_base_repository=expected_base_repository,
+        )
+        if live.get("state") != "OPEN" or not identity_matches:
+            raise GitHubReadError(
+                "foreign_run_pr", "fixture Final Run PR does not match merge identity"
+            )
+        if not live["mergeable"]:
             raise ValueError("fixture final merge does not match expected open head")
         base = self.git.resolve(str(pull["base_branch"]))
         result = subprocess.run(

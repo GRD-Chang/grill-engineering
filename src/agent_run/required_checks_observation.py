@@ -144,6 +144,7 @@ def bind_new_publication_head(job: dict[str, Any], publication_sha: str) -> None
 
     for key in (
         "required_checks_evidence",
+        "required_checks_observation_status",
         "required_checks",
         "required_checks_mode",
     ):

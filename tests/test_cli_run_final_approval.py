@@ -17,6 +17,7 @@ from cli_run_supervision_support import (
     _run_until_pending_window,
 )
 
+
 def test_run_supervises_pending_final_run_checks_in_one_call(
     git_repo: Path,
 ) -> None:
@@ -84,10 +85,14 @@ def test_final_approval_supervises_a_transient_required_checks_read_failure(
     waiting = run_cli(git_repo, fixture, "approve", run_id)
 
     assert waiting.returncode == 0, waiting.stderr
-    assert stdout_json(waiting)["status"] == "waiting_checks"
+    assert stdout_json(waiting)["status"] == "waiting_external"
     persisted_wait = load_only_run_state(git_repo)
     assert persisted_wait["diagnostics"][0]["code"] == "github_timeout"
-    assert persisted_wait["supervision_window"]["kind"] == "required_checks"
+    assert persisted_wait["supervision_window"]["kind"] == "github_convergence"
+    assert (
+        persisted_wait["run_publication"]["required_checks_observation_status"]
+        == "unavailable"
+    )
     granted_at = persisted_wait["run_publication"]["approval_grant"]["granted_at"]
     assert len(fixture_data["delivery"]["pull_requests"]) == 2
 
@@ -99,6 +104,60 @@ def test_final_approval_supervises_a_transient_required_checks_read_failure(
     assert final_state["run_publication"]["approval_grant"]["granted_at"] == granted_at
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
 
+
+def test_final_approval_supervises_live_pr_read_after_snapshot_wait(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    awaiting_approval = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
+    run_id = str(stdout_json(awaiting_approval)["run_id"])
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["run_required_checks_read_failures"] = [
+        {"code": "github_timeout", "message": "snapshot unavailable"}
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    snapshot_wait = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert snapshot_wait.returncode == 0, snapshot_wait.stderr
+    assert stdout_json(snapshot_wait)["status"] == "waiting_external"
+    first_state = load_only_run_state(git_repo)
+    grant = first_state["run_publication"]["approval_grant"]
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["open_live_pull_request_failures"] = [
+        {
+            "scope": "final_run",
+            "type": "github",
+            "code": "github_timeout",
+            "message": "live PR unavailable",
+        }
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    live_wait = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert live_wait.returncode == 2, live_wait.stderr
+    assert stdout_json(live_wait)["status"] == "waiting_external"
+    second_state = load_only_run_state(git_repo)
+    assert second_state["run_publication"]["approval_grant"] == grant
+    assert second_state["run_publication"]["phase"] == "waiting_external"
+    assert second_state["status"] != "execution_failed"
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["open_live_pull_request_failures"] = []
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    recovered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert stdout_json(recovered)["status"] == "completed"
+    final_state = load_only_run_state(git_repo)
+    assert final_state["run_publication"]["approval_grant"] == grant
+    assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
+
+
 def test_final_approval_required_checks_read_timeout_preserves_its_grant_for_resume(
     git_repo: Path,
 ) -> None:
@@ -109,26 +168,31 @@ def test_final_approval_required_checks_read_timeout_preserves_its_grant_for_res
     )
     run_id = str(stdout_json(awaiting_approval)["run_id"])
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
-    fixture_data["supervision_clock_multiplier"] = 540
+    fixture_data["supervision_clock_multiplier"] = 1
     fixture_data["delivery"]["run_required_checks_read_failures"] = [
         {"code": "github_timeout", "message": "required checks unavailable"}
-        for _ in range(4)
+        for _ in range(32)
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
-    assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == "waiting_checks"
+    assert (
+        stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"]
+        == "waiting_external"
+    )
     grant = load_only_run_state(git_repo)["run_publication"]["approval_grant"]
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
     assert paused.returncode == 2
     paused_state = load_only_run_state(git_repo)
     assert paused_state["status"] == "supervision_timeout"
-    assert paused_state["supervision_wait"]["kind"] == "required_checks"
+    assert paused_state["supervision_wait"]["kind"] == "github_convergence"
     assert (
         paused_state["supervision_wait"]["deadline"]
         - paused_state["supervision_wait"]["started_at"]
-        == 45 * 60
+        == 10 * 60
     )
+    assert paused_state["supervision_wait"]["retry_count"] >= 5
+    assert "publication_operation_retry" not in paused_state["run_publication"]
     assert paused_state["run_publication"]["approval_grant"] == grant
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
 

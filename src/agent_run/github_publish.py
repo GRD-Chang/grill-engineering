@@ -8,7 +8,12 @@ from typing import Any
 from urllib.parse import quote
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
-from agent_run.github import GhGitHubReader, GitHubReadError, MergeOutcomeUnknownError
+from agent_run.github import (
+    GhGitHubReader,
+    GitHubReadError,
+    MergeOutcomeUnknownError,
+    _merge_identity_matches,
+)
 from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
 from agent_run.required_checks import annotate_configured_code_failures
@@ -315,7 +320,40 @@ class GhGitHubPublisher:
                 f"body={body}",
             )
 
-    def normal_merge(self, *, pr_number: int, expected_head_sha: str) -> str:
+    def normal_merge(
+        self,
+        *,
+        pr_number: int,
+        expected_head_sha: str,
+        expected_head_branch: str | None = None,
+        expected_head_repository: str | None = None,
+        expected_base_branch: str | None = None,
+        expected_base_sha: str | None = None,
+        expected_base_repository: str | None = None,
+    ) -> str:
+        if any(
+            value is not None
+            for value in (
+                expected_head_branch,
+                expected_head_repository,
+                expected_base_branch,
+                expected_base_sha,
+                expected_base_repository,
+            )
+        ):
+            live = self.live_pull_request(pr_number)
+            if live.get("state") != "OPEN" or not _merge_identity_matches(
+                live,
+                expected_head_sha=expected_head_sha,
+                expected_head_branch=expected_head_branch,
+                expected_head_repository=expected_head_repository,
+                expected_base_branch=expected_base_branch,
+                expected_base_sha=expected_base_sha,
+                expected_base_repository=expected_base_repository,
+            ):
+                raise GitHubReadError(
+                    "foreign_run_pr", "Final Run PR does not match merge identity"
+                )
         merged = self._run(
             "pr",
             "merge",
