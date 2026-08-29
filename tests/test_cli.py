@@ -75,6 +75,8 @@ def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
                 "2",
                 "--parent-only-paired-rounds",
                 "7",
+                "--run-repair-rounds",
+                "6",
                 "--review-deadline",
                 "90m",
             ]
@@ -85,6 +87,7 @@ def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
     assert configured["result"] == "configured"
     assert configured["policy"]["ticket_review_rounds"] == 2
     assert configured["policy"]["parent_only_paired_rounds"] == 7
+    assert configured["policy"]["run_repair_rounds"] == 6
     assert configured["policy"]["invocation_deadlines"]["review"] == 5400
 
     assert main(["policy", "show"]) == 0
@@ -93,6 +96,7 @@ def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
     assert shown["user_defaults"] == {
         "invocation_deadlines": {"review": "90m"},
         "parent_only_paired_rounds": 7,
+        "run_repair_rounds": 6,
         "ticket_review_rounds": 2,
     }
 
@@ -2862,6 +2866,7 @@ def test_resume_rejects_an_owner_that_has_already_advanced(
             "status": "execution_failed",
             "run_acceptance": {
                 "phase": "accepted",
+                "policy_snapshot": deepcopy(state["policy_snapshot"]),
                 "acceptance_generation": 1,
                 "validation_attempts": 1,
                 "review_budget": _canonical_run_budget(),
@@ -2947,6 +2952,7 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
             "status": "run_publication_pending",
             "run_acceptance": {
                 "phase": "accepted",
+                "policy_snapshot": deepcopy(state["policy_snapshot"]),
                 "acceptance_generation": 1,
                 "validation_attempts": 1,
                 "review_budget": _canonical_run_budget(),

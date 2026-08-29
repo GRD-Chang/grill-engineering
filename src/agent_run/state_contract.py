@@ -8,10 +8,10 @@ from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     parent_only_budget_policy_for_job,
     parse_policy_snapshot,
+    run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
 from agent_run.review_budget import (
-    RUN_POLICY,
     ReviewBudgetPolicy,
     ensure_budget,
 )
@@ -510,10 +510,57 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
                         "legacy state has an invalid parent_job.policy_snapshot"
                     ) from error
             else:
-                policy = RUN_POLICY
+                try:
+                    _require_policy_snapshot_binding(
+                        value.get("policy_snapshot"),
+                        state["policy_snapshot"],
+                        "run_acceptance",
+                    )
+                    policy = run_repair_budget_policy_for_job(
+                        value, state_snapshot=state.get("policy_snapshot")
+                    )
+                except (TypeError, ValueError) as error:
+                    raise IncompatibleRunStateError(
+                        "legacy state has an invalid run_acceptance.policy_snapshot"
+                    ) from error
             subjects.append((key, value, policy))
             if key == "run_acceptance" and isinstance(value.get("repair_job"), dict):
-                subjects.append(("run_acceptance.repair_job", value["repair_job"], RUN_POLICY))
+                repair = value["repair_job"]
+                run_snapshot = value.get("policy_snapshot") or state.get(
+                    "policy_snapshot"
+                )
+                run_budget = value.get("review_budget")
+                repair_budget = repair.get("review_budget")
+                if (
+                    isinstance(run_budget, dict)
+                    and isinstance(repair_budget, dict)
+                    and type(run_budget.get("window")) is int
+                    and type(repair_budget.get("window")) is int
+                    and run_budget["window"] != repair_budget["window"]
+                ):
+                    raise IncompatibleRunStateError(
+                        "legacy state has mismatched Run Acceptance and Run Repair Budget Windows"
+                    )
+                if repair.get("publication_authority") == "fallback" or (
+                    "fallback_publication_receipt" in repair
+                ):
+                    raise IncompatibleRunStateError(
+                        "legacy state has an unauthorized Run Repair fallback Publication Authority"
+                    )
+                try:
+                    _require_policy_snapshot_binding(
+                        repair.get("policy_snapshot"),
+                        run_snapshot,
+                        "run_acceptance.repair_job",
+                    )
+                    repair_policy = run_repair_budget_policy_for_job(
+                        repair, state_snapshot=run_snapshot
+                    )
+                except (TypeError, ValueError) as error:
+                    raise IncompatibleRunStateError(
+                        "legacy state has an invalid run_acceptance.repair_job.policy_snapshot"
+                    ) from error
+                subjects.append(("run_acceptance.repair_job", repair, repair_policy))
     for location, job, policy in subjects:
         try:
             ensure_budget(job, policy)
@@ -521,6 +568,19 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid canonical {location}.review_budget"
             ) from error
+
+
+def _require_policy_snapshot_binding(
+    nested: object, parent: object, location: str
+) -> None:
+    """Ensure nested Run projections use the same frozen Policy Snapshot."""
+
+    if nested is None:
+        raise ValueError(f"{location}.policy_snapshot is missing")
+    nested_snapshot = parse_policy_snapshot(nested).snapshot()
+    parent_snapshot = parse_policy_snapshot(parent).snapshot()
+    if nested_snapshot != parent_snapshot:
+        raise ValueError(f"{location}.policy_snapshot differs from its Run Snapshot")
 
 
 def _looks_like_materialized_job(value: dict[str, Any]) -> bool:

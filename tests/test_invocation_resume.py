@@ -233,10 +233,12 @@ def _prepared_resume(
     elif subject_kind == "run_repair":
         state["run_acceptance"] = {
             "phase": "repairing",
+            "policy_snapshot": dict(state["policy_snapshot"]),
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
             "repair_job": {
                 "phase": "accepted",
+                "policy_snapshot": dict(state["policy_snapshot"]),
                 "review_budget": _canonical_budget(),
                 "review_budget_history": [],
                 "repair_generation": 2,
@@ -250,6 +252,7 @@ def _prepared_resume(
     elif subject_kind == "final_publication":
         state["run_acceptance"] = {
             "phase": "accepted",
+            "policy_snapshot": dict(state["policy_snapshot"]),
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
             "validation_attempts": 2,

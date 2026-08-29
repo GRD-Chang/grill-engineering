@@ -15,15 +15,17 @@ from typing import Any
 
 from agent_run.review_budget import (
     PARENT_ONLY_POLICY,
+    RUN_POLICY,
     TICKET_POLICY,
     ReviewBudgetPolicy,
 )
 
 
-DELIVERY_POLICY_PROTOCOL = 2
+DELIVERY_POLICY_PROTOCOL = 3
 _POLICY_KEYS = frozenset(
     {
         "parent_only_paired_rounds",
+        "run_repair_rounds",
         "ticket_review_rounds",
         "invocation_deadlines",
     }
@@ -45,6 +47,7 @@ class DeliveryPolicy:
 
     ticket_review_rounds: int = 3
     parent_only_paired_rounds: int = 10
+    run_repair_rounds: int = 10
     development_deadline_seconds: float = 5 * 60 * 60
     review_deadline_seconds: float = 2 * 60 * 60
     publication_deadline_seconds: float = 60 * 60
@@ -62,6 +65,11 @@ class DeliveryPolicy:
                 self.parent_only_paired_rounds, "parent_only_paired_rounds"
             ),
         )
+        object.__setattr__(
+            self,
+            "run_repair_rounds",
+            _positive_integer(self.run_repair_rounds, "run_repair_rounds"),
+        )
         for field, label in (
             ("development_deadline_seconds", "development deadline"),
             ("review_deadline_seconds", "review deadline"),
@@ -76,6 +84,7 @@ class DeliveryPolicy:
     def snapshot(self) -> dict[str, Any]:
         return {
             "parent_only_paired_rounds": self.parent_only_paired_rounds,
+            "run_repair_rounds": self.run_repair_rounds,
             "ticket_review_rounds": self.ticket_review_rounds,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
@@ -150,6 +159,8 @@ def normalize_policy_overrides(
     round_aliases = {
         "parent_only_paired_round": "parent_only_paired_rounds",
         "parent_only_paired_rounds": "parent_only_paired_rounds",
+        "run_repair_round": "run_repair_rounds",
+        "run_repair_rounds": "run_repair_rounds",
         "ticket_review_rounds": "ticket_review_rounds",
         "ticket_review_round": "ticket_review_rounds",
     }
@@ -203,6 +214,7 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
     return _policy_from_values(
         {
             "parent_only_paired_rounds": value.get("parent_only_paired_rounds"),
+            "run_repair_rounds": value.get("run_repair_rounds"),
             "ticket_review_rounds": value.get("ticket_review_rounds"),
             "invocation_deadlines": dict(deadlines),
         }
@@ -265,6 +277,18 @@ def parent_only_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
     )
 
 
+def run_repair_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
+    """Derive the Run D(N)/R(N+1) review-first topology."""
+
+    return ReviewBudgetPolicy(
+        development_limit=policy.run_repair_rounds,
+        review_limit=policy.run_repair_rounds + 1,
+        final_ci_fix_limit=0,
+        fallback=False,
+        budget_scope="run",
+    )
+
+
 def ticket_budget_policy_for_job(
     job: Mapping[str, Any], *, state_snapshot: object | None = None
 ) -> ReviewBudgetPolicy:
@@ -297,6 +321,24 @@ def parent_only_budget_policy_for_job(
         return parent_only_budget_policy(parse_policy_snapshot(raw))
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Parent-only Policy Snapshot: {error}") from error
+
+
+def run_repair_budget_policy_for_job(
+    job: Mapping[str, Any], *, state_snapshot: object | None = None
+) -> ReviewBudgetPolicy:
+    """Resolve the frozen Run policy shared by Run Acceptance and Run Repair."""
+
+    raw = job.get("policy_snapshot")
+    if raw is None:
+        raw = state_snapshot
+    if raw is None:
+        # Keep the direct engine seam usable for legacy unit callers; the
+        # persisted State contract rejects a missing Policy Snapshot.
+        return RUN_POLICY
+    try:
+        return run_repair_budget_policy(parse_policy_snapshot(raw))
+    except DeliveryPolicyError as error:
+        raise ValueError(f"invalid Run Policy Snapshot: {error}") from error
 
 
 class DeliveryPolicyStore:
@@ -425,6 +467,9 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
     return DeliveryPolicy(
         parent_only_paired_rounds=_positive_integer(
             values.get("parent_only_paired_rounds"), "parent_only_paired_rounds"
+        ),
+        run_repair_rounds=_positive_integer(
+            values.get("run_repair_rounds"), "run_repair_rounds"
         ),
         ticket_review_rounds=_positive_integer(
             values.get("ticket_review_rounds"), "ticket_review_rounds"

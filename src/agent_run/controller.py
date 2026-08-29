@@ -21,6 +21,7 @@ from agent_run.delivery_policy import (
     DeliveryPolicy,
     default_delivery_policy,
     parent_only_budget_policy_for_job,
+    run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
 from agent_run.error_safety import bounded_error
@@ -48,7 +49,6 @@ from agent_run.run_currentness import (
 )
 from agent_run.run_locator import RunLocatorError, RunLocatorIndex
 from agent_run.review_budget import (
-    RUN_POLICY,
     budget_checkpoint_subjects,
     reset_budget,
 )
@@ -1378,7 +1378,13 @@ def _resume_review_budget_window(
         )
         return True
     if subject_kind == "run":
-        reset_budget(subject, RUN_POLICY)
+        reset_budget(
+            subject,
+            run_repair_budget_policy_for_job(
+                subject, state_snapshot=state.get("policy_snapshot")
+            ),
+        )
+        subject["policy_snapshot"] = policy.snapshot()
         state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject["phase"] = "repairing"
@@ -1388,7 +1394,17 @@ def _resume_review_budget_window(
         )
         return True
     run_state = _state_mapping(state, "run_acceptance")
-    reset_budget(run_state, RUN_POLICY)
+    reset_budget(
+        run_state,
+        run_repair_budget_policy_for_job(
+            run_state,
+            state_snapshot=(
+                subject.get("policy_snapshot")
+                or state.get("policy_snapshot")
+            ),
+        ),
+    )
+    run_state["policy_snapshot"] = policy.snapshot()
     state["policy_snapshot"] = policy.snapshot()
     run_state["repair_request"] = _budget_repair_request(subject)
     run_state["phase"] = "repairing"

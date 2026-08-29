@@ -108,10 +108,10 @@ def test_reset_budget_opens_numbered_window_without_old_attempts() -> None:
     assert "fallback_publication_receipt" not in job
 
 
-def test_run_policy_keeps_existing_development_capacity_but_caps_reviews() -> None:
+def test_run_policy_allows_ten_developments_and_eleven_reviews() -> None:
     job = _job_with_budget()
 
-    for _ in range(5):
+    for _ in range(11):
         mark_review(job, RUN_POLICY)
     assert not can_start_review(job, RUN_POLICY)
     assert can_start_development(job, RUN_POLICY)
@@ -328,7 +328,9 @@ def test_ticket_budget_resume_opens_new_window_and_preserves_repair_evidence() -
 def test_run_repair_review_counts_share_the_run_window() -> None:
     from agent_run.run_repair_cycle import sync_repair_cycle_counters
 
+    policy_snapshot = DeliveryPolicy().snapshot()
     run: dict[str, object] = {
+        "policy_snapshot": policy_snapshot,
         "review_budget": {
             "window": 1,
             "development_attempts": 0,
@@ -341,6 +343,7 @@ def test_run_repair_review_counts_share_the_run_window() -> None:
         "repair_cycle": {"generation": 1},
     }
     job: dict[str, object] = {
+        "policy_snapshot": policy_snapshot,
         "modification_attempts": 0,
         "validation_attempts": 0,
         "review_budget": {
@@ -356,6 +359,53 @@ def test_run_repair_review_counts_share_the_run_window() -> None:
     mark_review(job, RUN_POLICY)
     sync_repair_cycle_counters(run, job)
     assert run["review_budget"]["reviewer_invocations"] == 5
+
+
+def test_run_repair_sync_uses_frozen_limits_for_both_budget_projections() -> None:
+    from agent_run.run_repair_cycle import sync_repair_cycle_counters
+
+    policy = DeliveryPolicy(run_repair_rounds=2)
+    run: dict[str, object] = {
+        "policy_snapshot": policy.snapshot(),
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 1,
+            "reviewer_invocations": 2,
+            "final_ci_fix_used": False,
+            "review_artifacts": [
+                {"review_identity": {"attempt_id": "r1"}},
+                {"review_identity": {"attempt_id": "r2"}},
+            ],
+            "checkpoint_reason": None,
+        },
+        "review_budget_history": [],
+        "repair_cycle": {"generation": 1},
+    }
+    job: dict[str, object] = {
+        "policy_snapshot": policy.snapshot(),
+        "modification_attempts": 0,
+        "validation_attempts": 0,
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 2,
+            "reviewer_invocations": 3,
+            "final_ci_fix_used": False,
+            "review_artifacts": [
+                {"review_identity": {"attempt_id": "r2"}},
+                {"review_identity": {"attempt_id": "r3"}},
+            ],
+            "checkpoint_reason": "review_budget_exhausted",
+        },
+        "review_budget_history": [],
+    }
+
+    sync_repair_cycle_counters(run, job)
+
+    assert run["review_budget"] == job["review_budget"]
+    assert run["review_budget"]["development_attempts"] == 2
+    assert run["review_budget"]["reviewer_invocations"] == 3
+    assert len(run["review_budget"]["review_artifacts"]) == 3
+    assert run["review_budget"]["checkpoint_reason"] == "review_budget_exhausted"
 
 
 def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> None:

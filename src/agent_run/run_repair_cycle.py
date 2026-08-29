@@ -5,7 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from agent_run.review_budget import RUN_POLICY, ensure_budget
+from agent_run.delivery_policy import run_repair_budget_policy_for_job
+from agent_run.review_budget import ensure_budget
 from agent_run.required_checks_observation import clear_required_checks_observation
 
 
@@ -73,8 +74,29 @@ def pause_human_blocked_repair_cycle(
 def sync_repair_cycle_counters(
     run: dict[str, Any], job: dict[str, Any]
 ) -> None:
-    run_budget = ensure_budget(run, RUN_POLICY)
-    job_budget = ensure_budget(job, RUN_POLICY)
+    run_snapshot = run.get("policy_snapshot")
+    job_snapshot = job.get("policy_snapshot")
+    if not isinstance(run_snapshot, dict) or not isinstance(job_snapshot, dict):
+        raise ValueError(
+            "Run Acceptance and Run Repair Policy Snapshots are required"
+        )
+    if run_snapshot != job_snapshot:
+        raise ValueError("Run Acceptance and Run Repair Policy Snapshots differ")
+    policy = run_repair_budget_policy_for_job(
+        run, state_snapshot=job_snapshot
+    )
+    run_budget = ensure_budget(run, policy)
+    job_budget = ensure_budget(job, policy)
+    if run_budget["window"] != job_budget["window"]:
+        raise ValueError("Run Acceptance and Run Repair Budget Windows differ")
+    # The Run Budget Window owns both the top-level Acceptance and active
+    # Repair projections. Keep Development usage shared just like Reviewer
+    # usage so a Job rotation cannot reopen capacity.
+    if job_budget["development_attempts"] < run_budget["development_attempts"]:
+        job_budget["development_attempts"] = run_budget["development_attempts"]
+    run_budget["development_attempts"] = max(
+        run_budget["development_attempts"], job_budget["development_attempts"]
+    )
     # A Run Review Budget Window spans the top-level Reviewer and every Run
     # Repair Reviewer.  Seed/raise the active repair projection from the
     # durable Run count so a rotated Repair Job cannot reopen old capacity.
@@ -84,10 +106,17 @@ def sync_repair_cycle_counters(
         run_budget["reviewer_invocations"], job_budget["reviewer_invocations"]
     )
     merged_artifacts = _merge_review_artifacts(
-        run_budget["review_artifacts"], job_budget["review_artifacts"]
+        run_budget["review_artifacts"],
+        job_budget["review_artifacts"],
+        limit=policy.review_limit,
     )
     run_budget["review_artifacts"] = deepcopy(merged_artifacts)
     job_budget["review_artifacts"] = deepcopy(merged_artifacts)
+    checkpoint_reason = (
+        run_budget["checkpoint_reason"] or job_budget["checkpoint_reason"]
+    )
+    run_budget["checkpoint_reason"] = checkpoint_reason
+    job_budget["checkpoint_reason"] = checkpoint_reason
     cycle = run.get("repair_cycle")
     if not isinstance(cycle, dict):
         return
@@ -110,7 +139,10 @@ def sync_repair_cycle_counters(
 
 
 def _merge_review_artifacts(
-    run_artifacts: list[dict[str, Any]], job_artifacts: list[dict[str, Any]]
+    run_artifacts: list[dict[str, Any]],
+    job_artifacts: list[dict[str, Any]],
+    *,
+    limit: int,
 ) -> list[dict[str, Any]]:
     """Keep one ordered, bounded view of Run and active Repair artifacts."""
 
@@ -126,7 +158,7 @@ def _merge_review_artifacts(
             continue
         seen.add(key)
         merged.append(deepcopy(artifact))
-    return merged[-5:]
+    return merged[-limit:]
 
 
 def rotate_repair_job(

@@ -13,6 +13,8 @@ from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
     parse_policy_snapshot,
     resolve_delivery_policy,
+    run_repair_budget_policy,
+    run_repair_budget_policy_for_job,
     ticket_review_budget_policy,
 )
 
@@ -58,6 +60,21 @@ def test_parent_only_job_policy_reads_its_frozen_snapshot() -> None:
     assert parent_only_budget_policy_for_job(job).development_limit == 6
 
 
+def test_run_repair_policy_derives_review_first_rounds() -> None:
+    policy = resolve_delivery_policy(command_overrides={"run_repair_rounds": 4})
+
+    budget_policy = run_repair_budget_policy(policy)
+
+    assert policy.run_repair_rounds == 4
+    assert budget_policy.development_limit == 4
+    assert budget_policy.review_limit == 5
+    assert budget_policy.final_ci_fix_limit == 0
+    assert budget_policy.fallback is False
+    assert run_repair_budget_policy_for_job(
+        {"policy_snapshot": policy.snapshot()}
+    ) == budget_policy
+
+
 def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
     from agent_run.delivery_policy import invocation_deadline_for_state
 
@@ -80,6 +97,8 @@ def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
         {"ticket_review_rounds": True},
         {"parent_only_paired_rounds": 0},
         {"parent_only_paired_rounds": True},
+        {"run_repair_rounds": 0},
+        {"run_repair_rounds": True},
         {"invocation_deadlines": {"review": "0s"}},
         {"invocation_deadlines": {"review": "not-a-duration"}},
         {"invocation_deadlines": {"review": 10**400}},

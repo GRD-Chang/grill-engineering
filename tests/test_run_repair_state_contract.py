@@ -36,6 +36,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     state = load_only_run_state(git_repo)
     repair_job: dict[str, object] = {
         "phase": phase,
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
     }
@@ -43,6 +44,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
         repair_job["repair_mode"] = repair_mode
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "repair_job": repair_job,
     }
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
@@ -82,10 +84,12 @@ def test_canonical_run_repair_modes_pass_state_validation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "repair_mode": repair_mode,
@@ -93,6 +97,132 @@ def test_canonical_run_repair_modes_pass_state_validation(
     }
 
     require_current_run_state(state)
+
+
+@pytest.mark.parametrize("missing", ["run_acceptance", "repair_job"])
+def test_run_repair_snapshot_is_required_for_materialized_projections(
+    git_repo: Path, missing: str
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    run_snapshot = deepcopy(state["policy_snapshot"])
+    repair_snapshot = deepcopy(run_snapshot)
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "policy_snapshot": run_snapshot,
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "developing",
+            "policy_snapshot": repair_snapshot,
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+            "repair_mode": "squash",
+        },
+    }
+    if missing == "run_acceptance":
+        del state["run_acceptance"]["policy_snapshot"]
+    else:
+        del state["run_acceptance"]["repair_job"]["policy_snapshot"]
+
+    with pytest.raises(IncompatibleRunStateError, match="invalid .*policy_snapshot"):
+        require_current_run_state(state)
+
+
+def test_old_run_policy_snapshot_is_incompatible_without_inference(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    old_snapshot = deepcopy(state["policy_snapshot"])
+    old_snapshot.pop("run_repair_rounds")
+    state["policy_snapshot"] = old_snapshot
+
+    with pytest.raises(IncompatibleRunStateError, match="invalid Policy Snapshot"):
+        require_current_run_state(state)
+
+
+def test_old_run_review_history_without_policy_snapshot_is_incompatible(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["run_acceptance"] = {
+        "phase": "blocked",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
+        "review_budget": {
+            **_canonical_run_budget(),
+            "window": 2,
+        },
+        "review_budget_history": [
+            {
+                "phase": "blocked",
+                "modification_attempts": 0,
+                "validation_attempts": 0,
+                "review_budget": _canonical_run_budget(),
+            }
+        ],
+    }
+
+    with pytest.raises(
+        IncompatibleRunStateError, match="invalid canonical run_acceptance.review_budget"
+    ):
+        require_current_run_state(state)
+
+
+def test_run_repair_budget_window_must_match_run_acceptance(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    run_budget = _canonical_run_budget()
+    repair_budget = _canonical_run_budget()
+    repair_budget["window"] = 2
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
+        "review_budget": run_budget,
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "developing",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
+            "repair_mode": "squash",
+            "review_budget": repair_budget,
+            "review_budget_history": [],
+        },
+    }
+
+    with pytest.raises(IncompatibleRunStateError, match="Budget Windows"):
+        require_current_run_state(state)
+
+
+def test_run_repair_cannot_use_ticket_fallback_authority(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    run_cli(git_repo, fixture, "start", "1")
+    state = load_only_run_state(git_repo)
+    state["run_acceptance"] = {
+        "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
+        "review_budget": _canonical_run_budget(),
+        "review_budget_history": [],
+        "repair_job": {
+            "phase": "developing",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
+            "repair_mode": "squash",
+            "review_budget": _canonical_run_budget(),
+            "review_budget_history": [],
+            "fallback_publication_receipt": {},
+        },
+    }
+
+    with pytest.raises(IncompatibleRunStateError, match="fallback Publication Authority"):
+        require_current_run_state(state)
 
 
 def test_direct_state_validation_rejects_missing_active_run_repair_mode(
@@ -103,10 +233,12 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "candidate",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
         },
@@ -124,10 +256,12 @@ def test_waiting_run_repair_requires_an_exact_head_observation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "waiting_checks",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
@@ -148,10 +282,12 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "developing",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
@@ -189,10 +325,12 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "waiting_checks",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "repair_mode": "squash",
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
@@ -290,10 +428,12 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": phase,
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "repair_mode": "squash",
@@ -324,10 +464,12 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "candidate",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "repair_mode": "squash",
@@ -346,10 +488,12 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_job": {
             "phase": "completed",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "repair_mode": "squash",

@@ -18,7 +18,7 @@ from agent_run.required_checks_observation import clear_required_checks_observat
 TICKET_DEVELOPMENT_LIMIT = 4
 TICKET_REVIEW_LIMIT = 3
 FINAL_CI_FIX_LIMIT = 1
-RUN_REVIEW_LIMIT = 5
+RUN_REVIEW_LIMIT = 11
 MAX_REVIEW_ARTIFACTS = RUN_REVIEW_LIMIT
 _REVIEW_BUDGET_KEYS = frozenset(
     {
@@ -182,10 +182,15 @@ def _validate_budget_history(
         old_budget = snapshot.get("review_budget")
         if not isinstance(old_budget, dict):
             raise ValueError(f"{location}.review_budget is missing")
+        if policy.budget_scope == "run" and not isinstance(
+            snapshot.get("policy_snapshot"), dict
+        ):
+            raise ValueError(f"{location}.policy_snapshot is missing")
         historical_policy = policy
         if snapshot.get("policy_snapshot") is not None and policy.budget_scope in {
             "ticket",
             "parent-only",
+            "run",
         }:
             # Ticket windows retain their own policy so a later user-default
             # change cannot make an older audit snapshot invalid. Parent-only
@@ -194,6 +199,7 @@ def _validate_budget_history(
             from agent_run.delivery_policy import (
                 parent_only_budget_policy,
                 parse_policy_snapshot,
+                run_repair_budget_policy,
                 ticket_review_budget_policy,
             )
 
@@ -202,7 +208,11 @@ def _validate_budget_history(
                 historical_policy = (
                     ticket_review_budget_policy(parsed_snapshot)
                     if policy.budget_scope == "ticket"
-                    else parent_only_budget_policy(parsed_snapshot)
+                    else (
+                        parent_only_budget_policy(parsed_snapshot)
+                        if policy.budget_scope == "parent-only"
+                        else run_repair_budget_policy(parsed_snapshot)
+                    )
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(f"{location}.policy_snapshot is invalid") from error

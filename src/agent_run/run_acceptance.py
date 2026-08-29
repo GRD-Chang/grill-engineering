@@ -14,7 +14,10 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
 )
 from agent_run.change_delivery import latest_reviewer_thread
-from agent_run.delivery_policy import invocation_deadline_for_state
+from agent_run.delivery_policy import (
+    invocation_deadline_for_state,
+    run_repair_budget_policy_for_job,
+)
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
@@ -44,7 +47,7 @@ from agent_run.integration_record_contract import (
 )
 from agent_run.worker_credentials import InitialCredentialUnavailable
 from agent_run.review_budget import (
-    RUN_POLICY,
+    ReviewBudgetPolicy,
     ensure_budget,
     mark_review,
     new_budget,
@@ -110,7 +113,8 @@ class RunAcceptanceEngine:
             if not self._all_tickets_completed(state):
                 raise ValueError("Run Acceptance requires every Ticket to be completed")
             run = self._run_state(state)
-            ensure_budget(run, RUN_POLICY)
+            budget_policy = self._run_budget_policy(state, run)
+            ensure_budget(run, budget_policy)
             self._invalidate_stale_acceptance(state, run)
             while True:
                 phase = str(run["phase"])
@@ -172,10 +176,10 @@ class RunAcceptanceEngine:
                     continue
                 if phase != "pending":
                     raise ValueError(f"unknown Run Acceptance phase: {phase}")
-                budget = ensure_budget(run, RUN_POLICY)
+                budget = ensure_budget(run, budget_policy)
                 if (
                     pending_semantic_attempt(run, role="reviewer") is None
-                    and int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit
+                    and int(budget["reviewer_invocations"]) >= budget_policy.review_limit
                 ):
                     run["phase"] = "ready_for_human"
                     run["blocked_reason"] = "review_budget_exhausted"
@@ -197,6 +201,7 @@ class RunAcceptanceEngine:
                     return self._save(state)
 
     def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
+        budget_policy = self._run_budget_policy(state, run)
         resume_initial_credential_wait(
             state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
         )
@@ -253,7 +258,7 @@ class RunAcceptanceEngine:
                 generation=int(run["acceptance_generation"]),
                 currentness_boundary=boundary,
                 ordinal=validation_attempt,
-                budget_window=int(ensure_budget(run, RUN_POLICY)["window"]),
+                budget_window=int(ensure_budget(run, budget_policy)["window"]),
             )
             run["phase"] = "reviewing"
             self._save(state)
@@ -314,7 +319,7 @@ class RunAcceptanceEngine:
             # when a live boundary refresh discards that verdict.
             artifact = AcceptanceArtifact.parse(review.artifact)
             if semantic_attempt.get("budget_consumed") is not True:
-                mark_review(run, RUN_POLICY)
+                mark_review(run, budget_policy)
                 semantic_attempt["budget_consumed"] = True
             # The reviewer has already consumed this identity even if a live
             # authority refresh discards its verdict.  Keep it unavailable to
@@ -331,7 +336,7 @@ class RunAcceptanceEngine:
         finally:
             self.git.remove_worktree(checkout)
         run.pop("reviewer_new_thread", None)
-        budget = ensure_budget(run, RUN_POLICY)
+        budget = ensure_budget(run, budget_policy)
         budget["review_artifacts"].append(
             {
                 "reviewer_thread_id": review.thread_id,
@@ -346,7 +351,7 @@ class RunAcceptanceEngine:
                 "artifact": artifact.raw,
             }
         )
-        del budget["review_artifacts"][:-5]
+        del budget["review_artifacts"][:-budget_policy.review_limit]
         record = self._acceptance_record(
             state,
             run_head,
@@ -390,8 +395,8 @@ class RunAcceptanceEngine:
         else:
             close_semantic_attempt(run, semantic_attempt, outcome="acceptance_artifact")
             clear_current_human_blocker(run)
-            budget = ensure_budget(run, RUN_POLICY)
-            if int(budget["reviewer_invocations"]) >= RUN_POLICY.review_limit:
+            budget = ensure_budget(run, budget_policy)
+            if int(budget["reviewer_invocations"]) >= budget_policy.review_limit:
                 run["phase"] = "ready_for_human"
                 run["blocked_reason"] = "review_budget_exhausted"
                 budget["checkpoint_reason"] = "review_budget_exhausted"
@@ -515,8 +520,18 @@ class RunAcceptanceEngine:
             "review_budget": new_budget(),
             "review_budget_history": [],
         }
+        if isinstance(state.get("policy_snapshot"), dict):
+            run["policy_snapshot"] = dict(state["policy_snapshot"])
         state["run_acceptance"] = run
         return run
+
+    @staticmethod
+    def _run_budget_policy(
+        state: dict[str, Any], run: dict[str, Any]
+    ) -> ReviewBudgetPolicy:
+        return run_repair_budget_policy_for_job(
+            run, state_snapshot=state.get("policy_snapshot")
+        )
 
     def _invalidate_stale_acceptance(
         self, state: dict[str, Any], run: dict[str, Any]

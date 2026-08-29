@@ -36,6 +36,7 @@ def test_candidate_history_state_load_rejects_nested_acceptance_record_before_mu
     state, states, _git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "pending",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "candidate_acceptance_history": _malformed_candidate_history(),
@@ -51,11 +52,13 @@ def test_candidate_history_stale_recovery_rejects_unknown_fields_before_mutation
     state, _states, _git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_cycle": {"status": "active"},
         "candidate_acceptance_history": [],
         "repair_job": {
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "candidate_acceptance_history": _malformed_candidate_history(),
@@ -592,6 +595,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     }
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -711,6 +715,7 @@ def test_required_check_repair_promotion_clears_old_observation_and_archives_pro
     }
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,

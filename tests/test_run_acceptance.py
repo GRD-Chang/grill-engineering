@@ -11,6 +11,7 @@ import pytest
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.controller import Controller, _resume_review_budget_window
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.git import MergeConflictError
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -266,12 +267,42 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
     }
 
 
+def test_run_repair_review_budget_stops_at_r_n_plus_one_without_development_n_plus_one(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    policy = DeliveryPolicy(run_repair_rounds=1)
+    state["policy_snapshot"] = policy.snapshot()
+    states.save_run(str(state["run_id"]), state)
+
+    agents = ScriptedRunAgents()
+    agents._reviews = [_repair_artifact(), _candidate_finding_artifact()]
+    result = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+    ).accept(str(state["run_id"]))
+
+    run = result["run_acceptance"]
+    job = run["repair_job"]
+    assert result["status"] == "ready_for_human"
+    assert run["blocked_reason"] == "review_budget_exhausted"
+    assert len(agents.development_requests) == 1
+    assert len(agents.review_requests) == 2
+    assert run["review_budget"]["development_attempts"] == 1
+    assert run["review_budget"]["reviewer_invocations"] == 2
+    assert job["review_budget"] == run["review_budget"]
+    assert job["phase"] == "blocked"
+
+
 def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state, states, git = _completed_run(git_repo)
     run = {
         "phase": "pending",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,
@@ -813,7 +844,7 @@ def test_completed_ticket_integration_record_rejects_nested_role_drift(
         )
 
 
-def test_r5_resume_reuses_the_repair_development_thread(
+def test_run_repair_resume_reuses_the_repair_development_thread(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
@@ -833,12 +864,13 @@ def test_r5_resume_reuses_the_repair_development_thread(
         capture_output=True,
         check=True,
     ).stdout.strip()
-    thread_id = "r5-development-thread"
-    thread_history = ["r5-development-thread-old-turn"]
+    thread_id = "run-repair-development-thread"
+    thread_history = ["run-repair-development-thread-old-turn"]
     exhausted_budget = _canonical_run_budget()
-    exhausted_budget["reviewer_invocations"] = 5
+    exhausted_budget["reviewer_invocations"] = 11
     state["run_acceptance"] = {
         "phase": "ready_for_human",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "repair_generation": 1,
         "acceptance_generation": 1,
         "modification_attempts": 0,
@@ -850,6 +882,7 @@ def test_r5_resume_reuses_the_repair_development_thread(
         "review_budget_history": [],
         "repair_job": {
             "phase": "blocked",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "blocked_reason": "review_budget_exhausted",
             "repair_mode": "squash",
             "repair_source": "acceptance",
@@ -882,7 +915,7 @@ def test_r5_resume_reuses_the_repair_development_thread(
     assert job["repair_seed_candidate_sha"] == candidate
     assert job["repair_mode"] == "squash"
 
-    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "r5-seed"
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "run-repair-seed"
     git.prepare_ticket_checkout(
         branch=str(job["repair_branch"]),
         base_sha=str(job["base_sha"]),
@@ -904,6 +937,7 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,
@@ -946,6 +980,7 @@ def test_second_reviewer_attempt_keeps_the_run_acceptance_generation(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,
@@ -992,6 +1027,7 @@ def test_resume_rejects_stale_run_invocation_before_agent_start(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,
@@ -1245,6 +1281,7 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,
@@ -1675,6 +1712,7 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
     )
     run = state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,

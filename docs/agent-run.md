@@ -44,7 +44,7 @@ Delivery Policy 的取值优先级是内置默认值、用户级默认值、单�
 
 ```bash
 agent-run policy show
-agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --review-deadline 2h
+agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 10 --review-deadline 2h
 agent-run run <parent-issue> --ticket-review-rounds 1 --development-deadline 30m
 ```
 
@@ -52,6 +52,9 @@ Ticket 的语义 Review 轮数为 `N` 时，普通 Development 为 `N+1` 次、R
 为 `4/3`，最后一次普通 Development 不再进入 Review，并保留有条件的一次 Final CI-fix。
 Parent-only 的配对轮数为 `N` 时，Development 与 Reviewer 都最多执行 `N` 次并严格配对；默认
 为 `10/10`，Reviewer 失败不会转入 Ticket Fallback，而是在当前窗口耗尽后等待显式 Resume。
+Run Repair 的修复轮数为 `N` 时，首次整体 Reviewer 加最多 `N` 次 Development 和 `N+1` 次
+Reviewer；默认准确执行 `D10/R11`。第 `N+1` 次 Reviewer 仍有 Finding 时进入 Review Budget
+Checkpoint，不使用 Final CI-fix 或未经 Reviewer 验收的 Publication Authority。
 正整数轮数和正 duration 在创建 Worker、PR 或部分状态之前校验。每个新 Run 以及显式开启的
 新 Budget Window 都把实际生效的完整策略保存为 Policy Snapshot；之后修改用户级默认值不会
 改变活动 Run 或活动预算窗口。缺少或不完整 Snapshot 的旧状态会 fail closed。
@@ -275,7 +278,7 @@ default head、Parent/Graph revision 和 Ticket Completion records 全部精确�
 Run Acceptance Generation。
 仅当 Run Reviewer 报告 Human Blocker 后执行 `resume` 时，Controller 复用刚刚被阻塞的
 Reviewer Thread，但仍创建新的 Validation Checkout，并要求它重新读取权威状态和重新验收。
-无代码变化不消耗预算，十次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
+无代码变化不消耗预算，配置的 `N` 次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
 通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。`run` 随后推进
 正常 Run Publication Attempt：由新的、只读的 Run Publication Codex 根据
 Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；仅 Human Blocker resume
@@ -297,7 +300,7 @@ Repair → Candidate Run Acceptance → 严格 promotion 的路径；若 promoti
 Run tree、Parent、Graph 或 Completion 任一非 default 绑定失配，才回退到 fresh Run Acceptance。若只有
 default head 前进，则在同一 Repair Cycle 验收最新组合且不重置代码修改预算；已集成 Job 在 revalidation 中又收到 Finding 时，
 Controller 保留 Repair Thread、Integration-repair Worktree 与计数，归档旧 Job/PR 并轮转新的 branch/PR。
-`revise` 原样保存维护者反馈、重置一个新的十次实际变更预算，并进入同一 Candidate/promotion 语义。`abandon` 先把
+`revise` 原样保存维护者反馈、重置一个新的 `N` 次实际变更预算，并进入同一 Candidate/promotion 语义。`abandon` 先把
 `abandonment_pending` 与逐项恢复义务写入耐久状态，再幂等关闭未合并的自动化 PR、只重开
 带有本 Run Publisher close 证据且尚未进入默认分支的 Ticket。任一步响应丢失后，其他生命周期
 命令都不会恢复正常发布；重复 `abandon` 会在 GitHub 暴露精确 close 或外部 transition 后继续

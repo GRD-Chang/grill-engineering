@@ -7,11 +7,11 @@ from typing import Any
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
+    run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
-from agent_run.review_budget import RUN_POLICY
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
@@ -194,7 +194,8 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
             "运行修复: "
             f"Run Acceptance Generation {run_repair['acceptance_generation']}；"
             f"Repair Cycle Generation {run_repair['repair_cycle_generation']}；"
-            f"代码修改 {run_repair['code_modification_attempts']}/10；"
+            f"代码修改 {run_repair['code_modification_attempts']}"
+            f"/{run_repair['code_modification_limit']}；"
             f"Candidate 验证 {run_repair['validation_attempts']} 次；"
             "Candidate 验证状态 "
             f"{_display_term(run_repair['candidate_validation_status'])}"
@@ -851,6 +852,9 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
     cycle = acceptance.get("repair_cycle")
     if not isinstance(job, dict) or not isinstance(cycle, dict):
         return None
+    policy = run_repair_budget_policy_for_job(
+        job, state_snapshot=state.get("policy_snapshot")
+    )
     candidate_validation_status = _candidate_validation_status(job)
     return {
         # Keep ``generation`` and ``phase`` as compatibility aliases while
@@ -865,6 +869,7 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "candidate_validation_status": candidate_validation_status,
         "cycle_status": cycle.get("status"),
         "code_modification_attempts": cycle.get("code_modification_attempts", 0),
+        "code_modification_limit": policy.development_limit,
         "validation_attempts": cycle.get("validation_attempts", 0),
         "candidate_sha": job.get("candidate_sha"),
         "development_thread_id": cycle.get("development_thread_id"),
@@ -895,7 +900,9 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
                 return None
             repair = acceptance.get("repair_job")
             subject = repair if isinstance(repair, dict) else acceptance
-            policy = RUN_POLICY
+            policy = run_repair_budget_policy_for_job(
+                subject, state_snapshot=state.get("policy_snapshot")
+            )
     budget = subject.get("review_budget")
     if not isinstance(budget, dict):
         return None
