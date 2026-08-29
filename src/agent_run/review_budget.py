@@ -170,8 +170,25 @@ def _validate_budget_history(
         old_budget = snapshot.get("review_budget")
         if not isinstance(old_budget, dict):
             raise ValueError(f"{location}.review_budget is missing")
+        historical_policy = policy
+        if policy.fallback and snapshot.get("policy_snapshot") is not None:
+            # Ticket windows retain their own policy so a later user-default
+            # change cannot make an older audit snapshot invalid.
+            from agent_run.delivery_policy import (
+                parse_policy_snapshot,
+                ticket_review_budget_policy,
+            )
+
+            try:
+                historical_policy = ticket_review_budget_policy(
+                    parse_policy_snapshot(snapshot["policy_snapshot"])
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"{location}.policy_snapshot is invalid") from error
         try:
-            _validate_budget_projection(old_budget, f"{location}.review_budget", policy)
+            _validate_budget_projection(
+                old_budget, f"{location}.review_budget", historical_policy
+            )
         except (KeyError, TypeError) as error:
             raise ValueError(f"{location}.review_budget is invalid") from error
         if old_budget["window"] != index:

@@ -440,7 +440,7 @@ def run_worker_process(
     cwd: Path,
     prompt: str,
     environment: dict[str, str],
-    timeout: int,
+    timeout: float,
     on_stdout_line: Callable[[str], None] | None = None,
     abort_event: threading.Event | None = None,
     abort_reason: Callable[[], str] | None = None,

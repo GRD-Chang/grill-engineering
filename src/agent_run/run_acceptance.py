@@ -14,6 +14,7 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
 )
 from agent_run.change_delivery import latest_reviewer_thread
+from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
@@ -258,6 +259,9 @@ class RunAcceptanceEngine:
             self._save(state)
             if run.get("reviewer_new_thread") is True:
                 request["_invocation_mode"] = "new-thread"
+            invocation_deadline_seconds = invocation_deadline_for_state(
+                state, "reviewer"
+            )
             request["_invocation_event"] = invocation_event_recorder(
                 state,
                 role="reviewer",
@@ -268,6 +272,7 @@ class RunAcceptanceEngine:
                 currentness_boundary=boundary,
                 semantic_attempt=semantic_attempt,
                 save=self._save,
+                invocation_deadline_seconds=invocation_deadline_seconds,
             )
             request["_currentness_check"] = lambda: (
                 self._refresh_run_currentness(state)

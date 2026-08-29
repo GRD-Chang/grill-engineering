@@ -57,6 +57,53 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
             build_parser().parse_args([internal_command, "run-id"])
 
 
+def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "policy",
+                "configure",
+                "--ticket-review-rounds",
+                "2",
+                "--review-deadline",
+                "90m",
+            ]
+        )
+        == 0
+    )
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["result"] == "configured"
+    assert configured["policy"]["ticket_review_rounds"] == 2
+    assert configured["policy"]["invocation_deadlines"]["review"] == 5400
+
+    assert main(["policy", "show"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["result"] == "policy"
+    assert shown["user_defaults"] == {
+        "invocation_deadlines": {"review": "90m"},
+        "ticket_review_rounds": 2,
+    }
+
+
+def test_invalid_policy_is_rejected_before_run_state_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert main(["run", "1", "--review-deadline", "0s"]) == 2
+    assert json.loads(capsys.readouterr().out)["result"] == "error"
+    assert not (tmp_path / ".agent-run").exists()
+
+
 def test_public_operator_docs_describe_the_v01_quickstart() -> None:
     documents = [
         (PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
@@ -996,6 +1043,30 @@ def run_cli(
         environment.update(extra_env)
     return subprocess.run(
         [sys.executable, "-m", "agent_run", *arguments, "--github-fixture", str(fixture)],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def run_policy_cli(
+    repo: Path,
+    *arguments: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    source_path = str(PROJECT_ROOT / "src")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not environment.get("PYTHONPATH")
+        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
+    )
+    if extra_env:
+        environment.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-m", "agent_run", "policy", *arguments],
         cwd=repo,
         env=environment,
         text=True,

@@ -1115,12 +1115,12 @@ def test_non_gh_bwrap_failure_stays_execution_failure(
     assert not marker.exists()
 
 
-def test_codex_worker_uses_three_hour_wall_clock_limit(
+def test_codex_worker_uses_development_invocation_deadline(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    timeouts: list[int] = []
+    timeouts: list[float] = []
 
     def fake_run(
         arguments: list[str], **options: Any
@@ -1149,7 +1149,7 @@ def test_codex_worker_uses_three_hour_wall_clock_limit(
         {"checkout": str(checkout), "ticket": {"number": 3}}
     )
 
-    assert timeouts == [3 * 60 * 60]
+    assert timeouts == [pytest.approx(5 * 60 * 60, abs=1)]
 
 
 def test_codex_prompts_require_independent_development_and_acceptance_lanes(

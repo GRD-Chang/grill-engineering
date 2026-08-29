@@ -610,6 +610,9 @@ class ProfiledAgentBackend:
             if event is not None:
                 event(kind, **facts)
 
+        deadline_seconds = getattr(event, "deadline_seconds", None)
+        if deadline_seconds is not None:
+            setattr(notify, "deadline_seconds", deadline_seconds)
         request["_invocation_event"] = notify
         request["_execution_role"] = role
         try:

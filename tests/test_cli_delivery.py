@@ -7,10 +7,17 @@ from typing import Any
 
 import pytest
 
+from agent_run.delivery_policy import DeliveryPolicyStore
 from agent_run.git import GitRepository
 from agent_run.state import StateStore
 from conftest import write_fixture
-from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
+from test_cli import (
+    load_only_run_state,
+    run_internal_stage,
+    run_cli,
+    run_policy_cli,
+    stdout_json,
+)
 
 
 HUMAN_BLOCKER = (
@@ -18,6 +25,14 @@ HUMAN_BLOCKER = (
 )
 STANDARDS_PASS_EVIDENCE = "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。"
 SPEC_PASS_EVIDENCE = "已核对的验收标准：当前交付的全部验收标准；覆盖结论：候选完整覆盖。"
+
+
+def assert_invalid_policy_cli_result(result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode == 2, result.stderr
+    assert result.stderr == ""
+    error = stdout_json(result)
+    assert error["result"] == "error"
+    assert error["diagnostics"][0]["code"] == "command_failed"
 
 
 def ticket() -> dict[str, Any]:
@@ -332,6 +347,295 @@ def test_public_run_completes_one_supervised_fallback_final_ci_fix(
     assert ticket_prs[0]["head_sha"] == job["publication_sha"]
     assert fixture_data["delivery"]["check_position"] >= 5
     assert fixture_data["supervision_clock"] > 0
+
+
+def test_public_ticket_policy_override_drives_dynamic_fallback_topology(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agent_data = final_run_agents()
+    agent_data["developments"] = [
+        {
+            "expected_thread_id": None,
+            "thread_id": "ticket-dynamic",
+            "summary": "Completed the first Development.",
+            "write_files": {"feature.txt": "first\n"},
+        },
+        {
+            "expected_thread_id": "ticket-dynamic",
+            "thread_id": "ticket-dynamic",
+            "expected_files": {"feature.txt": "first\n"},
+            "summary": "Repaired the failed Review finding.",
+            "write_files": {"feature.txt": "done\n"},
+        },
+    ]
+    agent_data["reviews"] = [repair_acceptance("ticket-dynamic-reviewer")]
+    agent_data["publications"] = [publication()]
+    agents = git_repo / "dynamic-ticket-policy.json"
+    agents.write_text(json.dumps(agent_data), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--ticket-review-rounds",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    job = state["ticket_jobs"]["3"]
+    assert state["policy_snapshot"]["ticket_review_rounds"] == 1
+    assert job["policy_snapshot"] == state["policy_snapshot"]
+    assert job["review_budget"]["development_attempts"] == 2
+    assert job["review_budget"]["reviewer_invocations"] == 1
+    assert job["fallback_publication_receipt"]["reviewer_invocations"] == 1
+    assert job["phase"] == "completed"
+
+    reopened = run_cli(
+        git_repo,
+        fixture,
+        "start",
+        "1",
+        "--ticket-review-rounds",
+        "7",
+    )
+    assert reopened.returncode == 0, reopened.stderr
+    assert stdout_json(reopened)["run_id"] == state["run_id"]
+    assert (
+        load_only_run_state(git_repo)["policy_snapshot"]["ticket_review_rounds"] == 1
+    )
+
+
+def test_public_cli_command_policy_overrides_user_default_in_fixture_flow(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    config_home = git_repo / "user-config-command-override"
+    isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
+    configured = run_policy_cli(
+        git_repo,
+        "configure",
+        "--ticket-review-rounds",
+        "1",
+        extra_env=isolated_env,
+    )
+    assert configured.returncode == 0, configured.stderr
+    assert stdout_json(configured)["user_defaults"]["ticket_review_rounds"] == 1
+    agent_data = final_run_agents()
+    agent_data["developments"] = [
+        {
+            "expected_thread_id": None,
+            "thread_id": "ticket-command-override",
+            "summary": "Completed the first Development.",
+            "write_files": {"feature.txt": "first\n"},
+        },
+        {
+            "expected_thread_id": "ticket-command-override",
+            "thread_id": "ticket-command-override",
+            "expected_files": {"feature.txt": "first\n"},
+            "summary": "Repaired the first Review finding.",
+            "write_files": {"feature.txt": "second\n"},
+        },
+        {
+            "expected_thread_id": "ticket-command-override",
+            "thread_id": "ticket-command-override",
+            "expected_files": {"feature.txt": "second\n"},
+            "summary": "Completed the final Development.",
+            "write_files": {"feature.txt": "done\n"},
+        },
+    ]
+    agent_data["reviews"] = [
+        repair_acceptance("ticket-command-reviewer-1"),
+        repair_acceptance("ticket-command-reviewer-2"),
+    ]
+    agent_data["publications"] = [publication()]
+    agents = git_repo / "command-overrides-ticket-policy.json"
+    agents.write_text(json.dumps(agent_data), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--ticket-review-rounds",
+        "2",
+        "--agent-fixture",
+        str(agents),
+        extra_env=isolated_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    job = state["ticket_jobs"]["3"]
+    assert state["policy_snapshot"]["ticket_review_rounds"] == 2
+    assert job["policy_snapshot"] == state["policy_snapshot"]
+    assert job["review_budget"]["development_attempts"] == 3
+    assert job["review_budget"]["reviewer_invocations"] == 2
+    assert job["fallback_publication_receipt"]["reviewer_invocations"] == 2
+    assert [
+        attempt["ordinal"]
+        for attempt in job["semantic_attempt_history"]
+        if attempt["role"] == "development"
+    ] == [1, 2, 3]
+    assert [
+        attempt["ordinal"]
+        for attempt in job["semantic_attempt_history"]
+        if attempt["role"] == "reviewer"
+    ] == [1, 2]
+    assert job["phase"] == "completed"
+
+
+def test_user_policy_snapshot_is_frozen_across_human_blocker_resume(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    config_home = git_repo / "user-config"
+    policy_store = DeliveryPolicyStore(
+        config_home / "agent-run" / "delivery-policy.json"
+    )
+    policy_store.configure({"ticket_review_rounds": 1})
+    isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
+
+    blocked_agents = git_repo / "blocked-user-policy-agents.json"
+    blocked_agents.write_text(
+        json.dumps(
+            {
+                "developments": [human_blocker_step("ticket-user-policy")],
+                "publications": [],
+                "reviews": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=isolated_env)
+    )["run_id"]
+    blocked = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(blocked_agents),
+        extra_env=isolated_env,
+    )
+    assert blocked.returncode == 2
+    blocked_state = load_only_run_state(git_repo)
+    assert blocked_state["policy_snapshot"]["ticket_review_rounds"] == 1
+    assert blocked_state["ticket_jobs"]["3"]["policy_snapshot"] == blocked_state[
+        "policy_snapshot"
+    ]
+    blocked_fixture = fixture.read_text(encoding="utf-8")
+    invalid_resume = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--development-deadline",
+        "nope",
+        extra_env=isolated_env,
+    )
+    assert_invalid_policy_cli_result(invalid_resume)
+    assert load_only_run_state(git_repo) == blocked_state
+    assert fixture.read_text(encoding="utf-8") == blocked_fixture
+
+    policy_store.path.write_text("{\n", encoding="utf-8")
+    resumed_agents = git_repo / "resumed-user-policy-agents.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": "ticket-user-policy",
+                        "thread_id": "ticket-user-policy",
+                        "summary": "Completed after the access blocker was resolved.",
+                        "write_files": {"feature.txt": "done\n"},
+                    }
+                ],
+                "publications": [publication()],
+                "reviews": [passing_acceptance("ticket-user-reviewer", "Passed.")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--message",
+        "Issue read access has been granted.",
+        "--agent-fixture",
+        str(resumed_agents),
+        extra_env=isolated_env,
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    state = load_only_run_state(git_repo)
+    job = state["ticket_jobs"]["3"]
+    assert state["policy_snapshot"]["ticket_review_rounds"] == 1
+    assert job["policy_snapshot"] == state["policy_snapshot"]
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
+
+
+def test_existing_run_ignores_invalid_user_policy_on_normal_run(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    config_home = git_repo / "user-config-normal-run"
+    policy_store = DeliveryPolicyStore(
+        config_home / "agent-run" / "delivery-policy.json"
+    )
+    policy_store.configure({"ticket_review_rounds": 1})
+    isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
+    agents = git_repo / "normal-run-agents.json"
+    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+
+    started = run_cli(
+        git_repo,
+        fixture,
+        "start",
+        "1",
+        extra_env=isolated_env,
+    )
+    assert started.returncode == 0, started.stderr
+    before = load_only_run_state(git_repo)
+    expected_snapshot = before["policy_snapshot"]
+    assert expected_snapshot["ticket_review_rounds"] == 1
+    before_fixture = fixture.read_text(encoding="utf-8")
+    invalid_run = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--development-deadline",
+        "nope",
+        extra_env=isolated_env,
+    )
+    assert_invalid_policy_cli_result(invalid_run)
+    assert load_only_run_state(git_repo) == before
+    assert fixture.read_text(encoding="utf-8") == before_fixture
+
+    policy_store.path.write_text("{\n", encoding="utf-8")
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+        extra_env=isolated_env,
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    state = load_only_run_state(git_repo)
+    assert state["policy_snapshot"] == expected_snapshot
+    assert state["ticket_jobs"]["3"]["policy_snapshot"] == expected_snapshot
 
 
 def test_ticket_required_checks_read_timeout_resumes_without_publication_retry(
@@ -671,6 +975,12 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
 def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     git_repo: Path,
 ) -> None:
+    config_home = git_repo / "checkpoint-policy-config"
+    isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
+    policy_store = DeliveryPolicyStore(
+        config_home / "agent-run" / "delivery-policy.json"
+    )
+    policy_store.configure({"ticket_review_rounds": 3})
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
@@ -727,6 +1037,7 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
         "1",
         "--agent-fixture",
         str(agents),
+        extra_env=isolated_env,
     )
 
     assert blocked.returncode == 2, blocked.stdout
@@ -751,10 +1062,57 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     attempts_before = json.dumps(
         job_before["semantic_attempt_history"], sort_keys=True
     )
+    fixture_before = fixture.read_text(encoding="utf-8")
     delivery_before = json.dumps(
         json.loads(fixture.read_text(encoding="utf-8"))["delivery"],
         sort_keys=True,
     )
+    invalid_resume = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--development-deadline",
+        "nope",
+        extra_env=isolated_env,
+    )
+    assert_invalid_policy_cli_result(invalid_resume)
+    assert load_only_run_state(git_repo) == before
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+    assert json.dumps(
+        json.loads(fixture.read_text(encoding="utf-8"))["delivery"],
+        sort_keys=True,
+    ) == delivery_before
+
+    policy_store.path.write_text(
+        json.dumps({"ticket_review_rounds": 0}), encoding="utf-8"
+    )
+    invalid_rounds = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        extra_env=isolated_env,
+    )
+    assert_invalid_policy_cli_result(invalid_rounds)
+    assert load_only_run_state(git_repo) == before
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+
+    policy_store.path.write_text(
+        json.dumps({"invocation_deadlines": {"development": "nope"}}),
+        encoding="utf-8",
+    )
+    invalid_user_duration = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        extra_env=isolated_env,
+    )
+    assert_invalid_policy_cli_result(invalid_user_duration)
+    assert load_only_run_state(git_repo) == before
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+    policy_store.path.write_text("{}", encoding="utf-8")
     empty_agents = git_repo / "no-implicit-budget-work.json"
     empty_agents.write_text(
         json.dumps(
@@ -776,6 +1134,7 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
         "1",
         "--agent-fixture",
         str(empty_agents),
+        extra_env=isolated_env,
     )
 
     assert polled.returncode == 2, polled.stdout
@@ -817,8 +1176,11 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
         fixture,
         "resume",
         run_id,
+        "--ticket-review-rounds",
+        "1",
         "--agent-fixture",
         str(recovery_agents),
+        extra_env=isolated_env,
     )
 
     assert resumed.returncode == 0, resumed.stdout
@@ -826,6 +1188,11 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     completed_job = completed["ticket_jobs"]["3"]
     assert completed_job["review_budget"]["window"] == 2
     assert completed_job["review_budget"]["development_attempts"] == 1
+    assert completed["policy_snapshot"]["ticket_review_rounds"] == 1
+    assert completed_job["policy_snapshot"] == completed["policy_snapshot"]
+    assert completed_job["review_budget_history"][0]["policy_snapshot"][
+        "ticket_review_rounds"
+    ] == 3
     assert "final_ci_fix_failure_head" not in completed_job
     assert completed_job["ci_evidence"]["head_sha"] == latest_failure_head
     assert completed_job["review_budget_history"][0][
@@ -861,6 +1228,8 @@ def test_resume_human_blocker_records_bounded_response_and_reuses_development_th
         git_repo,
         fixture,
         "run",
+        "1",
+        "--ticket-review-rounds",
         "1",
         "--agent-fixture",
         str(blocked_agents),
@@ -932,7 +1301,9 @@ def test_ticket_human_response_reaches_fresh_acceptance(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", "--ticket-review-rounds", "1")
+    )["run_id"]
     blocked = run_cli(
         git_repo,
         fixture,
@@ -981,6 +1352,8 @@ def test_ticket_human_response_reaches_fresh_acceptance(
         fixture,
         "resume",
         run_id,
+        "--ticket-review-rounds",
+        "7",
         "--message",
         response_history[0]["response"],
         "--agent-fixture",
@@ -990,6 +1363,7 @@ def test_ticket_human_response_reaches_fresh_acceptance(
     assert resumed.returncode == 0, resumed.stderr
     job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
     assert job["human_response_history"] == response_history
+    assert job["policy_snapshot"]["ticket_review_rounds"] == 1
     assert job["phase"] == "completed"
 
 

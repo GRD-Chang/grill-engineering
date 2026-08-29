@@ -5,9 +5,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
-from agent_run.review_budget import RUN_POLICY, TICKET_POLICY
+from agent_run.review_budget import RUN_POLICY
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
@@ -875,7 +876,9 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
     active = state.get("active_ticket_job")
     if isinstance(active, dict) and active.get("phase") not in {"completed", "merged"}:
         subject = active
-        policy = TICKET_POLICY
+        policy = ticket_budget_policy_for_job(
+            active, state_snapshot=state.get("policy_snapshot")
+        )
     else:
         parent = state.get("parent_job")
         if isinstance(parent, dict):

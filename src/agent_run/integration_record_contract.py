@@ -100,6 +100,10 @@ def _require_deterministic_integration_record(
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.final_ci_fix_used is invalid"
         )
+    if record.get("policy_snapshot") != completed_job.get("policy_snapshot"):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.policy_snapshot is not bound to the completed Ticket"
+        )
     evidence = record.get("required_checks_evidence")
     publication_sha = record["publication_sha"]
     require_required_checks_observation(

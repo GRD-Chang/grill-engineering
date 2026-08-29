@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
-from agent_run.review_budget import TICKET_POLICY, ensure_budget
+from agent_run.delivery_policy import ticket_budget_policy_for_job
+from agent_run.review_budget import ensure_budget
 from agent_run.state_errors import IncompatibleRunStateError
 
 
@@ -80,7 +81,7 @@ def _require_accepted_ticket_review_authorization(
 ) -> None:
     _require_accepted_integration_authorization(authorization, record, location)
     try:
-        budget = ensure_budget(job, TICKET_POLICY)
+        budget = ensure_budget(job, ticket_budget_policy_for_job(job))
     except (KeyError, TypeError, ValueError) as error:
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.review_budget is invalid"

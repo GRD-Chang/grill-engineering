@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
+from agent_run.delivery_policy import (
+    DELIVERY_POLICY_PROTOCOL,
+    parse_policy_snapshot,
+    ticket_budget_policy_for_job,
+)
 from agent_run.review_budget import (
     RUN_POLICY,
-    TICKET_POLICY,
     ReviewBudgetPolicy,
     ensure_budget,
 )
@@ -116,6 +121,16 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Review Budget protocol"
         )
+    if state.get("delivery_policy_protocol") != DELIVERY_POLICY_PROTOCOL:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Delivery Policy protocol"
+        )
+    try:
+        parse_policy_snapshot(state.get("policy_snapshot"))
+    except (TypeError, ValueError) as error:
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid Policy Snapshot"
+        ) from error
     if (
         type(state.get("semantic_attempt_protocol")) is not int
         or state.get("semantic_attempt_protocol") != 1
@@ -468,11 +483,19 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
     subjects: list[tuple[str, dict[str, Any], ReviewBudgetPolicy]] = []
     ticket_jobs = state.get("ticket_jobs")
     if isinstance(ticket_jobs, dict):
-        subjects.extend(
-            (f"ticket_jobs[{key}]", job, TICKET_POLICY)
-            for key, job in ticket_jobs.items()
-            if isinstance(job, dict) and _looks_like_materialized_job(job)
-        )
+        for key, job in ticket_jobs.items():
+            if not isinstance(job, dict) or not _looks_like_materialized_job(job):
+                continue
+            location = f"ticket_jobs[{key}]"
+            try:
+                policy = ticket_budget_policy_for_job(
+                    job, state_snapshot=state.get("policy_snapshot")
+                )
+            except (TypeError, ValueError) as error:
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.policy_snapshot"
+                ) from error
+            subjects.append((location, job, policy))
     for key in ("parent_job", "run_acceptance"):
         value = state.get(key)
         if isinstance(value, dict):
@@ -755,6 +778,16 @@ def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
             )
 
 
+def _is_positive_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
 def _require_invocation(
     invocation: dict[str, Any], location: str, run_id: str
 ) -> None:
@@ -868,6 +901,20 @@ def _require_invocation(
     ):
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}.attempt_count"
+        )
+    deadline_seconds = invocation.get("deadline_seconds")
+    if deadline_seconds is not None and not _is_positive_finite_number(
+        deadline_seconds
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.deadline_seconds"
+        )
+    deadline_at = invocation.get("deadline_at")
+    if deadline_at is not None and (
+        not isinstance(deadline_at, str) or not deadline_at.strip()
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.deadline_at"
         )
     for key in ("requested_thread_id", "reported_thread_id", "ended_at", "error"):
         if invocation.get(key) is not None and not isinstance(invocation.get(key), str):

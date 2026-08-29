@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,6 +71,14 @@ class _CodexThreadResumeError(CodexProcessError):
     pass
 
 
+_DIRECT_INVOCATION_TIMEOUT_SECONDS = 3 * 60 * 60
+_DEFAULT_INVOCATION_TIMEOUT_SECONDS = {
+    "development": 5 * 60 * 60,
+    "review": 2 * 60 * 60,
+    "publication": 60 * 60,
+}
+
+
 class CodexCliBackend:
     """Runs untrusted role-scoped agents without Publisher GitHub credentials."""
 
@@ -98,6 +107,9 @@ class CodexCliBackend:
             output_name="Development result",
             validate=parse_development_wire_result,
             initial_writable_checkout=True,
+            default_deadline_seconds=_DEFAULT_INVOCATION_TIMEOUT_SECONDS[
+                "development"
+            ],
         )
         result = parse_development_wire_result(
             _json_object(output, "Development result")
@@ -322,6 +334,9 @@ class CodexCliBackend:
             output_name="Publication Artifact",
             validate=validate_publication,
             initial_writable_checkout=False,
+            default_deadline_seconds=_DEFAULT_INVOCATION_TIMEOUT_SECONDS[
+                "publication"
+            ],
         )
 
     @staticmethod
@@ -408,6 +423,7 @@ class CodexCliBackend:
             output_name="Acceptance Artifact",
             validate=lambda value: AcceptanceArtifact.parse(value),
             initial_writable_checkout=False,
+            default_deadline_seconds=_DEFAULT_INVOCATION_TIMEOUT_SECONDS["review"],
         )
         return ReviewResult(
             thread_id=thread_id,
@@ -430,10 +446,18 @@ class CodexCliBackend:
         output_name: str,
         validate: Callable[[object], object],
         initial_writable_checkout: bool,
+        default_deadline_seconds: float = _DIRECT_INVOCATION_TIMEOUT_SECONDS,
     ) -> tuple[str, str]:
         """Run one Invocation with at most two same-Thread output repairs."""
 
         event = request.get("_invocation_event")
+        event_deadline_seconds = getattr(event, "deadline_seconds", None)
+        deadline_seconds = _invocation_timeout_seconds(
+            request,
+            default=default_deadline_seconds,
+            override=event_deadline_seconds,
+        )
+        deadline_started = time.monotonic()
         notify = event if callable(event) else lambda _kind, **_facts: None
         notify(
             "started",
@@ -458,6 +482,13 @@ class CodexCliBackend:
                     "不要修改文件或继续开发。校验错误：" + validation_error[:2000]
                 )
             try:
+                remaining = deadline_seconds - (
+                    time.monotonic() - deadline_started
+                )
+                if remaining <= 0:
+                    raise CodexProcessError(
+                        f"{output_name} exceeded its Invocation Deadline"
+                    )
                 execution_binding = request.get("_execution_binding")
                 model = None
                 reasoning_effort = None
@@ -481,12 +512,17 @@ class CodexCliBackend:
                     writable_checkout=initial_writable_checkout and attempt == 1,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    timeout=remaining,
                     on_thread=lambda value: notify(
                         "thread_started",
                         reported_thread_id=value,
                         attempt_count=attempt,
                     ),
                 )
+                if time.monotonic() - deadline_started >= deadline_seconds:
+                    raise CodexProcessError(
+                        f"{output_name} exceeded its Invocation Deadline"
+                    )
             except InitialCredentialUnavailable:
                 raise
             except BaseException as error:
@@ -511,6 +547,12 @@ class CodexCliBackend:
                     continue
                 notify("failed", attempt_count=attempt, error=validation_error)
                 raise CodexProcessError(validation_error) from error
+            if time.monotonic() - deadline_started >= deadline_seconds:
+                deadline_error = CodexProcessError(
+                    f"{output_name} exceeded its Invocation Deadline"
+                )
+                notify("failed", attempt_count=attempt, error=str(deadline_error))
+                raise deadline_error
             if callable(currentness) and not currentness():
                 stale = CodexProcessError(
                     f"{output_name} currentness changed before result application"
@@ -636,6 +678,7 @@ class CodexCliBackend:
         writable_checkout: bool = True,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        timeout: float = _DIRECT_INVOCATION_TIMEOUT_SECONDS,
         on_thread: Callable[[str], None] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
@@ -758,7 +801,7 @@ class CodexCliBackend:
                         "cwd": checkout,
                         "prompt": prompt,
                         "environment": environment,
-                        "timeout": 3 * 60 * 60,
+                        "timeout": timeout,
                     }
                     if self.credential_provider is not None or profile is not None:
                         worker_options.update(
@@ -973,6 +1016,25 @@ def _is_json_scalar(value: object) -> bool:
 
 def _bounded_error(value: str) -> str:
     return bounded_error(value)
+
+
+def _invocation_timeout_seconds(
+    request: dict[str, Any], *, default: float, override: object | None = None
+) -> float:
+    value = (
+        request.get("_invocation_deadline_seconds", default)
+        if override is None
+        else override
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Invocation Deadline must be a positive duration")
+    try:
+        timeout = float(value)
+    except OverflowError as error:
+        raise ValueError("Invocation Deadline must be a positive duration") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Invocation Deadline must be a positive duration")
+    return timeout
 
 
 def _thread_line_callback(

@@ -13,6 +13,7 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.change_delivery import ensure_linked_branch_display
+from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
     resume_initial_credential_wait,
@@ -437,6 +438,9 @@ class RunPublicationFlow(RunPublicationShared):
     ) -> Callable[..., None]:
         run = self._mapping(state, "run_acceptance")
         acceptance = self._mapping(run, "acceptance_record")
+        invocation_deadline_seconds = invocation_deadline_for_state(
+            state, "final_publication"
+        )
         return invocation_event_recorder(
             state,
             role="final_publication",
@@ -447,6 +451,7 @@ class RunPublicationFlow(RunPublicationShared):
             currentness_boundary=self._publication_boundary(state),
             semantic_attempt=semantic_attempt,
             save=self._save,
+            invocation_deadline_seconds=invocation_deadline_seconds,
         )
 
     def _publication_boundary(self, state: dict[str, Any]) -> dict[str, Any]:

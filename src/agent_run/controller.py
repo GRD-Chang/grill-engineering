@@ -5,7 +5,7 @@ import secrets
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.agent_invocation import fail_interrupted_invocation
@@ -16,6 +16,12 @@ from agent_run.change_currentness import (
     unknown_pr_mutation,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_policy import (
+    DELIVERY_POLICY_PROTOCOL,
+    DeliveryPolicy,
+    default_delivery_policy,
+    ticket_budget_policy_for_job,
+)
 from agent_run.error_safety import bounded_error
 from agent_run.graph import state_from_graph
 from agent_run.human_responses import append_human_response
@@ -42,7 +48,6 @@ from agent_run.run_currentness import (
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.review_budget import (
     RUN_POLICY,
-    TICKET_POLICY,
     budget_checkpoint_subjects,
     reset_budget,
 )
@@ -77,6 +82,8 @@ class Controller:
         states: StateStore,
         locator: RunLocatorIndex | None = None,
         profiles: AgentProfileStore | None = None,
+        delivery_policy: DeliveryPolicy | None = None,
+        delivery_policy_provider: Callable[[], DeliveryPolicy] | None = None,
     ) -> None:
         self.github = github
         self.states = states
@@ -84,6 +91,8 @@ class Controller:
         self.publisher = Publisher(git)
         self.locator = locator
         self.profiles = profiles
+        self.delivery_policy = delivery_policy or default_delivery_policy()
+        self.delivery_policy_provider = delivery_policy_provider
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -167,7 +176,11 @@ class Controller:
                     repository_hint, parent_number, "repository-pending"
                 )
                 existing = self._initial_state(
-                    provisional, parent_number, run_id, "repository-pending"
+                    provisional,
+                    parent_number,
+                    run_id,
+                    "repository-pending",
+                    delivery_policy=self._policy_for_new_run(),
                 )
                 existing["base_resolution_pending"] = True
                 existing["repository_binding_pending"] = True
@@ -202,12 +215,15 @@ class Controller:
         resume_budget_checkpoint: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         with self.states.locked():
+            existing = self._load_run(run_id)
+            budget_policy = self.delivery_policy
+            if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
+                budget_policy = self._policy_for_new_run()
             try:
-                existing = self._load_bound_run(run_id)
+                existing = self._load_bound_run(run_id, state=existing)
             except GitHubReadError as error:
                 if not is_github_convergence_error(error.code):
                     raise
-                existing = self._load_run(run_id)
                 if explicit_resume:
                     append_explicit_resume_audit(
                         existing,
@@ -323,7 +339,10 @@ class Controller:
                 human_response = _validated_human_response(human_response)
             resuming_run_acceptance = False
             budget_resumed = (
-                _resume_review_budget_window(state)
+                _resume_review_budget_window(
+                    state,
+                    budget_policy,
+                )
                 if resume_budget_checkpoint
                 else False
             )
@@ -659,8 +678,10 @@ class Controller:
             self.states.save_run(run_id, state)
             return True
 
-    def _load_bound_run(self, run_id: str) -> dict[str, Any]:
-        state = self._load_run(run_id)
+    def _load_bound_run(
+        self, run_id: str, *, state: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        state = self._load_run(run_id) if state is None else state
         repository = self.github.repository()
         if state.get("repository") != repository.name_with_owner:
             raise ValueError(
@@ -982,13 +1003,18 @@ class Controller:
         parent_number: int,
         run_id: str,
         base_sha: str,
+        *,
+        delivery_policy: DeliveryPolicy | None = None,
     ) -> dict[str, Any]:
         now = _now()
+        policy = delivery_policy or self.delivery_policy
         state: dict[str, Any] = {
             "run_id": run_id,
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
+            "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
             "semantic_attempt_protocol": 1,
+            "policy_snapshot": policy.snapshot(),
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
             "base": {"branch": repository.default_branch, "sha": base_sha},
@@ -1062,7 +1088,13 @@ class Controller:
             run_id = self._available_run_id(
                 repository.name_with_owner, parent_number, identity_sha
             )
-            state = self._initial_state(repository, parent_number, run_id, identity_sha)
+            state = self._initial_state(
+                repository,
+                parent_number,
+                run_id,
+                identity_sha,
+                delivery_policy=self._policy_for_new_run(),
+            )
             state["base_resolution_pending"] = True
             # Persist identity before a remote fetch.  A timeout can then be
             # resumed against the same durable Run rather than creating a new
@@ -1126,6 +1158,11 @@ class Controller:
         self._ensure_delivery_branch(state, base_sha)
         self.states.save_run(run_id, state)
         return state, resumed
+
+    def _policy_for_new_run(self) -> DeliveryPolicy:
+        if self.delivery_policy_provider is not None:
+            return self.delivery_policy_provider()
+        return self.delivery_policy
 
     def _register_pending_locator(self, state: dict[str, Any]) -> None:
         if self.locator is None or state.get("locator_registration_pending") is not True:
@@ -1279,9 +1316,12 @@ def _resume_agent_human_blocker(
     return False
 
 
-def _resume_review_budget_window(state: dict[str, Any]) -> bool:
+def _resume_review_budget_window(
+    state: dict[str, Any], delivery_policy: DeliveryPolicy | None = None
+) -> bool:
     """Open exactly one new bounded window after an explicit budget pause."""
 
+    policy = delivery_policy or default_delivery_policy()
     subjects = budget_checkpoint_subjects(state)
     if not subjects:
         return False
@@ -1289,7 +1329,14 @@ def _resume_review_budget_window(state: dict[str, Any]) -> bool:
         raise ValueError("multiple Review Budget checkpoints require an unambiguous resume target")
     subject_kind, subject = subjects[0]
     if subject_kind == "ticket":
-        reset_budget(subject, TICKET_POLICY)
+        reset_budget(
+            subject,
+            ticket_budget_policy_for_job(
+                subject, state_snapshot=state.get("policy_snapshot")
+            ),
+        )
+        subject["policy_snapshot"] = policy.snapshot()
+        state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject.pop("escalation_code", None)
         _resume_change_subject_after_budget(subject)
@@ -1298,6 +1345,7 @@ def _resume_review_budget_window(state: dict[str, Any]) -> bool:
         return True
     if subject_kind == "parent":
         reset_budget(subject, RUN_POLICY)
+        state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject.pop("escalation_code", None)
         _resume_change_subject_after_budget(subject)
@@ -1307,6 +1355,7 @@ def _resume_review_budget_window(state: dict[str, Any]) -> bool:
         return True
     if subject_kind == "run":
         reset_budget(subject, RUN_POLICY)
+        state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject["phase"] = "repairing"
         subject["repair_request"] = _budget_repair_request(subject)
@@ -1316,6 +1365,7 @@ def _resume_review_budget_window(state: dict[str, Any]) -> bool:
         return True
     run_state = _state_mapping(state, "run_acceptance")
     reset_budget(run_state, RUN_POLICY)
+    state["policy_snapshot"] = policy.snapshot()
     run_state["repair_request"] = _budget_repair_request(subject)
     run_state["phase"] = "repairing"
     run_state.pop("blocked_reason", None)

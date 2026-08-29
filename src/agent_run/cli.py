@@ -20,6 +20,12 @@ from agent_run.agent_profiles import (
 from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.delivery_policy import (
+    DeliveryPolicy,
+    DeliveryPolicyError,
+    DeliveryPolicyStore,
+    resolve_delivery_policy,
+)
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_auth_profile import (
@@ -73,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,auth,doctor}",
+        metavar="{start,run,resume,requeue,approve,revise,abandon,status,history,configure,policy,auth,doctor}",
     )
     start = subcommands.add_parser(
         "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
@@ -81,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(start)
     _add_profile_options(start)
+    _add_policy_options(start)
     start.add_argument("--new-run", action="store_true", help=argparse.SUPPRESS)
     run = subcommands.add_parser(
         "run", help="推进正常 Job Loop，停在需要操作者处理的边界"
@@ -88,12 +95,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(run)
     _add_profile_options(run)
+    _add_policy_options(run)
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume = subcommands.add_parser(
         "resume", help="恢复失败/Human Blocker Invocation 或监督超时窗口"
     )
     resume.add_argument("run_id", help="交付运行标识")
     _add_common_options(resume)
+    _add_policy_options(resume)
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--new-thread",
@@ -144,6 +153,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(configure)
     _add_profile_options(configure)
     configure.add_argument("--json", action="store_true", dest="as_json")
+    policy = subcommands.add_parser(
+        "policy",
+        help="查看或配置用户级 Delivery Policy 默认值",
+    )
+    policy.add_argument("--json", action="store_true", dest="as_json")
+    policy_commands = policy.add_subparsers(
+        dest="policy_command", metavar="{show,configure}"
+    )
+    policy_show = policy_commands.add_parser("show", help="显示当前生效策略")
+    policy_show.add_argument("--json", action="store_true", dest="as_json")
+    policy_configure = policy_commands.add_parser(
+        "configure", help="保存用户级 Delivery Policy 默认值"
+    )
+    _add_policy_options(policy_configure, dest_prefix="policy_")
+    policy_configure.add_argument("--json", action="store_true", dest="as_json")
     auth = subcommands.add_parser("auth", help="配置 Worker 的 GitHub 只读身份")
     auth_commands = auth.add_subparsers(
         dest="auth_command", required=True, metavar="{status,app}"
@@ -186,6 +210,12 @@ def _main_with_parser(
     github: Any = None
     precondition_failed = False
     try:
+        _validate_explicit_policy_options(parsed)
+        delivery_policy_provider = (
+            (lambda: _resolve_delivery_policy(parsed))
+            if parsed.command in {"start", "run", "resume"}
+            else None
+        )
         creation_profile = (
             _profile_configuration(parsed)
             if parsed.command in {"start", "run"}
@@ -195,6 +225,8 @@ def _main_with_parser(
             return _auth_command(parsed)
         if parsed.command == "doctor":
             return doctor.run(as_json=parsed.as_json)
+        if parsed.command == "policy":
+            return _policy_command(parsed)
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
         if parsed.command in {"status", "history"}:
@@ -229,6 +261,7 @@ def _main_with_parser(
             states,
             locator=RunLocatorIndex.default(),
             profiles=profiles,
+            delivery_policy_provider=delivery_policy_provider,
         )
         if fixture_path is None and not _running_active_runner():
             raise ValueError(
@@ -278,7 +311,7 @@ def _main_with_parser(
                 new_thread=parsed.new_thread,
                 human_response=parsed.message,
                 explicit_resume=True,
-                resume_budget_checkpoint=True,
+                resume_budget_checkpoint=budget_checkpoint_resume,
             )
             if state.get("status") in {
                 "unsupported_scope_change",
@@ -565,6 +598,7 @@ def _main_with_parser(
         incompatible_state = isinstance(error, IncompatibleRunStateError)
         if (
             not incompatible_state
+            and not isinstance(error, DeliveryPolicyError)
             and not isinstance(error, DirtyManagedCheckoutError)
             and controller is not None
             and isinstance(run_id, str)
@@ -861,6 +895,89 @@ def _add_profile_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_policy_options(
+    parser: argparse.ArgumentParser, *, dest_prefix: str = ""
+) -> None:
+    parser.add_argument(
+        "--ticket-review-rounds",
+        "--ticket-review-round",
+        dest=f"{dest_prefix}ticket_review_rounds",
+        type=_positive_integer,
+        help="Ticket Review 语义轮数（推导 Development=N+1）",
+    )
+    for role, label in (
+        ("development", "Development"),
+        ("review", "Review"),
+        ("publication", "Publication"),
+    ):
+        parser.add_argument(
+            f"--{role}-deadline",
+            f"--{role}-duration",
+            f"--{role}-timeout",
+            dest=f"{dest_prefix}{role}_deadline",
+            type=_positive_duration_argument,
+            help=f"{label} Invocation 正 duration（可用秒或 s/m/h/d）",
+        )
+
+
+def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for key in ("ticket_review_rounds",):
+        value = getattr(parsed, f"policy_{key}", None)
+        if value is None:
+            value = getattr(parsed, key, None)
+        if value is not None:
+            overrides[key] = value
+    deadlines: dict[str, Any] = {}
+    for role in ("development", "review", "publication"):
+        value = getattr(parsed, f"policy_{role}_deadline", None)
+        if value is None:
+            value = getattr(parsed, f"{role}_deadline", None)
+        if value is not None:
+            deadlines[role] = value
+    if deadlines:
+        overrides["invocation_deadlines"] = deadlines
+    return overrides
+
+
+def _resolve_delivery_policy(parsed: argparse.Namespace) -> DeliveryPolicy:
+    store = DeliveryPolicyStore()
+    return resolve_delivery_policy(
+        user_defaults=store.load(),
+        command_overrides=_policy_overrides(parsed),
+    )
+
+
+def _validate_explicit_policy_options(parsed: argparse.Namespace) -> None:
+    overrides = _policy_overrides(parsed)
+    if overrides:
+        resolve_delivery_policy(command_overrides=overrides)
+
+
+def _policy_command(parsed: argparse.Namespace) -> int:
+    store = DeliveryPolicyStore()
+    command = getattr(parsed, "policy_command", None)
+    overrides = _policy_overrides(parsed)
+    if command == "show" or (command is None and not overrides):
+        user_defaults = store.load()
+        policy = resolve_delivery_policy(user_defaults=user_defaults)
+        result = {
+            "result": "policy",
+            "policy": policy.snapshot(),
+            "user_defaults": user_defaults or {},
+        }
+    else:
+        policy = store.configure(overrides)
+        user_defaults = store.load()
+        result = {
+            "result": "configured",
+            "policy": policy.snapshot(),
+            "user_defaults": user_defaults or {},
+        }
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _profile_configuration(
     parsed: argparse.Namespace,
 ) -> tuple[str | None, ProfileOverrides]:
@@ -1003,10 +1120,19 @@ def _profile_state_root(parsed: argparse.Namespace) -> Path:
 
 
 def _positive_integer(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必须是正整数") from error
     if number <= 0:
-        raise argparse.ArgumentTypeError("Issue 编号必须是正整数")
+        raise argparse.ArgumentTypeError("必须是正整数")
     return number
+
+
+def _positive_duration_argument(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise argparse.ArgumentTypeError("duration 必须为正数，可带 s/m/h/d 后缀")
+    return value
 
 
 def _has_resumed_agent_phase(state: dict[str, object]) -> bool:

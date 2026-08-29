@@ -113,6 +113,7 @@ def require_active_ticket_publication_authorization(
             "candidate_sha": job["candidate_sha"],
             "candidate_tree": persisted_tree,
             "effective_revision": job["effective_revision"],
+            "policy_snapshot": job.get("policy_snapshot"),
             "window": budget.get("window"),
             "final_ci_fix_used": budget.get("final_ci_fix_used"),
         }

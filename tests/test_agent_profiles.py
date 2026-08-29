@@ -304,7 +304,7 @@ def test_invocation_history_contains_started_snapshot_before_completion() -> Non
         phase="publication",
         work_subject="ticket:1",
         generation=1,
-        invocation_input={"request": "value"},
+        invocation_input={"request": "value", "_invocation_deadline_seconds": 42},
         currentness_boundary={"head_sha": "abc"},
         semantic_attempt=semantic_attempt,
         save=lambda value: saved.append(json.loads(json.dumps(value))),
@@ -321,6 +321,8 @@ def test_invocation_history_contains_started_snapshot_before_completion() -> Non
         profile_revision=1,
     )
     assert state["agent_invocation_history"][0]["status"] == "running"
+    assert state["agent_invocation_history"][0]["deadline_seconds"] == 42
+    assert state["agent_invocation_history"][0]["deadline_at"]
     assert saved[-1]["agent_invocation_history"][0]["status"] == "running"
 
     record("completed", reported_thread_id="thread-1", attempt_count=1)

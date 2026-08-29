@@ -164,7 +164,7 @@ def complete_review(
                 "artifact": artifact.raw,
             }
         )
-        del budget["review_artifacts"][:-5]
+        del budget["review_artifacts"][: -stage.review_budget_policy().review_limit]
     job["last_review_candidate_sha"] = str(job["candidate_sha"])
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw

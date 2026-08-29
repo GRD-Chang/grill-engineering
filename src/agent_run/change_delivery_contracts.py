@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent_run.review_budget import ReviewBudgetPolicy
+
 
 class StaleDisposition(str, Enum):
     """The shared engine's deterministic recovery for a stale change job."""
@@ -22,6 +24,7 @@ class ChangeJobContract:
     label: str
     branch: str
     base_branch: str
+    review_budget_policy: ReviewBudgetPolicy | None = None
 
 
 class ChangeDeliveryAdapter(Protocol):
