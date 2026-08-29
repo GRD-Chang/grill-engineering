@@ -38,6 +38,7 @@ from agent_run.github_auth_profile import (
 from agent_run.error_safety import bounded_error
 from agent_run.execution_binding import emit_execution_binding
 from agent_run.worker_sandbox import (
+    WorkerDeadlineExceeded,
     WorkerSandboxError,
     bubblewrap_command,
     create_gh_access_adapter,
@@ -69,6 +70,12 @@ class CodexProcessError(RuntimeError):
 
 class _CodexThreadResumeError(CodexProcessError):
     pass
+
+
+class _CodexInvocationDeadlineError(CodexProcessError):
+    def __init__(self, message: str, *, process_started: bool) -> None:
+        super().__init__(message)
+        self.process_started = process_started
 
 
 _DIRECT_INVOCATION_TIMEOUT_SECONDS = 3 * 60 * 60
@@ -458,6 +465,7 @@ class CodexCliBackend:
             override=event_deadline_seconds,
         )
         deadline_started = time.monotonic()
+        deadline_at = deadline_started + deadline_seconds
         notify = event if callable(event) else lambda _kind, **_facts: None
         notify(
             "started",
@@ -481,14 +489,20 @@ class CodexCliBackend:
                     f"上一输出未通过本地 {output_name} contract。只重新输出完整 JSON，"
                     "不要修改文件或继续开发。校验错误：" + validation_error[:2000]
                 )
-            try:
-                remaining = deadline_seconds - (
-                    time.monotonic() - deadline_started
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                deadline_error = CodexProcessError(
+                    f"{output_name} exceeded its Invocation Deadline"
                 )
-                if remaining <= 0:
-                    raise CodexProcessError(
-                        f"{output_name} exceeded its Invocation Deadline"
-                    )
+                notify(
+                    "failed",
+                    attempt_count=attempt - 1,
+                    error=str(deadline_error),
+                    return_code=None,
+                    signal=None,
+                )
+                raise deadline_error
+            try:
                 execution_binding = request.get("_execution_binding")
                 model = None
                 reasoning_effort = None
@@ -513,18 +527,33 @@ class CodexCliBackend:
                     model=model,
                     reasoning_effort=reasoning_effort,
                     timeout=remaining,
+                    deadline_at_monotonic=deadline_at,
                     on_thread=lambda value: notify(
                         "thread_started",
                         reported_thread_id=value,
                         attempt_count=attempt,
                     ),
                 )
-                if time.monotonic() - deadline_started >= deadline_seconds:
+                if time.monotonic() >= deadline_at:
                     raise CodexProcessError(
                         f"{output_name} exceeded its Invocation Deadline"
                     )
             except InitialCredentialUnavailable:
                 raise
+            except _CodexInvocationDeadlineError as error:
+                deadline_error = CodexProcessError(
+                    f"{output_name} exceeded its Invocation Deadline",
+                    return_code=error.return_code,
+                    signal_number=error.signal_number,
+                )
+                notify(
+                    "failed",
+                    attempt_count=attempt if error.process_started else attempt - 1,
+                    error=str(deadline_error),
+                    return_code=deadline_error.return_code,
+                    signal=deadline_error.signal_number,
+                )
+                raise deadline_error from error
             except BaseException as error:
                 notify(
                     "failed",
@@ -547,7 +576,7 @@ class CodexCliBackend:
                     continue
                 notify("failed", attempt_count=attempt, error=validation_error)
                 raise CodexProcessError(validation_error) from error
-            if time.monotonic() - deadline_started >= deadline_seconds:
+            if time.monotonic() >= deadline_at:
                 deadline_error = CodexProcessError(
                     f"{output_name} exceeded its Invocation Deadline"
                 )
@@ -679,6 +708,7 @@ class CodexCliBackend:
         model: str | None = None,
         reasoning_effort: str | None = None,
         timeout: float = _DIRECT_INVOCATION_TIMEOUT_SECONDS,
+        deadline_at_monotonic: float | None = None,
         on_thread: Callable[[str], None] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
@@ -797,12 +827,23 @@ class CodexCliBackend:
                         gh_adapter=adapter_directory / "gh",
                         gh_targets=gh_targets,
                     )
+                    worker_timeout = timeout
+                    if deadline_at_monotonic is not None:
+                        worker_timeout = deadline_at_monotonic - time.monotonic()
+                        if worker_timeout <= 0:
+                            raise _CodexInvocationDeadlineError(
+                                "Codex worker timed out", process_started=False
+                            )
                     worker_options: dict[str, Any] = {
                         "cwd": checkout,
                         "prompt": prompt,
                         "environment": environment,
-                        "timeout": timeout,
+                        "timeout": worker_timeout,
                     }
+                    if deadline_at_monotonic is not None:
+                        worker_options["deadline_at_monotonic"] = (
+                            deadline_at_monotonic
+                        )
                     if self.credential_provider is not None or profile is not None:
                         worker_options.update(
                             {
@@ -819,7 +860,13 @@ class CodexCliBackend:
                     result = run_worker_process(arguments, **worker_options)
             except InitialCredentialUnavailable:
                 raise
-            except (WorkerSandboxError, WorkerCredentialError) as error:
+            except WorkerDeadlineExceeded as error:
+                raise _CodexInvocationDeadlineError(
+                    str(error), process_started=True
+                ) from error
+            except WorkerSandboxError as error:
+                raise CodexProcessError(str(error)) from error
+            except WorkerCredentialError as error:
                 raise CodexProcessError(str(error)) from error
             if result.returncode != 0:
                 message = _terminal_error(result.stdout, result.stderr)

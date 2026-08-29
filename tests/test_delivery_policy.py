@@ -34,8 +34,19 @@ def test_policy_resolution_uses_builtin_user_then_command_precedence() -> None:
     assert policy.ticket_review_rounds == 1
     assert policy.review_deadline_seconds == 30
     assert policy.development_deadline_seconds == 5 * 60 * 60
+    assert policy.publication_deadline_seconds == 60 * 60
     assert ticket_review_budget_policy(policy).development_limit == 2
     assert ticket_review_budget_policy(policy).review_limit == 1
+
+
+def test_policy_uses_role_specific_builtin_invocation_deadlines() -> None:
+    policy = resolve_delivery_policy()
+
+    assert policy.invocation_deadlines == {
+        "development": 5 * 60 * 60,
+        "review": 2 * 60 * 60,
+        "publication": 60 * 60,
+    }
 
 
 def test_parent_only_policy_uses_an_independent_paired_round_limit() -> None:

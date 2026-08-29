@@ -20,13 +20,17 @@ from typing import Any
 
 import pytest
 
+import agent_run.codex as codex_module
+import agent_run.worker_sandbox as worker_sandbox_module
 from agent_run.cli import main
+from agent_run.cli_presentation import _next_action
 from agent_run.codex import (
     CodexCliBackend,
     CodexProcessError,
     _terminal_error,
 )
 from agent_run.agents import PublicationResult
+from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.github_auth import (
     GitHubCredentialError,
     _GitHubAppCredentialProvider,
@@ -52,6 +56,7 @@ from agent_run.worker_credentials import (
     WORKER_RENEWAL_WINDOW_SECONDS,
     _is_allowed_gh_read,
 )
+from agent_run.semantic_attempt import allocate_semantic_attempt
 
 
 PASS_EVIDENCE = {
@@ -1150,6 +1155,224 @@ def test_codex_worker_uses_development_invocation_deadline(
     )
 
     assert timeouts == [pytest.approx(5 * 60 * 60, abs=1)]
+
+
+def test_deadline_exhausted_before_output_repair_does_not_count_unstarted_process(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    clock = [0.0]
+    events: list[tuple[str, dict[str, object]]] = []
+    process_count = 0
+
+    def fake_run(
+        arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal process_count
+        process_count += 1
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text('{"invalid": true}', encoding="utf-8")
+        clock[0] = 9.0
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"deadline-thread"}\n',
+            "",
+        )
+
+    def expire_during_validation(_output: object) -> None:
+        clock[0] = 11.0
+        raise ValueError("invalid structured output")
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    monkeypatch.setattr("agent_run.codex.time.monotonic", lambda: clock[0])
+
+    with pytest.raises(CodexProcessError, match="Invocation Deadline"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret")._invoke_structured_output(
+            request={
+                "_invocation_deadline_seconds": 10,
+                "_invocation_event": lambda kind, **facts: events.append(
+                    (kind, facts)
+                ),
+            },
+            prompt="produce structured output",
+            checkout=tmp_path,
+            thread_id=None,
+            schema={"type": "object"},
+            output_name="Test output",
+            validate=expire_during_validation,
+            initial_writable_checkout=False,
+        )
+
+    assert process_count == 1
+    assert events[-1] == (
+        "failed",
+        {
+            "attempt_count": 1,
+            "error": "Test output exceeded its Invocation Deadline",
+            "return_code": None,
+            "signal": None,
+        },
+    )
+
+
+def test_output_repair_receives_only_the_remaining_invocation_deadline(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    clock = [0.0]
+    timeouts: list[float] = []
+    absolute_deadlines: list[float] = []
+    real_bubblewrap_command = codex_module.bubblewrap_command
+
+    def setup_worker(*args: Any, **kwargs: Any) -> list[str]:
+        clock[0] += 2.0
+        return real_bubblewrap_command(*args, **kwargs)
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        timeouts.append(options["timeout"])
+        absolute_deadlines.append(options["deadline_at_monotonic"])
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {"invalid": "first output"}
+                if len(timeouts) == 1
+                else {
+                    "result_kind": "development",
+                    "summary": "Repaired within the original deadline.",
+                    "human_blockers": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        clock[0] += 4.0 if len(timeouts) == 1 else 1.0
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"deadline-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    monkeypatch.setattr("agent_run.codex.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agent_run.codex.bubblewrap_command", setup_worker)
+
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+        {
+            "checkout": str(tmp_path),
+            "_invocation_deadline_seconds": 10,
+        }
+    )
+
+    assert result.summary == "Repaired within the original deadline."
+    assert timeouts == [8, 2]
+    assert absolute_deadlines == [10, 10]
+
+
+def test_deadline_exhausted_during_worker_setup_does_not_start_output_attempt(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    clock = [0.0]
+    events: list[tuple[str, dict[str, object]]] = []
+    process_count = 0
+    real_bubblewrap_command = codex_module.bubblewrap_command
+
+    def expire_during_setup(*args: Any, **kwargs: Any) -> list[str]:
+        clock[0] = 11.0
+        return real_bubblewrap_command(*args, **kwargs)
+
+    def fake_run(
+        _arguments: list[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal process_count
+        process_count += 1
+        raise AssertionError("expired Invocation must not start a Worker process")
+
+    monkeypatch.setattr("agent_run.codex.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agent_run.codex.bubblewrap_command", expire_during_setup)
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+
+    with pytest.raises(CodexProcessError, match="Invocation Deadline"):
+        CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
+            {
+                "checkout": str(tmp_path),
+                "_invocation_deadline_seconds": 10,
+                "_invocation_event": lambda kind, **facts: events.append(
+                    (kind, facts)
+                ),
+            }
+        )
+
+    assert process_count == 0
+    assert events[-1] == (
+        "failed",
+        {
+            "attempt_count": 0,
+            "error": "Development result exceeded its Invocation Deadline",
+            "return_code": None,
+            "signal": None,
+        },
+    )
+
+
+def test_deadline_expiry_persists_execution_failure_and_resume_action(
+    tmp_path: Path,
+) -> None:
+    worker = tmp_path / "blocking-codex"
+    worker.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+    worker.chmod(0o700)
+    job: dict[str, Any] = {}
+    semantic_attempt = allocate_semantic_attempt(
+        job,
+        role="development",
+        work_subject="ticket:3",
+        generation=1,
+        currentness_boundary={"base_sha": "base"},
+        ordinal=1,
+        budget_window=1,
+    )
+    state: dict[str, Any] = {
+        "run_id": "run-deadline",
+        "ticket_jobs": {"3": job},
+        "agent_invocation_history": [],
+        "diagnostics": [],
+        "status": "active",
+    }
+    saved: list[dict[str, Any]] = []
+    record = invocation_event_recorder(
+        state,
+        role="development",
+        phase="developing",
+        work_subject="ticket:3",
+        generation=1,
+        invocation_input={"checkout": str(tmp_path)},
+        currentness_boundary={"base_sha": "base"},
+        semantic_attempt=semantic_attempt,
+        save=lambda value: saved.append(json.loads(json.dumps(value))),
+        invocation_deadline_seconds=0.1,
+    )
+
+    with pytest.raises(CodexProcessError, match="Invocation Deadline"):
+        CodexCliBackend(
+            executable=str(worker), credential_provider=lambda: "reader-secret"
+        ).develop(
+            {
+                "checkout": str(tmp_path),
+                "_invocation_event": record,
+            }
+        )
+
+    invocation = state["active_agent_invocation"]
+    assert state["status"] == "execution_failed"
+    assert state["terminal_kind"] == "execution_failed"
+    assert invocation["status"] == "failed"
+    assert invocation["error"] == (
+        "Development result exceeded its Invocation Deadline"
+    )
+    assert invocation["deadline_seconds"] == 0.1
+    assert invocation["deadline_at"]
+    assert saved[-1]["active_agent_invocation"] == invocation
+    assert _next_action(state) == "agent-run resume run-deadline"
 
 
 def test_codex_prompts_require_independent_development_and_acceptance_lanes(
@@ -3793,10 +4016,17 @@ def test_stdout_callback_error_terminates_hanging_worker(tmp_path: Path) -> None
 
 def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
     process_ids: list[int] = []
+    child_pid_file = tmp_path / "child.pid"
 
     with pytest.raises(WorkerSandboxError, match="timed out"):
         run_worker_process(
-            ["sh", "-c", "sleep 60"],
+            [
+                "sh",
+                "-c",
+                'sleep 60 & echo "$!" > "$1"; wait',
+                "sh",
+                str(child_pid_file),
+            ],
             cwd=tmp_path,
             prompt="",
             environment={"PATH": "/usr/bin:/bin"},
@@ -3806,12 +4036,71 @@ def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
         )
 
     assert len(process_ids) == 1
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
     reader_threads = {
         thread.name
         for thread in threading.enumerate()
         if thread.name.startswith(f"agent-run-worker-{process_ids[0]}-")
     }
     assert not reader_threads
+
+
+def test_absolute_deadline_includes_popen_startup_and_kills_process_group(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    child_pid_file = tmp_path / "delayed-start-child.pid"
+    process_ids: list[int] = []
+    timed_waits: list[float] = []
+    real_popen = worker_sandbox_module.subprocess.Popen
+    real_wait = real_popen.wait
+
+    def delayed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        process = real_popen(*args, **kwargs)
+        child_start_deadline = time.monotonic() + 1
+        while (
+            not child_pid_file.exists()
+            and time.monotonic() < child_start_deadline
+        ):
+            time.sleep(0.005)
+        assert child_pid_file.exists()
+        time.sleep(0.2)
+        return process
+
+    def record_wait(
+        process: subprocess.Popen[str], timeout: float | None = None
+    ) -> int:
+        if timeout is not None:
+            timed_waits.append(timeout)
+        return real_wait(process, timeout=timeout)
+
+    monkeypatch.setattr(worker_sandbox_module.subprocess, "Popen", delayed_popen)
+    monkeypatch.setattr(real_popen, "wait", record_wait)
+    deadline_at = time.monotonic() + 0.1
+
+    with pytest.raises(WorkerSandboxError, match="timed out"):
+        run_worker_process(
+            [
+                "sh",
+                "-c",
+                'sleep 60 & echo "$!" > "$1"; wait',
+                "sh",
+                str(child_pid_file),
+            ],
+            cwd=tmp_path,
+            prompt="",
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+            deadline_at_monotonic=deadline_at,
+            on_process_started=process_ids.append,
+        )
+
+    assert len(process_ids) == 1
+    assert timed_waits == []
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
 
 
 def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(
