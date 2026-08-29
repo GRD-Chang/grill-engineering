@@ -7,7 +7,7 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
-- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run` 或 `resume <run-id>` 开始新的等待窗口，不需要另启 watcher；
+- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run <parent-issue>` 或 `resume <parent-issue>` 开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -27,9 +27,14 @@
 
 ```bash
 agent-run run <parent-issue> --repo OWNER/REPO
-agent-run status <run-id> --repo OWNER/REPO
-agent-run history <run-id> --repo OWNER/REPO
+agent-run status --parent <parent-issue>
+agent-run history --parent <parent-issue>
+agent-run runs --repo OWNER/REPO
 ```
+
+当前仓库只有一个进行中 Run 时，`status` 与 `history` 可以省略 Run 选择参数；在任意目录使用
+`--repo OWNER/REPO` 时必须同时提供 `--parent <parent-issue>`。多个候选时命令会列出工作目录、
+Parent、状态和开始时间并停止，不按最近时间猜测。
 
 ### Delivery Policy
 
@@ -54,7 +59,7 @@ Invocation 内的初始调用和 Output Repair 共用该 deadline。
 在人工边界使用对应的公开命令：
 
 ```bash
-agent-run resume <run-id> [--new-thread] [--message "..."] --repo OWNER/REPO
+agent-run resume <parent-issue> [--new-thread] [--message "..."] --repo OWNER/REPO
 agent-run requeue <run-id> --repo OWNER/REPO
 agent-run approve <run-id> --repo OWNER/REPO
 agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
@@ -191,26 +196,28 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 - **Resume**：进程、凭据、sandbox、timeout、signal、非零退出、缺少最终输出或 Thread mismatch 导致 `execution_failed`，或 Agent 成功给出 Human Blocker 时，由维护者显式在当前 Semantic Attempt 内启动 successor Invocation。
 - **Requeue**：Currentness Boundary 已经 stale 时替换整个 Job Generation。它不是失败进程的 retry；Ticket 与 Parent-only Change Job 只有在 `requeue_required` 才能执行，Run Acceptance 与 Final Run Publication 的漂移则回到 fresh Run Acceptance。
 
-默认 Resume 在仍 current 且保存了 Thread ID 时复用同一 Thread：
+默认 Resume 在仍 current 且保存了 Thread ID 时复用同一 Thread。日常恢复使用 Parent 位置参数：
 
 ```bash
-agent-run status <run-id> --repo OWNER/REPO --json
-agent-run resume <run-id> --repo OWNER/REPO
-agent-run history <run-id> --repo OWNER/REPO --json
+agent-run status --repo OWNER/REPO --parent <parent-issue> --json
+agent-run resume <parent-issue> --repo OWNER/REPO
+agent-run history --repo OWNER/REPO --parent <parent-issue> --json
 ```
+
+完整 Run ID 与显式 `--state-dir` 仍可用于自动化和精确排障；它们不会参与 Parent 的模糊选择。
 
 只有维护者明确要丢弃当前 Invocation 上下文，或没有可恢复 Thread ID 时才使用新 Thread；它仍属于
 原 Semantic Attempt，因此不会增加 Development、Reviewer 或 Publication 计数。新 Thread
 接收该阶段完整标准 Prompt，不会得到“接替上一位 Agent”的手工交接叙述：
 
 ```bash
-agent-run resume <run-id> --new-thread --repo OWNER/REPO
+agent-run resume <parent-issue> --new-thread --repo OWNER/REPO
 ```
 
 Human Blocker 与失败共用 Resume UX，但只有 Human Blocker 可以附带不可变、未经改写的维护者响应：
 
 ```bash
-agent-run resume <run-id> \
+agent-run resume <parent-issue> \
   --message '已授权使用内部测试仓库；继续当前验收。' \
   --repo OWNER/REPO
 ```
@@ -221,7 +228,7 @@ Development 与 Fresh Acceptance 的权威上下文。它不修改 Issue、不�
 `requeue_required`；此时只能先查看状态/历史，再由维护者显式 Requeue：
 
 ```bash
-agent-run status <run-id> --repo OWNER/REPO
+agent-run status --repo OWNER/REPO --parent <parent-issue>
 agent-run requeue <run-id> --repo OWNER/REPO
 ```
 
@@ -234,9 +241,11 @@ Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置�
 被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
 
 新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、仓库根和 `.agent-run` state 目录，最多保留
-最近 32 条，不回填或迁移历史 Run。因此，`status` 与 `history` 可在任意目录下按 Run ID 自动定位；
-若索引缺失、失效或冲突，命令明确要求 `--state-dir`，绝不全盘搜索。其他会推进 Run 或改变外部状态
-的命令仍必须从目标仓库运行，或显式指定 state 目录。
+最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；
+`status`、`history` 可以按当前仓库的唯一进行中 Run、`--parent`，或任意目录的
+`--repo + --parent` 选择。若没有唯一候选、存在多个 clone、索引失效或冲突，命令会列出候选并
+停止，绝不按最近时间猜测或全盘搜索。其他会推进 Run 或改变外部状态的命令仍必须从目标仓库运行，
+或显式指定 state 目录。
 
 如果 merge 的写入响应出现网络错误或无法解析的响应，Publisher 不盲目重放：先在 GitHub 对账。PR 已
 合并即恢复成功；PR 仍 OPEN 且 live head/base、Required Checks 与 mergeability 均保持当前时，最多重试

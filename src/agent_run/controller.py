@@ -45,7 +45,7 @@ from agent_run.run_currentness import (
     ticket_completion_records,
     ticket_completion_records_fingerprint,
 )
-from agent_run.run_locator import RunLocatorIndex
+from agent_run.run_locator import RunLocatorError, RunLocatorIndex
 from agent_run.review_budget import (
     RUN_POLICY,
     budget_checkpoint_subjects,
@@ -165,6 +165,7 @@ class Controller:
                 existing = self.states.find_run(repository_hint, parent_number)
             if existing is not None:
                 require_current_run_state(existing)
+                self._require_current_checkout(existing)
             resumed = existing is not None
             if existing is None:
                 provisional = Repository(
@@ -682,12 +683,26 @@ class Controller:
         self, run_id: str, *, state: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         state = self._load_run(run_id) if state is None else state
+        self._require_current_checkout(state)
         repository = self.github.repository()
         if state.get("repository") != repository.name_with_owner:
             raise ValueError(
                 "configured GitHub repository does not match the Delivery Run"
             )
         return state
+
+    def _require_current_checkout(self, state: dict[str, Any]) -> None:
+        expected_identity = state.get("checkout_identity")
+        current_identity = self.publisher.git.checkout_identity()
+        if (
+            not isinstance(expected_identity, str)
+            or current_identity is None
+            or current_identity != expected_identity
+        ):
+            raise RunLocatorError(
+                "run_locator_stale",
+                "Delivery Run 与当前 checkout identity 不一致或不可用；不会执行 mutation。",
+            )
 
     def _wait_for_github_read(
         self,
@@ -1014,6 +1029,7 @@ class Controller:
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
             "semantic_attempt_protocol": 1,
+            "checkout_identity": self.publisher.git.ensure_checkout_identity(),
             "policy_snapshot": policy.snapshot(),
             "repository": repository.name_with_owner,
             "parent": {"number": parent_number, "title": None, "revision": None},
@@ -1104,6 +1120,7 @@ class Controller:
         else:
             state = existing
             require_current_run_state(state)
+            self._require_current_checkout(state)
             run_id = str(state["run_id"])
         self._register_pending_locator(state)
         if resumed:

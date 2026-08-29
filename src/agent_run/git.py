@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 from agent_run.git_errors import GitError as GitError
@@ -47,6 +49,46 @@ class GitRepository:
         if result.returncode != 0:
             raise GitError(result.stderr.strip() or "not inside a Git repository")
         return cls(Path(result.stdout.strip()).resolve())
+
+    def checkout_identity(self) -> str | None:
+        """Read the local identity that binds a Run to this Git clone."""
+        try:
+            marker = self._checkout_identity_path()
+            value = marker.read_text(encoding="ascii").strip()
+        except (GitError, OSError, UnicodeError):
+            return None
+        return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
+
+    def ensure_checkout_identity(self) -> str:
+        """Create the clone-local Run binding without relying on a remote."""
+        marker = self._checkout_identity_path()
+        try:
+            existing = marker.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, UnicodeError):
+            existing = ""
+        except OSError as error:
+            raise GitError(
+                f"could not read Git checkout identity marker: {error}"
+            ) from error
+        if re.fullmatch(r"[0-9a-f]{32}", existing):
+            return existing
+
+        identity = uuid.uuid4().hex
+        try:
+            with marker.open("x", encoding="ascii") as marker_file:
+                marker_file.write(identity + "\n")
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
+        except FileExistsError:
+            current = self.checkout_identity()
+            if current is not None:
+                return current
+            raise GitError("Git checkout identity marker is invalid")
+        except OSError as error:
+            raise GitError(
+                f"could not create Git checkout identity marker: {error}"
+            ) from error
+        return identity
 
     def resolve_base(self, default_branch: str, expected_sha: str | None) -> str:
         if expected_sha is not None:
@@ -841,6 +883,17 @@ class GitRepository:
     def _resolve_in_optional(self, directory: Path, reference: str) -> str | None:
         result = self._run_in(directory, "rev-parse", "--verify", reference)
         return result.stdout.strip() if result.returncode == 0 else None
+
+    def _checkout_identity_path(self) -> Path:
+        result = self._run("rev-parse", "--git-dir")
+        if result.returncode != 0 or not result.stdout.strip():
+            raise GitError(
+                result.stderr.strip() or "could not locate Git metadata directory"
+            )
+        common_dir = Path(result.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = self.root / common_dir
+        return common_dir.resolve() / "agent-run-checkout-id"
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

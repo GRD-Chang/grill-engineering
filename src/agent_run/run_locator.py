@@ -14,9 +14,16 @@ MAX_LOCATOR_ENTRIES = 32
 
 
 class RunLocatorError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        candidates: list[dict[str, object]] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.candidates = candidates or []
 
 
 class RunLocatorIndex:
@@ -100,6 +107,11 @@ class RunLocatorIndex:
             )
         return state_dir
 
+    def entries(self) -> list[dict[str, str]]:
+        """Read the bounded index without pruning or otherwise mutating it."""
+
+        return [dict(entry) for entry in self._entries_or_raise()]
+
     @contextmanager
     def _locked(self) -> Iterator[None]:
         lock_path = self.path.parent / ".run-locator.lock"
@@ -127,6 +139,10 @@ class RunLocatorIndex:
         if not isinstance(raw_entries, list):
             raise RunLocatorError(
                 "run_locator_invalid", "本机 Run 定位索引格式无效；请显式提供 --state-dir。"
+            )
+        if len(raw_entries) > MAX_LOCATOR_ENTRIES:
+            raise RunLocatorError(
+                "run_locator_invalid", "本机 Run 定位索引超过最大条目数；请显式提供 --state-dir。"
             )
         entries: list[dict[str, str]] = []
         for raw_entry in raw_entries:
