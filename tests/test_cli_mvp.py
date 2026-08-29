@@ -346,7 +346,9 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
     run_id = str(state["run_id"])
     for command in ("status", "history"):
         output = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
-        assert output["next_action"] == f"agent-run resume {run_id}"
+        assert output["next_action"] == (
+            "agent-run resume 1 --repo example/project"
+        )
         snapshot = output["supervision"]
         assert snapshot["credential_failure_class"] == "credential_unavailable"
         assert snapshot.get("credential_http_status") == http_status
@@ -1050,16 +1052,17 @@ def test_public_run_and_resume_reuse_initial_fetch_failure_run(
     assert failed_state["base_resolution_pending"] is True
     assert not list((git_repo / ".git" / "refs" / "heads" / "agent-run").rglob("*"))
 
-    recovered = run_cli(
+    held = run_cli(
         git_repo,
         fixture,
         "run",
         "1",
         extra_env=environment,
     )
-    assert recovered.returncode == 2
-    assert stdout_json(recovered)["run_id"] == run_id
-    assert stdout_json(recovered)["status"] == "progress_exhausted"
+    assert held.returncode == 2
+    assert stdout_json(held)["run_id"] == run_id
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert load_only_run_state(git_repo) == failed_state
     resumed = run_cli(git_repo, fixture, "resume", run_id, extra_env=environment)
     assert resumed.returncode == 2
     assert stdout_json(resumed)["run_id"] == run_id
@@ -1092,8 +1095,30 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
     )
     assert interrupted_retry == {"attempts": 1, "limit": 5}
     assert publication_attempt["publication_operation_retry"] == interrupted_retry
+    interrupted_state = load_only_run_state(git_repo)
+    fixture_before = fixture.read_text(encoding="utf-8")
 
-    recovered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    held = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+
+    assert held.returncode == 2
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert load_only_run_state(git_repo) == interrupted_state
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        str(interrupted_state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+    assert resumed.returncode == 0, resumed.stdout
+    assert stdout_json(resumed)["status"] == "active"
+
+    recovered = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
 
     assert recovered.returncode == 0, recovered.stdout
     assert stdout_json(recovered)["status"] == "run_approval_pending"
@@ -1194,8 +1219,29 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
 
     interrupted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
     assert interrupted.returncode == 2
+    interrupted_state = load_only_run_state(git_repo)
+    fixture_before = fixture.read_text(encoding="utf-8")
 
-    recovered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    held = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert held.returncode == 2
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert load_only_run_state(git_repo) == interrupted_state
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        str(interrupted_state["run_id"]),
+        "--agent-fixture",
+        str(agents),
+    )
+    assert resumed.returncode == 0, resumed.stdout
+    assert stdout_json(resumed)["status"] == "active"
+
+    recovered = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
     assert recovered.returncode == 0, recovered.stdout
     assert stdout_json(recovered)["status"] == "run_approval_pending"
     job = load_only_run_state(git_repo)["ticket_jobs"]["3"]

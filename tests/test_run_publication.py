@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,10 @@ from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.state_contract import (
+    IncompatibleRunStateError,
+    require_current_run_state,
+)
 
 from run_acceptance_test_support import _passing_artifact
 from test_cli import run_internal_stage, run_cli, stdout_json
@@ -375,7 +380,36 @@ def test_final_publication_human_resume_clears_current_blocker(
 
     blocked = engine.publish(str(state["run_id"]))
     assert blocked["status"] == "ready_for_human"
+    assert blocked["run_publication"]["blocked_reason"] == "agent_requires_human"
+    malformed = deepcopy(blocked)
+    malformed["run_publication"].pop("blocked_reason")
+    with pytest.raises(IncompatibleRunStateError, match="Human Blocker phase"):
+        require_current_run_state(malformed)
     assert publisher.data["delivery"]["pull_requests"] == []
+    for command in ("status", "history"):
+        view = run_cli(
+            git_repo,
+            git_repo / "github.json",
+            command,
+            str(state["run_id"]),
+        )
+        assert view.returncode == 0, view.stderr
+        assert "类型: Human Blocker" in view.stdout
+        assert "对象: Run Publication" in view.stdout
+        assert "阶段: pending" in view.stdout
+        assert (
+            "原因: GitHub denied access; tried gh issue view; grant Issue read access."
+            in view.stdout
+        )
+        assert (
+            "触发阻塞的 Agent: publication；model publication-model；"
+            "reasoning effort high；本轮时长: 0 秒"
+            in view.stdout
+        )
+        assert (
+            "唯一下一步: agent-run resume 1 --repo example/project"
+            in view.stdout
+        )
     history = stdout_json(
         run_cli(
             git_repo,
@@ -411,6 +445,7 @@ def test_final_publication_human_resume_clears_current_blocker(
             "response": "Issue read access is now available.",
         }
     ]
+    assert "blocked_reason" not in resumed["run_publication"]
 
     published = engine.publish(str(state["run_id"]))
 

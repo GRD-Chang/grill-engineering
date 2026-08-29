@@ -11,6 +11,10 @@ from agent_run.delivery_policy import (
     ticket_budget_policy_for_job,
 )
 from agent_run.external_supervision import public_supervision_snapshot
+from agent_run.operator_action_presentation import (
+    operator_action_view,
+    print_operator_action as _print_operator_action,
+)
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.semantic_attempt import semantic_attempt_subjects
@@ -62,6 +66,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     semantic_attempt = _current_semantic_attempt(state, active_invocation)
     delivery_cleanup = _public_delivery_cleanup(state)
     latest_resume = latest_resume_audit(state)
+    operator_action = _operator_action_view(state)
     output = {
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
@@ -76,7 +81,12 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "review_budget": review_budget,
         "elapsed_seconds": _elapsed_seconds(state.get("created_at")),
         "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
-        "next_action": _next_action(state),
+        "next_action": (
+            operator_action["next_action"]
+            if operator_action is not None
+            else _next_action(state)
+        ),
+        "operator_action": operator_action,
         "diagnostics": state.get("diagnostics", []),
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
@@ -225,7 +235,10 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     abandonment = output["abandonment"]
     if isinstance(abandonment, dict):
         print(f"放弃恢复: {abandonment.get('phase')}")
-    print(f"下一步: {output['next_action']}")
+    if operator_action is None:
+        print(f"下一步: {output['next_action']}")
+    else:
+        _print_operator_action(operator_action)
 
 
 def _print_history(state: dict[str, object], *, as_json: bool) -> None:
@@ -242,10 +255,16 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     agent_resumes = public_resume_audit.get("history", [])
     if not isinstance(agent_resumes, list):
         raise ValueError("resume_audit.history must be an array")
+    operator_action = _operator_action_view(state)
     output = {
         "run_id": state.get("run_id"),
         "timeline": timeline,
-        "next_action": _next_action(state),
+        "next_action": (
+            operator_action["next_action"]
+            if operator_action is not None
+            else _next_action(state)
+        ),
+        "operator_action": operator_action,
         "abandonment": state.get("run_abandonment"),
         "agent_invocations": invocations,
         "semantic_agent_attempts": semantic_attempts,
@@ -381,7 +400,10 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
                     f"新增依赖 {summary.get('added_dependencies', [])}；"
                     f"移除依赖 {summary.get('removed_dependencies', [])}"
                 )
-    print(f"下一步: {output['next_action']}")
+    if operator_action is None:
+        print(f"下一步: {output['next_action']}")
+    else:
+        _print_operator_action(operator_action)
 
 
 def _current_semantic_attempt(
@@ -696,6 +718,14 @@ def _next_action(state: dict[str, Any]) -> str:
     }:
         return f"agent-run run {parent_number}"
     return "无"
+
+
+def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
+    return operator_action_view(
+        state,
+        current_identity=_current_delivery_identity(state),
+        fallback_next_action=_next_action(state),
+    )
 
 
 def _current_worker(state: dict[str, object]) -> dict[str, object] | None:

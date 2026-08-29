@@ -34,6 +34,7 @@ from agent_run.github_auth_profile import (
 )
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
+from agent_run.operator_gate import has_non_invocation_execution_failure
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
@@ -318,6 +319,11 @@ def _main_with_parser(
                 cli_presentation._print_precondition_failure(current)
                 return 2
             if current.get("status") == "supervision_timeout" and (
+                parsed.new_thread or parsed.message is not None
+            ):
+                cli_presentation._print_precondition_failure(current)
+                return 2
+            if has_non_invocation_execution_failure(current) and (
                 parsed.new_thread or parsed.message is not None
             ):
                 cli_presentation._print_precondition_failure(current)
@@ -718,6 +724,7 @@ def _main_with_parser(
                         [locator_diagnostic]
                         if locator_error
                         or isinstance(error, DirtyManagedCheckoutError)
+                        or isinstance(error, DeliveryPolicyError)
                         or incompatible_state
                         or durable_status not in {
                             "blocked",

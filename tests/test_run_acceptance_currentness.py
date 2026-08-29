@@ -278,14 +278,19 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     )
 
+    held = run_cli(git_repo, fixture, "run", "1")
+    assert held.returncode == 2
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert states.load_run(run_id) == state
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
+        delivery_before
+    )
+
     resumed = run_cli(
         git_repo,
         fixture,
         "resume",
         run_id,
-        "--message",
-        "The old blocker has been resolved.",
-        "--new-thread",
     )
 
     assert resumed.returncode == 0, resumed.stderr
@@ -299,8 +304,8 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert persisted["active_agent_invocation"] is None
     resume_event = persisted["resume_audit"]["history"][-1]
     assert resume_event["semantic_attempt_id"] == attempt["attempt_id"]
-    assert resume_event["human_response_supplied"] is True
-    assert resume_event["new_thread"] is True
+    assert resume_event["human_response_supplied"] is False
+    assert resume_event["new_thread"] is False
     assert resume_event["successor_invocation_started_at"] is None
     retired = persisted["retired_semantic_attempt_owners"][-1]
     assert retired["work_subject"] == f"run-repair:{run_id}"

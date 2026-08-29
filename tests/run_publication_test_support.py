@@ -155,6 +155,25 @@ class HumanThenRunPublicationAgents:
 
     def run_publication(self, request: dict[str, Any]) -> dict[str, Any]:
         self.requests.append(request)
+        event = request["_invocation_event"]
+        requested_thread = request.get("thread_id")
+        event(
+            "started",
+            requested_thread_id=requested_thread,
+            attempt_count=0,
+            model="publication-model",
+            reasoning_effort="high",
+        )
+        event(
+            "thread_started",
+            reported_thread_id="blocked-publication-thread",
+            attempt_count=1,
+        )
+        event(
+            "completed",
+            reported_thread_id="blocked-publication-thread",
+            attempt_count=1,
+        )
         if len(self.requests) == 1:
             return {
                 "result_kind": "human_blocker",

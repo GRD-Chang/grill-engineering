@@ -10,6 +10,7 @@ from agent_run.controller import (
     Controller,
     _change_job_for_invocation,
     _resume_agent_human_blocker,
+    _validated_human_response,
 )
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.human_responses import current_human_response_history
@@ -58,6 +59,20 @@ def test_human_response_history_keeps_ordered_immutable_entries() -> None:
         "human_blockers": ["blocker-18"],
         "response": "response-18",
     }
+
+
+def test_human_response_validation_trims_without_rewriting_content() -> None:
+    assert _validated_human_response("  保留  中间空格  ") == "保留  中间空格"
+    assert _validated_human_response("a" * 8192) == "a" * 8192
+    assert _validated_human_response("界" * 2730) == "界" * 2730
+
+
+@pytest.mark.parametrize("response", ["   ", "a" * 8193, "界" * 2731])
+def test_human_response_validation_rejects_empty_or_over_8_kib(
+    response: str,
+) -> None:
+    with pytest.raises(ValueError):
+        _validated_human_response(response)
 
 
 def test_old_or_mixed_generation_response_history_is_not_reusable() -> None:

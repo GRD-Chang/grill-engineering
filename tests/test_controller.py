@@ -122,7 +122,7 @@ def test_base_fetch_failure_preserves_a_recoverable_run(
     assert persisted["diagnostics"][0]["code"] == "base_resolution_failed"
 
     monkeypatch.undo()
-    recovered, resumed = controller.resume(run_id)
+    recovered, resumed = controller.resume(run_id, explicit_resume=True)
 
     assert resumed
     assert recovered["run_id"] == run_id
@@ -282,6 +282,12 @@ def test_credential_renewal_failure_uses_a_recoverable_diagnostic(
         {
             "code": "worker_credential_renewal_failed",
             "message": "Worker GitHub read credential error: worker_credential_renewal_failed: retries exhausted; token=[REDACTED]",
+            "operator_gate": {
+                "work_subject": "ticket:2",
+                "action_kind": "execution_failure",
+                "phase": "active",
+                "reason": "worker_credential_renewal_failed",
+            },
         }
     ]
 

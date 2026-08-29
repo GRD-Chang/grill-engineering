@@ -218,6 +218,7 @@ def test_state_contract_binds_publication_pending_to_exhaustion(
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_cli(git_repo, fixture, "start", "1")
     state = load_only_run_state(git_repo)
+    state["active_ticket_job"] = None
     if owner.get("publication_operation_retry") is not None:
         owner["publication_attempts"] = 1
         allocate_semantic_attempt(

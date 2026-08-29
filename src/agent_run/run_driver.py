@@ -20,6 +20,7 @@ from agent_run.external_supervision import (
     public_supervision_snapshot,
 )
 from agent_run.github import GitHubReadError
+from agent_run.operator_gate import has_run_operator_gate
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -327,8 +328,10 @@ class DirectRunOperations:
             "ready_for_human",
             "run_approval_pending",
             "parent_approval_pending",
-            "progress_exhausted",
-        }:
+        } or (
+            status == "progress_exhausted"
+            and state.get("terminal_kind") == "waiting_human"
+        ):
             kind = RunOutcomeKind.HUMAN_GATE
         else:
             kind = RunOutcomeKind.PROGRESS
@@ -337,11 +340,10 @@ class DirectRunOperations:
     @staticmethod
     def _cannot_advance(state: dict[str, Any]) -> bool:
         return (
-            state.get("status") in {"completed", "abandoned", "requeue_required"}
+            state.get("status") in {"completed", "abandoned"}
+            or has_run_operator_gate(state)
             or is_github_refresh_wait(state)
             or _is_currentness_human_blocker(state)
-            or state.get("status")
-            in {"unsupported_scope_change", "deterministic_contradiction"}
         )
 
 

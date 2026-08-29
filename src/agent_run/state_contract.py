@@ -18,6 +18,12 @@ from agent_run.review_budget import (
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
 )
+from agent_run.operator_gate import (
+    active_ticket_gate_mirror_is_consistent,
+    operator_gate_identity_is_consistent,
+    operator_gate_subject_count,
+    operator_gate_subjects,
+)
 from agent_run.required_checks_observation import (
     require_required_checks_observation,
     validate_legacy_required_checks_projection,
@@ -162,6 +168,22 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
+    if operator_gate_subject_count(state) > 1:
+        raise IncompatibleRunStateError(
+            "legacy state has multiple current Run-wide Operator Gates"
+        )
+    if (
+        not operator_gate_identity_is_consistent(state)
+        and not _operator_gate_identity_waits_for_subject_validation(state)
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent Operator Gate action identity "
+            "or current lifecycle"
+        )
+    if not active_ticket_gate_mirror_is_consistent(state):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent active Ticket gate mirror"
+        )
     require_completed_ticket_integration_records(state)
     _require_required_checks_observations(state)
     _require_review_budget_windows(state)
@@ -174,6 +196,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
     _require_resume_audit(state["resume_audit"], run_id=str(state["run_id"]))
+    if not operator_gate_identity_is_consistent(state):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent Operator Gate action identity "
+            "or current lifecycle"
+        )
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
@@ -235,6 +262,29 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid ticket_graph.revision"
         )
+
+
+def _operator_gate_identity_waits_for_subject_validation(
+    state: dict[str, Any],
+) -> bool:
+    """Let the owner contract report malformed gate fields first."""
+
+    for location, subject in operator_gate_subjects(state):
+        phase = subject.get("phase")
+        if phase == "blocked" and not isinstance(subject.get("blocked_reason"), str):
+            return True
+        if phase != "publication_pending":
+            continue
+        try:
+            retry = require_publication_operation_retry(
+                subject.get("publication_operation_retry"),
+                location=f"{location}.publication_operation_retry",
+            )
+        except ValueError:
+            return True
+        if retry["attempts"] != retry["limit"]:
+            return True
+    return False
 
 
 def _require_required_checks_observations(state: dict[str, Any]) -> None:
@@ -639,14 +689,10 @@ def _require_human_blocker(subject: dict[str, Any]) -> None:
     blockers = subject.get("human_blockers")
     if subject.get("phase") not in {"blocked", "ready_for_human"}:
         return
-    if reason not in {"agent_requires_human", "reviewer_requires_human"} and not isinstance(
-        blockers, list
-    ):
+    recognized = reason in {"agent_requires_human", "reviewer_requires_human"}
+    if not recognized and not isinstance(blockers, list):
         return
-    if reason is not None and reason not in {
-        "agent_requires_human",
-        "reviewer_requires_human",
-    }:
+    if not recognized:
         raise IncompatibleRunStateError("legacy state has an invalid Human Blocker phase")
     if not isinstance(blockers, list) or not 1 <= len(blockers) <= 8 or not all(
         isinstance(blocker, str) and blocker and len(blocker) <= 2000

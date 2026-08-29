@@ -16,6 +16,7 @@ from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.requeue import RequeueError, requeue_change_job
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
+from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from conftest import write_fixture
 from test_cli import issue, run_cli, stdout_json
@@ -453,6 +454,63 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
     ) == []
 
 
+def test_requeue_transition_restores_its_exact_gate_after_graph_read_recovers(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    git = GitRepository.discover(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    state, _ = controller.start(1)
+    active = state["active_ticket_job"]
+    assert isinstance(active, dict)
+    active.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{state['run_id']}/ticket-7",
+            "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
+            "effective_revision": "stale",
+            "base_sha": git.resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": active}
+    states.save_run(str(state["run_id"]), state)
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["issues"]["7"]["body"] = "new requirements"
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    stale, _ = controller.resume(str(state["run_id"]))
+    assert stale["status"] == "requeue_required"
+    prepared, retired = controller.requeue(str(state["run_id"]))
+    assert prepared["requeue_transition"]["retired"] == retired
+
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery_graph_read_failures"] = [
+        {
+            "code": "github_read_failed",
+            "message": "repository graph is converging",
+        }
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    waiting, waiting_retired = controller.requeue(str(state["run_id"]))
+    assert waiting["status"] == "waiting_external"
+    assert waiting_retired == retired
+
+    recovered, recovered_retired = controller.requeue(str(state["run_id"]))
+
+    assert recovered["status"] == "requeue_required"
+    assert recovered_retired == retired
+    assert recovered["diagnostics"] == [
+        {
+            "code": recovered["requeue_required"]["reason"],
+            "message": "Change Job Generation is stale; run requeue",
+        }
+    ]
+    assert states.load_run(str(state["run_id"])) == recovered
+
+
 
 def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     git_repo: Path,
@@ -669,6 +727,12 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
         "generation": 1,
         "reason": "ticket_requirements_changed",
     }
+    state["diagnostics"] = [
+        {
+            "code": "ticket_requirements_changed",
+            "message": "Ticket requirements changed; run requeue",
+        }
+    ]
     states.save_run(run_id, state)
 
     waiting = run_cli(git_repo, fixture, "requeue", run_id)
@@ -688,8 +752,33 @@ def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) ->
     states = StateStore(git_repo / ".agent-run")
     state = states.load_run(run_id)
     assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": f"agent-run/{run_id}/ticket-7",
+            "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
+            "effective_revision": "stale",
+            "base_sha": GitRepository(git_repo).resolve(str(state["run_branch"])),
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
     state["status"] = "requeue_required"
     state["terminal_kind"] = "requeue_required"
+    state["requeue_required"] = {
+        "work_subject": "ticket:7",
+        "generation": 1,
+        "reason": "ticket_requirements_changed",
+    }
+    state["diagnostics"] = [
+        {
+            "code": "ticket_requirements_changed",
+            "message": "Ticket requirements changed; run requeue",
+        }
+    ]
     states.save_run(run_id, state)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["repository_read_failures"] = [
@@ -772,6 +861,12 @@ def test_stale_human_blocker_cannot_resume_the_old_generation(git_repo: Path) ->
         }
     )
     state["ticket_jobs"] = {"7": job}
+    state.update(
+        {
+            "status": "ready_for_human",
+            "terminal_kind": "waiting_human",
+        }
+    )
     states.save_run(str(state["run_id"]), state)
 
     resumed, _ = controller.resume(str(state["run_id"]), resume_human_blocker=True)
@@ -800,6 +895,88 @@ def test_pr_base_or_head_mutation_requires_human_not_requeue(git_repo: Path) -> 
     assert unknown_pr_mutation(state, "ticket:7", job, Reader(), git) == (
         "change_pr_base_changed_externally"
     )
+
+
+def test_public_views_keep_currentness_contradiction_bound_to_ticket(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    state = states.load_run(run_id)
+    assert state is not None
+    job = state["active_ticket_job"]
+    assert isinstance(job, dict)
+    publisher = FixtureGitHubPublisher(fixture, git)
+    base_sha = git.resolve(str(state["run_branch"]))
+    branch = f"agent-run/{run_id}/ticket-7"
+    publisher.ensure_ticket_branch(
+        ticket_number=7,
+        branch=branch,
+        base_branch=str(state["run_branch"]),
+        expected_base_sha=base_sha,
+        expected_remote_sha=base_sha,
+        recovery_remote_sha=base_sha,
+    )
+    pr_number = publisher.ensure_ticket_pr(
+        branch=branch,
+        base_branch=str(state["run_branch"]),
+        title="Ticket change",
+        body="Ticket change",
+        primary_ticket=7,
+        expected_head_sha=base_sha,
+        expected_base_sha=base_sha,
+    )
+    graph = state["ticket_graph"]
+    parent = state["parent"]
+    job.update(
+        {
+            "ticket_branch_generation": 1,
+            "ticket_branch": branch,
+            "phase": "developing",
+            "review_budget": _canonical_budget(),
+            "review_budget_history": [],
+            "effective_revision": effective_revision(
+                ticket_revision=graph["tickets"]["7"]["content_revision"],
+                parent_revision=parent["revision"],
+                graph_revision=graph["revision"],
+            ),
+            "base_sha": base_sha,
+            "pr_number": pr_number,
+            "publication_sha": base_sha,
+        }
+    )
+    state["ticket_jobs"] = {"7": job}
+    states.save_run(run_id, state)
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["delivery"]["pull_requests"][0]["base_branch"] = "foreign"
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    blocked = run_cli(git_repo, fixture, "run", "1")
+
+    assert blocked.returncode == 2
+    persisted = states.load_run(run_id)
+    assert persisted is not None
+    assert persisted["status"] == "blocked"
+    assert persisted["diagnostics"][0]["operator_gate"] == {
+        "work_subject": "ticket:7",
+        "action_kind": "deterministic_contradiction",
+        "phase": "developing",
+        "reason": "change_pr_base_changed_externally",
+    }
+    for command in ("status", "history"):
+        view = run_cli(git_repo, fixture, command, run_id)
+        assert view.returncode == 0, view.stderr
+        assert "类型: Deterministic Contradiction" in view.stdout
+        assert "对象: Ticket #7" in view.stdout
+        assert "阶段: developing" in view.stdout
+        assert "原因: Change PR changed outside the current Generation" in view.stdout
+        assert f"已保留成果: PR #{pr_number}" in view.stdout
+        assert (
+            "唯一下一步: 修复诊断中的确定性外部矛盾后执行 "
+            "agent-run run 1 --repo example/project"
+        ) in view.stdout
 
 
 def test_run_repair_completion_drift_requires_a_new_generation(

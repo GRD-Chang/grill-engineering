@@ -2055,6 +2055,52 @@ def test_fresh_validation_human_resume_rejects_an_older_reviewer_thread(
         engine.deliver(str(state["run_id"]))
 
 
+def test_fresh_validation_human_resume_with_new_thread_replaces_blocker_artifact(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    state, _ = controller.start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    agents = HumanThenHistoricalReviewerAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo),
+        states=states,
+        github=ScriptedPublisher(git_repo),
+        agents=agents,
+    )
+
+    blocked = engine.deliver(str(state["run_id"]))
+    blocked_job = blocked["active_ticket_job"]
+    assert blocked_job["review_budget"]["reviewer_invocations"] == 1
+    assert len(blocked_job["review_budget"]["review_artifacts"]) == 1
+
+    resumed, _ = controller.resume(
+        str(state["run_id"]),
+        resume_human_blocker=True,
+    )
+    resumed_job = resumed["ticket_jobs"]["3"]
+    resumed_job["review_new_thread"] = True
+    resumed["active_ticket_job"] = resumed_job
+    states.save_run(str(state["run_id"]), resumed)
+    engine.deliver(str(state["run_id"]))
+
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    completed_job = persisted["ticket_jobs"]["3"]
+    assert completed_job["review_budget"]["reviewer_invocations"] == 1
+    assert len(completed_job["review_budget"]["review_artifacts"]) == 1
+    assert completed_job["review_budget"]["review_artifacts"][0][
+        "reviewer_thread_id"
+    ] == "older-reviewer"
+    assert completed_job["review_budget"]["review_artifacts"][0]["artifact"] == (
+        completed_job["acceptance_artifact"]
+    )
+
+
 def test_ticket_review_budget_fallback_publishes_without_acceptance_record(
     git_repo: Path,
 ) -> None:
@@ -2519,8 +2565,8 @@ def test_no_change_attempt_does_not_consume_modification_budget(
     resumed, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
-    assert resumed["status"] == "progress_exhausted"
-    assert resumed["active_ticket_job"] is None
+    assert resumed["status"] == "blocked"
+    assert resumed["active_ticket_job"]["ticket_number"] == 3
     assert resumed["ticket_jobs"]["3"]["modification_attempts"] == 0
     assert resumed["ticket_jobs"]["3"]["blocked_reason"] == ("no_code_changes")
     assert first_agents.calls == 1
@@ -3501,18 +3547,13 @@ def test_pr_closed_between_ensure_and_first_live_read_is_recoverable(
     resumed, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
-    assert resumed["status"] == "progress_exhausted"
-    assert resumed["active_ticket_job"] is None
+    assert resumed["status"] == "blocked"
+    assert resumed["active_ticket_job"]["ticket_number"] == 3
     assert resumed["diagnostics"] == [
         {
-            "code": "no_executable_ticket",
-            "message": "No open, ready and unblocked Ticket is executable",
-            "remaining_tickets": [
-                {
-                    "ticket_number": 3,
-                    "reason": "ticket_pr_closed_unmerged",
-                }
-            ],
+            "code": "ticket_pr_closed_unmerged",
+            "message": "Current Ticket PR was closed without merging",
+            "ticket_number": 3,
         }
     ]
     assert publisher.closed_issues == []
@@ -4515,7 +4556,7 @@ def test_ticket_fallback_avoids_unbounded_escalation_response(
     assert publisher.escalated == []
 
 
-def test_resume_switches_frontier_without_deleting_blocked_ticket_job(
+def test_resume_preserves_frontier_while_an_operator_gate_is_current(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -4550,6 +4591,12 @@ def test_resume_switches_frontier_without_deleting_blocked_ticket_job(
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
+        }
+    )
+    state.update(
+        {
+            "status": "ready_for_human",
+            "terminal_kind": "waiting_human",
         }
     )
     state["ticket_jobs"]["4"] = {
@@ -4662,7 +4709,7 @@ def test_resume_switches_frontier_without_deleting_blocked_ticket_job(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
 
-    assert resumed["active_ticket_job"]["ticket_number"] == 5
+    assert resumed["active_ticket_job"]["ticket_number"] == 3
     assert resumed["ticket_jobs"]["3"] == old_job
     assert resumed["ticket_jobs"]["3"]["blocked_reason"] == ("reviewer_requires_human")
     assert resumed["ticket_jobs"]["3"]["development_thread_id"] == ("developer-3")

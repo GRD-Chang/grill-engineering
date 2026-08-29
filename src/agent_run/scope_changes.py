@@ -5,6 +5,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 
+_UNSUPPORTED_GRAPH_CHANGE_MESSAGE = (
+    "Ticket 集合或 blockedBy 依赖已变化；当前 MVP 不支持吸收或"
+    "自动重排此范围变化，只能查看状态或放弃当前 Delivery Run"
+)
+
+
 def reconcile_structure(
     previous: dict[str, Any], projected: dict[str, Any]
 ) -> dict[str, Any]:
@@ -51,10 +57,7 @@ def reconcile_structure(
                 "diagnostics": [
                     {
                         "code": "completed_ticket_reopened",
-                        "message": (
-                            f"Completed Ticket #{reopened[0]} was reopened outside "
-                            "Run Abandonment Recovery"
-                        ),
+                        "message": _completed_ticket_reopened_message(reopened),
                         "ticket_numbers": reopened,
                     }
                 ],
@@ -111,16 +114,89 @@ def _unsupported(
             "diagnostics": [
                 {
                     "code": "unsupported_ticket_graph_change",
-                    "message": (
-                        "Ticket 集合或 blockedBy 依赖已变化；当前 MVP 不支持吸收或"
-                        "自动重排此范围变化，只能查看状态或放弃当前 Delivery Run"
-                    ),
+                    "message": _UNSUPPORTED_GRAPH_CHANGE_MESSAGE,
                 }
             ],
             "updated_at": _now(),
         }
     )
     return blocked
+
+
+def unsupported_scope_change_identity_is_consistent(
+    state: dict[str, Any],
+) -> bool:
+    """Validate one producer-specific durable scope contradiction."""
+
+    change = state.get("unsupported_scope_change")
+    accepted_graph = state.get("ticket_graph")
+    diagnostics = state.get("diagnostics")
+    if (
+        not isinstance(change, dict)
+        or set(change)
+        != {
+            "accepted_graph_revision",
+            "observed_graph_revision",
+            "graph_change_summary",
+            "observed_ticket_graph",
+            "observed_at",
+        }
+        or not isinstance(accepted_graph, dict)
+        or not isinstance(diagnostics, list)
+        or len(diagnostics) != 1
+    ):
+        return False
+    accepted = change.get("accepted_graph_revision")
+    observed = change.get("observed_graph_revision")
+    observed_graph = change.get("observed_ticket_graph")
+    summary = change.get("graph_change_summary")
+    diagnostic = diagnostics[0]
+    if (
+        not isinstance(accepted, str)
+        or accepted != state.get("accepted_ticket_graph_revision")
+        or accepted_graph.get("revision") != accepted
+        or not isinstance(observed, str)
+        or observed == accepted
+        or not isinstance(observed_graph, dict)
+        or observed_graph.get("revision") != observed
+        or not isinstance(observed_graph.get("ordered_ticket_numbers"), list)
+        or not all(
+            isinstance(number, int)
+            for number in observed_graph["ordered_ticket_numbers"]
+        )
+        or not isinstance(observed_graph.get("tickets"), dict)
+        or not isinstance(summary, dict)
+        or not isinstance(change.get("observed_at"), str)
+        or not isinstance(diagnostic, dict)
+    ):
+        return False
+    try:
+        reopened = _reopened_completed_tickets(
+            state, {"ticket_graph": observed_graph}
+        )
+        expected_delta = _graph_change_summary(accepted_graph, observed_graph)
+    except (TypeError, ValueError):
+        return False
+    if reopened:
+        return (
+            summary == {"reopened_completed_tickets": reopened}
+            and diagnostic.get("code") == "completed_ticket_reopened"
+            and diagnostic.get("message")
+            == _completed_ticket_reopened_message(reopened)
+            and diagnostic.get("ticket_numbers") == reopened
+        )
+    return (
+        summary == expected_delta
+        and diagnostic.get("code") == "unsupported_ticket_graph_change"
+        and diagnostic.get("message") == _UNSUPPORTED_GRAPH_CHANGE_MESSAGE
+    )
+
+
+def _completed_ticket_reopened_message(reopened: list[int]) -> str:
+    return (
+        f"Completed Ticket #{reopened[0]} was reopened outside "
+        "Run Abandonment Recovery"
+    )
 
 
 def _graph_change_summary(

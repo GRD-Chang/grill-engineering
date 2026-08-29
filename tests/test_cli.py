@@ -19,6 +19,7 @@ from agent_run.controller import Controller
 from agent_run.codex import CodexProcessError
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
+from agent_run.requeue import RequeueError
 from agent_run.run_driver import DirectRunOperations, RunStep
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import FaultInjectingStateStore, StateStore
@@ -55,6 +56,141 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
         assert internal_command not in help_text
         with pytest.raises(SystemExit):
             build_parser().parse_args([internal_command, "run-id"])
+
+
+def test_public_run_preserves_non_invocation_execution_failure_until_resume(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    agents = git_repo / "agents.json"
+    agent_data = {
+        "developments": [
+            {
+                "expected_thread_id": None,
+                "thread_id": "developer-2",
+                "human_blockers": ["Maintainer input is required."],
+            }
+        ],
+        "publications": [],
+        "reviews": [],
+    }
+    agents.write_text(json.dumps(agent_data), encoding="utf-8")
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    assert Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).record_execution_failure(run_id, "controller failed before an Agent started")
+    failed = load_only_run_state(git_repo)
+    assert failed["active_agent_invocation"] is None
+
+    status = run_cli(git_repo, fixture, "status", run_id)
+    assert "类型: Execution Failure" in status.stdout
+    assert "唯一下一步: agent-run resume 1 --repo example/project" in status.stdout
+    for command in ("status", "history"):
+        json_view = stdout_json(
+            run_cli(git_repo, fixture, command, run_id, "--json")
+        )
+        assert json_view["operator_action"]["type"] == "Execution Failure"
+        assert json_view["operator_action"]["object"] == "Ticket #2"
+        assert json_view["operator_action"]["phase"] == "active"
+        assert json_view["operator_action"]["next_action"] == (
+            "agent-run resume 1 --repo example/project"
+        )
+        assert json_view["next_action"] == json_view["operator_action"][
+            "next_action"
+        ]
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["repository_read_failures"] = [
+        {
+            "code": "github_read_failed",
+            "message": "repository binding has not converged",
+        }
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    ordinary_run = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert ordinary_run.returncode == 2
+    assert load_only_run_state(git_repo) == failed
+    assert json.loads(agents.read_text(encoding="utf-8")) == agent_data
+
+    ordinary_run_after_binding = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+    assert ordinary_run_after_binding.returncode == 2
+    assert load_only_run_state(git_repo) == failed
+
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    with pytest.raises(RequeueError, match="unresolved Execution Failure"):
+        controller.requeue(run_id)
+    assert load_only_run_state(git_repo) == failed
+
+    for lifecycle_command in ("requeue", "approve", "revise"):
+        rejected = run_cli(git_repo, fixture, lifecycle_command, run_id)
+        assert rejected.returncode == 2
+        assert load_only_run_state(git_repo) == failed
+
+    for invalid_option in (
+        ("--message", "not valid for an Execution Failure"),
+        ("--new-thread",),
+    ):
+        invalid_resume = run_cli(
+            git_repo,
+            fixture,
+            "resume",
+            "1",
+            "--repo",
+            "example/project",
+            *invalid_option,
+        )
+        assert invalid_resume.returncode == 2
+        assert load_only_run_state(git_repo) == failed
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        "1",
+        "--repo",
+        "example/project",
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    resumed_state = load_only_run_state(git_repo)
+    assert resumed_state["status"] == "active"
+    assert resumed_state["resume_audit"]["history"][-1]["kind"] == (
+        "execution_failure"
+    )
+    assert resumed_state["resume_audit"]["history"][-1]["failure_code"] == (
+        "command_failed"
+    )
+
+    advanced = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+    assert advanced.returncode == 2
+    assert stdout_json(advanced)["status"] == "ready_for_human"
+    final_audit = load_only_run_state(git_repo)["resume_audit"]["history"][-1]
+    assert final_audit["kind"] == "execution_failure"
+    assert isinstance(final_audit["successor_invocation_started_at"], str)
 
 
 def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
@@ -3068,22 +3204,33 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     work_subject="ticket:2", role="development", phase="developing"
                 )
             },
-            f"agent-run resume {run_id}",
+            "agent-run resume 1 --repo example/project",
         ),
         (
             "ready_for_human",
             {
+                "active_ticket_job": None,
                 "parent_job": {
                     "phase": "blocked",
                     "blocked_reason": "agent_requires_human",
                     "human_blockers": ["Need maintainer input."],
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                },
+            },
+            "agent-run resume 1 --repo example/project",
+        ),
+        (
+            "requeue_required",
+            {
+                "requeue_required": {
+                    "work_subject": "ticket:2",
+                    "generation": 1,
+                    "reason": "ticket_requirements_changed",
                 }
             },
-            f"agent-run resume {run_id}",
+            f"agent-run requeue {run_id}",
         ),
-        ("requeue_required", {}, f"agent-run requeue {run_id}"),
     ]
 
     for status, additions, expected_action in cases:
@@ -3104,6 +3251,24 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     ),
                 }
             )
+            state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
+        if status == "requeue_required":
+            state["ticket_jobs"]["2"].update(
+                {
+                    "ticket_branch_generation": 1,
+                    "phase": "developing",
+                    "review_budget": _canonical_run_budget(),
+                    "review_budget_history": [],
+                }
+            )
+            state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
+            state["terminal_kind"] = "requeue_required"
+            state["diagnostics"] = [
+                {
+                    "code": "ticket_requirements_changed",
+                    "message": "Ticket requirements changed; run requeue",
+                }
+            ]
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
         result = run_cli(git_repo, fixture, "status", run_id, "--json")
@@ -3252,6 +3417,62 @@ def test_no_executable_ticket_is_progress_exhaustion_not_completion(
     assert state["status"] == "progress_exhausted"
     assert state["active_ticket_job"] is None
     assert state["diagnostics"][0]["code"] == "no_executable_ticket"
+
+
+@pytest.mark.parametrize(
+    "triage_label", ["needs-triage", "needs-info", "ready-for-human"]
+)
+def test_triage_ticket_does_not_create_an_operator_gate(
+    git_repo: Path,
+    triage_label: str,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={
+            "2": issue(2, labels=["ready-for-agent", triage_label]),
+        },
+    )
+
+    started = run_cli(git_repo, fixture, "start", "1")
+
+    assert started.returncode == 2
+    run_id = stdout_json(started)["run_id"]
+    state = load_only_run_state(git_repo)
+    assert state["status"] == "progress_exhausted"
+    assert state["terminal_kind"] == "temporarily_no_work"
+    assert state["diagnostics"][0]["remaining_tickets"] == [
+        {
+            "ticket_number": 2,
+            "reason": f"disqualifying_label:{triage_label}",
+        }
+    ]
+    for command in ("status", "history"):
+        view = stdout_json(
+            run_cli(git_repo, fixture, command, run_id, "--json")
+        )
+        assert view["operator_action"] is None
+
+
+def test_needs_triage_ticket_does_not_block_an_eligible_ticket(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={
+            "2": issue(2, labels=["ready-for-agent", "needs-triage"]),
+            "3": issue(3),
+        },
+    )
+
+    started = run_cli(git_repo, fixture, "start", "1")
+
+    assert started.returncode == 0, started.stderr
+    output = stdout_json(started)
+    assert output["status"] == "active"
+    assert output["active_ticket"] == 3
+    state = load_only_run_state(git_repo)
+    assert state["frontier"] == [3]
+    assert state["active_ticket_job"]["ticket_number"] == 3
 
 
 def test_cycle_is_persisted_as_blocked_with_diagnostic(git_repo: Path) -> None:

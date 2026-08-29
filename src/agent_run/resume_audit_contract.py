@@ -11,6 +11,7 @@ RESUME_AUDIT_KINDS = frozenset(
     {
         "agent_invocation",
         "budget_checkpoint",
+        "execution_failure",
         "github_refresh_retry",
         "human_blocker",
         "supervision_timeout",

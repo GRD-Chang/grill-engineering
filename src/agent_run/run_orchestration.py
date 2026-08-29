@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from agent_run.operator_gate import (
+    has_run_operator_gate,
+    is_mechanical_revision_restart,
+)
 from agent_run.revisions import TicketGraphDriftError
 
 
@@ -15,10 +19,6 @@ class TicketEngine(Protocol):
 
 class DeliveryRunEngine:
     """Advance one Delivery Run until no automatic work remains."""
-
-    _REVISION_RESTART_REASONS = frozenset(
-        {"effective_revision_mismatch", "merged_revision_mismatch"}
-    )
 
     def __init__(
         self, *, controller: RunController, tickets: TicketEngine
@@ -39,6 +39,8 @@ class DeliveryRunEngine:
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)
                 return state
+            if has_run_operator_gate(result):
+                return result
             if result.get("status") in {
                 "waiting_checks",
                 "waiting_external",
@@ -57,7 +59,7 @@ class DeliveryRunEngine:
                 return state
             if active.get("phase") != "blocked":
                 continue
-            if active.get("blocked_reason") in self._REVISION_RESTART_REASONS:
+            if is_mechanical_revision_restart(active.get("blocked_reason")):
                 continue
             return state
         return state

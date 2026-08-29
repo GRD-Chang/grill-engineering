@@ -408,6 +408,10 @@ def test_public_run_supervises_non_repairable_final_check_failure(
         run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
     )
     assert status["supervision"]["kind"] == "github_convergence"
+    status_view = run_cli(git_repo, fixture, "status", str(state["run_id"])).stdout
+    assert "类型: Supervision Timeout Pause" in status_view
+    assert "对象: Run Publication" in status_view
+    assert "阶段: waiting_external" in status_view
     assert status["supervision"]["timeout_resume_action"] == (
         f"agent-run resume {state['run_id']}"
     )

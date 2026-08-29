@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,17 +11,29 @@ import pytest
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
+from agent_run.cli_presentation import _operator_action_view
 from agent_run.delivery import TicketDeliveryEngine
-from agent_run.state_contract import IncompatibleRunStateError
+from agent_run.state_contract import (
+    IncompatibleRunStateError,
+    require_current_run_state,
+)
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.operator_gate import (
+    active_ticket_gate_mirror_is_consistent,
+    has_run_operator_gate,
+    operator_gate_identity_is_consistent,
+    operator_gate_subject_count,
+    operator_gate_subjects,
+)
 from agent_run.run_orchestration import DeliveryRunEngine
+from agent_run.run_driver import DirectRunOperations
 from agent_run.state import StateStore
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.review_budget import new_budget
 from conftest import write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import passing_acceptance
+from test_cli_delivery import parent_round_agents, passing_acceptance
 
 
 def _ticket(
@@ -85,6 +98,1065 @@ def test_legacy_semantic_attempt_state_is_rejected_before_reuse(
 
     with pytest.raises(IncompatibleRunStateError, match="Semantic Agent Attempt"):
         controller.resume(str(state["run_id"]))
+
+
+def test_legacy_state_with_multiple_operator_gates_fails_closed(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket(2), "3": _ticket(3)},
+    )
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    for ticket_number in (2, 3):
+        job = state["ticket_jobs"].setdefault(
+            str(ticket_number), {"ticket_number": ticket_number}
+        )
+        job.update(
+            {
+                "phase": "blocked" if ticket_number == 2 else "publication_pending",
+                "policy_snapshot": dict(state["policy_snapshot"]),
+                "review_budget": new_budget(),
+                "review_budget_history": [],
+            }
+        )
+    state["ticket_jobs"]["2"].update(
+        {
+            "blocked_reason": "agent_requires_human",
+            "human_blocker_phase": "candidate",
+            "human_blockers": ["Ticket 2 needs maintainer input."],
+        }
+    )
+
+    with pytest.raises(IncompatibleRunStateError, match="multiple current"):
+        require_current_run_state(state)
+
+
+def test_active_only_human_gate_projects_the_current_ticket() -> None:
+    active = {
+        "ticket_number": 3,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blocker_phase": "developing",
+        "human_blockers": ["Maintainer input is required."],
+    }
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "ticket_jobs": {},
+        "active_ticket_job": active,
+        "parent": {"number": 1},
+        "repository": "example/project",
+    }
+
+    assert operator_gate_subjects(state) == [("ticket:3", active)]
+    action = _operator_action_view(state)
+    assert action is not None
+    assert action["type"] == "Human Blocker"
+    assert action["object"] == "Ticket #3"
+    assert action["phase"] == "developing"
+    assert action["reasons"] == ["Maintainer input is required."]
+
+
+def test_abandonment_pending_overrides_a_local_human_blocker_action() -> None:
+    active = {
+        "ticket_number": 3,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blockers": ["Maintainer input is required."],
+    }
+    state: dict[str, Any] = {
+        "run_id": "run-1",
+        "status": "abandonment_pending",
+        "ticket_jobs": {"3": deepcopy(active)},
+        "active_ticket_job": deepcopy(active),
+        "parent": {"number": 1},
+        "repository": "example/project",
+    }
+
+    action = _operator_action_view(state)
+
+    assert action is not None
+    assert action["type"] == "Abandonment Recovery"
+    assert action["object"] == "Ticket #3"
+    assert action["phase"] == "blocked"
+    assert action["reasons"] == ["Run abandonment recovery is incomplete."]
+    assert action["next_action"] == "agent-run abandon run-1"
+
+
+def test_run_repair_supersedes_a_retained_publication_approval_phase() -> None:
+    state: dict[str, Any] = {
+        "status": "run_acceptance_pending",
+        "run_acceptance": {
+            "phase": "repairing",
+            "repair_job": {"phase": "developing"},
+        },
+        "run_publication": {"phase": "ready_for_approval"},
+    }
+
+    assert operator_gate_subjects(state) == []
+    assert not has_run_operator_gate(state)
+    assert not DirectRunOperations._cannot_advance(state)
+    assert _operator_action_view(state) is None
+
+
+def test_pending_acceptance_cannot_claim_a_publication_approval_gate() -> None:
+    state: dict[str, Any] = {
+        "status": "run_acceptance_pending",
+        "run_acceptance": {"phase": "pending"},
+        "run_publication": {"phase": "ready_for_approval"},
+    }
+
+    assert operator_gate_subject_count(state) == 1
+    assert not operator_gate_identity_is_consistent(state)
+
+
+@pytest.mark.parametrize(
+    "publication_phase", ["blocked", "ready_for_human", "publication_pending"]
+)
+def test_run_repair_does_not_hide_a_publication_gate(
+    publication_phase: str,
+) -> None:
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "run_acceptance": {
+            "phase": "repairing",
+            "repair_job": {"phase": "developing"},
+        },
+        "run_publication": {"phase": publication_phase},
+    }
+
+    assert [location for location, _subject in operator_gate_subjects(state)] == [
+        "run_publication"
+    ]
+    assert has_run_operator_gate(state)
+
+
+def test_run_repair_and_publication_gates_fail_closed_together() -> None:
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "run_acceptance": {
+            "phase": "repairing",
+            "repair_job": {"phase": "blocked"},
+        },
+        "run_publication": {"phase": "blocked"},
+    }
+
+    assert operator_gate_subject_count(state) == 2
+
+
+def test_consistent_active_ticket_gate_mirror_counts_once() -> None:
+    active = {
+        "ticket_number": 3,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blockers": ["Maintainer input is required."],
+    }
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "ticket_jobs": {"3": deepcopy(active)},
+        "active_ticket_job": deepcopy(active),
+    }
+
+    assert operator_gate_subject_count(state) == 1
+    assert [location for location, _subject in operator_gate_subjects(state)] == [
+        "ticket:3"
+    ]
+
+
+@pytest.mark.parametrize("active", [None, {"ticket_number": 3, "phase": "completed"}])
+def test_canonical_ticket_gate_requires_a_current_active_mirror(
+    active: dict[str, Any] | None,
+) -> None:
+    blocked = {
+        "ticket_number": 3,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blockers": ["Maintainer input is required."],
+    }
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "ticket_jobs": {"3": blocked},
+        "active_ticket_job": active,
+    }
+
+    assert not active_ticket_gate_mirror_is_consistent(state)
+
+
+@pytest.mark.parametrize("active_kind", ["missing", "terminal"])
+def test_canonical_ticket_gate_without_current_active_mirror_fails_closed(
+    git_repo: Path,
+    active_kind: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    blocked = state["ticket_jobs"]["2"]
+    blocked.update(
+        {
+            "phase": "blocked",
+            "blocked_reason": "agent_requires_human",
+            "human_blockers": ["Maintainer input is required."],
+        }
+    )
+    state["active_ticket_job"] = (
+        None
+        if active_kind == "missing"
+        else {"ticket_number": 2, "phase": "completed"}
+    )
+    state["status"] = "ready_for_human"
+    state["terminal_kind"] = "waiting_human"
+
+    with pytest.raises(IncompatibleRunStateError, match="active Ticket gate mirror"):
+        require_current_run_state(state)
+
+
+def test_different_active_and_canonical_ticket_gates_count_twice() -> None:
+    def blocked_ticket(number: int) -> dict[str, Any]:
+        return {
+            "ticket_number": number,
+            "phase": "blocked",
+            "blocked_reason": "agent_requires_human",
+            "human_blockers": [f"Ticket {number} needs input."],
+        }
+
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "ticket_jobs": {"2": blocked_ticket(2)},
+        "active_ticket_job": blocked_ticket(3),
+    }
+
+    assert operator_gate_subject_count(state) == 2
+    assert [location for location, _subject in operator_gate_subjects(state)] == [
+        "ticket:3",
+        "ticket:2",
+    ]
+
+
+def test_unbound_execution_failure_is_distinct_from_ticket_human_gate() -> None:
+    blocked = {
+        "ticket_number": 2,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blockers": ["Ticket 2 needs input."],
+    }
+    state: dict[str, Any] = {
+        "status": "execution_failed",
+        "terminal_kind": "execution_failed",
+        "ticket_jobs": {"2": deepcopy(blocked)},
+        "active_ticket_job": deepcopy(blocked),
+        "active_agent_invocation": None,
+        "diagnostics": [{"code": "command_failed", "message": "runner failed"}],
+    }
+
+    assert operator_gate_subject_count(state) == 2
+    assert [location for location, _subject in operator_gate_subjects(state)] == [
+        "ticket:2",
+        "run",
+    ]
+
+
+def test_unbound_execution_failure_and_ticket_human_gate_fail_closed(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        states,
+    )
+    state, _ = controller.start(1)
+    blocked = state["ticket_jobs"]["2"]
+    blocked.update(
+        {
+            "phase": "blocked",
+            "blocked_reason": "agent_requires_human",
+            "human_blockers": ["Ticket 2 needs input."],
+        }
+    )
+    state["active_ticket_job"] = deepcopy(blocked)
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "active_agent_invocation": None,
+            "diagnostics": [
+                {"code": "command_failed", "message": "runner failed"}
+            ],
+        }
+    )
+
+    with pytest.raises(IncompatibleRunStateError, match="multiple current"):
+        require_current_run_state(state)
+
+    run_id = str(state["run_id"])
+    states.save_run(run_id, state)
+    state_path = states.runs_directory / f"{run_id}.json"
+    state_before = state_path.read_bytes()
+    fixture_before = fixture.read_bytes()
+    commands = (
+        ("status", run_id, "--json"),
+        ("history", run_id, "--json"),
+        ("resume", run_id),
+        ("run", "1"),
+    )
+    for command in commands:
+        rejected = run_cli(git_repo, fixture, *command)
+        assert rejected.returncode == 2
+        assert stdout_json(rejected)["status"] == "incompatible_run_state", (
+            command,
+            rejected.stdout,
+            rejected.stderr,
+        )
+        assert state_path.read_bytes() == state_before
+        assert fixture.read_bytes() == fixture_before
+
+
+def test_ticket_gate_cannot_coexist_with_another_active_ticket() -> None:
+    blocked = {
+        "ticket_number": 2,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blockers": ["Ticket 2 needs input."],
+    }
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "ticket_jobs": {"2": blocked, "3": {"ticket_number": 3, "phase": "developing"}},
+        "active_ticket_job": {"ticket_number": 3, "phase": "developing"},
+    }
+
+    assert not active_ticket_gate_mirror_is_consistent(state)
+
+
+def test_ticket_gate_and_another_active_ticket_fail_closed(git_repo: Path) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _ticket(2), "3": _ticket(3)}
+    )
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    blocked = state["ticket_jobs"]["2"]
+    blocked.update(
+        {
+            "phase": "blocked",
+            "blocked_reason": "agent_requires_human",
+            "human_blockers": ["Ticket 2 needs input."],
+        }
+    )
+    active = {"ticket_number": 3, "phase": "developing"}
+    state["ticket_jobs"]["3"] = deepcopy(active)
+    state["active_ticket_job"] = deepcopy(active)
+    state["status"] = "ready_for_human"
+    state["terminal_kind"] = "waiting_human"
+
+    with pytest.raises(IncompatibleRunStateError, match="active Ticket gate mirror"):
+        require_current_run_state(state)
+
+
+@pytest.mark.parametrize("location", ["run_acceptance", "run_publication"])
+def test_run_gate_cannot_coexist_with_an_active_ticket(location: str) -> None:
+    state: dict[str, Any] = {
+        "status": "ready_for_human",
+        "ticket_jobs": {"3": {"ticket_number": 3, "phase": "developing"}},
+        "active_ticket_job": {"ticket_number": 3, "phase": "developing"},
+    }
+    state[location] = {
+        "phase": "ready_for_human",
+        "blocked_reason": "reviewer_requires_human",
+        "human_blockers": ["Run needs input."],
+    }
+
+    assert not active_ticket_gate_mirror_is_consistent(state)
+
+
+def test_run_gate_and_an_active_ticket_fail_closed(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    active = state["active_ticket_job"]
+    assert isinstance(active, dict)
+    active["phase"] = "developing"
+    state["ticket_jobs"]["2"] = deepcopy(active)
+    state["run_acceptance"] = {
+        "phase": "ready_for_human",
+        "blocked_reason": "reviewer_requires_human",
+        "human_blockers": ["Run needs input."],
+    }
+    state["status"] = "ready_for_human"
+    state["terminal_kind"] = "waiting_human"
+
+    with pytest.raises(IncompatibleRunStateError, match="active Ticket gate mirror"):
+        require_current_run_state(state)
+
+
+def test_diagnostic_gate_evidence_projects_execution_failure_subject() -> None:
+    ticket = {
+        "ticket_number": 3,
+        "phase": "reviewing",
+        "candidate_sha": "candidate-sha",
+    }
+    state: dict[str, Any] = {
+        "status": "execution_failed",
+        "ticket_jobs": {"3": ticket},
+        "active_ticket_job": deepcopy(ticket),
+        "active_agent_invocation": None,
+        "parent": {"number": 1},
+        "repository": "example/project",
+        "diagnostics": [
+            {
+                "code": "command_failed",
+                "message": "Runner failed after preserving the candidate.",
+                "operator_gate": {
+                    "work_subject": "ticket:3",
+                    "action_kind": "execution_failure",
+                    "phase": "reviewing",
+                    "reason": "command_failed",
+                },
+            }
+        ],
+    }
+
+    assert operator_gate_subject_count(state) == 1
+    action = _operator_action_view(state)
+    assert action is not None
+    assert action["type"] == "Execution Failure"
+    assert action["object"] == "Ticket #3"
+    assert action["phase"] == "reviewing"
+    assert action["reasons"] == ["Runner failed after preserving the candidate."]
+    assert action["preserved"] == "Candidate candidate-sha"
+    assert action["next_action"] == "agent-run resume 1 --repo example/project"
+
+
+def test_distinct_diagnostic_gate_bindings_count_as_multiple_actions() -> None:
+    state: dict[str, Any] = {
+        "status": "execution_failed",
+        "terminal_kind": "execution_failed",
+        "ticket_jobs": {
+            "2": {"ticket_number": 2, "phase": "developing"},
+            "3": {"ticket_number": 3, "phase": "reviewing"},
+        },
+        "active_ticket_job": None,
+        "active_agent_invocation": None,
+        "diagnostics": [
+            {
+                "code": "first_failure",
+                "message": "First action failed.",
+                "operator_gate": {
+                    "work_subject": "ticket:2",
+                    "action_kind": "execution_failure",
+                    "phase": "developing",
+                    "reason": "first_failure",
+                },
+            },
+            {
+                "code": "second_failure",
+                "message": "Second action failed.",
+                "operator_gate": {
+                    "work_subject": "ticket:3",
+                    "action_kind": "execution_failure",
+                    "phase": "reviewing",
+                    "reason": "second_failure",
+                },
+            },
+        ],
+    }
+
+    assert operator_gate_subject_count(state) == 2
+
+
+def test_duplicate_diagnostic_gate_bindings_count_as_one_action() -> None:
+    binding = {
+        "work_subject": "ticket:2",
+        "action_kind": "execution_failure",
+        "phase": "developing",
+        "reason": "command_failed",
+    }
+    state: dict[str, Any] = {
+        "status": "execution_failed",
+        "ticket_jobs": {"2": {"ticket_number": 2, "phase": "developing"}},
+        "active_ticket_job": None,
+        "diagnostics": [
+            {"operator_gate": deepcopy(binding)},
+            {"operator_gate": deepcopy(binding)},
+        ],
+    }
+
+    assert operator_gate_subject_count(state) == 1
+
+
+def test_completed_ticket_cannot_be_rebound_by_a_diagnostic_gate(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    completed = state["ticket_jobs"]["2"]
+    completed["phase"] = "completed"
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "active_ticket_job": deepcopy(completed),
+            "diagnostics": [
+                {
+                    "operator_gate": {
+                        "work_subject": "ticket:2",
+                        "action_kind": "execution_failure",
+                        "phase": "completed",
+                        "reason": "command_failed",
+                    }
+                }
+            ],
+        }
+    )
+
+    assert not active_ticket_gate_mirror_is_consistent(state)
+    with pytest.raises(IncompatibleRunStateError, match="current lifecycle"):
+        require_current_run_state(state)
+
+
+def test_distinct_diagnostic_gate_bindings_fail_canonical_validation(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={"2": _ticket(2), "3": _ticket(3)}
+    )
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    ticket_two = state["ticket_jobs"]["2"]
+    ticket_three = {**deepcopy(ticket_two), "ticket_number": 3, "phase": "reviewing"}
+    ticket_two["phase"] = "developing"
+    state["ticket_jobs"]["3"] = ticket_three
+    state["active_ticket_job"] = None
+    state["status"] = "execution_failed"
+    state["terminal_kind"] = "execution_failed"
+    state["active_agent_invocation"] = None
+    state["diagnostics"] = [
+        {
+            "code": "first_failure",
+            "message": "First action failed.",
+            "operator_gate": {
+                "work_subject": "ticket:2",
+                "action_kind": "execution_failure",
+                "phase": "developing",
+                "reason": "first_failure",
+            },
+        },
+        {
+            "code": "second_failure",
+            "message": "Second action failed.",
+            "operator_gate": {
+                "work_subject": "ticket:3",
+                "action_kind": "execution_failure",
+                "phase": "reviewing",
+                "reason": "second_failure",
+            },
+        },
+    ]
+
+    with pytest.raises(IncompatibleRunStateError, match="multiple current"):
+        require_current_run_state(state)
+
+
+def test_same_ticket_human_blocker_and_execution_failure_fail_closed(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    job = state["ticket_jobs"]["2"]
+    job.update(
+        {
+            "phase": "blocked",
+            "blocked_reason": "agent_requires_human",
+            "human_blocker_phase": "developing",
+            "human_blockers": ["Maintainer input is required."],
+        }
+    )
+    state.update(
+        {
+            "active_ticket_job": deepcopy(job),
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "active_agent_invocation": None,
+            "diagnostics": [
+                {
+                    "code": "command_failed",
+                    "message": "A separate command failed.",
+                    "operator_gate": {
+                        "work_subject": "ticket:2",
+                        "action_kind": "execution_failure",
+                        "phase": "blocked",
+                        "reason": "command_failed",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert operator_gate_subject_count(state) == 2
+    with pytest.raises(IncompatibleRunStateError, match="multiple current"):
+        require_current_run_state(state)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "active",
+        "publication_pending",
+        "parent_approval_pending",
+        "run_approval_pending",
+    ],
+)
+def test_local_human_blocker_requires_a_matching_top_level_status(
+    git_repo: Path,
+    status: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    job = state["ticket_jobs"]["2"]
+    job.update(
+        {
+            "phase": "blocked",
+            "blocked_reason": "agent_requires_human",
+            "human_blockers": ["Maintainer input is required."],
+        }
+    )
+    state["active_ticket_job"] = deepcopy(job)
+    state["status"] = status
+
+    assert operator_gate_subject_count(state) == 1
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(state)
+
+
+@pytest.mark.parametrize(
+    ("status", "location", "subject"),
+    [
+        (
+            "publication_pending",
+            "run_publication",
+            {"phase": "publication_pending"},
+        ),
+        (
+            "parent_approval_pending",
+            "parent",
+            {"phase": "ready_for_approval"},
+        ),
+        (
+            "run_approval_pending",
+            "run_publication",
+            {"phase": "ready_for_approval"},
+        ),
+    ],
+)
+def test_local_gate_action_can_match_its_top_level_status(
+    status: str,
+    location: str,
+    subject: dict[str, Any],
+) -> None:
+    state: dict[str, Any] = {"status": status, "ticket_jobs": {}}
+    if location == "parent":
+        state["parent_job"] = subject
+    else:
+        state["run_publication"] = subject
+
+    assert operator_gate_subject_count(state) == 1
+    assert operator_gate_identity_is_consistent(state)
+
+
+@pytest.mark.parametrize(
+    ("status", "action_kind"),
+    [
+        ("ready_for_human", "execution_failure"),
+        ("abandonment_pending", "execution_failure"),
+        ("supervision_timeout", "deterministic_contradiction"),
+        ("run_approval_pending", "execution_failure"),
+    ],
+)
+def test_diagnostic_gate_action_must_match_top_level_status(
+    git_repo: Path,
+    status: str,
+    action_kind: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    job = state["ticket_jobs"]["2"]
+    job["phase"] = "reviewing"
+    state.update(
+        {
+            "active_ticket_job": deepcopy(job),
+            "status": status,
+            "terminal_kind": status,
+            "diagnostics": [
+                {
+                    "operator_gate": {
+                        "work_subject": "ticket:2",
+                        "action_kind": action_kind,
+                        "phase": "reviewing",
+                        "reason": "mismatched_action",
+                    }
+                }
+            ],
+        }
+    )
+
+    assert operator_gate_subject_count(state) == 1
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(state)
+
+
+def test_completed_parent_cannot_be_rebound_by_a_diagnostic_gate(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-agents.json"
+    agents.write_text(
+        json.dumps(parent_round_agents(1, passing_last=True)),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    delivered = run_internal_stage(
+        git_repo,
+        fixture,
+        "deliver",
+        run_id,
+        "--agent-fixture",
+        str(agents),
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    completed = run_cli(git_repo, fixture, "approve", run_id)
+    assert completed.returncode == 0, completed.stderr
+    state = load_only_run_state(git_repo)
+    assert state["parent_job"]["phase"] == "completed"
+    state.update(
+        {
+            "status": "deterministic_contradiction",
+            "terminal_kind": "deterministic_contradiction",
+            "diagnostics": [
+                {
+                    "code": "parent_rebound",
+                    "message": "Completed Parent was rebound.",
+                    "operator_gate": {
+                        "work_subject": f"parent-only:{run_id}",
+                        "action_kind": "deterministic_contradiction",
+                        "phase": "completed",
+                        "reason": "parent_rebound",
+                    },
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(IncompatibleRunStateError, match="current lifecycle"):
+        require_current_run_state(state)
+
+
+@pytest.mark.parametrize(
+    ("work_subject", "state_subject", "expected_object"),
+    [
+        (
+            "parent-only:run-1",
+            "parent_job",
+            "Parent Issue #1",
+        ),
+        (
+            "run-repair:run-1",
+            "run_repair",
+            "Run Acceptance",
+        ),
+    ],
+)
+def test_diagnostic_gate_evidence_projects_each_change_job_subject(
+    work_subject: str,
+    state_subject: str,
+    expected_object: str,
+) -> None:
+    job = {
+        "phase": "reviewing",
+        "candidate_sha": "candidate-sha",
+        "pr_number": 12,
+    }
+    state: dict[str, Any] = {
+        "run_id": "run-1",
+        "status": "blocked",
+        "terminal_kind": "waiting_human",
+        "ticket_jobs": {},
+        "active_ticket_job": None,
+        "parent": {"number": 1},
+        "repository": "example/project",
+        "diagnostics": [
+            {
+                "code": "change_pr_head_changed_externally",
+                "message": "Change PR changed outside the current Generation",
+                "operator_gate": {
+                    "work_subject": work_subject,
+                    "action_kind": "deterministic_contradiction",
+                    "phase": "reviewing",
+                    "reason": "change_pr_head_changed_externally",
+                },
+            }
+        ],
+    }
+    if state_subject == "parent_job":
+        state["parent_job"] = job
+    else:
+        state["run_acceptance"] = {"phase": "repairing", "repair_job": job}
+
+    action = _operator_action_view(state)
+
+    assert action is not None
+    assert action["type"] == "Deterministic Contradiction"
+    assert action["object"] == expected_object
+    assert action["phase"] == "reviewing"
+    assert action["reasons"] == [
+        "Change PR changed outside the current Generation"
+    ]
+    assert action["preserved"] == "Candidate candidate-sha；PR #12"
+    assert action["next_action"] == (
+        "修复诊断中的确定性外部矛盾后执行 "
+        "agent-run run 1 --repo example/project"
+    )
+
+
+@pytest.mark.parametrize("mirror_kind", ["missing", "divergent"])
+def test_active_ticket_gate_mirror_must_match_canonical_job(
+    git_repo: Path,
+    mirror_kind: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    active = {
+        "ticket_number": 2,
+        "phase": "blocked",
+        "blocked_reason": "agent_requires_human",
+        "human_blocker_phase": "developing",
+        "human_blockers": ["Maintainer input is required."],
+    }
+    state["status"] = "ready_for_human"
+    state["terminal_kind"] = "waiting_human"
+    state["active_ticket_job"] = deepcopy(active)
+    if mirror_kind == "missing":
+        state["ticket_jobs"].pop("2", None)
+    else:
+        state["ticket_jobs"]["2"] = {
+            **deepcopy(active),
+            "human_blockers": ["Different persisted blocker."],
+        }
+
+    with pytest.raises(IncompatibleRunStateError, match="active Ticket gate mirror"):
+        require_current_run_state(state)
+
+
+def test_global_active_ticket_gate_requires_an_exact_canonical_mirror(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    active = {
+        "ticket_number": 2,
+        "phase": "developing",
+        "human_blockers": [],
+    }
+    state["status"] = "supervision_timeout"
+    state["terminal_kind"] = "supervision_timeout"
+    state["active_ticket_job"] = deepcopy(active)
+    state["ticket_jobs"]["2"] = {**deepcopy(active), "phase": "candidate"}
+
+    assert not active_ticket_gate_mirror_is_consistent(state)
+    with pytest.raises(IncompatibleRunStateError, match="active Ticket gate mirror"):
+        require_current_run_state(state)
+
+
+def test_deterministic_contradiction_keeps_the_triggering_work_subject() -> None:
+    state: dict[str, Any] = {
+        "status": "deterministic_contradiction",
+        "ticket_jobs": {
+            "3": {
+                "ticket_number": 3,
+                "phase": "reviewing",
+                "candidate_sha": "candidate-sha",
+            }
+        },
+        "active_agent_invocation": {
+            "work_subject": "ticket:3",
+            "phase": "reviewing",
+        },
+        "diagnostics": [
+            {"code": "foreign_ticket_pr", "message": "PR identity changed."}
+        ],
+    }
+
+    action = _operator_action_view(state)
+
+    assert action is not None
+    assert action["type"] == "Deterministic Contradiction"
+    assert action["object"] == "Ticket #3"
+    assert action["phase"] == "reviewing"
+    assert action["preserved"] == "Candidate candidate-sha"
+
+
+def test_historical_mechanical_revision_does_not_hide_current_execution_gate() -> None:
+    current = {
+        "ticket_number": 3,
+        "phase": "reviewing",
+        "candidate_sha": "current-candidate",
+    }
+    state: dict[str, Any] = {
+        "status": "execution_failed",
+        "ticket_jobs": {
+            "2": {
+                "ticket_number": 2,
+                "phase": "blocked",
+                "blocked_reason": "effective_revision_mismatch",
+            },
+            "3": current,
+        },
+        "active_ticket_job": current,
+        "active_agent_invocation": {
+            "work_subject": "ticket:3",
+            "phase": "reviewing",
+        },
+        "diagnostics": [{"message": "Current reviewer process failed."}],
+    }
+
+    assert has_run_operator_gate(state)
+    action = _operator_action_view(state)
+    assert action is not None
+    assert action["type"] == "Execution Failure"
+    assert action["object"] == "Ticket #3"
+
+
+def test_mechanical_revision_becomes_global_gate_at_requeue_boundary() -> None:
+    job = {
+        "ticket_number": 2,
+        "phase": "blocked",
+        "blocked_reason": "effective_revision_mismatch",
+    }
+    state: dict[str, Any] = {
+        "status": "requeue_required",
+        "ticket_jobs": {"2": job},
+        "active_ticket_job": job,
+        "requeue_required": {"work_subject": "ticket:2"},
+    }
+
+    assert has_run_operator_gate(state)
+    assert operator_gate_subject_count(state) == 1
+    action = _operator_action_view(state)
+    assert action is not None
+    assert action["type"] == "Requeue Required"
+    assert action["object"] == "Ticket #2"
+    assert action["phase"] == "blocked"
+
+
+def test_requeue_gate_generation_must_match_the_current_change_job(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
+    controller = Controller(
+        FixtureGitHubReader(fixture),
+        GitRepository(git_repo),
+        StateStore(git_repo / ".agent-run"),
+    )
+    state, _ = controller.start(1)
+    job = state["ticket_jobs"]["2"]
+    job.update(
+        {
+            "ticket_branch_generation": 2,
+            "ticket_branch": f"agent-run/{state['run_id']}/ticket-2",
+            "phase": "blocked",
+            "blocked_reason": "effective_revision_mismatch",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
+            "review_budget": new_budget(),
+            "review_budget_history": [],
+        }
+    )
+    state.update(
+        {
+            "status": "requeue_required",
+            "terminal_kind": "requeue_required",
+            "active_ticket_job": deepcopy(job),
+            "diagnostics": [
+                {
+                    "code": "ticket_requirements_changed",
+                    "message": "Ticket requirements changed; run requeue",
+                }
+            ],
+            "requeue_required": {
+                "work_subject": "ticket:2",
+                "generation": 1,
+                "reason": "ticket_requirements_changed",
+            },
+        }
+    )
+
+    assert not operator_gate_identity_is_consistent(state)
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(state)
+
+    state["requeue_required"]["generation"] = 2
+
+    assert operator_gate_identity_is_consistent(state)
+    require_current_run_state(state)
+
+    state["requeue_required"]["reason"] = "fabricated_reason"
+    assert not operator_gate_identity_is_consistent(state)
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(state)
+
+    state["requeue_required"]["reason"] = "ticket_requirements_changed"
+    state["diagnostics"][0]["code"] = "ticket_base_changed"
+    assert not operator_gate_identity_is_consistent(state)
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(state)
 
 
 def test_pending_semantic_attempt_owner_mismatch_is_rejected_without_invocation(
@@ -402,6 +1474,25 @@ def test_graph_change_fails_closed_with_auditable_revisions(
     ]
 
     assert change["observed_ticket_graph"]["ordered_ticket_numbers"] == [2, 3]
+    missing_action = deepcopy(state)
+    missing_action.pop("unsupported_scope_change")
+    assert not operator_gate_identity_is_consistent(missing_action)
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(missing_action)
+    mismatched_reason = deepcopy(state)
+    mismatched_reason["diagnostics"][0]["code"] = "completed_ticket_reopened"
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(mismatched_reason)
+    incomplete_summary = deepcopy(state)
+    incomplete_summary["unsupported_scope_change"]["graph_change_summary"] = {}
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(incomplete_summary)
+    malformed_observed_graph = deepcopy(state)
+    malformed_observed_graph["unsupported_scope_change"]["observed_ticket_graph"][
+        "ordered_ticket_numbers"
+    ] = ["2", "3"]
+    with pytest.raises(IncompatibleRunStateError, match="action identity"):
+        require_current_run_state(malformed_observed_graph)
 
     data["parent"]["sub_issues"] = [2]
     data["issues"].pop("3")
@@ -507,7 +1598,7 @@ def test_parent_clarification_and_comments_do_not_change_the_ticket_graph(
     assert "pending_structure_change" not in state
 
 
-def test_human_blocked_branch_does_not_stop_independent_work(
+def test_human_blocked_ticket_gates_independent_work_until_resume(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -550,37 +1641,122 @@ def test_human_blocked_branch_does_not_stop_independent_work(
     started = run_cli(git_repo, fixture, "start", "1")
     run_id = stdout_json(started)["run_id"]
 
-    result = run_internal_stage(
+    result = run_cli(
         git_repo,
         fixture,
-        "deliver",
-        run_id,
+        "run",
+        "1",
         "--agent-fixture",
         str(agent_fixture),
     )
 
     assert result.returncode == 2
     state = load_only_run_state(git_repo)
-    assert state["status"] == "progress_exhausted"
+    assert state["status"] == "ready_for_human"
     assert state["terminal_kind"] == "waiting_human"
-    assert state["active_ticket_job"] is None
+    assert state["active_ticket_job"]["ticket_number"] == 2
     assert state["ticket_jobs"]["2"]["phase"] == "blocked"
-    assert state["ticket_jobs"]["3"]["phase"] == "completed"
+    assert "3" not in state["ticket_jobs"]
     assert "4" not in state["ticket_jobs"]
-    remaining = state["diagnostics"][0]["remaining_tickets"]
-    assert remaining == [
-        {
-                "ticket_number": 2,
-                "reason": "reviewer_requires_human",
-                "human_blockers": [
-                    "发生：产品决策缺失；尝试：已读取权威输入；人必须：作出产品决策。"
+    status_view = run_cli(git_repo, fixture, "status", run_id)
+    assert status_view.returncode == 0
+    assert "操作者动作" in status_view.stdout
+    assert "类型: Human Blocker" in status_view.stdout
+    assert "对象: Ticket #2" in status_view.stdout
+    assert "阶段: candidate" in status_view.stdout
+    assert _human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"] in status_view.stdout
+    assert "触发阻塞的 Agent: reviewer" in status_view.stdout
+    assert "model gpt-5.6-sol" in status_view.stdout
+    assert "reasoning effort high" in status_view.stdout
+    assert "本轮时长:" in status_view.stdout
+    assert f"已保留成果: Candidate {state['ticket_jobs']['2']['candidate_sha']}" in status_view.stdout
+    assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in status_view.stdout
+    assert "唯一下一步: agent-run resume 1 --repo example/project" in status_view.stdout
+    history_view = run_cli(git_repo, fixture, "history", run_id)
+    assert history_view.returncode == 0
+    assert "类型: Human Blocker" in history_view.stdout
+    assert "对象: Ticket #2" in history_view.stdout
+    assert _human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"] in history_view.stdout
+    for command in ("status", "history"):
+        json_view = stdout_json(
+            run_cli(git_repo, fixture, command, run_id, "--json")
+        )
+        assert json_view["operator_action"]["type"] == "Human Blocker"
+        assert json_view["operator_action"]["object"] == "Ticket #2"
+        assert json_view["operator_action"]["phase"] == "candidate"
+        assert json_view["operator_action"]["next_action"] == (
+            "agent-run resume 1 --repo example/project"
+        )
+        assert json_view["next_action"] == json_view["operator_action"][
+            "next_action"
+        ]
+
+    repeated = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert repeated.returncode == 2
+    repeated_state = load_only_run_state(git_repo)
+    assert repeated_state["status"] == "ready_for_human"
+    assert repeated_state["active_ticket_job"]["ticket_number"] == 2
+    assert "3" not in repeated_state["ticket_jobs"]
+
+    agent_fixture.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-3",
+                        "summary": "Implemented independent ticket 3.",
+                        "write_files": {"ticket-3.txt": "done\n"},
+                    },
+                    {
+                        "expected_thread_id": None,
+                        "thread_id": "developer-4",
+                        "summary": "Implemented ticket 4 after ticket 2 closed.",
+                        "write_files": {"ticket-4.txt": "done\n"},
+                    },
                 ],
-        },
-        {"ticket_number": 4, "reason": "blocked_by_open_issues"},
-    ]
+                "publications": [_publication(2), _publication(3), _publication(4)],
+                "reviews": [
+                    {
+                        **passing_acceptance(
+                            "reviewer-2", "Ticket 2 passed after the operator resumed it."
+                        ),
+                        "expected_thread_id": "reviewer-2",
+                    },
+                    passing_acceptance("reviewer-3", "Ticket 3 passed."),
+                    passing_acceptance("reviewer-4", "Ticket 4 passed."),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(agent_fixture),
+    )
+
+    assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+    state = load_only_run_state(git_repo)
+    assert state["status"] == "run_acceptance_pending"
+    assert state["ticket_jobs"]["2"]["phase"] == "completed"
+    assert state["ticket_jobs"]["3"]["phase"] == "completed"
+    assert state["ticket_jobs"]["4"]["phase"] == "completed"
 
 
-def test_nonretryable_blocked_job_yields_to_independent_frontier(
+def test_deterministic_ticket_conflict_gates_independent_frontier(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -608,15 +1784,29 @@ def test_nonretryable_blocked_job_yields_to_independent_frontier(
             "review_budget_history": [],
         }
     )
+    state.update(
+        {
+            "status": "blocked",
+            "terminal_kind": "waiting_human",
+            "diagnostics": [
+                {
+                    "code": "published_head_mismatch",
+                    "message": "Published-Head Gate rejected live PR state",
+                    "ticket_number": 2,
+                }
+            ],
+        }
+    )
     states.save_run(str(state["run_id"]), state)
 
     resumed, _ = controller.resume(str(state["run_id"]))
 
-    assert resumed["status"] == "active"
-    assert resumed["active_ticket_job"]["ticket_number"] == 3
+    assert resumed["status"] == "blocked"
+    assert resumed["active_ticket_job"]["ticket_number"] == 2
     assert resumed["ticket_jobs"]["2"]["blocked_reason"] == (
         "published_head_mismatch"
     )
+    assert "3" not in resumed["ticket_jobs"]
 
 
 def test_run_recovers_after_process_failure_between_tickets(
@@ -688,6 +1878,8 @@ def test_run_recovers_after_process_failure_between_tickets(
         ),
         encoding="utf-8",
     )
+    explicitly_resumed = run_cli(git_repo, fixture, "resume", run_id)
+    assert explicitly_resumed.returncode == 0, explicitly_resumed.stderr
     recovered = run_internal_stage(
         git_repo,
         fixture,
@@ -783,6 +1975,8 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     data = json.loads(fixture.read_text(encoding="utf-8"))
     assert data["issues"]["2"]["state"] == "CLOSED"
 
+    explicitly_resumed = run_cli(git_repo, fixture, "resume", run_id)
+    assert explicitly_resumed.returncode == 0, explicitly_resumed.stderr
     recovered = run_internal_stage(
         git_repo,
         fixture,

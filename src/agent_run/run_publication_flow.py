@@ -405,6 +405,7 @@ class RunPublicationFlow(RunPublicationShared):
                 publication.update(
                     {
                         "phase": "ready_for_human",
+                        "blocked_reason": "agent_requires_human",
                         "human_blockers": list(blockers),
                         "human_blocker_phase": "pending",
                     }

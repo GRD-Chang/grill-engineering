@@ -10,9 +10,9 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.cli_presentation import _print_precondition_failure
+from agent_run.operator_gate import has_non_invocation_execution_failure
 from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.semantic_attempt import (
-    invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
 )
 
@@ -55,6 +55,8 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
 
     if invocation_is_explicitly_resumable(state):
         return True
+    if has_non_invocation_execution_failure(state):
+        return True
     return (
         human_blocker_subject_count(state) == 1
         or _review_budget_checkpoint_count(state) == 1
@@ -70,15 +72,7 @@ def _command_is_ready(state: dict[str, object], command: str) -> bool:
     if status == "abandoned":
         return True
     if status == "execution_failed":
-        invocation = state.get("active_agent_invocation")
-        # A failed Agent Invocation has exactly one recovery path: `resume`.
-        # Deterministic publisher/check reconciliation retains its historical
-        # lifecycle command recovery path.
-        return not (
-            isinstance(invocation, dict)
-            and invocation.get("status") in {"failed", "completed", "resuming"}
-            and invocation_attempt_is_pending(state, invocation)
-        )
+        return False
     if status in {
         "unsupported_scope_change",
         "deterministic_contradiction",

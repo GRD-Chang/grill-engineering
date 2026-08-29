@@ -5,7 +5,7 @@ import secrets
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.agent_invocation import fail_interrupted_invocation
@@ -40,6 +40,13 @@ from agent_run.external_supervision import (
     wait_for_github_refresh,
 )
 from agent_run.models import DeliveryGraph, Repository
+from agent_run.operator_gate import (
+    has_mechanical_revision_restart,
+    has_non_invocation_execution_failure,
+    has_run_operator_gate,
+    has_unresolved_subject_gate,
+    operator_gate_subjects,
+)
 from agent_run.requeue import RequeueError, current_change_job, requeue_change_job
 from agent_run.run_currentness import (
     invalidate_run_acceptance,
@@ -56,9 +63,12 @@ from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
     wait_for_recoverable_github_read,
 )
-from agent_run.resume_audit import append_explicit_resume_audit
+from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_audit
 from agent_run.scope_changes import reconcile_structure
-from agent_run.semantic_attempt import invocation_attempt_is_pending
+from agent_run.semantic_attempt import (
+    invocation_attempt_is_pending,
+    invocation_is_explicitly_resumable,
+)
 from agent_run.state import StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -167,6 +177,8 @@ class Controller:
             if existing is not None:
                 require_current_run_state(existing)
                 self._require_current_checkout(existing)
+                if has_run_operator_gate(existing):
+                    return existing, True
             resumed = existing is not None
             if existing is None:
                 provisional = Repository(
@@ -216,6 +228,12 @@ class Controller:
         explicit_resume: bool = False,
         resume_budget_checkpoint: bool = False,
     ) -> tuple[dict[str, Any], bool]:
+        if message is not None:
+            if human_response is not None:
+                raise ValueError("pass only one Human Blocker response")
+            human_response = message
+        if human_response is not None:
+            human_response = _validated_human_response(human_response)
         with self.states.locked():
             existing = self._load_run(run_id)
             budget_policy = self.delivery_policy
@@ -226,13 +244,22 @@ class Controller:
             except GitHubReadError as error:
                 if not is_github_convergence_error(error.code):
                     raise
-                if explicit_resume:
+                response_replayed = False
+                if human_response is not None:
+                    response_binding = _bind_current_human_response(
+                        existing, human_response
+                    )
+                    if not resume_human_blocker or response_binding is None:
+                        raise ValueError("--message requires a current Human Blocker")
+                    response_replayed = response_binding == "replayed"
+                audit_replayed = response_replayed and _resume_audit_matches_replay(
+                    existing, new_thread=new_thread
+                )
+                if explicit_resume and not audit_replayed:
                     append_explicit_resume_audit(
                         existing,
                         new_thread=new_thread,
-                        human_response_supplied=(
-                            human_response is not None or message is not None
-                        ),
+                        human_response_supplied=human_response is not None,
                     )
                 wait_for_github_refresh(
                     existing,
@@ -250,14 +277,34 @@ class Controller:
                 "deterministic_contradiction",
             }:
                 return existing, True
-            if explicit_resume:
+            response_replayed = False
+            if human_response is not None:
+                response_binding = _bind_current_human_response(
+                    existing, human_response
+                )
+                if not resume_human_blocker or response_binding is None:
+                    raise ValueError("--message requires a current Human Blocker")
+                response_replayed = response_binding == "replayed"
+            hold_operator_gate = (
+                not explicit_resume
+                and not resume_human_blocker
+                and not resume_budget_checkpoint
+                and (
+                    has_unresolved_subject_gate(existing)
+                    or has_non_invocation_execution_failure(existing)
+                )
+            )
+            audit_replayed = response_replayed and _resume_audit_matches_replay(
+                existing, new_thread=new_thread
+            )
+            if explicit_resume and not audit_replayed:
                 append_explicit_resume_audit(
                     existing,
                     new_thread=new_thread,
-                    human_response_supplied=(
-                        human_response is not None or message is not None
-                    ),
+                    human_response_supplied=human_response is not None,
                 )
+            if human_response is not None:
+                self.states.save_run(run_id, existing)
             resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
             existing_invocation = existing.get("active_agent_invocation")
             resume_completed_invocation = (
@@ -267,7 +314,7 @@ class Controller:
                 and invocation_attempt_is_pending(existing, existing_invocation)
             )
             if resuming_supervision_timeout:
-                if new_thread or human_response is not None or message is not None:
+                if new_thread or human_response is not None:
                     raise ValueError(
                         "supervision timeout resume does not accept Agent or Human Blocker options"
                     )
@@ -289,11 +336,18 @@ class Controller:
                     existing["updated_at"] = _now()
                     self.states.save_run(run_id, existing)
                     return existing, True
-                return self._start_locked(repository, parent_number, existing)
+                return self._start_locked(
+                    repository,
+                    parent_number,
+                    existing,
+                    allow_non_invocation_execution_recovery=explicit_resume,
+                )
             base = _state_mapping(existing, "base")
             base_sha = str(base["sha"])
             state = self._refresh(existing, parent_number)
             if is_github_refresh_wait(state):
+                if hold_operator_gate:
+                    return existing, True
                 self.states.save_run(run_id, state)
                 return state, True
             if state.get("status") in {
@@ -333,12 +387,8 @@ class Controller:
                 self._ensure_delivery_branch(state, base_sha)
                 self.states.save_run(run_id, state)
                 return state, True
-            if message is not None:
-                if human_response is not None:
-                    raise ValueError("pass only one Human Blocker response")
-                human_response = message
-            if human_response is not None:
-                human_response = _validated_human_response(human_response)
+            if hold_operator_gate:
+                return existing, True
             resuming_run_acceptance = False
             budget_resumed = (
                 _resume_review_budget_window(
@@ -354,7 +404,7 @@ class Controller:
                 resumed_subject = True
             elif resume_human_blocker:
                 resuming_run_acceptance = _run_acceptance_human_blocker(state)
-                resumed_subject = _resume_agent_human_blocker(state, human_response)
+                resumed_subject = _resume_agent_human_blocker(state)
                 if human_response is not None and not resumed_subject:
                     raise ValueError("--message requires a current Human Blocker")
             elif human_response is not None:
@@ -381,8 +431,13 @@ class Controller:
         attach an old Thread or retain candidate/acceptance state.
         """
         with self.states.locked():
+            existing = self._load_run(run_id)
+            if existing.get("status") == "execution_failed":
+                raise RequeueError(
+                    "requeue cannot replace an unresolved Execution Failure"
+                )
             try:
-                existing = self._load_bound_run(run_id)
+                existing = self._load_bound_run(run_id, state=existing)
             except GitHubReadError as error:
                 return self._wait_for_github_read(
                     run_id,
@@ -588,8 +643,8 @@ class Controller:
             ):
                 return False
             if (
-                state.get("status") == "blocked"
-                and state.get("terminal_kind") == "waiting_human"
+                has_run_operator_gate(state)
+                and state.get("status") != "execution_failed"
             ):
                 return False
             hint_reader = getattr(self.github, "repository_hint", None)
@@ -610,26 +665,41 @@ class Controller:
             ):
                 return False
             active = state.get("active_agent_invocation")
+            invocation_owns_failure = (
+                isinstance(active, dict)
+                and (
+                    active.get("status") in {"running", "failed"}
+                    or (
+                        active.get("status") == "completed"
+                        and invocation_attempt_is_pending(state, active)
+                    )
+                )
+            )
             if isinstance(active, dict) and isinstance(active.get("role"), str):
                 fail_interrupted_invocation(
                     state,
                     role=str(active["role"]),
                     save=lambda _state: None,
                 )
+            code = (
+                "worker_credential_renewal_failed"
+                if "worker_credential_renewal_failed:" in message
+                else "command_failed"
+            )
+            diagnostic = _operator_gate_diagnostic(
+                state,
+                code=code,
+                message=message,
+                action_kind="execution_failure",
+                reason=code,
+                fallback_phase=str(state.get("status") or "execution_failed"),
+                bind_to_current_change_job=not invocation_owns_failure,
+            )
             state.update(
                 {
                     "status": "execution_failed",
                     "terminal_kind": "execution_failed",
-                    "diagnostics": [
-                        {
-                            "code": (
-                                "worker_credential_renewal_failed"
-                                if "worker_credential_renewal_failed:" in message
-                                else "command_failed"
-                            ),
-                            "message": bounded_error(message),
-                        }
-                    ],
+                    "diagnostics": [diagnostic],
                     "updated_at": _now(),
                 }
             )
@@ -667,13 +737,21 @@ class Controller:
                 return False
             state.pop("supervision_window", None)
             state.pop("supervision_wait", None)
+            diagnostic = _operator_gate_diagnostic(
+                state,
+                code=code,
+                message=message,
+                action_kind="deterministic_contradiction",
+                reason=code,
+                fallback_phase=str(
+                    state.get("status") or "deterministic_contradiction"
+                ),
+            )
             state.update(
                 {
                     "status": "deterministic_contradiction",
                     "terminal_kind": "deterministic_contradiction",
-                    "diagnostics": [
-                        {"code": code, "message": bounded_error(message)}
-                    ],
+                    "diagnostics": [diagnostic],
                     "updated_at": _now(),
                 }
             )
@@ -824,16 +902,21 @@ class Controller:
             else:
                 failed.pop("supervision_window", None)
                 failed.pop("supervision_wait", None)
+                diagnostic = _operator_gate_diagnostic(
+                    failed,
+                    code=error.code,
+                    message=error.message,
+                    action_kind="deterministic_contradiction",
+                    reason=error.code,
+                    fallback_phase=str(
+                        failed.get("status") or "deterministic_contradiction"
+                    ),
+                )
                 failed.update(
                     {
                         "status": "deterministic_contradiction",
                         "terminal_kind": "deterministic_contradiction",
-                        "diagnostics": [
-                            {
-                                "code": error.code,
-                                "message": bounded_error(error.message),
-                            }
-                        ],
+                        "diagnostics": [diagnostic],
                     }
                 )
             failed["updated_at"] = _now()
@@ -894,6 +977,12 @@ class Controller:
                         {
                             "code": external,
                             "message": "Change PR changed outside the current Generation",
+                            "operator_gate": _operator_gate_binding(
+                                subject,
+                                job,
+                                action_kind="deterministic_contradiction",
+                                reason=external,
+                            ),
                         }
                     ],
                 }
@@ -909,6 +998,12 @@ class Controller:
                         {
                             "code": "candidate_or_acceptance_inconsistent",
                             "message": "Candidate or Acceptance cannot be safely requeued",
+                            "operator_gate": _operator_gate_binding(
+                                subject,
+                                job,
+                                action_kind="deterministic_contradiction",
+                                reason="candidate_or_acceptance_inconsistent",
+                            ),
                         }
                     ],
                 }
@@ -1096,6 +1191,8 @@ class Controller:
         repository: Repository,
         parent_number: int,
         existing: dict[str, Any] | None,
+        *,
+        allow_non_invocation_execution_recovery: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         resumed = existing is not None
         if existing is None:
@@ -1133,6 +1230,14 @@ class Controller:
                 return state, True
             if state.get("status") == "supervision_timeout":
                 restore_supervision_wait(state)
+            elif (
+                has_non_invocation_execution_failure(state)
+                and not allow_non_invocation_execution_recovery
+            ) or has_unresolved_subject_gate(state) or (
+                invocation_is_explicitly_resumable(state)
+                and not has_mechanical_revision_restart(state)
+            ):
+                return state, True
         base = _state_mapping(state, "base")
         base_sha = str(base["sha"])
         if state.get("base_resolution_pending") is True:
@@ -1259,30 +1364,24 @@ def _resume_agent_human_blocker(
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
-    ticket_jobs = state.get("ticket_jobs")
-    if isinstance(ticket_jobs, dict):
-        for job in ticket_jobs.values():
-            if _resume_change_job(
-                state, job, ticket=True, human_response=human_response
-            ):
-                return True
-    parent = state.get("parent_job")
-    if _resume_change_job(state, parent, ticket=False, human_response=human_response):
-        return True
-    acceptance = state.get("run_acceptance")
-    if not isinstance(acceptance, dict):
+    target = _current_human_blocker_target(state)
+    if target is None:
         return False
-    repair = acceptance.get("repair_job")
-    if _resume_run_repair_human_blocker(
-        state, acceptance, repair, human_response=human_response
-    ):
-        return True
-    if acceptance.get("phase") == "ready_for_human" and acceptance.get(
-        "blocked_reason"
-    ) in {
-        "agent_requires_human",
-        "reviewer_requires_human",
-    }:
+    location, subject, _generation = target
+    if location.startswith("ticket:"):
+        return _resume_change_job(
+            state, subject, ticket=True, human_response=human_response
+        )
+    if location == "parent":
+        return _resume_change_job(
+            state, subject, ticket=False, human_response=human_response
+        )
+    acceptance = state.get("run_acceptance")
+    if location == "run_repair" and isinstance(acceptance, dict):
+        return _resume_run_repair_human_blocker(
+            state, acceptance, subject, human_response=human_response
+        )
+    if location == "run_acceptance" and isinstance(acceptance, dict):
         blockers = _human_blockers(acceptance)
         append_human_response(
             acceptance,
@@ -1306,11 +1405,7 @@ def _resume_agent_human_blocker(
         )
         return True
     publication = state.get("run_publication")
-    if (
-        isinstance(publication, dict)
-        and publication.get("phase") == "ready_for_human"
-        and publication.get("human_blockers") is not None
-    ):
+    if location == "run_publication" and isinstance(publication, dict):
         publication.update(
             {
                 "phase": str(publication.get("human_blocker_phase", "pending")),
@@ -1323,6 +1418,7 @@ def _resume_agent_human_blocker(
             human_response,
             generation=_publication_generation(state),
         )
+        publication.pop("blocked_reason", None)
         state.update(
             {
                 "status": "run_publication_pending",
@@ -1332,6 +1428,142 @@ def _resume_agent_human_blocker(
         )
         return True
     return False
+
+
+def _bind_current_human_response(
+    state: dict[str, Any], response: str
+) -> Literal["appended", "replayed"] | None:
+    """Bind response to one current Generation without releasing its gate."""
+
+    if human_blocker_subject_count(state) > 1:
+        raise ValueError(
+            "multiple current Human Blockers require an unambiguous resume target"
+        )
+    target = _current_human_blocker_target(state)
+    if target is None:
+        return None
+    _location, subject, generation = target
+    blockers = _human_blockers(subject)
+    if _is_replayed_human_response(
+        state,
+        subject,
+        blockers,
+        response,
+        generation=generation,
+    ):
+        return "replayed"
+    append_human_response(
+        subject,
+        blockers,
+        response,
+        generation=generation,
+    )
+    ticket_number = subject.get("ticket_number")
+    active = state.get("active_ticket_job")
+    if (
+        isinstance(ticket_number, int)
+        and isinstance(active, dict)
+        and active.get("ticket_number") == ticket_number
+    ):
+        state["active_ticket_job"] = subject
+    return "appended"
+
+
+def _is_replayed_human_response(
+    state: dict[str, Any],
+    subject: dict[str, Any],
+    blockers: list[str],
+    response: str,
+    *,
+    generation: int,
+) -> bool:
+    if _latest_unconsumed_response_audit(state) is None:
+        return False
+    history = subject.get("human_response_history")
+    latest = history[-1] if isinstance(history, list) and history else None
+    return (
+        isinstance(latest, dict)
+        and latest.get("generation") == generation
+        and latest.get("human_blockers") == blockers
+        and latest.get("response") == response
+    )
+
+
+def _latest_unconsumed_response_audit(
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    audit = state.get("resume_audit")
+    history = audit.get("history") if isinstance(audit, dict) else None
+    if not isinstance(history, list):
+        return None
+    for event in reversed(history):
+        if not isinstance(event, dict):
+            continue
+        if event.get("successor_invocation_started_at") is not None:
+            return None
+        if event.get("human_response_supplied") is True and event.get("kind") in {
+            "human_blocker",
+            "github_refresh_retry",
+        }:
+            return event
+    return None
+
+
+def _resume_audit_matches_replay(
+    state: dict[str, Any], *, new_thread: bool
+) -> bool:
+    event = latest_resume_audit(state)
+    return (
+        event is not None
+        and event.get("kind") in {"human_blocker", "github_refresh_retry"}
+        and event.get("human_response_supplied") is True
+        and event.get("successor_invocation_started_at") is None
+        and event.get("new_thread") is new_thread
+    )
+
+
+def _current_human_blocker_target(
+    state: dict[str, Any],
+) -> tuple[str, dict[str, Any], int] | None:
+    for location, subject in operator_gate_subjects(state):
+        if location.startswith("ticket:"):
+            ticket_jobs = state.get("ticket_jobs")
+            key = location.removeprefix("ticket:")
+            canonical = (
+                ticket_jobs.get(key) if isinstance(ticket_jobs, dict) else None
+            )
+            if not _is_change_job_human_blocker(canonical):
+                continue
+            assert isinstance(canonical, dict)
+            return location, canonical, _subject_generation(canonical)
+        if location in {"parent", "run_repair"}:
+            if _is_change_job_human_blocker(subject):
+                return location, subject, _subject_generation(subject)
+            continue
+        if location == "run_acceptance" and _is_ready_human_blocker(subject):
+            generation = int(subject.get("acceptance_generation", 1))
+            return location, subject, generation
+        if location == "run_publication" and _is_ready_human_blocker(subject):
+            return location, subject, _publication_generation(state)
+    return None
+
+
+def _is_change_job_human_blocker(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("phase") == "blocked"
+        and value.get("blocked_reason")
+        in {"agent_requires_human", "reviewer_requires_human"}
+    )
+
+
+def _is_ready_human_blocker(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("phase") == "ready_for_human"
+        and value.get("blocked_reason")
+        in {"agent_requires_human", "reviewer_requires_human"}
+    )
 
 
 def _resume_review_budget_window(
@@ -1942,3 +2174,53 @@ def _publication_generation(state: dict[str, Any]) -> int:
         if isinstance(generation, int):
             return generation
     return 1
+
+
+def _operator_gate_binding(
+    work_subject: str,
+    subject: dict[str, Any],
+    *,
+    action_kind: str,
+    reason: str,
+    fallback_phase: str = "blocked",
+) -> dict[str, str]:
+    """Bind a top-level diagnostic to the exact current Work Subject."""
+
+    phase = subject.get("phase")
+    return {
+        "work_subject": work_subject,
+        "action_kind": action_kind,
+        "phase": phase if isinstance(phase, str) and phase else fallback_phase,
+        "reason": reason,
+    }
+
+
+def _operator_gate_diagnostic(
+    state: dict[str, Any],
+    *,
+    code: str,
+    message: str,
+    action_kind: str,
+    reason: str,
+    fallback_phase: str,
+    bind_to_current_change_job: bool = True,
+) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {
+        "code": code,
+        "message": bounded_error(message),
+    }
+    if not bind_to_current_change_job:
+        return diagnostic
+    try:
+        work_subject, subject, _container = current_change_job(state)
+    except RequeueError:
+        return diagnostic
+    if subject is not None:
+        diagnostic["operator_gate"] = _operator_gate_binding(
+            work_subject,
+            subject,
+            action_kind=action_kind,
+            reason=reason,
+            fallback_phase=fallback_phase,
+        )
+    return diagnostic

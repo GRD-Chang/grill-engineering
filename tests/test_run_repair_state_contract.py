@@ -150,6 +150,7 @@ def test_old_run_review_history_without_policy_snapshot_is_incompatible(
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_cli(git_repo, fixture, "start", "1")
     state = load_only_run_state(git_repo)
+    state["active_ticket_job"] = None
     state["run_acceptance"] = {
         "phase": "blocked",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),

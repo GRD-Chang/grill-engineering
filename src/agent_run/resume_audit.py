@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.external_supervision import is_github_refresh_wait
+from agent_run.operator_gate import has_non_invocation_execution_failure
 from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.resume_audit_contract import (
     RESUME_AUDIT_KINDS,
@@ -122,6 +123,7 @@ def bind_resume_to_successor(
     if not isinstance(event, dict) or event.get("kind") not in {
         "agent_invocation",
         "budget_checkpoint",
+        "execution_failure",
         "github_refresh_retry",
         "human_blocker",
     }:
@@ -160,6 +162,8 @@ def _resume_kind(
         return "budget_checkpoint"
     if human_blocker_subject_count(state) == 1:
         return "human_blocker"
+    if has_non_invocation_execution_failure(state):
+        return "execution_failure"
     if (
         invocation is not None
         and invocation.get("status") in {"failed", "completed", "resuming"}

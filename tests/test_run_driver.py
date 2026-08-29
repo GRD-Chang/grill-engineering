@@ -60,6 +60,22 @@ from agent_run.state import StateStore
             RunOutcomeKind.DETERMINISTIC_CONTRADICTION,
             None,
         ),
+        (
+            {
+                "status": "progress_exhausted",
+                "terminal_kind": "temporarily_no_work",
+            },
+            RunOutcomeKind.PROGRESS,
+            None,
+        ),
+        (
+            {
+                "status": "progress_exhausted",
+                "terminal_kind": "waiting_human",
+            },
+            RunOutcomeKind.HUMAN_GATE,
+            None,
+        ),
         ({"status": "requeue_required"}, RunOutcomeKind.REQUEUE_REQUIRED, None),
         ({"status": "completed"}, RunOutcomeKind.TERMINAL_COMPLETION, None),
         ({"status": "abandoned"}, RunOutcomeKind.TERMINAL_ABANDONMENT, None),
