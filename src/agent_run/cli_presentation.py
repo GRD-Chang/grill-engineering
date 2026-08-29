@@ -5,7 +5,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
-from agent_run.delivery_policy import ticket_budget_policy_for_job
+from agent_run.delivery_policy import (
+    parent_only_budget_policy_for_job,
+    ticket_budget_policy_for_job,
+)
 from agent_run.external_supervision import public_supervision_snapshot
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.review_budget import RUN_POLICY
@@ -883,7 +886,9 @@ def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
         parent = state.get("parent_job")
         if isinstance(parent, dict):
             subject = parent
-            policy = RUN_POLICY
+            policy = parent_only_budget_policy_for_job(
+                parent, state_snapshot=state.get("policy_snapshot")
+            )
         else:
             acceptance = state.get("run_acceptance")
             if not isinstance(acceptance, dict):

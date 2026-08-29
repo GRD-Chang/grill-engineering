@@ -20,6 +20,7 @@ from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     DeliveryPolicy,
     default_delivery_policy,
+    parent_only_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
 from agent_run.error_safety import bounded_error
@@ -1361,7 +1362,13 @@ def _resume_review_budget_window(
         state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
         return True
     if subject_kind == "parent":
-        reset_budget(subject, RUN_POLICY)
+        reset_budget(
+            subject,
+            parent_only_budget_policy_for_job(
+                subject, state_snapshot=state.get("policy_snapshot")
+            ),
+        )
+        subject["policy_snapshot"] = policy.snapshot()
         state["policy_snapshot"] = policy.snapshot()
         subject.pop("blocked_reason", None)
         subject.pop("escalation_code", None)

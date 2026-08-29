@@ -9,6 +9,8 @@ from agent_run.delivery_policy import (
     DeliveryPolicy,
     DeliveryPolicyError,
     DeliveryPolicyStore,
+    parent_only_budget_policy,
+    parent_only_budget_policy_for_job,
     parse_policy_snapshot,
     resolve_delivery_policy,
     ticket_review_budget_policy,
@@ -34,6 +36,28 @@ def test_policy_resolution_uses_builtin_user_then_command_precedence() -> None:
     assert ticket_review_budget_policy(policy).review_limit == 1
 
 
+def test_parent_only_policy_uses_an_independent_paired_round_limit() -> None:
+    policy = resolve_delivery_policy(
+        user_defaults={"parent_only_paired_rounds": 4},
+        command_overrides={"parent_only_paired_rounds": 2},
+    )
+
+    assert policy.parent_only_paired_rounds == 2
+    budget_policy = parent_only_budget_policy(policy)
+    assert budget_policy.development_limit == 2
+    assert budget_policy.review_limit == 2
+    assert budget_policy.final_ci_fix_limit == 0
+    assert budget_policy.fallback is False
+
+
+def test_parent_only_job_policy_reads_its_frozen_snapshot() -> None:
+    policy = DeliveryPolicy(parent_only_paired_rounds=6)
+    job = {"policy_snapshot": policy.snapshot()}
+
+    assert parent_only_budget_policy_for_job(job).review_limit == 6
+    assert parent_only_budget_policy_for_job(job).development_limit == 6
+
+
 def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
     from agent_run.delivery_policy import invocation_deadline_for_state
 
@@ -54,6 +78,8 @@ def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
     [
         {"ticket_review_rounds": 0},
         {"ticket_review_rounds": True},
+        {"parent_only_paired_rounds": 0},
+        {"parent_only_paired_rounds": True},
         {"invocation_deadlines": {"review": "0s"}},
         {"invocation_deadlines": {"review": "not-a-duration"}},
         {"invocation_deadlines": {"review": 10**400}},

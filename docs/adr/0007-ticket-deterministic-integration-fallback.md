@@ -10,7 +10,13 @@ Review 预算耗尽后的 Candidate 不运行 Controller 本地代码 Validation
 
 Git Integrity Check 或可修复 Required Check 失败都将原始证据返回同一 Development Thread；系统不增加 validation-fix、Git-fix 或独立 CI-fix 阶段。Ticket 复用 Run Repair 已有的 CI Failure Evidence 分类，只有准确绑定当前 PR head、已完成且由配置的 code-failure step 证明可归因于代码的失败才启动 Development；pending、未知、证据不完整或矛盾、未配置 step、cancelled、runner 与暂时平台错误只进入有界 Controller 监督，监督到期后暂停等待 `run` 或 `resume` 继续读取，不消耗 Agent 或预算。Final CI-fix 只是一个条件式额外 Development Attempt，以 `attempt_kind=final_ci_fix` 和 `final_ci_fix_used` 记录；它不增加 Reviewer 额度，但会使用尚未消耗的 Reviewer Invocation。失败检查本身不计预算，只有实际 Development Attempt 计数。Development 无法解决时可返回 Human Blocker，普通预算与 Final CI-fix 均耗尽后等待人工 `resume` 开启新窗口。若 Resume 前仍保留需修改代码的准确失败证据，新窗口先由原 Development Thread 修复，产出新 Candidate 后才启动 Reviewer 1；Final CI-fix 后准确新 head 再次出现可修复 CI 失败时亦如此，不审查未修改的失败 Candidate。Agent 始终无权 commit、push、force-push、rebase 或 merge。
 
-Ticket、Run 与 Parent-only 的每次 Reviewer 都按 Prompt 调用 `code-review` skill。每个窗口的 Reviewer 1 建立当前基线；Ticket Reviewer 2–3 以及 Run/Parent-only Reviewer 2–5 只额外收到紧邻上一轮 Acceptance Artifact 的完整原始内容及其角色化 review identity，Prompt 建议优先参考上轮问题和当前修复，但 Reviewer 自主决定审查顺序、范围以及是否全量审核。Ticket/Parent-only 使用 reviewed base/Candidate，普通 Run 使用 default base、Run head 与 expected merge tree，Run Repair Candidate 使用 Run base、Repair Candidate 与 expected merge tree。Controller 不解析 Findings、不维护 closure 状态，也不要求 Development 逐项报告处理结果。该策略不复用旧 pass，不改变 Run/Parent-only 的五次 Review、CI Failure Evidence、Repair Cycle、人工批准或最终完成权威。
+Ticket、Run 与 Parent-only 的每次 Reviewer 都按 Prompt 调用 `code-review` skill。每个窗口的 Reviewer 1 建立当前基线；Ticket Reviewer 2–3 以及 Run/Parent-only Reviewer 2–5 只额外收到紧邻上一轮 Acceptance Artifact 的完整原始内容及其角色化 review identity，Prompt 建议优先参考上轮问题和当前修复，但 Reviewer 自主决定审查顺序、范围以及是否全量审核。Ticket/Parent-only 使用 reviewed base/Candidate，普通 Run 使用 default base、Run head 与 expected merge tree，Run Repair Candidate 使用 Run base、Repair Candidate 与 expected merge tree。Controller 不解析 Findings、不维护 closure 状态，也不要求 Development 逐项报告处理结果。该策略不复用旧 pass；Run 的五次 Review、CI Failure Evidence、Repair Cycle、人工批准或最终完成权威不受本 ADR 影响。Parent-only 的五次 Review 旧决策由 Issue #170 的后续取代决策替换，具体见下节。
+
+## 后续取代：Issue #170 Parent-only 独立配对策略
+
+Issue #170 仅取代本 ADR 中关于 Parent-only 五次 Review 上限及其自动退出路径的旧决策：Parent-only 从有效 Policy Snapshot 读取独立的配对轮数 `N`，Development 与 Reviewer 严格执行 `D=N/R=N`，内置默认 `D10/R10`。第 `N` 次 Reviewer 仍失败时进入 Review Budget Checkpoint，等待维护者显式 `resume` 开启新窗口；Parent-only 不使用 Ticket 的 Deterministic Fallback。
+
+该取代只适用于 Parent-only 的预算上限、配对拓扑与检查点路径，不改变本 ADR 已接受的 Ticket `D4/R3` Deterministic Fallback、Final CI-fix、Required Checks、Run Acceptance 或 Publisher 权威边界；Run 的五次 Review 旧决策也不由 Issue #170 改变。
 
 ## Considered Options
 

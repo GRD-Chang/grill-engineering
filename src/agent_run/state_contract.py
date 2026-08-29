@@ -6,6 +6,7 @@ from typing import Any
 
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
+    parent_only_budget_policy_for_job,
     parse_policy_snapshot,
     ticket_budget_policy_for_job,
 )
@@ -499,7 +500,18 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
     for key in ("parent_job", "run_acceptance"):
         value = state.get(key)
         if isinstance(value, dict):
-            subjects.append((key, value, RUN_POLICY))
+            if key == "parent_job":
+                try:
+                    policy = parent_only_budget_policy_for_job(
+                        value, state_snapshot=state.get("policy_snapshot")
+                    )
+                except (TypeError, ValueError) as error:
+                    raise IncompatibleRunStateError(
+                        "legacy state has an invalid parent_job.policy_snapshot"
+                    ) from error
+            else:
+                policy = RUN_POLICY
+            subjects.append((key, value, policy))
             if key == "run_acceptance" and isinstance(value.get("repair_job"), dict):
                 subjects.append(("run_acceptance.repair_job", value["repair_job"], RUN_POLICY))
     for location, job, policy in subjects:

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.controller import _resume_review_budget_window
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.review_budget import (
     RUN_POLICY,
     TICKET_POLICY,
@@ -114,6 +115,36 @@ def test_run_policy_keeps_existing_development_capacity_but_caps_reviews() -> No
         mark_review(job, RUN_POLICY)
     assert not can_start_review(job, RUN_POLICY)
     assert can_start_development(job, RUN_POLICY)
+
+
+def test_parent_budget_resume_validates_old_window_before_applying_new_policy() -> None:
+    old_policy = DeliveryPolicy(parent_only_paired_rounds=10)
+    new_policy = DeliveryPolicy(parent_only_paired_rounds=2)
+    job = _job_with_budget(
+        review_budget={
+            "window": 1,
+            "development_attempts": 10,
+            "reviewer_invocations": 10,
+            "final_ci_fix_used": False,
+            "review_artifacts": [],
+            "checkpoint_reason": "review_budget_exhausted",
+        },
+        parent_branch="parent-branch",
+        policy_snapshot=old_policy.snapshot(),
+        blocked_reason="review_budget_exhausted",
+        phase="blocked",
+    )
+    state = {
+        "parent_job": job,
+        "policy_snapshot": old_policy.snapshot(),
+        "status": "blocked",
+    }
+
+    assert _resume_review_budget_window(state, new_policy)
+    assert job["review_budget"]["window"] == 2
+    assert job["policy_snapshot"] == new_policy.snapshot()
+    assert job["review_budget_history"][0]["policy_snapshot"] == old_policy.snapshot()
+    assert state["policy_snapshot"] == new_policy.snapshot()
 
 
 @pytest.mark.parametrize("value", [None, [], {"window": 0}])

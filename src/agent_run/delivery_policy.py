@@ -13,12 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_run.review_budget import TICKET_POLICY, ReviewBudgetPolicy
+from agent_run.review_budget import (
+    PARENT_ONLY_POLICY,
+    TICKET_POLICY,
+    ReviewBudgetPolicy,
+)
 
 
-DELIVERY_POLICY_PROTOCOL = 1
+DELIVERY_POLICY_PROTOCOL = 2
 _POLICY_KEYS = frozenset(
     {
+        "parent_only_paired_rounds",
         "ticket_review_rounds",
         "invocation_deadlines",
     }
@@ -39,6 +44,7 @@ class DeliveryPolicy:
     """Complete policy values captured by one Delivery Run/window."""
 
     ticket_review_rounds: int = 3
+    parent_only_paired_rounds: int = 10
     development_deadline_seconds: float = 5 * 60 * 60
     review_deadline_seconds: float = 2 * 60 * 60
     publication_deadline_seconds: float = 60 * 60
@@ -48,6 +54,13 @@ class DeliveryPolicy:
             self,
             "ticket_review_rounds",
             _positive_integer(self.ticket_review_rounds, "ticket_review_rounds"),
+        )
+        object.__setattr__(
+            self,
+            "parent_only_paired_rounds",
+            _positive_integer(
+                self.parent_only_paired_rounds, "parent_only_paired_rounds"
+            ),
         )
         for field, label in (
             ("development_deadline_seconds", "development deadline"),
@@ -62,6 +75,7 @@ class DeliveryPolicy:
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "parent_only_paired_rounds": self.parent_only_paired_rounds,
             "ticket_review_rounds": self.ticket_review_rounds,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
@@ -134,6 +148,8 @@ def normalize_policy_overrides(
         deadlines[role] = value
 
     round_aliases = {
+        "parent_only_paired_round": "parent_only_paired_rounds",
+        "parent_only_paired_rounds": "parent_only_paired_rounds",
         "ticket_review_rounds": "ticket_review_rounds",
         "ticket_review_round": "ticket_review_rounds",
     }
@@ -186,6 +202,7 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
         raise DeliveryPolicyError("Policy Snapshot deadlines have an invalid field set")
     return _policy_from_values(
         {
+            "parent_only_paired_rounds": value.get("parent_only_paired_rounds"),
             "ticket_review_rounds": value.get("ticket_review_rounds"),
             "invocation_deadlines": dict(deadlines),
         }
@@ -232,6 +249,19 @@ def ticket_review_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
         review_limit=policy.ticket_review_rounds,
         final_ci_fix_limit=1,
         fallback=True,
+        budget_scope="ticket",
+    )
+
+
+def parent_only_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
+    """Derive the Parent-only Development N/Review N paired topology."""
+
+    return ReviewBudgetPolicy(
+        development_limit=policy.parent_only_paired_rounds,
+        review_limit=policy.parent_only_paired_rounds,
+        final_ci_fix_limit=0,
+        fallback=False,
+        budget_scope="parent-only",
     )
 
 
@@ -249,6 +279,24 @@ def ticket_budget_policy_for_job(
         return ticket_review_budget_policy(parse_policy_snapshot(raw))
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Ticket Policy Snapshot: {error}") from error
+
+
+def parent_only_budget_policy_for_job(
+    job: Mapping[str, Any], *, state_snapshot: object | None = None
+) -> ReviewBudgetPolicy:
+    """Resolve the frozen Parent-only paired-round policy for one Job."""
+
+    raw = job.get("policy_snapshot")
+    if raw is None:
+        raw = state_snapshot
+    if raw is None:
+        # Keep the direct engine seam usable for legacy unit callers; the
+        # persisted State contract rejects a missing Run Policy Snapshot.
+        return PARENT_ONLY_POLICY
+    try:
+        return parent_only_budget_policy(parse_policy_snapshot(raw))
+    except DeliveryPolicyError as error:
+        raise ValueError(f"invalid Parent-only Policy Snapshot: {error}") from error
 
 
 class DeliveryPolicyStore:
@@ -375,6 +423,9 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
             "invocation_deadlines is missing: " + ", ".join(sorted(required))
         )
     return DeliveryPolicy(
+        parent_only_paired_rounds=_positive_integer(
+            values.get("parent_only_paired_rounds"), "parent_only_paired_rounds"
+        ),
         ticket_review_rounds=_positive_integer(
             values.get("ticket_review_rounds"), "ticket_review_rounds"
         ),

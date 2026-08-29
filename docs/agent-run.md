@@ -44,12 +44,14 @@ Delivery Policy 的取值优先级是内置默认值、用户级默认值、单�
 
 ```bash
 agent-run policy show
-agent-run policy configure --ticket-review-rounds 3 --review-deadline 2h
+agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --review-deadline 2h
 agent-run run <parent-issue> --ticket-review-rounds 1 --development-deadline 30m
 ```
 
 Ticket 的语义 Review 轮数为 `N` 时，普通 Development 为 `N+1` 次、Reviewer 为 `N` 次；默认
 为 `4/3`，最后一次普通 Development 不再进入 Review，并保留有条件的一次 Final CI-fix。
+Parent-only 的配对轮数为 `N` 时，Development 与 Reviewer 都最多执行 `N` 次并严格配对；默认
+为 `10/10`，Reviewer 失败不会转入 Ticket Fallback，而是在当前窗口耗尽后等待显式 Resume。
 正整数轮数和正 duration 在创建 Worker、PR 或部分状态之前校验。每个新 Run 以及显式开启的
 新 Budget Window 都把实际生效的完整策略保存为 Policy Snapshot；之后修改用户级默认值不会
 改变活动 Run 或活动预算窗口。缺少或不完整 Snapshot 的旧状态会 fail closed。

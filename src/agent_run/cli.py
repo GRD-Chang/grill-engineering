@@ -1521,6 +1521,13 @@ def _add_policy_options(
     parser: argparse.ArgumentParser, *, dest_prefix: str = ""
 ) -> None:
     parser.add_argument(
+        "--parent-only-paired-rounds",
+        "--parent-only-paired-round",
+        dest=f"{dest_prefix}parent_only_paired_rounds",
+        type=_positive_integer,
+        help="Parent-only Development/Review 配对轮数（推导 D=N/R=N）",
+    )
+    parser.add_argument(
         "--ticket-review-rounds",
         "--ticket-review-round",
         dest=f"{dest_prefix}ticket_review_rounds",
@@ -1544,7 +1551,7 @@ def _add_policy_options(
 
 def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
-    for key in ("ticket_review_rounds",):
+    for key in ("parent_only_paired_rounds", "ticket_review_rounds"):
         value = getattr(parsed, f"policy_{key}", None)
         if value is None:
             value = getattr(parsed, key, None)

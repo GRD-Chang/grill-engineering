@@ -1613,6 +1613,212 @@ Parent-only 流程复用候选与独立验收门禁，并保持普通合并边�
     }
 
 
+def parent_round_agents(rounds: int, *, passing_last: bool) -> dict[str, object]:
+    development_steps: list[dict[str, object]] = []
+    for ordinal in range(1, rounds + 1):
+        step: dict[str, object] = {
+            "expected_thread_id": None if ordinal == 1 else "parent-round-developer",
+            "thread_id": "parent-round-developer",
+            "summary": f"Completed Parent-only Development {ordinal}.",
+            "write_files": {"parent-feature.txt": f"candidate-{ordinal}\n"},
+        }
+        if ordinal > 1:
+            step["expected_files"] = {
+                "parent-feature.txt": f"candidate-{ordinal - 1}\n"
+            }
+        development_steps.append(step)
+    reviews = [
+        (
+            passing_acceptance(
+                f"parent-round-reviewer-{ordinal}", "The final candidate passed."
+            )
+            if passing_last and ordinal == rounds
+            else repair_acceptance(f"parent-round-reviewer-{ordinal}")
+        )
+        for ordinal in range(1, rounds + 1)
+    ]
+    return {
+        "developments": development_steps,
+        "publications": [parent_publication()],
+        "reviews": reviews,
+    }
+
+
+def test_parent_only_uses_configured_paired_rounds_and_shared_publication_gate(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-configured-rounds.json"
+    agents.write_text(json.dumps(parent_round_agents(2, passing_last=True)), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--parent-only-paired-rounds",
+        "2",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    job = state["parent_job"]
+    assert state["policy_snapshot"]["parent_only_paired_rounds"] == 2
+    assert job["policy_snapshot"] == state["policy_snapshot"]
+    assert job["review_budget"]["development_attempts"] == 2
+    assert job["review_budget"]["reviewer_invocations"] == 2
+    assert "fallback_publication_receipt" not in job
+    assert job["phase"] == "ready_for_approval"
+    status = stdout_json(run_cli(git_repo, fixture, "status", state["run_id"], "--json"))
+    assert status["review_budget"]["development_limit"] == 2
+    assert status["review_budget"]["reviewer_limit"] == 2
+
+    approved = run_cli(git_repo, fixture, "approve", state["run_id"])
+
+    assert approved.returncode == 0, approved.stderr
+    assert stdout_json(approved)["status"] == "completed"
+
+
+def test_parent_only_default_paired_budget_reaches_the_tenth_reviewer(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-default-ten-rounds.json"
+    agents.write_text(json.dumps(parent_round_agents(10, passing_last=True)), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+        extra_env={"XDG_CONFIG_HOME": str(git_repo / "default-policy-config")},
+    )
+
+    assert result.returncode == 0, result.stderr
+    state = load_only_run_state(git_repo)
+    job = state["parent_job"]
+    assert state["policy_snapshot"]["parent_only_paired_rounds"] == 10
+    assert job["review_budget"]["development_attempts"] == 10
+    assert job["review_budget"]["reviewer_invocations"] == 10
+    assert len(job["review_budget"]["review_artifacts"]) == 10
+    assert job["phase"] == "ready_for_approval"
+    assert "fallback_publication_receipt" not in job
+
+    approved = run_cli(git_repo, fixture, "approve", state["run_id"])
+
+    assert approved.returncode == 0, approved.stderr
+    assert stdout_json(approved)["status"] == "completed"
+
+
+def test_parent_only_tenth_review_failure_checkpoints_without_an_extra_development(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = git_repo / "parent-ten-round-failure.json"
+    agents.write_text(json.dumps(parent_round_agents(10, passing_last=False)), encoding="utf-8")
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert result.returncode == 2, result.stdout
+    state = load_only_run_state(git_repo)
+    job = state["parent_job"]
+    assert state["status"] == "blocked"
+    assert job["blocked_reason"] == "review_budget_exhausted"
+    assert job["review_budget"]["checkpoint_reason"] == "review_budget_exhausted"
+    assert job["review_budget"]["development_attempts"] == 10
+    assert job["review_budget"]["reviewer_invocations"] == 10
+    assert len(job["review_budget"]["review_artifacts"]) == 10
+    assert len(job["reviewer_thread_ids"]) == 10
+    assert "fallback_publication_receipt" not in job
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "pull_requests"
+    ] == []
+
+
+def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    initial_agents = git_repo / "parent-checkpoint-agents.json"
+    initial_agents.write_text(
+        json.dumps(parent_round_agents(1, passing_last=False)), encoding="utf-8"
+    )
+
+    blocked = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--parent-only-paired-rounds",
+        "1",
+        "--agent-fixture",
+        str(initial_agents),
+    )
+
+    assert blocked.returncode == 2, blocked.stdout
+    blocked_state = load_only_run_state(git_repo)
+    assert blocked_state["parent_job"]["review_budget"]["window"] == 1
+
+    resumed_agents = git_repo / "parent-checkpoint-resume-agents.json"
+    resumed_agents.write_text(
+        json.dumps(
+            {
+                "developments": [
+                    {
+                        "expected_thread_id": "parent-round-developer",
+                        "thread_id": "parent-round-developer",
+                        "expected_files": {"parent-feature.txt": "candidate-1\n"},
+                        "summary": "Repaired the Parent-only finding.",
+                        "write_files": {"parent-feature.txt": "candidate-2\n"},
+                    }
+                ],
+                "publications": [parent_publication()],
+                "reviews": [
+                    passing_acceptance(
+                        "parent-resume-reviewer", "The new budget window passed."
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        blocked_state["run_id"],
+        "--parent-only-paired-rounds",
+        "2",
+        "--agent-fixture",
+        str(resumed_agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    state = load_only_run_state(git_repo)
+    job = state["parent_job"]
+    assert state["policy_snapshot"]["parent_only_paired_rounds"] == 2
+    assert job["policy_snapshot"] == state["policy_snapshot"]
+    assert job["review_budget"]["window"] == 2
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
+    assert job["review_budget_history"][0]["policy_snapshot"][
+        "parent_only_paired_rounds"
+    ] == 1
+    assert job["phase"] == "ready_for_approval"
+
+
 @pytest.mark.parametrize(
     ("display_outcome", "expected_display_status"),
     [

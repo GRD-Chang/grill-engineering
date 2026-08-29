@@ -32,6 +32,7 @@ from agent_run.change_delivery import (
 )
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.delivery_loop import TicketDeliveryAdapter
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GitHubReadError, MergeOutcomeUnknownError
@@ -3239,7 +3240,11 @@ def test_parent_publication_reads_existing_pr_context_once(git_repo: Path) -> No
 
 
 def test_parent_review_budget_exhaustion_persists_checkpoint() -> None:
-    state: dict[str, Any] = {"status": "parent_delivery_pending", "diagnostics": []}
+    state: dict[str, Any] = {
+        "status": "parent_delivery_pending",
+        "diagnostics": [],
+        "policy_snapshot": DeliveryPolicy().snapshot(),
+    }
     job: dict[str, Any] = {
         "review_budget": {
             "window": 1,

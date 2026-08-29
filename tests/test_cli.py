@@ -73,6 +73,8 @@ def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
                 "configure",
                 "--ticket-review-rounds",
                 "2",
+                "--parent-only-paired-rounds",
+                "7",
                 "--review-deadline",
                 "90m",
             ]
@@ -82,6 +84,7 @@ def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
     configured = json.loads(capsys.readouterr().out)
     assert configured["result"] == "configured"
     assert configured["policy"]["ticket_review_rounds"] == 2
+    assert configured["policy"]["parent_only_paired_rounds"] == 7
     assert configured["policy"]["invocation_deadlines"]["review"] == 5400
 
     assert main(["policy", "show"]) == 0
@@ -89,6 +92,7 @@ def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
     assert shown["result"] == "policy"
     assert shown["user_defaults"] == {
         "invocation_deadlines": {"review": "90m"},
+        "parent_only_paired_rounds": 7,
         "ticket_review_rounds": 2,
     }
 
