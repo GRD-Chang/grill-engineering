@@ -90,10 +90,52 @@ def append_explicit_resume_audit(
     }
     event["resume_id"] = resume_identity(str(state["run_id"]), event)
     event["event_digest"] = resume_event_digest(event)
+    response_audit: dict[str, Any] | None = None
+    response: str | None = None
+    if human_response_supplied:
+        response = _latest_human_response(state, event)
+        if response is None:
+            raise ValueError("Human Response Resume is missing its response fact")
+        stored_audit = state.setdefault("human_response_audit", {})
+        if not isinstance(stored_audit, dict):
+            raise ValueError("human_response_audit must be an object")
+        response_audit = stored_audit
     history.append(event)
+    if response_audit is not None and response is not None:
+        response_audit[event["resume_id"]] = response
     audit["rolling_digest"] = resume_history_digest(history)
     audit["total"] = sequence
     return deepcopy(event)
+
+
+def _latest_human_response(
+    state: dict[str, Any], event: dict[str, Any]
+) -> str | None:
+    work_subject = event.get("work_subject")
+    generation = event.get("generation")
+    subject: object = None
+    if isinstance(work_subject, str) and work_subject.startswith("ticket:"):
+        jobs = state.get("ticket_jobs")
+        subject = jobs.get(work_subject.split(":", 1)[1]) if isinstance(jobs, dict) else None
+    elif isinstance(work_subject, str) and work_subject.startswith("parent-only:"):
+        subject = state.get("parent_job")
+    elif isinstance(work_subject, str) and work_subject.startswith("run-acceptance:"):
+        subject = state.get("run_acceptance")
+    elif isinstance(work_subject, str) and work_subject.startswith("run-repair:"):
+        acceptance = state.get("run_acceptance")
+        subject = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    elif isinstance(work_subject, str) and work_subject.startswith("run-publication:"):
+        subject = state.get("run_publication")
+    history = subject.get("human_response_history") if isinstance(subject, dict) else None
+    if not isinstance(history, list):
+        return None
+    for entry in reversed(history):
+        if not isinstance(entry, dict) or entry.get("generation") != generation:
+            continue
+        response = entry.get("response")
+        if isinstance(response, str):
+            return response
+    return None
 
 
 def latest_resume_audit(state: dict[str, Any]) -> dict[str, Any] | None:

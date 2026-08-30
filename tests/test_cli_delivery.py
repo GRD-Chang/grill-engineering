@@ -3405,8 +3405,8 @@ def test_child_addition_cannot_continue_parent_only_delivery(
     assert status["scope_change"]["observed_graph_revision"] == observed
     assert "abandon" in status["next_action"]
     status_text = run_cli(git_repo, fixture, "status", run_id).stdout
-    assert f"accepted={accepted}" in status_text
-    assert f"observed={observed}" in status_text
+    assert accepted not in status_text
+    assert observed not in status_text
     assert "Ticket 图变化：新增 1" in status_text
     history = stdout_json(
         run_cli(git_repo, fixture, "history", run_id, "--json")
@@ -3422,8 +3422,8 @@ def test_child_addition_cannot_continue_parent_only_delivery(
     assert scope_events[0]["graph_change_summary"]["added_tickets"] == [3]
     assert "abandon" in history["next_action"]
     history_text = run_cli(git_repo, fixture, "history", run_id).stdout
-    assert f"accepted={accepted}" in history_text
-    assert f"observed={observed}" in history_text
+    assert accepted not in history_text
+    assert observed not in history_text
     assert "新增 Ticket [3]" in history_text
     final = json.loads(fixture.read_text(encoding="utf-8"))
     assert final.get("delivery", {}).get("mutations", []) == []

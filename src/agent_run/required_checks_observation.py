@@ -286,6 +286,7 @@ def clear_required_checks_observation(job: dict[str, Any]) -> None:
     for key in (
         "required_checks_evidence",
         "required_checks_observation_status",
+        "required_checks_observed_at",
         "required_checks",
         "required_checks_mode",
     ):

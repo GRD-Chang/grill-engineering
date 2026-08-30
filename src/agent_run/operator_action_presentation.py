@@ -8,6 +8,7 @@ from agent_run.operator_gate import (
     operator_gate_evidence,
     operator_gate_subjects,
 )
+from agent_run.presentation_helpers import delivery_object_label, human_next_action
 
 
 def operator_action_view(
@@ -56,7 +57,12 @@ def operator_action_view(
     )
     return {
         "type": _operator_action_label(action_kind),
-        "object": _operator_action_object(state, location, subject),
+        "object": delivery_object_label(
+            state,
+            location,
+            ticket_number=subject.get("ticket_number"),
+            include_parent_for_run=True,
+        ),
         "phase": phase,
         "reasons": reasons,
         "trigger_invocation": (
@@ -72,7 +78,9 @@ def operator_action_view(
     }
 
 
-def print_operator_action(action: dict[str, Any]) -> None:
+def print_operator_action(
+    action: dict[str, Any], *, run_id: object = None
+) -> None:
     print("操作者动作:")
     print(f"类型: {action['type']}")
     print(f"对象: {action['object']}")
@@ -87,9 +95,26 @@ def print_operator_action(action: dict[str, Any]) -> None:
             f"reasoning effort {invocation['reasoning_effort']}；"
             f"本轮时长: {invocation['duration_seconds']} 秒"
         )
-    print(f"已保留成果: {action['preserved']}")
+    print(f"已保留成果: {_human_preserved_results(action['preserved'])}")
     print("全局暂停: 整个 Delivery Run 已暂停；其他 Ticket 不会推进")
-    print(f"唯一下一步: {action['next_action']}")
+    print(
+        "唯一下一步: "
+        f"{human_next_action(action['next_action'], run_id=run_id)}"
+    )
+
+
+def _human_preserved_results(value: object) -> str:
+    if not isinstance(value, str):
+        return "当前状态与已有审计证据"
+    parts: list[str] = []
+    for item in value.split("；"):
+        if item.startswith("Candidate "):
+            parts.append("Candidate 已保存")
+        elif item.startswith("Managed Checkout "):
+            parts.append("Managed Checkout 已保存")
+        else:
+            parts.append(item)
+    return "；".join(parts)
 
 
 def _operator_action_kind(
@@ -159,22 +184,6 @@ def _diagnostic_code(state: dict[str, Any]) -> str | None:
     diagnostic = diagnostics[0]
     code = diagnostic.get("code") if isinstance(diagnostic, dict) else None
     return code if isinstance(code, str) and code else None
-
-
-def _operator_action_object(
-    state: dict[str, Any], location: str, subject: dict[str, Any]
-) -> str:
-    if location.startswith("ticket:"):
-        return f"Ticket #{subject.get('ticket_number', location.split(':', 1)[1])}"
-    parent = state.get("parent")
-    parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
-    if location == "parent":
-        return f"Parent Issue #{parent_number}"
-    if location in {"run_acceptance", "run_repair"}:
-        return "Run Acceptance"
-    if location == "run_publication":
-        return "Run Publication"
-    return f"Delivery Run（Parent Issue #{parent_number}）"
 
 
 def _triggering_invocation(
@@ -268,6 +277,12 @@ def _operator_next_action(
         "supervision_timeout",
     } and isinstance(repository, str) and isinstance(parent_number, int):
         return f"agent-run resume {parent_number} --repo {repository}"
+    if (
+        action_kind == "final_approval"
+        and isinstance(repository, str)
+        and isinstance(parent_number, int)
+    ):
+        return f"agent-run approve {parent_number} --repo {repository}"
     if action_kind == "deterministic_contradiction":
         run_id = state.get("run_id")
         if state.get("status") == "unsupported_scope_change":
@@ -275,8 +290,11 @@ def _operator_next_action(
         if reason in {
             "candidate_or_acceptance_inconsistent",
             "foreign_run_pr",
-        } and isinstance(run_id, str):
-            return f"agent-run abandon {run_id}"
+        }:
+            if isinstance(repository, str) and isinstance(parent_number, int):
+                return f"agent-run abandon {parent_number} --repo {repository}"
+            if isinstance(run_id, str):
+                return f"agent-run abandon {run_id}"
         if isinstance(repository, str) and isinstance(parent_number, int):
             return (
                 "修复诊断中的确定性外部矛盾后执行 "

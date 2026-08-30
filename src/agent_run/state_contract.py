@@ -196,6 +196,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
     _require_resume_audit(state["resume_audit"], run_id=str(state["run_id"]))
+    _require_human_response_audit(state)
     if not operator_gate_identity_is_consistent(state):
         raise IncompatibleRunStateError(
             "legacy state has an inconsistent Operator Gate action identity "
@@ -205,6 +206,19 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
         raise IncompatibleRunStateError("legacy state has an invalid timeline")
+    timeline_continuation = state.get("timeline_continuation", [])
+    if not isinstance(timeline_continuation, list) or not all(
+        isinstance(event, dict) for event in timeline_continuation
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid timeline_continuation"
+        )
+    from agent_run.state import MAX_TIMELINE_CONTINUATION_EVENTS
+
+    if len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
+        raise IncompatibleRunStateError(
+            "legacy state has an oversized timeline_continuation"
+        )
     if "active_agent_invocation" not in state:
         raise IncompatibleRunStateError(
             "legacy state is missing canonical active_agent_invocation"
@@ -821,6 +835,53 @@ def _require_resume_audit(audit: dict[str, Any], *, run_id: str) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an inconsistent resume_audit.rolling_digest"
         )
+
+
+def _require_human_response_audit(state: dict[str, Any]) -> None:
+    protocol = state.get("human_response_audit_protocol")
+    if protocol is not None and protocol != 1:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Human Response audit protocol"
+        )
+    if protocol == 1 and "human_response_audit" not in state:
+        raise IncompatibleRunStateError(
+            "current state is missing canonical human_response_audit"
+        )
+    response_audit = state.get("human_response_audit", {})
+    if not isinstance(response_audit, dict):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid human_response_audit"
+        )
+    resume_audit = state["resume_audit"]
+    history = resume_audit.get("history") if isinstance(resume_audit, dict) else None
+    events = {
+        event.get("resume_id"): event
+        for event in (history if isinstance(history, list) else [])
+        if isinstance(event, dict)
+    }
+    expected_resume_ids = {
+        resume_id
+        for resume_id, event in events.items()
+        if isinstance(resume_id, str)
+        and event.get("human_response_supplied") is True
+    }
+    if protocol == 1 and set(response_audit) != expected_resume_ids:
+        raise IncompatibleRunStateError(
+            "legacy state has incomplete Human Response audit facts"
+        )
+    for resume_id, response in response_audit.items():
+        event = events.get(resume_id)
+        if (
+            not isinstance(resume_id, str)
+            or not isinstance(response, str)
+            or not response
+            or len(response.encode("utf-8")) > 8192
+            or not isinstance(event, dict)
+            or event.get("human_response_supplied") is not True
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Human Response audit fact"
+            )
 
 
 def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:

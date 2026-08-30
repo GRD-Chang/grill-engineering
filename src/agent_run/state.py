@@ -17,6 +17,7 @@ from agent_run.resume_audit import latest_resume_audit
 
 
 MAX_TIMELINE_EVENTS = 256
+MAX_TIMELINE_CONTINUATION_EVENTS = 256
 
 
 class SimulatedProcessCrash(OSError):
@@ -49,6 +50,9 @@ class StateStore:
             state["timeline"] = durable_state["timeline"]
             if durable_state.get("timeline_at_capacity") is True:
                 state["timeline_at_capacity"] = True
+            continuation = durable_state.get("timeline_continuation")
+            if isinstance(continuation, list):
+                state["timeline_continuation"] = continuation
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.runs_directory,
             prefix=f".{run_id}.",
@@ -147,6 +151,7 @@ def _append_timeline_event(
     marker = _timeline_marker(state)
     marker.update(_execution_timeline_projection(state))
     marker["result"] = _timeline_result(state)
+    previous_marker: dict[str, object] | None = None
     if previous is not None:
         previous_marker = _timeline_marker(previous)
         previous_marker.update(_execution_timeline_projection(previous))
@@ -157,6 +162,7 @@ def _append_timeline_event(
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
     if state.get("timeline_at_capacity") is True:
+        _append_timeline_continuation(state, marker, previous_marker)
         return
     if len(timeline) >= MAX_TIMELINE_EVENTS - 1:
         timeline.append(
@@ -168,8 +174,59 @@ def _append_timeline_event(
             }
         )
         state["timeline_at_capacity"] = True
+        _append_timeline_continuation(state, marker, previous_marker)
         return
-    event = {
+    event = _timeline_event(marker)
+    if _event_matches_marker(timeline[-1] if timeline else None, marker):
+        return
+    timeline.append(event)
+
+
+def _append_timeline_continuation(
+    state: dict[str, Any],
+    marker: dict[str, object],
+    previous_marker: dict[str, object] | None,
+) -> None:
+    continuation = state.setdefault("timeline_continuation", [])
+    if not isinstance(continuation, list):
+        raise ValueError("timeline_continuation must be an array")
+    continuation_marker = dict(marker)
+    continuation_marker["kind"] = _continuation_kind(marker, previous_marker)
+    if _event_matches_marker(
+        continuation[-1] if continuation else None, continuation_marker
+    ):
+        return
+    continuation.append(_timeline_event(continuation_marker))
+    if len(continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
+        del continuation[: len(continuation) - MAX_TIMELINE_CONTINUATION_EVENTS]
+
+
+def _continuation_kind(
+    marker: dict[str, object], previous_marker: dict[str, object] | None
+) -> object:
+    status = marker.get("status")
+    phase = marker.get("phase")
+    if status in {"completed", "abandoned"}:
+        return "completion"
+    if phase in {"merged", "completed"}:
+        return "integration"
+    if previous_marker is None or marker.get("approval_granted_at") != previous_marker.get(
+        "approval_granted_at"
+    ):
+        if marker.get("approval_granted_at") is not None:
+            return "publication"
+    if previous_marker is None or marker.get(
+        "required_checks_observed_at"
+    ) != previous_marker.get("required_checks_observed_at"):
+        if marker.get("required_checks_result") is not None:
+            return "required_checks"
+    if marker.get("kind") == "run_publication":
+        return "publication"
+    return marker["kind"]
+
+
+def _timeline_event(marker: dict[str, object]) -> dict[str, object]:
+    event: dict[str, object] = {
         "at": datetime.now(UTC).isoformat(),
         "kind": marker["kind"],
         "status": marker["status"],
@@ -182,6 +239,9 @@ def _append_timeline_event(
         "phase",
         "pr_number",
         "commit_sha",
+        "approval_granted_at",
+        "required_checks_result",
+        "required_checks_observed_at",
         "human_blockers",
         "accepted_graph_revision",
         "observed_graph_revision",
@@ -205,9 +265,7 @@ def _append_timeline_event(
         value = marker.get(key)
         if value is not None or (key == "budget_window" and key in marker):
             event[key] = deepcopy(value) if key == "graph_change_summary" else value
-    if _event_matches_marker(timeline[-1] if timeline else None, marker):
-        return
-    timeline.append(event)
+    return event
 
 
 def _execution_timeline_projection(state: dict[str, Any]) -> dict[str, object]:
@@ -310,6 +368,8 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
     ) and isinstance(publication, dict):
         phase = str(publication.get("phase", "pending"))
         role = _worker_role(publication, phase)
+        approval_grant = publication.get("approval_grant")
+        required_checks = publication.get("required_checks_evidence")
         return _with_human_blockers({
             "kind": "run_publication",
             "status": status,
@@ -319,6 +379,19 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             "phase": phase,
             "pr_number": publication.get("pr_number"),
             "commit_sha": publication.get("integrated_sha"),
+            "approval_granted_at": (
+                approval_grant.get("granted_at")
+                if isinstance(approval_grant, dict)
+                else None
+            ),
+            "required_checks_result": (
+                required_checks.get("result")
+                if isinstance(required_checks, dict)
+                else None
+            ),
+            "required_checks_observed_at": publication.get(
+                "required_checks_observed_at"
+            ),
         }, publication)
     run_acceptance = state.get("run_acceptance")
     if status in {"run_acceptance_pending", "ready_for_human"} and isinstance(

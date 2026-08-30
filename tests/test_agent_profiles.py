@@ -600,14 +600,15 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         assert review["profile_revision"] == 2
         text_history = run_cli(git_repo, fixture, "history", run_id).stdout
         assert "model=old-development" in text_history
-        assert "profile_revision=1" in text_history
+        assert "reasoning_effort=max" in text_history
+        assert "profile_revision" not in text_history
         publication = next(
             item
             for item in history["agent_invocations"]
             if item.get("invocation_role") == "publication"
         )
         assert publication["binding_role"] == "development"
-        assert "Agent Invocation publication(profile=development)" in text_history
+        assert "profile=development" not in text_history
     finally:
         if process.poll() is None:
             process.terminate()

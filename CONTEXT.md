@@ -473,8 +473,8 @@ _Avoid_: Ticket 局部人工门禁、门禁期间切换 frontier、把普通依�
 _Avoid_: 把 Parent Issue 当成全局唯一身份、全局 `latest` 猜测、要求用户记住哈希式 Run ID、模糊前缀匹配
 
 **Lifecycle Parent Selector（生命周期 Parent 选择器）**:
-操作者为当前仓库中的 mutation 命令选择 Delivery Run 的现有用户合同：`run` 与 `resume` 都以位置参数形式接收 Parent Issue number，并可用显式 repository identity 校验目标；`resume` 只允许匹配一个已存在且处于可恢复人工门禁的 Run，不创建新 Run，也不根据最近时间猜测。完整不透明 Run ID 只保留给自动化、精确排障和歧义恢复，不是普通恢复流程的必填身份。
-_Avoid_: 为 resume 另造 `--parent` 语法、把 Parent Issue 当成跨仓库身份、resume 隐式创建 Run、最近 Run 猜测
+操作者为当前仓库中的 mutation 命令选择 Delivery Run 的现有用户合同：`run`、`resume` 与 `approve` 都以位置参数形式接收 Parent Issue number，并可用显式 repository identity 校验目标；`resume` 只允许匹配一个已存在且处于可恢复人工门禁的 Run，`approve` 只允许匹配一个处于最终批准门禁的 Run。两者都不创建新 Run，也不根据最近时间猜测；完整不透明 Run ID 只保留给自动化、精确排障和歧义恢复，不是普通操作流程的必填身份。
+_Avoid_: 为 lifecycle action 另造 `--parent` 语法、把 Parent Issue 当成跨仓库身份、mutation 隐式创建 Run、最近 Run 猜测
 
 **Machine Audit View（机器审计视图）**:
 `status --json` 与 `history --json` 提供的稳定机器可读视图，保留诊断、自动化和精确审计所需的内部身份、版本绑定、调用记录与计数层级。

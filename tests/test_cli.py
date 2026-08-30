@@ -19,6 +19,8 @@ from agent_run.controller import Controller
 from agent_run.codex import CodexProcessError
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
+from agent_run.operator_action_presentation import print_operator_action
+from agent_run.presentation_helpers import human_next_action
 from agent_run.requeue import RequeueError
 from agent_run.run_driver import DirectRunOperations, RunStep
 from agent_run.semantic_attempt import canonical_fingerprint
@@ -845,11 +847,11 @@ def test_status_distinguishes_semantic_invocation_output_budget_and_publication_
 
     cli.cli_presentation._print_status(state, as_json=False)
     human = capsys.readouterr().out
-    assert "Semantic Agent Attempt: attempt-publication-2" in human
-    assert "Agent Invocation: publication failed" in human
-    assert "Output Attempt: 3" in human
-    assert "Budget Window: none" in human
-    assert "Publication Operation Retry: 2/4" in human
+    assert "Status:     执行失败，可恢复" in human
+    assert "Ticket #3" in human
+    assert "Semantic Agent Attempt" not in human
+    assert "attempt-publication-2" not in human
+    assert "sha256:boundary" not in human
 
 
 def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
@@ -944,11 +946,10 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
 
     cli.cli_presentation._print_history(state, as_json=False)
     human = capsys.readouterr().out
-    assert "Semantic Agent Attempt attempt-reviewer-1 reviewer ordinal=1" in human
-    assert "Agent Invocation failed" in human
-    assert "Output Attempt=2" in human
-    assert "Budget Window=1" in human
-    assert "Publication Operation Retry=1/3" in human
+    assert "Review Agent 第 1 轮" in human
+    assert "Semantic Agent Attempt" not in human
+    assert "attempt-reviewer-1" not in human
+    assert "sha256:second" not in human
 
 
 def test_timeline_projects_semantic_invocation_output_and_retry_counters(
@@ -1054,9 +1055,254 @@ def test_status_exposes_preserved_dirty_checkout_and_recovery_action(
 
     cli.cli_presentation._print_status(state, as_json=False)
     human = capsys.readouterr().out
-    assert "/repo/.agent-run/worktrees/run-1/ticket-3" in human
-    assert "tracked modifications" in human
-    assert "agent-run resume run-1" in human
+    assert "已保留 1 个受管工作区" in human
+    assert "完整诊断与恢复操作见 --json" in human
+    assert "/repo/.agent-run/worktrees/run-1/ticket-3" not in human
+    assert "tracked modifications" not in human
+    assert "run-1" not in human
+
+
+def test_operator_action_keeps_repository_names_starting_with_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    print_operator_action(
+        {
+            "type": "Human Blocker",
+            "object": "Ticket #2",
+            "phase": "candidate",
+            "reasons": ["需要操作者确认"],
+            "trigger_invocation": None,
+            "preserved": "当前状态与已有审计证据",
+            "next_action": (
+                "agent-run resume 1 --repo run-1-1234567890abcdef/project"
+            ),
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "agent-run resume 1 --repo run-1-1234567890abcdef/project" in output
+    assert "<run-id>/project" not in output
+    assert human_next_action(
+        "agent-run resume run-1-1234567890abcdef-2",
+        run_id="run-1-1234567890abcdef-2",
+    ) == "agent-run resume <run-id>"
+    print_operator_action(
+        {
+            "type": "Deterministic Contradiction",
+            "object": "Ticket #2",
+            "phase": "blocked",
+            "reasons": ["Candidate mismatch"],
+            "trigger_invocation": None,
+            "preserved": "当前状态与已有审计证据",
+            "next_action": "agent-run abandon run-1-1234567890abcdef-2",
+        },
+        run_id="run-1-1234567890abcdef-2",
+    )
+    contradiction = capsys.readouterr().out
+    assert "agent-run abandon <run-id>" in contradiction
+    assert "run-1-1234567890abcdef-2" not in contradiction
+
+
+def test_history_matches_responses_and_findings_to_their_subject_and_window(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def artifact(finding: str) -> dict[str, object]:
+        return {
+            "checks": {
+                "e2e": {"findings": [finding]},
+                "standards": {"findings": []},
+                "spec": {"findings": []},
+            }
+        }
+
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "active",
+        "timeline": [],
+        "ticket_jobs": {
+            "2": {
+                "human_response_history": [{"response": "response-for-ticket-2"}],
+                "review_budget_history": [
+                    {
+                        "review_budget": {
+                            "window": 1,
+                            "review_artifacts": [{"artifact": artifact("old-window")}],
+                        }
+                    }
+                ],
+                "review_budget": {
+                    "window": 2,
+                    "review_artifacts": [{"artifact": artifact("current-window")}],
+                },
+            },
+            "3": {
+                "human_response_history": [{"response": "response-for-ticket-3"}],
+                "review_budget_history": [],
+                "review_budget": {"window": 1, "review_artifacts": []},
+            },
+        },
+        "agent_invocation_history": [
+            {
+                "started_at": "2026-08-30T00:01:00+00:00",
+                "ended_at": "2026-08-30T00:02:00+00:00",
+                "status": "completed",
+                "phase": "candidate",
+                "work_subject": "ticket:2",
+                "invocation_role": "reviewer",
+                "semantic_attempt": {
+                    "role": "reviewer",
+                    "ordinal": 1,
+                    "budget_window": 2,
+                },
+            }
+        ],
+        "resume_audit": {
+            "history": [
+                {
+                    "requested_at": "2026-08-30T00:03:00+00:00",
+                    "work_subject": "ticket:3",
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+                {
+                    "requested_at": "2026-08-30T00:04:00+00:00",
+                    "work_subject": "ticket:2",
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+            ]
+        },
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+    review = next(event for event in output["events"] if event["kind"] == "review")
+    resumes = [event for event in output["events"] if event["kind"] == "resume"]
+
+    assert review["details"] == ["current-window"]
+    assert [(event["object"], event["details"]) for event in resumes] == [
+        ("Ticket #3", ["response-for-ticket-3"]),
+        ("Ticket #2", ["response-for-ticket-2"]),
+    ]
+
+
+def test_terminal_status_and_history_share_a_stable_elapsed_time(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "completed",
+        "timeline": [
+            {
+                "at": "2026-08-30T00:00:10+00:00",
+                "kind": "run_status",
+                "status": "completed",
+            }
+        ],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    first_status = json.loads(capsys.readouterr().out)
+    cli.cli_presentation._print_status(state, as_json=True)
+    second_status = json.loads(capsys.readouterr().out)
+    cli.cli_presentation._print_history(state, as_json=True)
+    history = json.loads(capsys.readouterr().out)
+
+    assert first_status["elapsed_seconds"] == 10
+    assert second_status["elapsed_seconds"] == 10
+    assert history["summary"]["elapsed_seconds"] == 10
+
+
+def test_history_does_not_assign_a_new_generation_response_to_an_old_resume(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "active",
+        "timeline": [],
+        "ticket_jobs": {
+            "2": {
+                "human_response_history": [
+                    {"generation": 2, "response": "new-generation-response"}
+                ]
+            }
+        },
+        "resume_audit": {
+            "history": [
+                {
+                    "requested_at": "2026-08-30T00:01:00+00:00",
+                    "work_subject": "ticket:2",
+                    "generation": 1,
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+                {
+                    "requested_at": "2026-08-30T00:02:00+00:00",
+                    "work_subject": "ticket:2",
+                    "generation": 2,
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+            ]
+        },
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+    resumes = [event for event in output["events"] if event["kind"] == "resume"]
+
+    assert [event["details"] for event in resumes] == [
+        [],
+        ["new-generation-response"],
+    ]
+
+
+def test_status_labels_the_latest_agent_with_its_own_ticket(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "active",
+        "active_ticket_job": {"ticket_number": 3, "phase": "developing"},
+        "ticket_jobs": {
+            "2": {"ticket_number": 2, "phase": "completed"},
+            "3": {"ticket_number": 3, "phase": "developing"},
+        },
+        "agent_invocation_history": [
+            {
+                "started_at": "2026-08-30T00:01:00+00:00",
+                "ended_at": "2026-08-30T00:02:00+00:00",
+                "status": "completed",
+                "work_subject": "ticket:2",
+                "role": "publication",
+                "model": "fixture-agent",
+                "reasoning_effort": "high",
+            }
+        ],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=False)
+    output = capsys.readouterr().out
+
+    assert "当前对象:   Ticket #3" in output
+    assert "最近 Agent: Publication Agent · Ticket #2" in output
+    assert "Publication Agent · Ticket #3" not in output
 
 
 def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(

@@ -136,12 +136,13 @@ agent-run history [--parent <parent-issue>]
 agent-run runs [--repo OWNER/REPO]
 agent-run resume <parent-issue> --repo OWNER/REPO
 agent-run doctor [--json]
-agent-run approve <run-id> --repo OWNER/REPO
+agent-run approve <parent-issue> --repo OWNER/REPO
 ```
 
 `start` 只创建或恢复本地 Delivery Run；`run` 推进正常 Job Loop；当前仓库只有一个进行中 Run 时，
 `status`、`history` 可省略选择参数，也可以使用 `--parent`；在任意目录用 `--repo` 时必须同时
 提供 `--parent`。`runs` 用于发现候选，`resume` 按 Parent 只恢复一个已存在且可恢复的 Run，
-不会创建新 Run；完整 Run ID 和显式 `--state-dir` 仍保留给自动化与精确排障。`approve` 是进入默认分支前的显式人工批准。安装、更新、rollback 和
+不会创建新 Run；`approve` 按 Parent 只选择一个处于最终批准门禁的 Run。两者在零匹配或多匹配时
+都会拒绝猜测；完整 Run ID 和显式 `--state-dir` 仍保留给自动化与精确排障。`approve` 是进入默认分支前的显式人工批准。安装、更新、rollback 和
 uninstall 都不迁移、修改或绑定既有 Delivery Run；不兼容 state 仍返回
 `incompatible_run_state`。

@@ -66,7 +66,7 @@ Invocation 内的初始调用和 Output Repair 共用该 deadline。
 ```bash
 agent-run resume <parent-issue> [--new-thread] [--message "..."] --repo OWNER/REPO
 agent-run requeue <run-id> --repo OWNER/REPO
-agent-run approve <run-id> --repo OWNER/REPO
+agent-run approve <parent-issue> --repo OWNER/REPO
 agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
 agent-run abandon <run-id> [--discard-worktree] --repo OWNER/REPO
 ```
@@ -114,10 +114,11 @@ Profile Revision 同时保留各角色的 preset 与显式覆盖来源。Publica
 解除引用时，仍沿用的 Development 显式字段会记录在 `provenance.inherited` 中，避免仅凭当前
 preset 误解其实际值来源。
 
-同一 Thread 的 Resume 与 Output Repair 始终使用原绑定；配置只影响后来创建的 Thread。`status` 在
-运行中的顶层 Codex 显示实际 Invocation role、Thread、model、reasoning effort 和 Profile Revision；
-如果 Thread 引用另一 Profile，还会同时显示被引用的 Profile role。空闲时显示 `none`；
-`history --json` 保留每次启动的相同事实，包括仍在运行中的 Invocation。
+同一 Thread 的 Resume 与 Output Repair 始终使用原绑定；配置只影响后来创建的 Thread。普通
+`status` 在运行中的顶层 Codex 只显示面向操作者的角色、model 与 reasoning effort；Thread、Profile
+Revision、绑定来源及其他内部身份只由 `status --json` 的 Machine Audit View 提供。空闲时普通视图
+显示当前没有运行中的 Agent；`history --json` 保留每次启动的完整审计事实，包括仍在运行中的
+Invocation。
 
 会触发代码修复的 Required Check 必须由 GitHub Actions job API 准确绑定当前 PR head，且失败
 只发生在仓库 `pyproject.toml` 显式列出的稳定 `workflow::name::step`；缺少或矛盾的
@@ -148,8 +149,10 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 `publication_operation_retries` 分别展示语义工作、输出修复、预算和外部发布操作重试，不把这些
 层级混成一个计数。每次公共 `resume` 另存独立授权事件；`status --json` 的 `latest_resume` 显示
 最近一次，`history --json` 的 `agent_resumes` 显示每次授权的原因、Thread、Attempt 与 successor
-关联，`resume_audit` 则显示总数和滚动摘要。审计保留每次 Resume 的完整小型事实且不限制次数，
-但不保存维护者消息或原始错误文本。它不保存 Prompt、transcript 或 Acceptance Artifact。
+关联，`resume_audit` 则显示总数和滚动摘要。基础 Resume 授权审计保留每次 Resume 的完整小型事实且
+不限制次数；独立的不可变 Human Response 审计按 Resume identity 保留维护者消息，统一 `events`
+投影在 JSON 中保留完整响应，普通文本只显示确定性截断的摘要。审计不保存原始错误文本、Prompt、transcript 或
+Acceptance Artifact。
 Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中最多修复两次，且不增加领域 attempt；进程失败不会自动重试或替换
@@ -206,10 +209,13 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 ```bash
 agent-run status --repo OWNER/REPO --parent <parent-issue> --json
 agent-run resume <parent-issue> --repo OWNER/REPO
+agent-run approve <parent-issue> --repo OWNER/REPO
 agent-run history --repo OWNER/REPO --parent <parent-issue> --json
 ```
 
-完整 Run ID 与显式 `--state-dir` 仍可用于自动化和精确排障；它们不会参与 Parent 的模糊选择。
+`resume` 只选择唯一可恢复 Run，`approve` 只选择唯一处于最终批准门禁的 Run；零匹配或多匹配都
+拒绝猜测。完整 Run ID 与显式 `--state-dir` 仍可用于自动化和精确排障；它们不会参与 Parent 的
+模糊选择。
 
 只有维护者明确要丢弃当前 Invocation 上下文，或没有可恢复 Thread ID 时才使用新 Thread；它仍属于
 原 Semantic Attempt，因此不会增加 Development、Reviewer 或 Publication 计数。新 Thread

@@ -1660,6 +1660,8 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert "4" not in state["ticket_jobs"]
     status_view = run_cli(git_repo, fixture, "status", run_id)
     assert status_view.returncode == 0
+    assert "Repository: example/project" in status_view.stdout
+    assert "Parent:     #1 Parent spec" in status_view.stdout
     assert "操作者动作" in status_view.stdout
     assert "类型: Human Blocker" in status_view.stdout
     assert "对象: Ticket #2" in status_view.stdout
@@ -1669,9 +1671,19 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert "model gpt-5.6-sol" in status_view.stdout
     assert "reasoning effort high" in status_view.stdout
     assert "本轮时长:" in status_view.stdout
-    assert f"已保留成果: Candidate {state['ticket_jobs']['2']['candidate_sha']}" in status_view.stdout
+    assert "已保留成果: Candidate 已保存" in status_view.stdout
     assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in status_view.stdout
     assert "唯一下一步: agent-run resume 1 --repo example/project" in status_view.stdout
+    for internal_value in (
+        run_id,
+        str(state["ticket_jobs"]["2"]["candidate_sha"]),
+        "reviewer-2",
+        "Semantic Agent Attempt",
+        "Thread ",
+        "binding",
+        "digest",
+    ):
+        assert internal_value not in status_view.stdout
     history_view = run_cli(git_repo, fixture, "history", run_id)
     assert history_view.returncode == 0
     assert "类型: Human Blocker" in history_view.stdout
@@ -1690,6 +1702,18 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         assert json_view["next_action"] == json_view["operator_action"][
             "next_action"
         ]
+        assert json_view["run_id"] == run_id
+        if command == "history":
+            assert json_view["events"]
+            assert json_view["events"] == sorted(
+                json_view["events"], key=lambda event: event["at"]
+            )
+            assert any(
+                event["kind"] == "human_blocker"
+                and event["details"]
+                == [_human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"]]
+                for event in json_view["events"]
+            )
 
     repeated = run_cli(
         git_repo,
@@ -1739,11 +1763,14 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         encoding="utf-8",
     )
 
+    long_response = "允许在隔离沙箱中写入临时测试数据。" * 20
     resumed = run_cli(
         git_repo,
         fixture,
         "resume",
         run_id,
+        "--message",
+        long_response,
         "--agent-fixture",
         str(agent_fixture),
     )
@@ -1754,6 +1781,26 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert state["ticket_jobs"]["2"]["phase"] == "completed"
     assert state["ticket_jobs"]["3"]["phase"] == "completed"
     assert state["ticket_jobs"]["4"]["phase"] == "completed"
+    history_json = stdout_json(
+        run_cli(git_repo, fixture, "history", run_id, "--json")
+    )
+    assert any(
+        event["kind"] == "resume" and event["details"] == [long_response]
+        for event in history_json["events"]
+    )
+    state["timeline"] = [state["timeline"][0]]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    stale_timeline_history = stdout_json(
+        run_cli(git_repo, fixture, "history", run_id, "--json")
+    )
+    assert any(
+        event["kind"] == "resume" and event["details"] == [long_response]
+        for event in stale_timeline_history["events"]
+    )
+    history_text = run_cli(git_repo, fixture, "history", run_id).stdout
+    assert "…（已截断；完整内容见 --json）" in history_text
+    assert long_response not in history_text
 
 
 def test_deterministic_ticket_conflict_gates_independent_frontier(

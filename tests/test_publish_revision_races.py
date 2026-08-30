@@ -490,7 +490,8 @@ def test_abandon_recovers_lost_change_pr_close_response(
         assert "原因: Run abandonment recovery is incomplete." in text_view.stdout
         assert "已保留成果:" in text_view.stdout
         assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in text_view.stdout
-        assert f"唯一下一步: agent-run abandon {run_id}" in text_view.stdout
+        assert "唯一下一步: agent-run abandon <run-id>" in text_view.stdout
+        assert run_id not in text_view.stdout
     after_interruption = json.loads(fixture.read_text(encoding="utf-8"))
     assert after_interruption["delivery"]["pull_requests"][0]["state"] == "CLOSED"
     close_mutations = [

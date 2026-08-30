@@ -133,7 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
     approve = subcommands.add_parser(
         "approve", help="显式批准并合并已通过门禁的最终 Run PR"
     )
-    approve.add_argument("run_id", help="交付运行标识")
+    approve.add_argument(
+        "run_id",
+        metavar="parent-issue-or-run-id",
+        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+    )
     _add_common_options(approve)
     revise = subcommands.add_parser("revise", help="以 Run 级人工反馈开启新的修复窗口")
     revise.add_argument("run_id", help="交付运行标识")
@@ -284,6 +288,8 @@ def _main_with_parser(
         )
         if parsed.command == "resume":
             _resolve_resume_selection(parsed, git)
+        elif parsed.command == "approve":
+            _resolve_approve_selection(parsed, git)
         if fixture_path is None and not _running_active_runner():
             raise ValueError(
                 "self-hosting lifecycle commands require an installed Active Runner"
@@ -889,15 +895,57 @@ def _resolve_resume_selection(
         purpose="resume",
         current_root=git.root,
     )
+    parsed.run_id = _selected_local_run_id(parsed, git, selected, command="resume")
+
+
+def _resolve_approve_selection(
+    parsed: argparse.Namespace,
+    git: GitRepository,
+) -> None:
+    """Resolve the public Parent form of ``approve`` without guessing a Run."""
+
+    raw_selector = parsed.run_id
+    if not isinstance(raw_selector, str) or not raw_selector.isdecimal():
+        return
+    parent_number = int(raw_selector)
+    if parent_number <= 0:
+        raise RunLocatorError(
+            "run_selector_invalid", "Parent Issue 编号必须是正整数。"
+        )
+
+    parsed.run_id = None
+    parsed.parent = parent_number
+    records = _selector_records(parsed, current_root=git.root)
+    selected, _state = _select_one_record(
+        records,
+        parent_number=parent_number,
+        active_only=True,
+        purpose="approve",
+        ready_command="approve",
+        current_root=git.root,
+    )
+    parsed.run_id = _selected_local_run_id(parsed, git, selected, command="approve")
+
+
+def _selected_local_run_id(
+    parsed: argparse.Namespace,
+    git: GitRepository,
+    selected: dict[str, object],
+    *,
+    command: str,
+) -> str:
     selected_run_id = selected.get("run_id")
     if not isinstance(selected_run_id, str):  # pragma: no cover - candidate contract
         raise ValueError("selected Delivery Run is missing its Run ID")
     selected_root = selected.get("repository_root")
-    if not isinstance(selected_root, str) or Path(selected_root).resolve() != git.root.resolve():
+    if (
+        not isinstance(selected_root, str)
+        or Path(selected_root).resolve() != git.root.resolve()
+    ):
         raise _selector_error(
             "run_selector_requires_checkout",
-            "resume 选择到的 Run 不属于当前 checkout；请切换到候选工作目录，"
-            "或使用完整 Run ID 与 --state-dir 走精确恢复路径。",
+            f"{command} 选择到的 Run 不属于当前 checkout；请切换到候选工作目录，"
+            "或使用完整 Run ID 与 --state-dir 走精确操作路径。",
             [selected],
         )
     selected_state_dir = selected.get("state_dir")
@@ -912,11 +960,11 @@ def _resolve_resume_selection(
     ):
         raise _selector_error(
             "run_selector_requires_state_dir",
-            "resume 选择到的 Run 不在当前使用的 state directory；"
+            f"{command} 选择到的 Run 不在当前使用的 state directory；"
             "请显式提供候选的 --state-dir 与当前 checkout。",
             [selected],
         )
-    parsed.run_id = selected_run_id
+    return selected_run_id
 
 
 def _load_exact_read_only_run(
@@ -1277,6 +1325,7 @@ def _select_one_record(
     active_only: bool,
     purpose: str,
     recoverable_only: bool = False,
+    ready_command: str | None = None,
     current_root: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, Any]]:
     public_records = [record[0] for record in records]
@@ -1296,6 +1345,10 @@ def _select_one_record(
         if parent_number is not None and public.get("parent") != parent_number:
             continue
         if active_only and state.get("status") in {"completed", "abandoned"}:
+            continue
+        if ready_command is not None and not cli_surface._command_is_ready(
+            state, ready_command
+        ):
             continue
         matches.append((public, state))
 
