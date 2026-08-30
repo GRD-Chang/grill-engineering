@@ -21,6 +21,7 @@ from agent_run.operator_action_presentation import (
     operator_action_view,
     print_operator_action as _print_operator_action,
 )
+from agent_run.presentation_helpers import current_work_subject
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.semantic_attempt import semantic_attempt_subjects
@@ -486,54 +487,41 @@ def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
-    publication = state.get("run_publication")
-    if isinstance(publication, dict) and publication.get("phase") == "publishing":
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    location, subject = current
+    if location == "run_publication" and subject.get("phase") == "publishing":
         return {
             "role": "运行发布工作代理",
-            "attempt": publication.get("publication_attempts"),
-            "thread_id": publication.get("thread_id"),
-            "phase": publication.get("phase"),
+            "attempt": subject.get("publication_attempts"),
+            "thread_id": subject.get("thread_id"),
+            "phase": subject.get("phase"),
         }
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        repair = acceptance.get("repair_job")
-        if isinstance(repair, dict):
-            return _worker_from_job(repair, run_repair=True)
-    if isinstance(acceptance, dict) and acceptance.get("phase") == "reviewing":
-        reviewer_ids = acceptance.get("reviewer_thread_ids")
+    if location == "run_repair":
+        return _worker_from_job(subject, run_repair=True)
+    if location == "run_acceptance" and subject.get("phase") == "reviewing":
+        reviewer_ids = subject.get("reviewer_thread_ids")
         thread_id = (
             reviewer_ids[-1]
             if isinstance(reviewer_ids, list) and reviewer_ids
-            else acceptance.get("development_thread_id")
+            else subject.get("development_thread_id")
         )
         return {
             "role": "运行验收工作代理",
-            "attempt": acceptance.get("validation_attempts"),
+            "attempt": subject.get("validation_attempts"),
             "thread_id": thread_id,
-            "phase": acceptance.get("phase"),
+            "phase": subject.get("phase"),
         }
-    active = _active_ticket_job(state)
-    if active:
-        return _worker_from_job(active)
-    parent_job = state.get("parent_job")
-    if isinstance(parent_job, dict):
-        return _worker_from_job(parent_job)
+    if location.startswith("ticket:") or location == "parent":
+        return _worker_from_job(subject)
     return None
 
 
 def _current_phase(state: dict[str, object]) -> object:
-    publication = state.get("run_publication")
-    if isinstance(publication, dict):
-        return publication.get("phase")
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        return acceptance.get("phase")
-    active = _active_ticket_job(state)
-    if active:
-        return active.get("phase")
-    parent_job = state.get("parent_job")
-    if isinstance(parent_job, dict):
-        return parent_job.get("phase")
+    current = current_work_subject(state)
+    if current is not None:
+        return current[1].get("phase")
     return state.get("status")
 
 
@@ -667,29 +655,27 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
 def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
     """Expose the active subject's bounded window without leaking policy logic."""
 
-    subject: dict[str, object] | None = None
-    active = state.get("active_ticket_job")
-    if isinstance(active, dict) and active.get("phase") not in {"completed", "merged"}:
-        subject = active
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    location, subject = current
+    if location.startswith("ticket:"):
         policy = ticket_budget_policy_for_job(
-            active, state_snapshot=state.get("policy_snapshot")
+            subject, state_snapshot=state.get("policy_snapshot")
+        )
+    elif location == "parent":
+        policy = parent_only_budget_policy_for_job(
+            subject, state_snapshot=state.get("policy_snapshot")
         )
     else:
-        parent = state.get("parent_job")
-        if isinstance(parent, dict):
-            subject = parent
-            policy = parent_only_budget_policy_for_job(
-                parent, state_snapshot=state.get("policy_snapshot")
-            )
-        else:
+        if location == "run_publication":
             acceptance = state.get("run_acceptance")
             if not isinstance(acceptance, dict):
                 return None
-            repair = acceptance.get("repair_job")
-            subject = repair if isinstance(repair, dict) else acceptance
-            policy = run_repair_budget_policy_for_job(
-                subject, state_snapshot=state.get("policy_snapshot")
-            )
+            subject = acceptance
+        policy = run_repair_budget_policy_for_job(
+            subject, state_snapshot=state.get("policy_snapshot")
+        )
     budget = subject.get("review_budget")
     if not isinstance(budget, dict):
         return None

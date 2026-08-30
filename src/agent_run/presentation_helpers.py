@@ -5,6 +5,64 @@ from datetime import UTC, datetime
 from typing import Any
 
 
+_TERMINAL_CHANGE_JOB_PHASES = {"completed", "merged", "abandoned"}
+_TERMINAL_RUN_ACCEPTANCE_PHASES = {"accepted", "completed"}
+_CURRENT_PUBLICATION_GATE_PHASES = {
+    "blocked",
+    "ready_for_human",
+    "publication_pending",
+}
+
+
+def current_work_subject(
+    state: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    """Select the one Work Subject represented by the public status view."""
+
+    active = state.get("active_ticket_job")
+    if (
+        isinstance(active, dict)
+        and active.get("phase") not in _TERMINAL_CHANGE_JOB_PHASES
+    ):
+        ticket_number = active.get("ticket_number")
+        locator = (
+            f"ticket:{ticket_number}"
+            if isinstance(ticket_number, int)
+            else "ticket:unknown"
+        )
+        return locator, active
+
+    parent = state.get("parent_job")
+    if (
+        isinstance(parent, dict)
+        and parent.get("phase") not in _TERMINAL_CHANGE_JOB_PHASES
+    ):
+        return "parent", parent
+
+    acceptance = state.get("run_acceptance")
+    publication = state.get("run_publication")
+    if (
+        isinstance(publication, dict)
+        and publication.get("phase") in _CURRENT_PUBLICATION_GATE_PHASES
+    ):
+        return "run_publication", publication
+
+    if (
+        isinstance(acceptance, dict)
+        and acceptance.get("phase") not in _TERMINAL_RUN_ACCEPTANCE_PHASES
+    ):
+        repair = acceptance.get("repair_job")
+        if acceptance.get("phase") == "repairing" and isinstance(repair, dict):
+            return "run_repair", repair
+        return "run_acceptance", acceptance
+
+    if isinstance(publication, dict):
+        return "run_publication", publication
+    if isinstance(acceptance, dict):
+        return "run_acceptance", acceptance
+    return None
+
+
 def human_next_action(value: object, *, run_id: object = None) -> object:
     """Hide managed Run identifiers from ordinary operator instructions."""
 

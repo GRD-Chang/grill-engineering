@@ -13,8 +13,10 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_publication import RunPublicationEngine
+from agent_run.semantic_attempt import allocate_semantic_attempt, close_semantic_attempt
 from agent_run.state_contract import IncompatibleRunStateError
 
+from test_cli import run_cli, stdout_json
 
 from run_acceptance_test_support import (
     ScriptedRunAgents,
@@ -634,7 +636,115 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
             data["default_head_sha"] = git.resolve("main")
             fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    repair_agents = ScriptedRunAgents()
+    class StatusAssertingRepairAgents(ScriptedRunAgents):
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            json_status = run_cli(
+                git_repo,
+                fixture,
+                "status",
+                str(state["run_id"]),
+                "--json",
+            )
+            text_status = run_cli(
+                git_repo,
+                fixture,
+                "status",
+                str(state["run_id"]),
+            )
+            assert json_status.returncode == text_status.returncode == 0
+            status = stdout_json(json_status)
+            assert status["phase"] == "developing"
+            assert status["worker"]["role"] == "运行修复开发工作代理"
+            assert status["review_budget"]["development_limit"] == 10
+            assert status["review_budget"]["reviewer_limit"] == 11
+            assert status["progress"]["phase"] == "developing"
+            assert status["progress"]["current_object"] == "Run Acceptance"
+            assert status["progress"]["round_progress"]["development_label"] == (
+                "Run Development"
+            )
+            assert "阶段:       开发中" in text_status.stdout
+            assert "当前对象:   Run Acceptance" in text_status.stdout
+            assert (
+                "最近 Agent: 运行修复开发工作代理 · Run Acceptance"
+                in text_status.stdout
+            )
+            assert "Run Development     1 / 10 轮" in text_status.stdout
+            assert "Run Review          0 / 11 轮" in text_status.stdout
+            assert "等待人工批准" not in text_status.stdout
+            assert "当前对象:   Run Publication" not in text_status.stdout
+
+            active_repair = states.load_current_run(str(state["run_id"]))
+            publication_phase_labels = {
+                "blocked": "已阻塞",
+                "ready_for_human": "等待人工处理",
+                "publication_pending": "等待发布",
+            }
+            for publication_phase, phase_label in publication_phase_labels.items():
+                gated = deepcopy(active_repair)
+                publication = gated["run_publication"]
+                publication["phase"] = publication_phase
+                if publication_phase == "publication_pending":
+                    retry = {"attempts": 5, "limit": 5}
+                    attempt = allocate_semantic_attempt(
+                        publication,
+                        role="publication",
+                        work_subject=f"run-publication:{state['run_id']}",
+                        generation=1,
+                        currentness_boundary={
+                            "run_head_sha": git.resolve(str(state["run_branch"]))
+                        },
+                        ordinal=1,
+                    )
+                    publication["publication_attempts"] = 1
+                    publication["publication_operation_retry"] = retry
+                    close_semantic_attempt(
+                        publication,
+                        attempt,
+                        outcome="publication_artifact",
+                    )
+                    gated["status"] = "publication_pending"
+                    gated["terminal_kind"] = "publication_pending"
+                else:
+                    publication["blocked_reason"] = "agent_requires_human"
+                    publication["human_blockers"] = [
+                        "Final Run publication requires maintainer action."
+                    ]
+                    gated["status"] = "ready_for_human"
+                    gated["terminal_kind"] = "ready_for_human"
+                states.save_run(str(state["run_id"]), gated)
+
+                gated_json_result = run_cli(
+                    git_repo,
+                    fixture,
+                    "status",
+                    str(state["run_id"]),
+                    "--json",
+                )
+                gated_text = run_cli(
+                    git_repo,
+                    fixture,
+                    "status",
+                    str(state["run_id"]),
+                )
+                assert gated_json_result.returncode == gated_text.returncode == 0, (
+                    publication_phase,
+                    gated_json_result.stdout,
+                    gated_text.stdout,
+                )
+                gated_json = stdout_json(gated_json_result)
+                assert gated_json["phase"] == publication_phase
+                assert gated_json["progress"]["phase"] == publication_phase
+                assert gated_json["progress"]["current_object"] == "Run Publication"
+                assert gated_json["worker"] is None
+                assert gated_json["progress"]["current_agent"] is None
+                assert f"阶段:       {phase_label}" in gated_text.stdout
+                assert "当前对象:   Run Publication" in gated_text.stdout
+                assert "运行修复开发工作代理" not in gated_text.stdout
+
+            states.save_run(str(state["run_id"]), active_repair)
+            return super().develop(request)
+
+    repair_agents = StatusAssertingRepairAgents()
     repair_agents._reviews = [_passing_artifact()]
     first = RunAcceptanceEngine(
         git=git,
@@ -677,6 +787,15 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     assert second["run_acceptance"]["development_thread_history"] == [thread_id]
     assert second["run_publication"]["pr_number"] == final_pr
     assert len(second["run_acceptance"]["completed_repair_jobs"]) == 1
+
+    json_status = stdout_json(
+        run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
+    )
+    text_status = run_cli(git_repo, fixture, "status", str(state["run_id"]))
+    assert json_status["phase"] == "stale"
+    assert json_status["progress"]["current_object"] == "Run Publication"
+    assert "阶段:       已失效" in text_status.stdout
+    assert "当前对象:   Run Publication" in text_status.stdout
 
 
 def test_required_check_repair_promotion_clears_old_observation_and_archives_provenance(

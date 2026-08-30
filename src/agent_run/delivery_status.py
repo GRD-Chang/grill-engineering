@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.presentation_helpers import (
+    current_work_subject,
     delivery_object_label,
     elapsed_seconds_since,
     human_next_action,
@@ -19,7 +20,8 @@ def status_progress_view(
     parent_view = parent if isinstance(parent, dict) else {}
     invocation = _progress_invocation(state, audit)
     worker = audit.get("worker")
-    current_object = _current_object(state)
+    current = current_work_subject(state)
+    current_object = _current_object(state, current)
     current_agent = _agent_view(
         state,
         invocation,
@@ -36,7 +38,7 @@ def status_progress_view(
         "phase": audit.get("phase"),
         "current_object": current_object,
         "ticket_progress": _ticket_progress(state),
-        "round_progress": _round_progress(state, audit.get("review_budget")),
+        "round_progress": _round_progress(current, audit.get("review_budget")),
         "run_repair": _run_repair_progress(audit.get("run_repair")),
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
@@ -244,18 +246,14 @@ def _ticket_progress(state: dict[str, Any]) -> dict[str, int]:
 
 
 def _round_progress(
-    state: dict[str, Any], budget: object
+    current: tuple[str, dict[str, Any]] | None, budget: object
 ) -> dict[str, Any] | None:
     if not isinstance(budget, dict):
         return None
-    active = state.get("active_ticket_job")
-    if isinstance(active, dict) and active.get("phase") not in {
-        "completed",
-        "merged",
-        "abandoned",
-    }:
+    location = current[0] if current is not None else ""
+    if location.startswith("ticket:"):
         prefix = "Ticket"
-    elif isinstance(state.get("parent_job"), dict):
+    elif location == "parent":
         prefix = "Parent"
     else:
         prefix = "Run"
@@ -266,23 +264,11 @@ def _round_progress(
     }
 
 
-def _current_object(state: dict[str, Any]) -> str:
-    active = state.get("active_ticket_job")
-    if (
-        isinstance(active, dict)
-        and active.get("phase") not in {"completed", "merged", "abandoned"}
-        and isinstance(active.get("ticket_number"), int)
-    ):
-        return f"Ticket #{active['ticket_number']}"
-    if isinstance(state.get("parent_job"), dict):
-        parent = state.get("parent")
-        number = parent.get("number", "?") if isinstance(parent, dict) else "?"
-        return f"Parent Issue #{number}"
-    if isinstance(state.get("run_publication"), dict):
-        return "Run Publication"
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        return "Run Acceptance"
+def _current_object(
+    state: dict[str, Any], current: tuple[str, dict[str, Any]] | None
+) -> str:
+    if current is not None:
+        return delivery_object_label(state, current[0])
     return "Delivery Run"
 
 
@@ -297,6 +283,10 @@ def _current_findings(state: dict[str, Any]) -> list[str]:
 
 
 def _current_subjects(state: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    current = current_work_subject(state)
+    selected = current[1] if current is not None else None
+    if selected is not None:
+        yield selected
     acceptance = state.get("run_acceptance")
     repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
     active = state.get("active_ticket_job")
@@ -313,7 +303,7 @@ def _current_subjects(state: dict[str, Any]) -> Iterable[dict[str, Any]]:
         acceptance,
         state.get("run_publication"),
     ):
-        if isinstance(subject, dict):
+        if isinstance(subject, dict) and subject is not selected:
             yield subject
 
 
