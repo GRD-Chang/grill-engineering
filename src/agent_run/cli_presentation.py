@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.delivery_policy import (
+    parent_only_budget_policy_for_job,
+    run_repair_budget_policy_for_job,
+    ticket_budget_policy_for_job,
+)
+from agent_run.delivery_progress import (
+    history_progress_view,
+    print_history_progress,
+    print_status_progress,
+    run_elapsed_seconds,
+    status_progress_view,
+)
 from agent_run.external_supervision import public_supervision_snapshot
+from agent_run.operator_action_presentation import (
+    operator_action_view,
+    print_operator_action as _print_operator_action,
+)
+from agent_run.presentation_helpers import current_work_subject
 from agent_run.state_contract import human_blocker_subject_count
-from agent_run.review_budget import RUN_POLICY, TICKET_POLICY
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
@@ -58,6 +73,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     semantic_attempt = _current_semantic_attempt(state, active_invocation)
     delivery_cleanup = _public_delivery_cleanup(state)
     latest_resume = latest_resume_audit(state)
+    operator_action = _operator_action_view(state)
     output = {
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
@@ -70,9 +86,14 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "candidate_sha": current_identity.get("candidate_sha"),
         "pr_number": current_identity.get("pr_number"),
         "review_budget": review_budget,
-        "elapsed_seconds": _elapsed_seconds(state.get("created_at")),
+        "elapsed_seconds": run_elapsed_seconds(state),
         "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
-        "next_action": _next_action(state),
+        "next_action": (
+            operator_action["next_action"]
+            if operator_action is not None
+            else _next_action(state)
+        ),
+        "operator_action": operator_action,
         "diagnostics": state.get("diagnostics", []),
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
@@ -91,142 +112,29 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "latest_resume": latest_resume,
         "supervision": public_supervision_snapshot(state),
     }
+    progress = status_progress_view(state, output)
+    output["progress"] = progress
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
-    print(f"交付运行: {output['run_id']}")
-    print(f"运行状态: {_display_term(output['status'])}")
-    print(f"当前阶段: {_display_term(output['phase'])}")
-    if active_ticket is not None:
-        print(f"当前任务: #{active_ticket}")
-    print(
-        "当前 Candidate/PR: "
-        f"{output['candidate_sha'] or 'none'} / {output['pr_number'] or 'none'}"
+    print_status_progress(
+        state,
+        output,
+        progress,
+        display_term=_display_term,
+        print_operator_action=lambda action: _print_operator_action(
+            action, run_id=state.get("run_id")
+        ),
     )
-    if worker is not None:
-        print(
-            "当前工作代理: "
-            f"{worker['role']}（第 {worker['attempt']} 次尝试，{_display_term(worker['phase'])}，"
-            f"会话 {worker['thread_id'] or '尚不可用'}）"
-        )
-    if isinstance(active_invocation, dict):
-        invocation_role = (
-            active_invocation.get("invocation_role")
-            or active_invocation.get("role")
-            or active_invocation.get("binding_role")
-        )
-        profile_role = active_invocation.get("profile_role") or active_invocation.get(
-            "binding_role"
-        )
-        role_text = str(invocation_role)
-        if profile_role is not None and profile_role != invocation_role:
-            role_text += f"（Profile {profile_role}）"
-        print(
-            "当前 Codex: "
-            f"{role_text}；"
-            f"Thread {active_invocation.get('reported_thread_id') or active_invocation.get('requested_thread_id') or '尚不可用'}；"
-            f"model {active_invocation.get('model') or '未绑定'}；"
-            f"reasoning effort {active_invocation.get('reasoning_effort') or '未绑定'}；"
-            f"Profile Revision {active_invocation.get('profile_revision') or '未绑定'}"
-        )
-    else:
-        print("当前 Codex: none")
-    if isinstance(semantic_attempt, dict):
-        print(
-            "Semantic Agent Attempt: "
-            f"{semantic_attempt.get('attempt_id')}；"
-            f"{semantic_attempt.get('role')}；"
-            f"ordinal {semantic_attempt.get('ordinal')}；"
-            f"{semantic_attempt.get('status')}"
-        )
-    else:
-        print("Semantic Agent Attempt: none")
-    if isinstance(active_invocation, dict):
-        print(
-            "Agent Invocation: "
-            f"{active_invocation.get('role')} {active_invocation.get('status')}"
-        )
-    else:
-        print("Agent Invocation: none")
-    output_attempt = output["output_attempt"]
-    print(
-        "Output Attempt: "
-        f"{output_attempt.get('attempt_count') if isinstance(output_attempt, dict) else 'none'}"
-    )
-    print(f"Budget Window: {output['budget_window'] or 'none'}")
-    operation_retry = output["publication_operation_retry"]
-    if isinstance(operation_retry, dict):
-        print(
-            "Publication Operation Retry: "
-            f"{operation_retry.get('attempts')}/{operation_retry.get('limit')}"
-        )
-    else:
-        print("Publication Operation Retry: none")
-    if isinstance(delivery_cleanup, dict):
-        print(
-            "Delivery Cleanup: "
-            f"{delivery_cleanup.get('status')}；{delivery_cleanup.get('last_error')}"
-        )
-        items = delivery_cleanup.get("items")
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                print(
-                    "  Preserved Checkout: "
-                    f"{item.get('checkout')}；{item.get('last_error')}；"
-                    f"恢复={item.get('recovery_action')}"
-                )
-    if isinstance(latest_resume, dict):
-        print(
-            "最近显式 Resume: "
-            f"#{latest_resume.get('sequence')} {latest_resume.get('kind')}；"
-            f"Thread {latest_resume.get('thread_id') or 'none'}；"
-            f"Attempt {latest_resume.get('semantic_attempt_id') or 'none'}；"
-            f"failure={latest_resume.get('failure_code') or 'none'}"
-        )
-    if isinstance(run_repair, dict):
-        print(
-            "运行修复: "
-            f"Run Acceptance Generation {run_repair['acceptance_generation']}；"
-            f"Repair Cycle Generation {run_repair['repair_cycle_generation']}；"
-            f"代码修改 {run_repair['code_modification_attempts']}/10；"
-            f"Candidate 验证 {run_repair['validation_attempts']} 次；"
-            "Candidate 验证状态 "
-            f"{_display_term(run_repair['candidate_validation_status'])}"
-        )
-    if isinstance(review_budget, dict):
-        print(
-            "Review Budget: "
-            f"Window {review_budget['window']}；"
-            f"Development {review_budget['development_attempts']}/{review_budget['development_limit']}；"
-            f"Reviewer {review_budget['reviewer_invocations']}/{review_budget['reviewer_limit']}；"
-            f"Final CI-fix {'used' if review_budget['final_ci_fix_used'] else 'available'}"
-        )
-    print(f"已运行: {output['elapsed_seconds']} 秒")
-    if output["gate"]:
-        print("当前门禁: 必需检查")
-    _print_supervision(output["supervision"])
-    scope_change = output["scope_change"]
-    if isinstance(scope_change, dict):
-        print(
-            "Ticket Graph: "
-            f"accepted={scope_change.get('accepted_graph_revision')} "
-            f"observed={scope_change.get('observed_graph_revision')}"
-        )
-        summary = scope_change.get("graph_change_summary")
-        if isinstance(summary, dict):
-            print(f"变化摘要: {summary.get('summary')}")
-    abandonment = output["abandonment"]
-    if isinstance(abandonment, dict):
-        print(f"放弃恢复: {abandonment.get('phase')}")
-    print(f"下一步: {output['next_action']}")
 
 
 def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     timeline = state.get("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
+    timeline_continuation = state.get("timeline_continuation", [])
+    if not isinstance(timeline_continuation, list):
+        raise ValueError("timeline_continuation must be an array")
     invocations = state.get("agent_invocation_history", [])
     if not isinstance(invocations, list):
         raise ValueError("agent_invocation_history must be an array")
@@ -237,10 +145,17 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
     agent_resumes = public_resume_audit.get("history", [])
     if not isinstance(agent_resumes, list):
         raise ValueError("resume_audit.history must be an array")
+    operator_action = _operator_action_view(state)
     output = {
         "run_id": state.get("run_id"),
         "timeline": timeline,
-        "next_action": _next_action(state),
+        "timeline_continuation": timeline_continuation,
+        "next_action": (
+            operator_action["next_action"]
+            if operator_action is not None
+            else _next_action(state)
+        ),
+        "operator_action": operator_action,
         "abandonment": state.get("run_abandonment"),
         "agent_invocations": invocations,
         "semantic_agent_attempts": semantic_attempts,
@@ -263,120 +178,20 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         "agent_resumes": agent_resumes,
         "supervision": public_supervision_snapshot(state),
     }
+    progress = history_progress_view(state, output)
+    output.update(progress)
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
-    print(f"交付运行: {output['run_id']}")
-    _print_supervision(output["supervision"])
-    for attempt in semantic_attempts:
-        print(
-            "Semantic Agent Attempt "
-            f"{attempt.get('attempt_id')} {attempt.get('role')} "
-            f"ordinal={attempt.get('ordinal')} "
-            f"Budget Window={attempt.get('budget_window') or 'none'} "
-            f"status={attempt.get('status')} outcome={attempt.get('outcome')}"
-        )
-    for invocation in invocations:
-        if not isinstance(invocation, dict):
-            continue
-        invocation_role = (
-            invocation.get("invocation_role")
-            or invocation.get("role")
-            or invocation.get("binding_role")
-        )
-        profile_role = invocation.get("profile_role") or invocation.get("binding_role")
-        role_text = str(invocation_role)
-        if profile_role is not None and profile_role != invocation_role:
-            role_text += f"(profile={profile_role})"
-        print(
-            "Agent Invocation "
-            f"{role_text} {invocation.get('status')} "
-            f"Output Attempt={invocation.get('attempt_count')} "
-            f"return_code={invocation.get('return_code')} "
-            f"signal={invocation.get('signal')} "
-            f"requested={invocation.get('requested_thread_id')} "
-            f"reported={invocation.get('reported_thread_id')} "
-            f"model={invocation.get('model')} "
-            f"effort={invocation.get('reasoning_effort')} "
-            f"profile_revision={invocation.get('profile_revision')} "
-            f"error={invocation.get('error')}"
-        )
-    for retry in operation_retries:
-        print(
-            "Publication Operation Retry "
-            f"{retry.get('work_subject')} "
-            f"{retry.get('attempts')}/{retry.get('limit')}"
-        )
-    for resume in agent_resumes:
-        if not isinstance(resume, dict):
-            continue
-        print(
-            "Explicit Resume "
-            f"#{resume.get('sequence')} {resume.get('kind')} "
-            f"status={resume.get('source_status')} "
-            f"failure={resume.get('failure_code')} "
-            f"Thread={resume.get('thread_id')} "
-            f"Attempt={resume.get('semantic_attempt_id')} "
-            f"new_thread={resume.get('new_thread')}"
-        )
-    for event in timeline:
-        if not isinstance(event, dict):
-            continue
-        detail = " ".join(
-            str(_display_term(event[key]) if key == "phase" else event[key])
-            for key in (
-                "worker",
-                "ticket",
-                "attempt",
-                "thread_id",
-                "phase",
-                "pr_number",
-                "commit_sha",
-                "result",
-            )
-            if event.get(key) is not None
-        )
-        print(
-            f"{event.get('at')} {_display_term(event.get('kind'))} "
-            f"{_display_term(event.get('status'))} {detail}".rstrip()
-        )
-        if event.get("semantic_attempt_id") is not None:
-            print(
-                "  Semantic Agent Attempt "
-                f"{event.get('semantic_attempt_id')} "
-                f"{event.get('semantic_attempt_role')} "
-                f"ordinal={event.get('semantic_attempt_ordinal')}；"
-                f"Agent Invocation {event.get('agent_invocation_status')}；"
-                f"Output Attempt={event.get('output_attempt')}；"
-                f"Budget Window={event.get('budget_window') or 'none'}；"
-                "Publication Operation Retry="
-                f"{event.get('publication_operation_retry_attempts') or 'none'}/"
-                f"{event.get('publication_operation_retry_limit') or 'none'}"
-            )
-        if event.get("explicit_resume_sequence") is not None:
-            print(
-                "  Explicit Resume "
-                f"#{event.get('explicit_resume_sequence')} "
-                f"{event.get('explicit_resume_kind')}；"
-                f"Thread={event.get('explicit_resume_thread_id') or 'none'}；"
-                f"Attempt={event.get('explicit_resume_attempt_id') or 'none'}"
-            )
-        if event.get("kind") == "unsupported_scope_change":
-            print(
-                "  Ticket Graph: "
-                f"accepted={event.get('accepted_graph_revision')} "
-                f"observed={event.get('observed_graph_revision')}"
-            )
-            summary = event.get("graph_change_summary")
-            if isinstance(summary, dict):
-                print(
-                    "  变化明细: "
-                    f"新增 Ticket {summary.get('added_tickets', [])}；"
-                    f"移除 Ticket {summary.get('removed_tickets', [])}；"
-                    f"新增依赖 {summary.get('added_dependencies', [])}；"
-                    f"移除依赖 {summary.get('removed_dependencies', [])}"
-                )
-    print(f"下一步: {output['next_action']}")
+    print_history_progress(
+        state,
+        output,
+        progress,
+        display_term=_display_term,
+        print_operator_action=lambda action: _print_operator_action(
+            action, run_id=state.get("run_id")
+        ),
+    )
 
 
 def _current_semantic_attempt(
@@ -587,36 +402,6 @@ def _public_delivery_cleanup(
     }
 
 
-def _print_supervision(wait: object) -> None:
-    if not isinstance(wait, dict):
-        return
-    print(f"等待种类: {wait.get('kind')}")
-    print(f"等待对象: {wait.get('subject')}")
-    print(f"等待 head/base: {wait.get('head_sha')} / {wait.get('base_sha')}")
-    print(
-        "等待窗口: "
-        f"开始={wait.get('started_at')} 截止={wait.get('deadline')} "
-        f"剩余={wait.get('remaining_seconds')} 秒"
-    )
-    print(f"重试次数: {wait.get('retry_count')}")
-    observation = wait.get("latest_observation")
-    if isinstance(observation, dict):
-        print(
-            "最新观测: "
-            f"{observation.get('code')} {observation.get('message')}"
-        )
-    else:
-        print("最新观测: 无")
-    failure_class = wait.get("credential_failure_class")
-    if isinstance(failure_class, str):
-        print(f"凭据失败类别: {failure_class}")
-    http_status = wait.get("credential_http_status")
-    if type(http_status) is int:
-        print(f"凭据 HTTP 状态: {http_status}")
-    if wait.get("timeout_resume_action") is not None:
-        print(f"超时恢复: {wait['timeout_resume_action']}")
-
-
 def _next_action(state: dict[str, Any]) -> str:
     status = str(state.get("status"))
     run_id = state.get("run_id")
@@ -693,55 +478,50 @@ def _next_action(state: dict[str, Any]) -> str:
     return "无"
 
 
+def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
+    return operator_action_view(
+        state,
+        current_identity=_current_delivery_identity(state),
+        fallback_next_action=_next_action(state),
+    )
+
+
 def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
-    publication = state.get("run_publication")
-    if isinstance(publication, dict) and publication.get("phase") == "publishing":
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    location, subject = current
+    if location == "run_publication" and subject.get("phase") == "publishing":
         return {
             "role": "运行发布工作代理",
-            "attempt": publication.get("publication_attempts"),
-            "thread_id": publication.get("thread_id"),
-            "phase": publication.get("phase"),
+            "attempt": subject.get("publication_attempts"),
+            "thread_id": subject.get("thread_id"),
+            "phase": subject.get("phase"),
         }
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        repair = acceptance.get("repair_job")
-        if isinstance(repair, dict):
-            return _worker_from_job(repair, run_repair=True)
-    if isinstance(acceptance, dict) and acceptance.get("phase") == "reviewing":
-        reviewer_ids = acceptance.get("reviewer_thread_ids")
+    if location == "run_repair":
+        return _worker_from_job(subject, run_repair=True)
+    if location == "run_acceptance" and subject.get("phase") == "reviewing":
+        reviewer_ids = subject.get("reviewer_thread_ids")
         thread_id = (
             reviewer_ids[-1]
             if isinstance(reviewer_ids, list) and reviewer_ids
-            else acceptance.get("development_thread_id")
+            else subject.get("development_thread_id")
         )
         return {
             "role": "运行验收工作代理",
-            "attempt": acceptance.get("validation_attempts"),
+            "attempt": subject.get("validation_attempts"),
             "thread_id": thread_id,
-            "phase": acceptance.get("phase"),
+            "phase": subject.get("phase"),
         }
-    active = _active_ticket_job(state)
-    if active:
-        return _worker_from_job(active)
-    parent_job = state.get("parent_job")
-    if isinstance(parent_job, dict):
-        return _worker_from_job(parent_job)
+    if location.startswith("ticket:") or location == "parent":
+        return _worker_from_job(subject)
     return None
 
 
 def _current_phase(state: dict[str, object]) -> object:
-    publication = state.get("run_publication")
-    if isinstance(publication, dict):
-        return publication.get("phase")
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        return acceptance.get("phase")
-    active = _active_ticket_job(state)
-    if active:
-        return active.get("phase")
-    parent_job = state.get("parent_job")
-    if isinstance(parent_job, dict):
-        return parent_job.get("phase")
+    current = current_work_subject(state)
+    if current is not None:
+        return current[1].get("phase")
     return state.get("status")
 
 
@@ -847,6 +627,9 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
     cycle = acceptance.get("repair_cycle")
     if not isinstance(job, dict) or not isinstance(cycle, dict):
         return None
+    policy = run_repair_budget_policy_for_job(
+        job, state_snapshot=state.get("policy_snapshot")
+    )
     candidate_validation_status = _candidate_validation_status(job)
     return {
         # Keep ``generation`` and ``phase`` as compatibility aliases while
@@ -861,6 +644,7 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "candidate_validation_status": candidate_validation_status,
         "cycle_status": cycle.get("status"),
         "code_modification_attempts": cycle.get("code_modification_attempts", 0),
+        "code_modification_limit": policy.development_limit,
         "validation_attempts": cycle.get("validation_attempts", 0),
         "candidate_sha": job.get("candidate_sha"),
         "development_thread_id": cycle.get("development_thread_id"),
@@ -871,23 +655,27 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
 def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:
     """Expose the active subject's bounded window without leaking policy logic."""
 
-    subject: dict[str, object] | None = None
-    active = state.get("active_ticket_job")
-    if isinstance(active, dict) and active.get("phase") not in {"completed", "merged"}:
-        subject = active
-        policy = TICKET_POLICY
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    location, subject = current
+    if location.startswith("ticket:"):
+        policy = ticket_budget_policy_for_job(
+            subject, state_snapshot=state.get("policy_snapshot")
+        )
+    elif location == "parent":
+        policy = parent_only_budget_policy_for_job(
+            subject, state_snapshot=state.get("policy_snapshot")
+        )
     else:
-        parent = state.get("parent_job")
-        if isinstance(parent, dict):
-            subject = parent
-            policy = RUN_POLICY
-        else:
+        if location == "run_publication":
             acceptance = state.get("run_acceptance")
             if not isinstance(acceptance, dict):
                 return None
-            repair = acceptance.get("repair_job")
-            subject = repair if isinstance(repair, dict) else acceptance
-            policy = RUN_POLICY
+            subject = acceptance
+        policy = run_repair_budget_policy_for_job(
+            subject, state_snapshot=state.get("policy_snapshot")
+        )
     budget = subject.get("review_budget")
     if not isinstance(budget, dict):
         return None
@@ -935,18 +723,6 @@ def _candidate_validation_status(job: dict[str, object]) -> str:
     return "unreviewed"
 
 
-def _elapsed_seconds(created_at: object) -> int | None:
-    if not isinstance(created_at, str):
-        return None
-    try:
-        started = datetime.fromisoformat(created_at)
-    except ValueError:
-        return None
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=UTC)
-    return max(0, int((datetime.now(UTC) - started).total_seconds()))
-
-
 def _display_term(value: object) -> object:
     if not isinstance(value, str):
         return value
@@ -955,6 +731,9 @@ def _display_term(value: object) -> object:
         "ticket_completed": "任务已完成",
         "waiting_checks": "等待必需检查",
         "waiting_merge": "等待合并确认",
+        "waiting_external": "等待外部系统收敛",
+        "github_convergence": "GitHub 状态收敛",
+        "required_checks": "必需检查",
         "publication_pending": "等待发布",
         "parent_delivery_pending": "等待父项交付",
         "parent_approval_pending": "等待父项人工批准",

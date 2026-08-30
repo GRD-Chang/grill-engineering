@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,7 @@ class RunPublicationShared:
             "required_checks_observation_status"
         )
         publication["required_checks_evidence"] = observation
+        publication["required_checks_observed_at"] = datetime.now(UTC).isoformat()
         publication.pop("required_checks_observation_status", None)
         if prior_observation_status in {"unavailable", "unknown"}:
             publication.pop("publication_operation_retry", None)

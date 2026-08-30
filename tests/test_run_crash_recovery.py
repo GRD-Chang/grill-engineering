@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,30 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         expected_thread_id=expected_thread,
     )
 
+    fixture_before = fixture.read_text(encoding="utf-8")
+    held = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+    assert held.returncode == 2
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert load_only_run_state(git_repo) == interrupted_state
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+    assert resumed.returncode == 0, resumed.stdout
+
     recovered = run_internal_stage(
         git_repo,
         fixture,
@@ -244,7 +269,9 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", "--development-deadline", "42s")
+    )["run_id"]
     failed = run_cli(
         git_repo,
         fixture,
@@ -255,9 +282,12 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
     )
     assert failed.returncode == 2
     failed_state = load_only_run_state(git_repo)
-    attempt_id = failed_state["active_agent_invocation"]["semantic_attempt"][
-        "attempt_id"
-    ]
+    failed_invocation = failed_state["active_agent_invocation"]
+    attempt_id = failed_invocation["semantic_attempt"]["attempt_id"]
+    assert failed_invocation["deadline_seconds"] == 42
+    assert failed_state["ticket_jobs"]["2"]["review_budget"][
+        "development_attempts"
+    ] == 1
 
     recovery_agents = _write_agents(
         git_repo / "agents-recovery.json",
@@ -327,6 +357,20 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
     )
     assert successor["semantic_attempt"]["attempt_id"] == attempt_id
     assert successor["resume_sequence"] == resumes[-1]["sequence"]
+    assert successor["deadline_seconds"] == 42
+    assert datetime.fromisoformat(successor["deadline_at"]) - datetime.fromisoformat(
+        successor["started_at"]
+    ) == timedelta(seconds=42)
+    development_invocations = [
+        invocation
+        for invocation in final_state["agent_invocation_history"]
+        if invocation.get("role") == "development"
+        and invocation.get("semantic_attempt", {}).get("attempt_id") == attempt_id
+    ]
+    assert len(development_invocations) == 2
+    assert final_state["ticket_jobs"]["2"]["review_budget"][
+        "development_attempts"
+    ] == 1
     require_current_run_state(final_state)
     successor_index = final_state["agent_invocation_history"].index(successor)
     for field, value in (
@@ -422,7 +466,8 @@ def test_public_cli_recovers_after_external_response_loss(
     )
 
     assert interrupted.returncode == 2
-    active = load_only_run_state(git_repo).get("active_ticket_job")
+    interrupted_state = load_only_run_state(git_repo)
+    active = interrupted_state.get("active_ticket_job")
     expected_thread = (
         active.get("development_thread_id")
         if isinstance(active, dict)
@@ -434,6 +479,30 @@ def test_public_cli_recovers_after_external_response_loss(
         reviewer="reviewer-recovery",
         expected_thread_id=expected_thread,
     )
+
+    fixture_before = fixture.read_text(encoding="utf-8")
+    held = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+    assert held.returncode == 2
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert load_only_run_state(git_repo) == interrupted_state
+    assert fixture.read_text(encoding="utf-8") == fixture_before
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+    assert resumed.returncode == 0, resumed.stdout
 
     recovered = run_internal_stage(
         git_repo,
@@ -483,7 +552,7 @@ def test_abandon_recovers_ticket_after_close_response_loss(
     assert recovered_fixture["delivery"]["closed_issues"] == []
 
 
-def test_ready_for_human_remainder_is_reported_after_independent_work(
+def test_triage_remainder_is_not_a_gate_after_independent_work(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -544,13 +613,16 @@ def test_ready_for_human_remainder_is_reported_after_independent_work(
     assert result.returncode == 2
     state = load_only_run_state(git_repo)
     assert state["ticket_jobs"]["3"]["phase"] == "completed"
-    assert state["terminal_kind"] == "waiting_human"
+    assert state["terminal_kind"] == "temporarily_no_work"
     assert state["diagnostics"][0]["remaining_tickets"] == [
         {
             "ticket_number": 2,
             "reason": "disqualifying_label:ready-for-human",
         }
     ]
+    for command in ("status", "history"):
+        view = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+        assert view["operator_action"] is None
 
 
 @pytest.mark.parametrize(

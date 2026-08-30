@@ -18,7 +18,7 @@ from agent_run.required_checks_observation import clear_required_checks_observat
 TICKET_DEVELOPMENT_LIMIT = 4
 TICKET_REVIEW_LIMIT = 3
 FINAL_CI_FIX_LIMIT = 1
-RUN_REVIEW_LIMIT = 5
+RUN_REVIEW_LIMIT = 11
 MAX_REVIEW_ARTIFACTS = RUN_REVIEW_LIMIT
 _REVIEW_BUDGET_KEYS = frozenset(
     {
@@ -40,6 +40,7 @@ class ReviewBudgetPolicy:
     review_limit: int
     final_ci_fix_limit: int = 0
     fallback: bool = False
+    budget_scope: str = "run"
 
 
 class ReviewBudget(TypedDict):
@@ -77,17 +78,28 @@ TICKET_POLICY = ReviewBudgetPolicy(
     review_limit=TICKET_REVIEW_LIMIT,
     final_ci_fix_limit=FINAL_CI_FIX_LIMIT,
     fallback=True,
+    budget_scope="ticket",
 )
 RUN_POLICY = ReviewBudgetPolicy(
     development_limit=10,
     review_limit=RUN_REVIEW_LIMIT,
+    budget_scope="run",
+)
+PARENT_ONLY_POLICY = ReviewBudgetPolicy(
+    development_limit=10,
+    review_limit=10,
+    budget_scope="parent-only",
 )
 
 
 def policy_for_subject(label: str) -> ReviewBudgetPolicy:
     """Return the policy for a shared-engine subject label."""
 
-    return TICKET_POLICY if label.startswith("ticket-") else RUN_POLICY
+    if label.startswith("ticket-"):
+        return TICKET_POLICY
+    if label == "parent-only":
+        return PARENT_ONLY_POLICY
+    return RUN_POLICY
 
 
 def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudget:
@@ -170,8 +182,44 @@ def _validate_budget_history(
         old_budget = snapshot.get("review_budget")
         if not isinstance(old_budget, dict):
             raise ValueError(f"{location}.review_budget is missing")
+        if policy.budget_scope == "run" and not isinstance(
+            snapshot.get("policy_snapshot"), dict
+        ):
+            raise ValueError(f"{location}.policy_snapshot is missing")
+        historical_policy = policy
+        if snapshot.get("policy_snapshot") is not None and policy.budget_scope in {
+            "ticket",
+            "parent-only",
+            "run",
+        }:
+            # Ticket windows retain their own policy so a later user-default
+            # change cannot make an older audit snapshot invalid. Parent-only
+            # windows use the same rule when a later window has a new paired
+            # round limit.
+            from agent_run.delivery_policy import (
+                parent_only_budget_policy,
+                parse_policy_snapshot,
+                run_repair_budget_policy,
+                ticket_review_budget_policy,
+            )
+
+            try:
+                parsed_snapshot = parse_policy_snapshot(snapshot["policy_snapshot"])
+                historical_policy = (
+                    ticket_review_budget_policy(parsed_snapshot)
+                    if policy.budget_scope == "ticket"
+                    else (
+                        parent_only_budget_policy(parsed_snapshot)
+                        if policy.budget_scope == "parent-only"
+                        else run_repair_budget_policy(parsed_snapshot)
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"{location}.policy_snapshot is invalid") from error
         try:
-            _validate_budget_projection(old_budget, f"{location}.review_budget", policy)
+            _validate_budget_projection(
+                old_budget, f"{location}.review_budget", historical_policy
+            )
         except (KeyError, TypeError) as error:
             raise ValueError(f"{location}.review_budget is invalid") from error
         if old_budget["window"] != index:

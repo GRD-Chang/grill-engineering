@@ -170,6 +170,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     artifact = _repair_artifact()
     run = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 4,
@@ -190,6 +191,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     run["repair_job"] = {
         "run_id": state["run_id"],
         "phase": "escalating",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_attempt": 1,
@@ -277,6 +279,7 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     state, states, git = _completed_run(git_repo)
     run = state["run_acceptance"] = {
         "phase": "pending",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,
@@ -354,6 +357,7 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     state["status"] = run_status
     repair_job = {
         "phase": job_phase,
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "repair_mode": "squash",
@@ -378,6 +382,7 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
         )
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 4,
@@ -525,6 +530,7 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
         artifact = _repair_artifact()
         state["run_acceptance"] = {
             "phase": "repairing",
+            "policy_snapshot": dict(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "repair_generation": int(prior.get("repair_generation", 0)),
@@ -603,6 +609,7 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     )
     candidate_sha = git.resolve(str(state["run_branch"]))
     job = {
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "default_base_sha": git.resolve("main"),
@@ -621,6 +628,7 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
     assert job["candidate_acceptance_history"][-1]["outcome"] == expected_outcome
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "candidate_acceptance_history": [],

@@ -13,6 +13,7 @@ from agent_run.change_delivery import (
     ensure_change_branch_authority,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_policy import run_repair_budget_policy_for_job
 from agent_run.git import MergeConflictError
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import (
@@ -23,7 +24,7 @@ from agent_run.run_repair_cycle import (
     sync_repair_cycle_counters,
     uses_merge_resolution,
 )
-from agent_run.review_budget import RUN_POLICY, ensure_budget, new_budget
+from agent_run.review_budget import ensure_budget, new_budget
 from agent_run.run_repair_currentness import RunRepairObservationPending
 from agent_run.run_repair_delivery import (
     RunRepairAdapter,
@@ -267,6 +268,12 @@ class RunRepairLifecycle:
         currentness = self.owner.repair_currentness
         if github is None or requests is None or currentness is None:
             raise ValueError("Run Repair requires the Publisher")
+        run_state = self.owner._run_state(state)
+        policy = run_repair_budget_policy_for_job(
+            job,
+            state_snapshot=run_state.get("policy_snapshot")
+            or state.get("policy_snapshot"),
+        )
         return ChangeDeliveryEngine(
             git=self.owner.git,
             github=github,
@@ -275,6 +282,7 @@ class RunRepairLifecycle:
                 label=f"run-repair-{job['repair_attempt']}",
                 branch=str(job["repair_branch"]),
                 base_branch=str(state["run_branch"]),
+                review_budget_policy=policy,
             ),
             adapter=RunRepairAdapter(
                 git=self.owner.git,
@@ -338,7 +346,10 @@ class RunRepairLifecycle:
                 )
             self.owner.git.resolve(f"{preserved_candidate}^{{tree}}")
         run_state = self.owner._run_state(state)
-        run_budget = ensure_budget(run_state, RUN_POLICY)
+        run_policy = run_repair_budget_policy_for_job(
+            run_state, state_snapshot=state.get("policy_snapshot")
+        )
+        run_budget = ensure_budget(run_state, run_policy)
         run_budget_history = run_state.get("review_budget_history")
         if not isinstance(run_budget_history, list):
             raise ValueError("run review_budget_history must be an array")
@@ -395,8 +406,12 @@ class RunRepairLifecycle:
             "reviewer_thread_ids": prior_threads,
             "prior_reviewer_thread_ids": prior_threads,
             "candidate_acceptance_history": [],
+            "policy_snapshot": deepcopy(
+                run_state.get("policy_snapshot") or state.get("policy_snapshot")
+            ),
             "review_budget": new_budget(
                 window=run_budget["window"],
+                development_attempts=run_budget["development_attempts"],
                 reviewer_invocations=run_budget["reviewer_invocations"],
                 review_artifacts=prior_review_artifacts,
             ),

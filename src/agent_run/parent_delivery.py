@@ -19,8 +19,12 @@ from agent_run.parent_delivery_loop import (
     ParentDeliveryLoop,
     parent_approval_grant_authority,
 )
+from agent_run.delivery_policy import (
+    parent_only_budget_policy_for_job,
+    policy_snapshot_for_state,
+)
 from agent_run.state import StateStore
-from agent_run.review_budget import RUN_POLICY, new_budget, reset_budget
+from agent_run.review_budget import new_budget, reset_budget
 from agent_run.required_checks_observation import clear_required_checks_observation
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -253,6 +257,7 @@ class ParentDeliveryEngine:
             "reviewer_thread_ids": [],
             "validation_attempts": 0,
             "acceptance_artifact": None,
+            "policy_snapshot": policy_snapshot_for_state(state),
             "review_budget": new_budget(),
             "review_budget_history": [],
         }
@@ -268,7 +273,12 @@ class ParentDeliveryEngine:
         if pending is not None:
             close_semantic_attempt(job, pending, outcome="currentness_invalidated")
             detach_active_invocation(state, pending)
-        reset_budget(job, RUN_POLICY)
+        reset_budget(
+            job,
+            parent_only_budget_policy_for_job(
+                job, state_snapshot=state.get("policy_snapshot")
+            ),
+        )
         clear_required_checks_observation(job)
         for key in (
             "candidate_sha",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.delivery_policy import parse_policy_snapshot, ticket_review_budget_policy
 from agent_run.review_budget import TICKET_POLICY
 from agent_run.required_checks_observation import require_required_checks_observation
 from agent_run.state_errors import IncompatibleRunStateError
@@ -19,6 +20,25 @@ def _require_fallback_integration_authorization(
     require_publication_facts: bool = True,
     require_previous_publication_authorization: bool = True,
 ) -> None:
+    raw_policy_snapshot = authorization.get("policy_snapshot")
+    if raw_policy_snapshot is None:
+        policy = TICKET_POLICY
+    else:
+        try:
+            policy = ticket_review_budget_policy(
+                parse_policy_snapshot(raw_policy_snapshot)
+            )
+        except (TypeError, ValueError):
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.fallback_receipt policy snapshot is invalid"
+            ) from None
+    if (
+        "policy_snapshot" in record
+        and record.get("policy_snapshot") != raw_policy_snapshot
+    ):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.fallback_receipt policy snapshot is not bound"
+        )
     if authorization.get("kind") != "ticket_fallback_publication_receipt":
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.fallback_receipt kind is invalid"
@@ -107,8 +127,8 @@ def _require_fallback_integration_authorization(
         )
     if (
         review_budget.get("window") != record["window"]
-        or review_budget.get("development_attempts") != TICKET_POLICY.development_limit
-        or review_budget.get("reviewer_invocations") != TICKET_POLICY.review_limit
+        or review_budget.get("development_attempts") != policy.development_limit
+        or review_budget.get("reviewer_invocations") != policy.review_limit
         or review_budget.get("final_ci_fix_used") != record["final_ci_fix_used"]
         or review_budget.get("checkpoint_reason") is not None
         or review_budget.get("review_artifacts") != authorization.get("review_artifacts")
@@ -118,16 +138,16 @@ def _require_fallback_integration_authorization(
         )
     if (
         authorization.get("window") != record["window"]
-        or authorization.get("reviewer_invocations") != TICKET_POLICY.review_limit
+        or authorization.get("reviewer_invocations") != policy.review_limit
         or authorization.get("development_attempts")
-        != TICKET_POLICY.development_limit
+        != policy.development_limit
         or authorization.get("final_ci_fix_used") != record["final_ci_fix_used"]
     ):
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.fallback_receipt budget is invalid"
         )
     review_artifacts = authorization.get("review_artifacts")
-    if not isinstance(review_artifacts, list) or len(review_artifacts) != TICKET_POLICY.review_limit:
+    if not isinstance(review_artifacts, list) or len(review_artifacts) != policy.review_limit:
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.fallback_receipt review artifacts are invalid"
         )
@@ -183,7 +203,7 @@ def _require_fallback_integration_authorization(
             f"incompatible_run_state: {location}.fallback_receipt latest review binding is invalid"
         )
     validation_attempts = authorization.get("validation_attempts")
-    if type(validation_attempts) is not int or validation_attempts < TICKET_POLICY.review_limit:
+    if type(validation_attempts) is not int or validation_attempts < policy.review_limit:
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.fallback_receipt validation attempts are invalid"
         )

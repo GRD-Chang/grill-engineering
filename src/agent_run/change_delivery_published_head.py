@@ -405,6 +405,7 @@ def publish_and_merge(
     merge_intent = job.get("merge_intent")
     integration_record = {
         "source": "fallback" if fallback else "accepted",
+        "policy_snapshot": deepcopy(job.get("policy_snapshot")),
         "pr_number": pr_number,
         "base_sha": str(job["base_sha"]),
         "candidate_sha": str(job["candidate_sha"]),

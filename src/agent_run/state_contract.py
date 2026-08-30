@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
+from agent_run.delivery_policy import (
+    DELIVERY_POLICY_PROTOCOL,
+    parent_only_budget_policy_for_job,
+    parse_policy_snapshot,
+    run_repair_budget_policy_for_job,
+    ticket_budget_policy_for_job,
+)
 from agent_run.review_budget import (
-    RUN_POLICY,
-    TICKET_POLICY,
     ReviewBudgetPolicy,
     ensure_budget,
 )
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
+)
+from agent_run.operator_gate import (
+    active_ticket_gate_mirror_is_consistent,
+    operator_gate_identity_is_consistent,
+    operator_gate_subject_count,
+    operator_gate_subjects,
 )
 from agent_run.required_checks_observation import (
     require_required_checks_observation,
@@ -116,6 +128,16 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Review Budget protocol"
         )
+    if state.get("delivery_policy_protocol") != DELIVERY_POLICY_PROTOCOL:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Delivery Policy protocol"
+        )
+    try:
+        parse_policy_snapshot(state.get("policy_snapshot"))
+    except (TypeError, ValueError) as error:
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid Policy Snapshot"
+        ) from error
     if (
         type(state.get("semantic_attempt_protocol")) is not int
         or state.get("semantic_attempt_protocol") != 1
@@ -146,6 +168,22 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
+    if operator_gate_subject_count(state) > 1:
+        raise IncompatibleRunStateError(
+            "legacy state has multiple current Run-wide Operator Gates"
+        )
+    if (
+        not operator_gate_identity_is_consistent(state)
+        and not _operator_gate_identity_waits_for_subject_validation(state)
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent Operator Gate action identity "
+            "or current lifecycle"
+        )
+    if not active_ticket_gate_mirror_is_consistent(state):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent active Ticket gate mirror"
+        )
     require_completed_ticket_integration_records(state)
     _require_required_checks_observations(state)
     _require_review_budget_windows(state)
@@ -158,10 +196,29 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_integrated_revalidation_merge(state)
     _require_semantic_attempt_owners(state)
     _require_resume_audit(state["resume_audit"], run_id=str(state["run_id"]))
+    _require_human_response_audit(state)
+    if not operator_gate_identity_is_consistent(state):
+        raise IncompatibleRunStateError(
+            "legacy state has an inconsistent Operator Gate action identity "
+            "or current lifecycle"
+        )
     if not all(isinstance(ticket, int) for ticket in state["frontier"]):
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
         raise IncompatibleRunStateError("legacy state has an invalid timeline")
+    timeline_continuation = state.get("timeline_continuation", [])
+    if not isinstance(timeline_continuation, list) or not all(
+        isinstance(event, dict) for event in timeline_continuation
+    ):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid timeline_continuation"
+        )
+    from agent_run.state import MAX_TIMELINE_CONTINUATION_EVENTS
+
+    if len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
+        raise IncompatibleRunStateError(
+            "legacy state has an oversized timeline_continuation"
+        )
     if "active_agent_invocation" not in state:
         raise IncompatibleRunStateError(
             "legacy state is missing canonical active_agent_invocation"
@@ -219,6 +276,29 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid ticket_graph.revision"
         )
+
+
+def _operator_gate_identity_waits_for_subject_validation(
+    state: dict[str, Any],
+) -> bool:
+    """Let the owner contract report malformed gate fields first."""
+
+    for location, subject in operator_gate_subjects(state):
+        phase = subject.get("phase")
+        if phase == "blocked" and not isinstance(subject.get("blocked_reason"), str):
+            return True
+        if phase != "publication_pending":
+            continue
+        try:
+            retry = require_publication_operation_retry(
+                subject.get("publication_operation_retry"),
+                location=f"{location}.publication_operation_retry",
+            )
+        except ValueError:
+            return True
+        if retry["attempts"] != retry["limit"]:
+            return True
+    return False
 
 
 def _require_required_checks_observations(state: dict[str, Any]) -> None:
@@ -468,17 +548,83 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
     subjects: list[tuple[str, dict[str, Any], ReviewBudgetPolicy]] = []
     ticket_jobs = state.get("ticket_jobs")
     if isinstance(ticket_jobs, dict):
-        subjects.extend(
-            (f"ticket_jobs[{key}]", job, TICKET_POLICY)
-            for key, job in ticket_jobs.items()
-            if isinstance(job, dict) and _looks_like_materialized_job(job)
-        )
+        for key, job in ticket_jobs.items():
+            if not isinstance(job, dict) or not _looks_like_materialized_job(job):
+                continue
+            location = f"ticket_jobs[{key}]"
+            try:
+                policy = ticket_budget_policy_for_job(
+                    job, state_snapshot=state.get("policy_snapshot")
+                )
+            except (TypeError, ValueError) as error:
+                raise IncompatibleRunStateError(
+                    f"legacy state has an invalid {location}.policy_snapshot"
+                ) from error
+            subjects.append((location, job, policy))
     for key in ("parent_job", "run_acceptance"):
         value = state.get(key)
         if isinstance(value, dict):
-            subjects.append((key, value, RUN_POLICY))
+            if key == "parent_job":
+                try:
+                    policy = parent_only_budget_policy_for_job(
+                        value, state_snapshot=state.get("policy_snapshot")
+                    )
+                except (TypeError, ValueError) as error:
+                    raise IncompatibleRunStateError(
+                        "legacy state has an invalid parent_job.policy_snapshot"
+                    ) from error
+            else:
+                try:
+                    _require_policy_snapshot_binding(
+                        value.get("policy_snapshot"),
+                        state["policy_snapshot"],
+                        "run_acceptance",
+                    )
+                    policy = run_repair_budget_policy_for_job(
+                        value, state_snapshot=state.get("policy_snapshot")
+                    )
+                except (TypeError, ValueError) as error:
+                    raise IncompatibleRunStateError(
+                        "legacy state has an invalid run_acceptance.policy_snapshot"
+                    ) from error
+            subjects.append((key, value, policy))
             if key == "run_acceptance" and isinstance(value.get("repair_job"), dict):
-                subjects.append(("run_acceptance.repair_job", value["repair_job"], RUN_POLICY))
+                repair = value["repair_job"]
+                run_snapshot = value.get("policy_snapshot") or state.get(
+                    "policy_snapshot"
+                )
+                run_budget = value.get("review_budget")
+                repair_budget = repair.get("review_budget")
+                if (
+                    isinstance(run_budget, dict)
+                    and isinstance(repair_budget, dict)
+                    and type(run_budget.get("window")) is int
+                    and type(repair_budget.get("window")) is int
+                    and run_budget["window"] != repair_budget["window"]
+                ):
+                    raise IncompatibleRunStateError(
+                        "legacy state has mismatched Run Acceptance and Run Repair Budget Windows"
+                    )
+                if repair.get("publication_authority") == "fallback" or (
+                    "fallback_publication_receipt" in repair
+                ):
+                    raise IncompatibleRunStateError(
+                        "legacy state has an unauthorized Run Repair fallback Publication Authority"
+                    )
+                try:
+                    _require_policy_snapshot_binding(
+                        repair.get("policy_snapshot"),
+                        run_snapshot,
+                        "run_acceptance.repair_job",
+                    )
+                    repair_policy = run_repair_budget_policy_for_job(
+                        repair, state_snapshot=run_snapshot
+                    )
+                except (TypeError, ValueError) as error:
+                    raise IncompatibleRunStateError(
+                        "legacy state has an invalid run_acceptance.repair_job.policy_snapshot"
+                    ) from error
+                subjects.append(("run_acceptance.repair_job", repair, repair_policy))
     for location, job, policy in subjects:
         try:
             ensure_budget(job, policy)
@@ -486,6 +632,19 @@ def _require_review_budget_windows(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid canonical {location}.review_budget"
             ) from error
+
+
+def _require_policy_snapshot_binding(
+    nested: object, parent: object, location: str
+) -> None:
+    """Ensure nested Run projections use the same frozen Policy Snapshot."""
+
+    if nested is None:
+        raise ValueError(f"{location}.policy_snapshot is missing")
+    nested_snapshot = parse_policy_snapshot(nested).snapshot()
+    parent_snapshot = parse_policy_snapshot(parent).snapshot()
+    if nested_snapshot != parent_snapshot:
+        raise ValueError(f"{location}.policy_snapshot differs from its Run Snapshot")
 
 
 def _looks_like_materialized_job(value: dict[str, Any]) -> bool:
@@ -544,14 +703,10 @@ def _require_human_blocker(subject: dict[str, Any]) -> None:
     blockers = subject.get("human_blockers")
     if subject.get("phase") not in {"blocked", "ready_for_human"}:
         return
-    if reason not in {"agent_requires_human", "reviewer_requires_human"} and not isinstance(
-        blockers, list
-    ):
+    recognized = reason in {"agent_requires_human", "reviewer_requires_human"}
+    if not recognized and not isinstance(blockers, list):
         return
-    if reason is not None and reason not in {
-        "agent_requires_human",
-        "reviewer_requires_human",
-    }:
+    if not recognized:
         raise IncompatibleRunStateError("legacy state has an invalid Human Blocker phase")
     if not isinstance(blockers, list) or not 1 <= len(blockers) <= 8 or not all(
         isinstance(blocker, str) and blocker and len(blocker) <= 2000
@@ -682,6 +837,53 @@ def _require_resume_audit(audit: dict[str, Any], *, run_id: str) -> None:
         )
 
 
+def _require_human_response_audit(state: dict[str, Any]) -> None:
+    protocol = state.get("human_response_audit_protocol")
+    if protocol is not None and protocol != 1:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Human Response audit protocol"
+        )
+    if protocol == 1 and "human_response_audit" not in state:
+        raise IncompatibleRunStateError(
+            "current state is missing canonical human_response_audit"
+        )
+    response_audit = state.get("human_response_audit", {})
+    if not isinstance(response_audit, dict):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid human_response_audit"
+        )
+    resume_audit = state["resume_audit"]
+    history = resume_audit.get("history") if isinstance(resume_audit, dict) else None
+    events = {
+        event.get("resume_id"): event
+        for event in (history if isinstance(history, list) else [])
+        if isinstance(event, dict)
+    }
+    expected_resume_ids = {
+        resume_id
+        for resume_id, event in events.items()
+        if isinstance(resume_id, str)
+        and event.get("human_response_supplied") is True
+    }
+    if protocol == 1 and set(response_audit) != expected_resume_ids:
+        raise IncompatibleRunStateError(
+            "legacy state has incomplete Human Response audit facts"
+        )
+    for resume_id, response in response_audit.items():
+        event = events.get(resume_id)
+        if (
+            not isinstance(resume_id, str)
+            or not isinstance(response, str)
+            or not response
+            or len(response.encode("utf-8")) > 8192
+            or not isinstance(event, dict)
+            or event.get("human_response_supplied") is not True
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Human Response audit fact"
+            )
+
+
 def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
     """Require retained Resume events and successor Invocations to agree."""
 
@@ -753,6 +955,16 @@ def _require_resume_audit_invocation_links(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 "legacy state has an Invocation bound to the wrong Resume"
             )
+
+
+def _is_positive_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
 
 
 def _require_invocation(
@@ -868,6 +1080,20 @@ def _require_invocation(
     ):
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}.attempt_count"
+        )
+    deadline_seconds = invocation.get("deadline_seconds")
+    if deadline_seconds is not None and not _is_positive_finite_number(
+        deadline_seconds
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.deadline_seconds"
+        )
+    deadline_at = invocation.get("deadline_at")
+    if deadline_at is not None and (
+        not isinstance(deadline_at, str) or not deadline_at.strip()
+    ):
+        raise IncompatibleRunStateError(
+            f"legacy state has an invalid {location}.deadline_at"
         )
     for key in ("requested_thread_id", "reported_thread_id", "ended_at", "error"):
         if invocation.get(key) is not None and not isinstance(invocation.get(key), str):

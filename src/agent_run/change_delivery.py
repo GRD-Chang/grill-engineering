@@ -38,6 +38,7 @@ from agent_run.review_budget import (
 )
 
 MAX_MODIFICATION_ATTEMPTS = 10
+_DEFAULT_MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
 
 
@@ -451,9 +452,16 @@ class ChangeDeliveryEngine:
             job.pop("last_publication_error", None)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
-        policy = policy_for_subject(self.contract.label)
-        if policy.fallback and MAX_MODIFICATION_ATTEMPTS != 10:
-            return replace(policy, development_limit=MAX_MODIFICATION_ATTEMPTS)
+        policy = self.contract.review_budget_policy or policy_for_subject(
+            self.contract.label
+        )
+        if policy.fallback and MAX_MODIFICATION_ATTEMPTS != _DEFAULT_MAX_MODIFICATION_ATTEMPTS:
+            return replace(
+                policy,
+                development_limit=min(
+                    policy.development_limit, MAX_MODIFICATION_ATTEMPTS
+                ),
+            )
         return policy
 
     def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool:
@@ -492,9 +500,8 @@ class ChangeDeliveryEngine:
     ) -> bool:
         return prepare_ticket_fallback(self, state, job)
 
-    @staticmethod
-    def _fallback_candidate_is_eligible(job: dict[str, Any]) -> bool:
-        return fallback_candidate_is_eligible(job)
+    def _fallback_candidate_is_eligible(self, job: dict[str, Any]) -> bool:
+        return fallback_candidate_is_eligible(job, self.review_budget_policy())
 
     def _record_publication_operation_failure(
         self, state: dict[str, Any], job: dict[str, Any], error: Exception

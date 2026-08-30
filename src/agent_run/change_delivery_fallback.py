@@ -166,7 +166,7 @@ def prepare_ticket_fallback(
     stage: FallbackStage, state: dict[str, Any], job: dict[str, Any]
 ) -> bool:
     policy = stage.review_budget_policy()
-    if not policy.fallback or not fallback_candidate_is_eligible(job):
+    if not policy.fallback or not fallback_candidate_is_eligible(job, policy):
         return False
     candidate = job.get("candidate_sha")
     if not isinstance(candidate, str):
@@ -249,6 +249,7 @@ def prepare_ticket_fallback(
     )
     receipt = {
         "kind": "ticket_fallback_publication_receipt",
+        "policy_snapshot": deepcopy(job.get("policy_snapshot")),
         "window": budget["window"],
         "base_sha": str(job["base_sha"]),
         "candidate_sha": candidate,
@@ -301,7 +302,9 @@ def prepare_ticket_fallback(
     return True
 
 
-def fallback_candidate_is_eligible(job: dict[str, Any]) -> bool:
+def fallback_candidate_is_eligible(
+    job: dict[str, Any], policy: ReviewBudgetPolicy
+) -> bool:
     budget = job.get("review_budget")
     candidate = job.get("candidate_sha")
     last_review_candidate = job.get("last_review_candidate_sha")
@@ -312,7 +315,7 @@ def fallback_candidate_is_eligible(job: dict[str, Any]) -> bool:
     )
     return (
         isinstance(budget, dict)
-        and budget.get("reviewer_invocations") == 3
+        and budget.get("reviewer_invocations") == policy.review_limit
         and isinstance(candidate, str)
         and candidate != last_review_candidate
         and has_fallback_artifact

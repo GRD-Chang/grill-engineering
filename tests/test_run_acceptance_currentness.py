@@ -141,6 +141,7 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     )
     run = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -151,6 +152,7 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
         "acceptance_artifact": _repair_artifact(),
         "repair_job": {
             "phase": "developing",
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "repair_generation": 1,
@@ -224,6 +226,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     budget["development_attempts"] = 1
     repair_job = {
         "phase": "developing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": budget,
         "review_budget_history": [],
         "repair_generation": 1,
@@ -246,6 +249,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     }
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -274,14 +278,19 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     )
 
+    held = run_cli(git_repo, fixture, "run", "1")
+    assert held.returncode == 2
+    assert stdout_json(held)["status"] == "execution_failed"
+    assert states.load_run(run_id) == state
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
+        delivery_before
+    )
+
     resumed = run_cli(
         git_repo,
         fixture,
         "resume",
         run_id,
-        "--message",
-        "The old blocker has been resolved.",
-        "--new-thread",
     )
 
     assert resumed.returncode == 0, resumed.stderr
@@ -295,8 +304,8 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert persisted["active_agent_invocation"] is None
     resume_event = persisted["resume_audit"]["history"][-1]
     assert resume_event["semantic_attempt_id"] == attempt["attempt_id"]
-    assert resume_event["human_response_supplied"] is True
-    assert resume_event["new_thread"] is True
+    assert resume_event["human_response_supplied"] is False
+    assert resume_event["new_thread"] is False
     assert resume_event["successor_invocation_started_at"] is None
     retired = persisted["retired_semantic_attempt_owners"][-1]
     assert retired["work_subject"] == f"run-repair:{run_id}"
@@ -458,6 +467,7 @@ def test_run_repair_preserves_dirty_inflight_development_after_final_pr_drift(
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": pr_number}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -552,6 +562,7 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": pr_number}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -636,12 +647,14 @@ def test_stale_run_repair_keeps_threads_out_of_fresh_review(
     state, _states, _git = _completed_run(git_repo)
     run = state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "development_thread_id": None,
         "development_thread_history": [],
         "reviewer_thread_ids": ["run-reviewer"],
         "repair_job": {
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": _canonical_run_budget(),
             "review_budget_history": [],
             "development_thread_id": "repair-developer",
@@ -697,6 +710,7 @@ def test_interrupted_run_review_restarts_with_a_fresh_attempt(
     state, states, git = _completed_run(git_repo)
     state["run_acceptance"] = {
         "phase": "reviewing",
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "acceptance_generation": 1,

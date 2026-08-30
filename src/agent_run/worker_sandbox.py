@@ -17,6 +17,10 @@ class WorkerSandboxError(RuntimeError):
     pass
 
 
+class WorkerDeadlineExceeded(WorkerSandboxError):
+    pass
+
+
 def worker_environment(
     gh_config: Path, github_read_token: str
 ) -> dict[str, str]:
@@ -440,7 +444,8 @@ def run_worker_process(
     cwd: Path,
     prompt: str,
     environment: dict[str, str],
-    timeout: int,
+    timeout: float,
+    deadline_at_monotonic: float | None = None,
     on_stdout_line: Callable[[str], None] | None = None,
     abort_event: threading.Event | None = None,
     abort_reason: Callable[[], str] | None = None,
@@ -515,7 +520,11 @@ def run_worker_process(
     stdin_writer.start()
     wait_error: BaseException | None = None
     try:
-        deadline = time.monotonic() + timeout
+        deadline = (
+            deadline_at_monotonic
+            if deadline_at_monotonic is not None
+            else time.monotonic() + timeout
+        )
         while process.poll() is None:
             if abort_event is not None and abort_event.is_set():
                 wait_error = WorkerSandboxError(
@@ -524,7 +533,7 @@ def run_worker_process(
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                wait_error = WorkerSandboxError("Codex worker timed out")
+                wait_error = WorkerDeadlineExceeded("Codex worker timed out")
                 break
             try:
                 process.wait(timeout=min(0.1, remaining))

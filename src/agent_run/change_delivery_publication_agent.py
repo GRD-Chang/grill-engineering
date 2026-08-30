@@ -10,6 +10,7 @@ from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.artifacts import PublicationArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
+from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.external_supervision import is_github_convergence_error
 from agent_run.github import GitHubReadError
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
@@ -171,6 +172,7 @@ def invocation_events(
 ) -> Callable[..., None]:
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     boundary = stage._invocation_boundary(job)
+    invocation_deadline_seconds = invocation_deadline_for_state(state, role)
     return invocation_event_recorder(
         state,
         role=role,
@@ -181,6 +183,7 @@ def invocation_events(
         currentness_boundary=boundary,
         semantic_attempt=semantic_attempt,
         save=stage.save,
+        invocation_deadline_seconds=invocation_deadline_seconds,
     )
 
 

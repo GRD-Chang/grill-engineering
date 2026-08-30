@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from copy import deepcopy
 from typing import Any, Callable
 
@@ -60,6 +60,7 @@ def invocation_event_recorder(
     currentness_boundary: dict[str, Any],
     semantic_attempt: dict[str, Any],
     save: Callable[[dict[str, Any]], object],
+    invocation_deadline_seconds: float | None = None,
 ) -> Callable[..., None]:
     """Persist the small, durable facts for one active Agent Invocation."""
 
@@ -104,6 +105,22 @@ def invocation_event_recorder(
                 "resume_id": resume_id,
                 "resume_sequence": resume_sequence,
             }
+            deadline_seconds = invocation_deadline_seconds
+            if deadline_seconds is None:
+                deadline_seconds = invocation_input.get("_invocation_deadline_seconds")
+            if isinstance(deadline_seconds, (int, float)) and not isinstance(
+                deadline_seconds, bool
+            ):
+                invocation["deadline_seconds"] = deadline_seconds
+                try:
+                    invocation["deadline_at"] = (
+                        datetime.fromisoformat(now)
+                        + timedelta(seconds=float(deadline_seconds))
+                    ).isoformat()
+                except OverflowError:
+                    # Monotonic enforcement still applies; an unrepresentable
+                    # far-future wall-clock timestamp is not durable evidence.
+                    pass
             state["active_agent_invocation"] = invocation
             _sync_invocation_history(state, invocation)
         else:
@@ -155,6 +172,7 @@ def invocation_event_recorder(
             _sync_invocation_history(state, invocation)
         save(state)
 
+    setattr(record, "deadline_seconds", invocation_deadline_seconds)
     return record
 
 

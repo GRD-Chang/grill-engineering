@@ -30,6 +30,7 @@ from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 from agent_run.review_budget import previous_review_context
+from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.required_checks_observation import clear_required_checks_observation
 
 
@@ -399,6 +400,9 @@ class TicketDeliveryLoop:
                 label=f"ticket-{int(job['ticket_number'])}",
                 branch=str(job["ticket_branch"]),
                 base_branch=str(state["run_branch"]),
+                review_budget_policy=ticket_budget_policy_for_job(
+                    job, state_snapshot=state.get("policy_snapshot")
+                ),
             ),
             adapter=self.adapter,
             publisher=self.publisher,

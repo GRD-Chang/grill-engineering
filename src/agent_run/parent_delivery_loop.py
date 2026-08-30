@@ -20,12 +20,13 @@ from agent_run.change_delivery import (
     latest_reviewer_thread,
     StaleDisposition,
 )
+from agent_run.delivery_policy import parent_only_budget_policy_for_job
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.github import MergeOutcomeUnknownError
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
-from agent_run.review_budget import RUN_POLICY, ensure_budget, previous_review_context
+from agent_run.review_budget import ensure_budget, previous_review_context
 from agent_run.required_checks_observation import clear_required_checks_observation
 
 
@@ -362,6 +363,9 @@ class ParentDeliveryLoop:
                 label="parent-only",
                 branch=str(job["parent_branch"]),
                 base_branch=str(_mapping(state, "base")["branch"]),
+                review_budget_policy=parent_only_budget_policy_for_job(
+                    job, state_snapshot=state.get("policy_snapshot")
+                ),
             ),
             adapter=self.adapter,
             publisher=self.publisher,
@@ -463,7 +467,12 @@ class ParentDeliveryLoop:
     def _escalate(state: dict[str, Any], job: dict[str, Any], code: str) -> None:
         job["blocked_reason"] = code
         if code == "review_budget_exhausted":
-            budget = ensure_budget(job, RUN_POLICY)
+            budget = ensure_budget(
+                job,
+                parent_only_budget_policy_for_job(
+                    job, state_snapshot=state.get("policy_snapshot")
+                ),
+            )
             budget["checkpoint_reason"] = code
         state["status"] = "blocked"
         state["diagnostics"] = [{"code": code, "message": "Parent Issue requires explicit human intervention"}]

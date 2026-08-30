@@ -66,7 +66,7 @@ Controller 也不解析 Development Summary 来判断 Finding 是否关闭。
 | Git Integrity Repair | 对应需求 URL、当前可修复的原始 Git Integrity Evidence、当前 checkout | stale/currentness 路由、剩余预算 |
 | Required-Checks Repair | 对应需求 URL、exact-head CI Evidence、当前 checkout | ordinary/final-ci-fix 身份、剩余预算 |
 | Ticket Reviewer | Parent/Ticket URL、reviewed base、当前 Candidate、Validation Checkout | R1–R3 序号、D4/fallback、预算余量 |
-| Run Reviewer | Parent URL、default/Run identity、最终 Ticket Set、最终合并预览、适用的 fallback Ticket evidence | R1–R5 序号、checkpoint/resume |
+| Run Reviewer | Parent URL、default/Run identity、最终 Ticket Set、最终合并预览、适用的 fallback Ticket evidence | R1–N+1 序号（默认 N=10 时为 R11）、checkpoint/resume |
 | Parent-only Reviewer | Parent URL、reviewed base、当前 Candidate | R1–R5 序号、人工批准状态 |
 | Reviewer 后续轮次 | 上述当前事实，加紧邻上一轮角色化 review identity 与完整 Artifact | 更早 Artifact、closure ledger、Development disposition |
 | 正常 Publication | 需求 URL、当前 diff、当前 Acceptance Artifact | checks/merge 后继状态、预算 |

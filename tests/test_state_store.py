@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from agent_run.run_locator import MAX_LOCATOR_ENTRIES, RunLocatorIndex
-from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
+from agent_run.state import (
+    MAX_TIMELINE_CONTINUATION_EVENTS,
+    MAX_TIMELINE_EVENTS,
+    StateStore,
+)
 
 
 def test_run_locator_prunes_missing_directories_and_bounds_entries(tmp_path: Path) -> None:
@@ -272,7 +276,8 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
         }
     ]
 
-    for number in range(MAX_TIMELINE_EVENTS + 10):
+    final_revision = f"observed-{MAX_TIMELINE_EVENTS * 2 + 9}"
+    for number in range(MAX_TIMELINE_EVENTS * 2 + 10):
         change = state["unsupported_scope_change"]
         assert isinstance(change, dict)
         change["observed_graph_revision"] = f"observed-{number}"
@@ -281,3 +286,7 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
     assert len(state["timeline"]) == MAX_TIMELINE_EVENTS
     assert state["timeline"][-1]["kind"] == "timeline_capacity"
     assert state["timeline_at_capacity"] is True
+    assert len(state["timeline_continuation"]) == MAX_TIMELINE_CONTINUATION_EVENTS
+    assert state["timeline_continuation"][-1]["observed_graph_revision"] == (
+        final_revision
+    )

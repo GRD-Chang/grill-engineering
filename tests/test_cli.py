@@ -19,6 +19,9 @@ from agent_run.controller import Controller
 from agent_run.codex import CodexProcessError
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
+from agent_run.operator_action_presentation import print_operator_action
+from agent_run.presentation_helpers import human_next_action
+from agent_run.requeue import RequeueError
 from agent_run.run_driver import DirectRunOperations, RunStep
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import FaultInjectingStateStore, StateStore
@@ -55,6 +58,196 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
         assert internal_command not in help_text
         with pytest.raises(SystemExit):
             build_parser().parse_args([internal_command, "run-id"])
+
+
+def test_public_run_preserves_non_invocation_execution_failure_until_resume(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    agents = git_repo / "agents.json"
+    agent_data = {
+        "developments": [
+            {
+                "expected_thread_id": None,
+                "thread_id": "developer-2",
+                "human_blockers": ["Maintainer input is required."],
+            }
+        ],
+        "publications": [],
+        "reviews": [],
+    }
+    agents.write_text(json.dumps(agent_data), encoding="utf-8")
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    states = StateStore(git_repo / ".agent-run")
+    assert Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    ).record_execution_failure(run_id, "controller failed before an Agent started")
+    failed = load_only_run_state(git_repo)
+    assert failed["active_agent_invocation"] is None
+
+    status = run_cli(git_repo, fixture, "status", run_id)
+    assert "类型: Execution Failure" in status.stdout
+    assert "唯一下一步: agent-run resume 1 --repo example/project" in status.stdout
+    for command in ("status", "history"):
+        json_view = stdout_json(
+            run_cli(git_repo, fixture, command, run_id, "--json")
+        )
+        assert json_view["operator_action"]["type"] == "Execution Failure"
+        assert json_view["operator_action"]["object"] == "Ticket #2"
+        assert json_view["operator_action"]["phase"] == "active"
+        assert json_view["operator_action"]["next_action"] == (
+            "agent-run resume 1 --repo example/project"
+        )
+        assert json_view["next_action"] == json_view["operator_action"][
+            "next_action"
+        ]
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["repository_read_failures"] = [
+        {
+            "code": "github_read_failed",
+            "message": "repository binding has not converged",
+        }
+    ]
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+    ordinary_run = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert ordinary_run.returncode == 2
+    assert load_only_run_state(git_repo) == failed
+    assert json.loads(agents.read_text(encoding="utf-8")) == agent_data
+
+    ordinary_run_after_binding = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+    assert ordinary_run_after_binding.returncode == 2
+    assert load_only_run_state(git_repo) == failed
+
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+    )
+    with pytest.raises(RequeueError, match="unresolved Execution Failure"):
+        controller.requeue(run_id)
+    assert load_only_run_state(git_repo) == failed
+
+    for lifecycle_command in ("requeue", "approve", "revise"):
+        rejected = run_cli(git_repo, fixture, lifecycle_command, run_id)
+        assert rejected.returncode == 2
+        assert load_only_run_state(git_repo) == failed
+
+    for invalid_option in (
+        ("--message", "not valid for an Execution Failure"),
+        ("--new-thread",),
+    ):
+        invalid_resume = run_cli(
+            git_repo,
+            fixture,
+            "resume",
+            "1",
+            "--repo",
+            "example/project",
+            *invalid_option,
+        )
+        assert invalid_resume.returncode == 2
+        assert load_only_run_state(git_repo) == failed
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        "1",
+        "--repo",
+        "example/project",
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    resumed_state = load_only_run_state(git_repo)
+    assert resumed_state["status"] == "active"
+    assert resumed_state["resume_audit"]["history"][-1]["kind"] == (
+        "execution_failure"
+    )
+    assert resumed_state["resume_audit"]["history"][-1]["failure_code"] == (
+        "command_failed"
+    )
+
+    advanced = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+    )
+    assert advanced.returncode == 2
+    assert stdout_json(advanced)["status"] == "ready_for_human"
+    final_audit = load_only_run_state(git_repo)["resume_audit"]["history"][-1]
+    assert final_audit["kind"] == "execution_failure"
+    assert isinstance(final_audit["successor_invocation_started_at"], str)
+
+
+def test_public_policy_cli_persists_user_defaults_and_shows_resolved_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "policy",
+                "configure",
+                "--ticket-review-rounds",
+                "2",
+                "--parent-only-paired-rounds",
+                "7",
+                "--run-repair-rounds",
+                "6",
+                "--review-deadline",
+                "90m",
+            ]
+        )
+        == 0
+    )
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["result"] == "configured"
+    assert configured["policy"]["ticket_review_rounds"] == 2
+    assert configured["policy"]["parent_only_paired_rounds"] == 7
+    assert configured["policy"]["run_repair_rounds"] == 6
+    assert configured["policy"]["invocation_deadlines"]["review"] == 5400
+
+    assert main(["policy", "show"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["result"] == "policy"
+    assert shown["user_defaults"] == {
+        "invocation_deadlines": {"review": "90m"},
+        "parent_only_paired_rounds": 7,
+        "run_repair_rounds": 6,
+        "ticket_review_rounds": 2,
+    }
+
+
+def test_invalid_policy_is_rejected_before_run_state_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert main(["run", "1", "--review-deadline", "0s"]) == 2
+    assert json.loads(capsys.readouterr().out)["result"] == "error"
+    assert not (tmp_path / ".agent-run").exists()
 
 
 def test_public_operator_docs_describe_the_v01_quickstart() -> None:
@@ -654,11 +847,11 @@ def test_status_distinguishes_semantic_invocation_output_budget_and_publication_
 
     cli.cli_presentation._print_status(state, as_json=False)
     human = capsys.readouterr().out
-    assert "Semantic Agent Attempt: attempt-publication-2" in human
-    assert "Agent Invocation: publication failed" in human
-    assert "Output Attempt: 3" in human
-    assert "Budget Window: none" in human
-    assert "Publication Operation Retry: 2/4" in human
+    assert "Status:     执行失败，可恢复" in human
+    assert "Ticket #3" in human
+    assert "Semantic Agent Attempt" not in human
+    assert "attempt-publication-2" not in human
+    assert "sha256:boundary" not in human
 
 
 def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
@@ -753,11 +946,10 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
 
     cli.cli_presentation._print_history(state, as_json=False)
     human = capsys.readouterr().out
-    assert "Semantic Agent Attempt attempt-reviewer-1 reviewer ordinal=1" in human
-    assert "Agent Invocation failed" in human
-    assert "Output Attempt=2" in human
-    assert "Budget Window=1" in human
-    assert "Publication Operation Retry=1/3" in human
+    assert "Review Agent 第 1 轮" in human
+    assert "Semantic Agent Attempt" not in human
+    assert "attempt-reviewer-1" not in human
+    assert "sha256:second" not in human
 
 
 def test_timeline_projects_semantic_invocation_output_and_retry_counters(
@@ -863,9 +1055,254 @@ def test_status_exposes_preserved_dirty_checkout_and_recovery_action(
 
     cli.cli_presentation._print_status(state, as_json=False)
     human = capsys.readouterr().out
-    assert "/repo/.agent-run/worktrees/run-1/ticket-3" in human
-    assert "tracked modifications" in human
-    assert "agent-run resume run-1" in human
+    assert "已保留 1 个受管工作区" in human
+    assert "完整诊断与恢复操作见 --json" in human
+    assert "/repo/.agent-run/worktrees/run-1/ticket-3" not in human
+    assert "tracked modifications" not in human
+    assert "run-1" not in human
+
+
+def test_operator_action_keeps_repository_names_starting_with_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    print_operator_action(
+        {
+            "type": "Human Blocker",
+            "object": "Ticket #2",
+            "phase": "candidate",
+            "reasons": ["需要操作者确认"],
+            "trigger_invocation": None,
+            "preserved": "当前状态与已有审计证据",
+            "next_action": (
+                "agent-run resume 1 --repo run-1-1234567890abcdef/project"
+            ),
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "agent-run resume 1 --repo run-1-1234567890abcdef/project" in output
+    assert "<run-id>/project" not in output
+    assert human_next_action(
+        "agent-run resume run-1-1234567890abcdef-2",
+        run_id="run-1-1234567890abcdef-2",
+    ) == "agent-run resume <run-id>"
+    print_operator_action(
+        {
+            "type": "Deterministic Contradiction",
+            "object": "Ticket #2",
+            "phase": "blocked",
+            "reasons": ["Candidate mismatch"],
+            "trigger_invocation": None,
+            "preserved": "当前状态与已有审计证据",
+            "next_action": "agent-run abandon run-1-1234567890abcdef-2",
+        },
+        run_id="run-1-1234567890abcdef-2",
+    )
+    contradiction = capsys.readouterr().out
+    assert "agent-run abandon <run-id>" in contradiction
+    assert "run-1-1234567890abcdef-2" not in contradiction
+
+
+def test_history_matches_responses_and_findings_to_their_subject_and_window(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def artifact(finding: str) -> dict[str, object]:
+        return {
+            "checks": {
+                "e2e": {"findings": [finding]},
+                "standards": {"findings": []},
+                "spec": {"findings": []},
+            }
+        }
+
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "active",
+        "timeline": [],
+        "ticket_jobs": {
+            "2": {
+                "human_response_history": [{"response": "response-for-ticket-2"}],
+                "review_budget_history": [
+                    {
+                        "review_budget": {
+                            "window": 1,
+                            "review_artifacts": [{"artifact": artifact("old-window")}],
+                        }
+                    }
+                ],
+                "review_budget": {
+                    "window": 2,
+                    "review_artifacts": [{"artifact": artifact("current-window")}],
+                },
+            },
+            "3": {
+                "human_response_history": [{"response": "response-for-ticket-3"}],
+                "review_budget_history": [],
+                "review_budget": {"window": 1, "review_artifacts": []},
+            },
+        },
+        "agent_invocation_history": [
+            {
+                "started_at": "2026-08-30T00:01:00+00:00",
+                "ended_at": "2026-08-30T00:02:00+00:00",
+                "status": "completed",
+                "phase": "candidate",
+                "work_subject": "ticket:2",
+                "invocation_role": "reviewer",
+                "semantic_attempt": {
+                    "role": "reviewer",
+                    "ordinal": 1,
+                    "budget_window": 2,
+                },
+            }
+        ],
+        "resume_audit": {
+            "history": [
+                {
+                    "requested_at": "2026-08-30T00:03:00+00:00",
+                    "work_subject": "ticket:3",
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+                {
+                    "requested_at": "2026-08-30T00:04:00+00:00",
+                    "work_subject": "ticket:2",
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+            ]
+        },
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+    review = next(event for event in output["events"] if event["kind"] == "review")
+    resumes = [event for event in output["events"] if event["kind"] == "resume"]
+
+    assert review["details"] == ["current-window"]
+    assert [(event["object"], event["details"]) for event in resumes] == [
+        ("Ticket #3", ["response-for-ticket-3"]),
+        ("Ticket #2", ["response-for-ticket-2"]),
+    ]
+
+
+def test_terminal_status_and_history_share_a_stable_elapsed_time(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "completed",
+        "timeline": [
+            {
+                "at": "2026-08-30T00:00:10+00:00",
+                "kind": "run_status",
+                "status": "completed",
+            }
+        ],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    first_status = json.loads(capsys.readouterr().out)
+    cli.cli_presentation._print_status(state, as_json=True)
+    second_status = json.loads(capsys.readouterr().out)
+    cli.cli_presentation._print_history(state, as_json=True)
+    history = json.loads(capsys.readouterr().out)
+
+    assert first_status["elapsed_seconds"] == 10
+    assert second_status["elapsed_seconds"] == 10
+    assert history["summary"]["elapsed_seconds"] == 10
+
+
+def test_history_does_not_assign_a_new_generation_response_to_an_old_resume(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "active",
+        "timeline": [],
+        "ticket_jobs": {
+            "2": {
+                "human_response_history": [
+                    {"generation": 2, "response": "new-generation-response"}
+                ]
+            }
+        },
+        "resume_audit": {
+            "history": [
+                {
+                    "requested_at": "2026-08-30T00:01:00+00:00",
+                    "work_subject": "ticket:2",
+                    "generation": 1,
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+                {
+                    "requested_at": "2026-08-30T00:02:00+00:00",
+                    "work_subject": "ticket:2",
+                    "generation": 2,
+                    "source_status": "ready_for_human",
+                    "human_response_supplied": True,
+                },
+            ]
+        },
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+    resumes = [event for event in output["events"] if event["kind"] == "resume"]
+
+    assert [event["details"] for event in resumes] == [
+        [],
+        ["new-generation-response"],
+    ]
+
+
+def test_status_labels_the_latest_agent_with_its_own_ticket(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1-1234567890abcdef",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Parent spec"},
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "status": "active",
+        "active_ticket_job": {"ticket_number": 3, "phase": "developing"},
+        "ticket_jobs": {
+            "2": {"ticket_number": 2, "phase": "completed"},
+            "3": {"ticket_number": 3, "phase": "developing"},
+        },
+        "agent_invocation_history": [
+            {
+                "started_at": "2026-08-30T00:01:00+00:00",
+                "ended_at": "2026-08-30T00:02:00+00:00",
+                "status": "completed",
+                "work_subject": "ticket:2",
+                "role": "publication",
+                "model": "fixture-agent",
+                "reasoning_effort": "high",
+            }
+        ],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=False)
+    output = capsys.readouterr().out
+
+    assert "当前对象:   Ticket #3" in output
+    assert "最近 Agent: Publication Agent · Ticket #2" in output
+    assert "Publication Agent · Ticket #3" not in output
 
 
 def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(
@@ -996,6 +1433,30 @@ def run_cli(
         environment.update(extra_env)
     return subprocess.run(
         [sys.executable, "-m", "agent_run", *arguments, "--github-fixture", str(fixture)],
+        cwd=repo,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def run_policy_cli(
+    repo: Path,
+    *arguments: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    source_path = str(PROJECT_ROOT / "src")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not environment.get("PYTHONPATH")
+        else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
+    )
+    if extra_env:
+        environment.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-m", "agent_run", "policy", *arguments],
         cwd=repo,
         env=environment,
         text=True,
@@ -1497,6 +1958,970 @@ def test_lifecycle_commands_do_not_use_cross_directory_locator(
     assert state_path.read_text(encoding="utf-8") == before
 
 
+def test_status_and_history_select_the_unique_current_run_without_run_id(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    started = run_cli(git_repo, fixture, "start", "1")
+    run_id = stdout_json(started)["run_id"]
+
+    status = run_cli(git_repo, fixture, "status", "--json")
+    history = run_cli(git_repo, fixture, "history", "--json")
+
+    assert status.returncode == history.returncode == 0
+    assert stdout_json(status)["run_id"] == run_id
+    assert stdout_json(history)["run_id"] == run_id
+
+
+def test_parent_selector_works_in_a_repo_and_across_directories(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    local = run_cli(
+        git_repo, fixture, "status", "--parent", "1", "--json", extra_env=locator_env
+    )
+    cross_directory = run_cli(
+        elsewhere,
+        fixture,
+        "history",
+        "--repo",
+        "example/project",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert local.returncode == cross_directory.returncode == 0
+    assert stdout_json(local)["run_id"] == run_id
+    assert stdout_json(cross_directory)["run_id"] == run_id
+
+
+def test_parent_selector_fails_closed_when_same_repository_has_multiple_clones(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    first_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "--quiet", str(git_repo), str(clone)], check=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:example/project.git"],
+        cwd=clone,
+        check=True,
+    )
+    clone_fixture = write_fixture(clone / "github.json", issues={})
+    second_id = stdout_json(
+        run_cli(clone, clone_fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "status",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert result.returncode == 2
+    diagnostic = stdout_json(result)["diagnostics"][0]
+    assert diagnostic["code"] == "run_selector_ambiguous"
+    assert {candidate["run_id"] for candidate in diagnostic["candidates"]} == {
+        first_id,
+        second_id,
+    }
+
+
+def test_repository_parent_selector_does_not_collide_on_same_issue_number(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    first_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+
+    other_repo = tmp_path / "other-repo"
+    subprocess.run(["git", "clone", "--quiet", str(git_repo), str(other_repo)], check=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:other/project.git"],
+        cwd=other_repo,
+        check=True,
+    )
+    other_fixture = write_fixture(
+        other_repo / "github.json", issues={}, repository="other/project"
+    )
+    second_id = stdout_json(
+        run_cli(other_repo, other_fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    first = run_cli(
+        elsewhere,
+        fixture,
+        "status",
+        "--repo",
+        "example/project",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+    second = run_cli(
+        elsewhere,
+        other_fixture,
+        "history",
+        "--repo",
+        "other/project",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert first.returncode == second.returncode == 0
+    assert stdout_json(first)["run_id"] == first_id
+    assert stdout_json(second)["run_id"] == second_id
+
+
+def test_repository_parent_selector_ignores_unrelated_stale_locator(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={}, repository="a/project"
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:a/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    first_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    first_state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+
+    other_repo = tmp_path / "other-repo"
+    subprocess.run(["git", "clone", "--quiet", str(git_repo), str(other_repo)], check=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:b/project.git"],
+        cwd=other_repo,
+        check=True,
+    )
+    other_fixture = write_fixture(
+        other_repo / "github.json", issues={}, repository="b/project"
+    )
+    second_id = stdout_json(
+        run_cli(other_repo, other_fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    second_state_path = other_repo / ".agent-run" / "runs" / f"{second_id}.json"
+    second_state_path.unlink()
+    locator_path = tmp_path / "locator-home" / "agent-run" / "run-locator.json"
+    before_first_state = first_state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    status = run_cli(
+        elsewhere,
+        fixture,
+        "status",
+        "--repo",
+        "a/project",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+    history = run_cli(
+        elsewhere,
+        fixture,
+        "history",
+        "--repo",
+        "a/project",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert status.returncode == history.returncode == 0
+    assert stdout_json(status)["run_id"] == first_id
+    assert stdout_json(history)["run_id"] == first_id
+
+    for command in ("status", "history"):
+        unrelated = run_cli(
+            elsewhere,
+            other_fixture,
+            command,
+            "--repo",
+            "b/project",
+            "--parent",
+            "1",
+            "--json",
+            extra_env=locator_env,
+        )
+
+        assert unrelated.returncode == 2
+        diagnostic = stdout_json(unrelated)["diagnostics"][0]
+        assert diagnostic["code"] == "run_locator_stale"
+    assert first_state_path.read_text(encoding="utf-8") == before_first_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+    assert not second_state_path.exists()
+
+
+def test_runs_discovers_bounded_human_run_candidates(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    state = load_only_run_state(git_repo)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    discovered = run_cli(
+        elsewhere,
+        fixture,
+        "runs",
+        "--repo",
+        "example/project",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    output = stdout_json(discovered)
+    assert output["result"] == "runs"
+    assert output["repository"] == "example/project"
+    assert output["runs"] == [
+        {
+            "parent": 1,
+            "repository": "example/project",
+            "repository_root": str(git_repo.resolve()),
+            "run_id": run_id,
+            "started_at": state["created_at"],
+            "state_dir": str((git_repo / ".agent-run").resolve()),
+            "status": state["status"],
+        }
+    ]
+
+
+def test_runs_with_default_state_dir_reports_the_checkout_root(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+
+    discovered = run_cli(
+        git_repo,
+        fixture,
+        "runs",
+        "--state-dir",
+        str(git_repo / ".agent-run"),
+        "--json",
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == str(git_repo.resolve())
+    assert candidate["state_dir"] == str((git_repo / ".agent-run").resolve())
+
+
+def test_runs_with_registered_custom_state_dir_reports_the_checkout_root(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    custom_state_dir = tmp_path / "custom-state"
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    run_id = stdout_json(
+        run_cli(
+            git_repo,
+            fixture,
+            "start",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            extra_env=locator_env,
+        )
+    )["run_id"]
+
+    discovered = run_cli(
+        git_repo,
+        fixture,
+        "runs",
+        "--state-dir",
+        str(custom_state_dir),
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == str(git_repo.resolve())
+    assert candidate["state_dir"] == str(custom_state_dir.resolve())
+
+
+def test_registered_state_dir_without_checkout_identity_is_unavailable(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    custom_state_dir = tmp_path / "custom-state"
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    run_id = stdout_json(
+        run_cli(
+            git_repo,
+            fixture,
+            "start",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            extra_env=locator_env,
+        )
+    )["run_id"]
+    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.pop("checkout_identity", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    before_state = state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+
+    discovered = run_cli(
+        git_repo,
+        fixture,
+        "runs",
+        "--state-dir",
+        str(custom_state_dir),
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == "unavailable"
+    for command in ("status", "history"):
+        result = run_cli(
+            git_repo,
+            fixture,
+            command,
+            "--parent",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            "--json",
+            extra_env=locator_env,
+        )
+        assert result.returncode == 2
+        diagnostic = stdout_json(result)["diagnostics"][0]
+        assert diagnostic["code"] == "run_locator_stale"
+    assert state_path.read_text(encoding="utf-8") == before_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+
+
+def test_explicit_repository_run_without_origin_remains_selectable(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json", issues={}, repository="a/project"
+    )
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+
+    started = run_cli(
+        git_repo,
+        fixture,
+        "start",
+        "1",
+        "--repo",
+        "a/project",
+        extra_env=locator_env,
+    )
+
+    assert started.returncode == 0, started.stderr
+    run_id = stdout_json(started)["run_id"]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    locator_path = tmp_path / "locator-home" / "agent-run" / "run-locator.json"
+    before_state = state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+
+    status = run_cli(
+        git_repo, fixture, "status", "--json", extra_env=locator_env
+    )
+    history = run_cli(
+        git_repo,
+        fixture,
+        "history",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert status.returncode == history.returncode == 0
+    assert stdout_json(status)["run_id"] == run_id
+    assert stdout_json(history)["run_id"] == run_id
+    assert state_path.read_text(encoding="utf-8") == before_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+
+
+def test_runs_with_unknown_custom_state_dir_marks_worktree_unavailable(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    source = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    custom_state_dir = tmp_path / "custom-state"
+    custom_runs = custom_state_dir / "runs"
+    custom_runs.mkdir(parents=True)
+    shutil.copy2(source, custom_runs / source.name)
+    before = (custom_runs / source.name).read_text(encoding="utf-8")
+
+    discovered = run_cli(
+        git_repo,
+        fixture,
+        "runs",
+        "--state-dir",
+        str(custom_state_dir),
+        "--json",
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == "unavailable"
+    assert candidate["state_dir"] == str(custom_state_dir.resolve())
+    assert (custom_runs / source.name).read_text(encoding="utf-8") == before
+
+
+def test_runs_with_nested_dot_agent_run_state_dir_marks_worktree_unavailable(
+    git_repo: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    source = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    custom_state_dir = git_repo / "nested" / ".agent-run"
+    custom_runs = custom_state_dir / "runs"
+    custom_runs.mkdir(parents=True)
+    shutil.copy2(source, custom_runs / source.name)
+    before = (custom_runs / source.name).read_text(encoding="utf-8")
+
+    discovered = run_cli(
+        git_repo,
+        fixture,
+        "runs",
+        "--state-dir",
+        str(custom_state_dir),
+        "--json",
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == "unavailable"
+    assert candidate["state_dir"] == str(custom_state_dir.resolve())
+    assert (custom_runs / source.name).read_text(encoding="utf-8") == before
+
+
+def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inputs(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    custom_state_dir = tmp_path / "custom-state"
+    run_id = stdout_json(
+        run_cli(
+            git_repo,
+            fixture,
+            "start",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            extra_env=locator_env,
+        )
+    )["run_id"]
+    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    before_state = state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+
+    original = tmp_path / "original"
+    git_repo.rename(original)
+    subprocess.run(["git", "clone", "--quiet", str(original), str(git_repo)], check=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:other/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    replacement_fixture = write_fixture(
+        git_repo / "github.json", issues={}, repository="other/project"
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    discovered = run_cli(
+        elsewhere,
+        replacement_fixture,
+        "runs",
+        "--state-dir",
+        str(custom_state_dir),
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == "unavailable"
+    for command in ("status", "history"):
+        result = run_cli(
+            git_repo,
+            replacement_fixture,
+            command,
+            "--parent",
+            "1",
+            "--json",
+            extra_env=locator_env,
+        )
+        assert result.returncode == 2
+        diagnostic = stdout_json(result)["diagnostics"][0]
+        assert diagnostic["code"] == "run_locator_stale"
+    assert state_path.read_text(encoding="utf-8") == before_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+    assert not (git_repo / ".agent-run").exists()
+
+
+def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    from cli_fixtures import run_agents
+
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    custom_state_dir = tmp_path / "custom-state"
+    run_id = stdout_json(
+        run_cli(
+            git_repo,
+            fixture,
+            "start",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            extra_env=locator_env,
+        )
+    )["run_id"]
+    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        {
+            "status": "supervision_timeout",
+            "terminal_kind": "supervision_timeout",
+            "supervision_wait": {"resume_status": "waiting_external"},
+        }
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    before_state = state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+
+    original = tmp_path / "original"
+    git_repo.rename(original)
+    subprocess.run(["git", "clone", "--quiet", str(original), str(git_repo)], check=True)
+    replacement_fixture = write_fixture(
+        git_repo / "github.json", issues={}, repository="example/project"
+    )
+    agents = run_agents(git_repo / "agents.json")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    discovered = run_cli(
+        elsewhere,
+        replacement_fixture,
+        "runs",
+        "--state-dir",
+        str(custom_state_dir),
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert discovered.returncode == 0, discovered.stderr
+    candidate = stdout_json(discovered)["runs"][0]
+    assert candidate["run_id"] == run_id
+    assert candidate["repository_root"] == "unavailable"
+    for command, arguments in (
+        ("start", ("1", "--state-dir", str(custom_state_dir))),
+        (
+            "run",
+            (
+                "1",
+                "--state-dir",
+                str(custom_state_dir),
+                "--agent-fixture",
+                str(agents),
+            ),
+        ),
+        ("status", ("--parent", "1", "--json")),
+        ("history", ("--parent", "1", "--json")),
+        (
+            "resume",
+            (
+                "1",
+                "--state-dir",
+                str(custom_state_dir),
+                "--agent-fixture",
+                str(agents),
+            ),
+        ),
+        (
+            "resume",
+            (
+                run_id,
+                "--state-dir",
+                str(custom_state_dir),
+                "--agent-fixture",
+                str(agents),
+            ),
+        ),
+    ):
+        result = run_cli(
+            git_repo,
+            replacement_fixture,
+            command,
+            *arguments,
+            extra_env=locator_env,
+        )
+        assert result.returncode == 2, result.stderr
+        diagnostic = stdout_json(result)["diagnostics"][0]
+        assert diagnostic["code"] == "run_locator_stale"
+        assert state_path.read_text(encoding="utf-8") == before_state
+        assert locator_path.read_text(encoding="utf-8") == before_locator
+    assert state_path.read_text(encoding="utf-8") == before_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+    assert not (git_repo / ".agent-run").exists()
+
+
+def test_selector_does_not_cross_select_a_run_from_another_clone(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    custom_state_dir = tmp_path / "custom-state"
+    run_id = stdout_json(
+        run_cli(
+            git_repo,
+            fixture,
+            "start",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            extra_env=locator_env,
+        )
+    )["run_id"]
+    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    before_state = state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "--quiet", str(git_repo), str(clone)], check=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:example/project.git"],
+        cwd=clone,
+        check=True,
+    )
+    clone_fixture = write_fixture(clone / "github.json", issues={})
+
+    for command in ("status", "history"):
+        result = run_cli(
+            clone,
+            clone_fixture,
+            command,
+            "--parent",
+            "1",
+            "--json",
+            extra_env=locator_env,
+        )
+        assert result.returncode == 2, result.stderr
+        diagnostic = stdout_json(result)["diagnostics"][0]
+        assert diagnostic["code"] == "run_selector_requires_checkout"
+    assert state_path.read_text(encoding="utf-8") == before_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+    assert not (clone / ".agent-run").exists()
+
+
+def test_resume_with_explicit_state_dir_does_not_cross_select_another_clone(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    from cli_fixtures import run_agents
+
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    custom_state_dir = tmp_path / "custom-state"
+    run_id = stdout_json(
+        run_cli(
+            git_repo,
+            fixture,
+            "start",
+            "1",
+            "--state-dir",
+            str(custom_state_dir),
+            extra_env=locator_env,
+        )
+    )["run_id"]
+    state_path = custom_state_dir / "runs" / f"{run_id}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.update(
+        {
+            "status": "supervision_timeout",
+            "terminal_kind": "supervision_timeout",
+            "supervision_wait": {"resume_status": "waiting_external"},
+        }
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    before_state = state_path.read_text(encoding="utf-8")
+    before_locator = locator_path.read_text(encoding="utf-8")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "--quiet", str(git_repo), str(clone)], check=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:example/project.git"],
+        cwd=clone,
+        check=True,
+    )
+    clone_fixture = write_fixture(clone / "github.json", issues={})
+    agents = run_agents(clone / "agents.json")
+
+    result = run_cli(
+        clone,
+        clone_fixture,
+        "resume",
+        "1",
+        "--state-dir",
+        str(custom_state_dir),
+        "--agent-fixture",
+        str(agents),
+        extra_env=locator_env,
+    )
+
+    assert result.returncode == 2
+    diagnostic = stdout_json(result)["diagnostics"][0]
+    assert diagnostic["code"] == "run_selector_requires_checkout"
+    assert state_path.read_text(encoding="utf-8") == before_state
+    assert locator_path.read_text(encoding="utf-8") == before_locator
+    assert not (clone / ".agent-run").exists()
+
+
+def test_parent_selector_fails_closed_with_all_ambiguous_candidates(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    first = run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    first_id = stdout_json(first)["run_id"]
+    second = run_cli(
+        git_repo, fixture, "start", "1", "--new-run", extra_env=locator_env
+    )
+    second_id = stdout_json(second)["run_id"]
+    state_paths = sorted((git_repo / ".agent-run" / "runs").glob("*.json"))
+    before = [path.read_text(encoding="utf-8") for path in state_paths]
+
+    result = run_cli(
+        git_repo,
+        fixture,
+        "status",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert result.returncode == 2
+    diagnostic = stdout_json(result)["diagnostics"][0]
+    assert diagnostic["code"] == "run_selector_ambiguous"
+    assert {candidate["run_id"] for candidate in diagnostic["candidates"]} == {
+        first_id,
+        second_id,
+    }
+    assert [path.read_text(encoding="utf-8") for path in state_paths] == before
+
+
+def test_parent_selector_reports_stale_index_candidates_without_mutation(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    before = state_path.read_text(encoding="utf-8")
+    locator_path = locator_home / "agent-run" / "run-locator.json"
+    locator = json.loads(locator_path.read_text(encoding="utf-8"))
+    locator["entries"][0]["state_dir"] = str(tmp_path / "missing-state")
+    locator_path.write_text(json.dumps(locator), encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    result = run_cli(
+        elsewhere,
+        fixture,
+        "status",
+        "--repo",
+        "example/project",
+        "--parent",
+        "1",
+        "--json",
+        extra_env=locator_env,
+    )
+
+    assert result.returncode == 2
+    diagnostic = stdout_json(result)["diagnostics"][0]
+    assert diagnostic["code"] == "run_locator_stale"
+    assert diagnostic["candidates"][0]["run_id"] == run_id
+    assert diagnostic["candidates"][0]["state_dir"] == str(tmp_path / "missing-state")
+    assert state_path.read_text(encoding="utf-8") == before
+
+
+def test_resume_parent_selector_never_creates_a_run_when_no_recoverable_match(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+
+    result = run_cli(git_repo, fixture, "resume", "1")
+
+    assert result.returncode == 2
+    diagnostic = stdout_json(result)["diagnostics"][0]
+    assert diagnostic["code"] == "run_selector_not_found"
+    assert not (git_repo / ".agent-run").exists()
+
+
+def test_resume_parent_selector_reuses_one_existing_recoverable_run(
+    git_repo: Path,
+) -> None:
+    from cli_fixtures import run_agents
+
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
+        cwd=git_repo,
+        check=True,
+    )
+    agents = run_agents(git_repo / "agents.json")
+    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state = load_only_run_state(git_repo)
+    state.update(
+        {
+            "status": "supervision_timeout",
+            "terminal_kind": "supervision_timeout",
+            "supervision_wait": {"resume_status": "waiting_external"},
+        }
+    )
+    run_file.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        "1",
+        "--repo",
+        "example/project",
+        "--agent-fixture",
+        str(agents),
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["run_id"] == run_id
+    resumed_state = load_only_run_state(git_repo)
+    assert resumed_state["run_id"] == run_id
+    assert resumed_state["resume_audit"]["total"] == 1
+    assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+
+
 def test_frontier_uses_native_dependencies_labels_state_and_parent_order(
     git_repo: Path,
 ) -> None:
@@ -1823,6 +3248,7 @@ def test_resume_rejects_an_owner_that_has_already_advanced(
             "status": "execution_failed",
             "run_acceptance": {
                 "phase": "accepted",
+                "policy_snapshot": deepcopy(state["policy_snapshot"]),
                 "acceptance_generation": 1,
                 "validation_attempts": 1,
                 "review_budget": _canonical_run_budget(),
@@ -1908,6 +3334,7 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
             "status": "run_publication_pending",
             "run_acceptance": {
                 "phase": "accepted",
+                "policy_snapshot": deepcopy(state["policy_snapshot"]),
                 "acceptance_generation": 1,
                 "validation_attempts": 1,
                 "review_budget": _canonical_run_budget(),
@@ -2023,22 +3450,33 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     work_subject="ticket:2", role="development", phase="developing"
                 )
             },
-            f"agent-run resume {run_id}",
+            "agent-run resume 1 --repo example/project",
         ),
         (
             "ready_for_human",
             {
+                "active_ticket_job": None,
                 "parent_job": {
                     "phase": "blocked",
                     "blocked_reason": "agent_requires_human",
                     "human_blockers": ["Need maintainer input."],
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                },
+            },
+            "agent-run resume 1 --repo example/project",
+        ),
+        (
+            "requeue_required",
+            {
+                "requeue_required": {
+                    "work_subject": "ticket:2",
+                    "generation": 1,
+                    "reason": "ticket_requirements_changed",
                 }
             },
-            f"agent-run resume {run_id}",
+            f"agent-run requeue {run_id}",
         ),
-        ("requeue_required", {}, f"agent-run requeue {run_id}"),
     ]
 
     for status, additions, expected_action in cases:
@@ -2059,6 +3497,24 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     ),
                 }
             )
+            state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
+        if status == "requeue_required":
+            state["ticket_jobs"]["2"].update(
+                {
+                    "ticket_branch_generation": 1,
+                    "phase": "developing",
+                    "review_budget": _canonical_run_budget(),
+                    "review_budget_history": [],
+                }
+            )
+            state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
+            state["terminal_kind"] = "requeue_required"
+            state["diagnostics"] = [
+                {
+                    "code": "ticket_requirements_changed",
+                    "message": "Ticket requirements changed; run requeue",
+                }
+            ]
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
         result = run_cli(git_repo, fixture, "status", run_id, "--json")
@@ -2207,6 +3663,62 @@ def test_no_executable_ticket_is_progress_exhaustion_not_completion(
     assert state["status"] == "progress_exhausted"
     assert state["active_ticket_job"] is None
     assert state["diagnostics"][0]["code"] == "no_executable_ticket"
+
+
+@pytest.mark.parametrize(
+    "triage_label", ["needs-triage", "needs-info", "ready-for-human"]
+)
+def test_triage_ticket_does_not_create_an_operator_gate(
+    git_repo: Path,
+    triage_label: str,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={
+            "2": issue(2, labels=["ready-for-agent", triage_label]),
+        },
+    )
+
+    started = run_cli(git_repo, fixture, "start", "1")
+
+    assert started.returncode == 2
+    run_id = stdout_json(started)["run_id"]
+    state = load_only_run_state(git_repo)
+    assert state["status"] == "progress_exhausted"
+    assert state["terminal_kind"] == "temporarily_no_work"
+    assert state["diagnostics"][0]["remaining_tickets"] == [
+        {
+            "ticket_number": 2,
+            "reason": f"disqualifying_label:{triage_label}",
+        }
+    ]
+    for command in ("status", "history"):
+        view = stdout_json(
+            run_cli(git_repo, fixture, command, run_id, "--json")
+        )
+        assert view["operator_action"] is None
+
+
+def test_needs_triage_ticket_does_not_block_an_eligible_ticket(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={
+            "2": issue(2, labels=["ready-for-agent", "needs-triage"]),
+            "3": issue(3),
+        },
+    )
+
+    started = run_cli(git_repo, fixture, "start", "1")
+
+    assert started.returncode == 0, started.stderr
+    output = stdout_json(started)
+    assert output["status"] == "active"
+    assert output["active_ticket"] == 3
+    state = load_only_run_state(git_repo)
+    assert state["frontier"] == [3]
+    assert state["active_ticket_job"]["ticket_number"] == 3
 
 
 def test_cycle_is_persisted_as_blocked_with_diagnostic(git_repo: Path) -> None:

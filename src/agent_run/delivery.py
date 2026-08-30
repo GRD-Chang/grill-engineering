@@ -14,6 +14,7 @@ from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitRepository
 from agent_run.revisions import effective_revision
 from agent_run.review_budget import new_budget
+from agent_run.delivery_policy import policy_snapshot_for_state
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization,
 )
@@ -328,6 +329,7 @@ class TicketDeliveryEngine:
             "reviewer_thread_ids": [],
             "validation_attempts": 0,
             "acceptance_artifact": None,
+            "policy_snapshot": policy_snapshot_for_state(state),
             "review_budget": new_budget(),
             "review_budget_history": [],
         }

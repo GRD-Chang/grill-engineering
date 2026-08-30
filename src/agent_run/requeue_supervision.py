@@ -58,11 +58,20 @@ def refresh_requeue_transition_facts(
         state["parent"] = _mapping(refreshed, "parent")
         state["ticket_graph"] = _mapping(refreshed, "ticket_graph")
         if state.pop("github_refresh_pending", None):
+            requeue = _mapping(state, "requeue_required")
+            reason = requeue.get("reason")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError("requeue_required reason is invalid")
             state.update(
                 {
                     "status": "requeue_required",
                     "terminal_kind": "requeue_required",
-                    "diagnostics": [],
+                    "diagnostics": [
+                        {
+                            "code": reason,
+                            "message": "Change Job Generation is stale; run requeue",
+                        }
+                    ],
                 }
             )
         state["updated_at"] = now()

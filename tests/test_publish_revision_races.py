@@ -470,6 +470,28 @@ def test_abandon_recovers_lost_change_pr_close_response(
 
     assert interrupted.returncode == 2
     assert stdout_json(interrupted)["status"] == "abandonment_pending"
+    for command in ("status", "history"):
+        json_view = stdout_json(
+            run_cli(git_repo, fixture, command, run_id, "--json")
+        )
+        action = json_view["operator_action"]
+        assert action["type"] == "Abandonment Recovery"
+        assert action["object"] == "Ticket #2"
+        assert action["phase"] == "waiting_checks"
+        assert action["reasons"] == [
+            "Run abandonment recovery is incomplete."
+        ]
+        assert action["next_action"] == f"agent-run abandon {run_id}"
+        assert json_view["next_action"] == action["next_action"]
+        text_view = run_cli(git_repo, fixture, command, run_id)
+        assert "类型: Abandonment Recovery" in text_view.stdout
+        assert "对象: Ticket #2" in text_view.stdout
+        assert "阶段: waiting_checks" in text_view.stdout
+        assert "原因: Run abandonment recovery is incomplete." in text_view.stdout
+        assert "已保留成果:" in text_view.stdout
+        assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in text_view.stdout
+        assert "唯一下一步: agent-run abandon <run-id>" in text_view.stdout
+        assert run_id not in text_view.stdout
     after_interruption = json.loads(fixture.read_text(encoding="utf-8"))
     assert after_interruption["delivery"]["pull_requests"][0]["state"] == "CLOSED"
     close_mutations = [
@@ -525,10 +547,13 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
     fixture.write_text(json.dumps(drifted), encoding="utf-8")
     assert run_internal_stage(git_repo, fixture, "deliver", run_id).returncode == 2
 
+    before_abandonment = json.loads(fixture.read_text(encoding="utf-8"))
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
 
-    assert abandoned.returncode == 0, abandoned.stderr
+    assert abandoned.returncode == 2, abandoned.stderr
+    assert stdout_json(abandoned)["status"] == "incompatible_run_state"
     after = json.loads(fixture.read_text(encoding="utf-8"))
+    assert after == before_abandonment
     assert after["issues"]["2"]["state"] == "CLOSED"
     assert not any(
         mutation["action"].startswith("abandonment_")

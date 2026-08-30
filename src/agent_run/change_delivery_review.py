@@ -80,6 +80,7 @@ def review(
     _record_reviewer(
         job, review.thread_id, new_thread=job.get("review_new_thread") is True
     )
+    human_blocker_resume = job.get("review_human_blocker_resume") is True
     job.pop("review_new_thread", None)
     job.pop("review_failure_resume", None)
     job.pop("review_resume_thread_id", None)
@@ -97,6 +98,7 @@ def review(
     job["pending_review_result"] = {
         "reviewer_thread_id": review.thread_id,
         "artifact": artifact.raw,
+        "human_blocker_resume": human_blocker_resume,
     }
     # Persist the returned result and Reviewer identity atomically.  This
     # keeps the successful lifecycle's existing save cadence while making
@@ -155,16 +157,35 @@ def complete_review(
                     f"{candidate_sha}^{{tree}}"
                 ),
             }
-        budget["review_artifacts"].append(
-            {
-                "reviewer_thread_id": reviewer_thread_id,
-                "candidate_sha": candidate_sha,
-                "reviewed_base_sha": str(job["base_sha"]),
-                "review_identity": review_identity,
-                "artifact": artifact.raw,
-            }
+        review_record = {
+            "reviewer_thread_id": reviewer_thread_id,
+            "candidate_sha": candidate_sha,
+            "reviewed_base_sha": str(job["base_sha"]),
+            "review_identity": review_identity,
+            "artifact": artifact.raw,
+        }
+        matching_index = next(
+            (
+                index
+                for index in range(len(budget["review_artifacts"]) - 1, -1, -1)
+                if budget["review_artifacts"][index].get("candidate_sha")
+                == candidate_sha
+                and (
+                    pending.get("human_blocker_resume") is True
+                    or budget["review_artifacts"][index].get("reviewer_thread_id")
+                    == reviewer_thread_id
+                )
+            ),
+            None,
         )
-        del budget["review_artifacts"][:-5]
+        if matching_index is None:
+            budget["review_artifacts"].append(review_record)
+        else:
+            # Human Blocker resume completes the same semantic Reviewer attempt
+            # against the same Candidate.  Its new Artifact supersedes the
+            # blocked result; the raw blocker remains in human_blocker_history.
+            budget["review_artifacts"][matching_index] = review_record
+        del budget["review_artifacts"][: -stage.review_budget_policy().review_limit]
     job["last_review_candidate_sha"] = str(job["candidate_sha"])
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw

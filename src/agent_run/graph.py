@@ -386,11 +386,7 @@ def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
         "merged_result_mismatch",
         "no_code_changes",
     }
-    if any(
-        item.get("reason") in human_reasons
-        or str(item.get("reason", "")).startswith("disqualifying_label:")
-        for item in remaining
-    ):
+    if any(item.get("reason") in human_reasons for item in remaining):
         return "waiting_human"
     return "temporarily_no_work"
 

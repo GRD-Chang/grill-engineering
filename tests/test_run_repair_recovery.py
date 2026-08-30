@@ -44,6 +44,7 @@ def test_run_repair_promotion_rejects_final_pr_trigger_drift(
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -113,6 +114,7 @@ def test_run_repair_trigger_creation_supervises_recoverable_pr_reads(
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -256,6 +258,7 @@ def test_run_repair_resumes_returned_candidate_review_after_currentness_read_fai
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -333,6 +336,7 @@ def test_run_repair_publication_default_drift_revalidates_in_same_cycle(
     publisher = FixtureGitHubPublisher(fixture, git)
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
@@ -399,6 +403,7 @@ def test_run_repair_development_uses_latest_candidate_finding(
     fixture = git_repo / "github.json"
     state["run_acceptance"] = {
         "phase": "repairing",
+        "policy_snapshot": dict(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
         "modification_attempts": 0,
