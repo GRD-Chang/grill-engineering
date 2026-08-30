@@ -26,7 +26,7 @@ from agent_run.requeue import close_superseded_pull_request, remove_superseded_w
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
-from agent_run.state import StateStore
+from agent_run.state import SimulatedProcessCrash, StateStore
 
 
 class RunOutcomeKind(str, Enum):
@@ -434,6 +434,11 @@ class RunDriver:
             if failed is None:  # pragma: no cover - Controller just wrote it
                 raise
             return failed
+        except SimulatedProcessCrash:
+            # Fault injection models an abrupt Executor exit.  Do not convert
+            # it into a normal Run execution failure: the Host must retain the
+            # unresolved ownership record for the next command to reconcile.
+            raise
         except (CodexProcessError, OSError, ValueError) as error:
             if not self.operations.controller.record_execution_failure(run_id, str(error)):
                 raise

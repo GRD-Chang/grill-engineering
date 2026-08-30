@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from agent_run.artifacts import AcceptanceArtifact
@@ -24,8 +25,43 @@ from agent_run.operator_action_presentation import (
 from agent_run.presentation_helpers import current_work_subject
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
+from agent_run.run_lifecycle import ActionReceipt
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
+
+
+def public_action_receipt(
+    receipt: ActionReceipt,
+    *,
+    repository: object,
+    parent: object,
+    next_action: object,
+) -> dict[str, object]:
+    """Project one lifecycle result into the operator-facing receipt."""
+
+    parent_view = (
+        {
+            "number": parent.get("number"),
+            "title": parent.get("title"),
+        }
+        if isinstance(parent, Mapping)
+        else {"number": None, "title": None}
+    )
+    status = {
+        "completed": "applied",
+        "executor_active": "applied",
+        "accepted": "in_progress",
+        "applying": "in_progress",
+        "failed": "failed",
+    }.get(receipt.status, "in_progress")
+    return {
+        "repository": repository,
+        "parent": parent_view,
+        "operation": receipt.kind,
+        "submission": "attached" if receipt.attached else "started",
+        "status": status,
+        "next_action": next_action,
+    }
 
 def _print_precondition_failure(state: dict[str, object]) -> None:
     active = _active_ticket_job(state)
@@ -115,6 +151,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
     progress = status_progress_view(state, output)
     output["progress"] = progress
     if as_json:
+        output["lifecycle_action"] = state.get("action_application_receipt")
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
     print_status_progress(

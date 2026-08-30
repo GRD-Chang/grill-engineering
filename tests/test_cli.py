@@ -1398,6 +1398,24 @@ def test_source_checkout_cannot_run_production_lifecycle_without_active_runner(
     assert not (git_repo / ".agent-run").exists()
 
 
+def test_production_run_without_a_real_executor_host_fails_before_writes(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr(cli, "_running_active_runner", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "FakeExecutorHost",
+        lambda: pytest.fail("production run must not construct the fixture host"),
+    )
+
+    assert main(["run", "1", "--repo", "example/project"]) == 2
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["diagnostics"][0]["code"] == "execution_readiness"
+    assert not (git_repo / ".agent-run").exists()
+
+
 def issue(
     number: int,
     *,
@@ -3009,7 +3027,7 @@ def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
 
 
 @pytest.mark.parametrize("command", ["status", "history"])
-def test_status_and_history_reject_an_incompatible_legacy_state(
+def test_status_and_history_show_incompatible_legacy_evidence(
     git_repo: Path, command: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
@@ -3023,9 +3041,11 @@ def test_status_and_history_reject_an_incompatible_legacy_state(
 
     result = run_cli(git_repo, fixture, command, run_id, "--json")
 
-    assert result.returncode == 2
-    assert stdout_json(result)["status"] == "incompatible_run_state"
-    assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert result.returncode == 0
+    output = stdout_json(result)
+    assert output["run_id"] == run_id
+    if command == "status":
+        assert output["status"] == before["status"]
     assert json.loads(state_path.read_text(encoding="utf-8")) == before
 
 

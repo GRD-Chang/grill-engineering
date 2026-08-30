@@ -380,7 +380,7 @@ def test_parent_only_pending_window_survives_process_restart(
     first_process, first_state = _run_until_pending_window(
         git_repo, fixture, agents
     )
-    _interrupt_run(first_process)
+    _interrupt_run(first_process, git_repo)
     first_window = first_state["supervision_window"]
     assert isinstance(first_window, dict)
     first_invocations = first_state["agent_invocation_history"]
@@ -391,7 +391,7 @@ def test_parent_only_pending_window_survives_process_restart(
     second_process, _ = _run_until_pending_window(
         git_repo, fixture, agents, wait_for_retry_message=True
     )
-    _interrupt_run(second_process)
+    _interrupt_run(second_process, git_repo)
 
     resumed_state = load_only_run_state(git_repo)
     assert resumed_state["supervision_window"] == first_window
@@ -453,7 +453,7 @@ def test_final_run_pending_window_survives_process_restart(
     first_process, first_state = _run_until_pending_window(
         git_repo, fixture, agents
     )
-    _interrupt_run(first_process)
+    _interrupt_run(first_process, git_repo)
     first_window = first_state["supervision_window"]
     assert isinstance(first_window, dict)
     first_invocations = first_state["agent_invocation_history"]
@@ -464,7 +464,7 @@ def test_final_run_pending_window_survives_process_restart(
     second_process, _ = _run_until_pending_window(
         git_repo, fixture, agents, wait_for_retry_message=True
     )
-    _interrupt_run(second_process)
+    _interrupt_run(second_process, git_repo)
 
     resumed_state = load_only_run_state(git_repo)
     assert resumed_state["supervision_window"] == first_window

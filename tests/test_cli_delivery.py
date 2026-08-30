@@ -755,7 +755,19 @@ def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
     )
 
     assert interrupted.returncode == 130
-    assert stdout_json(interrupted)["status"] == "execution_failed"
+    interrupted_output = stdout_json(interrupted)
+    assert interrupted_output["status"] == "execution_failed"
+    assert interrupted_output["diagnostics"][0]["code"] == (
+        "executor_agent_interrupted"
+    )
+    control = json.loads(
+        next((git_repo / ".agent-run" / "task-control").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert control["action"]["status"] == "completed"
+    assert control["executor"]["status"] == "exited"
+    assert control["executor"]["failure"] == "executor_agent_interrupted"
     state = load_only_run_state(git_repo)
     job = state["active_ticket_job"]
     checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
@@ -898,6 +910,9 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     )
 
     assert interrupted.returncode == 130, interrupted.stdout
+    assert stdout_json(interrupted)["diagnostics"][0]["code"] == (
+        "executor_agent_interrupted"
+    )
     state = load_only_run_state(git_repo)
     job = state["active_ticket_job"]
     pending = job["pending_semantic_attempt"]

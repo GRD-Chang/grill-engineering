@@ -75,6 +75,7 @@ from agent_run.state_contract import (
     human_blocker_subject_count,
     require_current_run_state,
 )
+from agent_run.task_control import TASK_CONTROL_PROTOCOL
 
 
 class GitHubReader(Protocol):
@@ -123,7 +124,10 @@ class Controller:
             return self._start_locked(repository, parent_number, existing)
 
     def start_or_resume_unfinished(
-        self, parent_number: int
+        self,
+        parent_number: int,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically select the one live Run for the foreground `run` command."""
         try:
@@ -143,7 +147,12 @@ class Controller:
                     f"{run_ids}"
                 )
             existing = unfinished[0] if unfinished else None
-            return self._start_locked(repository, parent_number, existing)
+            return self._start_locked(
+                repository,
+                parent_number,
+                existing,
+                prepare_state=prepare_state,
+            )
 
     def _wait_for_initial_repository(
         self,
@@ -1126,6 +1135,7 @@ class Controller:
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
             "semantic_attempt_protocol": 1,
             "human_response_audit_protocol": 1,
+            "lifecycle_action_protocol": TASK_CONTROL_PROTOCOL,
             "checkout_identity": self.publisher.git.ensure_checkout_identity(),
             "policy_snapshot": policy.snapshot(),
             "repository": repository.name_with_owner,
@@ -1195,6 +1205,7 @@ class Controller:
         existing: dict[str, Any] | None,
         *,
         allow_non_invocation_execution_recovery: bool = False,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         resumed = existing is not None
         if existing is None:
@@ -1281,6 +1292,8 @@ class Controller:
             self.states.save_run(run_id, state)
             return state, resumed
         self._ensure_delivery_branch(state, base_sha)
+        if prepare_state is not None:
+            prepare_state(state)
         self.states.save_run(run_id, state)
         return state, resumed
 

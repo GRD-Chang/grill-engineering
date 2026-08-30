@@ -51,6 +51,7 @@ from agent_run.semantic_attempt import (
     require_semantic_attempt,
     require_semantic_attempt_record,
 )
+from agent_run.task_control import TASK_CONTROL_PROTOCOL
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
@@ -117,6 +118,10 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     if "schema_version" in state:
         raise IncompatibleRunStateError(
             "legacy state is incompatible with the Invocation/Generation contract"
+        )
+    if state.get("lifecycle_action_protocol") != TASK_CONTROL_PROTOCOL:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Lifecycle Action protocol"
         )
     if type(state.get("branch_authority_protocol")) is not int or state.get(
         "branch_authority_protocol"

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,76 @@ from cli_run_supervision_support import (
     _repair_agents,
     _run_until_pending_window,
 )
+from agent_run.executor_host import _process_start_token
+
+
+def _write_executor_record(repo: Path, pid: int, start_token: str) -> None:
+    directory = repo / ".agent-run" / "task-control"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "fixture.json").write_text(
+        json.dumps(
+            {
+                "executor": {
+                    "status": "running",
+                    "pid": pid,
+                    "process_start_token": start_token,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_interrupt_helper_does_not_signal_a_stale_executor_pid(
+    git_repo: Path,
+) -> None:
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    observer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        _write_executor_record(git_repo, unrelated.pid, "stale-start-token")
+        _interrupt_run(observer, git_repo)
+        assert unrelated.poll() is None
+    finally:
+        if observer.poll() is None:
+            observer.kill()
+        if unrelated.poll() is None:
+            unrelated.kill()
+        observer.wait(timeout=3)
+        unrelated.wait(timeout=3)
+
+
+def test_interrupt_helper_escalates_for_an_executor_ignoring_sigterm(
+    git_repo: Path,
+) -> None:
+    executor = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(30)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    observer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert executor.stdout is not None
+        assert executor.stdout.readline() == "ready\n"
+        start_token = _process_start_token(executor.pid)
+        assert start_token is not None
+        _write_executor_record(git_repo, executor.pid, start_token)
+        _interrupt_run(observer, git_repo)
+        assert executor.wait(timeout=3) == -signal.SIGKILL
+    finally:
+        if observer.poll() is None:
+            observer.kill()
+        if executor.poll() is None:
+            executor.kill()
+        observer.wait(timeout=3)
+        executor.wait(timeout=3)
 
 def test_run_supervises_pending_parent_only_checks_in_one_call(
     git_repo: Path,
@@ -113,7 +186,7 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
             assert "最新观测: 无" in text
             assert "超时恢复: agent-run run 1" in text
     finally:
-        _interrupt_run(process)
+        _interrupt_run(process, git_repo)
 
 def test_parent_only_approval_survives_pending_checks_until_the_same_pr_merges(
     git_repo: Path,
