@@ -143,7 +143,7 @@ _Avoid_: Runner Snapshot、Runner 内容身份、Delivery Run currentness
 _Avoid_: 分步更新 current 与 previous、半完成安装、可配置历史列表、每-Run Runner 绑定
 
 **Active Runner（当前 Runner）**:
-本机命令入口为 Controller 调用选择的完整 Runner Generation，并直接执行其中的 current Runner Snapshot。切换后启动的新进程使用新的 Active Runner；后续对既有 Delivery Run 的操作也使用该 Runner，系统不绑定旧 Snapshot、不迁移旧状态，也不承诺跨 Runner 状态兼容。管理动作不与已经运行的生命周期进程协调；清理或卸载 Snapshot 后，不保证旧进程还能继续加载代码、资源或启动子命令。
+本机命令入口为 Controller 调用选择的完整 Runner Generation，并直接执行其中的 current Runner Snapshot。Runner 管理只能在 Runner Management Quiescence 中改变 Active Runner，因此不会替换活跃 Run Executor Session 正在使用的 Runner；后续重新推进既有 Delivery Run 时使用届时的 Active Runner，系统不绑定旧 Snapshot、不迁移旧状态，也不承诺跨 Runner 状态兼容。
 _Avoid_: 当前 Git checkout、自动跟随源码、运行中热更新、每-Run Runner 绑定、状态兼容层
 
 **Runner Build（Runner 构建）**:
@@ -155,39 +155,139 @@ _Avoid_: 自动跟随源码、来源审批、状态迁移、自动触发构建
 _Avoid_: Promotion Audit、Codex 版本门禁、源码验收、状态兼容检查、长期信任证明
 
 **Runner Installation（Runner 安装）**:
-用户在所选源码目录显式执行 `./install.sh`，依次构建候选 Runner Snapshot、执行 Runner Compatibility Check、创建以新 Snapshot 为 current 且以可选旧 current 为 previous 的完整 Runner Generation，并在成功后原子切换 Active Runner 的动作。若候选 content identity 已经等于 Active current，安装器直接幂等成功：不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous。首次安装、切换 Git tag、拉取官方修改或构建本地未提交修改都使用同一动作；成功后固定只保留 Active Generation 引用的 current 与可选 previous，更早的 Generation 和 Snapshot 自动清理，失败时清理候选并保持旧 Generation 整体不变。切换后的清理失败只产生有界 warning，并由下一次管理动作重试，不回滚已经成功的 Active Runner。安装器只在 `~/.local/bin/agent-run` 缺失或仍是解析到受管 XDG root 的自有 symlink 时创建或替换入口；同名非受管路径使安装失败，不备份、不覆盖。用户级命令目录通过唯一边界标记的幂等受管块加入 shell PATH；安装器不安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件，也不执行 `sudo`。安装不修改既有 Delivery Run 状态，也不创建兼容或迁移路径。
+用户在所选源码目录显式执行 `./install.sh`，并在 Runner Management Quiescence 中依次构建候选 Runner Snapshot、执行 Runner Compatibility Check、创建以新 Snapshot 为 current 且以可选旧 current 为 previous 的完整 Runner Generation，并在成功后原子切换 Active Runner 的动作。若存在活跃 Run Executor Session，安装立即拒绝且不修改受管状态。若候选 content identity 已经等于 Active current，安装器直接幂等成功：不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous。首次安装、切换 Git tag、拉取官方修改或构建本地未提交修改都使用同一动作；成功后固定只保留 Active Generation 引用的 current 与可选 previous，更早的 Generation 和 Snapshot 自动清理，失败时清理候选并保持旧 Generation 整体不变。切换后的清理失败只产生有界 warning，并由下一次管理动作重试，不回滚已经成功的 Active Runner。安装器只在 `~/.local/bin/agent-run` 缺失或仍是解析到受管 XDG root 的自有 symlink 时创建或替换入口；同名非受管路径使安装失败，不备份、不覆盖。用户级命令目录通过唯一边界标记的幂等受管块加入 shell PATH；安装器不安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件，也不执行 `sudo`。安装器不检查或提示 Linux Executor Host Availability；公开生命周期动作在实际启动 Executor 前独立检查运行前置。安装不修改既有 Delivery Run 状态，也不创建兼容或迁移路径。
 _Avoid_: 自动更新、重复 PATH 配置、系统包管理、`sudo`、源码热加载、可配置保留策略、无限快照历史、状态迁移、每-Run Runner 绑定
 
 **Source Runner Installer（源码 Runner 安装器）**:
-随每份源码树提供、只在显式执行 `./install.sh` 时运行的一次性安装程序。它把当前源码目录安装为候选 Snapshot；identity 已经等于 Active current 时直接幂等成功，否则调用 Runner Compatibility Check、创建完整 Runner Generation、切换 Active Runner，并只保留 current 与可选 previous Snapshot。安装完成后不驻留、不参与 Controller 调用，也不形成独立包、版本或更新生命周期。v0.1 的公开分发入口是 Git clone 或切换到用户选择的 Git revision 后运行该安装器，不要求 PyPI 或 pipx。
+随每份源码树提供、只在显式执行 `./install.sh` 时运行的一次性安装程序。它把当前源码目录安装为候选 Snapshot；identity 已经等于 Active current 时直接幂等成功，否则调用 Runner Compatibility Check、创建完整 Runner Generation、切换 Active Runner，并只保留 current 与可选 previous Snapshot。它只检查 Installation Readiness，不查询、提示或启用 systemd、linger 或其他 Executor Host 能力。安装完成后不驻留、不参与 Controller 调用，也不形成独立包、版本或更新生命周期。v0.1 的公开分发入口是 Git clone 或切换到用户选择的 Git revision 后运行该安装器，不要求 PyPI 或 pipx。
 _Avoid_: Runner Manager、常驻 Launcher、editable install、独立发布物、PyPI 前置条件
 
+**Runner Installation Readiness（Runner 安装就绪度）**:
+Source Runner Installer 为构建并激活候选 Snapshot 强制检查的本机条件，包括可用的受支持 CPython、venv/pip、源码与 build backend、受管路径写入与冲突边界、Runner Compatibility Check 以及 Runner 管理租约。它不包含 systemd、linger、目标 Repository、GitHub 登录或 lifecycle mutation 所需能力；`doctor` 可以只读报告它，但只有 Installer 在实际安装时作权威判定。
+_Avoid_: Executor Host Availability、GitHub 执行资格、目标仓库、把 doctor 当作安装授权
+
+**Runner Execution Readiness（Runner 执行就绪度）**:
+一次公开 lifecycle mutation 在提交 Action 前按本次动作实际需要检查、并由 Executor 在真实宿主环境中通过启动握手最终确认的运行条件，包括有效 Active Runner、准确 Local Delivery Workspace/Delivery Task、Linux Executor Host Availability 以及本次 Agent、Git、GitHub、Publisher 或 sandbox 所需工具和认证。缺失时不得持久化新 Action或启动前台 fallback；`doctor` 只读报告，不替代动作时检查。`status` 与 `history` 不要求该就绪度。
+_Avoid_: Runner Installation Readiness、一次全局永久判定、阻止只读查询、Installer systemd 检查
+
 **Runner Management Lock（Runner 管理锁）**:
-Source Runner Installer 用于串行化 install、rollback 与 uninstall 的固定用户级非阻塞互斥锁。管理动作必须在修改任何受管状态前取得同一个锁；竞争者立即失败且不修改状态。uninstall 永不删除该锁文件，避免持锁 inode 被路径上的新文件替换后形成第二把锁；重复 uninstall 在没有其他受管安装时仍幂等成功。
-_Avoid_: 等待锁、每种动作一把锁、删除并重建锁文件、协调运行中的生命周期进程
+Source Runner Installer 与 Run Executor Session 共享的固定用户级非阻塞锁。Executor 从 Active Runner binding 确定前到 Session 退出或启动收口期间持共享 Runner Usage Lease；install、rollback 与 uninstall 必须取得独占 Runner Management Lease。多个 Executor 可以并行持有共享租约，任何共享或独占租约存在时竞争的独占管理动作立即失败且不修改状态；租约随持有进程退出由操作系统释放。uninstall 永不删除锁文件，避免替换持锁 inode 后出现第二把锁。
+_Avoid_: 等待锁、每种动作一把锁、删除并重建锁文件、systemd 查询、自动停止活跃 Executor、启动交接空窗
+
+**Runner Usage Lease（Runner 使用租约）**:
+Run Executor Session 对当前 Active Runner 的主机级共享使用权。Active Runner 选择、binding claim 与租约从启动者到 Executor 的接管必须连续，不能让 Runner 管理动作在 systemd 已接受启动但 Executor 尚未握手的窗口穿插；Executor 或启动者退出时由操作系统自动释放。它只保护受管 Runner 内容，不扩大 Delivery Task 唯一性，也不保存 Run 业务状态。
+_Avoid_: per-Run Snapshot 固定、引用计数、systemd unit 枚举、裸 PID、跨主机租约
+
+**Runner Management Quiescence（Runner 管理静默状态）**:
+本机不存在任何活跃 Run Executor Session 时形成的 Runner 管理前置状态。Runner Installation、Runner Rollback 与 Runner Uninstall 只在该状态下开始；任一活跃 Executor 存在时，管理动作立即拒绝，不等待、不停止 Delivery Run，也不改变 Active Runner。它保护的是当前用户共享的 Runner 生命周期，不扩大 Local Delivery Workspace 中 Delivery Task 的唯一性边界。
+_Avoid_: 等待 Executor、自动 stop、运行中热更新、每-Run Snapshot 固定、跨工作区 Delivery Task 锁
 
 **Runner Rollback（Runner 回退）**:
-用户在任一包含源码安装器的目录显式执行 `./install.sh --rollback`，创建交换 current 与 previous 的完整 Runner Generation 并原子切换 Active Runner 的动作。它不重新构建、不调用 Codex、不判断 Runner 或 Delivery Run 状态兼容性，也不修改任何 Delivery Run；没有 previous 时明确失败且旧 Generation 整体不变。
+用户在任一包含源码安装器的目录显式执行 `./install.sh --rollback`，并在 Runner Management Quiescence 中创建交换 current 与 previous 的完整 Runner Generation、原子切换 Active Runner 的动作。若存在活跃 Run Executor Session，回退立即拒绝且不修改受管状态。它不重新构建、不调用 Codex、不判断 Runner 或 Delivery Run 状态兼容性，也不修改任何 Delivery Run；没有 previous 时明确失败且旧 Generation 整体不变。
 _Avoid_: 状态迁移、兼容性检查、自动回退、下载历史版本、任意历史选择
 
 **Runner Uninstall（Runner 卸载）**:
-用户在任一包含源码安装器的目录显式执行 `./install.sh --uninstall`，删除全部受管 Runner Snapshot、Runner Generation、候选残留、内部 `active` 入口、本机受管 `agent-run` symlink 以及安装器添加的 PATH 受管配置。若用户已把公开入口替换为非受管路径，卸载保留该内容并以有界 operational error 报告清理未完成。它保留固定 Runner Management Lock、GitHub App 持久配置、全局 Run 定位状态和各目标仓库中的 `.agent-run` Delivery Run 数据；v0.1 不提供连带删除用户配置或运行数据的 purge 模式。
+用户在任一包含源码安装器的目录显式执行 `./install.sh --uninstall`，并在 Runner Management Quiescence 中删除全部受管 Runner Snapshot、Runner Generation、候选残留、内部 `active` 入口、本机受管 `agent-run` symlink 以及安装器添加的 PATH 受管配置。若存在活跃 Run Executor Session，卸载立即拒绝且不修改受管状态。若用户已把公开入口替换为非受管路径，卸载保留该内容并以有界 operational error 报告清理未完成。它保留固定 Runner Management Lock、GitHub App 持久配置、全局 Run 定位状态和各目标仓库中的 `.agent-run` Delivery Run 数据；v0.1 不提供连带删除用户配置或运行数据的 purge 模式。
 _Avoid_: 删除 Delivery Run、删除 GitHub App 配置、删除非受管 shell 配置、`--purge`
 
 **Run 内部监督（In-Run Supervision）**:
-一次由维护者显式启动或恢复的 `agent-run run`，在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。GitHub 读取或对账的未知非零退出默认进入有界监督，Controller 只保存经脱敏、有界的错误证据，不从 `gh` stderr 推断网络、认证、权限、代理或其他具体原因。只有结构化远端事实已证明 Publisher intent、身份、head/base、检查、状态或关闭证据矛盾时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
+Run Executor Session 在可自动判定的远端异步边界（例如 Required Checks、GitHub 事件最终一致性）内自行等待、退避重试和重新读取权威事实；维护者不为普通等待另行启动 watcher 或重复输入同一命令。GitHub 读取或对账的未知非零退出默认进入有界监督，Controller 只保存经脱敏、有界的错误证据，不从 `gh` stderr 推断网络、认证、权限、代理或其他具体原因。只有结构化远端事实已证明 Publisher intent、身份、head/base、检查、状态或关闭证据矛盾时，才转换为 Human Blocker；最终人工批准仍是独立授权边界。
 _Avoid_: 维护者轮询 CI、常驻的第二套控制器、自动越过 Final Human Acceptance
 
+**Run Executor Session（运行执行会话）**:
+一个 Delivery Run 中连续推进所有无需新增人工授权工作的活动执行区间。它先且只先消费一个已接受的 Lifecycle Action，再从最新持久状态使用同一确定性 Driver 推进 Development、Acceptance、Publication 与 Run 内部监督，直到到达人类边界、Operator Stop、可恢复失败、监督超时或终态后结束。同一 Local Delivery Workspace 中的同一 Delivery Task 同一时刻最多有一个 Run Executor Session；同一工作区内不同 Delivery Task 可以并行，并由各自的 Managed Development Checkout 与任务控制边界隔离。agent-run 不为这种并行增加仓库级 Git 锁或跨 Worktree Git 协调层；Git 自身的并发规则仍由 Git 负责，agent-run 只处理自己发起的 Git 命令结果。Run Executor Session 不属于发起命令的终端，也不等同于整个 Delivery Run：终端离开不结束它，等待人工期间也不要求它继续存在。
+_Avoid_: 终端拥有执行权、整个 Run 常驻进程、workspace 全局 daemon、把一次意图重复应用于自动循环、全局串行、同一本地任务多执行者、仓库级 Git 并发协调
+
+**Executor Host（执行会话宿主）**:
+在本机为准确 Local Delivery Workspace 与 Delivery Task 提供唯一 Run Executor Session 槽位的进程托管边界。它按准确 Delivery Run、执行代次与 Runner 身份启动、观察和回收 Executor，但不拥有 Delivery Run 业务状态、不决定 Controller 阶段，也不自动重放失败或结果未知的工作。每个 Delivery Task 的槽位彼此独立；Executor Host 不设置主机级并发数量上限、不建立跨任务队列，也不替用户分配整机 CPU 或内存。公开生命周期命令和 RunDriver 只依赖统一 Host 合同，不依赖具体操作系统的托管机制。
+_Avoid_: 业务状态权威、常驻 workspace daemon、裸 PID 身份、自动 restart、主机级并发上限、跨任务资源调度
+
+**Linux Executor Host Availability（Linux 执行宿主可用性）**:
+Linux MVP 启动 Run Executor Session 的运行前置，表示当前用户的 systemd manager 可访问且能够创建用户级 transient service。它通常随正常登录会话提供，不要求安装、启用或常驻一个 agent-run service，也不要求开启 Logout Persistence。该能力不可用时，公开生命周期动作明确失败并说明环境缺口，不回退为绑定当前终端的第二套执行模式；`status` 与 `history` 等只读查询仍可使用。
+_Avoid_: linger 前置条件、常驻 agent-run daemon、手工 enable 固定 service、静默前台回退、阻止只读查询
+
+**Executor Launch Environment（Executor 启动环境）**:
+每个 Run Executor Session 从启动该 Session 的 lifecycle 命令所在终端取得的用户环境快照，使项目 PATH、虚拟环境、代理、自定义 SDK 与本机工具在后台执行中保持一致。快照通过仅当前用户可读、大小有界、绑定准确 Action/generation 且只能消费一次的临时载体交接，不进入 Run state、Action history、systemd unit metadata 或日志；载体在握手、确定失败、冲突收口、Host 证明退出或不长于握手窗口的截止时间到达时删除，迟到的已关闭 generation 不能消费。agent-run 自有 identity、路径、控制 capability 与 Publisher authority 不由该环境提供，也不能被其覆盖；下一次新 Session 重新从发起终端取得快照。
+_Avoid_: 完整环境持久化、固定 allowlist 猜测项目工具、实时同步终端变化、秘密写入 unit、项目环境覆盖控制面
+
+**Logout Persistence（退出登录持续能力）**:
+Executor Host 在维护者最后一个登录会话结束后仍允许当前 Run Executor Session 继续运行的可选宿主能力。它不同于 Action Completion Observation 离开或普通 Terminal 关闭，不是创建、推进或恢复 Delivery Run 的前置条件；缺少该能力只表示 Executor 不保证跨 logout 存活。它不承诺跨主机重启继续，也不授权自动重放任何 Agent 或外部写操作。
+_Avoid_: 运行前置条件、Terminal Independence、重启恢复、自动 restart、Delivery Run 持久性
+
+**Action Completion Observation（动作完成观察）**:
+`stop` 与 `abandon` 在 Lifecycle Action 安全接受后，由当前命令对该 Action 直至准确目标状态的有界只读观察。观察只呈现少量结构化进展，可以随时离开；关闭终端或中断观察不会撤销 Action、停止 Executor、改变 Run 状态或转化为 Execution Failure。`status` 只返回一次当前 Delivery Progress View，其他公开生命周期命令也不进入持续观察。
+_Avoid_: 通用 watch 命令、终端所有权、Worker PTY 代理、以 Ctrl-C 隐式停止 Run、第二份运行状态、无界日志
+
+**Lifecycle Action（生命周期动作）**:
+维护者通过公开生命周期命令向准确 Delivery Run 提交的一次性、可验证意图。Action 在当前 Run 状态允许时被接受，并由唯一 Run Executor Session 至多消费一次；`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 共用这一入口和后续 Driver，不各自形成独立控制流程。活动 Executor 且没有未完成 Action 时再次收到普通 `run`，只返回现有执行状态而不创建新 Action；`resume`、`approve`、`revise` 与 `requeue` 只在准确对应边界接受，否则立即拒绝；`stop` 与 `abandon` 可在活动执行中请求收口。不被当前状态允许的 Action 不等待未来状态、不进入通用队列。完全匹配当前 unresolved Action 的 task、kind 与用户显式输入的重复原命令可以在新 Action 准入前附着并对账原 Action；它继续确认第一次接受时已解析并保存的语义 payload，即使其后用户级默认配置发生变化，也不重新解释第一次操作。原 Action 未收口时不产生第二个 Action 或历史，只有确认原 Action 已失败并持久收口后，同一次用户命令才可顺序提交 successor Action。其他相同或不同命令仍立即拒绝。
+_Avoid_: 终端控制文件、重复消费、通用消息队列、过期授权、命令各自直接驱动 Engine、隐式授权、重复命令创建第二个 Action
+
+**Action Admission Gate（动作准入门）**:
+一个 Local Delivery Workspace 中每个 Delivery Task 对维护者 Lifecycle Action 的单槽位准入规则：同一时刻最多一个已接受但尚未完成的 Action，后来的新 Action 立即拒绝且不修改 Run、不等待、不排队。`run`、`resume`、`approve`、`revise` 与 `requeue` 在各自意图已按 Action identity 准确应用且 Run Executor Session 完成启动握手时释放准入；`stop` 与 `abandon` 在各自目标状态持久形成时释放准入。RunDriver 的自动工作不占用该门，只读查询与其他非 Delivery Run 生命周期管理也不经过该门。Action 中断或结果未知时，完全匹配的原命令可以附着并对账；只有先形成原 Action 的确定终态并释放单槽，才可顺序接受 successor，不能仅清除忙碌标记后接受下一项。
+_Avoid_: 整个 Run Executor Session 锁、全仓库串行、Action 队列、优先级升级、过期授权、阻止 status/history、遗留 busy 标记
+
+**Configuration Mutation（配置变更）**:
+只修改后续工作所使用配置、而不启动、停止或推进 Delivery Run 的操作。用户级 Delivery Policy 与 GitHub 读取身份配置只影响之后适用的工作；Run-scoped Agent Profile Revision 只影响该 Delivery Run 之后新建的顶层 Thread，已经存在的 Thread 保持原绑定。Configuration Mutation 不属于 Lifecycle Action，不占用 Action Admission Gate；即使当前 Run Executor Session 正在执行，也可通过自身的有界原子写入保存。它不得借配置入口改变当前阶段、替换正在执行的 Agent 或取得 Publisher authority。
+_Avoid_: 把配置命令排入 Action 槽位、用配置命令启动或停止 Run、热替换现有 Thread、通过配置绕过生命周期授权
+
+**Task Control Record（任务控制记录）**:
+一个 Local Delivery Workspace 中每个 Delivery Task 的有界、原子控制面，集中保存 Local Delivery Task Index 投影、当前或最近 Lifecycle Action、Executor ownership/generation、Runner binding 与启动握手。它是 Action currentness 与 Executor 所有权的权威，不复制 Delivery Run 业务状态、用户环境、完整 Action history 或日志；Delivery Run 对已接受 Action 及其结果只保存不参与 admission/routing 的有界审计投影。
+_Avoid_: 第二份 Delivery Run state、Action 队列、无界事件日志、用户环境归档、以 history 决定 currentness
+
+**Task Control Reconciliation（任务控制对账）**:
+Task Control Record 缺失、损坏或与 Host/Run receipt 不一致时，下一次公开生命周期命令在接受新 Action 前执行的确定性恢复边界。它只比较准确 Delivery Run 的 Action Application Receipt、Executor Host ownership 与可验证的执行代次；证据足够时原子补回控制记录并继续本次命令，证据不足时 fail closed 并给出可定位诊断，不猜测旧 Executor 已退出、不启动第二个 Agent。`status` 与 `history` 不执行该对账、不修复或写入状态。
+_Avoid_: 只读查询隐式修复、删除 busy 标记冒充恢复、裸 PID 猜测、无法确认时启动新 Executor、重放业务 Action
+
+**Action Application Receipt（动作应用凭据）**:
+Delivery Run state 为一个已接受 Lifecycle Action 保存的最小、不可歧义事实，证明该 Action identity 对应的命令特定业务意图已经幂等应用。它只用于在 Run state 已提交而 Task Control 尚未收口的崩溃窗口中补完原 Action，不能授权 Publisher、代替 Action Receipt View、参与 Action history 展示或复制完整 Action payload；Task Control Record 只引用它，不重新解释业务状态。
+_Avoid_: 用户回执、Action history、第二份业务状态、重放业务意图、Publisher authority
+
+**Action Receipt（动作回执）**:
+公开生命周期命令在返回前对本次 Lifecycle Action 给出的有界、准确结果。`run`、`resume`、`approve`、`revise` 与 `requeue` 的成功回执说明命令特定意图已按 Action identity 幂等应用到 Delivery Run，且准确 Run Executor Session 已完成启动握手或已被确认存在；它不证明 Agent 工作、当前自动区间或整个 Delivery Run 已完成。`stop` 与 `abandon` 的成功回执只在各自准确目标状态已经持久形成后给出；Action 接受后的中间进展属于可离开的 Action Completion Observation。启动或收口结果未知时不得伪装成功或直接创建第二个 Executor，须先依据 Host、Task Control 与 Run application receipt 对账。
+_Avoid_: Delivery Run 完成声明、Agent 完成声明、仅凭进程启动请求、模糊 success、启动未知时盲目重试
+
+**Action Receipt View（动作回执视图）**:
+公开生命周期命令默认提供的面向操作者简洁叙事，与 Delivery Progress View 使用相同语言和信息层级。它回答准确 Repository 与 Parent、这次操作实际发生了什么、Agent Run 是否已经开始或原本就在运行、当前可理解状态，以及操作者是否需要行动和可使用的下一条 `status` 命令；`stop` 与 `abandon` 等待期间只展示少量结构化阶段变化，不输出 Worker 或宿主原始日志。成功输出保持简短，失败或结果未知时说明原因、保留了什么和如何恢复。默认视图不展示 Run ID、Action ID、SHA、digest、execution nonce、generation、Host slot、systemd unit、PID 或其他机器绑定，精确内部事实只进入 Machine Audit View 或诊断。
+_Avoid_: 字段转储、内部状态码、SHA、哈希式身份、Executor Host 术语、把命令接受写成交付完成、无下一步的错误
+
+**执行失败（Execution Failure）**:
+Delivery Run 身份已经确定后，当前自动步骤因 Agent 进程、凭据、sandbox、timeout、signal 或其他不能安全继续的执行问题而形成的持久化可恢复暂停。Run Executor Session 必须先保留准确 Work Subject、Semantic Attempt、Thread、Managed Development Checkout 与 Failure Diagnostic Evidence，再停止并等待显式 `resume`；它不自动重试，不等同于 Action Completion Observation 离开。只有无法确定 Run 身份或无法安全持久化状态的故障才保留为命令级进程错误，并由 Host Diagnostic Log 提供最后的排查入口。
+_Avoid_: 自动重试、监督超时、Human Blocker、无诊断证据的失败、丢弃未提交成果
+
+**Failure Diagnostic Evidence（故障诊断证据）**:
+Controller 在确定 Delivery Run 后为一次 Execution Failure 持久保存的有界、脱敏、可定位事实，使维护者无需依赖原终端即可判断故障发生在哪个 Work Subject、阶段与外部操作，并区分 Agent 中断、子进程失败、超时、信号、权限、持久化或宿主问题。Codex 的完整事件与对话由其自身 Session 记录负责，agent-run 只保留关联该 Invocation 与 Thread 所需的身份和失败摘要，不复制完整 Session、原始事件流或无界 stdout/stderr。`status` 展示可行动原因，Machine Audit View 保留更精确的诊断绑定。
+_Avoid_: 完整 Codex Session 副本、无界 transcript、原始凭据、只有通用 error 字符串、依赖发起终端
+
+**Host Diagnostic Log（宿主诊断日志）**:
+Executor Host 交给操作系统日志设施保存的进程级诊断信息，用于在 Executor 尚未来得及写入 Failure Diagnostic Evidence 时追查启动、退出、signal、异常与宿主资源故障。它只接收 Executor 自身的有限诊断，不主动复制 Codex 原始事件流、完整子进程输出或 Delivery Run timeline；其保留时长和轮转由宿主策略决定，因此不是 Delivery Run 权威状态、恢复依据或用户历史。在 Linux 实现中，该职责由用户级 systemd journal 承担。
+_Avoid_: 第二套 Run state、业务历史、完整 Agent 输出归档、无限保留、跨平台核心依赖
+
+**Agent 执行所有权（Agent Execution Ownership）**:
+一次 Agent 执行必须隶属于准确 Local Delivery Workspace、Delivery Task、Delivery Run、Run Executor Session 与当前执行代次，并由该任务唯一的 Executor 启动和回收。Executor 意外消失后，新 Executor 只有在确认旧执行者已不存在后才能开始新的 Agent 执行；无法确认时 fail closed。旧 Agent 执行被确认为已中断时，其 Invocation 先保存为 `execution_failed/session_interrupted` 并等待显式 `resume`，不自动重放；纯外部监督可继续原等待窗口，结果未知的 Publisher 写操作须先根据远端权威事实对账。本机进程身份只是所有权证据，不授权依据裸 PID 终止未经证明的进程，也不形成跨主机租约。
+_Avoid_: 旧 Worker 存活时启动新 Worker、自动重放中断的 Agent、盲目重放未知的远端写入、裸 PID 猜测、自动杀死无法证明归属的进程、终端持有所有权
+
+**Worker Lifecycle Isolation（Worker 生命周期隔离）**:
+Codex Worker 保留项目开发所需的用户环境与 trusted-yolo 宿主能力，但机制性不可访问 agent-run 的 Task Control、Delivery Run mutation state、相关 locator、Runner 管理租约、lifecycle mutation 入口或 Publisher 自有凭证与控制 capability。它是 ADR 0001 宿主访问合同的窄控制面例外，不是通用文件系统 sandbox；Worker 可以读取普通项目事实和使用项目工具，但不能停止、恢复、批准、放弃或发布自己的 Delivery Run。用户主动注入任意第三方写凭证不可能按名称穷举撤销，不属于 agent-run 自有 Mutation Authority 保证。
+_Avoid_: 只靠 Prompt 自律、Worker 自我批准、Publisher 凭证继承、禁止普通项目工具、宣称过滤任意第三方秘密
+
 **公开生命周期命令（Public Lifecycle Command）**:
-维护者用于创建或推进 Delivery Run 的稳定交互入口。`start` 仅创建或返回本地 Run 记录及其受管 Run Branch，不推进生命周期；`run` 是唯一的自动生命周期入口。Development、Acceptance、Publication 与内部等待只是 Controller 的阶段，不要求也不允许维护者把它们作为独立流程手工串接。`resume`、`approve`、`revise`、`requeue` 与 `abandon` 只在各自明确的失败、授权或恢复边界执行；监督超时可由同一 Parent 的显式 `run` 或 `resume` 恢复。
-_Avoid_: 手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
+维护者用于创建或推进 Delivery Run 的稳定交互入口。`run` 是创建或恢复 Run 的唯一普通入口，也是不携带新增恢复或批准意图的自动入口：不存在未完成 Run 且 Parent 当前可执行时创建后继 Run；已有准确 Executor 正常运行且没有未完成 Action 时只返回现有状态，不提供单独的公开 `start` 或额外 `--new-run`。`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 都只提交一次对应 Lifecycle Action，确保该任务唯一的 Run Executor Session 存在，并在取得准确 Action Receipt 后返回；它们不各自在调用进程内形成不同推进路径。`run`、`resume`、`approve`、`revise` 与 `requeue` 在命令意图准确应用并完成启动握手后返回；`stop` 与 `abandon` 默认通过可离开的 Action Completion Observation 等待各自目标状态后返回。`stop` 是可恢复的中止意图，停止后必须显式 `resume`；`abandon` 是不可恢复的终止、对账与受限收口。Development、Acceptance、Publication 与内部等待只是 Controller 阶段，不要求也不允许维护者把它们作为独立流程手工串接；监督超时可由同一 Parent 的显式 `run` 或 `resume` 恢复。
+_Avoid_: 公开 `start`、额外 `--new-run`、把 `stop` 当作 `abandon`、手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
+
+**Operator Stop（人工停止）**:
+维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。当 Task Control 与 Executor Host 已能确认没有活动 Executor、没有在途 Stop，`stop` 只返回当前可理解状态和适用的下一步，不创建 Lifecycle Action、不修改 Delivery Run 或 Action history；无法确认是否仍有 Executor 时不得把它当作无操作成功。
+_Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、无活动 Executor 时制造 Stop 历史
+
+**No-progress Guard（无进展保护）**:
+Run Executor Session 对一次自动步骤执行前后的确定性进展身份进行机械比较；若状态、当前 Work Subject、Generation、phase、Semantic Attempt、Invocation、Candidate、PR、准确 head、等待边界、cleanup 与下一步骤均未变化，则保存 `execution_failed/controller_no_progress` 并停止，而不以相同输入忙循环。时间戳、timeline、日志、展示字段与重试计数不构成进展；`waiting_checks`、`waiting_external` 与 `waiting_merge` 由 Run 内部监督负责，不属于无进展。
+_Avoid_: 任意最大循环次数、把长时间 Agent 执行判为无进展、把外部等待判为无进展、依赖时间戳伪造进展
 
 **监督截止时间（Supervision Deadline）**:
 Run 内部监督按远端状态类别采用有限等待预算。预算内保持自动轮询与重对账；到期时保存最后的权威证据并进入监督超时暂停，而不是执行失败或假装通过。GitHub 只读状态或事件收敛的默认预算为 10 分钟，Required Checks 的默认预算为 45 分钟；其他类别须有自己的明确预算。
 _Avoid_: 无限占用进程、把超时吞成 pass、把正常 pending 伪装成需要外部授权的 Human Blocker
 
 **监督超时暂停（Supervision Timeout Pause）**:
-可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据并退出，等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在超时暂停时显示使用 Lifecycle Parent Selector 的 `agent-run resume <parent-issue>`；同一 Parent 的显式 `run` 也可重新读取权威状态并开始新的对应等待窗口。活跃前台进程仍自行监督，维护者不应据此重复输入命令。超时 `resume` 不接受 Human Response 或新的 Agent Thread，且不会创建 Worker、PR 或 merge。
+可自动判定的远端异步状态在其监督截止时间内仍未收敛时，Run 保存最后的权威证据，当前 Run Executor Session 退出并等待维护者显式继续；它不要求维护者提供产品决策、权限、凭据或其他额外操作。`status` 与 `history` 在超时暂停时显示使用 Lifecycle Parent Selector 的 `agent-run resume <parent-issue>`；同一 Parent 的显式 `run` 也可重新读取权威状态并开始新的对应等待窗口。活跃 Executor 仍自行监督，维护者不应据此重复输入命令。超时 `resume` 不接受 Human Response 或新的 Agent Thread，且不会创建 Worker、PR 或 merge。
 _Avoid_: execution_failed、Human Blocker、常驻 watcher、无界单次进程
 
 **Ticket 关闭归属（Ticket Close Ownership）**:
@@ -195,20 +295,32 @@ Publisher 关闭 Primary Ticket 的可重建证明：它绑定 close-intent、PR
 _Avoid_: 仅凭 Issue 已关闭、时间字符串相等、把最终一致性延迟当作执行失败
 
 **Publisher（发布器）**:
-`agent-run` 单进程中唯一持有写凭证的受限模块，也是系统唯一的 Mutation Authority。它只接受 Controller 已校验且被 Change Job Contract 允许的动作，执行 Git、GitHub PR、评论、Issue 与合并写入；它不是独立服务，写凭证不会进入 Codex 子进程环境。
+一个 Delivery Task 的唯一 Run Executor Session 中持有写凭证的受限模块，也是系统唯一的 Mutation Authority。它只接受 Controller 已校验且被 Change Job Contract 允许的动作，执行 Git、GitHub PR、评论、Issue 与合并写入；它不是独立服务，写凭证不会进入 Codex 子进程环境。
 _Avoid_: Codex Worker、内容作者、智能审查者
 
 **Mutation Authority（变更权限）**:
 改变权威 Git 历史、metadata 或 GitHub 外部持久状态的排他权限；临时 checkout 的源码编辑和一次性 Git 数据不属于该权限。该权限只属于 Publisher，不因 Codex Worker 的建议、代码修改或完成声明而转移。
 _Avoid_: Agent 自治、结构化输出、候选就绪
 
+**Local Delivery Workspace（本地交付工作区）**:
+维护者发起并恢复 Delivery Run 的准确本地 Git 仓库根目录，也是任务唯一性和 Run Executor Session 排他权的本地范围。两个独立本地仓库根目录由维护者自行协调，Controller 不扫描、不关联、不阻止它们对同一远端 Parent 各自启动 Run。Controller 为 Run 创建的 Managed Development Checkout 仍隶属原工作区，不是可重复启动该任务的新工作区。
+_Avoid_: 主机级仓库注册表、跨 clone 锁、磁盘扫描、把 Managed Development Checkout 当作新的操作根
+
+**Delivery Task（交付任务）**:
+由准确 Repository 与 Parent Issue 共同标识的稳定远端交付对象。同一 Local Delivery Workspace 内，一个 Delivery Task 同时最多拥有一个未完成 Delivery Run；已完成或已放弃的 Run 保留为不可变历史，维护者可以显式创建一个后继 Run。不同 Repository 或同一 Repository 的不同 Parent Issue 是不同 Delivery Task，必须能够并行推进。
+_Avoid_: 裸 `run_id`、单张 Child Ticket、整个 Repository、主机全局任务、跨独立本地仓库的唯一性承诺
+
 **Delivery Run（交付运行）**:
-由一次人工授权启动、覆盖一组相关 Ticket 并以最终整体验收结束的交付范围。不同 Delivery Run 彼此拥有独立身份和集成边界。
-_Avoid_: 单张 Ticket、单次 Codex 执行、长期后台服务
+由一次人工授权在一个 Local Delivery Workspace 中启动、覆盖一个 Delivery Task 的 Parent Issue 及其相关 Ticket、并以最终整体验收结束的交付范围。一个 Run 拥有独立身份和集成边界；同一工作区内同一 Delivery Task 的多个 Run 只能按时间先后存在，不能并行。普通 `run` 本身就是创建或恢复授权：没有未完成 Run 且 Parent 当前可执行时创建后继 Run，旧终态 Run 只保留为历史，不复活、不覆盖。
+_Avoid_: 单张 Ticket、单次 Codex 执行、长期后台服务、同一 Parent 的并行 Run、复活或覆盖终态 Run、额外 `--new-run`
 
 **Run 定位索引（Run Locator Index）**:
 本机维护的最小 Run ID 到仓库根和 state 目录的定位记录。它只让新版本创建的 Run 在任意目录下由 `status` 与 `history` 找到正确的本地 state，不回填或迁移历史 Run；记录失效或冲突时要求维护者显式指定 state 目录，不扫描磁盘。索引最多保留最近 32 条，且不参与 Agent 编排、GitHub 状态、权限或生命周期 mutation。
 _Avoid_: 全盘搜索、历史 state 迁移、跨仓库自动 mutation、Agent 执行日志、第二套 Run state
+
+**Local Delivery Task Index（本地交付任务索引）**:
+一个 Local Delivery Workspace 内维护的最小活动 Delivery Task 到唯一未完成 Run 及其 state 目录的指针。它只保存任务身份、Run 身份和位置，不复制生命周期状态、不参与 Agent 编排，也不跨独立本地仓库目录发现或阻止 Run。Run Executor Session 结束不删除指针中的未完成 Run；下次显式 `run` 继续它。指针若仍指向已完成或已放弃的 Run，新授权可将它替换为后继 Run；指向缺失、损坏或身份不一致的 Run 则 fail closed，不扫描其他目录、不猜测、不创建第二个 Run。
+_Avoid_: 主机级索引、第二套 Run state、完整 Run 历史、磁盘扫描、远端任务注册表、静默覆盖冲突、复活终态 Run
 
 **Merge 结果对账（Merge Outcome Reconciliation）**:
 Publisher 发出带精确 head 绑定的 merge intent 后，如网络或 GitHub 响应使结果未知，先在 GitHub 只读事实中对账：已 MERGED 即恢复成功；仍 OPEN 且 head、base、Required Checks 与 mergeability 仍全部匹配时，最多重试同一 intent 三次；任一矛盾状态才停止为人工处理。结果读取使用 GitHub 事件与只读状态的监督预算。
@@ -227,7 +339,7 @@ _Avoid_: 启动授权、依赖已解除、完成状态
 _Avoid_: 默认分支、Ticket Branch、永久集成分支
 
 **Parent-only Delivery（仅 Parent 交付）**:
-当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Acceptance、Required Checks 和 Published-Head Gate；每个预算窗口按有效 Run Policy Snapshot 的 Parent-only 轮数 `N` 允许最多 `N` 次 Development 与 `N` 次 Reviewer Invocation，并严格组成 `Development N → Reviewer N` 的完整配对，内置默认 `N=10`。每次 Reviewer 都调用 `code-review` skill；Reviewer 1 建立完整 Parent 基线，Reviewer 2–N 只额外获得上一轮 Acceptance Artifact 的完整原始内容、其 reviewed base/Candidate identity 和优先参考上轮问题的 Prompt 倾向，并自主决定审查范围；Reviewer N 仍失败时进入 Review Budget Checkpoint。Parent-only 直接面向默认分支且没有后继 Run Acceptance，因此不允许 Deterministic Ticket Fallback，也不允许任何未经当前 Reviewer 验收的新 Candidate 进入 Publication。`agent-run approve <run-id>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
+当 Parent Issue 没有任何 Child Ticket 时使用的轻量完整交付：Publisher 创建与 Parent Issue 原生关联的唯一 Parent Branch 与直达默认分支的 Parent PR。它仍遵循共享的 Candidate-first、Fresh Acceptance、Required Checks 和 Published-Head Gate；每个预算窗口按有效 Run Policy Snapshot 的 Parent-only 轮数 `N` 允许最多 `N` 次 Development 与 `N` 次 Reviewer Invocation，并严格组成 `Development N → Reviewer N` 的完整配对，内置默认 `N=10`。每次 Reviewer 都调用 `code-review` skill；Reviewer 1 建立完整 Parent 基线，Reviewer 2–N 只额外获得上一轮 Acceptance Artifact 的完整原始内容、其 reviewed base/Candidate identity 和优先参考上轮问题的 Prompt 倾向，并自主决定审查范围；Reviewer N 仍失败时进入 Review Budget Checkpoint。Parent-only 直接面向默认分支且没有后继 Run Acceptance，因此不允许 Deterministic Ticket Fallback，也不允许任何未经当前 Reviewer 验收的新 Candidate 进入 Publication。`agent-run approve <parent-issue>` 只授予一次合并权限，Development–Acceptance Engine 随后重新核对当前 Parent Revision、验收记录、检查、默认分支与 PR head，并通过 Publisher 以普通 merge 合并。已合并但 closeout 响应丢失时，共享 Engine 只重试幂等审计评论和关闭，不得再次合并。
 _Avoid_: Run Branch、Final Run PR、跳过独立验收、自动合并
 
 **Ticket PR（Ticket 拉取请求）**:
@@ -292,19 +404,19 @@ _Avoid_: 复用不等价的旧 Reviewer、直接修改 Run Branch、仅修复局
 _Avoid_: PR 普通评论、Parent Spec Revision、Controller 摘要
 
 **Final Human Acceptance（最终人工验收）**:
-Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向维护者请求的 Delivery Run 整体确认。维护者通过本地 `agent-run approve <run-id>` 显式批准；Controller 随后重新核对默认分支 live base、Run PR live head、Run Acceptance、Required Checks、Parent Spec Revision 与 Ticket Graph Revision，完全一致时 Publisher 才可使用普通 merge commit 和 `--match-head-commit` 合入默认分支。批准只绑定这一准确 head/base 与验收结果：同一 head/base 的 GitHub 收敛延迟由 Controller 自动监督，新 head 或 base 则使批准失效并要求新的最终人工验收。此前各 Ticket 的自动完成不触发逐票人工验收。
+Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向维护者请求的 Delivery Run 整体确认。维护者通过本地 `agent-run approve <parent-issue>` 显式批准；Controller 随后重新核对默认分支 live base、Run PR live head、Run Acceptance、Required Checks、Parent Spec Revision 与 Ticket Graph Revision，完全一致时 Publisher 才可使用普通 merge commit 和 `--match-head-commit` 合入默认分支。批准只绑定这一准确 head/base 与验收结果：同一 head/base 的 GitHub 收敛延迟由 Controller 自动监督，新 head 或 base 则使批准失效并要求新的最终人工验收。此前各 Ticket 的自动完成不触发逐票人工验收。
 _Avoid_: Ticket 级确认、自动 merge 默认分支、Agent 语义范围判断
 
 **Final Approval Command（最终批准命令）**:
-维护者对一个已通过全部自动门禁的 Delivery Run 授予默认分支合并权限的本地显式命令 `agent-run approve <run-id>`。该授权只对命令执行时重新验证的 Run PR head、base 和有效 Revision 生效；同一事实集合的收敛延迟继续自动处理，新 head 或 base 则令授权失效并重新请求验收。
+维护者对一个已通过全部自动门禁的 Delivery Run 授予默认分支合并权限的本地显式命令 `agent-run approve <parent-issue>`。该授权只对命令执行时重新验证的 Run PR head、base 和有效 Revision 生效；同一事实集合的收敛延迟继续自动处理，新 head 或 base 则令授权失效并重新请求验收。
 _Avoid_: GitHub Approve、标签触发、永久授权
 
 **Final Revision Command（最终修改命令）**:
-维护者通过 `agent-run revise <run-id> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启按有效 Run Policy Snapshot 配置的 `N` 次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，Run 必须 fail closed 为 Unsupported Scope Change。
+维护者通过 `agent-run revise <parent-issue> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启按有效 Run Policy Snapshot 配置的 `N` 次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，Run 必须 fail closed 为 Unsupported Scope Change。
 _Avoid_: Parent Spec 静默改写、直接修改 Run Branch、无限自动重试
 
 **Final Abandon Command（最终放弃命令）**:
-维护者通过 `agent-run abandon <run-id>` 永久终止尚未进入默认分支的 Delivery Run 的显式命令。Controller 执行 Run Abandonment Recovery、关闭或标记未合并的自动化 PR，并保留完整审计证据；暂时等待或普通修复不能使用该命令。若任一 Managed Development Checkout 仍含 tracked modifications 或 untracked files，普通 `abandon` 必须在任何外部写入或删除前拒绝执行并报告准确路径；只有维护者额外显式给出 `--discard-worktree` 才授权不可恢复地删除这些未提交成果后继续放弃。
+维护者通过 `agent-run abandon <parent-issue>` 永久终止尚未进入默认分支的 Delivery Run 的显式命令。Controller 执行 Run Abandonment Recovery、关闭或标记未合并的自动化 PR，并保留完整审计证据；暂时等待或普通修复不能使用该命令。若任一 Managed Development Checkout 仍含 tracked modifications 或 untracked files，普通 `abandon` 必须在任何外部写入或删除前拒绝执行并报告准确路径；只有维护者额外显式给出 `--discard-worktree` 才授权不可恢复地删除这些未提交成果后继续放弃。
 _Avoid_: 暂停、单 Ticket 阻塞、默认分支回滚、将 `abandon` 默认解释为丢弃未提交成果
 
 **Ticket Squash Merge（Ticket 压缩合并）**:
@@ -457,7 +569,7 @@ Development–Acceptance Engine 在独立验收后本地持久化的权威记录
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Delivery Progress View（交付进度视图）**:
-`status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
+`status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
 _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
 
 **Operator Action View（操作者动作视图）**:
@@ -473,11 +585,11 @@ _Avoid_: Ticket 局部人工门禁、门禁期间切换 frontier、把普通依�
 _Avoid_: 把 Parent Issue 当成全局唯一身份、全局 `latest` 猜测、要求用户记住哈希式 Run ID、模糊前缀匹配
 
 **Lifecycle Parent Selector（生命周期 Parent 选择器）**:
-操作者为当前仓库中的 mutation 命令选择 Delivery Run 的现有用户合同：`run`、`resume` 与 `approve` 都以位置参数形式接收 Parent Issue number，并可用显式 repository identity 校验目标；`resume` 只允许匹配一个已存在且处于可恢复人工门禁的 Run，`approve` 只允许匹配一个处于最终批准门禁的 Run。两者都不创建新 Run，也不根据最近时间猜测；完整不透明 Run ID 只保留给自动化、精确排障和歧义恢复，不是普通操作流程的必填身份。
-_Avoid_: 为 lifecycle action 另造 `--parent` 语法、把 Parent Issue 当成跨仓库身份、mutation 隐式创建 Run、最近 Run 猜测
+操作者为当前仓库中的 mutation 命令选择 Delivery Run 的统一用户合同：`run`、`resume`、`requeue`、`approve`、`revise`、`stop`、`abandon` 与 Run-scoped `configure` 都以位置参数形式接收 Parent Issue number，并可用显式 repository identity 校验目标。`run` 可以在不存在未完成 Run 时创建后继 Run；其他命令只选择一个已经存在且满足该命令当前适用边界的准确 Run，不创建新 Run。尤其是 `resume` 只匹配唯一可恢复边界，`approve` 只匹配唯一最终批准门禁；其余命令也必须遵守各自状态合同。零匹配或多匹配都拒绝，不根据最近时间猜测。完整不透明 Run ID 只保留给自动化、精确排障和歧义恢复，不是普通操作者流程的必填身份。
+_Avoid_: 各命令使用不同 Parent 语法、把 Parent Issue 当成跨仓库身份、忽略命令专属门禁、mutation 隐式创建 Run、最近 Run 猜测、要求普通用户记忆 Run ID
 
 **Machine Audit View（机器审计视图）**:
-`status --json` 与 `history --json` 提供的稳定机器可读视图，保留诊断、自动化和精确审计所需的内部身份、版本绑定、调用记录与计数层级。
+`status --json`、`history --json` 与公开生命周期命令的 `--json` Action Receipt 提供的稳定机器可读视图，保留诊断、自动化和精确审计所需的内部身份、版本绑定、调用记录、Failure Diagnostic Evidence 与计数层级；Host Diagnostic Log 仍通过宿主诊断入口查看，不复制进该视图。
 _Avoid_: 默认交付进度视图、面向用户的叙事摘要
 
 **Operator Display Time（操作者显示时间）**:
@@ -489,8 +601,8 @@ _Avoid_: 直接展示持久化 UTC、无时区时间、根据仓库推断时区
 _Avoid_: 独立配置出无法闭环的 Development/Review 组合、仓库级资源预算、动态读取的运行中策略、Agent 自选预算
 
 **Run Policy Snapshot（运行策略快照）**:
-Delivery Run 创建或维护者显式开启新预算窗口时解析并保存的准确 Delivery Policy；已开始的预算窗口不因外部默认配置变化而改变。本策略与 Invocation Deadline 采用一次明确的规范状态协议切换：缺少 Policy Snapshot 的旧 Run 不迁移、不兼容推进，也不根据旧 Attempt 或当前默认值反推策略；只有按新协议创建的 Run 可以继续生命周期命令。
-_Avoid_: 每次命令重新读取默认值、追溯改写已消耗预算、推断或迁移旧 Run、仓库隐式覆盖
+Delivery Run 创建或维护者在预算耗尽检查点显式开启新预算窗口时解析并保存的准确 Delivery Policy；新窗口可以采用当时的用户级默认和本次命令明确覆盖。普通 Execution Failure、Human Blocker 或监督超时后的 Resume 只继续原 Semantic Agent Attempt 或原等待窗口，必须复用原 Policy Snapshot，不得改变预算或 Invocation Deadline。已开始及历史预算窗口不因外部默认配置或后继窗口变化而改变。本策略与 Invocation Deadline 采用一次明确的规范状态协议切换：缺少 Policy Snapshot 的旧 Run 不迁移、不兼容推进，也不根据旧 Attempt 或当前默认值反推策略；只有按新协议创建的 Run 可以继续生命周期命令。
+_Avoid_: 每次命令重新读取默认值、普通恢复中途改预算、追溯改写已消耗预算、推断或迁移旧 Run、仓库隐式覆盖
 
 **Agent Invocation（Agent 调用）**:
 Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
@@ -544,7 +656,7 @@ _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
 维护者以 `agent-run resume <parent-issue>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
-successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
+successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。只有这两类开启新预算窗口的 Resume 才能为新窗口解析当前用户级默认或接受本次命令的 Delivery Policy 覆盖；旧窗口用量与策略保持不变。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
 但不把新 Attempt 伪装成旧窗口的额外轮次。若检查点保留了尚需修改代码的准确失败证据，successor Invocation 必须先把该证据交回原 Development Thread，产生新 Candidate 后才启动新窗口的 Reviewer 1；尤其是 Final CI-fix 后准确 PR head 的 Required Checks 再失败时，不得先审查未变化且已知 CI 失败的 Candidate。`--new-thread` 或无可恢复 Thread 时才以该阶段完整标准 Prompt
 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale
 时不启动 Codex，只进入 `requeue_required`。
@@ -577,7 +689,7 @@ _Avoid_: Job Generation、CI 等待窗口、隐式自动续期
 若 preflight
 发现 Ticket Content Revision、Parent Revision 或适用 base 已变化，Controller 不启动 Codex，也不
 复用原 Ticket Job、Ticket Branch 或 Development Thread；它停在 `requeue_required`，维护者需执行
-`agent-run requeue <run-id>` 创建新的 generation。内容未变化时 Resume 仍可复用当前 Invocation 的
+`agent-run requeue <parent-issue>` 创建新的 generation。内容未变化时 Resume 仍可复用当前 Invocation 的
 Thread；它不重置既有窗口的消耗记录。
 _Avoid_: 隐式 Requeue、无内容变化重试、Run Feedback Revision
 
