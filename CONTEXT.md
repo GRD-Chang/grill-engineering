@@ -339,7 +339,7 @@ _Avoid_: 标签触发、定时触发、自动 intake
 _Avoid_: 启动授权、依赖已解除、完成状态
 
 **Run Branch（运行分支）**:
-一个 Delivery Run 独有的临时集成分支。已通过 Ticket Integration Gate（Fresh Acceptance 或 Deterministic Ticket Fallback）的 Ticket 变更先进入该分支，整个 Delivery Run 最终通过它接受人工整体验收后才进入默认分支。
+一个 Delivery Run 独有、由 Controller 创建和维护的受管 Run Branch。已通过 Ticket Integration Gate（Fresh Acceptance 或 Deterministic Ticket Fallback）的 Ticket 变更先进入该临时集成分支，整个 Delivery Run 最终通过它接受人工整体验收后才进入默认分支。
 _Avoid_: 默认分支、Ticket Branch、永久集成分支
 
 **Parent-only Delivery（仅 Parent 交付）**:
