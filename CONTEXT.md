@@ -234,6 +234,10 @@ _Avoid_: 把配置命令排入 Action 槽位、用配置命令启动或停止 Ru
 一个 Local Delivery Workspace 中每个 Delivery Task 的有界、原子控制面，集中保存 Local Delivery Task Index 投影、当前或最近 Lifecycle Action、Executor ownership/generation、Runner binding 与启动握手。它是 Action currentness 与 Executor 所有权的权威，不复制 Delivery Run 业务状态、用户环境、完整 Action history 或日志；Delivery Run 对已接受 Action 及其结果只保存不参与 admission/routing 的有界审计投影。
 _Avoid_: 第二份 Delivery Run state、Action 队列、无界事件日志、用户环境归档、以 history 决定 currentness
 
+**Task Control Lock（任务控制锁）**:
+每个 Delivery Task 独立使用的短时非阻塞互斥边界，只覆盖 Task Control Record 与相邻 Run receipt 的读取、验证和原子提交。它不得跨越 Agent、Git、GitHub、Publisher、进程启动握手、sleep 或外部监督，也不扩展为仓库级 Git 锁、主机级任务锁或整个 Run Executor Session 的长期租约。
+_Avoid_: workspace 全局长锁、等待锁、跨外部副作用持锁、仓库 Git 协调、Runner Management Lock
+
 **Task Control Reconciliation（任务控制对账）**:
 Task Control Record 缺失、损坏或与 Host/Run receipt 不一致时，下一次公开生命周期命令在接受新 Action 前执行的确定性恢复边界。它只比较准确 Delivery Run 的 Action Application Receipt、Executor Host ownership 与可验证的执行代次；证据足够时原子补回控制记录并继续本次命令，证据不足时 fail closed 并给出可定位诊断，不猜测旧 Executor 已退出、不启动第二个 Agent。`status` 与 `history` 不执行该对账、不修复或写入状态。
 _Avoid_: 只读查询隐式修复、删除 busy 标记冒充恢复、裸 PID 猜测、无法确认时启动新 Executor、重放业务 Action
