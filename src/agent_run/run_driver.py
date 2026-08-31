@@ -143,10 +143,17 @@ class DirectRunOperations:
         agents: Any,
         profiles: AgentProfileStore | None = None,
         before_external_step: Callable[[], None] | None = None,
+        resume_pending_refresh: Callable[
+            [str], tuple[dict[str, Any], bool]
+        ]
+        | None = None,
+        use_current_state_once: bool = False,
     ) -> None:
         self.controller: Any = controller
         self.states = states
         self.before_external_step = before_external_step
+        self.resume_pending_refresh = resume_pending_refresh
+        self.use_current_state_once = use_current_state_once
         self.git: Any
         self.github_reader: Any
         self._publisher_factory: Callable[[], Any]
@@ -188,7 +195,7 @@ class DirectRunOperations:
         return self._publisher
 
     def deliver(self, run_id: str) -> RunOutcome:
-        refreshed, _ = self.controller.resume(run_id)
+        refreshed, _ = self._refresh(run_id)
         if self._cannot_advance(refreshed):
             return self.classify(refreshed)
         refreshed = DeliveryCleanupEngine(
@@ -247,7 +254,7 @@ class DirectRunOperations:
         return self.classify(state)
 
     def accept(self, run_id: str) -> RunOutcome:
-        refreshed, _ = self.controller.resume(run_id)
+        refreshed, _ = self._refresh(run_id)
         if _has_pending_stale_dirty_checkout(refreshed):
             refreshed = DeliveryCleanupEngine(
                 git=self.git, states=self.states, github=self.publisher
@@ -292,7 +299,7 @@ class DirectRunOperations:
         return self.classify(state)
 
     def publish(self, run_id: str) -> RunOutcome:
-        refreshed, _ = self.controller.resume(run_id)
+        refreshed, _ = self._refresh(run_id)
         if self._cannot_advance(refreshed):
             return self.classify(refreshed)
         publication = refreshed.get("run_publication")
@@ -338,6 +345,25 @@ class DirectRunOperations:
         ):
             state = publication_engine.approve(run_id)
         return self.classify(state)
+
+    def _refresh(self, run_id: str) -> tuple[dict[str, Any], bool]:
+        current = self.states.load_current_run(run_id)
+        if (
+            self.resume_pending_refresh is not None
+            and isinstance(current, dict)
+            and is_github_refresh_wait(current)
+        ):
+            self.use_current_state_once = False
+            retry_result = self.resume_pending_refresh(run_id)
+            if not is_github_refresh_wait(retry_result[0]):
+                self.resume_pending_refresh = None
+            return retry_result
+        if self.use_current_state_once and isinstance(current, dict):
+            self.use_current_state_once = False
+            self.resume_pending_refresh = None
+            return current, True
+        normal_refresh: tuple[dict[str, Any], bool] = self.controller.resume(run_id)
+        return normal_refresh
 
     def requeue(self, run_id: str) -> RunOutcome:
         state, retired = self.controller.requeue(run_id)

@@ -169,11 +169,14 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         "1",
         "--repo",
         "example/project",
+        "--agent-fixture",
+        str(agents),
     )
 
-    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.returncode == 2, resumed.stderr
     resumed_state = load_only_run_state(git_repo)
-    assert resumed_state["status"] == "active"
+    assert stdout_json(resumed)["status"] == "ready_for_human"
+    assert resumed_state["status"] == "ready_for_human"
     assert resumed_state["resume_audit"]["history"][-1]["kind"] == (
         "execution_failure"
     )
@@ -181,16 +184,6 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         "command_failed"
     )
 
-    advanced = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        "--agent-fixture",
-        str(agents),
-    )
-    assert advanced.returncode == 2
-    assert stdout_json(advanced)["status"] == "ready_for_human"
     final_audit = load_only_run_state(git_repo)["resume_audit"]["history"][-1]
     assert final_audit["kind"] == "execution_failure"
     assert isinstance(final_audit["successor_invocation_started_at"], str)

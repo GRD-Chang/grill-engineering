@@ -294,6 +294,106 @@ def test_driver_does_not_apply_no_progress_guard_to_external_waits(tmp_path) -> 
     assert retries == 1
 
 
+def test_resume_refresh_authority_is_used_only_until_the_initial_retry_succeeds() -> None:
+    class States:
+        current = {
+            "run_id": "run-1",
+            "status": "waiting_external",
+            "github_refresh_pending": True,
+        }
+
+        @classmethod
+        def load_current_run(cls, _run_id: str):
+            return cls.current
+
+    states = States()
+    ordinary_refreshes: list[str] = []
+    explicit_refreshes: list[str] = []
+
+    class Controller:
+        @staticmethod
+        def resume(run_id: str):
+            ordinary_refreshes.append(run_id)
+            return {"run_id": run_id, "status": "ready_for_human"}, True
+
+    def retry_explicit_resume(run_id: str):
+        explicit_refreshes.append(run_id)
+        return {"run_id": run_id, "status": "active"}, True
+
+    operations = DirectRunOperations(
+        controller=Controller(),
+        states=states,
+        git=object(),
+        github_reader=object(),
+        publisher_factory=lambda: object(),
+        agents=object(),
+        resume_pending_refresh=retry_explicit_resume,
+    )
+
+    first, _ = operations._refresh("run-1")
+    assert first["status"] == "active"
+    assert explicit_refreshes == ["run-1"]
+    assert ordinary_refreshes == []
+
+    states.current = {
+        "run_id": "run-1",
+        "status": "waiting_external",
+        "github_refresh_pending": True,
+    }
+    second, _ = operations._refresh("run-1")
+    assert second["status"] == "ready_for_human"
+    assert explicit_refreshes == ["run-1"]
+    assert ordinary_refreshes == ["run-1"]
+
+
+def test_successful_resume_disarms_future_explicit_refresh_retry() -> None:
+    class States:
+        current = {"run_id": "run-1", "status": "active"}
+
+        @classmethod
+        def load_current_run(cls, _run_id: str):
+            return cls.current
+
+    ordinary_refreshes: list[str] = []
+    explicit_refreshes: list[str] = []
+
+    class Controller:
+        @staticmethod
+        def resume(run_id: str):
+            ordinary_refreshes.append(run_id)
+            return {"run_id": run_id, "status": "ready_for_human"}, True
+
+    def retry_explicit_resume(run_id: str):
+        explicit_refreshes.append(run_id)
+        return {"run_id": run_id, "status": "active"}, True
+
+    operations = DirectRunOperations(
+        controller=Controller(),
+        states=States(),
+        git=object(),
+        github_reader=object(),
+        publisher_factory=lambda: object(),
+        agents=object(),
+        resume_pending_refresh=retry_explicit_resume,
+        use_current_state_once=True,
+    )
+
+    first, _ = operations._refresh("run-1")
+    assert first["status"] == "active"
+    assert explicit_refreshes == []
+    assert ordinary_refreshes == []
+
+    States.current = {
+        "run_id": "run-1",
+        "status": "waiting_external",
+        "github_refresh_pending": True,
+    }
+    second, _ = operations._refresh("run-1")
+    assert second["status"] == "ready_for_human"
+    assert explicit_refreshes == []
+    assert ordinary_refreshes == ["run-1"]
+
+
 def test_publication_operation_retry_observations_are_not_progress() -> None:
     state: dict[str, object] = {
         "status": "waiting_external",

@@ -20,7 +20,7 @@ from agent_run.agent_profiles import (
     validate_profile_options,
 )
 from agent_run.codex import CodexCliBackend, CodexProcessError
-from agent_run.controller import Controller
+from agent_run.controller import Controller, _validated_human_response
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_policy import (
     DeliveryPolicy,
@@ -43,7 +43,6 @@ from agent_run.operator_gate import has_non_invocation_execution_failure
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
-from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.presentation_helpers import human_next_action
 from agent_run.error_safety import bounded_error
@@ -82,6 +81,7 @@ from agent_run.run_locator import (
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
+    human_blocker_subject_count,
     require_current_run_state,
 )
 from agent_run.task_control import (
@@ -342,12 +342,23 @@ def _main_with_parser_resources(
         )
         if parsed.command == "resume":
             _resolve_resume_selection(parsed, git)
+            selected_resume = cli_surface._load_local_run(states, parsed.run_id)
+            selected_parent = selected_resume.get("parent")
+            selected_parent_number = (
+                selected_parent.get("number")
+                if isinstance(selected_parent, Mapping)
+                else None
+            )
+            if type(selected_parent_number) is not int:
+                raise ValueError("Delivery Run is missing its Parent Issue")
+            parsed.parent = selected_parent_number
         elif parsed.command == "approve":
             _resolve_approve_selection(parsed, git)
         executor_binding = _executor_binding_from_environment()
+        executor_backed = parsed.command in {"run", "resume"}
         runner_lease_fd: int | None = None
         if (
-            parsed.command == "run"
+            executor_backed
             and fixture_path is None
             and executor_binding is None
         ):
@@ -361,13 +372,13 @@ def _main_with_parser_resources(
             )
         executor_host: ExecutorHost | None = None
         prepare_executor_session: Callable[[], None] | None = None
-        if parsed.command == "run" and fixture_path is not None:
+        if executor_backed and fixture_path is not None:
             executor_host = FakeExecutorHost(separate_process=True)
-        elif parsed.command == "run" and executor_binding is not None:
+        elif executor_backed and executor_binding is not None:
             executor_host = BoundExecutorHost(
                 action_id=executor_binding[0], generation=executor_binding[1]
             )
-        elif parsed.command == "run":
+        elif executor_backed:
             systemd_host = SystemdUserExecutorHost(
                 runtime_directory=_executor_runtime_directory(),
                 environment=dict(os.environ),
@@ -382,7 +393,7 @@ def _main_with_parser_resources(
             prepare_executor_session = lambda: systemd_host.prepare_environment(
                 supplied_arguments
             )
-        if parsed.command != "run":
+        if not executor_backed:
             _reject_if_task_action_pending(parsed, states, github, git)
         if parsed.command in {"resume", "requeue", "approve", "revise", "abandon"}:
             _require_profile(profiles, parsed.run_id)
@@ -391,7 +402,39 @@ def _main_with_parser_resources(
             if not cli_surface._command_is_ready(local_state, parsed.command):
                 cli_presentation._print_precondition_failure(local_state)
                 return 2
-        if parsed.command == "run":
+        if executor_backed:
+            if parsed.command == "resume":
+                current = cli_surface._load_local_run(states, parsed.run_id)
+                if parsed.message is not None:
+                    try:
+                        parsed.message = _validated_human_response(parsed.message)
+                    except ValueError as error:
+                        raise TaskControlError(str(error)) from error
+                resume_attachable = executor_binding is not None or (
+                    _resume_action_is_attachable(parsed, github, git)
+                )
+                if executor_binding is None and not resume_attachable:
+                    _reject_if_task_action_pending(parsed, states, github, git)
+                if not resume_attachable and not cli_surface._resume_is_ready(current):
+                    cli_presentation._print_precondition_failure(current)
+                    return 2
+                if (
+                    not resume_attachable
+                    and parsed.message is not None
+                    and human_blocker_subject_count(current) != 1
+                ):
+                    cli_presentation._print_precondition_failure(current)
+                    return 2
+                if current.get("status") == "supervision_timeout" and (
+                    parsed.new_thread or parsed.message is not None
+                ):
+                    cli_presentation._print_precondition_failure(current)
+                    return 2
+                if has_non_invocation_execution_failure(current) and (
+                    parsed.new_thread or parsed.message is not None
+                ):
+                    cli_presentation._print_precondition_failure(current)
+                    return 2
             state, resumed, lifecycle_receipt = _run_lifecycle(
                 parsed,
                 states,
@@ -412,109 +455,6 @@ def _main_with_parser_resources(
             _initialize_profile(
                 profiles, state, creation_profile, allow_create=not resumed
             )
-        elif parsed.command == "resume":
-            current = cli_surface._load_local_run(states, parsed.run_id)
-            if not cli_surface._resume_is_ready(current):
-                cli_presentation._print_precondition_failure(current)
-                return 2
-            if current.get("status") == "supervision_timeout" and (
-                parsed.new_thread or parsed.message is not None
-            ):
-                cli_presentation._print_precondition_failure(current)
-                return 2
-            if has_non_invocation_execution_failure(current) and (
-                parsed.new_thread or parsed.message is not None
-            ):
-                cli_presentation._print_precondition_failure(current)
-                return 2
-            budget_checkpoint_resume = (
-                cli_surface._review_budget_checkpoint_count(current) == 1
-            )
-            state, resumed = controller.resume(
-                parsed.run_id,
-                resume_human_blocker=current.get("status") != "supervision_timeout",
-                new_thread=parsed.new_thread,
-                human_response=parsed.message,
-                explicit_resume=True,
-                resume_budget_checkpoint=budget_checkpoint_resume,
-            )
-            if state.get("status") in {
-                "unsupported_scope_change",
-                "deterministic_contradiction",
-            }:
-                cli_presentation._print_precondition_failure(state)
-                return 2
-            if state.get("status") == "execution_failed":
-                cli_presentation._print_precondition_failure(state)
-                return 2
-            if state.get("status") == "abandonment_pending":
-                cli_presentation._print_precondition_failure(state)
-                return 2
-            if state.get("status") == "requeue_required":
-                cli_presentation._print_precondition_failure(state)
-                return 2
-            if _is_currentness_human_blocker(state):
-                cli_presentation._print_precondition_failure(state)
-                return 2
-            if not is_github_refresh_wait(state):
-                if current.get("status") == "supervision_timeout":
-                    state = _run_driver(
-                        parsed, states, controller, git, github, profiles
-                    ).advance(state)
-                else:
-                    publisher = (
-                        FixtureGitHubPublisher(Path(parsed.github_fixture), git)
-                        if parsed.github_fixture
-                        else GhGitHubPublisher(str(state["repository"]), git)
-                    )
-                    agent_fixture = getattr(parsed, "agent_fixture", None)
-                    agents = _agent_backend(parsed, profiles)
-                    publication_retried = (
-                        _has_resumed_agent_phase(state) or budget_checkpoint_resume
-                    )
-                    if publication_retried:
-                        if state.get("delivery_type") == "parent_only":
-                            state = ParentDeliveryEngine(
-                                git=git,
-                                states=states,
-                                github=publisher,
-                                agents=agents,
-                            ).deliver(parsed.run_id)
-                        elif state.get("status") == "active":
-                            state = DeliveryRunEngine(
-                                controller=controller,
-                                tickets=TicketDeliveryEngine(
-                                    git=git,
-                                    states=states,
-                                    github=publisher,
-                                    agents=agents,
-                                ),
-                            ).deliver_from_state(parsed.run_id, state)
-                        elif state.get("status") == "run_acceptance_pending":
-                            repository = github.repository()
-                            state = RunAcceptanceEngine(
-                                git=git,
-                                states=states,
-                                agents=agents,
-                                default_head_sha=git.resolve_base(
-                                    repository.default_branch, repository.default_head_sha
-                                ),
-                                github=publisher,
-                                currentness_reader=github,
-                            ).accept(parsed.run_id)
-                        elif state.get("status") == "run_publication_pending":
-                            repository = github.repository()
-                            state = RunPublicationEngine(
-                                git=git,
-                                states=states,
-                                agents=agents,
-                                github=publisher,
-                                default_branch=repository.default_branch,
-                                default_head_sha=git.resolve_base(
-                                    repository.default_branch, repository.default_head_sha
-                                ),
-                                currentness_reader=github,
-                            ).publish(parsed.run_id)
         elif parsed.command == "requeue":
             state = _run_driver(
                 parsed, states, controller, git, github, profiles
@@ -679,11 +619,12 @@ def _main_with_parser_resources(
         return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
     except (ExecutorAgentInterruptedError, KeyboardInterrupt) as interruption:
         agent_interrupted = isinstance(interruption, ExecutorAgentInterruptedError)
+        executor_backed = parsed.command in {"run", "resume"}
         interrupt_controller = controller
         interrupt_states = states
         run_id = getattr(parsed, "run_id", None)
         if (
-            parsed.command == "run"
+            executor_backed
             and git is not None
             and states is not None
             and github is not None
@@ -721,7 +662,7 @@ def _main_with_parser_resources(
                 pass
         if (
             not isinstance(run_id, str)
-            and parsed.command == "run"
+            and executor_backed
             and interrupt_states is not None
             and github is not None
         ):
@@ -732,7 +673,7 @@ def _main_with_parser_resources(
             if isinstance(interrupted, dict):
                 run_id = interrupted.get("run_id")
         if (
-            parsed.command != "run"
+            not executor_backed
             and interrupt_controller is not None
             and isinstance(run_id, str)
         ):
@@ -751,7 +692,7 @@ def _main_with_parser_resources(
                     "run_id": run_id,
                     "status": (
                         durable.get("status", "unknown")
-                        if parsed.command == "run" and isinstance(durable, dict)
+                        if executor_backed and isinstance(durable, dict)
                         else "execution_failed"
                     ),
                     "diagnostics": [
@@ -760,14 +701,14 @@ def _main_with_parser_resources(
                                 "executor_agent_interrupted"
                                 if agent_interrupted
                                 else "observation_interrupted"
-                                if parsed.command == "run"
+                                if executor_backed
                                 else "controller_interrupted"
                             ),
                             "message": (
                                 "Executor 内 Agent Invocation 被中断；已保留可恢复的 Semantic Agent Attempt"
                                 if agent_interrupted
                                 else "已离开 Lifecycle Action 观察；CLI 未改写 Delivery Run"
-                                if parsed.command == "run"
+                                if executor_backed
                                 else "控制器被中断；已保留 Managed Development Checkout 与当前 Semantic Agent Attempt"
                             ),
                         }
@@ -1071,6 +1012,77 @@ def _run_action_payload(
     }
 
 
+def _resume_action_payload(
+    parsed: argparse.Namespace,
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    budget_checkpoint_resume = (
+        cli_surface._review_budget_checkpoint_count(dict(current)) == 1
+    )
+    explicit_policy = _policy_overrides(parsed)
+    if explicit_policy and not budget_checkpoint_resume:
+        raise DeliveryPolicyError(
+            "ordinary resume does not accept Delivery Policy overrides; "
+            "policy can change only when opening a new Budget Window"
+        )
+    policy = (
+        _resolve_delivery_policy(parsed)
+        if budget_checkpoint_resume
+        else parse_policy_snapshot(policy_snapshot_for_state(current))
+    )
+    return {
+        "parent": parsed.parent,
+        "run_id": parsed.run_id,
+        "new_thread": bool(parsed.new_thread),
+        "message": parsed.message,
+        "resume_budget_checkpoint": budget_checkpoint_resume,
+        "policy": policy.snapshot(),
+    }
+
+
+def _resume_payload_for_existing_action(
+    parsed: argparse.Namespace,
+    existing_payload: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    semantic_fields = {
+        "parent": parsed.parent,
+        "run_id": parsed.run_id,
+        "new_thread": bool(parsed.new_thread),
+        "message": parsed.message,
+    }
+    semantic_match = all(
+        existing_payload.get(key) == value for key, value in semantic_fields.items()
+    )
+    if semantic_match and _resume_policy_matches_existing_action(
+        parsed, existing_payload
+    ):
+        return dict(existing_payload)
+    return _resume_action_payload(parsed, current)
+
+
+def _resume_policy_matches_existing_action(
+    parsed: argparse.Namespace,
+    existing_payload: Mapping[str, Any],
+) -> bool:
+    """Compare explicit Resume policy fields against its frozen first payload."""
+
+    explicit_policy = _policy_overrides(parsed)
+    if not explicit_policy:
+        return True
+    if existing_payload.get("resume_budget_checkpoint") is not True:
+        return False
+    stored_policy = existing_payload.get("policy")
+    if not isinstance(stored_policy, Mapping):
+        return False
+    frozen_policy = parse_policy_snapshot(stored_policy)
+    requested_policy = resolve_delivery_policy(
+        user_defaults=frozen_policy,
+        command_overrides=explicit_policy,
+    )
+    return requested_policy.snapshot() == frozen_policy.snapshot()
+
+
 def _run_lifecycle(
     parsed: argparse.Namespace,
     states: StateStore | FaultInjectingStateStore,
@@ -1089,6 +1101,9 @@ def _run_lifecycle(
         raise ExecutionReadinessError(
             "Runner Execution Readiness 不满足：未提供 Executor Host"
         )
+    action_kind = parsed.command
+    if action_kind not in {"run", "resume"}:
+        raise ValueError("Executor-backed lifecycle only supports run/resume")
     task = _task_for_parent(parsed, github, git)
     # Task Control belongs to the canonical Local Delivery Workspace, not to
     # an optional state-dir selected for a particular Run record.  This keeps
@@ -1149,6 +1164,11 @@ def _run_lifecycle(
     existing_action = (
         existing_control.get("action") if isinstance(existing_control, dict) else None
     )
+    existing_executor = (
+        existing_control.get("executor")
+        if isinstance(existing_control, dict)
+        else None
+    )
     if (
         requested_state_root != canonical_state_root
         and bound_state_root != requested_state_root
@@ -1172,7 +1192,11 @@ def _run_lifecycle(
             raise TaskControlError(
                 "当前 Lifecycle Action 尚未绑定 Run；不会在另一个 state directory 创建 Run"
             )
-    if current is not None and current.get("status") == "execution_failed":
+    if (
+        action_kind == "run"
+        and current is not None
+        and current.get("status") == "execution_failed"
+    ):
         receipt = current.get("action_application_receipt")
         if not isinstance(receipt, Mapping):
             # Preserve the established repository-binding probe for a legacy
@@ -1185,7 +1209,8 @@ def _run_lifecycle(
             return current, True, None
     preflight_override = current
     if (
-        current is not None
+        action_kind == "run"
+        and current is not None
         and current.get("status") in {"run_approval_pending", "parent_approval_pending"}
         and isinstance(existing_action, Mapping)
         and existing_action.get("status") in {"completed", "failed"}
@@ -1204,21 +1229,42 @@ def _run_lifecycle(
             preflight_override = refreshed
     if (
         isinstance(existing_action, dict)
-        and existing_action.get("status") in {"accepted", "applying"}
+        and (
+            existing_action.get("status") in {"accepted", "applying"}
+            or (
+                action_kind == "resume"
+                and isinstance(existing_executor, Mapping)
+                and existing_executor.get("status") in {"starting", "running"}
+                and existing_executor.get("action_id")
+                == existing_action.get("action_id")
+            )
+        )
         and isinstance(existing_action.get("payload"), dict)
     ):
-        payload = _run_payload_for_existing_action(
-            parsed,
-            existing_action["payload"],
-            current,
-            creation_profile,
-        )
-    else:
-        if current is None:
-            policy = _resolve_delivery_policy(parsed)
+        if action_kind == "resume":
+            if current is None:
+                raise TaskControlError("resume Action 找不到 Delivery Run")
+            payload = _resume_payload_for_existing_action(
+                parsed, existing_action["payload"], current
+            )
         else:
-            policy = parse_policy_snapshot(policy_snapshot_for_state(current))
-        payload = _run_action_payload(parsed, policy, creation_profile)
+            payload = _run_payload_for_existing_action(
+                parsed,
+                existing_action["payload"],
+                current,
+                creation_profile,
+            )
+    else:
+        if action_kind == "resume":
+            if current is None or current.get("run_id") != parsed.run_id:
+                raise TaskControlError("resume selector 与当前 Delivery Run 不匹配")
+            payload = _resume_action_payload(parsed, current)
+        else:
+            if current is None:
+                policy = _resolve_delivery_policy(parsed)
+            else:
+                policy = parse_policy_snapshot(policy_snapshot_for_state(current))
+            payload = _run_action_payload(parsed, policy, creation_profile)
 
     base_state_root = states.root.resolve()
 
@@ -1341,6 +1387,35 @@ def _run_lifecycle(
     ) -> RunDriver:
         run_profiles, run_controller = lifecycle_components(run_states, binding)
         fence, _ = executor_guards(binding)
+        resume_retry: Callable[
+            [str], tuple[dict[str, Any], bool]
+        ] | None = None
+        if action_kind == "resume":
+            policy_snapshot = payload.get("policy")
+            if not isinstance(policy_snapshot, Mapping):
+                raise TaskControlError("resume Action 缺少 Policy Snapshot")
+            resume_policy = parse_policy_snapshot(policy_snapshot)
+
+            def retry_resume_refresh(run_id: str) -> tuple[dict[str, Any], bool]:
+                return run_controller.resume(
+                    run_id,
+                    resume_human_blocker=initial_status != "supervision_timeout",
+                    new_thread=payload.get("new_thread") is True,
+                    human_response=(
+                        payload.get("message")
+                        if isinstance(payload.get("message"), str)
+                        else None
+                    ),
+                    explicit_resume=True,
+                    record_explicit_resume_audit=False,
+                    resume_budget_checkpoint=(
+                        payload.get("resume_budget_checkpoint") is True
+                    ),
+                    budget_policy=resume_policy,
+                )
+
+            resume_retry = retry_resume_refresh
+
         return _run_driver(
             parsed,
             run_states,
@@ -1349,6 +1424,8 @@ def _run_lifecycle(
             github,
             run_profiles,
             before_external_step=fence,
+            resume_pending_refresh=resume_retry,
+            use_current_state_once=action_kind == "resume",
         )
 
     def record_lifecycle_failure(
@@ -1366,8 +1443,40 @@ def _run_lifecycle(
         driver_factory=lifecycle_driver_factory,
         record_execution_failure=record_lifecycle_failure,
     )
+    initial_status = current.get("status") if current is not None else None
 
     def select_run(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        if action_kind == "resume":
+            action_payload = action.get("payload")
+            if not isinstance(action_payload, Mapping):
+                raise TaskControlError("resume Action 缺少语义 payload")
+            policy_snapshot = action_payload.get("policy")
+            if not isinstance(policy_snapshot, Mapping):
+                raise TaskControlError("resume Action 缺少 Policy Snapshot")
+            run_id = action_payload.get("run_id")
+            if not isinstance(run_id, str) or run_id != parsed.run_id:
+                raise TaskControlError("resume Action 的 Delivery Run binding 不匹配")
+            budget_checkpoint_resume = action_payload.get(
+                "resume_budget_checkpoint"
+            )
+            if not isinstance(budget_checkpoint_resume, bool):
+                raise TaskControlError("resume Action 的 Budget Window binding 无效")
+            return controller.resume(
+                run_id,
+                resume_human_blocker=initial_status != "supervision_timeout",
+                new_thread=action_payload.get("new_thread") is True,
+                human_response=(
+                    action_payload.get("message")
+                    if isinstance(action_payload.get("message"), str)
+                    else None
+                ),
+                explicit_resume=True,
+                resume_budget_checkpoint=budget_checkpoint_resume,
+                budget_policy=parse_policy_snapshot(policy_snapshot),
+                prepare_state=lambda state: prepare_action_application_receipt(
+                    state, action
+                ),
+            )
         return controller.start_or_resume_unfinished(
             task.parent_number,
             prepare_state=lambda state: prepare_action_application_receipt(
@@ -1432,7 +1541,9 @@ def _run_lifecycle(
         return lifecycle.execute_claimed(
             action_id=executor_binding[0], generation=executor_binding[1]
         )
-    return lifecycle.submit(LifecycleRequest(task=task, kind="run", payload=payload))
+    return lifecycle.submit(
+        LifecycleRequest(task=task, kind=action_kind, payload=payload)
+    )
 
 
 def _reconcile_existing_control(
@@ -1511,6 +1622,43 @@ def _profile_options_are_explicit(
     )
 
 
+def _resume_action_is_attachable(
+    parsed: argparse.Namespace,
+    github: Any,
+    git: GitRepository,
+) -> bool:
+    """Whether this exact Resume can join the Executor already in flight."""
+
+    task = _task_for_parent(parsed, github, git)
+    record = TaskControlStore(git.root / ".agent-run").load(task)
+    action = record.get("action") if isinstance(record, Mapping) else None
+    executor = record.get("executor") if isinstance(record, Mapping) else None
+    if not isinstance(action, Mapping) or action.get("kind") != "resume":
+        return False
+    action_active = action.get("status") in {"accepted", "applying"}
+    executor_active = (
+        isinstance(executor, Mapping)
+        and executor.get("status") in {"starting", "running"}
+        and executor.get("action_id") == action.get("action_id")
+    )
+    if not action_active and not executor_active:
+        return False
+    payload = action.get("payload")
+    if not isinstance(payload, Mapping):
+        return False
+    if not all(
+        payload.get(key) == value
+        for key, value in {
+            "parent": parsed.parent,
+            "run_id": parsed.run_id,
+            "new_thread": bool(parsed.new_thread),
+            "message": parsed.message,
+        }.items()
+    ):
+        return False
+    return _resume_policy_matches_existing_action(parsed, payload)
+
+
 def _reject_if_task_action_pending(
     parsed: argparse.Namespace,
     states: StateStore | FaultInjectingStateStore,
@@ -1581,6 +1729,11 @@ def _run_driver(
     github: FixtureGitHubReader | GhGitHubReader,
     profiles: AgentProfileStore,
     before_external_step: Callable[[], None] | None = None,
+    resume_pending_refresh: Callable[
+        [str], tuple[dict[str, Any], bool]
+    ]
+    | None = None,
+    use_current_state_once: bool = False,
 ) -> RunDriver:
     agents = _agent_backend(parsed, profiles)
     return RunDriver(
@@ -1597,6 +1750,8 @@ def _run_driver(
             agents=agents,
             profiles=profiles,
             before_external_step=before_external_step,
+            resume_pending_refresh=resume_pending_refresh,
+            use_current_state_once=use_current_state_once,
         ),
         states=states,
         supervisor=_foreground_supervisor(parsed),
@@ -1674,14 +1829,54 @@ def _resolve_resume_selection(
     parsed.run_id = None
     parsed.parent = parent_number
     records = _selector_records(parsed, current_root=git.root)
-    selected, _state = _select_one_record(
-        records,
-        parent_number=parent_number,
-        active_only=True,
-        recoverable_only=True,
-        purpose="resume",
-        current_root=git.root,
-    )
+    try:
+        selected, _state = _select_one_record(
+            records,
+            parent_number=parent_number,
+            active_only=True,
+            recoverable_only=True,
+            purpose="resume",
+            current_root=git.root,
+        )
+    except RunLocatorError as selection_error:
+        # Once an accepted Resume has moved the Run beyond its original
+        # recovery boundary, an identical second terminal must still locate
+        # and attach to that Action rather than report that nothing is
+        # resumable.
+        try:
+            selected, active_state = _select_one_record(
+                records,
+                parent_number=parent_number,
+                active_only=True,
+                purpose="resume",
+                current_root=git.root,
+            )
+        except RunLocatorError:
+            raise selection_error
+        repository = active_state.get("repository")
+        parent = active_state.get("parent")
+        parent_value = parent.get("number") if isinstance(parent, Mapping) else None
+        if not isinstance(repository, str) or parent_value != parent_number:
+            raise selection_error
+        task = TaskKey(git.root, repository, parent_number)
+        record = TaskControlStore(git.root / ".agent-run").load(task)
+        action = record.get("action") if isinstance(record, Mapping) else None
+        executor = record.get("executor") if isinstance(record, Mapping) else None
+        executor_active = (
+            isinstance(executor, Mapping)
+            and executor.get("status") in {"starting", "running"}
+            and isinstance(action, Mapping)
+            and executor.get("action_id") == action.get("action_id")
+        )
+        if (
+            not isinstance(action, Mapping)
+            or action.get("kind") != "resume"
+            or (
+                action.get("status") not in {"accepted", "applying"}
+                and not executor_active
+            )
+        ):
+            raise selection_error
     parsed.run_id = _selected_local_run_id(parsed, git, selected, command="resume")
 
 
@@ -2657,45 +2852,6 @@ def _positive_duration_argument(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise argparse.ArgumentTypeError("duration 必须为正数，可带 s/m/h/d 后缀")
     return value
-
-
-def _has_resumed_agent_phase(state: dict[str, object]) -> bool:
-    """Whether explicit resume re-entered a blocked or failed Agent phase."""
-    invocation = state.get("active_agent_invocation")
-    if (
-        isinstance(invocation, dict)
-        and (
-            invocation.get("status") in {"failed", "resuming"}
-            or (
-                invocation.get("status") == "completed"
-                and invocation_attempt_is_pending(state, invocation)
-            )
-        )
-        and invocation.get("role")
-        in {
-            "development",
-            "fresh_acceptance",
-            "publication",
-            "final_publication",
-            "reviewer",
-        }
-    ):
-        return True
-    for key in ("active_ticket_job", "parent_job"):
-        job = state.get(key)
-        if isinstance(job, dict) and job.get("prior_human_blockers"):
-            return True
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        if acceptance.get("prior_human_blockers"):
-            return True
-        repair = acceptance.get("repair_job")
-        if isinstance(repair, dict) and repair.get("prior_human_blockers"):
-            return True
-    publication = state.get("run_publication")
-    return isinstance(publication, dict) and bool(
-        publication.get("prior_human_blockers")
-    )
 
 
 def _is_currentness_human_blocker(state: dict[str, object]) -> bool:

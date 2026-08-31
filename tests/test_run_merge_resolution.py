@@ -455,6 +455,7 @@ def test_merge_resolution_staged_development_interruption_resumes_same_thread(
                         "artifact": _passing_artifact(),
                     }
                 ],
+                "run_publications": [fixture.agents.publication({})],
             }
         ),
         encoding="utf-8",
@@ -485,4 +486,4 @@ def test_merge_resolution_staged_development_interruption_resumes_same_thread(
     assert completed_development["reported_thread_id"] == (
         "integration-repair-developer"
     )
-    fixture.assert_completed(result)
+    fixture.assert_completed(result, expected_status="run_approval_pending")

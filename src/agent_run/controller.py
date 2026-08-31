@@ -249,7 +249,10 @@ class Controller:
         human_response: str | None = None,
         message: str | None = None,
         explicit_resume: bool = False,
+        record_explicit_resume_audit: bool = True,
         resume_budget_checkpoint: bool = False,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+        budget_policy: DeliveryPolicy | None = None,
     ) -> tuple[dict[str, Any], bool]:
         if message is not None:
             if human_response is not None:
@@ -258,9 +261,11 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
-        budget_policy = self.delivery_policy
+        if prepare_state is not None:
+            prepare_state(existing)
+        effective_budget_policy = self.delivery_policy
         if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
-            budget_policy = self._policy_for_new_run()
+            effective_budget_policy = budget_policy or self._policy_for_new_run()
         try:
             existing = self._load_bound_run(run_id, state=existing)
         except GitHubReadError as error:
@@ -277,7 +282,11 @@ class Controller:
             audit_replayed = response_replayed and _resume_audit_matches_replay(
                 existing, new_thread=new_thread
             )
-            if explicit_resume and not audit_replayed:
+            if (
+                explicit_resume
+                and record_explicit_resume_audit
+                and not audit_replayed
+            ):
                 append_explicit_resume_audit(
                     existing,
                     new_thread=new_thread,
@@ -319,7 +328,11 @@ class Controller:
         audit_replayed = response_replayed and _resume_audit_matches_replay(
             existing, new_thread=new_thread
         )
-        if explicit_resume and not audit_replayed:
+        if (
+            explicit_resume
+            and record_explicit_resume_audit
+            and not audit_replayed
+        ):
             append_explicit_resume_audit(
                 existing,
                 new_thread=new_thread,
@@ -415,7 +428,7 @@ class Controller:
         budget_resumed = (
             _resume_review_budget_window(
                 state,
-                budget_policy,
+                effective_budget_policy,
             )
             if resume_budget_checkpoint
             else False
@@ -431,12 +444,16 @@ class Controller:
                 raise ValueError("--message requires a current Human Blocker")
         elif human_response is not None:
             raise ValueError("--message requires Human Blocker resume")
+        invocation_already_resuming = (
+            isinstance(state.get("active_agent_invocation"), dict)
+            and state["active_agent_invocation"].get("status") == "resuming"
+        )
         if new_thread and not budget_resumed:
             if resuming_run_acceptance:
                 _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
             else:
                 _clear_current_invocation_thread(state)
-        else:
+        elif not invocation_already_resuming:
             _restore_current_invocation_thread(
                 state, allow_completed=resume_completed_invocation
             )
@@ -1264,6 +1281,7 @@ class Controller:
                 "abandoned",
                 "abandonment_pending",
                 "deterministic_contradiction",
+                "operator_stopped",
             }:
                 return state, True
             if state.get("status") == "supervision_timeout":

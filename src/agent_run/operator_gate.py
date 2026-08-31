@@ -18,6 +18,7 @@ _OPERATOR_GATE_STATUSES = frozenset(
         "parent_approval_pending",
         "run_approval_pending",
         "supervision_timeout",
+        "operator_stopped",
         "abandonment_pending",
     }
 )

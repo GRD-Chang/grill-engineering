@@ -7,6 +7,7 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
+- `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，发起终端退出或 Ctrl-C 只离开观察；
 - Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run <parent-issue>` 或 `resume <parent-issue>` 开始新的等待窗口，不需要另启 watcher；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
@@ -189,7 +190,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | --- | --- | --- | --- |
 | `start` | 新 Run 或同一 Parent 的现有 Run | 创建或幂等返回本地 Run 记录及其受管 Run Branch，供集成或排障检查身份与状态 | 不推进自动生命周期；日常交付不以它替代 `run` |
 | `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 在同一 Semantic Attempt 内创建 successor Invocation；或为同一等待身份开启新监督窗口 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；或为同一等待身份开启新监督窗口 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |

@@ -204,6 +204,13 @@ def test_run_repair_supersedes_a_retained_publication_approval_phase() -> None:
     assert _operator_action_view(state) is None
 
 
+def test_ordinary_run_cannot_advance_an_operator_stopped_boundary() -> None:
+    state: dict[str, Any] = {"status": "operator_stopped"}
+
+    assert has_run_operator_gate(state)
+    assert DirectRunOperations._cannot_advance(state)
+
+
 def test_pending_acceptance_cannot_claim_a_publication_approval_gate() -> None:
     state: dict[str, Any] = {
         "status": "run_acceptance_pending",
@@ -1758,6 +1765,10 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
                     passing_acceptance("reviewer-3", "Ticket 3 passed."),
                     passing_acceptance("reviewer-4", "Ticket 4 passed."),
                 ],
+                "run_reviews": [
+                    passing_acceptance("run-reviewer", "The complete Run passed.")
+                ],
+                "run_publications": [_publication(1)],
             }
         ),
         encoding="utf-8",
@@ -1777,7 +1788,7 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
 
     assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
     state = load_only_run_state(git_repo)
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     assert state["ticket_jobs"]["2"]["phase"] == "completed"
     assert state["ticket_jobs"]["3"]["phase"] == "completed"
     assert state["ticket_jobs"]["4"]["phase"] == "completed"
@@ -1921,16 +1932,18 @@ def test_run_recovers_after_process_failure_between_tickets(
                 "reviews": [
                     passing_acceptance("reviewer-3", "Ticket 3 passed.")
                 ],
+                "run_reviews": [
+                    passing_acceptance("run-reviewer", "The complete Run passed.")
+                ],
+                "run_publications": [_publication(1)],
             }
         ),
         encoding="utf-8",
     )
-    explicitly_resumed = run_cli(git_repo, fixture, "resume", run_id)
-    assert explicitly_resumed.returncode == 0, explicitly_resumed.stderr
-    recovered = run_internal_stage(
+    recovered = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(second_agents),
@@ -1938,10 +1951,10 @@ def test_run_recovers_after_process_failure_between_tickets(
 
     assert recovered.returncode == 0, recovered.stdout
     state = load_only_run_state(git_repo)
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     mutable = json.loads(fixture.read_text(encoding="utf-8"))
     assert mutable["delivery"]["closed_issues"] == [2, 3]
-    assert len(mutable["delivery"]["pull_requests"]) == 2
+    assert len(mutable["delivery"]["pull_requests"]) == 3
 
 
 def test_inflight_ticket_revision_requires_a_fresh_requeue(
@@ -1999,6 +2012,12 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
                 "reviews": [
                     passing_acceptance("reviewer-2", "Ticket 2 passed.")
                 ],
+                "run_reviews": [
+                    passing_acceptance(
+                        "run-reviewer", "The complete Run passed."
+                    )
+                ],
+                "run_publications": [_publication(1)],
             }
         ),
         encoding="utf-8",
@@ -2022,21 +2041,21 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
     data = json.loads(fixture.read_text(encoding="utf-8"))
     assert data["issues"]["2"]["state"] == "CLOSED"
 
-    explicitly_resumed = run_cli(git_repo, fixture, "resume", run_id)
-    assert explicitly_resumed.returncode == 0, explicitly_resumed.stderr
-    recovered = run_internal_stage(
+    explicitly_resumed = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(agent_fixture),
     )
-
-    assert recovered.returncode == 0, recovered.stdout
-    assert stdout_json(recovered)["status"] == "run_acceptance_pending"
+    assert explicitly_resumed.returncode == 0, explicitly_resumed.stderr
+    assert stdout_json(explicitly_resumed)["status"] == "run_approval_pending"
     data = json.loads(fixture.read_text(encoding="utf-8"))
-    assert len(data["delivery"]["pull_requests"]) == 1
+    assert [
+        pull_request["number"]
+        for pull_request in data["delivery"]["pull_requests"]
+    ] == [1, 2]
     assert data["delivery"]["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in data["delivery"]["mutations"]

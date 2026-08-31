@@ -411,7 +411,7 @@ def test_run_repair_resume_preserves_partial_worker_edits_and_thread(
     assert recovered.returncode == 0, recovered.stderr
     completed = load_only_run_state(git_repo)
     completed_run = completed["run_acceptance"]
-    assert stdout_json(recovered)["status"] == "run_publication_pending"
+    assert stdout_json(recovered)["status"] == "run_approval_pending"
     assert completed_run["repair_generation"] == generation
     assert completed_run["repair_cycle"]["status"] == "promoted"
     assert completed_run["repair_cycle"]["code_modification_attempts"] == 1

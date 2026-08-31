@@ -27,6 +27,7 @@ from agent_run.state_contract import (
 )
 
 from test_cli import run_internal_stage, run_cli, stdout_json
+from test_cli_delivery import final_run_publication
 
 from run_acceptance_test_support import (
     FreshCycleRunAgents,
@@ -2030,7 +2031,8 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
                         "thread_id": "failed-run-reviewer-thread",
                         "artifact": _passing_artifact(),
                     }
-                ]
+                ],
+                "run_publications": [final_run_publication()],
             }
         ),
         encoding="utf-8",
@@ -2045,10 +2047,15 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
     )
 
     assert resumed.returncode == 0, resumed.stderr
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
-    history = persisted["agent_invocation_history"]
-    assert history[-2]["status"] == "failed"
-    assert history[-2]["attempt_count"] == 3
-    assert history[-1]["status"] == "completed"
-    assert history[-1]["attempt_count"] == 1
+    review_history = [
+        invocation
+        for invocation in persisted["agent_invocation_history"]
+        if invocation["role"] == "reviewer"
+    ]
+    assert review_history[-2]["status"] == "failed"
+    assert review_history[-2]["attempt_count"] == 3
+    assert review_history[-1]["status"] == "completed"
+    assert review_history[-1]["attempt_count"] == 1

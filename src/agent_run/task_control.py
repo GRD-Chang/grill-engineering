@@ -184,7 +184,13 @@ class TaskControlStore:
                 isinstance(executor, dict)
                 and executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
             ):
-                if kind == "run":
+                same_executor_action = (
+                    isinstance(current, dict)
+                    and current.get("action_id") == executor.get("action_id")
+                    and current.get("kind") == kind
+                    and current.get("payload_digest") == payload_digest
+                )
+                if same_executor_action:
                     return ActionClaim(
                         action=None,
                         attached=True,

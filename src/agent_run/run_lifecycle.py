@@ -1,4 +1,4 @@
-"""The narrow lifecycle spine for the public ``run`` command."""
+"""The narrow lifecycle spine for public Executor-backed commands."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ def prepare_action_application_receipt(
 
 
 class RunLifecycle:
-    """Admit one ``run`` action and give its business work to one Executor.
+    """Admit one lifecycle action and give its business work to one Executor.
 
     The callbacks are deliberately supplied by the CLI composition root.  The
     lifecycle module owns admission, receipts and host hand-off; it does not
@@ -202,8 +202,8 @@ class RunLifecycle:
             raise ActionReconciliationError(
                 "Lifecycle Request 不属于当前 Delivery Task"
             )
-        if request.kind != "run":
-            raise ValueError("当前 Ticket 只实现 run Lifecycle Action")
+        if request.kind not in {"run", "resume"}:
+            raise ValueError("当前 Executor 只实现 run/resume Lifecycle Action")
 
         current = self.preflight()
         try:
@@ -661,7 +661,9 @@ class RunLifecycle:
             )
         recover = _safe_supervision_recovery(state)
         if (
-            state.get("run_id") is not None
+            expected_action is not None
+            and _action_matches_run_receipt(state, expected_action)
+            and state.get("run_id") is not None
             and not _restartable_after_executor_exit(state)
             and state.get("status")
             not in {"run_approval_pending", "parent_approval_pending"}

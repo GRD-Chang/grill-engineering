@@ -322,9 +322,15 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert cleanup["items"][0]["checkout"] == str(checkout)
     assert "agent-run run 1" in cleanup["items"][0]["recovery_action"]
     assert "agent-run run 1" in output["next_action"]
-    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
-        delivery_before
+    delivery_after_resume = json.loads(fixture.read_text(encoding="utf-8"))[
+        "delivery"
+    ]
+    expected_delivery = deepcopy(delivery_before)
+    expected_delivery["published_branches"].pop(ticket_branch)
+    expected_delivery["mutations"].append(
+        {"action": "delete_managed_branch", "branch": ticket_branch}
     )
+    assert delivery_after_resume == expected_delivery
 
     no_agents = git_repo / "no-agents.json"
     no_agents.write_text("{}", encoding="utf-8")
@@ -344,6 +350,9 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert dirty_state["retired_semantic_attempt_owners"] == persisted[
         "retired_semantic_attempt_owners"
     ]
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
+        delivery_after_resume
+    )
     assert tracked.is_file()
     assert untracked.is_file()
 

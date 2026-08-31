@@ -1532,7 +1532,9 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
         str(agents),
     )
     assert resumed.returncode == 0, resumed.stdout
-    assert stdout_json(resumed)["status"] == "active"
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    recovered_state = load_only_run_state(git_repo)
+    recovered_fixture = fixture.read_text(encoding="utf-8")
 
     recovered = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
@@ -1540,6 +1542,17 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
 
     assert recovered.returncode == 0, recovered.stdout
     assert stdout_json(recovered)["status"] == "run_approval_pending"
+    held_state = load_only_run_state(git_repo)
+    assert held_state["ticket_jobs"] == recovered_state["ticket_jobs"]
+    assert held_state["run_publication"] == recovered_state["run_publication"]
+    assert (
+        held_state["agent_invocation_history"]
+        == recovered_state["agent_invocation_history"]
+    )
+    assert held_state["review_budget_protocol"] == recovered_state[
+        "review_budget_protocol"
+    ]
+    assert fixture.read_text(encoding="utf-8") == recovered_fixture
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(fixture_data["delivery"]["pull_requests"]) == 2
     assert fixture_data["delivery"]["closed_issues"] == [3]
@@ -1655,13 +1668,26 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
         str(agents),
     )
     assert resumed.returncode == 0, resumed.stdout
-    assert stdout_json(resumed)["status"] == "active"
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    recovered_state = load_only_run_state(git_repo)
+    recovered_fixture = fixture.read_text(encoding="utf-8")
 
     recovered = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
     )
     assert recovered.returncode == 0, recovered.stdout
     assert stdout_json(recovered)["status"] == "run_approval_pending"
+    held_state = load_only_run_state(git_repo)
+    assert held_state["ticket_jobs"] == recovered_state["ticket_jobs"]
+    assert held_state["run_publication"] == recovered_state["run_publication"]
+    assert (
+        held_state["agent_invocation_history"]
+        == recovered_state["agent_invocation_history"]
+    )
+    assert held_state["review_budget_protocol"] == recovered_state[
+        "review_budget_protocol"
+    ]
+    assert fixture.read_text(encoding="utf-8") == recovered_fixture
     job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
     assert job["linked_branch_display"] == {
         "display_attempted": True,
