@@ -5,7 +5,8 @@ import json
 import os
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -52,12 +53,19 @@ from agent_run.external_supervision import (
     is_proven_github_state_contradiction,
 )
 from agent_run.executor import DeliveryExecutor
+from agent_run.executor_environment import default_executor_runtime_directory
 from agent_run.executor_host import (
+    BoundExecutorHost,
     ExecutorAgentInterruptedError,
     ExecutorHost,
     ExecutorSpec,
     ExecutorStartUnknownError,
     FakeExecutorHost,
+)
+from agent_run.runner_lease import default_runner_lock_path, runner_usage_lease
+from agent_run.systemd_executor_host import (
+    SystemdExecutionReadinessError,
+    SystemdUserExecutorHost,
 )
 from agent_run.run_driver import DirectRunOperations, RunDriver
 from agent_run.run_lifecycle import (
@@ -259,6 +267,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
 def _main_with_parser(
     parser: argparse.ArgumentParser, arguments: Sequence[str] | None = None
 ) -> int:
+    with ExitStack() as resources:
+        return _main_with_parser_resources(parser, arguments, resources)
+
+
+def _main_with_parser_resources(
+    parser: argparse.ArgumentParser,
+    arguments: Sequence[str] | None,
+    resources: ExitStack,
+) -> int:
     supplied_arguments = list(arguments) if arguments is not None else sys.argv[1:]
     parsed = parser.parse_args(supplied_arguments)
     controller: Controller | None = None
@@ -327,19 +344,44 @@ def _main_with_parser(
             _resolve_resume_selection(parsed, git)
         elif parsed.command == "approve":
             _resolve_approve_selection(parsed, git)
+        executor_binding = _executor_binding_from_environment()
+        runner_lease_fd: int | None = None
+        if (
+            parsed.command == "run"
+            and fixture_path is None
+            and executor_binding is None
+        ):
+            usage_lease = resources.enter_context(
+                runner_usage_lease(default_runner_lock_path())
+            )
+            runner_lease_fd = usage_lease.fileno()
         if fixture_path is None and not _running_active_runner():
             raise ValueError(
                 "self-hosting lifecycle commands require an installed Active Runner"
             )
-        if parsed.command == "run" and fixture_path is None:
-            raise ExecutionReadinessError(
-                "Runner Execution Readiness 不满足：当前版本未配置终端独立的 Executor Host"
+        executor_host: ExecutorHost | None = None
+        prepare_executor_session: Callable[[], None] | None = None
+        if parsed.command == "run" and fixture_path is not None:
+            executor_host = FakeExecutorHost(separate_process=True)
+        elif parsed.command == "run" and executor_binding is not None:
+            executor_host = BoundExecutorHost(
+                action_id=executor_binding[0], generation=executor_binding[1]
             )
-        executor_host = (
-            FakeExecutorHost(separate_process=True)
-            if parsed.command == "run" and fixture_path is not None
-            else None
-        )
+        elif parsed.command == "run":
+            systemd_host = SystemdUserExecutorHost(
+                runtime_directory=_executor_runtime_directory(),
+                environment=dict(os.environ),
+                executor_python=Path(sys.executable),
+                runner_lease_fd=runner_lease_fd,
+            )
+            try:
+                systemd_host.check_readiness()
+            except SystemdExecutionReadinessError as error:
+                raise ExecutionReadinessError(str(error)) from error
+            executor_host = systemd_host
+            prepare_executor_session = lambda: systemd_host.prepare_environment(
+                supplied_arguments
+            )
         if parsed.command != "run":
             _reject_if_task_action_pending(parsed, states, github, git)
         if parsed.command in {"resume", "requeue", "approve", "revise", "abandon"}:
@@ -359,6 +401,9 @@ def _main_with_parser(
                 profiles,
                 creation_profile,
                 executor_host,
+                lifecycle_arguments=tuple(supplied_arguments),
+                executor_binding=executor_binding,
+                prepare_executor_session=prepare_executor_session,
             )
         elif parsed.command == "start":
             state, resumed = controller.start(
@@ -781,7 +826,9 @@ def _main_with_parser(
         locator_error = locator_code is not None
         if locator_code is not None:
             diagnostic_code = locator_code
-        elif isinstance(error, ExecutionReadinessError):
+        elif isinstance(
+            error, (ExecutionReadinessError, SystemdExecutionReadinessError)
+        ):
             diagnostic_code = "execution_readiness"
         elif isinstance(error, DirtyManagedCheckoutError):
             diagnostic_code = "dirty_managed_checkout"
@@ -800,7 +847,9 @@ def _main_with_parser(
 
         if (
             locator_error
-            or isinstance(error, ExecutionReadinessError)
+            or isinstance(
+                error, (ExecutionReadinessError, SystemdExecutionReadinessError)
+            )
             or isinstance(error, DirtyManagedCheckoutError)
             or diagnostic_code
             in {"action_busy", "executor_start_unknown", "task_control"}
@@ -889,6 +938,26 @@ def _running_active_runner() -> bool:
     except ValueError:
         return False
     return True
+
+
+def _executor_binding_from_environment() -> tuple[str, int] | None:
+    action_id = os.environ.get("AGENT_RUN_EXECUTOR_ACTION_ID")
+    raw_generation = os.environ.get("AGENT_RUN_EXECUTOR_GENERATION")
+    if action_id is None and raw_generation is None:
+        return None
+    if not action_id or raw_generation is None:
+        raise ExecutionReadinessError("Executor 环境 binding 不完整")
+    try:
+        generation = int(raw_generation)
+    except ValueError as error:
+        raise ExecutionReadinessError("Executor generation 无效") from error
+    if generation <= 0:
+        raise ExecutionReadinessError("Executor generation 无效")
+    return action_id, generation
+
+
+def _executor_runtime_directory() -> Path:
+    return default_executor_runtime_directory()
 
 
 def _foreground_supervisor(parsed: argparse.Namespace) -> ExternalSupervisor:
@@ -1011,6 +1080,10 @@ def _run_lifecycle(
     profiles: AgentProfileStore,
     creation_profile: tuple[str | None, ProfileOverrides] | None,
     host: ExecutorHost | None,
+    *,
+    lifecycle_arguments: tuple[str, ...] = (),
+    executor_binding: tuple[str, int] | None = None,
+    prepare_executor_session: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
     if host is None:
         raise ExecutionReadinessError(
@@ -1242,9 +1315,17 @@ def _run_lifecycle(
             action_id=action_id,
             run_id=run_id,
             generation=generation,
+            command=lifecycle_arguments,
+            cwd=git.root,
+            state_root=states.root.resolve(),
         ),
         execute=delivery_executor.execute,
+        prepare_executor_session=prepare_executor_session,
     )
+    if executor_binding is not None:
+        return lifecycle.execute_claimed(
+            action_id=executor_binding[0], generation=executor_binding[1]
+        )
     return lifecycle.submit(LifecycleRequest(task=task, kind="run", payload=payload))
 
 

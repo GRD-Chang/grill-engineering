@@ -19,7 +19,15 @@ from typing import Any, Literal, Protocol
 from agent_run.state import SimulatedProcessCrash
 from agent_run.task_control import TaskControlError, TaskControlStore, TaskKey
 
-HostStatus = Literal["absent", "starting", "running", "exited", "unknown"]
+HostStatus = Literal[
+    "absent",
+    "reserved",
+    "starting",
+    "running",
+    "exited",
+    "unknown",
+    "conflict",
+]
 _STDERR_CHUNK_BYTES = 64 * 1024
 
 
@@ -48,6 +56,7 @@ class ExecutorSpec:
     command: tuple[str, ...] = ()
     cwd: Path | None = None
     environment: Mapping[str, str] | None = None
+    state_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,8 @@ class ExecutorHost(Protocol):
     def inspect(
         self, spec: ExecutorSpec, control: TaskControlStore
     ) -> HostObservation: ...
+
+    def cleanup_startup(self, spec: ExecutorSpec) -> None: ...
 
 
 def _relay_stderr(source_fd: int, target_fd: int) -> None:
@@ -503,6 +514,94 @@ class FakeExecutorHost:
             handshake=handshake,
             reason="cannot prove the recorded process binding",
         )
+
+    def cleanup_startup(self, spec: ExecutorSpec) -> None:
+        del spec
+
+
+class BoundExecutorHost:
+    """Executor-side adapter that takes over one pre-reserved generation."""
+
+    def __init__(self, *, action_id: str, generation: int) -> None:
+        self.action_id = action_id
+        self.generation = generation
+
+    def ensure(
+        self,
+        spec: ExecutorSpec,
+        control: TaskControlStore,
+        execute: Callable[[], Mapping[str, Any]] | None = None,
+        recover: bool = False,
+    ) -> HostObservation:
+        del recover
+        self._validate(spec)
+        if execute is None:
+            raise ExecutorHostError("Executor 没有绑定业务执行入口")
+        pid = os.getpid()
+        start_token = _process_start_token(pid)
+        try:
+            control.mark_process_started(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                pid=pid,
+                process_start_token=start_token,
+            )
+            control.mark_handshake(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                pid=pid,
+                process_start_token=start_token,
+            )
+            result = execute()
+            result_status = result.get("status")
+            control.finish_executor(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                result_status=(
+                    result_status if isinstance(result_status, str) else None
+                ),
+            )
+            return HostObservation("exited", spec.generation, pid, True)
+        except BaseException as error:
+            try:
+                control.finish_executor(
+                    spec.task,
+                    action_id=spec.action_id,
+                    generation=spec.generation,
+                    failure=str(error),
+                )
+            except TaskControlError:
+                pass
+            raise
+
+    def inspect(
+        self, spec: ExecutorSpec, control: TaskControlStore
+    ) -> HostObservation:
+        self._validate(spec)
+        record = control.load(spec.task)
+        executor = record.get("executor") if isinstance(record, dict) else None
+        if not isinstance(executor, dict):
+            return HostObservation(
+                "conflict", None, None, False, "Executor binding 缺失"
+            )
+        if (
+            executor.get("action_id") != self.action_id
+            or executor.get("generation") != self.generation
+        ):
+            return HostObservation(
+                "conflict", self.generation, None, False, "Executor binding 不匹配"
+            )
+        return HostObservation("reserved", self.generation, os.getpid(), False)
+
+    def cleanup_startup(self, spec: ExecutorSpec) -> None:
+        self._validate(spec)
+
+    def _validate(self, spec: ExecutorSpec) -> None:
+        if spec.action_id != self.action_id or spec.generation != self.generation:
+            raise ExecutorHostError("Executor 不能接管另一个 Action/generation")
 
 
 def _process_start_token(pid: int) -> str | None:

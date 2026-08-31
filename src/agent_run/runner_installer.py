@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +34,11 @@ try:
         terminate_process_group as _terminate_process_group,
     )
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
+    from agent_run.runner_lease import (
+        RunnerLeaseBusy,
+        RunnerLeaseError,
+        runner_management_lease,
+    )
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
     from process_cleanup import (  # type: ignore[import-not-found, no-redef]
         capture_process_scope,
@@ -44,6 +48,11 @@ except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
     from runner_runtime import (  # type: ignore[import-not-found, no-redef]
         RuntimeTreeError,
         find_runtime_package,
+    )
+    from runner_lease import (  # type: ignore[import-not-found, no-redef]
+        RunnerLeaseBusy,
+        RunnerLeaseError,
+        runner_management_lease,
     )
 
 
@@ -184,20 +193,15 @@ def _handle_sigterm() -> Iterator[None]:
 
 @contextmanager
 def _management_lock(paths: InstallPaths) -> Iterator[None]:
-    paths.data_root.mkdir(parents=True, exist_ok=True)
     try:
-        descriptor = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as error:
-        raise InstallerError("无法创建用户级安装锁") from error
-    with os.fdopen(descriptor, "a+") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise InstallerError("另一个 install、rollback 或 uninstall 正在运行") from error
-        try:
+        with runner_management_lease(paths.lock):
             yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except RunnerLeaseBusy as error:
+        raise InstallerError(
+            "存在活动 Executor，或另一个 install、rollback 或 uninstall 正在运行"
+        ) from error
+    except RunnerLeaseError as error:
+        raise InstallerError("无法创建用户级安装锁") from error
 
 
 def _install(paths: InstallPaths, source: Path) -> dict[str, object]:

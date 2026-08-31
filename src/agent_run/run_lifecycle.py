@@ -90,6 +90,7 @@ class RunLifecycle:
         initialize_profile: Callable[[dict[str, Any], bool], None] | None,
         executor_spec: Callable[[str | None, str, int], ExecutorSpec],
         execute: Callable[[str], Mapping[str, Any]],
+        prepare_executor_session: Callable[[], None] | None = None,
         poll_interval: float = 0.01,
         startup_timeout: float = 2.0,
         sleep: Callable[[float], None] = time.sleep,
@@ -104,6 +105,7 @@ class RunLifecycle:
         self.initialize_profile = initialize_profile
         self.executor_spec = executor_spec
         self.execute = execute
+        self.prepare_executor_session = prepare_executor_session
         self.poll_interval = max(0.001, poll_interval)
         self.startup_timeout = max(self.poll_interval, startup_timeout)
         self.sleep = sleep
@@ -208,7 +210,7 @@ class RunLifecycle:
                 )
                 if observation.status == "running":
                     break
-                if observation.status == "absent":
+                if observation.status in {"absent", "exited"}:
                     if _safe_supervision_recovery(state):
                         self.control.mark_executor_absent(
                             self.task,
@@ -218,6 +220,10 @@ class RunLifecycle:
                         return self.submit(request)
                     raise ExecutorLostError(
                         "活动 Executor 已退出；不会盲目启动第二个 Executor"
+                    )
+                if observation.status == "conflict":
+                    raise ExecutorStartUnknownError(
+                        observation.reason or "Executor binding conflict"
                     )
                 if self.clock() >= deadline:
                     raise ExecutorStartUnknownError(
@@ -247,11 +253,35 @@ class RunLifecycle:
             replace_receipt_action_id=replace_receipt_action_id,
         )
 
+    def execute_claimed(
+        self, *, action_id: str, generation: int
+    ) -> tuple[dict[str, Any], bool, ActionReceipt]:
+        """Execute one Action already reserved by an external Host."""
+
+        record = self.control.snapshot(self.task, action_id)
+        if record is None:
+            raise ActionReconciliationError("Executor 找不到已接受的 Action")
+        action = record.get("action")
+        executor = record.get("executor")
+        if not isinstance(action, Mapping) or action.get("action_id") != action_id:
+            raise ActionReconciliationError("Executor Action binding 不匹配")
+        if (
+            not isinstance(executor, Mapping)
+            or executor.get("action_id") != action_id
+            or executor.get("generation") != generation
+            or executor.get("status") not in {"starting", "running"}
+        ):
+            raise ActionReconciliationError("Executor generation binding 不匹配")
+        run_id = _record_run_id(record)
+        current = self._load_action_run(run_id, {}, record=record)
+        return self._continue_action(action, current)
+
     def _claim(self, request: LifecycleRequest) -> ActionClaim:
         return self.control.claim_action(
             self.task,
             kind=request.kind,
             payload=request.payload,
+            before_create=self.prepare_executor_session,
         )
 
     def _reconcile_from_run(
@@ -522,12 +552,16 @@ class RunLifecycle:
                 # Keep checking this exact generation while the process
                 # binding and handshake transaction is still being committed.
                 self.sleep(self.poll_interval)
-            if observation.status == "absent":
+            if observation.status in {"absent", "exited"}:
                 if not recover:
                     raise ExecutorLostError(
                         "Executor 已退出；只完成原 execution generation 对账，不自动重放 Agent"
                     )
                 observation = None
+            elif observation.status == "conflict":
+                raise ExecutorStartUnknownError(
+                    observation.reason or "Executor binding conflict"
+                )
         elif isinstance(executor, dict) and executor.get("status") in {
             "exited",
             "absent",
@@ -601,6 +635,46 @@ class RunLifecycle:
         *,
         expected_action: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        try:
+            return self._observe_action(
+                spec,
+                state,
+                action_id,
+                generation,
+                expected_action=expected_action,
+            )
+        except KeyboardInterrupt:
+            self._wait_for_executor_handoff(spec, action_id)
+            raise
+
+    def _wait_for_executor_handoff(
+        self, spec: ExecutorSpec, action_id: str
+    ) -> None:
+        deadline = self.clock() + self.startup_timeout
+        while True:
+            record = self.control.snapshot(self.task, action_id)
+            action = record.get("action") if isinstance(record, dict) else None
+            if isinstance(action, dict) and action.get("status") in {
+                "completed",
+                "failed",
+            }:
+                return
+            observation = self.host.inspect(spec, self.control)
+            if observation.status in {"running", "absent", "exited", "conflict"}:
+                return
+            if self.clock() >= deadline:
+                return
+            time.sleep(self.poll_interval)
+
+    def _observe_action(
+        self,
+        spec: ExecutorSpec,
+        state: dict[str, Any],
+        action_id: str,
+        generation: int,
+        *,
+        expected_action: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         startup_deadline = self.clock() + self.startup_timeout
         while True:
             record = self.control.snapshot(self.task, action_id)
@@ -623,6 +697,7 @@ class RunLifecycle:
             status = action.get("status")
             run_id = action.get("run_id")
             if status in {"completed", "failed"}:
+                self.host.cleanup_startup(spec)
                 if not isinstance(run_id, str):
                     if state.get("run_id") is not None:
                         return state
@@ -635,14 +710,21 @@ class RunLifecycle:
                 return final
 
             observation = self.host.inspect(spec, self.control)
-            if observation.status == "absent":
+            if observation.status in {"absent", "exited"}:
+                self.host.cleanup_startup(spec)
                 raise ExecutorLostError(
                     "Executor 在 Action 完成前退出；只完成原 execution generation 对账，不自动重放 Agent"
+                )
+            if observation.status == "conflict":
+                self.host.cleanup_startup(spec)
+                raise ExecutorStartUnknownError(
+                    observation.reason or "Executor binding conflict"
                 )
             if (
                 observation.status in {"starting", "unknown"}
                 and self.clock() >= startup_deadline
             ):
+                self.host.cleanup_startup(spec)
                 raise ExecutorStartUnknownError(
                     observation.reason
                     or "Executor 未在握手窗口内完成启动；不会盲目启动第二个 Executor"

@@ -13,7 +13,7 @@ import json
 import os
 import tempfile
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -151,6 +151,7 @@ class TaskControlStore:
         *,
         kind: str,
         payload: Mapping[str, Any],
+        before_create: Callable[[], None] | None = None,
     ) -> ActionClaim:
         if not isinstance(kind, str) or not kind.strip():
             raise TaskControlError("Lifecycle Action kind must be non-empty")
@@ -195,6 +196,10 @@ class TaskControlStore:
                     action=current if isinstance(current, dict) else None,
                 )
 
+            # The callback runs under the task lock after every attach path
+            # has returned, but before this transaction mutates durable state.
+            if before_create is not None:
+                before_create()
             generation = _positive_integer(record.get("next_generation", 1))
             if isinstance(executor, dict) and executor.get("status") in {
                 "exited",
@@ -431,6 +436,7 @@ class TaskControlStore:
         action_id: str,
         run_id: str | None,
         reclaim: bool = False,
+        before_create: Callable[[], None] | None = None,
     ) -> ExecutorReservation:
         with self._locked(task):
             record = self._require_unlocked(task)
@@ -468,6 +474,10 @@ class TaskControlStore:
                     "原 Executor 已退出；必须显式恢复，不能重放原业务意图"
                 )
 
+            # A joined generation returns above; only a genuinely new
+            # Executor session performs its preparation before reservation.
+            if before_create is not None:
+                before_create()
             generation = _positive_integer(action.get("executor_generation"))
             if (
                 isinstance(existing, dict)

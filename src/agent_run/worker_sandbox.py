@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import codecs
+import json
 import os
 import signal
 import shutil
@@ -7,7 +9,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
 from agent_run.worker_credentials import WORKER_GH_RESPONSE_TIMEOUT_SECONDS
@@ -21,6 +23,97 @@ class WorkerDeadlineExceeded(WorkerSandboxError):
     pass
 
 
+_STREAM_CHUNK_BYTES = 64 * 1024
+_STDOUT_CAPTURE_BYTES = 64 * 1024
+_STDERR_CAPTURE_BYTES = 64 * 1024
+_JSONL_LINE_BYTES = 64 * 1024
+
+
+class _BoundedBytesTail:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._value = bytearray()
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._value.extend(chunk[-self.limit :])
+        if len(self._value) > self.limit:
+            del self._value[: len(self._value) - self.limit]
+
+    def text(self) -> str:
+        return bytes(self._value).decode("utf-8", errors="replace")
+
+
+class _BoundedJsonlStream:
+    """Incrementally retain a bounded JSONL tail and critical event lines."""
+
+    def __init__(
+        self,
+        *,
+        capture_bytes: int = _STDOUT_CAPTURE_BYTES,
+        line_bytes: int = _JSONL_LINE_BYTES,
+        on_line: Callable[[str], None] | None = None,
+    ) -> None:
+        self.capture_bytes = capture_bytes
+        self.line_bytes = line_bytes
+        self.on_line = on_line
+        self._tail = _BoundedBytesTail(capture_bytes)
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._line = ""
+        self._discarding_line = False
+        self._pinned: dict[str, str] = {}
+
+    def feed(self, chunk: bytes) -> None:
+        self._tail.append(chunk)
+        self._consume(self._decoder.decode(chunk))
+
+    def finish(self) -> None:
+        self._consume(self._decoder.decode(b"", final=True), final=True)
+
+    def text(self) -> str:
+        pinned = "\n".join(self._pinned.values())
+        tail = self._tail.text()
+        return f"{pinned}\n{tail}" if pinned else tail
+
+    def _consume(self, value: str, *, final: bool = False) -> None:
+        for part in value.splitlines(keepends=True):
+            terminated = part.endswith(("\n", "\r"))
+            content = part.rstrip("\r\n") if terminated else part
+            if not self._discarding_line:
+                candidate = self._line + content
+                if len(candidate.encode("utf-8")) <= self.line_bytes:
+                    self._line = candidate
+                else:
+                    self._line = ""
+                    self._discarding_line = True
+            if terminated:
+                if not self._discarding_line:
+                    self._handle_line(self._line)
+                self._line = ""
+                self._discarding_line = False
+        if final and self._line and not self._discarding_line:
+            self._handle_line(self._line)
+            self._line = ""
+
+    def _handle_line(self, line: str) -> None:
+        if self.on_line is not None:
+            self.on_line(line)
+        try:
+            value: object = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(value, dict):
+            return
+        event_type = value.get("type")
+        if event_type == "thread.started":
+            self._pinned["thread.started"] = line
+        elif event_type in {"task_complete", "turn.failed"}:
+            self._pinned[str(event_type)] = line
+        elif "error" in value:
+            self._pinned["error"] = line
+
+
 def worker_environment(
     gh_config: Path, github_read_token: str
 ) -> dict[str, str]:
@@ -28,7 +121,8 @@ def worker_environment(
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key
+        if not key.startswith(("AGENT_RUN_EXECUTOR_", "AGENT_RUN_INTERNAL_"))
+        and key
         not in {
             "GH_TOKEN",
             "GITHUB_TOKEN",
@@ -43,6 +137,7 @@ def worker_environment(
             "AGENT_RUN_GITHUB_READ_PERMISSIONS",
             "AGENT_RUN_GITHUB_READ_TOKEN",
             "GH_HOST",
+            "DBUS_SESSION_BUS_ADDRESS",
         }
     }
     environment["PATH"] = _without_inherited_gh_adapters(
@@ -455,7 +550,7 @@ def run_worker_process(
         arguments,
         cwd=cwd,
         env=environment,
-        text=True,
+        text=False,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -469,31 +564,39 @@ def run_worker_process(
     assert stdin is not None
     assert stdout_pipe is not None
     assert stderr_pipe is not None
-    stdout_lines: list[str] = []
-    stderr_parts: list[str] = []
     callback_errors: list[BaseException] = []
     reader_errors: list[BaseException] = []
     writer_errors: list[BaseException] = []
 
+    def forward_stdout_line(line: str) -> None:
+        if on_stdout_line is not None and not callback_errors:
+            try:
+                on_stdout_line(line)
+            except BaseException as error:
+                callback_errors.append(error)
+                _terminate_process_group(process)
+
+    stdout_capture = _BoundedJsonlStream(on_line=forward_stdout_line)
+    stderr_capture = _BoundedBytesTail(_STDERR_CAPTURE_BYTES)
+
     def read_stdout() -> None:
         try:
-            for line in stdout_pipe:
-                stdout_lines.append(line)
-                if on_stdout_line is not None and not callback_errors:
-                    try:
-                        on_stdout_line(line)
-                    except BaseException as error:
-                        callback_errors.append(error)
-                        _terminate_process_group(process)
+            while chunk := os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                stdout_capture.feed(chunk)
+            stdout_capture.finish()
         except BaseException as error:
             reader_errors.append(error)
 
     def read_stderr() -> None:
-        stderr_parts.append(stderr_pipe.read())
+        try:
+            while chunk := os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                stderr_capture.append(chunk)
+        except BaseException as error:
+            reader_errors.append(error)
 
     def write_stdin() -> None:
         try:
-            stdin.write(prompt)
+            stdin.write(prompt.encode("utf-8"))
             stdin.close()
         except BrokenPipeError:
             return
@@ -563,12 +666,12 @@ def run_worker_process(
     return subprocess.CompletedProcess(
         arguments,
         process.returncode,
-        "".join(stdout_lines),
-        "".join(stderr_parts),
+        stdout_capture.text(),
+        stderr_capture.text(),
     )
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:

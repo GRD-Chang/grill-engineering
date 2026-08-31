@@ -44,6 +44,7 @@ from agent_run.worker_sandbox import (
     bubblewrap_command,
     run_worker_process,
     worker_environment,
+    _BoundedJsonlStream,
 )
 from agent_run.worker_credentials import (
     InitialCredentialUnavailable,
@@ -4127,3 +4128,187 @@ def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(
         )
 
     assert time.monotonic() - started < 2
+
+
+def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> None:
+    stream = _BoundedJsonlStream(capture_bytes=4096, line_bytes=1024)
+    stream.feed(b'{"type":"thread.started","thread_id":"thread-189"}\n')
+    noise_chunk = b"noise" * 1000
+    for _ in range(500):
+        stream.feed(noise_chunk)
+    stream.feed(
+        b'\n{"type":"turn.failed","error":{"message":"bounded failure"}}\n'
+    )
+    stream.finish()
+
+    captured = stream.text()
+    assert "thread-189" in captured
+    assert "bounded failure" in captured
+    assert len(captured.encode("utf-8")) <= 16 * 1024
+
+
+def test_worker_process_bounds_stdout_and_stderr_without_rss_assertions(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "large-output.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'thread-189'}))\n"
+        "for _ in range(512):\n"
+        "    print('x' * 8192)\n"
+        "    print('y' * 8192, file=sys.stderr)\n"
+        "print(json.dumps({'type': 'turn.failed', 'error': {'message': 'tail failure'}}))\n",
+        encoding="utf-8",
+    )
+
+    result = run_worker_process(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        prompt="",
+        environment=os.environ.copy(),
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert "thread-189" in result.stdout
+    assert "tail failure" in result.stdout
+    assert len(result.stdout.encode("utf-8")) <= 256 * 1024
+    assert len(result.stderr.encode("utf-8")) <= 128 * 1024
+
+
+def test_worker_descendant_inherits_hidden_control_and_runner_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is unavailable")
+    checkout = tmp_path / "repo" / ".agent-run" / "worktrees" / "run" / "ticket"
+    checkout.mkdir(parents=True)
+    control_root = tmp_path / "repo" / ".agent-run"
+    for child in ("runs", "task-control", "profiles"):
+        directory = control_root / child
+        directory.mkdir(parents=True)
+        (directory / "authority.json").write_text("secret", encoding="utf-8")
+    custom_state_root = tmp_path / "custom-state"
+    for child in ("runs", "task-control", "profiles"):
+        directory = custom_state_root / child
+        directory.mkdir(parents=True)
+        (directory / "authority.json").write_text("authority", encoding="utf-8")
+    (custom_state_root / ".lock").write_text("authority", encoding="utf-8")
+    custom_run = custom_state_root / "runs" / "authority.json"
+    custom_control = custom_state_root / "task-control" / "authority.json"
+    custom_profile = custom_state_root / "profiles" / "authority.json"
+    custom_lock = custom_state_root / ".lock"
+    data_home = tmp_path / "data"
+    runner_root = data_home / "agent-run"
+    runner_root.mkdir(parents=True)
+    (runner_root / "management-secret").write_text("secret", encoding="utf-8")
+    state_home = tmp_path / "state"
+    locator_root = state_home / "agent-run"
+    locator_root.mkdir(parents=True)
+    (locator_root / "run-locator.json").write_text("secret", encoding="utf-8")
+    runtime_home = tmp_path / "runtime"
+    systemd_private = runtime_home / "systemd" / "private"
+    systemd_private.parent.mkdir(parents=True)
+    systemd_private.write_text("fake-systemd-socket", encoding="utf-8")
+    user_bus = runtime_home / "bus"
+    user_bus.write_text("fake-user-bus", encoding="utf-8")
+    carrier_root = runtime_home / "agent-run" / "executor"
+    carrier_root.mkdir(parents=True)
+    carrier = carrier_root / "environment-other-generation.json"
+    carrier.write_text("secret-terminal-environment", encoding="utf-8")
+    temporary = tmp_path / "worker-temp"
+    temporary.mkdir()
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_home))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={user_bus}")
+    monkeypatch.setenv("AGENT_RUN_EXECUTOR_ACTION_ID", "secret-action")
+    monkeypatch.setenv("AGENT_RUN_INTERNAL_STATE_ROOT", str(custom_state_root))
+    environment = worker_environment(tmp_path / "gh", "read-token")
+    hidden = codex_module._worker_hidden_paths(None, checkout=checkout)
+    probe = checkout / "probe.py"
+    probe.write_text(
+        "import json, os, subprocess, sys\n"
+        "code = 'import json, os, subprocess; from pathlib import Path; "
+        "custom = Path(os.environ[\\\"CUSTOM_STATE\\\"]); "
+        "custom_before = custom.read_text() == \\\"authority\\\" if custom.exists() else False; "
+        "custom.write_text(\\\"mutated\\\"); "
+        "control = Path(os.environ[\\\"CUSTOM_CONTROL\\\"]); "
+        "control_before = control.read_text() == \\\"authority\\\" if control.exists() else False; "
+        "control.write_text(\\\"mutated\\\"); "
+        "profile = Path(os.environ[\\\"CUSTOM_PROFILE\\\"]); "
+        "profile_before = profile.read_text() == \\\"authority\\\" if profile.exists() else False; "
+        "profile.write_text(\\\"mutated\\\"); "
+        "lock = Path(os.environ[\\\"CUSTOM_LOCK\\\"]); "
+        "lock_before = subprocess.run([\\\"/bin/cat\\\", str(lock)], "
+        "capture_output=True, text=True).stdout == \\\"authority\\\"; "
+        "lock_write = subprocess.run([\\\"/usr/bin/tee\\\", str(lock)], "
+        "input=\\\"mutated\\\", text=True, capture_output=True).returncode == 0; "
+        "print(json.dumps({\\\"executor_env\\\": any(k.startswith(\\\"AGENT_RUN_EXECUTOR_\\\") for k in os.environ), "
+        "\\\"control\\\": Path(os.environ[\\\"CONTROL_SECRET\\\"]).exists(), "
+        "\\\"custom_before\\\": custom_before, "
+        "\\\"custom_control_before\\\": control_before, "
+        "\\\"custom_profile_before\\\": profile_before, "
+        "\\\"custom_lock_before\\\": lock_before, "
+        "\\\"custom_lock_write\\\": lock_write, "
+        "\\\"runner\\\": Path(os.environ[\\\"RUNNER_SECRET\\\"]).exists(), "
+        "\\\"locator\\\": Path(os.environ[\\\"LOCATOR_SECRET\\\"]).exists(), "
+        "\\\"carrier\\\": Path(os.environ[\\\"CARRIER_SECRET\\\"]).exists(), "
+        "\\\"user_bus\\\": subprocess.run([\\\"/bin/cat\\\", os.environ[\\\"USER_BUS\\\"]], capture_output=True, text=True).stdout == \\\"fake-user-bus\\\", "
+        "\\\"systemd_private\\\": subprocess.run([\\\"/bin/cat\\\", os.environ[\\\"SYSTEMD_PRIVATE\\\"]], capture_output=True, text=True).stdout == \\\"fake-systemd-socket\\\", "
+        "\\\"dbus_env\\\": \\\"DBUS_SESSION_BUS_ADDRESS\\\" in os.environ}))'\n"
+        "subprocess.run([sys.executable, '-c', code], check=True)\n",
+        encoding="utf-8",
+    )
+    environment.update(
+        {
+            "CONTROL_SECRET": str(control_root / "runs" / "authority.json"),
+            "CUSTOM_STATE": str(custom_run),
+            "CUSTOM_CONTROL": str(custom_control),
+            "CUSTOM_PROFILE": str(custom_profile),
+            "CUSTOM_LOCK": str(custom_lock),
+            "RUNNER_SECRET": str(runner_root / "management-secret"),
+            "LOCATOR_SECRET": str(locator_root / "run-locator.json"),
+            "CARRIER_SECRET": str(carrier),
+            "USER_BUS": str(user_bus),
+            "SYSTEMD_PRIVATE": str(systemd_private),
+        }
+    )
+    command = bubblewrap_command(
+        [sys.executable, str(probe)],
+        checkout=checkout,
+        temporary=temporary,
+        writable_checkout=True,
+        environment=environment,
+        hidden_paths=hidden,
+    )
+
+    result = subprocess.run(
+        command,
+        cwd=checkout,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert custom_run.read_text(encoding="utf-8") == "authority"
+    assert custom_control.read_text(encoding="utf-8") == "authority"
+    assert custom_profile.read_text(encoding="utf-8") == "authority"
+    assert custom_lock.read_text(encoding="utf-8") == "authority"
+    assert json.loads(result.stdout) == {
+        "carrier": False,
+        "control": False,
+        "custom_before": False,
+        "custom_control_before": False,
+        "custom_profile_before": False,
+        "custom_lock_before": False,
+        "custom_lock_write": False,
+        "dbus_env": False,
+        "executor_env": False,
+        "locator": False,
+        "runner": False,
+        "systemd_private": False,
+        "user_bus": False,
+    }

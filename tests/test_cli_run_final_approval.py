@@ -378,7 +378,7 @@ def test_parent_only_pending_window_survives_process_restart(
     agents = _parent_only_agents(git_repo / "parent-only-agents.json")
 
     first_process, first_state = _run_until_pending_window(
-        git_repo, fixture, agents
+        git_repo, fixture, agents, wait_for_retry_message=True
     )
     _interrupt_run(first_process, git_repo)
     first_window = first_state["supervision_window"]
@@ -451,7 +451,7 @@ def test_final_run_pending_window_survives_process_restart(
     agents = run_agents(git_repo / "agents.json")
 
     first_process, first_state = _run_until_pending_window(
-        git_repo, fixture, agents
+        git_repo, fixture, agents, wait_for_retry_message=True
     )
     _interrupt_run(first_process, git_repo)
     first_window = first_state["supervision_window"]

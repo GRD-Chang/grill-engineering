@@ -22,6 +22,7 @@ from agent_run.runner_installer import (
     InstallerError,
     _read_active,
 )
+from agent_run.systemd_executor_host import execution_readiness
 from agent_run.process_cleanup import (
     capture_process_scope,
     child_subreaper,
@@ -62,14 +63,27 @@ def _collect() -> dict[str, object]:
         "path": _path_check(),
         "worker_read_provider": _provider_check(),
     }
+    installation_keys = ("python", "codex", "active_runner", "path")
+    installation = {
+        "status": (
+            "ready"
+            if all(_check_is_ok(checks[key]) for key in installation_keys)
+            else "issues"
+        ),
+        "checks": list(installation_keys),
+    }
+    execution = execution_readiness()
     return {
         "result": "doctor",
         "status": (
             "ready"
             if all(_check_is_ok(check) for check in checks.values())
+            and _check_is_ok(execution)
             else "issues"
         ),
         "checks": checks,
+        "installation_readiness": installation,
+        "execution_readiness": execution,
     }
 
 
@@ -354,4 +368,13 @@ def _print_human(report: dict[str, object]) -> None:
                 "missing": "未找到 agent-run 入口",
             }.get(str(check.get("status")), "无法确认 agent-run 入口")
         print(f"{label}: {check.get('status')}" + (f" ({detail})" if detail else ""))
+    installation = report.get("installation_readiness")
+    execution = report.get("execution_readiness")
+    if isinstance(installation, dict):
+        print(f"安装就绪度: {installation.get('status')}")
+    if isinstance(execution, dict):
+        print(
+            f"执行就绪度: {execution.get('status')} "
+            f"({execution.get('host')})"
+        )
     print(f"总体: {report.get('status')}")

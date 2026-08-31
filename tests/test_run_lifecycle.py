@@ -9,14 +9,18 @@ import tempfile
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from agent_run.executor_host import (
+    BoundExecutorHost,
+    ExecutorLostError,
     ExecutorSpec,
     ExecutorStartUnknownError,
     FakeExecutorHost,
+    HostObservation,
 )
 from agent_run.run_lifecycle import (
     LifecycleRequest,
@@ -24,6 +28,11 @@ from agent_run.run_lifecycle import (
     prepare_action_application_receipt,
 )
 from agent_run.state import SimulatedProcessCrash
+from agent_run.systemd_executor_host import (
+    FakeSystemdTransport,
+    SystemdUnitObservation,
+    SystemdUserExecutorHost,
+)
 from agent_run.task_control import (
     ActionBusyError,
     ActionReconciliationError,
@@ -145,6 +154,134 @@ def test_task_action_admission_is_single_slot_and_duplicate_is_idempotent(
     with pytest.raises(ActionBusyError):
         control.claim_action(task, kind="approve", payload={"parent": 156})
     assert control.path_for(task).read_bytes() == before
+
+
+def test_run_prepares_executor_environment_before_persisting_a_new_action(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    states = _InMemoryRunState()
+    host = FakeExecutorHost()
+
+    def reject_environment() -> None:
+        raise ValueError("发起终端环境过大")
+
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=host,
+        task=task,
+        preflight=lambda: None,
+        select_run=lambda _action: pytest.fail("environment must fail first"),
+        initialize_profile=None,
+        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
+            task=task,
+            action_id=action_id,
+            run_id=run_id,
+            generation=generation,
+        ),
+        execute=lambda _run_id: pytest.fail("environment must fail first"),
+        prepare_executor_session=reject_environment,
+    )
+
+    with pytest.raises(ValueError, match="环境过大"):
+        lifecycle.submit(
+            LifecycleRequest(task=task, kind="run", payload={"parent": 156})
+        )
+
+    assert control.load(task) is None
+    assert host.start_count == 0
+
+
+def test_oversize_second_terminal_attaches_to_running_executor(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    states = _InMemoryRunState()
+    claim = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert claim.action is not None
+    assert claim.action_id is not None
+    action_id = claim.action_id
+    control.bind_run(task, action_id, "run-1")
+    prepare_action_application_receipt(states.value, claim.action)
+    states.save_run("run-1", states.value)
+    control.record_application(
+        task,
+        action_id=action_id,
+        run_id="run-1",
+        payload_digest=str(claim.action["payload_digest"]),
+    )
+    reservation = control.begin_executor(
+        task, action_id=action_id, run_id="run-1"
+    )
+    control.mark_process_started(
+        task,
+        action_id=action_id,
+        generation=reservation.generation,
+        pid=os.getpid(),
+        process_start_token=None,
+    )
+    control.mark_handshake(
+        task,
+        action_id=action_id,
+        generation=reservation.generation,
+        pid=os.getpid(),
+        process_start_token=None,
+    )
+    control.complete_action(task, action_id=action_id, result_status="active")
+    before = control.path_for(task).read_bytes()
+    transport = FakeSystemdTransport()
+    host = SystemdUserExecutorHost(
+        transport=transport,
+        runtime_directory=tmp_path / "runtime",
+        environment={"PATH": "x" * 1024},
+        executor_python=Path("/usr/bin/python3"),
+        max_environment_bytes=128,
+    )
+    spec = ExecutorSpec(
+        task=task,
+        action_id=action_id,
+        run_id="run-1",
+        generation=reservation.generation,
+        command=("run", "156"),
+        cwd=task.workspace,
+        state_root=tmp_path / "state",
+    )
+    transport.unit = SystemdUnitObservation(
+        "running", host._description(spec), os.getpid(), None
+    )
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=host,
+        task=task,
+        preflight=lambda: dict(states.value),
+        select_run=lambda _action: pytest.fail("the action is already running"),
+        initialize_profile=None,
+        executor_spec=lambda run_id, current_action_id, generation: replace(
+            spec,
+            run_id=run_id,
+            action_id=current_action_id,
+            generation=generation,
+        ),
+        execute=lambda _run_id: pytest.fail("the existing Executor owns execution"),
+        prepare_executor_session=lambda: host.prepare_environment(spec.command),
+    )
+
+    state, resumed, receipt = lifecycle.submit(
+        LifecycleRequest(task=task, kind="run", payload={"parent": 156})
+    )
+
+    assert state == states.value
+    assert resumed is True
+    assert receipt.attached is True
+    assert receipt.action_id == action_id
+    assert receipt.executor_generation == reservation.generation
+    assert control.path_for(task).read_bytes() == before
+    assert transport.start_count == 0
+    assert not list((tmp_path / "runtime").glob("environment-*.json"))
 
 
 def test_task_control_lock_contention_fails_without_persistent_mutation(
@@ -455,6 +592,109 @@ def test_run_lifecycle_does_not_reinvoke_business_callback_on_unknown_host(
     assert record is not None
     assert record["action"]["status"] == "accepted"
     assert record["executor"]["status"] == "starting"
+
+
+def test_run_lifecycle_treats_exited_native_unit_as_lost(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    states = _InMemoryRunState()
+
+    class ExitedHost:
+        cleanup_calls = 0
+
+        def ensure(
+            self,
+            spec: ExecutorSpec,
+            store: TaskControlStore,
+            execute: object = None,
+            recover: bool = False,
+        ) -> HostObservation:
+            del execute, recover
+            reservation = store.begin_executor(
+                spec.task, action_id=spec.action_id, run_id=spec.run_id
+            )
+            return HostObservation(
+                "exited", reservation.generation, None, False, "unit failed"
+            )
+
+        def inspect(
+            self, spec: ExecutorSpec, store: TaskControlStore
+        ) -> HostObservation:
+            del store
+            return HostObservation(
+                "exited", spec.generation, None, False, "unit failed"
+            )
+
+        def cleanup_startup(self, spec: ExecutorSpec) -> None:
+            del spec
+            self.cleanup_calls += 1
+
+    host = ExitedHost()
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=host,  # type: ignore[arg-type]
+        task=task,
+        preflight=lambda: None,
+        select_run=lambda _action: (dict(states.value), False),
+        initialize_profile=None,
+        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
+            task=task,
+            action_id=action_id,
+            run_id=run_id,
+            generation=generation,
+        ),
+        execute=lambda _run_id: dict(states.value),
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(ExecutorLostError, match="完成前退出"):
+        lifecycle.submit(
+            LifecycleRequest(task=task, kind="run", payload={"parent": 156})
+        )
+    assert host.cleanup_calls == 1
+
+
+def test_bound_executor_takes_over_pre_reserved_generation(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    states = _InMemoryRunState()
+    claim = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert claim.action_id is not None
+    reservation = control.begin_executor(
+        task, action_id=claim.action_id, run_id=None
+    )
+    host = BoundExecutorHost(
+        action_id=claim.action_id, generation=reservation.generation
+    )
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=host,
+        task=task,
+        preflight=lambda: None,
+        select_run=lambda _action: (dict(states.value), False),
+        initialize_profile=None,
+        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
+            task=task,
+            action_id=action_id,
+            run_id=run_id,
+            generation=generation,
+        ),
+        execute=lambda _run_id: dict(states.value),
+        sleep=lambda _seconds: None,
+    )
+
+    final, _resumed, receipt = lifecycle.execute_claimed(
+        action_id=claim.action_id, generation=reservation.generation
+    )
+
+    assert final["run_id"] == "run-1"
+    assert receipt.status == "completed"
+    record = control.load(task)
+    assert record is not None
+    assert record["action"]["status"] == "completed"
+    assert record["executor"]["status"] == "exited"
 
 
 def test_approval_boundary_is_not_written_before_executor_handshake(

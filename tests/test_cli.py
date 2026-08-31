@@ -8,11 +8,12 @@ import sys
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 
 import agent_run.cli as cli
+import agent_run.doctor as doctor
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
@@ -304,6 +305,16 @@ def test_doctor_reports_host_readiness_without_mutating_user_state(
     monkeypatch.setenv("XDG_DATA_HOME", str(data))
     monkeypatch.setenv("PATH", str(fake_bin))
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        doctor,
+        "execution_readiness",
+        lambda: {
+            "status": "ok",
+            "host": "systemd-user",
+            "linger_required": False,
+            "reason": None,
+        },
+    )
 
     assert main(["doctor", "--json"]) == 0
 
@@ -322,6 +333,16 @@ def test_doctor_reports_host_readiness_without_mutating_user_state(
         "provider": "host",
         "status": "ok",
     }
+    assert output["installation_readiness"]["status"] == "issues"
+    assert output["installation_readiness"]["checks"] == [
+        "python",
+        "codex",
+        "active_runner",
+        "path",
+    ]
+    assert output["execution_readiness"]["status"] == "ok"
+    assert output["execution_readiness"]["host"] == "systemd-user"
+    assert output["execution_readiness"]["linger_required"] is False
     assert "doctor-secret" not in output_text
     assert not config.exists()
     assert not data.exists()
@@ -1401,8 +1422,17 @@ def test_source_checkout_cannot_run_production_lifecycle_without_active_runner(
 def test_production_run_without_a_real_executor_host_fails_before_writes(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    class UnavailableSystemdHost:
+        def __init__(self, **_options: object) -> None:
+            pass
+
+        def check_readiness(self, *, command: object = None) -> None:
+            raise cli.ExecutionReadinessError("user systemd unavailable")
+
     monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
     monkeypatch.setattr(cli, "_running_active_runner", lambda: True)
+    monkeypatch.setattr(cli, "SystemdUserExecutorHost", UnavailableSystemdHost)
     monkeypatch.setattr(
         cli,
         "FakeExecutorHost",
@@ -1414,6 +1444,47 @@ def test_production_run_without_a_real_executor_host_fails_before_writes(
     output = json.loads(capsys.readouterr().out)
     assert output["diagnostics"][0]["code"] == "execution_readiness"
     assert not (git_repo / ".agent-run").exists()
+
+
+def test_production_run_defers_environment_capture_to_action_admission(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class AvailableSystemdHost:
+        def __init__(self, **_options: object) -> None:
+            self.readiness_commands: list[object] = []
+            self.prepared_commands: list[tuple[str, ...]] = []
+            hosts.append(self)
+
+        def check_readiness(self, *, command: object = None) -> None:
+            self.readiness_commands.append(command)
+
+        def prepare_environment(self, command: Sequence[str]) -> None:
+            self.prepared_commands.append(tuple(command))
+            raise cli.SystemdExecutionReadinessError("发起终端环境过大")
+
+    hosts: list[AvailableSystemdHost] = []
+
+    def enter_lifecycle(*_args: object, **options: object) -> None:
+        prepare = options.get("prepare_executor_session")
+        assert callable(prepare)
+        prepare()
+        pytest.fail("environment rejection must stop lifecycle admission")
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / "runner-state"))
+    monkeypatch.setattr(cli, "_running_active_runner", lambda: True)
+    monkeypatch.setattr(cli, "SystemdUserExecutorHost", AvailableSystemdHost)
+    monkeypatch.setattr(cli, "_run_lifecycle", enter_lifecycle)
+
+    assert main(["run", "1", "--repo", "example/project"]) == 2
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["diagnostics"][0]["code"] == "execution_readiness"
+    assert len(hosts) == 1
+    assert hosts[0].readiness_commands == [None]
+    assert hosts[0].prepared_commands == [("run", "1", "--repo", "example/project")]
+    assert not (git_repo / ".agent-run" / "task-control").exists()
 
 
 def issue(
@@ -1766,6 +1837,35 @@ def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
             }
         ]
     }
+
+
+def test_status_and_history_do_not_initialize_online_dependencies(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    locator_home = tmp_path / "locator-home"
+    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    run_id = stdout_json(
+        run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    )["run_id"]
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("offline command initialized an online dependency")
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(locator_home))
+    monkeypatch.setattr(cli, "SystemdUserExecutorHost", unavailable)
+    monkeypatch.setattr(cli, "CodexCliBackend", unavailable)
+    monkeypatch.setattr(cli, "GhGitHubReader", unavailable)
+
+    assert main(["status", run_id, "--json"]) == 0
+    assert main(["history", run_id, "--json"]) == 0
+    output = capsys.readouterr().out.splitlines()
+    assert json.loads(output[-2])["run_id"] == run_id
+    assert json.loads(output[-1])["run_id"] == run_id
 
 
 def test_new_runs_from_separate_clones_have_distinct_locator_ids(
