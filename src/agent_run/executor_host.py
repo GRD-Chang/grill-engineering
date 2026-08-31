@@ -84,6 +84,16 @@ class ExecutorHost(Protocol):
     def cleanup_startup(self, spec: ExecutorSpec) -> None: ...
 
 
+def _bind_execute_callback(
+    execute: Callable[[], Mapping[str, Any]],
+    spec: ExecutorSpec,
+    generation: int,
+) -> None:
+    binder = getattr(execute, "bind_executor", None)
+    if callable(binder):
+        binder(spec.action_id, generation, spec.run_id)
+
+
 def _relay_stderr(source_fd: int, target_fd: int) -> None:
     """Drain Executor stderr through fixed-size pipe buffers.
 
@@ -191,6 +201,8 @@ class FakeExecutorHost:
                 handshake=False,
                 reason="host launch response was lost",
             )
+        if execute is not None:
+            _bind_execute_callback(execute, spec, reservation.generation)
         if self.separate_process and execute is not None:
             return self._execute_separately(
                 spec,
@@ -223,6 +235,12 @@ class FakeExecutorHost:
                     pid=pid,
                     handshake=True,
                 )
+            control.assert_executor_current(
+                spec.task,
+                action_id=spec.action_id,
+                generation=reservation.generation,
+                run_id=spec.run_id,
+            )
             result = execute()
             result_status = result.get("status")
             status = result_status if isinstance(result_status, str) else None
@@ -353,6 +371,12 @@ class FakeExecutorHost:
                     generation=generation,
                     pid=os.getpid(),
                     process_start_token=start_token,
+                )
+                control.assert_executor_current(
+                    spec.task,
+                    action_id=spec.action_id,
+                    generation=generation,
+                    run_id=spec.run_id,
                 )
                 result = execute()
                 result_status = result.get("status")
@@ -553,6 +577,12 @@ class BoundExecutorHost:
                 generation=spec.generation,
                 pid=pid,
                 process_start_token=start_token,
+            )
+            control.assert_executor_current(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                run_id=spec.run_id,
             )
             result = execute()
             result_status = result.get("status")

@@ -370,7 +370,19 @@ class SystemdUserExecutorHost:
                 spec = replace(spec, generation=reservation.generation)
             if not reservation.created:
                 self._release_capture()
+                control.assert_executor_current(
+                    spec.task,
+                    action_id=spec.action_id,
+                    generation=spec.generation,
+                    run_id=spec.run_id,
+                )
                 return self._inspect(spec, control)
+            control.assert_executor_current(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                run_id=spec.run_id,
+            )
             native = self.transport.inspect(self._unit(spec))
             if native.status not in {"absent", "exited"}:
                 self._release_capture()
@@ -379,8 +391,20 @@ class SystemdUserExecutorHost:
                     self._finish_terminal(spec, control, observation.reason)
                 return observation
             try:
+                control.assert_executor_current(
+                    spec.task,
+                    action_id=spec.action_id,
+                    generation=spec.generation,
+                    run_id=spec.run_id,
+                )
                 captured = self._capture(spec.command)
                 runner_lock = default_runner_lock_path(captured.environment)
+                control.assert_executor_current(
+                    spec.task,
+                    action_id=spec.action_id,
+                    generation=spec.generation,
+                    run_id=spec.run_id,
+                )
                 carrier = write_environment_carrier(
                     self.runtime_directory, spec, captured
                 )
@@ -397,6 +421,12 @@ class SystemdUserExecutorHost:
             self._release_capture()
             key = self._key(spec)
             self._carriers[key] = carrier
+            control.assert_executor_current(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                run_id=spec.run_id,
+            )
             cleanup_error = self.transport.schedule_cleanup(
                 unit=self._cleanup_unit(spec),
                 paths=(
@@ -417,6 +447,12 @@ class SystemdUserExecutorHost:
                 )
                 raise ExecutorHostError(failure)
             try:
+                control.assert_executor_current(
+                    spec.task,
+                    action_id=spec.action_id,
+                    generation=spec.generation,
+                    run_id=spec.run_id,
+                )
                 self._mark_launch_pending(spec)
                 self._start_lease_guardian(carrier)
             except (OSError, ExecutorHostError) as error:
@@ -429,6 +465,12 @@ class SystemdUserExecutorHost:
                     failure=str(error),
                 )
                 raise
+            control.assert_executor_current(
+                spec.task,
+                action_id=spec.action_id,
+                generation=spec.generation,
+                run_id=spec.run_id,
+            )
             start_result = self.transport.start(
                 unit=self._unit(spec),
                 description=self._description(spec),

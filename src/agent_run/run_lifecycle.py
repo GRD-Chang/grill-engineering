@@ -54,6 +54,56 @@ class ActionReceipt:
     payload_digest: str | None
     failure: str | None = None
 
+
+class _ExecutorDispatch:
+    """Keep one Executor callback bound to its reserved identity."""
+
+    def __init__(
+        self,
+        callback: Callable[[int], Mapping[str, Any]],
+        *,
+        action_id: str,
+        generation: int,
+        run_id: str | None,
+    ) -> None:
+        self._callback = callback
+        self._action_id = action_id
+        self._generation = generation
+        self._run_id = run_id
+        self._bound = False
+
+    def bind_executor(
+        self, action_id: str, generation: int, run_id: str | None
+    ) -> None:
+        binding = (action_id, generation, run_id)
+        current = (self._action_id, self._generation, self._run_id)
+        if self._bound:
+            if binding != current:
+                raise ActionReconciliationError(
+                    "Executor callback received a second, different binding"
+                )
+            return
+        if action_id != self._action_id:
+            raise ActionReconciliationError("Executor callback Action binding 不匹配")
+        if self._run_id is not None and run_id != self._run_id:
+            raise ActionReconciliationError(
+                "Executor callback Delivery Run binding 不匹配"
+            )
+        self._generation = generation
+        self._run_id = run_id
+        self._bound = True
+
+    def __call__(self) -> Mapping[str, Any]:
+        return self._callback(self._generation)
+
+    def bind_run(self, run_id: str) -> None:
+        if self._run_id is not None and self._run_id != run_id:
+            raise ActionReconciliationError(
+                "Executor callback Delivery Run binding 不匹配"
+            )
+        self._run_id = run_id
+
+
 def prepare_action_application_receipt(
     state: dict[str, Any], action: Mapping[str, Any]
 ) -> None:
@@ -90,6 +140,9 @@ class RunLifecycle:
         initialize_profile: Callable[[dict[str, Any], bool], None] | None,
         executor_spec: Callable[[str | None, str, int], ExecutorSpec],
         execute: Callable[[str], Mapping[str, Any]],
+        execute_with_binding: Callable[
+            [str, str, int], Mapping[str, Any]
+        ] | None = None,
         prepare_executor_session: Callable[[], None] | None = None,
         poll_interval: float = 0.01,
         startup_timeout: float = 2.0,
@@ -105,11 +158,42 @@ class RunLifecycle:
         self.initialize_profile = initialize_profile
         self.executor_spec = executor_spec
         self.execute = execute
+        self.execute_with_binding = execute_with_binding
         self.prepare_executor_session = prepare_executor_session
         self.poll_interval = max(0.001, poll_interval)
         self.startup_timeout = max(self.poll_interval, startup_timeout)
         self.sleep = sleep
         self.clock = clock
+
+    def _set_executor_state_fence(
+        self,
+        store: StateStore,
+        *,
+        action_id: str,
+        generation: int,
+        run_id: str | None,
+    ) -> None:
+        set_write_guard = getattr(store, "_set_write_guard", None)
+        if not callable(set_write_guard):
+            return
+
+        def executor_write_transaction() -> Any:
+            return self.control._executor_current_transaction(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
+
+        set_write_guard(
+            lambda: self.control.assert_executor_current(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            ),
+            transaction=executor_write_transaction,
+        )
 
     def submit(
         self, request: LifecycleRequest
@@ -274,7 +358,7 @@ class RunLifecycle:
             raise ActionReconciliationError("Executor generation binding 不匹配")
         run_id = _record_run_id(record)
         current = self._load_action_run(run_id, {}, record=record)
-        return self._continue_action(action, current)
+        return self._continue_action(action, current, executor_generation=generation)
 
     def _claim(self, request: LifecycleRequest) -> ActionClaim:
         return self.control.claim_action(
@@ -307,29 +391,56 @@ class RunLifecycle:
         action_id = _string_field(action, "action_id")
         generation = _positive_integer(action.get("executor_generation"))
         execution_context: dict[str, Any] = {}
+        action_run_id = action.get("run_id")
+        if not isinstance(action_run_id, str) or not action_run_id:
+            action_run_id = None
 
-        def execute_action() -> Mapping[str, Any]:
+        def apply(generation: int) -> Mapping[str, Any]:
+            self._set_executor_state_fence(
+                self.states,
+                action_id=action_id,
+                generation=generation,
+                run_id=None,
+            )
+            self.control.assert_executor_current(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+            )
             state, resumed = self.select_run(action)
             run_id = _string_field(state, "run_id")
             self.control.bind_run(
                 self.task,
                 action_id,
                 run_id,
+                generation=generation,
                 state_dir=getattr(self.states, "root", None),
+            )
+            execute_action.bind_run(run_id)
+            self._set_executor_state_fence(
+                self.states,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
             )
             return self._apply_and_execute_bound_action(
                 action=action,
                 action_id=action_id,
                 state=state,
                 run_id=run_id,
+                generation=generation,
                 resumed=resumed,
                 execution_context=execution_context,
                 replace_receipt_action_id=replace_receipt_action_id,
             )
 
-        action_run_id = action.get("run_id")
-        if not isinstance(action_run_id, str) or not action_run_id:
-            action_run_id = None
+        execute_action = _ExecutorDispatch(
+            apply,
+            action_id=action_id,
+            generation=generation,
+            run_id=action_run_id,
+        )
+
         return self._run_executor(
             action_id=action_id,
             run_id=action_run_id,
@@ -347,6 +458,7 @@ class RunLifecycle:
         current: dict[str, Any] | None,
         *,
         replace_receipt_action_id: str | None = None,
+        executor_generation: int | None = None,
     ) -> tuple[dict[str, Any], bool, ActionReceipt]:
         action_id = _string_field(action, "action_id")
         latest = self.control.snapshot(self.task, action_id)
@@ -371,19 +483,43 @@ class RunLifecycle:
             state = state_store.load_current_run(run_id)
             if state is None:
                 raise ActionReconciliationError("Action 指向的 Delivery Run 不存在")
-            generation = _positive_integer(action.get("executor_generation"))
+            generation = (
+                executor_generation
+                if executor_generation is not None
+                else _positive_integer(action.get("executor_generation"))
+            )
             execution_context: dict[str, Any] = {}
 
-            def execute_action() -> Mapping[str, Any]:
+            def apply(bound_generation: int) -> Mapping[str, Any]:
+                self._set_executor_state_fence(
+                    state_store,
+                    action_id=action_id,
+                    generation=bound_generation,
+                    run_id=run_id,
+                )
+                self.control.assert_executor_current(
+                    self.task,
+                    action_id=action_id,
+                    generation=bound_generation,
+                    run_id=run_id,
+                )
                 return self._apply_and_execute_bound_action(
                     action=action,
                     action_id=action_id,
                     state=state,
                     run_id=run_id,
+                    generation=bound_generation,
                     resumed=True,
                     execution_context=execution_context,
                     state_store=state_store,
                 )
+
+            execute_action = _ExecutorDispatch(
+                apply,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
 
             return self._run_executor(
                 action_id=action_id,
@@ -409,20 +545,39 @@ class RunLifecycle:
         action: Mapping[str, Any],
         action_id: str,
         run_id: str,
+        generation: int,
         resumed: bool,
         execution_context: dict[str, Any],
         replace_receipt_action_id: str | None = None,
         state_store: StateStore | None = None,
     ) -> Mapping[str, Any]:
+        self.control.assert_executor_current(
+            self.task,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        )
+        self._set_executor_state_fence(
+            state_store or self.states,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        )
         if self.initialize_profile is not None:
             self.initialize_profile(state, resumed)
+            self.control.assert_executor_current(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
         prepared = self._persist_application(
             state,
             action_id=action_id,
             kind=_string_field(action, "kind"),
             payload_digest=_string_field(action, "payload_digest"),
             run_id=run_id,
-            generation=self._current_action_generation(action_id),
+            generation=generation,
             replace_receipt_action_id=replace_receipt_action_id,
             state_store=state_store,
         )
@@ -433,8 +588,17 @@ class RunLifecycle:
         self.control.complete_action(
             self.task,
             action_id=action_id,
+            generation=generation,
             result_status=(result_status if isinstance(result_status, str) else None),
         )
+        self.control.assert_executor_current(
+            self.task,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        )
+        if self.execute_with_binding is not None:
+            return self.execute_with_binding(run_id, action_id, generation)
         return self.execute(run_id)
 
     def _run_executor(
@@ -770,63 +934,72 @@ class RunLifecycle:
     ) -> dict[str, Any]:
         del state
         store = state_store or self.states
-        with store.locked():
-            current = store.load_current_run(run_id)
-            if current is None:
-                raise ActionReconciliationError("无法读取 Action 对应的 Delivery Run")
-            expected = {
-                "action_id": action_id,
-                "kind": kind,
-                "payload_digest": payload_digest,
-                "run_id": run_id,
-            }
-            receipt = current.get("action_application_receipt")
-            if receipt is not None and not isinstance(receipt, Mapping):
+        current = store.load_current_run(run_id)
+        if current is None:
+            raise ActionReconciliationError("无法读取 Action 对应的 Delivery Run")
+        expected = {
+            "action_id": action_id,
+            "kind": kind,
+            "payload_digest": payload_digest,
+            "run_id": run_id,
+        }
+        receipt = current.get("action_application_receipt")
+        if receipt is not None and not isinstance(receipt, Mapping):
+            raise ActionReconciliationError(
+                "Delivery Run 的 Action Application Receipt 无法对账"
+            )
+        if isinstance(receipt, Mapping) and not action_receipt_matches(
+            current, expected
+        ):
+            if (
+                replace_receipt_action_id is None
+                or receipt.get("action_id") != replace_receipt_action_id
+                or receipt.get("run_id") != run_id
+            ):
                 raise ActionReconciliationError(
-                    "Delivery Run 的 Action Application Receipt 无法对账"
+                    "Delivery Run 已绑定另一个 Lifecycle Action"
                 )
-            if isinstance(receipt, Mapping) and not action_receipt_matches(
-                current, expected
-            ):
-                if (
-                    replace_receipt_action_id is None
-                    or receipt.get("action_id") != replace_receipt_action_id
-                    or receipt.get("run_id") != run_id
-                ):
-                    raise ActionReconciliationError(
-                        "Delivery Run 已绑定另一个 Lifecycle Action"
-                    )
-            if not action_receipt_matches(current, expected) or (
-                isinstance(receipt, Mapping)
-                and receipt.get("executor_generation") != generation
-            ):
-                prepare_action_application_receipt(
-                    current,
-                    {
-                        "action_id": action_id,
-                        "kind": kind,
-                        "payload_digest": payload_digest,
-                        "executor_generation": generation,
-                    },
-                )
-                store.save_run(run_id, current)
+        if not action_receipt_matches(current, expected) or (
+            isinstance(receipt, Mapping)
+            and receipt.get("executor_generation") != generation
+        ):
+            self.control.assert_executor_current(
+                self.task,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
+            prepare_action_application_receipt(
+                current,
+                {
+                    "action_id": action_id,
+                    "kind": kind,
+                    "payload_digest": payload_digest,
+                    "executor_generation": generation,
+                },
+            )
+            self._set_executor_state_fence(
+                store,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
+            store.save_run(run_id, current)
+        self.control.assert_executor_current(
+            self.task,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        )
         self.control.record_application(
             self.task,
             action_id=action_id,
             run_id=run_id,
             payload_digest=payload_digest,
+            generation=generation,
             state_dir=getattr(store, "root", None),
         )
         return current
-
-    def _current_action_generation(self, action_id: str) -> int:
-        record = self.control.snapshot(self.task, action_id)
-        if record is None:
-            raise ActionReconciliationError("Action 在 Executor 应用前丢失")
-        action = record.get("action")
-        if not isinstance(action, Mapping):
-            raise ActionReconciliationError("Action 在 Executor 应用前无效")
-        return _positive_integer(action.get("executor_generation"))
 
     def _receipt_for_action(self, action_id: str, *, attached: bool) -> ActionReceipt:
         record = self.control.snapshot(self.task, action_id)

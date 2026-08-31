@@ -115,13 +115,17 @@ class Controller:
             return self._wait_for_initial_repository(
                 parent_number, error, unfinished_only=not reuse_existing
             )
-        with self.states.locked():
-            existing = (
-                self.states.find_run(repository.name_with_owner, parent_number)
-                if reuse_existing
-                else None
-            )
-            return self._start_locked(repository, parent_number, existing)
+        existing = (
+            self.states.find_run(repository.name_with_owner, parent_number)
+            if reuse_existing
+            else None
+        )
+        return self._start(
+            repository,
+            parent_number,
+            existing,
+            prevent_duplicate=reuse_existing,
+        )
 
     def start_or_resume_unfinished(
         self,
@@ -136,23 +140,22 @@ class Controller:
             return self._wait_for_initial_repository(
                 parent_number, error, unfinished_only=True
             )
-        with self.states.locked():
-            unfinished = self.states.find_unfinished_runs(
-                repository.name_with_owner, parent_number
+        unfinished = self.states.find_unfinished_runs(
+            repository.name_with_owner, parent_number
+        )
+        if len(unfinished) > 1:
+            run_ids = ", ".join(str(state["run_id"]) for state in unfinished)
+            raise ValueError(
+                "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                f"{run_ids}"
             )
-            if len(unfinished) > 1:
-                run_ids = ", ".join(str(state["run_id"]) for state in unfinished)
-                raise ValueError(
-                    "multiple unfinished Delivery Runs exist for this Parent Issue: "
-                    f"{run_ids}"
-                )
-            existing = unfinished[0] if unfinished else None
-            return self._start_locked(
-                repository,
-                parent_number,
-                existing,
-                prepare_state=prepare_state,
-            )
+        existing = unfinished[0] if unfinished else None
+        return self._start(
+            repository,
+            parent_number,
+            existing,
+            prepare_state=prepare_state,
+        )
 
     def _wait_for_initial_repository(
         self,
@@ -169,56 +172,67 @@ class Controller:
         repository_hint = hint_reader() if callable(hint_reader) else None
         if not isinstance(repository_hint, str) or not repository_hint:
             raise error
-        with self.states.locked():
-            if unfinished_only:
-                candidates = self.states.find_unfinished_runs(
-                    repository_hint, parent_number
+        if unfinished_only:
+            candidates = self.states.find_unfinished_runs(
+                repository_hint, parent_number
+            )
+            if len(candidates) > 1:
+                run_ids = ", ".join(str(state["run_id"]) for state in candidates)
+                raise ValueError(
+                    "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                    f"{run_ids}"
                 )
-                if len(candidates) > 1:
-                    run_ids = ", ".join(str(state["run_id"]) for state in candidates)
-                    raise ValueError(
-                        "multiple unfinished Delivery Runs exist for this Parent Issue: "
-                        f"{run_ids}"
-                    )
-                existing = candidates[0] if candidates else None
-            else:
-                existing = self.states.find_run(repository_hint, parent_number)
-            if existing is not None:
+            existing = candidates[0] if candidates else None
+        else:
+            existing = self.states.find_run(repository_hint, parent_number)
+        if existing is not None:
+            require_current_run_state(existing)
+            self._require_current_checkout(existing)
+            if has_run_operator_gate(existing):
+                return existing, True
+        resumed = existing is not None
+        if existing is None:
+            provisional = Repository(
+                name_with_owner=repository_hint,
+                default_branch="HEAD",
+                default_head_sha=None,
+            )
+            run_id = self._available_run_id(
+                repository_hint, parent_number, "repository-pending"
+            )
+            existing = self._initial_state(
+                provisional,
+                parent_number,
+                run_id,
+                "repository-pending",
+                delivery_policy=self._policy_for_new_run(),
+            )
+            existing["base_resolution_pending"] = True
+            existing["repository_binding_pending"] = True
+            existing, created = self.states.create_run_if_unfinished_absent(
+                repository_hint,
+                parent_number,
+                run_id,
+                existing,
+            )
+            if not created:
                 require_current_run_state(existing)
                 self._require_current_checkout(existing)
+                resumed = True
                 if has_run_operator_gate(existing):
                     return existing, True
-            resumed = existing is not None
-            if existing is None:
-                provisional = Repository(
-                    name_with_owner=repository_hint,
-                    default_branch="HEAD",
-                    default_head_sha=None,
-                )
-                run_id = self._available_run_id(
-                    repository_hint, parent_number, "repository-pending"
-                )
-                existing = self._initial_state(
-                    provisional,
-                    parent_number,
-                    run_id,
-                    "repository-pending",
-                    delivery_policy=self._policy_for_new_run(),
-                )
-                existing["base_resolution_pending"] = True
-                existing["repository_binding_pending"] = True
-            wait_for_github_convergence(
-                existing,
-                code=error.code,
-                message=error.message,
-                waiting_for="GitHub repository binding",
-            )
-            ensure_supervision_window(existing)
-            existing["updated_at"] = _now()
-            self.states.save_run(str(existing["run_id"]), existing)
-            self._initialize_direct_profile(existing)
-            self._register_pending_locator(existing)
-            return existing, resumed
+        wait_for_github_convergence(
+            existing,
+            code=error.code,
+            message=error.message,
+            waiting_for="GitHub repository binding",
+        )
+        ensure_supervision_window(existing)
+        existing["updated_at"] = _now()
+        self.states.save_run(str(existing["run_id"]), existing)
+        self._initialize_direct_profile(existing)
+        self._register_pending_locator(existing)
+        return existing, resumed
 
     def unfinished_runs(self, parent_number: int) -> list[dict[str, Any]]:
         repository = self.github.repository()
@@ -243,49 +257,15 @@ class Controller:
             human_response = message
         if human_response is not None:
             human_response = _validated_human_response(human_response)
-        with self.states.locked():
-            existing = self._load_run(run_id)
-            budget_policy = self.delivery_policy
-            if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
-                budget_policy = self._policy_for_new_run()
-            try:
-                existing = self._load_bound_run(run_id, state=existing)
-            except GitHubReadError as error:
-                if not is_github_convergence_error(error.code):
-                    raise
-                response_replayed = False
-                if human_response is not None:
-                    response_binding = _bind_current_human_response(
-                        existing, human_response
-                    )
-                    if not resume_human_blocker or response_binding is None:
-                        raise ValueError("--message requires a current Human Blocker")
-                    response_replayed = response_binding == "replayed"
-                audit_replayed = response_replayed and _resume_audit_matches_replay(
-                    existing, new_thread=new_thread
-                )
-                if explicit_resume and not audit_replayed:
-                    append_explicit_resume_audit(
-                        existing,
-                        new_thread=new_thread,
-                        human_response_supplied=human_response is not None,
-                    )
-                wait_for_github_refresh(
-                    existing,
-                    code=error.code,
-                    message=error.message,
-                    waiting_for="GitHub repository binding",
-                )
-                existing["updated_at"] = _now()
-                self.states.save_run(run_id, existing)
-                return existing, True
-            if existing.get("status") in {
-                "abandoned",
-                "abandonment_pending",
-                "completed",
-                "deterministic_contradiction",
-            }:
-                return existing, True
+        existing = self._load_run(run_id)
+        budget_policy = self.delivery_policy
+        if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
+            budget_policy = self._policy_for_new_run()
+        try:
+            existing = self._load_bound_run(run_id, state=existing)
+        except GitHubReadError as error:
+            if not is_github_convergence_error(error.code):
+                raise
             response_replayed = False
             if human_response is not None:
                 response_binding = _bind_current_human_response(
@@ -294,15 +274,6 @@ class Controller:
                 if not resume_human_blocker or response_binding is None:
                     raise ValueError("--message requires a current Human Blocker")
                 response_replayed = response_binding == "replayed"
-            hold_operator_gate = (
-                not explicit_resume
-                and not resume_human_blocker
-                and not resume_budget_checkpoint
-                and (
-                    has_unresolved_subject_gate(existing)
-                    or has_non_invocation_execution_failure(existing)
-                )
-            )
             audit_replayed = response_replayed and _resume_audit_matches_replay(
                 existing, new_thread=new_thread
             )
@@ -312,126 +283,168 @@ class Controller:
                     new_thread=new_thread,
                     human_response_supplied=human_response is not None,
                 )
-            if human_response is not None:
-                self.states.save_run(run_id, existing)
-            resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
-            existing_invocation = existing.get("active_agent_invocation")
-            resume_completed_invocation = (
-                existing.get("status") == "execution_failed"
-                and isinstance(existing_invocation, dict)
-                and existing_invocation.get("status") == "completed"
-                and invocation_attempt_is_pending(existing, existing_invocation)
+            wait_for_github_refresh(
+                existing,
+                code=error.code,
+                message=error.message,
+                waiting_for="GitHub repository binding",
             )
-            if resuming_supervision_timeout:
-                if new_thread or human_response is not None:
-                    raise ValueError(
-                        "supervision timeout resume does not accept Agent or Human Blocker options"
-                    )
-                restore_supervision_wait(existing)
-            parent = _state_mapping(existing, "parent")
-            parent_number = int(parent["number"])
-            if existing.get("base_resolution_pending") is True:
-                try:
-                    repository = self.github.repository()
-                except GitHubReadError as error:
-                    if not is_github_convergence_error(error.code):
-                        raise
-                    wait_for_github_refresh(
-                        existing,
-                        code=error.code,
-                        message=error.message,
-                        waiting_for="GitHub repository binding",
-                    )
-                    existing["updated_at"] = _now()
-                    self.states.save_run(run_id, existing)
-                    return existing, True
-                return self._start_locked(
-                    repository,
-                    parent_number,
+            existing["updated_at"] = _now()
+            self.states.save_run(run_id, existing)
+            return existing, True
+        if existing.get("status") in {
+            "abandoned",
+            "abandonment_pending",
+            "completed",
+            "deterministic_contradiction",
+        }:
+            return existing, True
+        response_replayed = False
+        if human_response is not None:
+            response_binding = _bind_current_human_response(
+                existing, human_response
+            )
+            if not resume_human_blocker or response_binding is None:
+                raise ValueError("--message requires a current Human Blocker")
+            response_replayed = response_binding == "replayed"
+        hold_operator_gate = (
+            not explicit_resume
+            and not resume_human_blocker
+            and not resume_budget_checkpoint
+            and (
+                has_unresolved_subject_gate(existing)
+                or has_non_invocation_execution_failure(existing)
+            )
+        )
+        audit_replayed = response_replayed and _resume_audit_matches_replay(
+            existing, new_thread=new_thread
+        )
+        if explicit_resume and not audit_replayed:
+            append_explicit_resume_audit(
+                existing,
+                new_thread=new_thread,
+                human_response_supplied=human_response is not None,
+            )
+        if human_response is not None:
+            self.states.save_run(run_id, existing)
+        resuming_supervision_timeout = existing.get("status") == "supervision_timeout"
+        existing_invocation = existing.get("active_agent_invocation")
+        resume_completed_invocation = (
+            existing.get("status") == "execution_failed"
+            and isinstance(existing_invocation, dict)
+            and existing_invocation.get("status") == "completed"
+            and invocation_attempt_is_pending(existing, existing_invocation)
+        )
+        if resuming_supervision_timeout:
+            if new_thread or human_response is not None:
+                raise ValueError(
+                    "supervision timeout resume does not accept Agent or Human Blocker options"
+                )
+            restore_supervision_wait(existing)
+        parent = _state_mapping(existing, "parent")
+        parent_number = int(parent["number"])
+        if existing.get("base_resolution_pending") is True:
+            try:
+                repository = self.github.repository()
+            except GitHubReadError as error:
+                if not is_github_convergence_error(error.code):
+                    raise
+                wait_for_github_refresh(
                     existing,
-                    allow_non_invocation_execution_recovery=explicit_resume,
+                    code=error.code,
+                    message=error.message,
+                    waiting_for="GitHub repository binding",
                 )
-            base = _state_mapping(existing, "base")
-            base_sha = str(base["sha"])
-            state = self._refresh(existing, parent_number)
-            if is_github_refresh_wait(state):
-                if hold_operator_gate:
-                    return existing, True
-                self.states.save_run(run_id, state)
-                return state, True
-            if state.get("status") in {
-                "unsupported_scope_change",
-                "deterministic_contradiction",
-            } or (
-                state.get("status") == "execution_failed"
-                and (
-                    existing.get("status") != "execution_failed"
-                    or state.get("diagnostics") != existing.get("diagnostics")
-                )
-            ):
-                self.states.save_run(run_id, state)
-                return state, True
-            if state.get("status") == "requeue_required":
-                self.states.save_run(run_id, state)
-                return state, True
-            if state.get("terminal_kind") == "run_acceptance_stale":
-                # Refresh retired the exact blocked/failed Run Repair Attempt.
-                # The supplied Human response or Thread choice belongs to that
-                # stale identity and must not be applied to fresh Acceptance.
-                self.states.save_run(run_id, state)
-                return state, True
-            if _is_currentness_human_blocker(state):
-                # A live Change PR no longer matches the persisted
-                # Generation. Do not repair invocations or touch a managed
-                # branch while the maintainer decides how to resolve it.
-                self.states.save_run(run_id, state)
-                return state, True
-            invocation = state.get("active_agent_invocation")
-            if (
-                isinstance(invocation, dict)
-                and invocation.get("role") in {"reviewer", "final_publication"}
-                and not self._run_invocation_boundary_is_current(state, invocation)
-            ):
-                _invalidate_stale_run_invocation(state, invocation)
-                self._ensure_delivery_branch(state, base_sha)
-                self.states.save_run(run_id, state)
-                return state, True
+                existing["updated_at"] = _now()
+                self.states.save_run(run_id, existing)
+                return existing, True
+            return self._start(
+                repository,
+                parent_number,
+                existing,
+                allow_non_invocation_execution_recovery=explicit_resume,
+            )
+        base = _state_mapping(existing, "base")
+        base_sha = str(base["sha"])
+        state = self._refresh(existing, parent_number)
+        if is_github_refresh_wait(state):
             if hold_operator_gate:
                 return existing, True
-            resuming_run_acceptance = False
-            budget_resumed = (
-                _resume_review_budget_window(
-                    state,
-                    budget_policy,
-                )
-                if resume_budget_checkpoint
-                else False
+            self.states.save_run(run_id, state)
+            return state, True
+        if state.get("status") in {
+            "unsupported_scope_change",
+            "deterministic_contradiction",
+        } or (
+            state.get("status") == "execution_failed"
+            and (
+                existing.get("status") != "execution_failed"
+                or state.get("diagnostics") != existing.get("diagnostics")
             )
-            if budget_resumed and human_response is not None:
-                raise ValueError("Review Budget resume does not accept a Human Blocker response")
-            if budget_resumed:
-                resumed_subject = True
-            elif resume_human_blocker:
-                resuming_run_acceptance = _run_acceptance_human_blocker(state)
-                resumed_subject = _resume_agent_human_blocker(state)
-                if human_response is not None and not resumed_subject:
-                    raise ValueError("--message requires a current Human Blocker")
-            elif human_response is not None:
-                raise ValueError("--message requires Human Blocker resume")
-            if new_thread and not budget_resumed:
-                if resuming_run_acceptance:
-                    _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
-                else:
-                    _clear_current_invocation_thread(state)
-            else:
-                _restore_current_invocation_thread(
-                    state, allow_completed=resume_completed_invocation
-                )
-            _mark_failed_invocation_resuming(state)
+        ):
+            self.states.save_run(run_id, state)
+            return state, True
+        if state.get("status") == "requeue_required":
+            self.states.save_run(run_id, state)
+            return state, True
+        if state.get("terminal_kind") == "run_acceptance_stale":
+            # Refresh retired the exact blocked/failed Run Repair Attempt.
+            # The supplied Human response or Thread choice belongs to that
+            # stale identity and must not be applied to fresh Acceptance.
+            self.states.save_run(run_id, state)
+            return state, True
+        if _is_currentness_human_blocker(state):
+            # A live Change PR no longer matches the persisted
+            # Generation. Do not repair invocations or touch a managed
+            # branch while the maintainer decides how to resolve it.
+            self.states.save_run(run_id, state)
+            return state, True
+        invocation = state.get("active_agent_invocation")
+        if (
+            isinstance(invocation, dict)
+            and invocation.get("role") in {"reviewer", "final_publication"}
+            and not self._run_invocation_boundary_is_current(state, invocation)
+        ):
+            _invalidate_stale_run_invocation(state, invocation)
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
-            self._initialize_direct_profile(state)
             return state, True
+        if hold_operator_gate:
+            return existing, True
+        resuming_run_acceptance = False
+        budget_resumed = (
+            _resume_review_budget_window(
+                state,
+                budget_policy,
+            )
+            if resume_budget_checkpoint
+            else False
+        )
+        if budget_resumed and human_response is not None:
+            raise ValueError("Review Budget resume does not accept a Human Blocker response")
+        if budget_resumed:
+            resumed_subject = True
+        elif resume_human_blocker:
+            resuming_run_acceptance = _run_acceptance_human_blocker(state)
+            resumed_subject = _resume_agent_human_blocker(state)
+            if human_response is not None and not resumed_subject:
+                raise ValueError("--message requires a current Human Blocker")
+        elif human_response is not None:
+            raise ValueError("--message requires Human Blocker resume")
+        if new_thread and not budget_resumed:
+            if resuming_run_acceptance:
+                _state_mapping(state, "run_acceptance")["reviewer_new_thread"] = True
+            else:
+                _clear_current_invocation_thread(state)
+        else:
+            _restore_current_invocation_thread(
+                state, allow_completed=resume_completed_invocation
+            )
+        _mark_failed_invocation_resuming(state)
+        self._ensure_delivery_branch(state, base_sha)
+        self.states.save_run(run_id, state)
+        self._initialize_direct_profile(state)
+        return state, True
 
     def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Create a blank Change Job Generation from facts read *now*.
@@ -439,161 +452,158 @@ class Controller:
         Requeue is intentionally separate from ``resume``: it never tries to
         attach an old Thread or retain candidate/acceptance state.
         """
-        with self.states.locked():
-            existing = self._load_run(run_id)
-            if existing.get("status") == "execution_failed":
-                raise RequeueError(
-                    "requeue cannot replace an unresolved Execution Failure"
+        existing = self._load_run(run_id)
+        if existing.get("status") == "execution_failed":
+            raise RequeueError(
+                "requeue cannot replace an unresolved Execution Failure"
+            )
+        try:
+            existing = self._load_bound_run(run_id, state=existing)
+        except GitHubReadError as error:
+            return self._wait_for_github_read(
+                run_id,
+                error,
+                waiting_for="GitHub repository binding",
+            ), {}
+        parent_number = int(_state_mapping(existing, "parent")["number"])
+        transition = existing.get("requeue_transition")
+        if isinstance(transition, dict):
+            retired = transition.get("retired")
+            if isinstance(retired, dict):
+                refreshed = refresh_requeue_transition_facts(
+                    existing, parent_number, self.github, now=_now
                 )
-            try:
-                existing = self._load_bound_run(run_id, state=existing)
-            except GitHubReadError as error:
-                return self._wait_for_github_read(
-                    run_id,
-                    error,
-                    waiting_for="GitHub repository binding",
-                ), {}
-            parent_number = int(_state_mapping(existing, "parent")["number"])
-            transition = existing.get("requeue_transition")
-            if isinstance(transition, dict):
-                retired = transition.get("retired")
-                if isinstance(retired, dict):
-                    refreshed = refresh_requeue_transition_facts(
-                        existing, parent_number, self.github, now=_now
-                    )
-                    if is_github_refresh_wait(refreshed):
-                        self.states.save_run(run_id, refreshed)
-                        return refreshed, retired
-                    if refreshed.get("status") != "requeue_required":
-                        self.states.save_run(run_id, refreshed)
-                        raise RequeueError(
-                            "requeue transition no longer has a current Change Job"
-                        )
+                if is_github_refresh_wait(refreshed):
                     self.states.save_run(run_id, refreshed)
                     return refreshed, retired
-            state = self._refresh(
-                existing, parent_number, check_requeue_currentness=True
-            )
-            if is_github_refresh_wait(state):
-                self.states.save_run(run_id, state)
-                return state, {}
-            if state.get("status") != "requeue_required":
-                self.states.save_run(run_id, state)
-                raise RequeueError("requeue is only allowed in requeue_required state")
-            try:
-                repository = self.github.repository()
-            except GitHubReadError as error:
-                return self._wait_for_github_read(
-                    run_id,
-                    error,
-                    state=state,
-                    waiting_for="GitHub requeue base refresh",
-                ), {}
-            base = _state_mapping(state, "base")
-            base["sha"] = self.publisher.resolve_base(
-                repository.default_branch, repository.default_head_sha
-            )
-            transition_state = deepcopy(state)
-            retired = requeue_change_job(transition_state)
-            state["requeue_transition"] = {
-                "retired": retired,
-                "base_sha": base["sha"],
-                "close_nonce": secrets.token_hex(16),
-            }
+                if refreshed.get("status") != "requeue_required":
+                    self.states.save_run(run_id, refreshed)
+                    raise RequeueError(
+                        "requeue transition no longer has a current Change Job"
+                    )
+                self.states.save_run(run_id, refreshed)
+                return refreshed, retired
+        state = self._refresh(
+            existing, parent_number, check_requeue_currentness=True
+        )
+        if is_github_refresh_wait(state):
             self.states.save_run(run_id, state)
-            return state, retired
+            return state, {}
+        if state.get("status") != "requeue_required":
+            self.states.save_run(run_id, state)
+            raise RequeueError("requeue is only allowed in requeue_required state")
+        try:
+            repository = self.github.repository()
+        except GitHubReadError as error:
+            return self._wait_for_github_read(
+                run_id,
+                error,
+                state=state,
+                waiting_for="GitHub requeue base refresh",
+            ), {}
+        base = _state_mapping(state, "base")
+        base["sha"] = self.publisher.resolve_base(
+            repository.default_branch, repository.default_head_sha
+        )
+        transition_state = deepcopy(state)
+        retired = requeue_change_job(transition_state)
+        state["requeue_transition"] = {
+            "retired": retired,
+            "base_sha": base["sha"],
+            "close_nonce": secrets.token_hex(16),
+        }
+        self.states.save_run(run_id, state)
+        return state, retired
 
     def finalize_requeue(self, run_id: str) -> dict[str, Any]:
         """Commit a prepared replacement only after old assets are retired."""
-        with self.states.locked():
-            try:
-                state = self._load_bound_run(run_id)
-            except GitHubReadError as error:
-                return self._wait_for_github_read(
-                    run_id,
-                    error,
-                    waiting_for="GitHub repository binding",
-                )
-            transition = _state_mapping(state, "requeue_transition")
-            retired = _state_mapping(transition, "retired")
-            prepared_base_sha = transition.get("base_sha")
-            if not isinstance(prepared_base_sha, str):
-                raise RequeueError("prepared requeue base is invalid")
-            # The initial intent is durable so an old-PR close can be retried,
-            # but the new Generation binds its base only after that retirement
-            # completes. This prevents a response-loss retry from reviving an
-            # already superseded default-branch snapshot.
-            try:
-                repository = self.github.repository()
-            except GitHubReadError as error:
-                return self._wait_for_github_read(
-                    run_id,
-                    error,
-                    state=state,
-                    waiting_for="GitHub requeue finalization refresh",
-                )
-            base_sha = self.publisher.resolve_base(
-                repository.default_branch, repository.default_head_sha
+        try:
+            state = self._load_bound_run(run_id)
+        except GitHubReadError as error:
+            return self._wait_for_github_read(
+                run_id,
+                error,
+                waiting_for="GitHub repository binding",
             )
-            _state_mapping(state, "base")["sha"] = base_sha
-            applied = requeue_change_job(state)
-            if applied != retired:
-                raise RequeueError("prepared requeue no longer matches current Job")
-            if retired["work_subject"].startswith("parent-only:"):
-                generation = int(retired["generation"]) + 1
-                state["parent_branch"] = (
-                    f"agent-run/{run_id}/parent-generation-{generation}"
-                )
-            parent_number = int(_state_mapping(state, "parent")["number"])
-            state.pop("requeue_transition", None)
-            state = self._refresh(state, parent_number)
-            self._ensure_delivery_branch(state, base_sha)
-            self.states.save_run(run_id, state)
-            return state
+        transition = _state_mapping(state, "requeue_transition")
+        retired = _state_mapping(transition, "retired")
+        prepared_base_sha = transition.get("base_sha")
+        if not isinstance(prepared_base_sha, str):
+            raise RequeueError("prepared requeue base is invalid")
+        # The initial intent is durable so an old-PR close can be retried,
+        # but the new Generation binds its base only after that retirement
+        # completes. This prevents a response-loss retry from reviving an
+        # already superseded default-branch snapshot.
+        try:
+            repository = self.github.repository()
+        except GitHubReadError as error:
+            return self._wait_for_github_read(
+                run_id,
+                error,
+                state=state,
+                waiting_for="GitHub requeue finalization refresh",
+            )
+        base_sha = self.publisher.resolve_base(
+            repository.default_branch, repository.default_head_sha
+        )
+        _state_mapping(state, "base")["sha"] = base_sha
+        applied = requeue_change_job(state)
+        if applied != retired:
+            raise RequeueError("prepared requeue no longer matches current Job")
+        if retired["work_subject"].startswith("parent-only:"):
+            generation = int(retired["generation"]) + 1
+            state["parent_branch"] = (
+                f"agent-run/{run_id}/parent-generation-{generation}"
+            )
+        parent_number = int(_state_mapping(state, "parent")["number"])
+        state.pop("requeue_transition", None)
+        state = self._refresh(state, parent_number)
+        self._ensure_delivery_branch(state, base_sha)
+        self.states.save_run(run_id, state)
+        return state
 
     def reject_requeue_after_pr_race(self, run_id: str) -> dict[str, Any]:
         """Persist a Human Blocker when old-PR retirement lost its race."""
-        with self.states.locked():
-            try:
-                state = self._load_bound_run(run_id)
-            except GitHubReadError as error:
-                return self._wait_for_github_read(
-                    run_id,
-                    error,
-                    waiting_for="GitHub repository binding",
-                )
-            subject, job, _ = current_change_job(state)
-            try:
-                reason = (
-                    unknown_pr_mutation(
-                        state, subject, job, self.github, self.publisher.git
-                    )
-                    if job is not None
-                    else None
-                )
-            except GitHubReadError as error:
-                return self._wait_for_github_read(
-                    run_id,
-                    error,
-                    state=state,
-                    waiting_for="GitHub Change PR currentness refresh",
-                )
-            state.pop("requeue_transition", None)
-            state.update(
-                {
-                    "status": "blocked",
-                    "terminal_kind": "waiting_human",
-                    "diagnostics": [
-                        {
-                            "code": reason or "change_pr_supersession_unknown",
-                            "message": "Change PR changed while Requeue retired its Generation",
-                        }
-                    ],
-                    "updated_at": _now(),
-                }
+        try:
+            state = self._load_bound_run(run_id)
+        except GitHubReadError as error:
+            return self._wait_for_github_read(
+                run_id,
+                error,
+                waiting_for="GitHub repository binding",
             )
-            self.states.save_run(run_id, state)
-            return state
+        subject, job, _ = current_change_job(state)
+        try:
+            reason = (
+                unknown_pr_mutation(
+                    state, subject, job, self.github, self.publisher.git
+                )
+                if job is not None
+                else None
+            )
+        except GitHubReadError as error:
+            return self._wait_for_github_read(
+                run_id,
+                error,
+                state=state,
+                waiting_for="GitHub Change PR currentness refresh",
+            )
+        state.pop("requeue_transition", None)
+        state.update(
+            {
+                "status": "blocked",
+                "terminal_kind": "waiting_human",
+                "diagnostics": [
+                    {
+                        "code": reason or "change_pr_supersession_unknown",
+                        "message": "Change PR changed while Requeue retired its Generation",
+                    }
+                ],
+                "updated_at": _now(),
+            }
+        )
+        self.states.save_run(run_id, state)
+        return state
 
     def _run_invocation_boundary_is_current(
         self, state: dict[str, Any], invocation: dict[str, Any]
@@ -628,144 +638,146 @@ class Controller:
         )
 
     def record_execution_failure(self, run_id: str, message: str) -> bool:
-        with self.states.locked():
-            state = self.states.load_run(run_id)
-            if state is None:
-                return False
-            try:
-                require_current_run_state(state)
-            except IncompatibleRunStateError:
-                return False
-            if state.get("status") in {
-                "abandoned",
-                "abandonment_pending",
-                "completed",
-                "parent_closeout_pending",
-            }:
-                return False
-            # Requeue persists its replacement intent before it performs any
-            # Publisher mutation. A lost response while retiring the old PR
-            # must preserve the pending state for a fresh currentness decision,
-            # never turn it into an ordinary failed invocation.
-            if state.get("status") == "requeue_required" and isinstance(
-                state.get("requeue_transition"), dict
-            ):
-                return False
-            if (
-                has_run_operator_gate(state)
-                and state.get("status") != "execution_failed"
-            ):
-                return False
-            hint_reader = getattr(self.github, "repository_hint", None)
-            repository_hint = hint_reader() if callable(hint_reader) else None
-            if (
-                isinstance(repository_hint, str)
-                and repository_hint
-                and state.get("repository") != repository_hint
-            ):
-                return False
-            try:
-                repository = self.github.repository()
-            except (GitHubReadError, OSError, ValueError):
-                repository = None
-            if (
-                repository is not None
-                and state.get("repository") != repository.name_with_owner
-            ):
-                return False
-            active = state.get("active_agent_invocation")
-            invocation_owns_failure = (
-                isinstance(active, dict)
-                and (
-                    active.get("status") in {"running", "failed"}
-                    or (
-                        active.get("status") == "completed"
-                        and invocation_attempt_is_pending(state, active)
-                    )
+        state = self.states.load_run(run_id)
+        if state is None:
+            return False
+        try:
+            require_current_run_state(state)
+        except IncompatibleRunStateError:
+            return False
+        if state.get("status") in {
+            "abandoned",
+            "abandonment_pending",
+            "completed",
+            "parent_closeout_pending",
+        }:
+            return False
+        # Requeue persists its replacement intent before it performs any
+        # Publisher mutation. A lost response while retiring the old PR
+        # must preserve the pending state for a fresh currentness decision,
+        # never turn it into an ordinary failed invocation.
+        if state.get("status") == "requeue_required" and isinstance(
+            state.get("requeue_transition"), dict
+        ):
+            return False
+        if (
+            has_run_operator_gate(state)
+            and state.get("status") != "execution_failed"
+        ):
+            return False
+        hint_reader = getattr(self.github, "repository_hint", None)
+        repository_hint = hint_reader() if callable(hint_reader) else None
+        if (
+            isinstance(repository_hint, str)
+            and repository_hint
+            and state.get("repository") != repository_hint
+        ):
+            return False
+        try:
+            repository = self.github.repository()
+        except (GitHubReadError, OSError, ValueError):
+            repository = None
+        if (
+            repository is not None
+            and state.get("repository") != repository.name_with_owner
+        ):
+            return False
+        active = state.get("active_agent_invocation")
+        invocation_owns_failure = (
+            isinstance(active, dict)
+            and (
+                active.get("status") in {"running", "failed"}
+                or (
+                    active.get("status") == "completed"
+                    and invocation_attempt_is_pending(state, active)
                 )
             )
-            if isinstance(active, dict) and isinstance(active.get("role"), str):
-                fail_interrupted_invocation(
-                    state,
-                    role=str(active["role"]),
-                    save=lambda _state: None,
-                )
+        )
+        if isinstance(active, dict) and isinstance(active.get("role"), str):
+            fail_interrupted_invocation(
+                state,
+                role=str(active["role"]),
+                save=lambda _state: None,
+            )
+        if message.startswith("controller_no_progress:"):
+            code = "controller_no_progress"
+            message = message.partition(":")[2].strip()
+        else:
             code = (
                 "worker_credential_renewal_failed"
                 if "worker_credential_renewal_failed:" in message
                 else "command_failed"
             )
-            diagnostic = _operator_gate_diagnostic(
-                state,
-                code=code,
-                message=message,
-                action_kind="execution_failure",
-                reason=code,
-                fallback_phase=str(state.get("status") or "execution_failed"),
-                bind_to_current_change_job=not invocation_owns_failure,
-            )
-            state.update(
-                {
-                    "status": "execution_failed",
-                    "terminal_kind": "execution_failed",
-                    "diagnostics": [diagnostic],
-                    "updated_at": _now(),
-                }
-            )
-            self.states.save_run(run_id, state)
-            return True
+        diagnostic = _operator_gate_diagnostic(
+            state,
+            code=code,
+            message=message,
+            action_kind="execution_failure",
+            reason=code,
+            fallback_phase=str(state.get("status") or "execution_failed"),
+            bind_to_current_change_job=not invocation_owns_failure,
+        )
+        state.update(
+            {
+                "status": "execution_failed",
+                "terminal_kind": "execution_failed",
+                "diagnostics": [diagnostic],
+                "updated_at": _now(),
+            }
+        )
+        self.states.save_run(run_id, state)
+        return True
 
     def record_deterministic_contradiction(
         self, run_id: str, code: str, message: str
     ) -> bool:
         """Persist a proven GitHub fact without treating it as retryable."""
 
-        with self.states.locked():
-            state = self.states.load_run(run_id)
-            if state is None:
-                return False
-            try:
-                require_current_run_state(state)
-            except IncompatibleRunStateError:
-                return False
-            if state.get("status") in {
-                "abandoned",
-                "abandonment_pending",
-                "completed",
-                "parent_closeout_pending",
-                "deterministic_contradiction",
-            }:
-                return False
-            hint_reader = getattr(self.github, "repository_hint", None)
-            repository_hint = hint_reader() if callable(hint_reader) else None
-            if (
-                isinstance(repository_hint, str)
-                and repository_hint
-                and state.get("repository") != repository_hint
-            ):
-                return False
-            state.pop("supervision_window", None)
-            state.pop("supervision_wait", None)
-            diagnostic = _operator_gate_diagnostic(
-                state,
-                code=code,
-                message=message,
-                action_kind="deterministic_contradiction",
-                reason=code,
-                fallback_phase=str(
-                    state.get("status") or "deterministic_contradiction"
-                ),
-            )
-            state.update(
-                {
-                    "status": "deterministic_contradiction",
-                    "terminal_kind": "deterministic_contradiction",
-                    "diagnostics": [diagnostic],
-                    "updated_at": _now(),
-                }
-            )
-            self.states.save_run(run_id, state)
-            return True
+        state = self.states.load_run(run_id)
+        if state is None:
+            return False
+        try:
+            require_current_run_state(state)
+        except IncompatibleRunStateError:
+            return False
+        if state.get("status") in {
+            "abandoned",
+            "abandonment_pending",
+            "completed",
+            "parent_closeout_pending",
+            "deterministic_contradiction",
+        }:
+            return False
+        hint_reader = getattr(self.github, "repository_hint", None)
+        repository_hint = hint_reader() if callable(hint_reader) else None
+        if (
+            isinstance(repository_hint, str)
+            and repository_hint
+            and state.get("repository") != repository_hint
+        ):
+            return False
+        state.pop("supervision_window", None)
+        state.pop("supervision_wait", None)
+        diagnostic = _operator_gate_diagnostic(
+            state,
+            code=code,
+            message=message,
+            action_kind="deterministic_contradiction",
+            reason=code,
+            fallback_phase=str(
+                state.get("status") or "deterministic_contradiction"
+            ),
+        )
+        state.update(
+            {
+                "status": "deterministic_contradiction",
+                "terminal_kind": "deterministic_contradiction",
+                "diagnostics": [diagnostic],
+                "updated_at": _now(),
+            }
+        )
+        self.states.save_run(run_id, state)
+        return True
 
     def _load_bound_run(
         self, run_id: str, *, state: dict[str, Any] | None = None
@@ -1198,7 +1210,7 @@ class Controller:
             raise ValueError("Delivery Run branch is invalid")
         self.publisher.ensure_run_branch(branch, base_sha)
 
-    def _start_locked(
+    def _start(
         self,
         repository: Repository,
         parent_number: int,
@@ -1206,6 +1218,7 @@ class Controller:
         *,
         allow_non_invocation_execution_recovery: bool = False,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
+        prevent_duplicate: bool = True,
     ) -> tuple[dict[str, Any], bool]:
         resumed = existing is not None
         if existing is None:
@@ -1226,7 +1239,19 @@ class Controller:
             # Persist identity before a remote fetch.  A timeout can then be
             # resumed against the same durable Run rather than creating a new
             # branch or Worker identity on the next foreground invocation.
-            self.states.save_run(run_id, state)
+            if prevent_duplicate:
+                state, created = self.states.create_run_if_unfinished_absent(
+                    repository.name_with_owner,
+                    parent_number,
+                    run_id,
+                    state,
+                )
+            else:
+                state, created = self.states.create_run_if_absent(run_id, state)
+            if not created:
+                require_current_run_state(state)
+                self._require_current_checkout(state)
+                return state, True
             self._initialize_direct_profile(state)
         else:
             state = existing

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -41,6 +42,7 @@ from agent_run.task_control import (
 )
 from conftest import write_fixture
 from cli_fixtures import run_agents
+from cli_run_supervision_support import _parent_only_agents
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import ticket
 
@@ -341,6 +343,38 @@ def test_task_control_lock_contention_fails_without_persistent_mutation(
     accepted = control.claim_action(task, kind="run", payload={"parent": 1})
     assert accepted.attached is False
     assert accepted.action_id is not None
+
+
+def test_task_control_preparation_callbacks_run_outside_short_transactions(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    lock_path = control.directory / f".{task.fingerprint}.lock"
+
+    def assert_lock_is_available() -> None:
+        with lock_path.open("a+") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:  # pragma: no cover - regression guard
+                raise AssertionError("preparation ran under the Task Control lock") from error
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    claim = control.claim_action(
+        task,
+        kind="run",
+        payload={"parent": 156},
+        before_create=assert_lock_is_available,
+    )
+    assert claim.action_id is not None
+    reservation = control.begin_executor(
+        task,
+        action_id=claim.action_id,
+        run_id=None,
+        before_create=assert_lock_is_available,
+    )
+    assert reservation.created is True
 
 
 @pytest.mark.parametrize("after_write", [False, True])
@@ -845,6 +879,37 @@ def test_recovered_executor_generation_is_recorded_in_run_receipt(
     assert state["action_application_receipt"]["executor_generation"] == 2
 
 
+def test_absent_executor_cannot_record_application_for_its_old_generation(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    claim = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert claim.action is not None
+    assert claim.action_id is not None
+    control.bind_run(task, claim.action_id, "run-1")
+    host = FakeExecutorHost()
+    spec = ExecutorSpec(
+        task=task,
+        action_id=claim.action_id,
+        run_id="run-1",
+        generation=1,
+    )
+
+    started = host.ensure(spec, control)
+    assert started.status == "running"
+    control.mark_executor_absent(task, action_id=claim.action_id, generation=1)
+
+    with pytest.raises(ActionReconciliationError, match="no longer active"):
+        control.record_application(
+            task,
+            action_id=claim.action_id,
+            run_id="run-1",
+            payload_digest=str(claim.action["payload_digest"]),
+            generation=1,
+        )
+
+
 def test_applied_receipt_without_executor_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -1112,6 +1177,122 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
     control_record = json.loads(controls[0].read_text(encoding="utf-8"))
     assert control_record["action"]["status"] == "completed"
     assert control_record["executor"]["status"] == "exited"
+
+
+def test_different_parent_runs_reach_agents_without_shared_state_lock(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    def parent_fixture(path: Path, number: int) -> Path:
+        return write_fixture(
+            path,
+            issues={},
+            parent={
+                "number": number,
+                "title": f"Parent {number}",
+                "body": "Deliver the standalone Parent request.",
+                "sub_issues": [],
+                "sub_issue_order_reliable": True,
+            },
+        )
+
+    fixture_one = parent_fixture(git_repo / "github-one.json", 1)
+    fixture_two = parent_fixture(git_repo / "github-two.json", 2)
+    agents_one = _parent_only_agents(git_repo / "agents-one.json")
+    agents_two = _parent_only_agents(git_repo / "agents-two.json")
+    started_one = tmp_path / "parent-one-started"
+    started_two = tmp_path / "parent-two-started"
+    release_one = tmp_path / "parent-one-release"
+    release_two = tmp_path / "parent-two-release"
+    for agents, started, release, thread_id in (
+        (agents_one, started_one, release_one, "parent-one-developer"),
+        (agents_two, started_two, release_two, "parent-two-developer"),
+    ):
+        data = json.loads(agents.read_text(encoding="utf-8"))
+        data["developments"][0]["thread_id"] = thread_id
+        data["invocation_gate"] = {
+            "role": "development",
+            "started_file": str(started),
+            "release_file": str(release),
+            "timeout_seconds": 10,
+        }
+        agents.write_text(json.dumps(data), encoding="utf-8")
+
+    environment = os.environ.copy()
+    environment.update(_isolated_environment(tmp_path / "different-parents"))
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = source
+
+    def command(parent: int, fixture: Path, agents: Path) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "agent_run",
+            "run",
+            str(parent),
+            "--agent-fixture",
+            str(agents),
+            "--github-fixture",
+            str(fixture),
+        ]
+
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        processes.append(
+            subprocess.Popen(
+                command(1, fixture_one, agents_one),
+                cwd=git_repo,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+        deadline = time.monotonic() + 10
+        while not started_one.exists():
+            if processes[0].poll() is not None:
+                stdout, stderr = processes[0].communicate()
+                raise AssertionError(f"first run failed early: {stdout}\n{stderr}")
+            if time.monotonic() >= deadline:
+                raise AssertionError("first Parent did not reach the Agent barrier")
+            os.sched_yield()
+
+        processes.append(
+            subprocess.Popen(
+                command(2, fixture_two, agents_two),
+                cwd=git_repo,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+        deadline = time.monotonic() + 10
+        while not started_two.exists():
+            if processes[1].poll() is not None:
+                stdout, stderr = processes[1].communicate()
+                raise AssertionError(f"second run failed early: {stdout}\n{stderr}")
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "different Parent was blocked before reaching the Agent barrier"
+                )
+            os.sched_yield()
+
+        release_one.touch()
+        release_two.touch()
+        results = [process.communicate(timeout=30) for process in processes]
+        for process, (stdout, stderr) in zip(processes, results):
+            assert process.returncode == 0, f"{stdout}\n{stderr}"
+        states = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((git_repo / ".agent-run" / "runs").glob("*.json"))
+        ]
+        assert len(states) == 2
+        assert {state["parent"]["number"] for state in states} == {1, 2}
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 
 
 def test_repeated_run_reuses_the_completed_action_after_receipt_loss(

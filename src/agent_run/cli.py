@@ -1222,8 +1222,93 @@ def _run_lifecycle(
 
     base_state_root = states.root.resolve()
 
-    def lifecycle_state_store() -> StateStore | FaultInjectingStateStore:
-        current_control = control.load(task)
+    def current_executor_binding() -> tuple[str, int, str | None]:
+        record = control.load(task)
+        if not isinstance(record, Mapping):
+            raise TaskControlError("Executor ownership record 不存在")
+        action_id: str | None
+        generation: int | None
+        if executor_binding is not None:
+            action_id, generation = executor_binding
+        else:
+            action = record.get("action")
+            executor = record.get("executor")
+            action_id = (
+                action.get("action_id")
+                if isinstance(action, Mapping)
+                else None
+            )
+            generation = (
+                executor.get("generation")
+                if isinstance(executor, Mapping)
+                else None
+            )
+        if not isinstance(action_id, str) or type(generation) is not int:
+            raise TaskControlError("Executor ownership/generation 不完整")
+        executor = record.get("executor")
+        run_id = (
+            executor.get("run_id")
+            if isinstance(executor, Mapping)
+            and isinstance(executor.get("run_id"), str)
+            else None
+        )
+        return action_id, generation, run_id
+
+    def assert_executor_current() -> None:
+        action_id, generation, run_id = current_executor_binding()
+        control.assert_executor_current(
+            task,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        )
+
+    def executor_write_transaction() -> Any:
+        action_id, generation, run_id = current_executor_binding()
+        return control._executor_current_transaction(
+            task,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        )
+
+    def executor_guards(
+        binding: tuple[str, int, str] | None,
+    ) -> tuple[Callable[[], None], Callable[[], Any]]:
+        if binding is None:
+            return assert_executor_current, executor_write_transaction
+        action_id, generation, run_id = binding
+
+        def assert_bound_executor_current() -> None:
+            control.assert_executor_current(
+                task,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
+
+        def bound_executor_write_transaction() -> Any:
+            return control._executor_current_transaction(
+                task,
+                action_id=action_id,
+                generation=generation,
+                run_id=run_id,
+            )
+
+        return assert_bound_executor_current, bound_executor_write_transaction
+
+    states._set_write_guard(
+        assert_executor_current, transaction=executor_write_transaction
+    )
+
+    def lifecycle_state_store(
+        binding: tuple[str, int, str] | None,
+    ) -> StateStore | FaultInjectingStateStore:
+        current_control = (
+            control.snapshot(task, binding[0])
+            if binding is not None
+            else control.load(task)
+        )
         bound_root = _control_state_root(current_control)
         if bound_root is None or bound_root == base_state_root:
             return states
@@ -1231,7 +1316,12 @@ def _run_lifecycle(
 
     def lifecycle_components(
         run_states: StateStore,
+        binding: tuple[str, int, str] | None,
     ) -> tuple[AgentProfileStore, Controller]:
+        fence, transaction = executor_guards(binding)
+        run_states._set_write_guard(
+            fence, transaction=transaction
+        )
         run_root = run_states.root.resolve()
         if run_root == base_state_root:
             return profiles, controller
@@ -1247,16 +1337,27 @@ def _run_lifecycle(
 
     def lifecycle_driver_factory(
         run_states: StateStore,
+        binding: tuple[str, int, str] | None,
     ) -> RunDriver:
-        run_profiles, run_controller = lifecycle_components(run_states)
+        run_profiles, run_controller = lifecycle_components(run_states, binding)
+        fence, _ = executor_guards(binding)
         return _run_driver(
-            parsed, run_states, run_controller, git, github, run_profiles
+            parsed,
+            run_states,
+            run_controller,
+            git,
+            github,
+            run_profiles,
+            before_external_step=fence,
         )
 
     def record_lifecycle_failure(
-        run_states: StateStore, run_id: str, message: str
+        run_states: StateStore,
+        run_id: str,
+        message: str,
+        binding: tuple[str, int, str] | None,
     ) -> bool:
-        _, run_controller = lifecycle_components(run_states)
+        _, run_controller = lifecycle_components(run_states, binding)
         return run_controller.record_execution_failure(run_id, message)
 
     delivery_executor = DeliveryExecutor(
@@ -1320,6 +1421,11 @@ def _run_lifecycle(
             state_root=states.root.resolve(),
         ),
         execute=delivery_executor.execute,
+        execute_with_binding=lambda run_id, action_id, generation: (
+            delivery_executor.execute(
+                run_id, action_id=action_id, generation=generation
+            )
+        ),
         prepare_executor_session=prepare_executor_session,
     )
     if executor_binding is not None:
@@ -1474,6 +1580,7 @@ def _run_driver(
     git: GitRepository,
     github: FixtureGitHubReader | GhGitHubReader,
     profiles: AgentProfileStore,
+    before_external_step: Callable[[], None] | None = None,
 ) -> RunDriver:
     agents = _agent_backend(parsed, profiles)
     return RunDriver(
@@ -1489,6 +1596,7 @@ def _run_driver(
             ),
             agents=agents,
             profiles=profiles,
+            before_external_step=before_external_step,
         ),
         states=states,
         supervisor=_foreground_supervisor(parsed),

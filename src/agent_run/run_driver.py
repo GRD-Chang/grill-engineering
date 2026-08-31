@@ -27,6 +27,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.task_control import TaskControlBusyError
 
 
 class RunOutcomeKind(str, Enum):
@@ -74,6 +75,60 @@ class RunController(Protocol):
     ) -> bool: ...
 
 
+class _FencedExternal:
+    """Check Executor ownership before every call into an external seam."""
+
+    def __init__(self, target: Any, fence: Callable[[], None]) -> None:
+        self._target = target
+        self._fence = fence
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._target, name)
+        if not callable(value):
+            return value
+
+        def fenced_call(*args: Any, **kwargs: Any) -> Any:
+            self._fence()
+            return value(*args, **kwargs)
+
+        return fenced_call
+
+
+def _fenced_publisher(
+    publisher: Any,
+    *,
+    fenced_git: Any,
+    fence: Callable[[], None],
+) -> Any:
+    """Keep publisher implementations from retaining an unfenced Git seam."""
+
+    if hasattr(publisher, "git"):
+        publisher.git = fenced_git
+    return _FencedExternal(publisher, fence)
+
+
+def _fence_controller_dependencies(
+    controller: Any,
+    *,
+    git: Any,
+    github: Any,
+    fence: Callable[[], None],
+) -> None:
+    """Apply the same fences to Controller calls made from a Driver step."""
+
+    controller_states = getattr(controller, "states", None)
+    set_write_guard = getattr(controller_states, "_set_write_guard", None)
+    if callable(set_write_guard) and getattr(
+        controller_states, "_write_transaction", None
+    ) is None:
+        set_write_guard(fence)
+    if hasattr(controller, "github"):
+        controller.github = github
+    publisher = getattr(controller, "publisher", None)
+    if publisher is not None and hasattr(publisher, "git"):
+        publisher.git = git
+
+
 class DirectRunOperations:
     """Internal lifecycle operations; never dispatch a public CLI command."""
 
@@ -87,15 +142,44 @@ class DirectRunOperations:
         publisher_factory: Callable[[], Any],
         agents: Any,
         profiles: AgentProfileStore | None = None,
+        before_external_step: Callable[[], None] | None = None,
     ) -> None:
-        self.controller = controller
+        self.controller: Any = controller
         self.states = states
-        self.git = git
-        self.github_reader = github_reader
-        self._publisher_factory = publisher_factory
+        self.before_external_step = before_external_step
+        self.git: Any
+        self.github_reader: Any
+        self._publisher_factory: Callable[[], Any]
+        if before_external_step is not None:
+            if getattr(states, "_write_transaction", None) is None:
+                states._set_write_guard(before_external_step)
+            fenced_git = _FencedExternal(git, before_external_step)
+            fenced_github_reader = _FencedExternal(
+                github_reader, before_external_step
+            )
+            self.git = fenced_git
+            self.github_reader = fenced_github_reader
+            self._publisher_factory = lambda: _fenced_publisher(
+                publisher_factory(),
+                fenced_git=fenced_git,
+                fence=before_external_step,
+            )
+            _fence_controller_dependencies(
+                controller,
+                git=fenced_git,
+                github=fenced_github_reader,
+                fence=before_external_step,
+            )
+            self.controller = _FencedExternal(controller, before_external_step)
+        else:
+            self.git = git
+            self.github_reader = github_reader
+            self._publisher_factory = publisher_factory
         self._publisher: Any | None = None
         self.agents = agents
         self.profiles = profiles
+        if before_external_step is not None:
+            self.agents = _FencedExternal(agents, before_external_step)
 
     @property
     def publisher(self) -> Any:
@@ -290,6 +374,8 @@ class DirectRunOperations:
     def dispatch(self, step: RunStep, run_id: str) -> RunOutcome:
         """Execute a typed step; the Driver never dispatches on raw state."""
 
+        if self.before_external_step is not None:
+            self.before_external_step()
         # The direct engine seam is also used by legacy in-process callers
         # that predate the public profile-aware CLI.  Seed only that seam's
         # independent control plane; the CLI passes an existing store and
@@ -372,10 +458,25 @@ class RunDriver:
                 step = outcome.next_step
                 if step is None:
                     return state
+                progress_marker_before_dispatch = _progress_marker(state)
                 outcome = self.operations.dispatch(step, run_id)
                 state = outcome.state
+                if (
+                    outcome.kind is RunOutcomeKind.PROGRESS
+                    and _progress_marker(state) == progress_marker_before_dispatch
+                ):
+                    recorded = self.operations.controller.record_execution_failure(
+                        run_id,
+                        "controller_no_progress: Run Controller returned Progress "
+                        "without changing its durable progress identity",
+                    )
+                    if not recorded:
+                        return state
+                    failed = self.states.load_current_run(run_id)
+                    if failed is None:  # pragma: no cover - Controller just wrote it
+                        return state
+                    return failed
                 if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
-                    previous_marker = None
                     if clear_supervision_window(state):
                         self.states.save_run(run_id, state)
                     if outcome.kind in {
@@ -389,12 +490,14 @@ class RunDriver:
                         return state
                     continue
                 previous_window = state.get("supervision_window")
+                self._before_external_step()
                 self.supervisor.observe(state)
                 if state.get("supervision_window") != previous_window:
                     self.states.save_run(run_id, state)
-                marker = _progress_marker(state)
+                marker = _external_wait_marker(state)
                 credential_wait = isinstance(state.get("credential_availability"), dict)
                 if credential_wait or marker == previous_marker:
+                    self._before_external_step()
                     if not self.supervisor.before_retry(
                         state,
                         persist_before_sleep=lambda: self.states.save_run(run_id, state),
@@ -405,6 +508,7 @@ class RunDriver:
                     # reads observe the same durable wait contract.
                     self.states.save_run(run_id, state)
                 previous_marker = marker
+                self._before_external_step()
                 wait = public_supervision_snapshot(state, now=self.supervisor.now())
                 if wait is None:  # pragma: no cover - external waits always create one
                     print(f"推进: {state['status']} → {step.value}", file=sys.stderr)
@@ -434,10 +538,16 @@ class RunDriver:
             if failed is None:  # pragma: no cover - Controller just wrote it
                 raise
             return failed
+
         except SimulatedProcessCrash:
             # Fault injection models an abrupt Executor exit.  Do not convert
             # it into a normal Run execution failure: the Host must retain the
             # unresolved ownership record for the next command to reconcile.
+            raise
+        except TaskControlBusyError:
+            # Short Task Control contention is not an execution failure.  The
+            # state store retries its own commit boundary; any remaining
+            # contention must reach the caller without changing Run status.
             raise
         except (CodexProcessError, OSError, ValueError) as error:
             if not self.operations.controller.record_execution_failure(run_id, str(error)):
@@ -446,6 +556,11 @@ class RunDriver:
             if failed is None:  # pragma: no cover - Controller just wrote it
                 raise
             return failed
+
+    def _before_external_step(self) -> None:
+        fence = getattr(self.operations, "before_external_step", None)
+        if callable(fence):
+            fence()
 
 
 def _next_step(state: dict[str, Any]) -> RunStep | None:
@@ -503,7 +618,46 @@ def _has_pending_stale_dirty_checkout(state: dict[str, Any]) -> bool:
     )
 
 
+_PROGRESS_VOLATILE_KEYS = frozenset(
+    {
+        "diagnostics",
+        "last_retry_delay_seconds",
+        "latest_observation",
+        "last_publication_error",
+        "retry_count",
+        "timeline",
+        "timeline_continuation",
+    }
+)
+_PROGRESS_VOLATILE_FIELDS = {
+    "publication_operation_retry": frozenset({"attempts"}),
+}
+
+
 def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
+    """Return the durable identity used to detect a controller no-op.
+
+    The projection deliberately keeps the state machine's durable business
+    fields, including subject/generation/attempt/invocation/candidate/PR/head,
+    and cleanup/waiting identities. Timestamps, supervision retry metadata,
+    diagnostics, and timeline entries are observations rather than progress.
+    """
+
+    next_step = _next_step(state)
+    return (
+        next_step.value if next_step is not None else None,
+        _stable_progress_value(state),
+    )
+
+
+def _external_wait_marker(state: dict[str, Any]) -> tuple[object, ...]:
+    """Return the lifecycle identity used to gate repeated external polls.
+
+    External observations and retry bookkeeping are intentionally excluded.
+    A phase, attempt, candidate, or pull-request transition still represents
+    progress and allows the next poll to run without consuming another retry.
+    """
+
     active = state.get("active_ticket_job")
     parent = state.get("parent_job")
     acceptance = state.get("run_acceptance")
@@ -532,6 +686,32 @@ def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
         publication.get("publication_attempts") if isinstance(publication, dict) else None,
         publication.get("pr_number") if isinstance(publication, dict) else None,
     )
+
+
+def _stable_progress_value(value: object, *, key: str | None = None) -> object:
+    if key is not None and (
+        key in _PROGRESS_VOLATILE_KEYS or key.endswith("_at")
+    ):
+        return None
+    if isinstance(value, dict):
+        volatile_fields = (
+            _PROGRESS_VOLATILE_FIELDS.get(key, frozenset())
+            if key is not None
+            else frozenset()
+        )
+        return tuple(
+            (name, _stable_progress_value(child, key=name))
+            for name, child in sorted(value.items())
+            if isinstance(name, str)
+            and name not in _PROGRESS_VOLATILE_KEYS
+            and name not in volatile_fields
+            and not name.endswith("_at")
+        )
+    if isinstance(value, list):
+        return tuple(_stable_progress_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
 
 
 def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:

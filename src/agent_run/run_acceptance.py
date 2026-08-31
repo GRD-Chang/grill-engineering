@@ -104,101 +104,100 @@ class RunAcceptanceEngine:
         self._repair_promotion = RunRepairPromotion(self)
 
     def accept(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self.states.load_current_run(run_id)
-            if state is None:
-                raise ValueError(f"unknown Delivery Run: {run_id}")
-            if not self._refresh_run_currentness(state):
+        state = self.states.load_current_run(run_id)
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        if not self._refresh_run_currentness(state):
+            return self._save(state)
+        if not self._all_tickets_completed(state):
+            raise ValueError("Run Acceptance requires every Ticket to be completed")
+        run = self._run_state(state)
+        budget_policy = self._run_budget_policy(state, run)
+        ensure_budget(run, budget_policy)
+        self._invalidate_stale_acceptance(state, run)
+        while True:
+            phase = str(run["phase"])
+            if phase == "reviewing":
+                # A process can die after persisting the attempt marker but
+                # before the reviewer returns. No verdict exists yet, so a
+                # later command must start a fresh attempt rather than get
+                # stuck on an in-flight transient state.
+                if fail_interrupted_invocation(
+                    state, role="reviewer", save=self._save
+                ):
+                    return state
+                run["phase"] = "pending"
+                self._save(state)
+                continue
+            if phase == "accepted":
+                state["status"] = "run_publication_pending"
+                state["terminal_kind"] = "run_acceptance_passed"
+                state["diagnostics"] = []
                 return self._save(state)
-            if not self._all_tickets_completed(state):
-                raise ValueError("Run Acceptance requires every Ticket to be completed")
-            run = self._run_state(state)
-            budget_policy = self._run_budget_policy(state, run)
-            ensure_budget(run, budget_policy)
-            self._invalidate_stale_acceptance(state, run)
-            while True:
-                phase = str(run["phase"])
-                if phase == "reviewing":
-                    # A process can die after persisting the attempt marker but
-                    # before the reviewer returns. No verdict exists yet, so a
-                    # later command must start a fresh attempt rather than get
-                    # stuck on an in-flight transient state.
-                    if fail_interrupted_invocation(
-                        state, role="reviewer", save=self._save
-                    ):
-                        return state
-                    run["phase"] = "pending"
-                    self._save(state)
-                    continue
-                if phase == "accepted":
-                    state["status"] = "run_publication_pending"
-                    state["terminal_kind"] = "run_acceptance_passed"
-                    state["diagnostics"] = []
+            if phase == "ready_for_human":
+                state["status"] = "ready_for_human"
+                state["terminal_kind"] = "waiting_human"
+                return self._save(state)
+            if phase == "repairing":
+                repair = self._repair(state, run)
+                if repair == "waiting":
                     return self._save(state)
-                if phase == "ready_for_human":
-                    state["status"] = "ready_for_human"
-                    state["terminal_kind"] = "waiting_human"
-                    return self._save(state)
-                if phase == "repairing":
-                    repair = self._repair(state, run)
-                    if repair == "waiting":
-                        return self._save(state)
-                    if repair == "stale":
-                        run["phase"] = "pending"
-                        run.pop("acceptance_record", None)
-                        run.pop("acceptance_artifact", None)
-                        # A discarded Repair establishes the fresh Acceptance
-                        # boundary; it does not reuse this invocation to run it.
-                        return self._save(state)
-                    if repair == "no_code_changes":
-                        run["phase"] = "ready_for_human"
-                        run["blocked_reason"] = "no_code_changes"
-                        state["diagnostics"] = [
-                            {
-                                "code": "no_code_changes",
-                                "message": "Run Repair produced no code changes",
-                            }
-                        ]
-                        continue
-                    if repair == "blocked":
-                        run["phase"] = "ready_for_human"
-                        continue
-                    if repair == "promoted":
-                        # The Candidate Acceptance has already been promoted
-                        # to the integrated Run boundary.  Run Publication is
-                        # the next phase; do not ask a second full Run
-                        # Reviewer to repeat the same three lanes.
-                        return self._save(state)
+                if repair == "stale":
                     run["phase"] = "pending"
                     run.pop("acceptance_record", None)
                     run.pop("acceptance_artifact", None)
-                    self._save(state)
-                    continue
-                if phase != "pending":
-                    raise ValueError(f"unknown Run Acceptance phase: {phase}")
-                budget = ensure_budget(run, budget_policy)
-                if (
-                    pending_semantic_attempt(run, role="reviewer") is None
-                    and int(budget["reviewer_invocations"]) >= budget_policy.review_limit
-                ):
+                    # A discarded Repair establishes the fresh Acceptance
+                    # boundary; it does not reuse this invocation to run it.
+                    return self._save(state)
+                if repair == "no_code_changes":
                     run["phase"] = "ready_for_human"
-                    run["blocked_reason"] = "review_budget_exhausted"
-                    budget["checkpoint_reason"] = "review_budget_exhausted"
-                    state.update(
+                    run["blocked_reason"] = "no_code_changes"
+                    state["diagnostics"] = [
                         {
-                            "status": "ready_for_human",
-                            "terminal_kind": "waiting_human",
-                            "diagnostics": [
-                                {
-                                    "code": "review_budget_exhausted",
-                                    "message": "Run Acceptance review budget is exhausted; resume is required",
-                                }
-                            ],
+                            "code": "no_code_changes",
+                            "message": "Run Repair produced no code changes",
                         }
-                    )
+                    ]
+                    continue
+                if repair == "blocked":
+                    run["phase"] = "ready_for_human"
+                    continue
+                if repair == "promoted":
+                    # The Candidate Acceptance has already been promoted
+                    # to the integrated Run boundary.  Run Publication is
+                    # the next phase; do not ask a second full Run
+                    # Reviewer to repeat the same three lanes.
                     return self._save(state)
-                if not self._review(state, run):
-                    return self._save(state)
+                run["phase"] = "pending"
+                run.pop("acceptance_record", None)
+                run.pop("acceptance_artifact", None)
+                self._save(state)
+                continue
+            if phase != "pending":
+                raise ValueError(f"unknown Run Acceptance phase: {phase}")
+            budget = ensure_budget(run, budget_policy)
+            if (
+                pending_semantic_attempt(run, role="reviewer") is None
+                and int(budget["reviewer_invocations"]) >= budget_policy.review_limit
+            ):
+                run["phase"] = "ready_for_human"
+                run["blocked_reason"] = "review_budget_exhausted"
+                budget["checkpoint_reason"] = "review_budget_exhausted"
+                state.update(
+                    {
+                        "status": "ready_for_human",
+                        "terminal_kind": "waiting_human",
+                        "diagnostics": [
+                            {
+                                "code": "review_budget_exhausted",
+                                "message": "Run Acceptance review budget is exhausted; resume is required",
+                            }
+                        ],
+                    }
+                )
+                return self._save(state)
+            if not self._review(state, run):
+                return self._save(state)
 
     def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
         budget_policy = self._run_budget_policy(state, run)

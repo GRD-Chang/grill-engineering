@@ -4,20 +4,28 @@ import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from agent_run.error_safety import bounded_error
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.resume_audit import latest_resume_audit
+from agent_run.task_control import TaskControlBusyError
 
 
 MAX_TIMELINE_EVENTS = 256
 MAX_TIMELINE_CONTINUATION_EVENTS = 256
+# Bound transient Task Control contention without relying on scheduler yield
+# counts; the interval stays short while the total wait remains finite.
+_STATE_COMMIT_RETRY_WINDOW_SECONDS = 0.25
+_STATE_COMMIT_RETRY_INTERVAL_SECONDS = 0.001
+_T = TypeVar("_T")
 
 
 class SimulatedProcessCrash(OSError):
@@ -28,19 +36,166 @@ class StateStore:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.runs_directory = root / "runs"
+        self._lock_depth = 0
+        self._lock_owner: int | None = None
+        self._write_guard: Callable[[], None] | None = None
+        self._write_transaction: Callable[[], Any] | None = None
+
+    def _set_write_guard(
+        self,
+        guard: Callable[[], None] | None,
+        *,
+        transaction: Callable[[], Any] | None = None,
+    ) -> None:
+        """Set the short-transaction guard used before a Run state commit."""
+
+        self._write_guard = guard
+        self._write_transaction = transaction
 
     @contextmanager
     def locked(self) -> Iterator[None]:
+        owner = threading.get_ident()
+        if self._lock_owner == owner:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
         self.root.mkdir(parents=True, exist_ok=True)
         lock_path = self.root / ".lock"
         with lock_path.open("a+", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._lock_depth = 1
+            self._lock_owner = owner
             try:
                 yield
             finally:
+                self._lock_depth = 0
+                self._lock_owner = None
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        self._commit_run(
+            lambda: self._save_run_and_notify_unlocked(run_id, state)
+        )
+
+    @contextmanager
+    def _write_boundary(self) -> Iterator[None]:
+        if self._write_transaction is not None:
+            with self._write_transaction():
+                yield
+        else:
+            if self._write_guard is not None:
+                self._write_guard()
+            yield
+
+    def _commit_run(self, operation: Callable[[], _T]) -> _T:
+        retry_deadline = (
+            time.monotonic() + _STATE_COMMIT_RETRY_WINDOW_SECONDS
+        )
+        while True:
+            try:
+                # Acquire Task Control before Run state.  Every retry leaves
+                # both short-transaction contexts before trying again.
+                with self._write_boundary():
+                    with self.locked():
+                        return operation()
+            except TaskControlBusyError:
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                # Release the StateStore lock before retrying the short
+                # Task Control transaction.  Use a bounded interval rather
+                # than a fixed number of scheduler yields so a legal,
+                # millisecond-scale transaction can finish.
+                time.sleep(
+                    min(_STATE_COMMIT_RETRY_INTERVAL_SECONDS, remaining)
+                )
+
+    def create_run_if_absent(
+        self, run_id: str, state: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically create one Run or return the existing Run."""
+
+        custom_save = self._custom_save_run()
+        if custom_save is not None:
+            with self.locked():
+                existing = self.load_run(run_id)
+                if existing is not None:
+                    return existing, False
+                custom_save(run_id, state)
+                return deepcopy(state), True
+
+        def create() -> tuple[dict[str, Any], bool]:
+            existing = self.load_run(run_id)
+            if existing is not None:
+                return existing, False
+            self._save_run_and_notify_unlocked(run_id, state)
+            return deepcopy(state), True
+
+        return self._commit_run(create)
+
+    def create_run_if_unfinished_absent(
+        self,
+        repository: str,
+        parent_number: int,
+        run_id: str,
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically reuse an unfinished Parent Run or create one."""
+
+        custom_save = self._custom_save_run()
+        if custom_save is not None:
+            with self.locked():
+                unfinished = self.find_unfinished_runs(repository, parent_number)
+                if len(unfinished) > 1:
+                    run_ids = ", ".join(str(item.get("run_id")) for item in unfinished)
+                    raise ValueError(
+                        "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                        f"{run_ids}"
+                    )
+                if unfinished:
+                    return unfinished[0], False
+                return self.create_run_if_absent(run_id, state)
+
+        def create() -> tuple[dict[str, Any], bool]:
+            unfinished = self.find_unfinished_runs(repository, parent_number)
+            if len(unfinished) > 1:
+                run_ids = ", ".join(str(item.get("run_id")) for item in unfinished)
+                raise ValueError(
+                    "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                    f"{run_ids}"
+                )
+            if unfinished:
+                return unfinished[0], False
+            existing = self.load_run(run_id)
+            if existing is not None:
+                return existing, False
+            self._save_run_and_notify_unlocked(run_id, state)
+            return deepcopy(state), True
+
+        return self._commit_run(create)
+
+    def _custom_save_run(self) -> Callable[[str, dict[str, Any]], None] | None:
+        instance_method = self.__dict__.get("save_run")
+        if callable(instance_method):
+            return cast(Callable[[str, dict[str, Any]], None], instance_method)
+        class_method = getattr(type(self), "save_run", None)
+        if class_method is not StateStore.save_run:
+            return self.save_run
+        return None
+
+    def _save_run_and_notify_unlocked(
+        self, run_id: str, state: dict[str, Any]
+    ) -> None:
+        self._save_run_unlocked(run_id, state)
+        self._after_run_saved()
+
+    def _after_run_saved(self) -> None:
+        """Hook for durable-write fault injection."""
+
+    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         destination = self.runs_directory / f"{run_id}.json"
         previous = self.load_run(run_id)
@@ -595,8 +750,7 @@ class FaultInjectingStateStore(StateStore):
         self.save_count = 0
         self.injected = False
 
-    def save_run(self, run_id: str, state: dict[str, Any]) -> None:
-        super().save_run(run_id, state)
+    def _after_run_saved(self) -> None:
         self.save_count += 1
         if not self.injected and self.save_count == self.crash_after_save:
             self.injected = True

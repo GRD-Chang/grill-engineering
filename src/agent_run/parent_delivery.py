@@ -50,180 +50,175 @@ class ParentDeliveryEngine:
         self.agents = agents
 
     def deliver(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            if state.get("status") in {
-                "abandoned",
-                "unsupported_scope_change",
-            }:
-                return state
-            job = self._job(state)
-            if job["phase"] in {"completed", "ready_for_approval"}:
-                return state
-            checkout = self.states.root / "worktrees" / run_id / "parent"
-            preserve_checkout = False
-            checkout_existed_before_attempt = checkout.exists()
-            prepared = self.git.ticket_checkout_matches(
-                checkout, str(job["parent_branch"])
+        state = self._load(run_id)
+        if state.get("status") in {
+            "abandoned",
+            "unsupported_scope_change",
+        }:
+            return state
+        job = self._job(state)
+        if job["phase"] in {"completed", "ready_for_approval"}:
+            return state
+        checkout = self.states.root / "worktrees" / run_id / "parent"
+        preserve_checkout = False
+        checkout_existed_before_attempt = checkout.exists()
+        prepared = self.git.ticket_checkout_matches(
+            checkout, str(job["parent_branch"])
+        )
+        try:
+            ensure_change_branch_authority(
+                github=self.github,
+                state=state,
+                job=job,
+                branch=str(job["parent_branch"]),
+                base_branch=str(_mapping(state, "base")["branch"]),
+                save=self._save,
             )
-            try:
-                ensure_change_branch_authority(
-                    github=self.github,
-                    state=state,
-                    job=job,
-                    branch=str(job["parent_branch"]),
-                    base_branch=str(_mapping(state, "base")["branch"]),
-                    save=self._save,
+            self.git.prepare_ticket_checkout(
+                branch=str(job["parent_branch"]),
+                base_sha=str(job["base_sha"]),
+                checkout=checkout,
+            )
+            prepared = True
+            result = ParentDeliveryLoop(
+                git=self.git,
+                states=self.states,
+                github=self.github,
+                agents=self.agents,
+            ).run(state, job, checkout)
+            if result.get("status") == "completed":
+                preserve_checkout = True
+                return DeliveryCleanupEngine(
+                    git=self.git, states=self.states, github=self.github
+                ).complete_parent(result)
+            preserve_checkout = result.get("status") in {
+                "waiting_checks",
+                "requeue_required",
+                "blocked",
+                "ready_for_human",
+            } or (
+                job.get("blocked_reason") == "agent_requires_human"
+                and job.get("human_blocker_phase")
+                in {"developing", "repairing"}
+            )
+            return result
+        except KeyboardInterrupt:
+            preserve_checkout = checkout_existed_before_attempt or prepared
+            raise
+        except BaseException:
+            preserve_checkout = checkout_existed_before_attempt or prepared
+            raise
+        finally:
+            if not preserve_checkout:
+                self.git.remove_worktree(
+                    checkout,
+                    discard_worktree=not (
+                        checkout_existed_before_attempt or prepared
+                    ),
                 )
-                self.git.prepare_ticket_checkout(
-                    branch=str(job["parent_branch"]),
-                    base_sha=str(job["base_sha"]),
-                    checkout=checkout,
-                )
-                prepared = True
-                result = ParentDeliveryLoop(
-                    git=self.git,
-                    states=self.states,
-                    github=self.github,
-                    agents=self.agents,
-                ).run(state, job, checkout)
-                if result.get("status") == "completed":
-                    preserve_checkout = True
-                    return DeliveryCleanupEngine(
-                        git=self.git, states=self.states, github=self.github
-                    ).complete_parent(result)
-                preserve_checkout = result.get("status") in {
-                    "waiting_checks",
-                    "requeue_required",
-                    "blocked",
-                    "ready_for_human",
-                } or (
-                    job.get("blocked_reason") == "agent_requires_human"
-                    and job.get("human_blocker_phase")
-                    in {"developing", "repairing"}
-                )
-                return result
-            except KeyboardInterrupt:
-                preserve_checkout = checkout_existed_before_attempt or prepared
-                raise
-            except BaseException:
-                preserve_checkout = checkout_existed_before_attempt or prepared
-                raise
-            finally:
-                if not preserve_checkout:
-                    self.git.remove_worktree(
-                        checkout,
-                        discard_worktree=not (
-                            checkout_existed_before_attempt or prepared
-                        ),
-                    )
-                    self._remove_empty_worktree_directories(checkout)
+                self._remove_empty_worktree_directories(checkout)
 
     def approve(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            job = _mapping(state, "parent_job")
-            if job.get("phase") == "completed":
-                return state
-            if job.get("phase") not in {"ready_for_approval", "merging"}:
-                raise ValueError("Parent-only delivery is not awaiting approval")
-            if state.get("status") == "unsupported_scope_change":
-                return state
-            if job.get("phase") == "ready_for_approval":
-                authority = parent_approval_grant_authority(state, job)
-                if not grant_matches(job.get("approval_grant"), authority):
-                    job["approval_grant"] = create_grant(authority)
-                job["phase"] = "waiting_checks"
-                state.update(
-                    {
-                        "status": "parent_delivery_pending",
-                        "terminal_kind": None,
-                        "diagnostics": [],
-                    }
-                )
-                self._save(state)
-        return self.deliver(run_id)
-
-    def recover_closeout(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            job = _mapping(state, "parent_job")
-            if job.get("phase") != "merging":
-                return state
-        return self.deliver(run_id)
-
-    def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            job = _mapping(state, "parent_job")
-            if job.get("phase") == "completed":
-                return state
-            if job.get("phase") == "abandoned":
-                return state
-            if not discard_worktree:
-                require_clean_run_worktrees(self.git, self.states, run_id)
-            abandonment = state.get("run_abandonment")
-            if not isinstance(abandonment, dict):
-                pr_number = job.get("pr_number")
-                abandonment = {
-                    "phase": "pending",
-                    "kind": "parent_only",
-                    "parent_pr": (
-                        {"pr_number": pr_number, "status": "pending"}
-                        if isinstance(pr_number, int)
-                        else None
-                    ),
-                }
-                state.update(
-                    {
-                        "run_abandonment": abandonment,
-                        "status": "abandonment_pending",
-                        "terminal_kind": "abandonment_pending",
-                        "diagnostics": [],
-                    }
-                )
-                self._save(state)
-            parent_pr = abandonment.get("parent_pr")
-            if (
-                isinstance(parent_pr, dict)
-                and parent_pr.get("status") != "completed"
-            ):
-                self.github.abandon_parent_pr(int(parent_pr["pr_number"]))
-                parent_pr["status"] = "completed"
-                self._save(state)
-            remove_run_worktrees(
-                self.git,
-                self.states,
-                run_id,
-                discard_worktree=discard_worktree,
-            )
-            abandonment["phase"] = "completed"
-            job["phase"] = "abandoned"
+        state = self._load(run_id)
+        job = _mapping(state, "parent_job")
+        if job.get("phase") == "completed":
+            return state
+        if job.get("phase") not in {"ready_for_approval", "merging"}:
+            raise ValueError("Parent-only delivery is not awaiting approval")
+        if state.get("status") == "unsupported_scope_change":
+            return state
+        if job.get("phase") == "ready_for_approval":
+            authority = parent_approval_grant_authority(state, job)
+            if not grant_matches(job.get("approval_grant"), authority):
+                job["approval_grant"] = create_grant(authority)
+            job["phase"] = "waiting_checks"
             state.update(
                 {
-                    "status": "abandoned",
-                    "terminal_kind": "abandoned",
+                    "status": "parent_delivery_pending",
+                    "terminal_kind": None,
                     "diagnostics": [],
                 }
             )
-            return self._save(state)
+            self._save(state)
+        return self.deliver(run_id)
+
+    def recover_closeout(self, run_id: str) -> dict[str, Any]:
+        state = self._load(run_id)
+        job = _mapping(state, "parent_job")
+        if job.get("phase") != "merging":
+            return state
+        return self.deliver(run_id)
+
+    def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
+        state = self._load(run_id)
+        job = _mapping(state, "parent_job")
+        if job.get("phase") == "completed":
+            return state
+        if job.get("phase") == "abandoned":
+            return state
+        if not discard_worktree:
+            require_clean_run_worktrees(self.git, self.states, run_id)
+        abandonment = state.get("run_abandonment")
+        if not isinstance(abandonment, dict):
+            pr_number = job.get("pr_number")
+            abandonment = {
+                "phase": "pending",
+                "kind": "parent_only",
+                "parent_pr": (
+                    {"pr_number": pr_number, "status": "pending"}
+                    if isinstance(pr_number, int)
+                    else None
+                ),
+            }
+            state.update(
+                {
+                    "run_abandonment": abandonment,
+                    "status": "abandonment_pending",
+                    "terminal_kind": "abandonment_pending",
+                    "diagnostics": [],
+                }
+            )
+            self._save(state)
+        parent_pr = abandonment.get("parent_pr")
+        if (
+            isinstance(parent_pr, dict)
+            and parent_pr.get("status") != "completed"
+        ):
+            self.github.abandon_parent_pr(int(parent_pr["pr_number"]))
+            parent_pr["status"] = "completed"
+            self._save(state)
+        remove_run_worktrees(
+            self.git,
+            self.states,
+            run_id,
+            discard_worktree=discard_worktree,
+        )
+        abandonment["phase"] = "completed"
+        job["phase"] = "abandoned"
+        state.update(
+            {
+                "status": "abandoned",
+                "terminal_kind": "abandoned",
+                "diagnostics": [],
+            }
+        )
+        return self._save(state)
 
     def retire_for_child_flow(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self.states.load_current_run(run_id)
-            if state is None:
-                raise ValueError(f"unknown Delivery Run: {run_id}")
-            job = state.get("parent_job")
-            if not isinstance(job, dict):
-                return state
-            pr_number = job.get("pr_number")
-            if isinstance(pr_number, int):
-                self.github.abandon_parent_pr(pr_number)
-            job["phase"] = "abandoned_for_structure_change"
-            state["retired_parent_job"] = dict(job)
-            state.pop("parent_job", None)
-            self._save(state)
+        state = self.states.load_current_run(run_id)
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        job = state.get("parent_job")
+        if not isinstance(job, dict):
             return state
+        pr_number = job.get("pr_number")
+        if isinstance(pr_number, int):
+            self.github.abandon_parent_pr(pr_number)
+        job["phase"] = "abandoned_for_structure_change"
+        state["retired_parent_job"] = dict(job)
+        state.pop("parent_job", None)
+        self._save(state)
+        return state
 
     def _load(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
@@ -329,14 +324,13 @@ class ParentDeliveryEngine:
                 pass
 
     def has_current_approval_grant(self, run_id: str) -> bool:
-        with self.states.locked():
-            state = self._load(run_id)
-            job = _mapping(state, "parent_job")
-            try:
-                authority = parent_approval_grant_authority(state, job)
-            except (KeyError, TypeError, ValueError):
-                return False
-            return grant_matches(job.get("approval_grant"), authority)
+        state = self._load(run_id)
+        job = _mapping(state, "parent_job")
+        try:
+            authority = parent_approval_grant_authority(state, job)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return grant_matches(job.get("approval_grant"), authority)
 
     def _save(self, state: dict[str, Any]) -> dict[str, Any]:
         self.states.save_run(str(state["run_id"]), state)

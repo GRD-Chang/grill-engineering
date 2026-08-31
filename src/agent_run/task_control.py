@@ -157,8 +157,8 @@ class TaskControlStore:
             raise TaskControlError("Lifecycle Action kind must be non-empty")
         normalized_payload = _bounded_payload(payload)
         payload_digest = _payload_digest(normalized_payload)
-        with self._locked(task):
-            record = self._read_unlocked(task) or _new_record(task)
+
+        def existing_claim(record: dict[str, Any]) -> ActionClaim | None:
             current = record.get("action")
             if (
                 isinstance(current, dict)
@@ -195,11 +195,28 @@ class TaskControlStore:
                     "当前 Delivery Task 已有活动 Executor；不会提交新的 Lifecycle Action",
                     action=current if isinstance(current, dict) else None,
                 )
+            return None
 
-            # The callback runs under the task lock after every attach path
-            # has returned, but before this transaction mutates durable state.
-            if before_create is not None:
-                before_create()
+        with self._locked(task):
+            record = self._read_unlocked(task) or _new_record(task)
+            claim = existing_claim(record)
+            if claim is not None:
+                return claim
+
+        # Session preparation can inspect the environment and perform other
+        # external work. It must not extend the Task Control transaction.
+        if before_create is not None:
+            before_create()
+
+        with self._locked(task):
+            # Another process may have claimed the Task while the session was
+            # prepared. Revalidate ownership before creating the Action.
+            record = self._read_unlocked(task) or _new_record(task)
+            claim = existing_claim(record)
+            if claim is not None:
+                return claim
+            current = record.get("action")
+            executor = record.get("executor")
             generation = _positive_integer(record.get("next_generation", 1))
             if isinstance(executor, dict) and executor.get("status") in {
                 "exited",
@@ -340,6 +357,7 @@ class TaskControlStore:
         action_id: str,
         run_id: str,
         *,
+        generation: int | None = None,
         state_dir: Path | None = None,
     ) -> dict[str, Any]:
         if not run_id:
@@ -347,6 +365,14 @@ class TaskControlStore:
         with self._locked(task):
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
+            if (
+                generation is not None
+                and _positive_integer(action.get("executor_generation"))
+                != generation
+            ):
+                raise ActionReconciliationError(
+                    "Lifecycle Action generation changed before Run binding"
+                )
             if action.get("run_id") not in {None, run_id}:
                 raise ActionReconciliationError(
                     "Lifecycle Action is already bound to another Delivery Run"
@@ -364,6 +390,13 @@ class TaskControlStore:
                 record["run_state_dir"] = str(Path(state_dir).resolve())
             executor = record.get("executor")
             if isinstance(executor, dict) and executor.get("action_id") == action_id:
+                if (
+                    generation is not None
+                    and executor.get("generation") != generation
+                ):
+                    raise ActionReconciliationError(
+                        "Executor generation changed before Run binding"
+                    )
                 if executor.get("run_id") not in {None, run_id}:
                     raise ActionReconciliationError(
                         "Executor is already bound to another Delivery Run"
@@ -380,10 +413,18 @@ class TaskControlStore:
         action_id: str,
         run_id: str,
         payload_digest: str,
+        generation: int | None = None,
         state_dir: Path | None = None,
     ) -> dict[str, Any]:
         with self._locked(task):
             record = self._require_unlocked(task)
+            executor: dict[str, Any] | None = None
+            if generation is not None:
+                executor = _require_executor(record, action_id, generation)
+                if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
+                    raise ActionReconciliationError(
+                        "Executor ownership is no longer active"
+                    )
             action = _require_active_action(record, action_id)
             if action.get("payload_digest") != payload_digest:
                 raise ActionReconciliationError(
@@ -438,8 +479,10 @@ class TaskControlStore:
         reclaim: bool = False,
         before_create: Callable[[], None] | None = None,
     ) -> ExecutorReservation:
-        with self._locked(task):
-            record = self._require_unlocked(task)
+
+        def existing_reservation(
+            record: dict[str, Any]
+        ) -> ExecutorReservation | None:
             action = _require_active_action(record, action_id)
             if action.get("run_id") not in {None, run_id}:
                 raise ActionReconciliationError(
@@ -473,11 +516,26 @@ class TaskControlStore:
                 raise ActionReconciliationError(
                     "原 Executor 已退出；必须显式恢复，不能重放原业务意图"
                 )
+            return None
 
-            # A joined generation returns above; only a genuinely new
-            # Executor session performs its preparation before reservation.
-            if before_create is not None:
-                before_create()
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            reservation = existing_reservation(record)
+            if reservation is not None:
+                return reservation
+
+        # Environment capture and other launch preparation are external work;
+        # do it before the short reservation transaction and revalidate after.
+        if before_create is not None:
+            before_create()
+
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            reservation = existing_reservation(record)
+            if reservation is not None:
+                return reservation
+            action = _require_active_action(record, action_id)
+            existing = record.get("executor")
             generation = _positive_integer(action.get("executor_generation"))
             if (
                 isinstance(existing, dict)
@@ -532,6 +590,57 @@ class TaskControlStore:
                     "Executor 不是可恢复的 active/exited/absent 状态"
                 )
             return deepcopy(record)
+
+    def assert_executor_current(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        run_id: str | None = None,
+    ) -> None:
+        """Revalidate the exact Executor fence before an external side effect."""
+
+        with self._executor_current_transaction(
+            task,
+            action_id=action_id,
+            generation=generation,
+            run_id=run_id,
+        ):
+            return
+
+    @contextmanager
+    def _executor_current_transaction(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        run_id: str | None = None,
+    ) -> Iterator[None]:
+        """Hold ownership through one short external/state commit boundary."""
+
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            executor = _require_executor(record, action_id, generation)
+            if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
+                raise ActionReconciliationError(
+                    "Executor ownership is no longer active"
+                )
+            if run_id is not None and executor.get("run_id") not in {None, run_id}:
+                raise ActionReconciliationError(
+                    "Executor is bound to another Delivery Run"
+                )
+            action = record.get("action")
+            if not isinstance(action, dict) or action.get("action_id") != action_id:
+                raise ActionReconciliationError(
+                    "Executor Action is no longer the current Task Action"
+                )
+            if action.get("status") not in _ACTIVE_ACTION_STATUSES | {"completed"}:
+                raise ActionReconciliationError(
+                    "Executor Action is no longer authorized"
+                )
+            yield
 
     def mark_process_started(
         self,
@@ -619,6 +728,7 @@ class TaskControlStore:
         task: TaskKey,
         *,
         action_id: str,
+        generation: int | None = None,
         result_status: str | None = None,
     ) -> dict[str, Any]:
         """Release admission after handshake and durable intent application."""
@@ -627,6 +737,8 @@ class TaskControlStore:
             record = self._require_unlocked(task)
             action = _require_active_action(record, action_id)
             executor = record.get("executor")
+            if generation is not None:
+                _require_executor(record, action_id, generation)
             if (
                 not isinstance(executor, dict)
                 or executor.get("action_id") != action_id
