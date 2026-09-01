@@ -22,7 +22,7 @@ from agent_run.operator_action_presentation import (
     operator_action_view,
     print_operator_action as _print_operator_action,
 )
-from agent_run.presentation_helpers import current_work_subject
+from agent_run.presentation_helpers import current_work_subject, human_next_action
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.run_lifecycle import ActionReceipt
@@ -63,33 +63,47 @@ def public_action_receipt(
         "next_action": next_action,
     }
 
-def _print_precondition_failure(state: dict[str, object]) -> None:
+def _print_precondition_failure(
+    state: dict[str, object], *, as_json: bool = False
+) -> None:
     active = _active_ticket_job(state)
     diagnostics = state.get("diagnostics")
     current_diagnostics = diagnostics if isinstance(diagnostics, list) else []
-    print(
-        json.dumps(
-            {
-                "result": "resumed",
-                "run_id": state["run_id"],
-                "status": state["status"],
-                "run_branch": state.get("run_branch", state.get("parent_branch")),
-                "active_ticket": active.get("ticket_number") if active else None,
-                "diagnostics": [
-                    *current_diagnostics,
-                    {
-                        "code": "command_precondition",
-                        "message": "当前交付运行尚未满足此命令的执行条件",
-                    },
-                ],
-                "scope_change": state.get("unsupported_scope_change"),
-                "abandonment": state.get("run_abandonment"),
-                "delivery_cleanup": _public_delivery_cleanup(state),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+    diagnostic = {
+        "code": "command_precondition",
+        "message": "当前交付运行尚未满足此命令的执行条件",
+    }
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "result": "resumed",
+                    "run_id": state["run_id"],
+                    "status": state["status"],
+                    "run_branch": state.get(
+                        "run_branch", state.get("parent_branch")
+                    ),
+                    "active_ticket": (
+                        active.get("ticket_number") if active else None
+                    ),
+                    "diagnostics": [*current_diagnostics, diagnostic],
+                    "scope_change": state.get("unsupported_scope_change"),
+                    "abandonment": state.get("run_abandonment"),
+                    "delivery_cleanup": _public_delivery_cleanup(state),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         )
-    )
+        return
+
+    parent = state.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
+    print(f"Repository: {state.get('repository')}")
+    print(f"Parent Issue: #{parent_number}")
+    print(f"交付状态: {human_delivery_status(state.get('status'))}")
+    print(f"命令状态: 未应用（{diagnostic['message']}）")
+    print("下一步: " + str(human_next_action_for_state(state)))
 
 
 def _print_status(state: dict[str, object], *, as_json: bool) -> None:
@@ -148,7 +162,13 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "latest_resume": latest_resume,
         "supervision": public_supervision_snapshot(state),
     }
-    progress = status_progress_view(state, output)
+    progress_source = output
+    if not as_json:
+        progress_source = {
+            **output,
+            "next_action": human_next_action_for_state(state),
+        }
+    progress = status_progress_view(state, progress_source)
     output["progress"] = progress
     if as_json:
         output["lifecycle_action"] = state.get("action_application_receipt")
@@ -159,8 +179,8 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         output,
         progress,
         display_term=_display_term,
-        print_operator_action=lambda action: _print_operator_action(
-            action, run_id=state.get("run_id")
+        print_operator_action=lambda action: _print_human_operator_action(
+            state, action
         ),
     )
 
@@ -215,18 +235,24 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         "agent_resumes": agent_resumes,
         "supervision": public_supervision_snapshot(state),
     }
-    progress = history_progress_view(state, output)
+    progress_source = output
+    if not as_json:
+        progress_source = {
+            **output,
+            "next_action": human_next_action_for_state(state),
+        }
+    progress = history_progress_view(state, progress_source)
     output.update(progress)
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
     print_history_progress(
         state,
-        output,
+        progress_source,
         progress,
         display_term=_display_term,
-        print_operator_action=lambda action: _print_operator_action(
-            action, run_id=state.get("run_id")
+        print_operator_action=lambda action: _print_human_operator_action(
+            state, action
         ),
     )
 
@@ -457,7 +483,7 @@ def _next_action(state: dict[str, Any]) -> str:
             and item.get("recovery_kind") == "stale_dirty_checkout"
             for item in items.values()
         ):
-            return (
+                return (
                 "先检查并把 stale Managed Development Checkout 的成果转存到安全位置，"
                 "再使旧 checkout 恢复 clean；"
                 f"随后用 agent-run run {parent_number} 退休旧 checkout 并继续 fresh Run Acceptance，"
@@ -501,6 +527,7 @@ def _next_action(state: dict[str, Any]) -> str:
         )
     if status in {
         "active",
+        "starting",
         "ticket_completed",
         "parent_delivery_pending",
         "run_acceptance_pending",
@@ -521,6 +548,61 @@ def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
         current_identity=_current_delivery_identity(state),
         fallback_next_action=_next_action(state),
     )
+
+
+def human_delivery_status(value: object) -> object:
+    """Render the same delivery terminology used by status and history."""
+
+    return _display_term(value)
+
+
+def human_next_action_for_state(state: Mapping[str, Any]) -> object:
+    """Project an ordinary recovery command through the Parent selector."""
+
+    public_state = state if isinstance(state, dict) else dict(state)
+    operator_action = _operator_action_view(public_state)
+    value: object = _next_action(public_state)
+    if isinstance(operator_action, Mapping):
+        next_action = operator_action.get("next_action")
+        if isinstance(next_action, str):
+            value = next_action
+    if not isinstance(value, str):
+        return value
+    repository = state.get("repository")
+    parent = state.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, Mapping) else None
+    run_id = state.get("run_id")
+    if (
+        isinstance(repository, str)
+        and isinstance(parent_number, int)
+        and isinstance(run_id, str)
+        and f"agent-run abandon {run_id} --discard-worktree" in value
+    ):
+        return value.replace(
+            f"agent-run run {parent_number}",
+            f"agent-run run {parent_number} --repo {repository}",
+        ).replace(
+            f"agent-run abandon {run_id} --discard-worktree",
+            f"agent-run abandon {parent_number} --repo {repository} --discard-worktree",
+        )
+    parts = value.split()
+    if (
+        len(parts) == 3
+        and parts[0] == "agent-run"
+        and parts[1] in {"run", "resume", "approve", "requeue", "abandon"}
+        and isinstance(repository, str)
+        and isinstance(parent_number, int)
+    ):
+        return f"agent-run {parts[1]} {parent_number} --repo {repository}"
+    return human_next_action(value, run_id=run_id)
+
+
+def _print_human_operator_action(
+    state: Mapping[str, Any], action: dict[str, Any]
+) -> None:
+    human_action = dict(action)
+    human_action["next_action"] = human_next_action_for_state(state)
+    _print_operator_action(human_action)
 
 
 def _current_worker(state: dict[str, object]) -> dict[str, object] | None:
@@ -765,6 +847,7 @@ def _display_term(value: object) -> object:
         return value
     return {
         "active": "进行中",
+        "starting": "正在启动",
         "ticket_completed": "任务已完成",
         "waiting_checks": "等待必需检查",
         "waiting_merge": "等待合并确认",
@@ -778,6 +861,7 @@ def _display_term(value: object) -> object:
         "run_acceptance_pending": "等待运行整体验收",
         "run_publication_pending": "等待运行发布",
         "run_approval_pending": "等待人工批准",
+        "requeue_required": "需要重新排队",
         "ready_for_human": "等待人工处理",
         "unsupported_scope_change": "不支持的范围变化",
         "deterministic_contradiction": "确定性矛盾，需人工处理",
@@ -786,6 +870,7 @@ def _display_term(value: object) -> object:
         "execution_failed": "执行失败，可恢复",
         "supervision_timeout": "监督超时暂停，可恢复",
         "blocked": "已阻塞",
+        "incompatible_run_state": "状态协议不兼容",
         "unreviewed": "未验收",
         "pass": "已通过",
         "fail": "未通过",

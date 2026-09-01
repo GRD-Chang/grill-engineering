@@ -31,7 +31,7 @@ from agent_run.run_driver import DirectRunOperations
 from agent_run.state import StateStore
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.review_budget import new_budget
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_round_agents, passing_acceptance
 
@@ -860,7 +860,7 @@ def test_completed_parent_cannot_be_rebound_by_a_diagnostic_gate(
         json.dumps(parent_round_agents(1, passing_last=True)),
         encoding="utf-8",
     )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -1394,7 +1394,7 @@ def test_deliver_advances_the_complete_dag_and_enters_run_acceptance(
         ),
         encoding="utf-8",
     )
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
 
     delivered = run_internal_stage(
@@ -1451,7 +1451,7 @@ def test_graph_change_fails_closed_with_auditable_revisions(
     fixture = write_fixture(
         git_repo / "github.json", issues={"2": _ticket(2)}
     )
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
     original = load_only_run_state(git_repo)
 
@@ -1462,7 +1462,7 @@ def test_graph_change_fails_closed_with_auditable_revisions(
     )
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    paused = run_cli(git_repo, fixture, "start", "1")
+    paused = seed_run(git_repo, fixture, "1")
 
     assert paused.returncode == 2
     state = load_only_run_state(git_repo)
@@ -1504,7 +1504,7 @@ def test_graph_change_fails_closed_with_auditable_revisions(
     data["parent"]["sub_issues"] = [2]
     data["issues"].pop("3")
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    restored = run_cli(git_repo, fixture, "start", "1")
+    restored = seed_run(git_repo, fixture, "1")
 
     assert restored.returncode == 0
     restored_state = load_only_run_state(git_repo)
@@ -1519,13 +1519,13 @@ def test_later_graph_drift_updates_observed_revision_without_accepting_it(
         git_repo / "github.json", issues={"2": _ticket(2)}
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1")
     )["run_id"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["sub_issues"].append(3)
     data["issues"]["3"] = _ticket(3)
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     first = load_only_run_state(git_repo)["unsupported_scope_change"]
     accepted = first["accepted_graph_revision"]
     first_observed = first["observed_graph_revision"]
@@ -1534,7 +1534,7 @@ def test_later_graph_drift_updates_observed_revision_without_accepting_it(
     data["parent"]["sub_issues"].append(4)
     data["issues"]["4"] = _ticket(4)
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    resumed = run_cli(git_repo, fixture, "start", "1")
+    resumed = seed_run(git_repo, fixture, "1")
 
     assert resumed.returncode == 2
     state = load_only_run_state(git_repo)
@@ -1577,7 +1577,7 @@ def test_parent_clarification_and_comments_do_not_change_the_ticket_graph(
         git_repo / "github.json", issues={"2": _ticket(2)}
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1")
     )["run_id"]
     original = load_only_run_state(git_repo)
     data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -1589,7 +1589,7 @@ def test_parent_clarification_and_comments_do_not_change_the_ticket_graph(
     data["issues"]["2"]["updated_at"] = "2099-01-01T00:00:00Z"
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    resumed = run_cli(git_repo, fixture, "start", "1")
+    resumed = seed_run(git_repo, fixture, "1")
 
     assert resumed.returncode == 0
     state = load_only_run_state(git_repo)
@@ -1645,7 +1645,7 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         ),
         encoding="utf-8",
     )
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
 
     result = run_cli(
@@ -1895,7 +1895,7 @@ def test_run_recovers_after_process_failure_between_tickets(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1")
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -2023,7 +2023,7 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1")
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -2107,7 +2107,7 @@ def test_provisional_close_intent_can_abandon(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
 
     interrupted = run_internal_stage(
         git_repo,

@@ -66,10 +66,10 @@ Invocation 内的初始调用和 Output Repair 共用该 deadline。
 
 ```bash
 agent-run resume <parent-issue> [--new-thread] [--message "..."] --repo OWNER/REPO
-agent-run requeue <run-id> --repo OWNER/REPO
+agent-run requeue <parent-issue> --repo OWNER/REPO
 agent-run approve <parent-issue> --repo OWNER/REPO
-agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
-agent-run abandon <run-id> [--discard-worktree] --repo OWNER/REPO
+agent-run revise <parent-issue> --message '未经改写的维护者反馈' --repo OWNER/REPO
+agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 ```
 
 ### GitHub 只读身份
@@ -106,9 +106,9 @@ Thread。Publication 默认继续引用 Development；显式覆盖后即使切�
 恢复引用才重新跟随 Development：
 
 ```bash
-agent-run configure <run-id> --development-model gpt-5.6-luna
-agent-run configure <run-id> --publication-model gpt-5.6-sol
-agent-run configure <run-id> --publication-from-development
+agent-run configure <parent-issue> --development-model gpt-5.6-luna
+agent-run configure <parent-issue> --publication-model gpt-5.6-sol
+agent-run configure <parent-issue> --publication-from-development
 ```
 
 Profile Revision 同时保留各角色的 preset 与显式覆盖来源。Publication 从 Development
@@ -183,12 +183,11 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 
 ### 命令边界与状态轮转
 
-下表是 `start/run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。Controller
+下表是 `run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。Controller
 内部阶段不是维护者操作；它们不能越过下表中的人工边界。
 
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
-| `start` | 新 Run 或同一 Parent 的现有 Run | 创建或幂等返回本地 Run 记录及其受管 Run Branch，供集成或排障检查身份与状态 | 不推进自动生命周期；日常交付不以它替代 `run` |
 | `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
 | `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；或为同一等待身份开启新监督窗口 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
@@ -241,10 +240,10 @@ Development 与 Fresh Acceptance 的权威上下文。它不修改 Issue、不�
 
 ```bash
 agent-run status --repo OWNER/REPO --parent <parent-issue>
-agent-run requeue <run-id> --repo OWNER/REPO
+agent-run requeue <parent-issue> --repo OWNER/REPO
 ```
 
-`run` 创建或恢复 Run、Run Branch 和工作前沿，并在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
+`run` 创建或恢复 Run、Run Branch 和工作前沿，并由准确的 Run Executor 逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
 重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
 Required Checks 仍为 pending 时，`run` 在有限窗口内监督；窗口到期后保存
 `supervision_timeout`，状态提示的恢复操作是 `resume`（同一 Parent 的显式 `run` 同样允许）；两者均不会重复创建 PR 或消耗修改预算。
@@ -256,8 +255,13 @@ Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置�
 最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；
 `status`、`history` 可以按当前仓库的唯一进行中 Run、`--parent`，或任意目录的
 `--repo + --parent` 选择。若没有唯一候选、存在多个 clone、索引失效或冲突，命令会列出候选并
-停止，绝不按最近时间猜测或全盘搜索。其他会推进 Run 或改变外部状态的命令仍必须从目标仓库运行，
-或显式指定 state 目录。
+停止，绝不按最近时间猜测或全盘搜索。普通 mutation 与 Run-scoped `configure` 同样使用 Parent
+位置参数并执行零匹配、多匹配和 repository mismatch 检查；完整 Run ID 与显式 state 目录仅是
+自动化和精确排障入口。改变 Run 的命令仍必须从目标仓库运行。
+
+Lifecycle mutation 默认输出面向维护者的回执，只显示仓库、Parent、操作、是否附着原操作、动作是否
+已应用、当前交付状态与下一步；动作应用完成不代表整个交付已经完成。Action ID、Run ID、Executor
+generation、payload digest 等稳定机器审计事实只在显式 `--json` 输出中提供。
 
 如果 merge 的写入响应出现网络错误或无法解析的响应，Publisher 不盲目重放：先在 GitHub 对账。PR 已
 合并即恢复成功；PR 仍 OPEN 且 live head/base、Required Checks 与 mergeability 均保持当前时，最多重试

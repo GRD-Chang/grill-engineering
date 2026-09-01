@@ -57,6 +57,7 @@ from agent_run.executor_host import (
     BoundExecutorHost,
     ExecutorAgentInterruptedError,
     ExecutorHost,
+    ExecutorLostError,
     ExecutorSpec,
     ExecutorStartUnknownError,
     FakeExecutorHost,
@@ -66,7 +67,7 @@ from agent_run.systemd_executor_host import (
     SystemdExecutionReadinessError,
     SystemdUserExecutorHost,
 )
-from agent_run.run_driver import DirectRunOperations, RunDriver
+from agent_run.run_driver import DirectRunOperations, RunDriver, RunOutcomeKind
 from agent_run.run_lifecycle import (
     ActionReceipt,
     LifecycleRequest,
@@ -78,7 +79,11 @@ from agent_run.run_locator import (
     RunLocatorError,
     RunLocatorIndex,
 )
-from agent_run.state import FaultInjectingStateStore, StateStore
+from agent_run.state import (
+    FaultInjectingStateStore,
+    SimulatedProcessCrash,
+    StateStore,
+)
 from agent_run.state_contract import (
     IncompatibleRunStateError,
     human_blocker_subject_count,
@@ -128,25 +133,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="command",
         required=True,
         metavar=(
-            "{start,run,resume,requeue,approve,revise,abandon,status,history,"
+            "{run,resume,requeue,approve,revise,abandon,status,history,"
             "runs,configure,policy,auth,doctor}"
         ),
     )
-    start = subcommands.add_parser(
-        "start", help="创建或返回交付运行及受管 Run Branch（不推进工作流）"
-    )
-    start.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
-    _add_common_options(start)
-    _add_profile_options(start)
-    _add_policy_options(start)
-    start.add_argument("--new-run", action="store_true", help=argparse.SUPPRESS)
     run = subcommands.add_parser(
-        "run", help="推进正常 Job Loop，停在需要操作者处理的边界"
+        "run", help="创建或继续 Parent 的自动交付，停在需要操作者处理的边界"
     )
     run.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
     _add_common_options(run)
     _add_profile_options(run)
     _add_policy_options(run)
+    run.add_argument("--json", action="store_true", dest="as_json")
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume = subcommands.add_parser(
         "resume", help="恢复失败/Human Blocker Invocation 或监督超时窗口"
@@ -157,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_options(resume)
     _add_policy_options(resume)
+    resume.add_argument("--json", action="store_true", dest="as_json")
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--new-thread",
@@ -166,8 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
     requeue = subcommands.add_parser(
         "requeue", help="仅从 requeue_required 创建新的 Change Job Generation"
     )
-    requeue.add_argument("run_id", help="交付运行标识")
+    requeue.add_argument(
+        "run_id",
+        metavar="parent-issue-or-run-id",
+        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+    )
     _add_common_options(requeue)
+    requeue.add_argument("--json", action="store_true", dest="as_json")
     requeue.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--message",
@@ -182,18 +186,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
     )
     _add_common_options(approve)
+    approve.add_argument("--json", action="store_true", dest="as_json")
+    approve.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     revise = subcommands.add_parser("revise", help="以 Run 级人工反馈开启新的修复窗口")
-    revise.add_argument("run_id", help="交付运行标识")
+    revise.add_argument(
+        "run_id",
+        metavar="parent-issue-or-run-id",
+        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+    )
     revise.add_argument("--message", required=True, help="未经改写的修订反馈")
     _add_common_options(revise)
+    revise.add_argument("--json", action="store_true", dest="as_json")
+    revise.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     abandon = subcommands.add_parser("abandon", help="放弃交付运行并执行受限恢复与清理")
-    abandon.add_argument("run_id", help="交付运行标识")
+    abandon.add_argument(
+        "run_id",
+        metavar="parent-issue-or-run-id",
+        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+    )
     abandon.add_argument(
         "--discard-worktree",
         action="store_true",
         help="不可恢复地丢弃该 Run 的 dirty Managed Development Checkout",
     )
     _add_common_options(abandon)
+    abandon.add_argument("--json", action="store_true", dest="as_json")
     status = subcommands.add_parser("status", help="显示当前状态与下一条允许的操作")
     status.add_argument("run_id", nargs="?", help="完整 Run ID；省略时使用 Human Run Selector")
     _add_common_options(status)
@@ -213,7 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
         aliases=["config", "profile"],
         help="为未来创建的顶层 Codex Thread 创建新的 Agent Profile Revision",
     )
-    configure.add_argument("run_id", help="交付运行标识")
+    configure.add_argument(
+        "run_id",
+        metavar="parent-issue-or-run-id",
+        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+    )
     _add_common_options(configure)
     _add_profile_options(configure)
     configure.add_argument("--json", action="store_true", dest="as_json")
@@ -288,12 +309,12 @@ def _main_with_parser_resources(
         _validate_explicit_policy_options(parsed)
         delivery_policy_provider = (
             (lambda: _resolve_delivery_policy(parsed))
-            if parsed.command in {"start", "run", "resume"}
+            if parsed.command in {"run", "resume"}
             else None
         )
         creation_profile = (
             _profile_configuration(parsed)
-            if parsed.command in {"start", "run"}
+            if parsed.command == "run"
             else None
         )
         if parsed.command == "auth":
@@ -302,8 +323,6 @@ def _main_with_parser_resources(
             return doctor.run(as_json=parsed.as_json)
         if parsed.command == "policy":
             return _policy_command(parsed)
-        if parsed.command in {"configure", "config", "profile"}:
-            return _configure_profile(parsed)
         if parsed.command == "runs":
             return _list_runs(parsed)
         if parsed.command in {"status", "history"}:
@@ -340,8 +359,18 @@ def _main_with_parser_resources(
             profiles=profiles,
             delivery_policy_provider=delivery_policy_provider,
         )
+        if parsed.command in {
+            "resume",
+            "requeue",
+            "approve",
+            "revise",
+            "abandon",
+            "configure",
+            "config",
+            "profile",
+        }:
+            _resolve_mutation_selection(parsed, git, states)
         if parsed.command == "resume":
-            _resolve_resume_selection(parsed, git)
             selected_resume = cli_surface._load_local_run(states, parsed.run_id)
             selected_parent = selected_resume.get("parent")
             selected_parent_number = (
@@ -352,10 +381,16 @@ def _main_with_parser_resources(
             if type(selected_parent_number) is not int:
                 raise ValueError("Delivery Run is missing its Parent Issue")
             parsed.parent = selected_parent_number
-        elif parsed.command == "approve":
-            _resolve_approve_selection(parsed, git)
+        if parsed.command in {"configure", "config", "profile"}:
+            return _configure_profile(parsed)
         executor_binding = _executor_binding_from_environment()
-        executor_backed = parsed.command in {"run", "resume"}
+        executor_backed = parsed.command in {
+            "run",
+            "resume",
+            "requeue",
+            "approve",
+            "revise",
+        }
         runner_lease_fd: int | None = None
         if (
             executor_backed
@@ -394,13 +429,21 @@ def _main_with_parser_resources(
                 supplied_arguments
             )
         if not executor_backed:
-            _reject_if_task_action_pending(parsed, states, github, git)
+            _reject_if_task_action_pending(parsed, states, git)
         if parsed.command in {"resume", "requeue", "approve", "revise", "abandon"}:
             _require_profile(profiles, parsed.run_id)
+        if executor_backed and parsed.command != "run":
+            _require_task_control_for_existing_receipt(parsed, states, git)
         if cli_surface._is_lifecycle_action(parsed.command):
             local_state = cli_surface._load_local_run(states, parsed.run_id)
-            if not cli_surface._command_is_ready(local_state, parsed.command):
-                cli_presentation._print_precondition_failure(local_state)
+            if (
+                not cli_surface._command_is_ready(local_state, parsed.command)
+                and not _lifecycle_action_is_attachable(parsed, github, git)
+            ):
+                _reject_if_task_action_pending(parsed, states, git)
+                cli_presentation._print_precondition_failure(
+                    local_state, as_json=parsed.as_json
+                )
                 return 2
         if executor_backed:
             if parsed.command == "resume":
@@ -413,27 +456,34 @@ def _main_with_parser_resources(
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
-                if executor_binding is None and not resume_attachable:
-                    _reject_if_task_action_pending(parsed, states, github, git)
                 if not resume_attachable and not cli_surface._resume_is_ready(current):
-                    cli_presentation._print_precondition_failure(current)
+                    _reject_if_task_action_pending(parsed, states, git)
+                    cli_presentation._print_precondition_failure(
+                        current, as_json=parsed.as_json
+                    )
                     return 2
                 if (
                     not resume_attachable
                     and parsed.message is not None
                     and human_blocker_subject_count(current) != 1
                 ):
-                    cli_presentation._print_precondition_failure(current)
+                    cli_presentation._print_precondition_failure(
+                        current, as_json=parsed.as_json
+                    )
                     return 2
                 if current.get("status") == "supervision_timeout" and (
                     parsed.new_thread or parsed.message is not None
                 ):
-                    cli_presentation._print_precondition_failure(current)
+                    cli_presentation._print_precondition_failure(
+                        current, as_json=parsed.as_json
+                    )
                     return 2
                 if has_non_invocation_execution_failure(current) and (
                     parsed.new_thread or parsed.message is not None
                 ):
-                    cli_presentation._print_precondition_failure(current)
+                    cli_presentation._print_precondition_failure(
+                        current, as_json=parsed.as_json
+                    )
                     return 2
             state, resumed, lifecycle_receipt = _run_lifecycle(
                 parsed,
@@ -448,18 +498,6 @@ def _main_with_parser_resources(
                 executor_binding=executor_binding,
                 prepare_executor_session=prepare_executor_session,
             )
-        elif parsed.command == "start":
-            state, resumed = controller.start(
-                parsed.parent, reuse_existing=not parsed.new_run
-            )
-            _initialize_profile(
-                profiles, state, creation_profile, allow_create=not resumed
-            )
-        elif parsed.command == "requeue":
-            state = _run_driver(
-                parsed, states, controller, git, github, profiles
-            ).operations.requeue(parsed.run_id).state
-            resumed = True
         else:
             refreshed, _ = controller.resume(parsed.run_id)
             if is_github_refresh_wait(refreshed):
@@ -526,36 +564,7 @@ def _main_with_parser_resources(
                 # lifecycle command.
                 state = refreshed
                 precondition_failed = True
-            elif (
-                parsed.command == "approve"
-                and refreshed.get("delivery_type") == "parent_only"
-                and refreshed.get("status") == "parent_approval_pending"
-            ):
-                state = ParentDeliveryEngine(
-                    git=git, states=states, github=publisher, agents=agents
-                ).approve(parsed.run_id)
-            elif (
-                parsed.command == "approve"
-                and refreshed.get("delivery_type") == "parent_only"
-                and refreshed.get("status") == "parent_closeout_pending"
-            ):
-                state = ParentDeliveryEngine(
-                    git=git, states=states, github=publisher, agents=agents
-                ).recover_closeout(parsed.run_id)
-            elif (
-                parsed.command == "approve"
-                and refreshed.get("status") == "run_approval_pending"
-            ):
-                state = publication.approve(parsed.run_id)
-            elif parsed.command == "revise" and refreshed.get("status") in {
-                "ready_for_human",
-                "run_approval_pending",
-            }:
-                state = publication.revise(parsed.run_id, parsed.message)
-            elif (
-                parsed.command == "abandon"
-                and refreshed.get("delivery_type") == "parent_only"
-            ):
+            elif refreshed.get("delivery_type") == "parent_only":
                 state = ParentDeliveryEngine(
                     git=git,
                     states=states,
@@ -566,15 +575,10 @@ def _main_with_parser_resources(
                     discard_worktree=parsed.discard_worktree,
                 )
             else:
-                state = (
-                    refreshed
-                    if parsed.command != "abandon"
-                    else publication.abandon(
-                        parsed.run_id,
-                        discard_worktree=parsed.discard_worktree,
-                    )
+                state = publication.abandon(
+                    parsed.run_id,
+                    discard_worktree=parsed.discard_worktree,
                 )
-                precondition_failed = parsed.command != "abandon"
             resumed = True
         active_ticket_job = state.get("active_ticket_job")
         diagnostics = state.get("diagnostics")
@@ -613,13 +617,24 @@ def _main_with_parser_resources(
                     output["next_action"], run_id=state.get("run_id")
                 ),
             )
-        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        if getattr(parsed, "as_json", False):
+            if lifecycle_receipt is not None:
+                output["action_audit"] = _action_audit(lifecycle_receipt)
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_lifecycle_result(state, output, lifecycle_receipt)
         if precondition_failed:
             return 2
         return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
     except (ExecutorAgentInterruptedError, KeyboardInterrupt) as interruption:
         agent_interrupted = isinstance(interruption, ExecutorAgentInterruptedError)
-        executor_backed = parsed.command in {"run", "resume"}
+        executor_backed = parsed.command in {
+            "run",
+            "resume",
+            "requeue",
+            "approve",
+            "revise",
+        }
         interrupt_controller = controller
         interrupt_states = states
         run_id = getattr(parsed, "run_id", None)
@@ -685,44 +700,46 @@ def _main_with_parser_resources(
             if interrupt_states is not None and isinstance(run_id, str)
             else None
         )
-        print(
-            json.dumps(
+        interruption_output = {
+            "result": "interrupted",
+            "run_id": run_id,
+            "status": (
+                durable.get("status", "unknown")
+                if executor_backed and isinstance(durable, dict)
+                else "execution_failed"
+            ),
+            "diagnostics": [
                 {
-                    "result": "interrupted",
-                    "run_id": run_id,
-                    "status": (
-                        durable.get("status", "unknown")
-                        if executor_backed and isinstance(durable, dict)
-                        else "execution_failed"
+                    "code": (
+                        "executor_agent_interrupted"
+                        if agent_interrupted
+                        else "observation_interrupted"
+                        if executor_backed
+                        else "controller_interrupted"
                     ),
-                    "diagnostics": [
-                        {
-                            "code": (
-                                "executor_agent_interrupted"
-                                if agent_interrupted
-                                else "observation_interrupted"
-                                if executor_backed
-                                else "controller_interrupted"
-                            ),
-                            "message": (
-                                "Executor 内 Agent Invocation 被中断；已保留可恢复的 Semantic Agent Attempt"
-                                if agent_interrupted
-                                else "已离开 Lifecycle Action 观察；CLI 未改写 Delivery Run"
-                                if executor_backed
-                                else "控制器被中断；已保留 Managed Development Checkout 与当前 Semantic Agent Attempt"
-                            ),
-                        }
-                    ],
-                    "next_action": (
-                        cli_presentation._next_action(durable)
-                        if isinstance(durable, dict)
-                        else None
+                    "message": (
+                        "Executor 内 Agent Invocation 被中断；已保留可恢复的 Semantic Agent Attempt"
+                        if agent_interrupted
+                        else "已离开 Lifecycle Action 观察；CLI 未改写 Delivery Run"
+                        if executor_backed
+                        else "控制器被中断；已保留 Managed Development Checkout 与当前 Semantic Agent Attempt"
                     ),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+                }
+            ],
+            "next_action": (
+                cli_presentation._next_action(durable)
+                if isinstance(durable, dict)
+                else None
+            ),
+        }
+        if getattr(parsed, "as_json", False):
+            print(
+                json.dumps(
+                    interruption_output, ensure_ascii=False, sort_keys=True
+                )
             )
-        )
+        else:
+            _print_interruption_result(durable, interruption_output)
         return 130
     except (
         CodexProcessError,
@@ -732,7 +749,27 @@ def _main_with_parser_resources(
         ValueError,
         WorkerSandboxError,
     ) as error:
-        run_id = getattr(parsed, "run_id", None)
+        selected_run_id = getattr(parsed, "run_id", None)
+        run_id = selected_run_id
+        if (
+            not isinstance(run_id, str)
+            and states is not None
+            and git is not None
+            and github is not None
+        ):
+            parent_number = getattr(parsed, "parent", None)
+            if type(parent_number) is int and parent_number > 0:
+                try:
+                    repository = _repository_hint(github, parsed)
+                    unfinished = states.find_unfinished_runs(
+                        repository, parent_number
+                    )
+                except (GitHubReadError, OSError, TaskControlError, ValueError):
+                    unfinished = []
+                if len(unfinished) == 1:
+                    durable_run_id = unfinished[0].get("run_id")
+                    if isinstance(durable_run_id, str):
+                        run_id = durable_run_id
         failure_recorded = False
         incompatible_state = isinstance(error, IncompatibleRunStateError)
         if (
@@ -742,25 +779,26 @@ def _main_with_parser_resources(
             and not isinstance(error, RunLocatorError)
             and not isinstance(error, TaskControlError)
             and controller is not None
-            and isinstance(run_id, str)
+            and isinstance(selected_run_id, str)
         ):
             if isinstance(error, GitHubReadError) and is_proven_github_state_contradiction(
                 error.code
             ):
                 failure_recorded = controller.record_deterministic_contradiction(
-                    run_id, error.code, error.message
+                    selected_run_id, error.code, error.message
                 )
             else:
                 failure_recorded = controller.record_execution_failure(
-                    run_id, bounded_error(str(error))
+                    selected_run_id, bounded_error(str(error))
                 )
+        failure_state: dict[str, Any] | None = None
         durable_status = None
         durable_diagnostics: list[object] | None = None
         if not incompatible_state and states is not None and isinstance(run_id, str):
-            durable = states.load_run(run_id)
-            if isinstance(durable, dict):
-                durable_status = durable.get("status")
-                diagnostics = durable.get("diagnostics")
+            failure_state = states.load_run(run_id)
+            if isinstance(failure_state, dict):
+                durable_status = failure_state.get("status")
+                diagnostics = failure_state.get("diagnostics")
                 if isinstance(diagnostics, list):
                     durable_diagnostics = diagnostics
         locator_code = error.code if isinstance(error, RunLocatorError) else None
@@ -814,55 +852,77 @@ def _main_with_parser_resources(
         }
         if isinstance(error, RunLocatorError):
             locator_diagnostic["candidates"] = error.candidates
-        print(
-            json.dumps(
-                {
-                    "result": "error",
-                    "status": (
-                        "blocked"
-                        if locator_error
+        error_status = (
+            "blocked"
+            if locator_error
+            else (
+                "incompatible_run_state"
+                if incompatible_state
+                else (
+                    "deterministic_contradiction"
+                    if durable_status == "deterministic_contradiction"
+                    else (
+                        "execution_failed"
+                        if failure_recorded
                         else (
-                            "incompatible_run_state"
-                            if incompatible_state
-                            else (
-                                "deterministic_contradiction"
-                                if durable_status == "deterministic_contradiction"
-                                else (
-                                    "execution_failed"
-                                    if failure_recorded
-                                    else (
-                                        durable_status
-                                        if durable_status
-                                        in {
-                                            "abandonment_pending",
-                                            "completed",
-                                            "abandoned",
-                                            "requeue_required",
-                                        }
-                                        else "blocked"
-                                    )
-                                )
-                            )
+                            durable_status
+                            if durable_status
+                            in {
+                                "abandonment_pending",
+                                "completed",
+                                "abandoned",
+                                "requeue_required",
+                            }
+                            else "blocked"
                         )
-                    ),
-                    "diagnostics": (
-                        [locator_diagnostic]
-                        if locator_error
-                        or isinstance(error, DirtyManagedCheckoutError)
-                        or isinstance(error, DeliveryPolicyError)
-                        or incompatible_state
-                        or durable_status not in {
-                            "blocked",
-                            "deterministic_contradiction",
-                        }
-                        or durable_diagnostics is None
-                        else durable_diagnostics
-                    ),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+                    )
+                )
             )
         )
+        output_diagnostics = (
+            [locator_diagnostic]
+            if locator_error
+            or isinstance(error, DirtyManagedCheckoutError)
+            or isinstance(error, DeliveryPolicyError)
+            or incompatible_state
+            or durable_status not in {"blocked", "deterministic_contradiction"}
+            or durable_diagnostics is None
+            else durable_diagnostics
+        )
+        if getattr(parsed, "as_json", False):
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "status": error_status,
+                        "diagnostics": output_diagnostics,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        else:
+            human_message = _human_failure_reason(
+                error, diagnostic_message.partition("\n候选：")[0]
+            )
+            print(
+                "命令状态: 未执行（"
+                f"{cli_presentation.human_delivery_status(error_status)}）"
+            )
+            print(f"原因: {human_message}")
+            if failure_state is not None:
+                _print_lifecycle_result(failure_state, {}, None)
+            if isinstance(error, RunLocatorError) and error.candidates:
+                print("候选交付:")
+                for candidate in error.candidates:
+                    candidate_status = cli_presentation.human_delivery_status(
+                        candidate.get("status") or "unknown"
+                    )
+                    print(
+                        f"- repository={candidate.get('repository') or 'unknown'} "
+                        f"Parent=#{candidate.get('parent') or 'unknown'} "
+                        f"status={candidate_status}"
+                    )
     return 2
 
 
@@ -940,6 +1000,93 @@ def _repository_hint(github: Any, parsed: argparse.Namespace) -> str:
     if not isinstance(name, str) or not name:
         raise TaskControlError("GitHub repository identity is unavailable")
     return name
+
+
+def _print_lifecycle_result(
+    state: Mapping[str, Any],
+    output: Mapping[str, Any],
+    receipt: ActionReceipt | None,
+) -> None:
+    """Render the ordinary mutation result without machine-only identities."""
+
+    parent = state.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
+    print(f"Repository: {state.get('repository')}")
+    print(f"Parent Issue: #{parent_number}")
+    if receipt is not None:
+        print(f"操作: {receipt.kind}")
+        print("提交结果: 已附着到原操作" if receipt.attached else "提交结果: 已接受新操作")
+        if receipt.status == "failed":
+            print("动作状态: 应用失败")
+        elif receipt.status in {"completed", "executor_active"}:
+            print("动作状态: 已应用")
+        else:
+            print("动作状态: 正在应用")
+        if receipt.executor_status in {"exited", "absent"}:
+            print("Agent: 原操作已收口，无活动 Executor")
+        elif receipt.attached:
+            print("Agent: 原有 Executor 正在处理")
+        else:
+            print("Agent: Executor 已正确开始")
+    status = state.get("status")
+    if status == "completed":
+        print("交付状态: 整个交付已完成")
+    elif status == "abandoned":
+        print("交付状态: 整个交付已放弃")
+    else:
+        print(
+            "交付状态: "
+            f"{cli_presentation.human_delivery_status(status)}"
+            "（动作完成不等于整个交付完成）"
+        )
+    print(
+        "下一步: "
+        + str(cli_presentation.human_next_action_for_state(state))
+    )
+
+
+def _print_interruption_result(
+    state: Mapping[str, Any] | None, output: Mapping[str, Any]
+) -> None:
+    """Render an interrupted observation without exposing machine identities."""
+
+    if isinstance(state, Mapping):
+        parent = state.get("parent")
+        parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
+        print(f"Repository: {state.get('repository')}")
+        print(f"Parent Issue: #{parent_number}")
+    diagnostic = output.get("diagnostics")
+    first = diagnostic[0] if isinstance(diagnostic, list) and diagnostic else None
+    message = first.get("message") if isinstance(first, Mapping) else "操作观察已中断"
+    print(f"操作状态: 已中断（{message}）")
+    print(
+        "交付状态: "
+        f"{cli_presentation.human_delivery_status(output.get('status'))}"
+        "（中断观察不会改写交付状态）"
+    )
+    next_action = (
+        cli_presentation.human_next_action_for_state(state)
+        if isinstance(state, Mapping)
+        else "执行 agent-run status 查看当前交付状态"
+    )
+    print("下一步: " + str(next_action))
+
+
+def _action_audit(receipt: ActionReceipt) -> dict[str, object]:
+    """Expose stable machine identities only through explicit JSON output."""
+
+    return {
+        "action_id": receipt.action_id,
+        "kind": receipt.kind,
+        "run_id": receipt.run_id,
+        "status": receipt.status,
+        "attached": receipt.attached,
+        "executor_status": receipt.executor_status,
+        "executor_generation": receipt.executor_generation,
+        "handshake": receipt.handshake,
+        "payload_digest": receipt.payload_digest,
+        "failure": receipt.failure,
+    }
 
 
 def _task_for_parent(
@@ -1083,6 +1230,35 @@ def _resume_policy_matches_existing_action(
     return requested_policy.snapshot() == frozen_policy.snapshot()
 
 
+def _mutation_action_payload(
+    parsed: argparse.Namespace, current: Mapping[str, Any]
+) -> dict[str, Any]:
+    run_id = current.get("run_id")
+    if not isinstance(run_id, str) or run_id != parsed.run_id:
+        raise TaskControlError(
+            f"{parsed.command} selector 与当前 Delivery Run 不匹配"
+        )
+    payload: dict[str, Any] = {
+        "parent": parsed.parent,
+        "run_id": run_id,
+    }
+    if parsed.command == "revise":
+        message = parsed.message.strip()
+        if not message:
+            raise TaskControlError("revision feedback must be non-empty")
+        payload["message"] = message
+    return payload
+
+
+def _mutation_payload_for_existing_action(
+    parsed: argparse.Namespace,
+    existing_payload: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    requested = _mutation_action_payload(parsed, current)
+    return dict(existing_payload) if dict(existing_payload) == requested else requested
+
+
 def _run_lifecycle(
     parsed: argparse.Namespace,
     states: StateStore | FaultInjectingStateStore,
@@ -1102,14 +1278,20 @@ def _run_lifecycle(
             "Runner Execution Readiness 不满足：未提供 Executor Host"
         )
     action_kind = parsed.command
-    if action_kind not in {"run", "resume"}:
-        raise ValueError("Executor-backed lifecycle only supports run/resume")
+    if action_kind not in {"run", "resume", "approve", "revise", "requeue"}:
+        raise ValueError("unsupported Executor-backed lifecycle action")
     task = _task_for_parent(parsed, github, git)
     # Task Control belongs to the canonical Local Delivery Workspace, not to
     # an optional state-dir selected for a particular Run record.  This keeps
     # two clients in the same checkout inside one admission domain.
     control = TaskControlStore(git.root / ".agent-run")
-    current = _preflight_run(task, states)
+    current = (
+        _preflight_run(task, states)
+        if action_kind == "run"
+        else states.load_current_run(parsed.run_id)
+    )
+    if action_kind != "run" and current is None:
+        raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
     if current is not None:
         controller._require_current_checkout(current)
     try:
@@ -1125,7 +1307,11 @@ def _run_lifecycle(
     requested_state_root = states.root.resolve()
     canonical_state_root = (git.root / ".agent-run").resolve()
     bound_state_root = _control_state_root(existing_control)
-    located_state_root = _located_unfinished_state_root(task, requested_state_root)
+    located_state_root = (
+        _located_unfinished_state_root(task, requested_state_root)
+        if action_kind == "run"
+        else None
+    )
     if bound_state_root is not None and located_state_root is not None:
         if bound_state_root != located_state_root:
             raise ValueError(
@@ -1151,7 +1337,11 @@ def _run_lifecycle(
             profiles=profiles,
             delivery_policy_provider=controller.delivery_policy_provider,
         )
-        current = _preflight_run(task, states)
+        current = (
+            _preflight_run(task, states)
+            if action_kind == "run"
+            else states.load_current_run(parsed.run_id)
+        )
         if requested_current is not None:
             if current is None or requested_current.get("run_id") != current.get(
                 "run_id"
@@ -1169,7 +1359,7 @@ def _run_lifecycle(
         if isinstance(existing_control, dict)
         else None
     )
-    if (
+    if action_kind == "run" and (
         requested_state_root != canonical_state_root
         and bound_state_root != requested_state_root
     ):
@@ -1247,24 +1437,34 @@ def _run_lifecycle(
             payload = _resume_payload_for_existing_action(
                 parsed, existing_action["payload"], current
             )
-        else:
+        elif action_kind == "run":
             payload = _run_payload_for_existing_action(
                 parsed,
                 existing_action["payload"],
                 current,
                 creation_profile,
             )
+        else:
+            if current is None:  # pragma: no cover - guarded above
+                raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
+            payload = _mutation_payload_for_existing_action(
+                parsed, existing_action["payload"], current
+            )
     else:
         if action_kind == "resume":
             if current is None or current.get("run_id") != parsed.run_id:
                 raise TaskControlError("resume selector 与当前 Delivery Run 不匹配")
             payload = _resume_action_payload(parsed, current)
-        else:
+        elif action_kind == "run":
             if current is None:
                 policy = _resolve_delivery_policy(parsed)
             else:
                 policy = parse_policy_snapshot(policy_snapshot_for_state(current))
             payload = _run_action_payload(parsed, policy, creation_profile)
+        else:
+            if current is None:  # pragma: no cover - guarded above
+                raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
+            payload = _mutation_action_payload(parsed, current)
 
     base_state_root = states.root.resolve()
 
@@ -1471,12 +1671,112 @@ def _run_lifecycle(
                     else None
                 ),
                 explicit_resume=True,
+                record_explicit_resume_audit=(
+                    current is None
+                    or not cli_surface._resume_is_publication_recovery(current)
+                ),
                 resume_budget_checkpoint=budget_checkpoint_resume,
                 budget_policy=parse_policy_snapshot(policy_snapshot),
                 prepare_state=lambda state: prepare_action_application_receipt(
                     state, action
                 ),
             )
+        if action_kind in {"approve", "revise", "requeue"}:
+            action_payload = action.get("payload")
+            if not isinstance(action_payload, Mapping):
+                raise TaskControlError(f"{action_kind} Action 缺少语义 payload")
+            run_id = action_payload.get("run_id")
+            if not isinstance(run_id, str) or run_id != parsed.run_id:
+                raise TaskControlError(
+                    f"{action_kind} Action 的 Delivery Run binding 不匹配"
+                )
+            driver = lifecycle_driver_factory(states, None)
+            prepare_state = lambda state: prepare_action_application_receipt(
+                state, action
+            )
+
+            def apply_intent() -> Any:
+                if action_kind == "approve":
+                    return driver.operations.approve(
+                        run_id, prepare_state=prepare_state
+                    )
+                if action_kind == "revise":
+                    message = action_payload.get("message")
+                    if not isinstance(message, str) or not message:
+                        raise TaskControlError("revise Action 缺少修订反馈")
+                    return driver.operations.revise(
+                        run_id, message, prepare_state=prepare_state
+                    )
+                return driver.operations.requeue(
+                    run_id, prepare_state=prepare_state
+                )
+
+            lost_response_reconciled = False
+            while True:
+                try:
+                    outcome = apply_intent()
+                except GitHubReadError as error:
+                    if (
+                        not is_proven_github_state_contradiction(error.code)
+                        or not controller.record_deterministic_contradiction(
+                            run_id, error.code, error.message
+                        )
+                    ):
+                        raise
+                    contradicted = states.load_current_run(run_id)
+                    if contradicted is None:  # pragma: no cover - just persisted
+                        raise TaskControlError(
+                            f"{action_kind} deterministic contradiction 未持久化"
+                        )
+                    prepare_action_application_receipt(contradicted, action)
+                    states.save_run(run_id, contradicted)
+                    return contradicted, True
+                except SimulatedProcessCrash:
+                    raise
+                except (OSError, TimeoutError):
+                    persisted = states.load_current_run(run_id)
+                    if (
+                        lost_response_reconciled
+                        or persisted is None
+                        or not action_receipt_matches(
+                            persisted, {**action, "run_id": run_id}
+                        )
+                    ):
+                        raise
+                    if action_kind == "revise":
+                        # Revision has no ambiguous Publisher closeout to
+                        # reconcile.  Its exact Action receipt proves the
+                        # repair intent was already saved, so replaying would
+                        # enqueue the same repair window twice.
+                        return persisted, True
+                    # The intent and its Action receipt committed atomically,
+                    # but the Publisher response was lost.  Reconcile the
+                    # idempotent closeout once inside this same Executor; do
+                    # not admit or apply a second user intent.
+                    lost_response_reconciled = True
+                    continue
+                state = outcome.state
+                # A newly admitted mutation is bound to its existing Run only
+                # after ``select_run`` returns.  The business mutation has
+                # nevertheless persisted that exact Run ID in its atomic
+                # application receipt, so include it while validating the
+                # receipt before handing control back to the lifecycle spine.
+                if action_receipt_matches(state, {**action, "run_id": run_id}):
+                    return state, True
+                if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
+                    raise TaskControlError(
+                        f"{action_kind} intent 未形成可验证的 Application Receipt"
+                    )
+                driver.supervisor.observe(state)
+                if not driver.supervisor.before_retry(
+                    state,
+                    persist_before_sleep=lambda: states.save_run(run_id, state),
+                ):
+                    states.save_run(run_id, state)
+                    raise TaskControlError(
+                        f"{action_kind} intent 在外部状态收敛前超时，尚未应用"
+                    )
+                states.save_run(run_id, state)
         return controller.start_or_resume_unfinished(
             task.parent_number,
             prepare_state=lambda state: prepare_action_application_receipt(
@@ -1542,7 +1842,16 @@ def _run_lifecycle(
             action_id=executor_binding[0], generation=executor_binding[1]
         )
     return lifecycle.submit(
-        LifecycleRequest(task=task, kind=action_kind, payload=payload)
+        LifecycleRequest(
+            task=task,
+            kind=action_kind,
+            payload=payload,
+            allow_terminal_successor=(
+                cli_surface._is_lifecycle_action(action_kind)
+                and current is not None
+                and cli_surface._command_is_ready(current, action_kind)
+            ),
+        )
     )
 
 
@@ -1659,54 +1968,78 @@ def _resume_action_is_attachable(
     return _resume_policy_matches_existing_action(parsed, payload)
 
 
+def _lifecycle_action_is_attachable(
+    parsed: argparse.Namespace,
+    github: Any,
+    git: GitRepository,
+) -> bool:
+    """Whether this command can be reconciled with its in-flight Action."""
+
+    task = _task_for_parent(parsed, github, git)
+    record = TaskControlStore(git.root / ".agent-run").load(task)
+    action = record.get("action") if isinstance(record, Mapping) else None
+    executor = record.get("executor") if isinstance(record, Mapping) else None
+    if not isinstance(action, Mapping) or action.get("kind") != parsed.command:
+        return False
+    if action.get("status") in {"accepted", "applying"} or (
+        isinstance(executor, Mapping)
+        and executor.get("status") in {"starting", "running"}
+        and executor.get("action_id") == action.get("action_id")
+    ):
+        return True
+    return action.get("status") in {"completed", "failed"} and (
+        _mutation_request_matches_action(parsed, action, parsed.run_id)
+    )
+
+
+def _mutation_request_matches_action(
+    parsed: argparse.Namespace,
+    action: Mapping[str, Any],
+    run_id: object,
+) -> bool:
+    """Compare a repeated public mutation with its first frozen payload."""
+
+    if not isinstance(run_id, str):
+        return False
+    requested: dict[str, object] = {
+        "parent": getattr(parsed, "parent", None),
+        "run_id": run_id,
+    }
+    if parsed.command == "revise":
+        message = getattr(parsed, "message", None)
+        if not isinstance(message, str) or not message.strip():
+            return False
+        requested["message"] = message.strip()
+    payload = action.get("payload")
+    return isinstance(payload, Mapping) and dict(payload) == requested
+
+
 def _reject_if_task_action_pending(
     parsed: argparse.Namespace,
     states: StateStore | FaultInjectingStateStore,
-    github: Any,
     git: GitRepository,
 ) -> None:
     """Reject a legacy mutation without holding control across its work."""
 
-    if parsed.command not in {
-        "start",
-        "resume",
-        "requeue",
-        "approve",
-        "revise",
-        "abandon",
-    }:
+    if parsed.command not in {"resume", "requeue", "approve", "revise", "abandon"}:
         return None
-    run_state: dict[str, Any] | None = None
-    if parsed.command == "start":
-        task = _task_for_parent(parsed, github, git)
-        current = states.find_run(task.repository, task.parent_number)
-        if isinstance(current, dict):
-            require_current_run_state(current)
-            run_state = current
-            expected = current.get("checkout_identity")
-            if not isinstance(expected, str) or git.checkout_identity() != expected:
-                # Controller's checkout binding is an authoritative read-only
-                # failure before any mutation.  Do not materialize a task
-                # lock in a replacement clone that cannot mutate this Run.
-                return None
-    else:
-        run_id = getattr(parsed, "run_id", None)
-        if not isinstance(run_id, str):
-            return None
-        state = states.load_run(run_id)
-        if not isinstance(state, dict):
-            return None
-        require_current_run_state(state)
-        run_state = state
-        parent = state.get("parent")
-        repository = state.get("repository")
-        number = parent.get("number") if isinstance(parent, dict) else None
-        if not isinstance(repository, str) or type(number) is not int or number <= 0:
-            return None
-        expected = state.get("checkout_identity")
-        if not isinstance(expected, str) or git.checkout_identity() != expected:
-            return None
-        task = TaskKey(git.root, repository, number)
+    run_id = getattr(parsed, "run_id", None)
+    if not isinstance(run_id, str):
+        return None
+    state = states.load_run(run_id)
+    if not isinstance(state, dict):
+        return None
+    require_current_run_state(state)
+    run_state = state
+    parent = state.get("parent")
+    repository = state.get("repository")
+    number = parent.get("number") if isinstance(parent, dict) else None
+    if not isinstance(repository, str) or type(number) is not int or number <= 0:
+        return None
+    expected = state.get("checkout_identity")
+    if not isinstance(expected, str) or git.checkout_identity() != expected:
+        return None
+    task = TaskKey(git.root, repository, number)
     control = TaskControlStore(git.root / ".agent-run")
     receipt = (
         run_state.get("action_application_receipt")
@@ -1719,6 +2052,35 @@ def _reject_if_task_action_pending(
             "无法确认当前 Action/Executor ownership"
         )
     control.require_mutation_available(task)
+
+
+def _require_task_control_for_existing_receipt(
+    parsed: argparse.Namespace,
+    states: StateStore | FaultInjectingStateStore,
+    git: GitRepository,
+) -> None:
+    """Fail closed when a different mutation cannot reconcile Run ownership."""
+
+    run_id = getattr(parsed, "run_id", None)
+    if not isinstance(run_id, str):
+        return
+    state = states.load_run(run_id)
+    if not isinstance(state, dict):
+        return
+    receipt = state.get("action_application_receipt")
+    if not isinstance(receipt, Mapping):
+        return
+    parent = state.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, Mapping) else None
+    repository = state.get("repository")
+    if not isinstance(repository, str) or type(parent_number) is not int:
+        return
+    task = TaskKey(git.root, repository, parent_number)
+    if TaskControlStore(git.root / ".agent-run").load(task) is None:
+        raise TaskControlError(
+            "Task Control Record 缺失；已有 Delivery Run Action Receipt，"
+            "无法确认当前 Action/Executor ownership"
+        )
 
 
 def _run_driver(
@@ -1807,6 +2169,171 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
     return state
 
 
+def _resolve_mutation_selection(
+    parsed: argparse.Namespace,
+    git: GitRepository,
+    states: StateStore | FaultInjectingStateStore,
+) -> None:
+    """Resolve the shared Parent-or-exact-Run mutation selector."""
+
+    raw_selector = parsed.run_id
+    if not isinstance(raw_selector, str):
+        raise RunLocatorError("run_selector_invalid", "缺少 Delivery Run selector。")
+    if parsed.command == "resume" and raw_selector.isdecimal():
+        _resolve_resume_selection(parsed, git)
+        return
+    if raw_selector.isdecimal():
+        parent_number = int(raw_selector)
+        if parent_number <= 0:
+            raise RunLocatorError(
+                "run_selector_invalid", "Parent Issue 编号必须是正整数。"
+            )
+        parsed.run_id = None
+        parsed.parent = parent_number
+        _reject_local_repository_mismatch(parsed, git, parent_number)
+        records = _selector_records(parsed, current_root=git.root)
+        ready_command = (
+            parsed.command
+            if parsed.command in {"approve", "revise", "requeue"}
+            else None
+        )
+        try:
+            selected, _state = _select_one_record(
+                records,
+                parent_number=parent_number,
+                active_only=True,
+                purpose=parsed.command,
+                ready_command=ready_command,
+                current_root=git.root,
+            )
+        except RunLocatorError as selection_error:
+            if ready_command is None:
+                raise
+            selected = _select_attached_action_run(
+                parsed,
+                git,
+                records,
+                parent_number=parent_number,
+                selection_error=selection_error,
+            )
+        parsed.run_id = _selected_local_run_id(
+            parsed, git, selected, command=parsed.command
+        )
+        return
+
+    state = states.load_current_run(raw_selector)
+    if state is None:
+        raise _selector_error(
+            "run_selector_not_found",
+            f"{parsed.command} 找不到指定的 Delivery Run；不会猜测目标。",
+            [],
+        )
+    _validate_repository_selector(parsed, state, raw_selector)
+    parent = state.get("parent")
+    exact_parent_number = (
+        parent.get("number") if isinstance(parent, Mapping) else None
+    )
+    if type(exact_parent_number) is not int or exact_parent_number <= 0:
+        raise ValueError("Delivery Run is missing its Parent Issue")
+    parsed.parent = exact_parent_number
+
+
+def _reject_local_repository_mismatch(
+    parsed: argparse.Namespace,
+    git: GitRepository,
+    parent_number: int,
+) -> None:
+    """Distinguish an explicit wrong repository from an absent Parent Run."""
+
+    repository = parsed.repo
+    if repository is None:
+        return
+    _validate_repository_name(repository)
+    local_records = _read_state_directory(git.root / ".agent-run", git.root)
+    mismatches = [
+        public
+        for public, state in local_records
+        if state is not None
+        and public.get("parent") == parent_number
+        and public.get("repository") != repository
+    ]
+    if mismatches:
+        raise _selector_error(
+            "run_selector_repository_mismatch",
+            f"Parent Issue #{parent_number} 的本地 Delivery Run 不属于指定 "
+            f"repository {repository!r}。",
+            mismatches,
+        )
+
+
+def _select_attached_action_run(
+    parsed: argparse.Namespace,
+    git: GitRepository,
+    records: list[tuple[dict[str, object], dict[str, Any] | None]],
+    *,
+    parent_number: int,
+    selection_error: RunLocatorError,
+) -> dict[str, object]:
+    """Locate only the exact Action already accepted for this command."""
+
+    expected_root = git.root.resolve()
+    candidates = [
+        (public, state)
+        for public, state in records
+        if state is not None
+        and public.get("parent") == parent_number
+        and isinstance(public.get("repository_root"), str)
+        and Path(str(public["repository_root"])).resolve() == expected_root
+    ]
+    repositories = {
+        str(state["repository"])
+        for _public, state in candidates
+        if isinstance(state.get("repository"), str)
+    }
+    if len(repositories) != 1:
+        raise selection_error
+    repository = next(iter(repositories))
+    record = TaskControlStore(git.root / ".agent-run").load(
+        TaskKey(git.root, repository, parent_number)
+    )
+    action = record.get("action") if isinstance(record, Mapping) else None
+    executor = record.get("executor") if isinstance(record, Mapping) else None
+    executor_active = (
+        isinstance(executor, Mapping)
+        and executor.get("status") in {"starting", "running"}
+        and isinstance(action, Mapping)
+        and executor.get("action_id") == action.get("action_id")
+    )
+    bound_run_id = (
+        action.get("run_id") if isinstance(action, Mapping) else None
+    )
+    if not isinstance(bound_run_id, str) and isinstance(record, Mapping):
+        bound_run_id = record.get("run_id")
+    if not isinstance(bound_run_id, str) and isinstance(action, Mapping):
+        frozen_payload = action.get("payload")
+        if isinstance(frozen_payload, Mapping):
+            bound_run_id = frozen_payload.get("run_id")
+    bound = [
+        (public, state)
+        for public, state in candidates
+        if isinstance(bound_run_id, str) and public.get("run_id") == bound_run_id
+    ]
+    if (
+        len(bound) != 1
+        or not isinstance(action, Mapping)
+        or action.get("kind") != parsed.command
+        or not isinstance(bound_run_id, str)
+        or not _mutation_request_matches_action(parsed, action, bound_run_id)
+        or (
+            action.get("status") not in {"accepted", "applying"}
+            and not executor_active
+            and action.get("status") not in {"completed", "failed"}
+        )
+    ):
+        raise selection_error
+    return bound[0][0]
+
+
 def _resolve_resume_selection(
     parsed: argparse.Namespace,
     git: GitRepository,
@@ -1878,35 +2405,6 @@ def _resolve_resume_selection(
         ):
             raise selection_error
     parsed.run_id = _selected_local_run_id(parsed, git, selected, command="resume")
-
-
-def _resolve_approve_selection(
-    parsed: argparse.Namespace,
-    git: GitRepository,
-) -> None:
-    """Resolve the public Parent form of ``approve`` without guessing a Run."""
-
-    raw_selector = parsed.run_id
-    if not isinstance(raw_selector, str) or not raw_selector.isdecimal():
-        return
-    parent_number = int(raw_selector)
-    if parent_number <= 0:
-        raise RunLocatorError(
-            "run_selector_invalid", "Parent Issue 编号必须是正整数。"
-        )
-
-    parsed.run_id = None
-    parsed.parent = parent_number
-    records = _selector_records(parsed, current_root=git.root)
-    selected, _state = _select_one_record(
-        records,
-        parent_number=parent_number,
-        active_only=True,
-        purpose="approve",
-        ready_command="approve",
-        current_root=git.root,
-    )
-    parsed.run_id = _selected_local_run_id(parsed, git, selected, command="approve")
 
 
 def _selected_local_run_id(
@@ -2455,8 +2953,13 @@ def _validate_repository_selector(
     if repository is not None:
         _validate_repository_name(repository)
         if state.get("repository") != repository:
+            parent = state.get("parent")
             candidate = {
-                "parent": None,
+                "parent": (
+                    parent.get("number")
+                    if isinstance(parent, Mapping)
+                    else None
+                ),
                 "repository": state.get("repository"),
                 "repository_root": "当前 checkout",
                 "run_id": run_id,
@@ -2469,6 +2972,28 @@ def _validate_repository_selector(
                 f"Run {run_id!r} 不属于指定 repository {repository!r}。",
                 [candidate],
             )
+
+
+def _human_failure_reason(error: Exception, fallback: str) -> str:
+    """Render selector failures without machine-only locator identities."""
+
+    if isinstance(error, ExecutorLostError):
+        return "Executor 已退出；已保留当前交付状态，不会自动重放未知工作。"
+    if isinstance(error, ActionBusyError):
+        return "当前交付已有未完成操作；本次命令未等待或排队。"
+    if isinstance(error, ExecutorStartUnknownError):
+        return "Executor ownership 暂时无法确认；不会启动第二个 Executor。"
+    if isinstance(error, TaskControlError):
+        return "Lifecycle 控制状态暂时无法确认；请通过 status 或 history 查看当前交付。"
+    if str(error).startswith("multiple unfinished Delivery Runs"):
+        return "同一 Parent Issue 存在多个未完成交付；请先人工消歧。"
+    if not isinstance(error, RunLocatorError):
+        return fallback
+    return {
+        "run_selector_repository_mismatch": "所选交付不属于指定 Repository。",
+        "run_selector_not_found": "没有找到唯一匹配的交付；不会猜测目标。",
+        "run_locator_stale": "交付定位记录已失效；请显式提供状态目录后重试。",
+    }.get(error.code, "无法唯一定位交付；不会猜测目标。")
 
 
 def _validate_repository_name(repository: str) -> None:
@@ -2747,19 +3272,22 @@ def _configure_profile(parsed: argparse.Namespace) -> int:
     document = AgentProfileStore(state_root).configure(
         parsed.run_id, preset=preset, overrides=overrides
     )
-    print(
-        json.dumps(
-            {
-                "result": "configured",
-                "run_id": parsed.run_id,
-                "profile_revision": document["profile_revision"],
-                "preset": document["preset"],
-                "profiles": document["profiles"],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-    )
+    output = {
+        "result": "configured",
+        "run_id": parsed.run_id,
+        "profile_revision": document["profile_revision"],
+        "preset": document["preset"],
+        "profiles": document["profiles"],
+    }
+    if parsed.as_json:
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    else:
+        parent = state.get("parent")
+        parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
+        print(f"Repository: {state.get('repository')}")
+        print(f"Parent Issue: #{parent_number}")
+        print(f"配置状态: 已保存 Agent Profile Revision {document['profile_revision']}")
+        print("运行状态: 未启动、停止或推进 Delivery Run；已有 Thread binding 不变")
     return 0
 
 

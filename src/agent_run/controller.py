@@ -463,7 +463,12 @@ class Controller:
         self._initialize_direct_profile(state)
         return state, True
 
-    def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def requeue(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Create a blank Change Job Generation from facts read *now*.
 
         Requeue is intentionally separate from ``resume``: it never tries to
@@ -474,6 +479,19 @@ class Controller:
             raise RequeueError(
                 "requeue cannot replace an unresolved Execution Failure"
             )
+        existing_transition = existing.get("requeue_transition")
+        if existing.get("status") != "requeue_required" and not (
+            isinstance(existing_transition, dict)
+            and is_github_refresh_wait(existing)
+        ):
+            raise RequeueError("requeue is only allowed in requeue_required state")
+        if prepare_state is not None:
+            # Persist the accepted requeue intent before its authoritative
+            # GitHub facts are observed.  A convergence wait can then finish
+            # this Action without losing or reapplying the maintainer intent.
+            prepare_state(existing)
+            self.states.save_run(run_id, existing)
+            prepare_state = None
         try:
             existing = self._load_bound_run(run_id, state=existing)
         except GitHubReadError as error:

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Parent-only delivery using the shared candidate-first change lifecycle."""
 
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from agent_run.agents import AgentBackend
@@ -118,7 +119,12 @@ class ParentDeliveryEngine:
                 )
                 self._remove_empty_worktree_directories(checkout)
 
-    def approve(self, run_id: str) -> dict[str, Any]:
+    def approve(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         state = self._load(run_id)
         job = _mapping(state, "parent_job")
         if job.get("phase") == "completed":
@@ -127,6 +133,9 @@ class ParentDeliveryEngine:
             raise ValueError("Parent-only delivery is not awaiting approval")
         if state.get("status") == "unsupported_scope_change":
             return state
+        if job.get("phase") == "merging" and prepare_state is not None:
+            prepare_state(state)
+            self._save(state)
         if job.get("phase") == "ready_for_approval":
             authority = parent_approval_grant_authority(state, job)
             if not grant_matches(job.get("approval_grant"), authority):
@@ -139,14 +148,24 @@ class ParentDeliveryEngine:
                     "diagnostics": [],
                 }
             )
+            if prepare_state is not None:
+                prepare_state(state)
             self._save(state)
         return self.deliver(run_id)
 
-    def recover_closeout(self, run_id: str) -> dict[str, Any]:
+    def recover_closeout(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         state = self._load(run_id)
         job = _mapping(state, "parent_job")
         if job.get("phase") != "merging":
             return state
+        if prepare_state is not None:
+            prepare_state(state)
+            self._save(state)
         return self.deliver(run_id)
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:

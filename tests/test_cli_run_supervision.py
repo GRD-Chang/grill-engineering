@@ -20,7 +20,6 @@ from test_cli_delivery import (
 
 from cli_run_supervision_support import (
     _assert_credential_wait_is_not_public,
-    _assert_waiting_external_recovery_action,
     _interrupt_run,
     _parent_only_agents,
     _repair_agents,
@@ -204,19 +203,18 @@ def test_parent_only_approval_survives_pending_checks_until_the_same_pr_merges(
     assert stdout_json(awaiting_approval)["status"] == "parent_approval_pending"
     run_id = str(stdout_json(awaiting_approval)["run_id"])
 
-    waiting = run_cli(git_repo, fixture, "approve", run_id)
-    assert waiting.returncode == 0, waiting.stderr
-    assert stdout_json(waiting)["status"] == "waiting_checks"
+    completed = run_cli(git_repo, fixture, "approve", run_id)
+    assert completed.returncode == 0, completed.stderr
+    assert stdout_json(completed)["status"] == "completed"
     granted = load_only_run_state(git_repo)["parent_job"]["approval_grant"]
     assert granted["pr_number"] == 1
     assert granted["repository"] == "example/project"
+    state = load_only_run_state(git_repo)
+    assert state["parent_job"]["merge_intent"]["attempts"] == 1
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert len(delivery["pull_requests"]) == 1
+    assert delivery["pull_requests"][0]["state"] == "MERGED"
 
-    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert completed.returncode == 0, completed.stderr
-    assert stdout_json(completed)["status"] == "completed"
-    assert load_only_run_state(git_repo)["parent_job"]["approval_grant"]["granted_at"] == granted["granted_at"]
-    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "MERGED"
 
 def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     git_repo: Path,
@@ -229,18 +227,43 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     agents = _parent_only_agents(git_repo / "parent-only-agents.json")
     initial = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
     run_id = str(stdout_json(initial)["run_id"])
-    assert stdout_json(run_cli(git_repo, fixture, "approve", run_id))["status"] == "waiting_checks"
+    approval = run_cli(git_repo, fixture, "approve", run_id)
+    assert approval.returncode == 2
+    assert stdout_json(approval)["status"] == "supervision_timeout"
+    assert "approval_grant" in load_only_run_state(git_repo)["parent_job"]
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["body"] = "Changed after approval."
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    halted = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    halted = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        "1",
+        "--agent-fixture",
+        str(agents),
+        machine_output=False,
+    )
 
     assert halted.returncode == 2
-    assert stdout_json(halted)["status"] == "requeue_required"
     state = load_only_run_state(git_repo)
+    assert state["status"] == "requeue_required"
+    assert "交付状态: 需要重新排队" in halted.stdout
+    assert "下一步: agent-run requeue 1 --repo example/project" in halted.stdout
+    assert "requeue_required" not in halted.stdout
+    assert "<run-id>" not in halted.stdout
+    for command in ("status", "history"):
+        view = run_cli(
+            git_repo, fixture, command, run_id, machine_output=False
+        )
+        assert "需要重新排队" in view.stdout
+        assert "agent-run requeue 1 --repo example/project" in view.stdout
+        assert run_id not in view.stdout
+        assert "<run-id>" not in view.stdout
     assert "approval_grant" not in state["parent_job"]
-    assert data["delivery"]["pull_requests"][0]["state"] == "OPEN"
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert delivery["pull_requests"][0]["state"] == "OPEN"
+
 
 def test_parent_only_approval_recovers_a_lost_merge_response_without_reapproval(
     git_repo: Path,
@@ -253,15 +276,20 @@ def test_parent_only_approval_recovers_a_lost_merge_response_without_reapproval(
     data["delivery"]["crash_after_normal_merge_once"] = True
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
-    waiting = run_cli(git_repo, fixture, "approve", run_id)
-    assert stdout_json(waiting)["status"] == "waiting_external"
-    _assert_waiting_external_recovery_action(git_repo, fixture, run_id)
-    granted_at = load_only_run_state(git_repo)["parent_job"]["approval_grant"]["granted_at"]
-    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
+    completed = run_cli(git_repo, fixture, "approve", run_id)
     assert completed.returncode == 0, completed.stderr
     assert stdout_json(completed)["status"] == "completed"
-    assert load_only_run_state(git_repo)["parent_job"]["approval_grant"]["granted_at"] == granted_at
+    state = load_only_run_state(git_repo)
+    job = state["parent_job"]
+    assert job["merge_intent"]["attempts"] == 1
+    assert [
+        item["result"] for item in job["merge_reconciliation_history"]
+    ] == ["outcome_unknown"]
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert len(delivery["pull_requests"]) == 1
+    assert delivery["pull_requests"][0]["state"] == "MERGED"
+    assert delivery["closed_issues"].count(1) == 1
+
 
 def test_run_routes_pending_parent_only_check_failure_through_repair(
     git_repo: Path,

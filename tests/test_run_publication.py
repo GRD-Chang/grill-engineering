@@ -13,6 +13,7 @@ from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.controller import Controller
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.state_contract import (
     IncompatibleRunStateError,
@@ -618,9 +619,28 @@ def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None
     assert preserved is not None
     assert preserved["status"] == "parent_closeout_pending"
 
-    completed = engine.approve(str(state["run_id"]))
+    successor = {
+        "action_id": "successor-approve",
+        "kind": "approve",
+        "payload_digest": "successor-payload",
+        "executor_generation": 2,
+    }
+    completed = engine.recover_closeout(
+        str(state["run_id"]),
+        prepare_state=lambda current: prepare_action_application_receipt(
+            current, successor
+        ),
+    )
 
     assert completed["status"] == "completed"
+    assert completed["action_application_receipt"]["action_id"] == (
+        "successor-approve"
+    )
+    persisted = states.load_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["action_application_receipt"]["action_id"] == (
+        "successor-approve"
+    )
     assert publisher.data["delivery"]["closed_issues"].count(1) == 1
     assert publisher.data["parent"]["state"] == "CLOSED"
 

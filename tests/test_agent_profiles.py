@@ -14,7 +14,7 @@ from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend, re
 from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from cli_fixtures import run_agents
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, ticket
 
@@ -389,14 +389,13 @@ def test_duplicate_thread_attach_is_idempotent_and_cleans_pending_binding(
     assert bindings[0]["thread_id"] == "thread-1"
 
 
-def test_public_cli_creates_and_updates_a_run_profile(
+def test_seeded_run_profile_can_be_updated_by_public_cli(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    started = run_cli(
+    started = seed_run(
         git_repo,
         fixture,
-        "start",
         "1",
         "--development-effort",
         "high",
@@ -517,6 +516,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         str(agent_fixture),
         "--github-fixture",
         str(fixture),
+        "--json",
     ]
     process = subprocess.Popen(
         command,
@@ -731,6 +731,7 @@ def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
         str(agent_fixture),
         "--github-fixture",
         str(fixture),
+        "--json",
     ]
     process = subprocess.Popen(
         command,

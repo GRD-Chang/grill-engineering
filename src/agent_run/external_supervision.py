@@ -244,9 +244,9 @@ def ensure_supervision_window(
 ) -> dict[str, object] | None:
     """Save an observable window whenever a public path enters a wait.
 
-    The normal ``run`` loop observes a wait before it retries it.  ``start``
-    and ``approve`` can instead return immediately after recording a wait, so
-    they establish the same durable window themselves for status/history.
+    The normal ``run`` loop observes a wait before it retries it.  Internal
+    initialization and approval paths can instead return immediately after
+    recording a wait, so they establish the same durable window themselves.
     """
 
     boundary = waiting_boundary(state)

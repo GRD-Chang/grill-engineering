@@ -53,7 +53,6 @@ from pathlib import Path
 import time
 
 from agent_run.task_control import (
-    ActionBusyError,
     TaskControlBusyError,
     TaskControlStore,
     TaskKey,
@@ -123,7 +122,7 @@ elif role == "second":
 
     TaskControlStore._locked = held_lock
 
-    def hold_same_parent_claim():
+    def hold_same_parent_transaction():
         store = TaskControlStore(Path.cwd() / ".agent-run")
         task = TaskKey(Path.cwd(), "example/project", 1)
         deadline = time.monotonic() + 10
@@ -139,15 +138,14 @@ elif role == "second":
                 raise RuntimeError("same-parent Executor did not become active")
             time.sleep(0.001)
         try:
-            store.claim_action(task, kind="run", payload={"parent": 1})
-        except ActionBusyError:
-            return
+            with store._locked(task):
+                pass
         except BaseException as error:
             error_path = os.environ.get("TICKET_190_HOLDER_ERROR")
             if error_path:
                 Path(error_path).write_text(str(error), encoding="utf-8")
 
-    threading.Thread(target=hold_same_parent_claim, daemon=False).start()
+    threading.Thread(target=hold_same_parent_transaction, daemon=False).start()
 """,
         encoding="utf-8",
     )

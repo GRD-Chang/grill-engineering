@@ -17,7 +17,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_thread_identity import prior_thread_identities
 
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import failed_invocation, run_internal_stage, run_cli, stdout_json
 
 from run_acceptance_test_support import (
@@ -102,7 +102,7 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
         ),
         encoding="utf-8",
     )
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)

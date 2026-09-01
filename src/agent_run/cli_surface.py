@@ -45,7 +45,11 @@ def _is_lifecycle_action(command: str) -> bool:
 def _resume_is_ready(state: dict[str, object]) -> bool:
     """Whether `resume` has a supported, bounded recovery boundary."""
 
-    if state.get("status") == "supervision_timeout":
+    if _resume_is_publication_recovery(state):
+        return True
+
+    status = state.get("status")
+    if status == "supervision_timeout":
         wait = state.get("supervision_wait")
         return isinstance(wait, dict) and wait.get("resume_status") in {
             "waiting_checks",
@@ -61,6 +65,26 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         human_blocker_subject_count(state) == 1
         or _review_budget_checkpoint_count(state) == 1
     )
+
+
+def _resume_is_publication_recovery(state: dict[str, object]) -> bool:
+    """Recognize a durable merge/closeout intent that only needs reconciliation."""
+
+    status = state.get("status")
+    if status == "parent_closeout_pending":
+        return True
+    parent_job = state.get("parent_job")
+    if (
+        state.get("delivery_type") == "parent_only"
+        and status == "parent_delivery_pending"
+        and isinstance(parent_job, dict)
+        and parent_job.get("phase") == "merging"
+    ):
+        # The merge/closeout intent is already durable.  Resume may only
+        # reconcile that exact publication generation; it does not create a
+        # new delivery intent.
+        return True
+    return False
 
 
 def _review_budget_checkpoint_count(state: dict[str, object]) -> int:

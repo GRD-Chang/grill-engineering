@@ -62,7 +62,12 @@ class RunOutcome:
 class RunController(Protocol):
     def resume(self, run_id: str) -> tuple[dict[str, Any], bool]: ...
 
-    def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
+    def requeue(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]: ...
 
     def reject_requeue_after_pr_race(self, run_id: str) -> dict[str, Any]: ...
 
@@ -365,8 +370,81 @@ class DirectRunOperations:
         normal_refresh: tuple[dict[str, Any], bool] = self.controller.resume(run_id)
         return normal_refresh
 
-    def requeue(self, run_id: str) -> RunOutcome:
-        state, retired = self.controller.requeue(run_id)
+    def approve(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> RunOutcome:
+        refreshed, _ = self._refresh(run_id)
+        if self._cannot_advance(refreshed) and refreshed.get("status") not in {
+            "run_approval_pending",
+            "parent_approval_pending",
+            "parent_closeout_pending",
+        }:
+            return self.classify(refreshed)
+        if refreshed.get("delivery_type") == "parent_only":
+            parent = ParentDeliveryEngine(
+                git=self.git,
+                states=self.states,
+                github=self.publisher,
+                agents=self.agents,
+            )
+            state = (
+                parent.recover_closeout(run_id, prepare_state=prepare_state)
+                if refreshed.get("status") == "parent_closeout_pending"
+                else parent.approve(run_id, prepare_state=prepare_state)
+            )
+            return self.classify(state)
+        repository = self.github_reader.repository()
+        publication = RunPublicationEngine(
+            git=self.git,
+            states=self.states,
+            agents=self.agents,
+            github=self.publisher,
+            default_branch=repository.default_branch,
+            default_head_sha=self.git.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            ),
+            currentness_reader=self.github_reader,
+        )
+        state = (
+            publication.recover_closeout(run_id, prepare_state=prepare_state)
+            if refreshed.get("status") == "parent_closeout_pending"
+            else publication.approve(run_id, prepare_state=prepare_state)
+        )
+        return self.classify(state)
+
+    def revise(
+        self,
+        run_id: str,
+        feedback: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> RunOutcome:
+        repository = self.github_reader.repository()
+        state = RunPublicationEngine(
+            git=self.git,
+            states=self.states,
+            agents=self.agents,
+            github=self.publisher,
+            default_branch=repository.default_branch,
+            default_head_sha=self.git.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            ),
+            currentness_reader=self.github_reader,
+        ).revise(run_id, feedback, prepare_state=prepare_state)
+        return self.classify(state)
+
+    def requeue(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> RunOutcome:
+        state, retired = self.controller.requeue(
+            run_id, prepare_state=prepare_state
+        )
         if is_github_refresh_wait(state):
             return self.classify(state)
         transition = state.get("requeue_transition")
@@ -412,12 +490,13 @@ class DirectRunOperations:
         if callable(set_run_id):
             set_run_id(run_id)
 
-        return {
-            RunStep.DELIVER: self.deliver,
-            RunStep.ACCEPT: self.accept,
-            RunStep.PUBLISH: self.publish,
-            RunStep.REQUEUE: self.requeue,
-        }[step](run_id)
+        if step is RunStep.DELIVER:
+            return self.deliver(run_id)
+        if step is RunStep.ACCEPT:
+            return self.accept(run_id)
+        if step is RunStep.PUBLISH:
+            return self.publish(run_id)
+        return self.requeue(run_id)
 
     @staticmethod
     def classify(state: dict[str, Any]) -> RunOutcome:

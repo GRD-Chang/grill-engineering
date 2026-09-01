@@ -40,7 +40,7 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from cli_fixtures import run_agents
 from cli_run_supervision_support import _parent_only_agents
 from test_cli import load_only_run_state, run_cli, stdout_json
@@ -343,6 +343,32 @@ def test_task_control_lock_contention_fails_without_persistent_mutation(
     accepted = control.claim_action(task, kind="run", payload={"parent": 1})
     assert accepted.attached is False
     assert accepted.action_id is not None
+
+
+def test_matching_action_attaches_during_task_control_transaction_contention(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    accepted = control.claim_action(task, kind="run", payload={"parent": 156})
+    reservation = control.begin_executor(
+        task, action_id=str(accepted.action_id), run_id=None
+    )
+    before = _file_snapshot(control.root)
+    lock_path = control.directory / f".{task.fingerprint}.lock"
+
+    with lock_path.open("a+") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        attached = control.claim_action(
+            task, kind="run", payload={"parent": 156}
+        )
+        with pytest.raises(ActionBusyError):
+            control.claim_action(task, kind="resume", payload={"parent": 156})
+
+    assert attached.attached is True
+    assert attached.action_id == accepted.action_id
+    assert reservation.created is True
+    assert _file_snapshot(control.root) == before
 
 
 def test_task_control_preparation_callbacks_run_outside_short_transactions(
@@ -1102,6 +1128,7 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
         str(agents),
         "--github-fixture",
         str(fixture),
+        "--json",
     ]
 
     first = subprocess.Popen(
@@ -1233,6 +1260,7 @@ def test_different_parent_runs_reach_agents_without_shared_state_lock(
             str(agents),
             "--github-fixture",
             str(fixture),
+            "--json",
         ]
 
     processes: list[subprocess.Popen[str]] = []
@@ -1726,6 +1754,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
         str(agents),
         "--github-fixture",
         str(fixture),
+        "--json",
     ]
     first = subprocess.Popen(
         command,
@@ -1784,7 +1813,7 @@ def test_old_run_without_lifecycle_protocol_is_read_only_but_not_mutable(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": ticket()})
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1837,6 +1866,7 @@ def test_custom_state_dir_cannot_fork_a_canonical_unfinished_run(
         str(agents),
         "--github-fixture",
         str(fixture),
+        "--json",
     ]
     first = subprocess.Popen(
         command,
@@ -1933,10 +1963,9 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
     started = tmp_path / "custom-interrupt-started"
     release = tmp_path / "custom-interrupt-release"
 
-    initial = run_cli(
+    initial = seed_run(
         git_repo,
         fixture,
-        "start",
         "1",
         "--state-dir",
         str(custom_state),
@@ -1989,6 +2018,13 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
         owner.send_signal(signal.SIGINT)
         stdout, stderr = owner.communicate(timeout=30)
         assert owner.returncode == 130, f"{stdout}\n{stderr}"
+        assert "操作状态: 已中断" in stdout
+        assert "交付状态: 进行中" in stdout
+        assert "下一步: agent-run run 1 --repo example/project" in stdout
+        assert "active" not in stdout
+        assert "<run-id>" not in stdout
+        custom_run_id = str(json.loads(custom_run_path.read_text())["run_id"])
+        assert custom_run_id not in stdout
         control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
         control_during_observation_exit = json.loads(
             control_path.read_text(encoding="utf-8")
@@ -2020,7 +2056,7 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
     assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
 
 
-def test_default_run_routes_to_a_custom_run_created_by_start(
+def test_default_run_routes_to_a_custom_seeded_run(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
@@ -2028,10 +2064,9 @@ def test_default_run_routes_to_a_custom_run_created_by_start(
     environment = _isolated_environment(tmp_path / "custom-start-first")
     custom_state = tmp_path / "custom-start-state"
 
-    started = run_cli(
+    started = seed_run(
         git_repo,
         fixture,
-        "start",
         "1",
         "--state-dir",
         str(custom_state),
@@ -2087,6 +2122,7 @@ def test_default_run_attaches_to_custom_state_during_executor_handshake(
         str(agents),
         "--github-fixture",
         str(fixture),
+        "--json",
     ]
     first = subprocess.Popen(
         [*command, "--state-dir", str(custom_state)],

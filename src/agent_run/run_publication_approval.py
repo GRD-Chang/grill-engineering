@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from agent_run.approval_grant import (
@@ -32,10 +33,13 @@ from agent_run.run_publication_shared import RunPublicationShared
 class RunPublicationApproval(RunPublicationShared):
     """Handle approval, revision, abandonment, and closeout of a Final Run PR."""
 
-    def approve(self, run_id: str) -> dict[str, Any]:
+    def approve(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         state = self._load(run_id)
-        if not self._refresh_currentness(state):
-            return self._save(state)
         publication = self._publication_state(state)
         recovering_merge = (
             publication["phase"] == "waiting_external"
@@ -52,6 +56,17 @@ class RunPublicationApproval(RunPublicationShared):
         run = self._mapping(state, "run_acceptance")
         record = self._mapping(publication, "record")
         pr_number = self._integer(publication, "pr_number")
+        run_head = self.git.resolve(str(state["run_branch"]))
+        authority = self._approval_grant_authority(
+            state, run, pr_number, run_head
+        )
+        if not grant_matches(publication.get("approval_grant"), authority):
+            publication["approval_grant"] = create_grant(authority)
+        if prepare_state is not None:
+            prepare_state(state)
+        self._save(state)
+        if not self._refresh_currentness(state):
+            return self._save(state)
         try:
             live = self.github.live_pull_request(pr_number)
         except (GitHubReadError, OSError, TimeoutError) as error:
@@ -79,7 +94,6 @@ class RunPublicationApproval(RunPublicationShared):
             )
             ensure_supervision_window(state)
             return self._save(state)
-        run_head = self.git.resolve(str(state["run_branch"]))
         if live.get("state") == "MERGED":
             self._require_persisted_merge_intent(
                 publication, state, record, pr_number, run_head
@@ -136,18 +150,10 @@ class RunPublicationApproval(RunPublicationShared):
             or live.get("base_branch") != self.default_branch
         ):
             return self._invalidate_for_fresh_acceptance(state)
-        authority = self._approval_grant_authority(
-            state, run, pr_number, run_head
-        )
         if recovering_merge and not grant_matches(
             publication.get("approval_grant"), authority
         ):
             return self._invalidate_for_fresh_acceptance(state)
-        if not recovering_merge and not grant_matches(
-            publication.get("approval_grant"), authority
-        ):
-            publication["approval_grant"] = create_grant(authority)
-            self._save(state)
         if live.get("state") != "OPEN":
             raise GitHubReadError(
                 "final_run_pr_not_open",
@@ -309,14 +315,28 @@ class RunPublicationApproval(RunPublicationShared):
         ensure_supervision_window(state)
         return self._save(state)
 
-    def recover_closeout(self, run_id: str) -> dict[str, Any]:
+    def recover_closeout(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         state = self._load(run_id)
         publication = self._publication_state(state)
         if publication.get("phase") != "merged":
             raise ValueError("Run Publication is not awaiting Parent closeout")
+        if prepare_state is not None:
+            prepare_state(state)
+            self._save(state)
         return self._complete_parent_closeout(state)
 
-    def revise(self, run_id: str, feedback: str) -> dict[str, Any]:
+    def revise(
+        self,
+        run_id: str,
+        feedback: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         if not feedback.strip():
             raise ValueError("revision feedback must be non-empty")
         state = self._load(run_id)
@@ -332,6 +352,8 @@ class RunPublicationApproval(RunPublicationShared):
         )
         publication["phase"] = "stale"
         state["terminal_kind"] = "final_revision_requested"
+        if prepare_state is not None:
+            prepare_state(state)
         return self._save(state)
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:

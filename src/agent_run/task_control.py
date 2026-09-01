@@ -203,70 +203,95 @@ class TaskControlStore:
                 )
             return None
 
-        with self._locked(task):
-            record = self._read_unlocked(task) or _new_record(task)
-            claim = existing_claim(record)
+        def claim_during_contention(error: TaskControlBusyError) -> ActionClaim:
+            """Attach from an atomic snapshot without extending the lock wait."""
+
+            try:
+                record = self.load(task)
+            except TaskControlError:
+                raise error
+            if record is not None:
+                claim = existing_claim(record)
+                if claim is not None:
+                    return claim
+            raise error
+
+        snapshot = self.load(task)
+        if snapshot is not None:
+            claim = existing_claim(snapshot)
             if claim is not None:
                 return claim
+
+        try:
+            with self._locked(task):
+                record = self._read_unlocked(task) or _new_record(task)
+                claim = existing_claim(record)
+                if claim is not None:
+                    return claim
+        except TaskControlBusyError as error:
+            return claim_during_contention(error)
 
         # Session preparation can inspect the environment and perform other
         # external work. It must not extend the Task Control transaction.
         if before_create is not None:
             before_create()
 
-        with self._locked(task):
-            # Another process may have claimed the Task while the session was
-            # prepared. Revalidate ownership before creating the Action.
-            record = self._read_unlocked(task) or _new_record(task)
-            claim = existing_claim(record)
-            if claim is not None:
-                return claim
-            current = record.get("action")
-            executor = record.get("executor")
-            generation = _positive_integer(record.get("next_generation", 1))
-            if isinstance(executor, dict) and executor.get("status") in {
-                "exited",
-                "absent",
-            }:
-                generation = max(
-                    generation,
-                    _positive_integer(executor.get("generation")) + 1,
+        try:
+            with self._locked(task):
+                # Another process may have claimed the Task while the session was
+                # prepared. Revalidate ownership before creating the Action.
+                record = self._read_unlocked(task) or _new_record(task)
+                claim = existing_claim(record)
+                if claim is not None:
+                    return claim
+                current = record.get("action")
+                executor = record.get("executor")
+                generation = _positive_integer(record.get("next_generation", 1))
+                if isinstance(executor, dict) and executor.get("status") in {
+                    "exited",
+                    "absent",
+                }:
+                    generation = max(
+                        generation,
+                        _positive_integer(executor.get("generation")) + 1,
+                    )
+                if isinstance(current, dict) and current.get("status") in {
+                    "completed",
+                    "failed",
+                }:
+                    _archive_terminal_action(record, current)
+                    # The successor has no Run or Executor binding until its own
+                    # application receipt is durably written.  Keep the
+                    # predecessor in bounded history instead of letting its
+                    # pointers look like ownership of the new Action.
+                    record["run_id"] = None
+                    record["executor"] = None
+                record["next_generation"] = generation + 1
+                action = {
+                    "action_id": uuid.uuid4().hex,
+                    "kind": kind,
+                    "payload": normalized_payload,
+                    "payload_digest": payload_digest,
+                    "status": "accepted",
+                    "run_id": None,
+                    "executor_generation": generation,
+                    "application_observed": False,
+                    "submitted_at": _now(),
+                    "completed_at": None,
+                    "result_status": None,
+                    "failure": None,
+                }
+                record["action"] = action
+                record["updated_at"] = _now()
+                self._write_unlocked(task, record)
+                return ActionClaim(
+                    action=deepcopy(action),
+                    attached=False,
+                    executor_active=False,
+                    record=deepcopy(record),
                 )
-            if isinstance(current, dict) and current.get("status") in {
-                "completed",
-                "failed",
-            }:
-                _archive_terminal_action(record, current)
-                # The successor has no Run or Executor binding until its own
-                # application receipt is durably written.  Keep the
-                # predecessor in bounded history instead of letting its
-                # pointers look like ownership of the new Action.
-                record["run_id"] = None
-                record["executor"] = None
-            record["next_generation"] = generation + 1
-            action = {
-                "action_id": uuid.uuid4().hex,
-                "kind": kind,
-                "payload": normalized_payload,
-                "payload_digest": payload_digest,
-                "status": "accepted",
-                "run_id": None,
-                "executor_generation": generation,
-                "application_observed": False,
-                "submitted_at": _now(),
-                "completed_at": None,
-                "result_status": None,
-                "failure": None,
-            }
-            record["action"] = action
-            record["updated_at"] = _now()
-            self._write_unlocked(task, record)
-            return ActionClaim(
-                action=deepcopy(action),
-                attached=False,
-                executor_active=False,
-                record=deepcopy(record),
-            )
+        except TaskControlBusyError as error:
+            return claim_during_contention(error)
 
     def reconcile_from_run(
         self,
@@ -758,6 +783,58 @@ class TaskControlStore:
                 raise ActionReconciliationError(
                     "Lifecycle Action 只能在业务意图持久应用后收口"
                 )
+            action["status"] = "completed"
+            action["completed_at"] = _now()
+            action["result_status"] = result_status
+            action["failure"] = None
+            record["updated_at"] = _now()
+            self._write_unlocked(task, record)
+            return deepcopy(record)
+
+    def complete_action_from_application_receipt(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        application_receipt: Mapping[str, Any],
+        result_status: str | None = None,
+    ) -> dict[str, Any]:
+        """Close an applied Action after the exact Executor is proven gone."""
+
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            action_value = record.get("action")
+            if (
+                not isinstance(action_value, dict)
+                or action_value.get("action_id") != action_id
+                or action_value.get("status")
+                not in _ACTIVE_ACTION_STATUSES | {"failed"}
+            ):
+                raise ActionReconciliationError(
+                    "Lifecycle Action 不再是可对账的当前 Task Action"
+                )
+            action = action_value
+            executor = _require_executor(record, action_id, generation)
+            if executor.get("status") not in {"exited", "absent"}:
+                raise ActionReconciliationError(
+                    "Lifecycle Action 崩溃对账前未证明 Executor 已退出"
+                )
+            expected = {
+                "action_id": action_id,
+                "kind": action.get("kind"),
+                "payload_digest": action.get("payload_digest"),
+                "run_id": action.get("run_id"),
+                "executor_generation": generation,
+            }
+            if any(
+                application_receipt.get(key) != value
+                for key, value in expected.items()
+            ):
+                raise ActionReconciliationError(
+                    "Delivery Run Receipt 与崩溃 Action ownership 不一致"
+                )
+            action["application_observed"] = True
             action["status"] = "completed"
             action["completed_at"] = _now()
             action["result_status"] = result_status

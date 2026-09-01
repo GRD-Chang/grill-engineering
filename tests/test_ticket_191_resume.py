@@ -11,7 +11,7 @@ from agent_run.delivery_policy import DeliveryPolicyStore
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from cli_run_supervision_support import _interrupt_run, _parent_only_agents
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_round_agents, passing_acceptance
 
@@ -478,7 +478,7 @@ def test_ordinary_run_preserves_an_operator_stopped_boundary(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     assert started.returncode == 0, started.stderr
     state = load_only_run_state(git_repo)
     state.update(

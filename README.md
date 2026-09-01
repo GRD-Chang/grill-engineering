@@ -129,7 +129,6 @@ python -m mypy src/agent_run
 ## 常用命令
 
 ```bash
-agent-run start <parent-issue> --repo OWNER/REPO
 agent-run run <parent-issue> --repo OWNER/REPO
 agent-run status [--parent <parent-issue>]
 agent-run history [--parent <parent-issue>]
@@ -137,12 +136,15 @@ agent-run runs [--repo OWNER/REPO]
 agent-run resume <parent-issue> --repo OWNER/REPO
 agent-run doctor [--json]
 agent-run approve <parent-issue> --repo OWNER/REPO
+agent-run revise <parent-issue> --message '维护者反馈' --repo OWNER/REPO
+agent-run requeue <parent-issue> --repo OWNER/REPO
 ```
 
-`start` 只创建或恢复本地 Delivery Run；`run` 推进正常 Job Loop；当前仓库只有一个进行中 Run 时，
+`run` 是创建或继续 Delivery Run 的唯一普通入口；当前仓库只有一个进行中 Run 时，
 `status`、`history` 可省略选择参数，也可以使用 `--parent`；在任意目录用 `--repo` 时必须同时
-提供 `--parent`。`runs` 用于发现候选，`resume` 按 Parent 只恢复一个已存在且可恢复的 Run，
-不会创建新 Run；`approve` 按 Parent 只选择一个处于最终批准门禁的 Run。两者在零匹配或多匹配时
-都会拒绝猜测；完整 Run ID 和显式 `--state-dir` 仍保留给自动化与精确排障。`approve` 是进入默认分支前的显式人工批准。安装、更新、rollback 和
+提供 `--parent`。`runs` 用于发现候选。普通 mutation 和 Run-scoped `configure` 都用 Parent
+Issue 定位唯一 Run：零匹配、多匹配或仓库不匹配时拒绝猜测；完整 Run ID 与显式 `--state-dir`
+只保留给自动化和精确排障。`resume` 不创建新 Run，`approve` 是进入默认分支前的显式人工批准。
+Lifecycle mutation 默认输出不含 Action ID、Run ID、PID 或 digest 的人类回执；需要稳定机器审计事实时显式使用 `--json`。安装、更新、rollback 和
 uninstall 都不迁移、修改或绑定既有 Delivery Run；不兼容 state 仍返回
 `incompatible_run_state`。
