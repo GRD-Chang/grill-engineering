@@ -292,6 +292,33 @@ def test_credential_renewal_failure_uses_a_recoverable_diagnostic(
     ]
 
 
+def test_execution_failure_producer_persists_one_bounded_safe_diagnostic(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": _issue(2)})
+    store = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), store
+    )
+    state, _ = controller.start(1)
+    run_id = str(state["run_id"])
+    credential = "ghp_1234567890abcdef"
+
+    assert controller.record_execution_failure(
+        run_id,
+        f"command failed; token={credential}; " + ("raw tool output " * 20_000),
+    )
+
+    persisted_bytes = (store.runs_directory / f"{run_id}.json").read_bytes()
+    recorded = store.load_run(run_id)
+    assert recorded is not None
+    assert len(recorded["diagnostics"]) == 1
+    assert credential.encode() not in persisted_bytes
+    assert len(recorded["diagnostics"][0]["message"].encode()) <= 8 * 1024
+    assert b"raw tool output raw tool output raw tool output" in persisted_bytes
+    assert len(persisted_bytes) < 64 * 1024
+
+
 def test_resume_waits_for_repository_binding_to_recover(git_repo: Path) -> None:
     store = StateStore(git_repo / ".agent-run")
     fixture = write_fixture(git_repo / "github.json", issues={"2": _issue(2)})

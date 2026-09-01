@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
-from agent_run.error_safety import bounded_error
+from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.task_control import TaskControlBusyError
@@ -21,11 +21,24 @@ from agent_run.task_control import TaskControlBusyError
 
 MAX_TIMELINE_EVENTS = 256
 MAX_TIMELINE_CONTINUATION_EVENTS = 256
+MAX_DIAGNOSTIC_ENTRIES = 32
+MAX_DIAGNOSTIC_BYTES = 16 * 1024
+MAX_RUN_STATE_BYTES = 4 * 1024 * 1024
 # Bound transient Task Control contention without relying on scheduler yield
 # counts; the interval stays short while the total wait remains finite.
 _STATE_COMMIT_RETRY_WINDOW_SECONDS = 0.25
 _STATE_COMMIT_RETRY_INTERVAL_SECONDS = 0.001
 _T = TypeVar("_T")
+
+
+def _load_bounded_json(path: Path) -> object:
+    with path.open("rb") as source:
+        encoded = source.read(MAX_RUN_STATE_BYTES + 1)
+    if len(encoded) > MAX_RUN_STATE_BYTES:
+        raise ValueError(
+            f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit: {path}"
+        )
+    return json.loads(encoded.decode("utf-8"))
 
 
 class SimulatedProcessCrash(OSError):
@@ -208,6 +221,19 @@ class StateStore:
             continuation = durable_state.get("timeline_continuation")
             if isinstance(continuation, list):
                 state["timeline_continuation"] = continuation
+        serialized = (
+            json.dumps(
+                durable_state,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        if len(serialized.encode("utf-8")) > MAX_RUN_STATE_BYTES:
+            raise ValueError(
+                f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit"
+            )
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.runs_directory,
             prefix=f".{run_id}.",
@@ -217,14 +243,7 @@ class StateStore:
         temporary_path = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-                json.dump(
-                    durable_state,
-                    temporary_file,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                temporary_file.write("\n")
+                temporary_file.write(serialized)
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
             os.replace(temporary_path, destination)
@@ -237,7 +256,7 @@ class StateStore:
         path = self.runs_directory / f"{run_id}.json"
         if not path.exists():
             return None
-        loaded: object = json.loads(path.read_text(encoding="utf-8"))
+        loaded = _load_bounded_json(path)
         if not isinstance(loaded, dict):
             raise ValueError(f"Invalid run state: {path}")
         return loaded
@@ -257,7 +276,7 @@ class StateStore:
             return None
         matches: list[dict[str, Any]] = []
         for path in self.runs_directory.glob("*.json"):
-            loaded: object = json.loads(path.read_text(encoding="utf-8"))
+            loaded = _load_bounded_json(path)
             if not isinstance(loaded, dict):
                 continue
             parent = loaded.get("parent")
@@ -278,7 +297,7 @@ class StateStore:
             return []
         runs: list[dict[str, Any]] = []
         for path in self.runs_directory.glob("*.json"):
-            loaded: object = json.loads(path.read_text(encoding="utf-8"))
+            loaded = _load_bounded_json(path)
             if not isinstance(loaded, dict):
                 continue
             parent = loaded.get("parent")
@@ -714,29 +733,139 @@ def _timeline_result(state: dict[str, Any]) -> object:
 
 
 def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
-    """Redact only error-bearing fields before a Run state reaches disk."""
+    """Bound diagnostics and exclude ephemeral or sensitive payloads from disk."""
 
     sanitized = _sanitize_error_value(value)
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
         raise ValueError("durable Run state must be a mapping")
+    diagnostics = sanitized.get("diagnostics")
+    if isinstance(diagnostics, list):
+        sanitized["diagnostics"] = [
+            _bound_diagnostic(item)
+            for item in diagnostics[:MAX_DIAGNOSTIC_ENTRIES]
+            if isinstance(item, dict)
+        ]
     return sanitized
 
 
-def _sanitize_error_value(value: object, *, diagnostic: bool = False) -> object:
+def _sanitize_error_value(
+    value: object, *, diagnostic: bool = False, path: tuple[str, ...] = ()
+) -> object:
     if isinstance(value, list):
-        return [_sanitize_error_value(item, diagnostic=diagnostic) for item in value]
+        return [
+            _sanitize_error_value(item, diagnostic=diagnostic, path=path)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return bounded_error(value) if diagnostic else redact_credentials(value)
     if not isinstance(value, dict):
         return value
     sanitized: dict[object, object] = {}
     for key, item in value.items():
+        if isinstance(key, str) and _is_ephemeral_payload_key(key):
+            continue
+        item_path = (*path, key) if isinstance(key, str) else path
+        if (
+            isinstance(key, str)
+            and _is_credential_key(key)
+            and not _is_durable_protocol_identity(item_path)
+        ):
+            sanitized[key] = "[REDACTED]"
+            continue
         is_diagnostic = key == "diagnostics"
-        if (key == "error" or key.endswith("_error")) and isinstance(item, str):
+        if diagnostic and isinstance(item, str):
             sanitized[key] = bounded_error(item)
-        elif key == "message" and diagnostic and isinstance(item, str):
+        elif isinstance(key, str) and (
+            key == "error" or key.endswith("_error")
+        ) and isinstance(item, str):
             sanitized[key] = bounded_error(item)
         else:
-            sanitized[key] = _sanitize_error_value(item, diagnostic=is_diagnostic)
+            sanitized[key] = _sanitize_error_value(
+                item,
+                diagnostic=diagnostic or is_diagnostic,
+                path=item_path,
+            )
     return sanitized
+
+
+def _normalized_key(value: str) -> str:
+    return value.casefold().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _is_ephemeral_payload_key(value: str) -> bool:
+    normalized = _normalized_key(value)
+    return (
+        normalized in {"env", "stdout", "stderr"}
+        or "environment" in normalized
+        or "transcript" in normalized
+        or "rawoutput" in normalized
+    )
+
+
+def _is_credential_key(value: str) -> bool:
+    normalized = _normalized_key(value)
+    return "credential" in normalized or normalized.endswith(
+        (
+            "authorization",
+            "token",
+            "secret",
+            "password",
+            "apikey",
+            "privatekey",
+            "cookie",
+        )
+    )
+
+
+def _is_durable_protocol_identity(path: tuple[str, ...]) -> bool:
+    return path[-2:] == ("candidate_commit_intent", "token") or (
+        bool(path)
+        and path[-1]
+        in {
+            "credential_availability",
+            "credential_failure_class",
+            "credential_http_status",
+            "previous_publication_authorization",
+        }
+    )
+
+
+def _diagnostic_size(value: dict[object, object]) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _truncate_utf8(value: str, limit: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    suffix = "...[truncated]"
+    budget = max(0, limit - len(suffix.encode("utf-8")))
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _bound_diagnostic(value: dict[object, object]) -> dict[object, object]:
+    if _diagnostic_size(value) <= MAX_DIAGNOSTIC_BYTES:
+        return value
+    bounded: dict[object, object] = {}
+    code = value.get("code")
+    message = value.get("message")
+    operator_gate = value.get("operator_gate")
+    if isinstance(code, str):
+        bounded["code"] = _truncate_utf8(code, 512)
+    if isinstance(message, str):
+        bounded["message"] = _truncate_utf8(message, 10 * 1024)
+    if isinstance(operator_gate, dict):
+        bounded["operator_gate"] = {
+            key: _truncate_utf8(item, 512)
+            for key, item in operator_gate.items()
+            if key in {"work_subject", "action_kind", "phase", "reason"}
+            and isinstance(item, str)
+        }
+    if _diagnostic_size(bounded) > MAX_DIAGNOSTIC_BYTES:
+        bounded["message"] = _truncate_utf8(str(bounded.get("message", "")), 8 * 1024)
+    return bounded
 
 
 class FaultInjectingStateStore(StateStore):

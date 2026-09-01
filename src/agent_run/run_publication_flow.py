@@ -180,7 +180,7 @@ class RunPublicationFlow(RunPublicationShared):
             publication.get("write_intent"), dict
         ):
             return self._wait_for_github_convergence(state, publication, error)
-        if error.code == "github_write_failed":
+        if error.code in {"github_write_failed", "github_write_outcome_unknown"}:
             return self._hold_unknown_write_outcome(state, publication, error)
         if not is_github_convergence_error(error.code):
             raise error

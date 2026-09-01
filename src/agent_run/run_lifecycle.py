@@ -9,6 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.agent_invocation import (
+    record_session_interruption,
+    session_interruption_is_persisted,
+)
 from agent_run.executor_host import (
     ExecutorHost,
     ExecutorLostError,
@@ -241,13 +245,118 @@ class RunLifecycle:
                 )
         record = self._reconcile_from_run(current, request.payload)
         action = record.get("action") if isinstance(record, Mapping) else None
+        executor = record.get("executor") if isinstance(record, Mapping) else None
+        reconciled_receipt_only_exit = False
+        if isinstance(executor, Mapping) and executor.get(
+            "reconciliation_required"
+        ) is True:
+            if not (
+                isinstance(current, dict)
+                and isinstance(action, Mapping)
+                and action_receipt_matches(current, action)
+            ):
+                raise _actionable_executor_unknown(
+                    "Task Control 不可用；Delivery Run Receipt 无法绑定原 Action。"
+                )
+            receipt_action_id = _string_field(action, "action_id")
+            receipt_generation = _positive_integer(action.get("executor_generation"))
+            receipt_run_id = _string_field(current, "run_id")
+            observation = self.host.observe(
+                self.executor_spec(
+                    receipt_run_id, receipt_action_id, receipt_generation
+                ),
+                self.control,
+            )
+            if (
+                observation.status != "exited"
+                or observation.generation != receipt_generation
+                or observation.runner_binding is None
+            ):
+                raise _actionable_executor_unknown(
+                    observation.reason
+                    or "Task Control 不可用；Host 未证明原 Executor 已退出。"
+                )
+            record = self.control.record_reconciled_executor_exit(
+                self.task,
+                action_id=receipt_action_id,
+                run_id=receipt_run_id,
+                generation=receipt_generation,
+                observed_status=observation.status,
+                observed_generation=observation.generation,
+                observed_runner_binding=observation.runner_binding,
+            )
+            action = record.get("action")
+            executor = record.get("executor")
+            reconciled_receipt_only_exit = True
+        if (
+            existing_control is None
+            and isinstance(receipt, Mapping)
+            and isinstance(record, Mapping)
+            and isinstance(current, Mapping)
+            and _restartable_after_executor_exit(current)
+            and not reconciled_receipt_only_exit
+        ):
+            raise _actionable_executor_unknown(
+                "Task Control 不可用；仅凭 Delivery Run Receipt 无法证明原 "
+                "Executor 已退出。请恢复对应 Task Control 后重试。"
+            )
+        if (
+            current is not None
+            and isinstance(record, Mapping)
+            and isinstance(action, Mapping)
+            and isinstance(executor, Mapping)
+            and executor.get("status") in {"absent", "exited"}
+            and action.get("kind") not in {"approve", "revise", "requeue"}
+            and action_receipt_matches(current, action)
+            and (
+                action.get("status") in {"accepted", "applying"}
+                or (
+                    action.get("status") in {"completed", "failed"}
+                    and (
+                        executor.get("status") == "absent"
+                        or isinstance(executor.get("failure"), str)
+                    )
+                )
+            )
+            and not _safe_supervision_recovery(current)
+            and not (
+                session_interruption_is_persisted(current)
+                and executor.get("failure") == "session_interrupted"
+            )
+            and (
+                current.get("status")
+                not in {
+                    "execution_failed",
+                    "completed",
+                    "abandoned",
+                    "ready_for_human",
+                }
+                or session_interruption_is_persisted(current)
+            )
+        ):
+            return self._record_session_interruption(
+                current,
+                record=record,
+                action_id=_string_field(action, "action_id"),
+                generation=_positive_integer(action.get("executor_generation")),
+                resumed=True,
+                attached=True,
+            )
         replace_receipt_action_id = _receipt_owner_action_id(record, current)
         current_run_id = current.get("run_id") if isinstance(current, Mapping) else None
         if (
             current is not None
             and isinstance(record, Mapping)
             and isinstance(action, Mapping)
-            and action.get("status") == "completed"
+            and (
+                action.get("status") == "completed"
+                or (
+                    action.get("status") == "failed"
+                    and request.kind != "resume"
+                    and isinstance(executor, Mapping)
+                    and executor.get("failure") == "session_interrupted"
+                )
+            )
             and action.get("kind") == request.kind
             and action.get("payload_digest") == payload_digest(request.payload)
             and action.get("run_id") == current_run_id
@@ -307,15 +416,20 @@ class RunLifecycle:
                             generation=generation,
                         )
                         return self.submit(request)
-                    raise ExecutorLostError(
-                        "活动 Executor 已退出；不会盲目启动第二个 Executor"
+                    return self._record_session_interruption(
+                        state,
+                        record=claim_record,
+                        action_id=action_id,
+                        generation=generation,
+                        resumed=True,
+                        attached=True,
                     )
                 if observation.status == "conflict":
-                    raise ExecutorStartUnknownError(
+                    raise _actionable_executor_unknown(
                         observation.reason or "Executor binding conflict"
                     )
                 if self.clock() >= deadline:
-                    raise ExecutorStartUnknownError(
+                    raise _actionable_executor_unknown(
                         observation.reason
                         or "Executor ownership 无法确认；不会启动第二个 Executor"
                     )
@@ -673,7 +787,7 @@ class RunLifecycle:
                 or executor.get("action_id") != action_id
             )
         ):
-            raise ExecutorStartUnknownError(
+            raise _actionable_executor_unknown(
                 "Delivery Run Receipt 已存在但 Executor ownership 缺失或不匹配；"
                 "不会启动第二个 Executor"
             )
@@ -681,7 +795,7 @@ class RunLifecycle:
             isinstance(executor, Mapping)
             and executor.get("reconciliation_required") is True
         ):
-            raise ExecutorStartUnknownError(
+            raise _actionable_executor_unknown(
                 "Task Control Record 曾丢失；Executor ownership 无法确认，"
                 "不会启动第二个 Executor"
             )
@@ -705,7 +819,7 @@ class RunLifecycle:
                 if observation.status not in {"starting", "unknown"}:
                     break
                 if self.clock() >= deadline:
-                    raise ExecutorStartUnknownError(
+                    raise _actionable_executor_unknown(
                         observation.reason
                         or "Executor ownership 无法确认；不会启动第二个 Executor"
                     )
@@ -722,12 +836,17 @@ class RunLifecycle:
                         attached=attached,
                     )
                 if not recover:
-                    raise ExecutorLostError(
-                        "Executor 已退出；只完成原 execution generation 对账，不自动重放 Agent"
+                    return self._record_session_interruption(
+                        state,
+                        record=record,
+                        action_id=action_id,
+                        generation=generation,
+                        resumed=resumed,
+                        attached=attached,
                     )
                 observation = None
             elif observation.status == "conflict":
-                raise ExecutorStartUnknownError(
+                raise _actionable_executor_unknown(
                     observation.reason or "Executor binding conflict"
                 )
         elif isinstance(executor, dict) and executor.get("status") in {
@@ -744,8 +863,13 @@ class RunLifecycle:
                         attached=attached,
                     )
                 if not recover:
-                    raise ExecutorLostError(
-                        "Executor 已收口但 Action 未完成；不会盲目重放业务意图"
+                    return self._record_session_interruption(
+                        state,
+                        record=record,
+                        action_id=action_id,
+                        generation=generation,
+                        resumed=resumed,
+                        attached=attached,
                     )
         elif executor is not None:
             raise ActionReconciliationError("Executor ownership record 无法对账")
@@ -801,6 +925,70 @@ class RunLifecycle:
         ):
             resumed = execution_context["resumed"]
         return final_state, resumed, receipt
+
+    def _record_session_interruption(
+        self,
+        state: dict[str, Any],
+        *,
+        record: Mapping[str, Any],
+        action_id: str,
+        generation: int,
+        resumed: bool,
+        attached: bool,
+    ) -> tuple[dict[str, Any], bool, ActionReceipt]:
+        action = record.get("action")
+        application_receipt = state.get("action_application_receipt")
+        if not isinstance(action, Mapping) or not isinstance(
+            application_receipt, Mapping
+        ):
+            raise ExecutorLostError(
+                "Executor 已退出，但 Delivery Run Receipt 无法证明原 Action；"
+                "不会改写状态或启动第二个 Executor"
+            )
+        if not (
+            action_receipt_matches(state, action)
+            or _unbound_action_matches_run_receipt(state, action)
+        ):
+            raise ExecutorLostError(
+                "Executor 已退出，但 Delivery Run Receipt 无法证明原 Action；"
+                "不会改写状态或启动第二个 Executor"
+            )
+        guarded_store = self._state_store_for_record(record)
+        state_store = StateStore(guarded_store.root)
+        run_id = _string_field(state, "run_id")
+        current = state_store.load_current_run(run_id)
+        current_receipt = (
+            current.get("action_application_receipt")
+            if isinstance(current, Mapping)
+            else None
+        )
+        if current is None or current_receipt != application_receipt:
+            raise ExecutorLostError(
+                "Executor 已退出，但当前 Delivery Run 无法证明原 Action；"
+                "不会改写状态或启动第二个 Executor"
+            )
+        if self.initialize_profile is not None:
+            # The earliest durable receipt can precede the frozen profile
+            # write.  Materialize that deterministic Action-bound profile so
+            # the advertised explicit Resume remains usable after closeout.
+            self.initialize_profile(current, True)
+        closed = self.control.fail_session_from_application_receipt(
+            self.task,
+            action_id=action_id,
+            generation=generation,
+            application_receipt=application_receipt,
+            persist_run_failure=lambda: record_session_interruption(
+                current,
+                save=lambda value: state_store.save_run(run_id, value),
+            ),
+        )
+        return (
+            current,
+            resumed,
+            self.receipt_from_record(
+                closed, action_id=action_id, attached=attached
+            ),
+        )
 
     def _complete_applied_action_after_executor_exit(
         self,
@@ -935,7 +1123,7 @@ class RunLifecycle:
                 )
             if observation.status == "conflict":
                 self.host.cleanup_startup(spec)
-                raise ExecutorStartUnknownError(
+                raise _actionable_executor_unknown(
                     observation.reason or "Executor binding conflict"
                 )
             if (
@@ -943,7 +1131,7 @@ class RunLifecycle:
                 and self.clock() >= startup_deadline
             ):
                 self.host.cleanup_startup(spec)
-                raise ExecutorStartUnknownError(
+                raise _actionable_executor_unknown(
                     observation.reason
                     or "Executor 未在握手窗口内完成启动；不会盲目启动第二个 Executor"
                 )
@@ -1277,7 +1465,10 @@ def _unbound_action_matches_run_receipt(
         and isinstance(payload, Mapping)
         and isinstance(run_id, str)
         and action.get("run_id") is None
-        and payload.get("run_id") == run_id
+        and (
+            payload.get("run_id") == run_id
+            or (action.get("kind") == "run" and "run_id" not in payload)
+        )
         and receipt.get("run_id") == run_id
         and all(
             receipt.get(key) == action.get(key)
@@ -1285,6 +1476,14 @@ def _unbound_action_matches_run_receipt(
         )
         and receipt.get("executor_generation")
         == action.get("executor_generation")
+    )
+
+
+def _actionable_executor_unknown(reason: str) -> ExecutorStartUnknownError:
+    return ExecutorStartUnknownError(
+        f"{reason}；请核验 Executor Host/Unit 与 Task Control 中的当前 "
+        "Action/generation，确认旧 Executor 状态后原样重试命令；"
+        "系统不会启动第二个 Executor"
     )
 
 

@@ -161,6 +161,7 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         "delivery_cleanup": delivery_cleanup,
         "latest_resume": latest_resume,
         "supervision": public_supervision_snapshot(state),
+        "executor_control": state.get("_executor_control"),
     }
     progress_source = output
     if not as_json:
@@ -234,6 +235,7 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
         },
         "agent_resumes": agent_resumes,
         "supervision": public_supervision_snapshot(state),
+        "executor_control": state.get("_executor_control"),
     }
     progress_source = output
     if not as_json:

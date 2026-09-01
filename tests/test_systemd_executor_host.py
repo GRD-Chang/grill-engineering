@@ -181,6 +181,11 @@ def test_systemd_host_accepts_launch_without_putting_environment_in_unit_metadat
     assert launch["unit"].endswith(".service")
     assert ":run-1:" in launch["description"]
     assert ":runner-" in launch["description"]
+    record = control.load(spec.task)
+    assert record is not None
+    runner_binding = record["executor"]["runner_binding"]
+    assert runner_binding == host._runner_binding()
+    assert str(host.executor_python) not in json.dumps(record)
     assert len(transport.cleanups) == 1
     cleanup = transport.cleanups[0]
     assert cleanup["delay_seconds"] == 30.0
@@ -576,6 +581,246 @@ def test_systemd_host_reports_binding_conflict_without_replacing_unit(
     assert record is not None
     assert record["action"]["status"] == "failed"
     assert record["executor"]["status"] == "exited"
+
+
+@pytest.mark.parametrize(
+    ("native_status", "description_kind", "expected_status"),
+    [
+        ("running", "exact", "running"),
+        ("exited", "exact", "exited"),
+        ("running", "conflict", "conflict"),
+        ("unknown", "missing", "unknown"),
+    ],
+)
+def test_systemd_host_observe_is_exact_and_strictly_read_only(
+    tmp_path: Path,
+    native_status: str,
+    description_kind: str,
+    expected_status: str,
+) -> None:
+    spec = _spec(tmp_path, run_id="run-1")
+    control = TaskControlStore(tmp_path / "control")
+    spec = _admit(control, spec)
+    transport = FakeSystemdTransport()
+    host = SystemdUserExecutorHost(
+        transport=transport,
+        runtime_directory=tmp_path / "runtime",
+        environment={},
+        executor_python=Path("/usr/bin/python3"),
+    )
+    description = {
+        "exact": host._description(spec),
+        "conflict": "agent-run-executor:another-binding",
+        "missing": None,
+    }[description_kind]
+    transport.unit = SystemdUnitObservation(
+        native_status,  # type: ignore[arg-type]
+        description,
+        os.getpid() if native_status == "running" else None,
+        None,
+    )
+    before = control.path_for(spec.task).read_bytes()
+
+    observation = host.observe(spec, control)
+
+    assert observation.status == expected_status
+    assert control.path_for(spec.task).read_bytes() == before
+    assert not (tmp_path / "runtime").exists()
+
+
+@pytest.mark.parametrize(
+    ("native_status", "description_kind", "expected_status"),
+    [
+        ("running", "historical", "running"),
+        ("exited", "historical", "exited"),
+        ("running", "current", "conflict"),
+        ("unknown", "missing", "unknown"),
+    ],
+)
+def test_systemd_observer_uses_the_generation_historical_runner_binding(
+    tmp_path: Path,
+    native_status: str,
+    description_kind: str,
+    expected_status: str,
+) -> None:
+    spec = _spec(tmp_path, run_id="run-1")
+    spec.cwd.mkdir(parents=True)
+    control = TaskControlStore(tmp_path / "control")
+    spec = _admit(control, spec)
+    transport = FakeSystemdTransport()
+    historical_host = SystemdUserExecutorHost(
+        transport=transport,
+        runtime_directory=tmp_path / "runtime-v1",
+        environment={"PATH": "/bin"},
+        executor_python=Path("/runner-v1/python"),
+    )
+    historical_host.ensure(spec, control)
+    historical_description = str(transport.launches[0]["description"])
+    control_before = control.path_for(spec.task).read_bytes()
+
+    current_host = SystemdUserExecutorHost(
+        transport=transport,
+        runtime_directory=tmp_path / "runtime-v2",
+        environment={},
+        executor_python=Path("/runner-v2/python"),
+    )
+    current_description = current_host._description(spec)
+    transport.unit = SystemdUnitObservation(
+        native_status,  # type: ignore[arg-type]
+        {
+            "historical": historical_description,
+            "current": current_description,
+            "missing": None,
+        }[description_kind],
+        os.getpid() if native_status == "running" else None,
+        "manager unavailable" if native_status == "unknown" else None,
+    )
+
+    observation = current_host.observe(spec, control)
+
+    assert observation.status == expected_status
+    if description_kind == "historical":
+        assert observation.runner_binding == historical_host._runner_binding()
+    assert control.path_for(spec.task).read_bytes() == control_before
+    assert transport.start_count == 1
+
+
+@pytest.mark.parametrize("control_case", ["missing", "corrupt"])
+@pytest.mark.parametrize(
+    ("native_status", "description_kind", "expected_status"),
+    [
+        ("exited", "exact", "exited"),
+        ("running", "exact", "running"),
+        ("unknown", "missing", "unknown"),
+        ("exited", "conflict", "conflict"),
+    ],
+)
+def test_receipt_only_control_recovers_runner_binding_from_exact_host_ownership(
+    tmp_path: Path,
+    control_case: str,
+    native_status: str,
+    description_kind: str,
+    expected_status: str,
+) -> None:
+    spec = _spec(tmp_path, run_id="run-1")
+    control = TaskControlStore(tmp_path / "control")
+    spec = _admit(control, spec)
+    control.bind_run(spec.task, spec.action_id, "run-1")
+    record = control.load(spec.task)
+    assert record is not None
+    action = record["action"]
+    receipt = {
+        "protocol": 1,
+        "action_id": action["action_id"],
+        "kind": action["kind"],
+        "payload_digest": action["payload_digest"],
+        "run_id": "run-1",
+        "executor_generation": action["executor_generation"],
+    }
+    if control_case == "missing":
+        control.path_for(spec.task).unlink()
+    else:
+        control.path_for(spec.task).write_text("not json", encoding="utf-8")
+    repaired = control.reconcile_from_run(
+        spec.task,
+        {"run_id": "run-1", "status": "active", "action_application_receipt": receipt},
+        payload=action["payload"],
+    )
+    assert repaired is not None
+    assert repaired["executor"]["reconciliation_required"] is True
+    assert "runner_binding" not in repaired["executor"]
+
+    historical_host = SystemdUserExecutorHost(
+        transport=FakeSystemdTransport(),
+        runtime_directory=tmp_path / "runtime-v1",
+        environment={},
+        executor_python=Path("/runner-v1/python"),
+    )
+    historical_description = historical_host._description(spec)
+    description = {
+        "exact": historical_description,
+        "missing": None,
+        "conflict": historical_description.replace(":run-1:", ":other-run:"),
+    }[description_kind]
+    transport = FakeSystemdTransport(
+        unit=SystemdUnitObservation(
+            native_status,  # type: ignore[arg-type]
+            description,
+            os.getpid() if native_status == "running" else None,
+            "manager unavailable" if native_status == "unknown" else None,
+        )
+    )
+    current_host = SystemdUserExecutorHost(
+        transport=transport,
+        runtime_directory=tmp_path / "runtime-v2",
+        environment={},
+        executor_python=Path("/runner-v2/python"),
+    )
+
+    observation = current_host.observe(spec, control)
+
+    assert observation.status == expected_status
+    if expected_status == "exited":
+        control_before_missing_binding = control.path_for(spec.task).read_bytes()
+        with pytest.raises(ActionReconciliationError, match="Runner binding"):
+            control.record_reconciled_executor_exit(
+                spec.task,
+                action_id=spec.action_id,
+                run_id="run-1",
+                generation=spec.generation,
+                observed_status="exited",
+                observed_generation=spec.generation,
+                observed_runner_binding=None,  # type: ignore[arg-type]
+            )
+        assert control.path_for(spec.task).read_bytes() == (
+            control_before_missing_binding
+        )
+    if expected_status not in {"exited", "running"}:
+        assert observation.runner_binding is None
+        assert control.load(spec.task) == repaired
+        assert transport.start_count == 0
+        return
+    assert observation.runner_binding == historical_host._runner_binding()
+    if expected_status == "running":
+        assert control.load(spec.task) == repaired
+        assert transport.start_count == 0
+        return
+    proven = control.record_reconciled_executor_exit(
+        spec.task,
+        action_id=spec.action_id,
+        run_id="run-1",
+        generation=spec.generation,
+        observed_status=observation.status,
+        observed_generation=observation.generation,
+        observed_runner_binding=observation.runner_binding,
+    )
+    assert proven["executor"]["runner_binding"] == historical_host._runner_binding()
+    assert transport.start_count == 0
+
+
+def test_systemd_host_observe_keeps_pending_absence_unknown_without_writes(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path, run_id="run-1")
+    control = TaskControlStore(tmp_path / "control")
+    spec = _admit(control, spec)
+    host = SystemdUserExecutorHost(
+        transport=FakeSystemdTransport(),
+        runtime_directory=tmp_path / "runtime",
+        environment={},
+        executor_python=Path("/usr/bin/python3"),
+    )
+    pending = host._launch_pending_path(spec)
+    pending.parent.mkdir(parents=True)
+    pending.touch()
+    control_before = control.path_for(spec.task).read_bytes()
+    pending_before = pending.read_bytes()
+
+    observation = host.observe(spec, control)
+
+    assert observation.status == "unknown"
+    assert control.path_for(spec.task).read_bytes() == control_before
+    assert pending.read_bytes() == pending_before
 
 
 def test_systemd_host_does_not_treat_transient_inspection_failure_as_conflict(

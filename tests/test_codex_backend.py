@@ -4144,7 +4144,7 @@ def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> Non
     captured = stream.text()
     assert "thread-189" in captured
     assert "bounded failure" in captured
-    assert len(captured.encode("utf-8")) <= 16 * 1024
+    assert len(captured.encode("utf-8")) <= 4096
 
 
 def test_worker_process_bounds_stdout_and_stderr_without_rss_assertions(

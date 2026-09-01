@@ -57,6 +57,7 @@ from agent_run.executor_host import (
     BoundExecutorHost,
     ExecutorAgentInterruptedError,
     ExecutorHost,
+    ExecutorHostError,
     ExecutorLostError,
     ExecutorSpec,
     ExecutorStartUnknownError,
@@ -66,6 +67,7 @@ from agent_run.runner_lease import default_runner_lock_path, runner_usage_lease
 from agent_run.systemd_executor_host import (
     SystemdExecutionReadinessError,
     SystemdUserExecutorHost,
+    observe_systemd_executor,
 )
 from agent_run.run_driver import DirectRunOperations, RunDriver, RunOutcomeKind
 from agent_run.run_lifecycle import (
@@ -2159,14 +2161,29 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
         except GitError:
             pass
     records = _selector_records(parsed, read_only=True)
-    _public, state = _select_one_record(
+    public, state = _select_one_record(
         records,
         parent_number=parent,
         active_only=parent is None,
         purpose="status/history",
         current_root=selector_root,
     )
-    return state
+    repository_root = public.get("repository_root")
+    selected_state_dir = public.get("state_dir")
+    return _with_executor_control(
+        state,
+        repository_root=(
+            Path(repository_root)
+            if isinstance(repository_root, str) and repository_root != "unavailable"
+            else None
+        ),
+        state_root=(
+            Path(selected_state_dir)
+            if isinstance(selected_state_dir, str)
+            and selected_state_dir != "unavailable"
+            else None
+        ),
+    )
 
 
 def _resolve_mutation_selection(
@@ -2450,8 +2467,13 @@ def _selected_local_run_id(
 def _load_exact_read_only_run(
     parsed: argparse.Namespace, run_id: str
 ) -> dict[str, object]:
+    repository_root: Path | None = None
+    state_root: Path | None = None
     if parsed.state_dir:
-        states = StateStore(Path(parsed.state_dir).resolve())
+        state_dir = Path(parsed.state_dir).resolve()
+        state_root = state_dir
+        states = StateStore(state_dir)
+        repository_root = _repository_root_for_state_dir(state_dir)
         state = _load_read_only_state(states, run_id)
         if state is not None and state.get("run_id") != run_id:
             state = None
@@ -2465,9 +2487,13 @@ def _load_exact_read_only_run(
             state = _load_read_only_state(StateStore(git.root / ".agent-run"), run_id)
             if state is not None and state.get("run_id") != run_id:
                 state = None
+            elif state is not None:
+                repository_root = git.root
+                state_root = git.root / ".agent-run"
         if state is None:
             locator = RunLocatorIndex.default()
             state_dir = locator.resolve_state_dir(run_id)
+            state_root = state_dir
             state = _load_read_only_state(StateStore(state_dir), run_id)
             if state is None or state.get("run_id") != run_id:
                 raise RunLocatorError(
@@ -2475,10 +2501,181 @@ def _load_exact_read_only_run(
                     f"无法定位 Delivery Run {run_id!r}：定位索引指向的状态文件无效；"
                     "请显式提供 --state-dir <状态目录>。",
                 )
+            roots = {
+                Path(entry["repository_root"]).resolve()
+                for entry in locator.entries()
+                if entry["run_id"] == run_id
+                and Path(entry["state_dir"]).resolve() == state_dir.resolve()
+            }
+            if len(roots) == 1:
+                repository_root = next(iter(roots))
     if state is None:  # pragma: no cover - exact loader raises before this point
         raise ValueError(f"unknown Delivery Run: {run_id}")
     _validate_repository_selector(parsed, state, run_id)
-    return state
+    return _with_executor_control(
+        state, repository_root=repository_root, state_root=state_root
+    )
+
+
+def _with_executor_control(
+    state: dict[str, Any],
+    *,
+    repository_root: Path | None,
+    state_root: Path | None,
+) -> dict[str, Any]:
+    """Add an ephemeral, strictly read-only Executor ownership audit."""
+
+    projected = dict(state)
+    if repository_root is None:
+        projected["_executor_control"] = {
+            "activity": "unknown",
+            "reason": "task_control_workspace_unavailable",
+        }
+        return projected
+    parent = state.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, Mapping) else None
+    repository = state.get("repository")
+    if type(parent_number) is not int or not isinstance(repository, str):
+        projected["_executor_control"] = {
+            "activity": "unknown",
+            "reason": "task_control_identity_unavailable",
+        }
+        return projected
+    task = TaskKey(repository_root, repository, parent_number)
+    try:
+        record = TaskControlStore(repository_root / ".agent-run").inspect_run(
+            task, state
+        )
+    except (OSError, TaskControlError):
+        projected["_executor_control"] = {
+            "activity": "unknown",
+            "reason": "task_control_invalid",
+        }
+        return projected
+    if record is None:
+        projected["_executor_control"] = {
+            "activity": "unknown",
+            "reason": "task_control_missing",
+        }
+        return projected
+    action = record.get("action")
+    executor = record.get("executor")
+    executor_status = (
+        executor.get("status") if isinstance(executor, Mapping) else None
+    )
+    activity = "unknown"
+    reason: str | None = "executor_control_invalid"
+    if isinstance(executor, Mapping) and executor.get(
+        "reconciliation_required"
+    ) is True:
+        reason = "executor_reconciliation_required"
+    elif executor_status in {"exited", "absent"}:
+        activity = "not_running"
+        reason = None
+    elif (
+        executor_status in {"starting", "running"}
+        and isinstance(action, Mapping)
+        and isinstance(executor, Mapping)
+        and isinstance(state_root, Path)
+    ):
+        action_id = action.get("action_id")
+        generation = executor.get("generation")
+        run_id = state.get("run_id")
+        exact_binding = (
+            isinstance(action_id, str)
+            and action_id
+            and type(generation) is int
+            and generation > 0
+            and isinstance(run_id, str)
+            and executor.get("action_id") == action_id
+            and executor.get("run_id") == run_id
+            and action.get("run_id") == run_id
+            and action.get("executor_generation") == generation
+            and action_receipt_matches(state, action)
+        )
+        if exact_binding:
+            assert isinstance(action_id, str)
+            assert type(generation) is int
+            assert isinstance(run_id, str)
+            spec = ExecutorSpec(
+                task=task,
+                action_id=action_id,
+                run_id=run_id,
+                generation=generation,
+                state_root=state_root.resolve(),
+            )
+            try:
+                observation = observe_systemd_executor(
+                    spec,
+                    TaskControlStore(repository_root / ".agent-run"),
+                    runtime_directory=_executor_runtime_directory(),
+                    executor_python=Path(sys.executable),
+                )
+            except (OSError, ExecutorHostError):
+                reason = "executor_host_unavailable"
+            else:
+                if observation.status == "absent":
+                    activity = "not_running"
+                    reason = None
+                elif observation.generation != generation:
+                    reason = "executor_binding_invalid"
+                elif observation.status == "running":
+                    recorded_pid = executor.get("pid")
+                    if (
+                        executor_status == "running"
+                        and isinstance(executor.get("handshake_at"), str)
+                        and type(recorded_pid) is int
+                        and recorded_pid > 0
+                        and observation.pid == recorded_pid
+                    ):
+                        activity = "running"
+                        reason = None
+                    else:
+                        reason = "executor_binding_invalid"
+                elif observation.status == "exited":
+                    activity = "not_running"
+                    reason = None
+                else:
+                    reason = "executor_host_unknown"
+        else:
+            reason = "executor_binding_invalid"
+    projected["_executor_control"] = {
+        "activity": activity,
+        "action": (
+            {
+                key: action.get(key)
+                for key in (
+                    "action_id",
+                    "kind",
+                    "payload_digest",
+                    "status",
+                    "run_id",
+                    "executor_generation",
+                    "application_observed",
+                )
+            }
+            if isinstance(action, Mapping)
+            else None
+        ),
+        "executor": (
+            {
+                key: executor.get(key)
+                for key in (
+                    "status",
+                    "action_id",
+                    "run_id",
+                    "generation",
+                    "pid",
+                    "handshake_at",
+                )
+            }
+            if isinstance(executor, Mapping)
+            else None
+        ),
+    }
+    if reason is not None:
+        projected["_executor_control"]["reason"] = reason
+    return projected
 
 
 def _load_read_only_state(states: StateStore, run_id: str) -> dict[str, Any] | None:

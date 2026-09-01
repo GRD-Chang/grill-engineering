@@ -586,6 +586,29 @@ def test_publication_does_not_create_a_final_pr_after_parent_drifts(
     assert published["run_acceptance"]["phase"] == "pending"
     assert drifting.data["delivery"]["pull_requests"] == []
 
+def test_run_publication_record_response_loss_is_read_back_without_duplicate(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["crash_after_record_run_publication_once"] = True
+    engine = RunPublicationEngine(
+        git=git,
+        states=states,
+        agents=RunPublicationAgents(),
+        github=publisher,
+        default_branch="main",
+        default_head_sha=git.resolve("main"),
+    )
+
+    recovered = engine.publish(str(state["run_id"]))
+
+    assert recovered["status"] == "run_approval_pending"
+    assert publisher.data["delivery"][
+        "crash_after_record_run_publication_once"
+    ] is False
+    assert len(publisher.data["delivery"]["run_publication_records"]) == 1
+
+
 def test_parent_closeout_recovers_without_a_second_merge(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     engine = RunPublicationEngine(

@@ -72,9 +72,20 @@ class _BoundedJsonlStream:
         self._consume(self._decoder.decode(b"", final=True), final=True)
 
     def text(self) -> str:
-        pinned = "\n".join(self._pinned.values())
-        tail = self._tail.text()
-        return f"{pinned}\n{tail}" if pinned else tail
+        # Critical lines share the same byte budget as the ordinary tail;
+        # pinning must not silently turn a bounded capture into an unbounded one.
+        per_line = max(1, self.capture_bytes // max(1, len(self._pinned) + 1))
+        pinned_lines = [
+            line
+            for line in self._pinned.values()
+            if len(line.encode("utf-8")) <= per_line
+        ]
+        pinned = "\n".join(pinned_lines)
+        prefix = f"{pinned}\n" if pinned else ""
+        prefix_bytes = prefix.encode("utf-8")
+        remaining = max(0, self.capture_bytes - len(prefix_bytes))
+        tail_bytes = self._tail.text().encode("utf-8")[-remaining:] if remaining else b""
+        return (prefix_bytes + tail_bytes).decode("utf-8", errors="ignore")
 
     def _consume(self, value: str, *, final: bool = False) -> None:
         for part in value.splitlines(keepends=True):

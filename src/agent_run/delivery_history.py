@@ -47,6 +47,12 @@ def print_history_progress(
     )
     print(f"Time zone: {timezone_label}")
     print(f"Elapsed:   {_duration(progress['summary']['elapsed_seconds'])}")
+    executor_control = audit.get("executor_control")
+    if (
+        isinstance(executor_control, dict)
+        and executor_control.get("activity") == "unknown"
+    ):
+        print("Agent 活跃状态: 无法确认")
     print("\n事件")
     for event in progress["events"]:
         timestamp = _parse_timestamp(event["at"])

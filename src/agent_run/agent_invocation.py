@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from copy import deepcopy
 from typing import Any, Callable
 
+from agent_run.requeue import RequeueError, current_change_job
 from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
 from agent_run.resume_audit import bind_resume_to_successor
 
@@ -212,3 +213,93 @@ def fail_interrupted_invocation(
     )
     save(state)
     return True
+
+
+def record_session_interruption(
+    state: dict[str, Any], *, save: Callable[[dict[str, Any]], object]
+) -> None:
+    """Persist a proven Executor Session loss without replaying its work."""
+
+    if session_interruption_is_persisted(state):
+        # The Run commit and Task Control close are deliberately separated by
+        # one local transaction boundary.  A crash in that window must only
+        # finish the original Control record on retry; deriving the gate again
+        # from the now-terminal Run would change its durable identity.
+        return
+
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
+        failed = dict(active)
+        failed.update(
+            {
+                "status": "failed",
+                "ended_at": datetime.now(UTC).isoformat(),
+                "error": "session_interrupted",
+            }
+        )
+        state["active_agent_invocation"] = failed
+        _sync_invocation_history(state, failed)
+    diagnostic: dict[str, Any] = {
+        "code": "session_interrupted",
+        "message": "Executor Session 已退出；保留现场并等待显式 Resume",
+    }
+    receipt = state.get("action_application_receipt")
+    if (
+        isinstance(receipt, dict)
+        and isinstance(receipt.get("action_id"), str)
+        and type(receipt.get("executor_generation")) is int
+    ):
+        diagnostic["action_identity"] = {
+            "action_id": receipt["action_id"],
+            "executor_generation": receipt["executor_generation"],
+        }
+    try:
+        work_subject, subject, _container = current_change_job(state)
+    except RequeueError:
+        subject = None
+    if subject is not None:
+        phase = subject.get("phase")
+        diagnostic["operator_gate"] = {
+            "work_subject": work_subject,
+            "action_kind": "execution_failure",
+            "phase": (
+                phase
+                if isinstance(phase, str) and phase
+                else str(state.get("status") or "execution_failed")
+            ),
+            "reason": "session_interrupted",
+        }
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "diagnostics": [diagnostic],
+        }
+    )
+    save(state)
+
+
+def session_interruption_is_persisted(state: dict[str, Any]) -> bool:
+    diagnostics = state.get("diagnostics")
+    receipt = state.get("action_application_receipt")
+    if not (
+        isinstance(receipt, dict)
+        and isinstance(receipt.get("action_id"), str)
+        and type(receipt.get("executor_generation")) is int
+    ):
+        return False
+    expected_identity = {
+        "action_id": receipt["action_id"],
+        "executor_generation": receipt["executor_generation"],
+    }
+    return (
+        state.get("status") == "execution_failed"
+        and state.get("terminal_kind") == "execution_failed"
+        and isinstance(diagnostics, list)
+        and any(
+            isinstance(diagnostic, dict)
+            and diagnostic.get("code") == "session_interrupted"
+            and diagnostic.get("action_identity") == expected_identity
+            for diagnostic in diagnostics
+        )
+    )

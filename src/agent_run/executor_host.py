@@ -57,6 +57,7 @@ class ExecutorSpec:
     cwd: Path | None = None
     environment: Mapping[str, str] | None = None
     state_root: Path | None = None
+    runner_binding: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class HostObservation:
     pid: int | None
     handshake: bool
     reason: str | None = None
+    runner_binding: str | None = None
 
 
 class ExecutorHost(Protocol):
@@ -78,6 +80,10 @@ class ExecutorHost(Protocol):
     ) -> HostObservation: ...
 
     def inspect(
+        self, spec: ExecutorSpec, control: TaskControlStore
+    ) -> HostObservation: ...
+
+    def observe(
         self, spec: ExecutorSpec, control: TaskControlStore
     ) -> HostObservation: ...
 
@@ -151,12 +157,18 @@ class FakeExecutorHost:
         *,
         start_outcome: Literal["accepted", "unknown"] = "accepted",
         separate_process: bool = False,
+        fault_hook: Callable[[str], None] | None = None,
     ) -> None:
         if start_outcome not in {"accepted", "unknown"}:
             raise ValueError("start_outcome must be accepted or unknown")
         self.start_outcome = start_outcome
         self.separate_process = separate_process
+        self.fault_hook = fault_hook
         self.start_count = 0
+
+    def _checkpoint(self, name: str) -> None:
+        if self.fault_hook is not None:
+            self.fault_hook(name)
 
     def ensure(
         self,
@@ -193,6 +205,7 @@ class FakeExecutorHost:
                 )
 
         self.start_count += 1
+        self._checkpoint("host_accepted")
         if self.start_outcome == "unknown":
             return HostObservation(
                 status="unknown",
@@ -221,6 +234,7 @@ class FakeExecutorHost:
                 pid=pid,
                 process_start_token=start_token,
             )
+            self._checkpoint("pre_handshake")
             control.mark_handshake(
                 spec.task,
                 action_id=spec.action_id,
@@ -228,6 +242,7 @@ class FakeExecutorHost:
                 pid=pid,
                 process_start_token=start_token,
             )
+            self._checkpoint("post_handshake")
             if execute is None:
                 return HostObservation(
                     status="running",
@@ -449,6 +464,11 @@ class FakeExecutorHost:
             )
         observation = self.inspect(spec, control)
         if not os.WIFEXITED(child_status) or os.WEXITSTATUS(child_status) != 0:
+            control.mark_executor_absent(
+                spec.task,
+                action_id=spec.action_id,
+                generation=generation,
+            )
             raise ExecutorHostError(
                 observation.reason or "Fixture Executor 未正常收口"
             )
@@ -539,6 +559,11 @@ class FakeExecutorHost:
             reason="cannot prove the recorded process binding",
         )
 
+    def observe(self, spec: ExecutorSpec, control: TaskControlStore) -> HostObservation:
+        """Inspect ownership without changing Task Control or Host state."""
+
+        return self.inspect(spec, control)
+
     def cleanup_startup(self, spec: ExecutorSpec) -> None:
         del spec
 
@@ -625,6 +650,11 @@ class BoundExecutorHost:
                 "conflict", self.generation, None, False, "Executor binding 不匹配"
             )
         return HostObservation("reserved", self.generation, os.getpid(), False)
+
+    def observe(
+        self, spec: ExecutorSpec, control: TaskControlStore
+    ) -> HostObservation:
+        return self.inspect(spec, control)
 
     def cleanup_startup(self, spec: ExecutorSpec) -> None:
         self._validate(spec)

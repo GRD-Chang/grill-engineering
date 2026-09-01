@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
-from agent_run.github_retry import run_read_command
+from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 from agent_run.models import Repository
 from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
 
@@ -32,12 +33,30 @@ def test_github_reader_retries_transient_timeout(
                 )
         return _repository_response()
 
-    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
     assert attempts == 3
+
+
+def test_github_command_capture_has_a_direct_byte_bound() -> None:
+    result = run_read_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.stdout.write('x' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096)); "
+                f"sys.stderr.write('y' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096))"
+            ),
+        ]
+    )
+
+    assert result.returncode == 0
+    assert len(result.stdout.encode("utf-8")) <= MAX_COMMAND_OUTPUT_BYTES
+    assert len(result.stderr.encode("utf-8")) <= MAX_COMMAND_OUTPUT_BYTES
 
 
 @pytest.mark.parametrize("stderr", ["permission denied", "unexpected response"])
@@ -51,7 +70,7 @@ def test_github_read_retries_do_not_classify_stderr(
         attempts += 1
         return subprocess.CompletedProcess(arguments, 1, "", stderr)
 
-    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
 
     result = run_read_command(["gh", "api", "repos/example/project"])
@@ -136,7 +155,7 @@ def test_git_fetch_retries_transient_timeout(
             )
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
-    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
 
     GitRepository(git_repo)._fetch_default_branch("main")
@@ -185,7 +204,7 @@ def test_publisher_does_not_write_after_branch_read_exhaustion(
             arguments, 1, "", "HTTP 503: upstream unavailable"
         )
 
-    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     monkeypatch.setattr(
@@ -273,7 +292,7 @@ def test_github_reader_retries_transient_http_status(
                 )
         return _repository_response()
 
-    monkeypatch.setattr("agent_run.github_retry.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")

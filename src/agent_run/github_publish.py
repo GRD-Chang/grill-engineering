@@ -288,37 +288,12 @@ class GhGitHubPublisher:
             "## Run Publication Record\n\n```json\n"
             f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n```"
         )
-        comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate"
+        self._record_marker_comment(
+            pr_number=pr_number,
+            marker=_RUN_PUBLICATION_MARKER,
+            body=body,
+            label="Run publication record",
         )
-        if not isinstance(comments, list):
-            raise GitHubReadError(
-                "github_invalid_response", "comments must be an array"
-            )
-        existing = next(
-            (
-                _mapping(comment)
-                for comment in comments
-                if _RUN_PUBLICATION_MARKER in str(_mapping(comment).get("body", ""))
-            ),
-            None,
-        )
-        if existing is None:
-            self._json(
-                "api",
-                f"repos/{self.repository}/issues/{pr_number}/comments",
-                "-f",
-                f"body={body}",
-            )
-        else:
-            self._json(
-                "api",
-                "--method",
-                "PATCH",
-                f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
-                "-f",
-                f"body={body}",
-            )
 
     def normal_merge(
         self,
@@ -398,16 +373,30 @@ class GhGitHubPublisher:
             )
         )
         marker = f"<!-- agent-run:{run_id}:parent-completed -->"
-        comments = issue.get("comments")
-        already_recorded = isinstance(comments, list) and any(
-            marker in str(_mapping(comment).get("body", "")) for comment in comments
+        body = (
+            f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
+            f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
+            "is verified on the default branch."
         )
-        if not already_recorded:
-            body = (
-                f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
-                f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
-                "is verified on the default branch."
+        comments = issue.get("comments")
+        marker_comments = (
+            [
+                _mapping(comment)
+                for comment in comments
+                if marker in str(_mapping(comment).get("body", ""))
+            ]
+            if isinstance(comments, list)
+            else []
+        )
+        if marker_comments and not any(
+            comment.get("body") == body for comment in marker_comments
+        ):
+            raise GitHubReadError(
+                "github_write_outcome_unknown",
+                "Parent Issue completion marker body does not match the intent",
             )
+        already_recorded = bool(marker_comments)
+        if not already_recorded:
             self._require(
                 "issue",
                 "comment",
@@ -424,6 +413,30 @@ class GhGitHubPublisher:
                 str(parent_number),
                 "--repo",
                 self.repository,
+            )
+        observed = _mapping(
+            self._json(
+                "issue",
+                "view",
+                str(parent_number),
+                "--repo",
+                self.repository,
+                "--json",
+                "state,comments,updatedAt",
+            )
+        )
+        observed_comments = observed.get("comments")
+        if (
+            observed.get("state") != "CLOSED"
+            or not isinstance(observed_comments, list)
+            or not any(
+                _mapping(comment).get("body") == body
+                for comment in observed_comments
+            )
+        ):
+            raise GitHubReadError(
+                "github_write_outcome_unknown",
+                "Parent Issue close remote readback did not match the intent",
             )
 
     def abandon_run_pr(self, pr_number: int) -> None:
@@ -1093,58 +1106,34 @@ class GhGitHubPublisher:
             f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n"
             "```"
         )
-        comments = self._json(
-            "api",
-            f"repos/{self.repository}/issues/{pr_number}/comments",
-            "--paginate",
+        self._record_marker_comment(
+            pr_number=pr_number,
+            marker=_ACCEPTANCE_MARKER,
+            body=body,
+            label="Acceptance record",
         )
-        if not isinstance(comments, list):
-            raise GitHubReadError(
-                "github_invalid_response", "comments must be an array"
-            )
-        existing = next(
-            (
-                _mapping(comment)
-                for comment in comments
-                if _ACCEPTANCE_MARKER in str(_mapping(comment).get("body", ""))
-            ),
-            None,
-        )
-        if existing is None:
-            self._json(
-                "api",
-                f"repos/{self.repository}/issues/{pr_number}/comments",
-                "-f",
-                f"body={body}",
-            )
-        else:
-            comment_id = _integer(existing, "id")
-            self._json(
-                "api",
-                "--method",
-                "PATCH",
-                f"repos/{self.repository}/issues/comments/{comment_id}",
-                "-f",
-                f"body={body}",
-            )
 
     def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         body = _render_agent_run_status(status)
-        comments = self._json(
-            "api",
-            f"repos/{self.repository}/issues/{pr_number}/comments",
-            "--paginate",
-            "--slurp",
+        self._record_marker_comment(
+            pr_number=pr_number,
+            marker=_AGENT_RUN_STATUS_MARKER,
+            body=body,
+            label="Agent Run status",
         )
-        comments = _flatten_pages(comments, "comments")
+
+    def _record_marker_comment(
+        self, *, pr_number: int, marker: str, body: str, label: str
+    ) -> None:
+        """Apply one marker-owned comment and prove its exact remote body."""
+
+        comments = self._marker_comments(pr_number)
         existing = next(
-            (
-                _mapping(comment)
-                for comment in comments
-                if _AGENT_RUN_STATUS_MARKER in str(_mapping(comment).get("body", ""))
-            ),
+            (comment for comment in comments if marker in str(comment.get("body", ""))),
             None,
         )
+        if existing is not None and existing.get("body") == body:
+            return
         if existing is None:
             self._json(
                 "api",
@@ -1161,6 +1150,24 @@ class GhGitHubPublisher:
                 "-f",
                 f"body={body}",
             )
+        if not any(
+            comment.get("body") == body for comment in self._marker_comments(pr_number)
+        ):
+            raise GitHubReadError(
+                "github_write_outcome_unknown",
+                f"{label} remote readback did not match the intended body",
+            )
+
+    def _marker_comments(self, pr_number: int) -> list[dict[str, Any]]:
+        comments = self._json(
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
+        )
+        return [
+            _mapping(comment) for comment in _flatten_pages(comments, "comments")
+        ]
 
     def has_supersession_close_receipt(
         self, pr_number: int, generation: object, close_nonce: object

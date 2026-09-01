@@ -359,15 +359,31 @@ class SystemdUserExecutorHost:
             self._release_capture()
             return self.inspect(spec, control)
         try:
+            current_runner_binding = self._runner_binding()
             reservation = control.begin_executor(
                 spec.task,
                 action_id=spec.action_id,
                 run_id=spec.run_id,
                 reclaim=recover,
+                runner_binding=current_runner_binding,
                 before_create=lambda: self.prepare_environment(spec.command),
             )
             if reservation.generation != spec.generation:
                 spec = replace(spec, generation=reservation.generation)
+            executor = reservation.record.get("executor")
+            reserved_runner_binding = (
+                executor.get("runner_binding")
+                if isinstance(executor, Mapping)
+                else None
+            )
+            spec = replace(
+                spec,
+                runner_binding=(
+                    reserved_runner_binding
+                    if isinstance(reserved_runner_binding, str)
+                    else current_runner_binding
+                ),
+            )
             if not reservation.created:
                 self._release_capture()
                 control.assert_executor_current(
@@ -526,11 +542,32 @@ class SystemdUserExecutorHost:
         finally:
             os.close(startup_lease)
 
+    def observe(
+        self, spec: ExecutorSpec, control: TaskControlStore
+    ) -> HostObservation:
+        """Read exact systemd ownership without cleanup or control writes."""
+
+        spec = self._bind_historical_runner(spec, control)
+        observation = self._from_native(spec, self.transport.inspect(self._unit(spec)))
+        if (
+            observation.status == "absent"
+            and self._launch_pending_path(spec).exists()
+        ):
+            return HostObservation(
+                "unknown",
+                spec.generation,
+                observation.pid,
+                False,
+                "systemd 启动结果尚未确认",
+            )
+        return observation
+
     def _inspect(
         self,
         spec: ExecutorSpec,
         control: TaskControlStore,
     ) -> HostObservation:
+        spec = self._bind_historical_runner(spec, control)
         native = self.transport.inspect(self._unit(spec))
         observation = self._from_native(spec, native)
         if observation.status in {"starting", "running"}:
@@ -683,7 +720,12 @@ class SystemdUserExecutorHost:
                 False,
                 bounded_error(native.reason or "systemd unit binding 无法确认"),
             )
-        if native.status != "absent" and native.description != self._description(spec):
+        observed_runner_binding = None
+        if native.status != "absent":
+            observed_runner_binding = self._runner_binding_from_description(
+                spec, native.description
+            )
+        if native.status != "absent" and observed_runner_binding is None:
             return HostObservation(
                 "conflict",
                 spec.generation,
@@ -691,12 +733,46 @@ class SystemdUserExecutorHost:
                 False,
                 "systemd unit binding 与当前 execution generation 不匹配",
             )
+        if (
+            native.status != "absent"
+            and spec.runner_binding is not None
+            and observed_runner_binding != spec.runner_binding
+        ):
+            return HostObservation(
+                "conflict",
+                spec.generation,
+                native.pid,
+                False,
+                "systemd unit Runner binding 与原 execution generation 不匹配",
+            )
         return HostObservation(
             native.status,
             spec.generation if native.status != "absent" else None,
             native.pid,
             False,
             bounded_error(native.reason) if native.reason else None,
+            observed_runner_binding,
+        )
+
+    @staticmethod
+    def _bind_historical_runner(
+        spec: ExecutorSpec, control: TaskControlStore
+    ) -> ExecutorSpec:
+        record = control.load(spec.task)
+        executor = record.get("executor") if isinstance(record, Mapping) else None
+        if not isinstance(executor, Mapping):
+            return spec
+        if (
+            executor.get("action_id") != spec.action_id
+            or executor.get("generation") != spec.generation
+            or executor.get("run_id") not in {None, spec.run_id}
+        ):
+            return spec
+        runner_binding = executor.get("runner_binding")
+        return (
+            replace(spec, runner_binding=runner_binding)
+            if isinstance(runner_binding, str)
+            else spec
         )
 
     @staticmethod
@@ -776,9 +852,7 @@ class SystemdUserExecutorHost:
         )
 
     def _description(self, spec: ExecutorSpec) -> str:
-        runner_binding = hashlib.sha256(
-            str(self.executor_python).encode("utf-8")
-        ).hexdigest()[:16]
+        runner_binding = spec.runner_binding or self._runner_binding()
         state_binding = hashlib.sha256(
             str(self._state_root(spec)).encode("utf-8")
         ).hexdigest()[:16]
@@ -787,6 +861,33 @@ class SystemdUserExecutorHost:
             f"{spec.action_id}:{spec.run_id or '-'}:{spec.generation}:"
             f"runner-{runner_binding}:state-{state_binding}"
         )
+
+    def _runner_binding_from_description(
+        self, spec: ExecutorSpec, description: str | None
+    ) -> str | None:
+        if description is None:
+            return None
+        state_binding = hashlib.sha256(
+            str(self._state_root(spec)).encode("utf-8")
+        ).hexdigest()[:16]
+        prefix = (
+            f"agent-run-executor:{spec.task.fingerprint}:"
+            f"{spec.action_id}:{spec.run_id or '-'}:{spec.generation}:runner-"
+        )
+        suffix = f":state-{state_binding}"
+        if not description.startswith(prefix) or not description.endswith(suffix):
+            return None
+        runner_binding = description[len(prefix) : -len(suffix)]
+        if len(runner_binding) != 16 or any(
+            character not in "0123456789abcdef" for character in runner_binding
+        ):
+            return None
+        return runner_binding
+
+    def _runner_binding(self) -> str:
+        return hashlib.sha256(
+            str(self.executor_python).encode("utf-8")
+        ).hexdigest()[:16]
 
     @staticmethod
     def _state_root(spec: ExecutorSpec) -> Path:
@@ -806,6 +907,25 @@ def execution_readiness(
         "linger_required": False,
         "reason": bounded_error(reason) if reason else None,
     }
+
+
+def observe_systemd_executor(
+    spec: ExecutorSpec,
+    control: TaskControlStore,
+    *,
+    runtime_directory: Path,
+    executor_python: Path,
+    transport: SystemdTransport | None = None,
+) -> HostObservation:
+    """Observe one exact production Host binding without reconciliation writes."""
+
+    host = SystemdUserExecutorHost(
+        runtime_directory=runtime_directory,
+        environment={},
+        executor_python=executor_python,
+        transport=transport,
+    )
+    return host.observe(spec, control)
 
 
 @dataclass(frozen=True)

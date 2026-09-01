@@ -335,9 +335,13 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     assert interrupted_again.returncode == 2
     after_second = load_only_run_state(git_repo)
     assert after_second["resume_audit"]["total"] == 1
-    assert after_second["active_agent_invocation"]["status"] == "resuming"
+    assert after_second["active_agent_invocation"]["status"] == "failed"
+    assert after_second["active_agent_invocation"]["error"] == (
+        "session_interrupted"
+    )
+    assert after_second["status"] == "execution_failed"
 
-    recovery_blocked = run_cli(
+    recovered = run_cli(
         git_repo,
         fixture,
         "resume",
@@ -345,14 +349,46 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
         "--agent-fixture",
         str(recovery_agents),
     )
-    assert recovery_blocked.returncode == 2
-    assert stdout_json(recovery_blocked)["diagnostics"][0]["code"] == "task_control"
+    assert recovered.returncode == 0, f"{recovered.stdout}\n{recovered.stderr}"
     final_state = load_only_run_state(git_repo)
-    assert final_state == after_second
-    assert final_state["resume_audit"]["total"] == 1
+    assert final_state["status"] == "run_approval_pending"
+    assert final_state["resume_audit"]["total"] == 2
     assert final_state["ticket_jobs"]["2"]["review_budget"][
         "development_attempts"
     ] == 1
+    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    final_control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert final_control["action"]["kind"] == "resume"
+    assert final_control["action"]["status"] == "completed"
+    assert final_control["action"]["executor_generation"] == 3
+    assert final_control["executor"]["generation"] == 3
+
+    fixture_before_repeat = fixture.read_bytes()
+    history_before_repeat = list(final_state["agent_invocation_history"])
+    repeated = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(recovery_agents),
+    )
+    assert repeated.returncode == 2
+    assert stdout_json(repeated)["diagnostics"] == [
+        {
+            "code": "command_precondition",
+            "message": "当前交付运行尚未满足此命令的执行条件",
+        }
+    ]
+    repeated_control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert repeated_control["action"]["action_id"] == final_control["action"][
+        "action_id"
+    ]
+    assert repeated_control["executor"]["generation"] == 3
+    repeated_state = load_only_run_state(git_repo)
+    assert repeated_state["resume_audit"]["total"] == 2
+    assert repeated_state["agent_invocation_history"] == history_before_repeat
+    assert fixture.read_bytes() == fixture_before_repeat
 
 
 @pytest.mark.parametrize(

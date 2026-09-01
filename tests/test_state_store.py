@@ -9,10 +9,110 @@ import pytest
 
 from agent_run.run_locator import MAX_LOCATOR_ENTRIES, RunLocatorIndex
 from agent_run.state import (
+    MAX_DIAGNOSTIC_BYTES,
+    MAX_DIAGNOSTIC_ENTRIES,
+    MAX_RUN_STATE_BYTES,
     MAX_TIMELINE_CONTINUATION_EVENTS,
     MAX_TIMELINE_EVENTS,
     StateStore,
 )
+
+
+def test_run_state_persistence_rejects_oversized_write_and_read(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    with pytest.raises(ValueError, match="persistence limit"):
+        store.save_run("run-large", {"payload": "x" * MAX_RUN_STATE_BYTES})
+    assert not (store.runs_directory / "run-large.json").exists()
+
+    store.runs_directory.mkdir(parents=True, exist_ok=True)
+    oversized = store.runs_directory / "run-external.json"
+    oversized.write_bytes(b" " * (MAX_RUN_STATE_BYTES + 1))
+    with pytest.raises(ValueError, match="persistence limit"):
+        store.load_run("run-external")
+
+
+def test_run_state_persistence_bounds_diagnostics(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    state = {
+        "diagnostics": [
+            {"code": f"code-{number}", "message": "bounded"}
+            for number in range(MAX_DIAGNOSTIC_ENTRIES + 5)
+        ]
+    }
+
+    store.save_run("run-1", state)
+
+    persisted = store.load_run("run-1")
+    assert persisted is not None
+    assert len(persisted["diagnostics"]) == MAX_DIAGNOSTIC_ENTRIES
+
+
+def test_run_state_persistence_bounds_each_diagnostic_and_drops_raw_payloads(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    credential = "ghp_1234567890abcdef"
+    raw_output = "raw-output-sentinel" * 32_768
+    state = {
+        "diagnostics": [
+            {
+                "code": "producer_failure",
+                "message": f"token={credential}\n" + ("failure " * 20_000),
+                "context": {
+                    "credentials": {"authorization": f"Bearer {credential}"},
+                    "transcript": raw_output,
+                    "raw_output": raw_output,
+                    "detail": "bounded detail " * 5_000,
+                },
+            }
+        ],
+        "extension": {
+            "environment": {"GH_TOKEN": credential},
+            "credentials": {"token": credential},
+            "transcript": raw_output,
+            "raw-output": raw_output,
+            "full_transcript": raw_output,
+            "raw_output_bytes": raw_output,
+            "credential_bundle": {"session_cookie": credential},
+        },
+        "active_ticket_job": {
+            "candidate_commit_intent": {"token": "candidate-intent-nonce"}
+        },
+        "credential_availability": {
+            "status": "waiting",
+            "detail": {"token": credential},
+        },
+    }
+
+    store.save_run("run-1", state)
+
+    path = store.runs_directory / "run-1.json"
+    persisted_bytes = path.read_bytes()
+    persisted = store.load_run("run-1")
+    assert persisted is not None
+    diagnostic = persisted["diagnostics"][0]
+    assert len(
+        json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":")).encode()
+    ) <= MAX_DIAGNOSTIC_BYTES
+    assert credential.encode() not in persisted_bytes
+    assert b"raw-output-sentinel" not in persisted_bytes
+    assert "environment" not in persisted["extension"]
+    assert "transcript" not in persisted["extension"]
+    assert "raw-output" not in persisted["extension"]
+    assert "full_transcript" not in persisted["extension"]
+    assert "raw_output_bytes" not in persisted["extension"]
+    assert persisted["extension"]["credentials"] == "[REDACTED]"
+    assert persisted["extension"]["credential_bundle"] == "[REDACTED]"
+    assert (
+        persisted["active_ticket_job"]["candidate_commit_intent"]["token"]
+        == "candidate-intent-nonce"
+    )
+    assert persisted["credential_availability"] == {
+        "status": "waiting",
+        "detail": {"token": "[REDACTED]"},
+    }
 
 
 def test_run_locator_prunes_missing_directories_and_bounds_entries(tmp_path: Path) -> None:
