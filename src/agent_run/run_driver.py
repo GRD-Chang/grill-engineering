@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
+from agent_run.agent_invocation import record_operator_stop
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.codex import CodexProcessError
 from agent_run.delivery import TicketDeliveryEngine
@@ -19,6 +21,7 @@ from agent_run.external_supervision import (
     is_proven_github_state_contradiction,
     public_supervision_snapshot,
 )
+from agent_run.executor_host import ExecutorHost
 from agent_run.github import GitHubReadError
 from agent_run.operator_gate import has_run_operator_gate
 from agent_run.parent_delivery import ParentDeliveryEngine
@@ -48,6 +51,15 @@ class RunStep(str, Enum):
     ACCEPT = "accept-run"
     PUBLISH = "publish-run"
     REQUEUE = "requeue"
+
+
+@dataclass(frozen=True)
+class ControlRunOperation:
+    """One admitted Stop or Abandon consumed by the shared Run Driver."""
+
+    kind: Literal["stop", "abandon"]
+    target_executor: Mapping[str, Any] | None
+    discard_worktree: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,12 +165,14 @@ class DirectRunOperations:
         ]
         | None = None,
         use_current_state_once: bool = False,
+        executor_host: ExecutorHost | None = None,
     ) -> None:
         self.controller: Any = controller
         self.states = states
         self.before_external_step = before_external_step
         self.resume_pending_refresh = resume_pending_refresh
         self.use_current_state_once = use_current_state_once
+        self.executor_host = executor_host
         self.git: Any
         self.github_reader: Any
         self._publisher_factory: Callable[[], Any]
@@ -198,6 +212,64 @@ class DirectRunOperations:
         if self._publisher is None:
             self._publisher = self._publisher_factory()
         return self._publisher
+
+    def apply_control(
+        self, run_id: str, operation: ControlRunOperation
+    ) -> RunOutcome:
+        """Apply one fenced control operation without entering automatic progress."""
+
+        if operation.kind not in {"stop", "abandon"}:
+            raise ValueError("unsupported control operation")
+        if self.before_external_step is not None:
+            self.before_external_step()
+        if operation.target_executor is not None:
+            if self.executor_host is None:
+                raise ValueError("Control operation 缺少 Executor Host")
+            self.executor_host.terminate_control_target(operation.target_executor)
+        state = self.states.load_current_run(run_id)
+        if state is None:
+            raise ValueError("Control Executor 找不到 Delivery Run")
+        if operation.kind == "stop":
+            if state.get("status") not in {
+                "completed",
+                "abandoned",
+                "operator_stopped",
+            }:
+                record_operator_stop(
+                    state,
+                    save=lambda value: self.states.save_run(run_id, value),
+                )
+            return self.classify(state)
+        if state.get("status") in {"abandoned", "completed"}:
+            return self.classify(state)
+        repository = self.github_reader.repository()
+        default_head = self.git.resolve_base(
+            repository.default_branch, repository.default_head_sha
+        )
+        if state.get("delivery_type") == "parent_only":
+            result = ParentDeliveryEngine(
+                git=self.git,
+                states=self.states,
+                github=self.publisher,
+                agents=self.agents,
+            ).abandon(
+                run_id,
+                discard_worktree=operation.discard_worktree,
+            )
+        else:
+            result = RunPublicationEngine(
+                git=self.git,
+                states=self.states,
+                agents=self.agents,
+                github=self.publisher,
+                default_branch=repository.default_branch,
+                default_head_sha=default_head,
+                currentness_reader=self.github_reader,
+            ).abandon(
+                run_id,
+                discard_worktree=operation.discard_worktree,
+            )
+        return self.classify(result)
 
     def deliver(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
@@ -552,10 +624,17 @@ class RunDriver:
         self.states = states
         self.supervisor = supervisor
 
-    def advance(self, state: dict[str, Any]) -> dict[str, Any]:
+    def advance(
+        self,
+        state: dict[str, Any],
+        *,
+        control_operation: ControlRunOperation | None = None,
+    ) -> dict[str, Any]:
         run_id = state.get("run_id")
         if not isinstance(run_id, str):
             raise ValueError("Delivery Run is missing its Run ID")
+        if control_operation is not None:
+            return self.operations.apply_control(run_id, control_operation).state
         outcome = self.operations.classify(state)
         previous_marker: tuple[object, ...] | None = None
         try:

@@ -129,6 +129,32 @@ class ExecutorReservation:
     record: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ControlActionClaim:
+    """A stop/abandon claim that atomically revokes prior Executor authority."""
+
+    action: dict[str, Any]
+    attached: bool
+    target_executor: dict[str, Any] | None
+    record: dict[str, Any]
+
+    @property
+    def action_id(self) -> str:
+        return str(self.action["action_id"])
+
+
+def unresolved_control_target(action: object) -> dict[str, Any] | None:
+    """Return a failed control Action's target until a successor reconciles it."""
+
+    if not isinstance(action, Mapping) or (
+        action.get("status") != "failed"
+        or action.get("kind") not in {"stop", "abandon"}
+    ):
+        return None
+    target = action.get("target_executor")
+    return deepcopy(dict(target)) if isinstance(target, Mapping) else None
+
+
 class TaskControlStore:
     """One bounded JSON record and one non-blocking lock per :class:`TaskKey`."""
 
@@ -155,6 +181,46 @@ class TaskControlStore:
             return None
         _verify_record_matches_run(record, run_state)
         return record
+
+    def proves_read_only_stop(
+        self,
+        task: TaskKey,
+        run_state: Mapping[str, Any],
+        *,
+        host_absent_executor: tuple[str, int] | None = None,
+    ) -> bool:
+        """Atomically prove Stop needs neither an Action nor a Host probe."""
+
+        terminal = run_state.get("status") in {
+            "completed",
+            "abandoned",
+            "operator_stopped",
+        }
+        with self._locked(task):
+            record = self._read_unlocked(task)
+            if record is None:
+                return terminal
+            _verify_record_matches_run(record, run_state)
+            action = record.get("action")
+            if (
+                isinstance(action, Mapping)
+                and action.get("status") in _ACTIVE_ACTION_STATUSES
+            ):
+                return False
+            if unresolved_control_target(action) is not None:
+                return False
+            if terminal:
+                return True
+            executor = record.get("executor")
+            return executor is None or (
+                isinstance(executor, Mapping)
+                and executor.get("status") in {"exited", "absent"}
+            ) or (
+                host_absent_executor is not None
+                and isinstance(executor, Mapping)
+                and executor.get("action_id") == host_absent_executor[0]
+                and executor.get("generation") == host_absent_executor[1]
+            )
 
     def claim_action(
         self,
@@ -188,6 +254,11 @@ class TaskControlStore:
                 raise ActionBusyError(
                     "当前 Delivery Task 已有未完成 Lifecycle Action；不会等待或排队",
                     action=current,
+                )
+            if unresolved_control_target(current) is not None:
+                raise ActionReconciliationError(
+                    "失败 Control Action 的目标 ownership 尚未收口；"
+                    "请先重试 Stop 或 Abandon"
                 )
 
             executor = record.get("executor")
@@ -303,6 +374,178 @@ class TaskControlStore:
                 )
         except TaskControlBusyError as error:
             return claim_during_contention(error)
+
+    def claim_control_action(
+        self,
+        task: TaskKey,
+        *,
+        kind: str,
+        payload: Mapping[str, Any],
+        run_id: str,
+        state_dir: Path,
+    ) -> ControlActionClaim | None:
+        """Claim Stop/Abandon and fence the prior Executor in one transaction.
+
+        This store only admits the control action and fences prior ownership;
+        the Host starts its Executor afterward.  Moving the previous Executor
+        snapshot into the Action first makes every old ownership check fail
+        before any process is terminated or the Run outcome is written.
+        """
+
+        if kind not in {"stop", "abandon"}:
+            raise TaskControlError("control action kind must be stop or abandon")
+        if not isinstance(run_id, str) or not run_id:
+            raise TaskControlError("control action requires a Delivery Run")
+        state_root = Path(state_dir).resolve()
+        normalized_payload = _bounded_payload(payload)
+        digest = _payload_digest(normalized_payload)
+
+        with self._locked(task):
+            record = self._read_unlocked(task)
+            if record is None:
+                if kind == "stop":
+                    raise ActionReconciliationError(
+                        "Stop ownership 缺失；不会猜测或终止进程"
+                    )
+                record = _new_record(task)
+            current = record.get("action")
+            if isinstance(current, dict) and current.get("status") in _ACTIVE_ACTION_STATUSES:
+                if (
+                    current.get("kind") == kind
+                    and current.get("payload_digest") == digest
+                    and current.get("run_id") == run_id
+                ):
+                    target = current.get("target_executor")
+                    return ControlActionClaim(
+                        action=deepcopy(current),
+                        attached=True,
+                        target_executor=(deepcopy(target) if isinstance(target, dict) else None),
+                        record=deepcopy(record),
+                    )
+                raise ActionBusyError(
+                    "当前 Delivery Task 已有未完成 Lifecycle Action；不会等待或排队",
+                    action=current,
+                )
+
+            unresolved_target = unresolved_control_target(current)
+            if (
+                unresolved_target is not None
+                and isinstance(current, Mapping)
+                and (
+                    current.get("run_id") != run_id
+                    or unresolved_target.get("run_id") != run_id
+                )
+            ):
+                raise ActionReconciliationError(
+                    "失败 Control Action 的目标与当前 Delivery Run 不匹配；"
+                    "不会猜测或跳过进程 ownership"
+                )
+            executor = record.get("executor")
+            if (
+                kind == "stop"
+                and unresolved_target is None
+                and (
+                    executor is None
+                    or (
+                        isinstance(executor, dict)
+                        and executor.get("status") in {"exited", "absent"}
+                    )
+                )
+            ):
+                return None
+            active_target = (
+                deepcopy(executor)
+                if isinstance(executor, dict)
+                and executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
+                else None
+            )
+            target = active_target or unresolved_target
+            if active_target is not None:
+                if not isinstance(current, dict) or (
+                    current.get("status") not in _TERMINAL_ACTION_STATUSES
+                    or current.get("action_id") != active_target.get("action_id")
+                    or current.get("executor_generation")
+                    != active_target.get("generation")
+                    or active_target.get("run_id") != run_id
+                ):
+                    raise ActionReconciliationError(
+                        "活动 Executor 与已应用 Action ownership 不一致"
+                    )
+            elif executor is not None and (
+                not isinstance(executor, dict)
+                or executor.get("status") not in {"exited", "absent"}
+            ):
+                raise ActionReconciliationError("Executor ownership 无法确认")
+
+            if isinstance(current, dict) and current.get("status") in _TERMINAL_ACTION_STATUSES:
+                _archive_terminal_action(record, current)
+            generation = _positive_integer(record.get("next_generation", 1))
+            if target is not None:
+                generation = max(
+                    generation, _positive_integer(target.get("generation")) + 1
+                )
+            action: dict[str, Any] = {
+                "action_id": uuid.uuid4().hex,
+                "kind": kind,
+                "payload": normalized_payload,
+                "payload_digest": digest,
+                "status": "applying",
+                "run_id": run_id,
+                "executor_generation": generation,
+                "application_observed": False,
+                "submitted_at": _now(),
+                "completed_at": None,
+                "result_status": None,
+                "failure": None,
+            }
+            if target is not None:
+                action["target_executor"] = target
+            record.update(
+                {
+                    "run_id": run_id,
+                    "run_state_dir": str(state_root),
+                    "next_generation": generation + 1,
+                    "action": action,
+                    "executor": None,
+                    "updated_at": _now(),
+                }
+            )
+            self._write_unlocked(task, record)
+            return ControlActionClaim(
+                action=deepcopy(action),
+                attached=False,
+                target_executor=deepcopy(target),
+                record=deepcopy(record),
+            )
+
+    def complete_control_action(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        result_status: str,
+    ) -> dict[str, Any]:
+        """Close a Stop/Abandon after its exact Run outcome is durable."""
+
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            action = _require_active_action(record, action_id)
+            if action.get("kind") not in {"stop", "abandon"}:
+                raise ActionReconciliationError("current Action is not a control action")
+            if record.get("executor") is not None:
+                raise ActionReconciliationError("control action cannot own an Executor")
+            action.update(
+                {
+                    "application_observed": True,
+                    "status": "completed",
+                    "completed_at": _now(),
+                    "result_status": _bounded_text(result_status),
+                    "failure": None,
+                }
+            )
+            record["updated_at"] = _now()
+            self._write_unlocked(task, record)
+            return deepcopy(record)
 
     def reconcile_from_run(
         self,
@@ -790,6 +1033,70 @@ class TaskControlStore:
             self._write_unlocked(task, record)
             return deepcopy(record)
 
+    def mark_worker_started(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        pid: int,
+        process_start_token: str,
+    ) -> dict[str, Any]:
+        """Bind one active Worker process group to the exact Executor."""
+
+        if type(pid) is not int or pid <= 0:
+            raise TaskControlError("Worker PID must be positive")
+        if not isinstance(process_start_token, str) or not process_start_token:
+            raise TaskControlError("Worker process start token is required")
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            executor = _require_executor(record, action_id, generation)
+            if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
+                raise ActionReconciliationError("Executor is not active")
+            worker = executor.get("worker")
+            if isinstance(worker, dict) and (
+                worker.get("pid") != pid
+                or worker.get("process_start_token") != process_start_token
+            ):
+                raise ActionReconciliationError("Executor already owns another Worker")
+            if isinstance(worker, dict):
+                return deepcopy(record)
+            executor["worker"] = {
+                "pid": pid,
+                "process_start_token": process_start_token,
+                "started_at": _now(),
+            }
+            record["updated_at"] = _now()
+            self._write_unlocked(task, record)
+            return deepcopy(record)
+
+    def mark_worker_finished(
+        self,
+        task: TaskKey,
+        *,
+        action_id: str,
+        generation: int,
+        pid: int,
+        process_start_token: str,
+    ) -> dict[str, Any]:
+        """Clear the exact Worker binding without affecting Executor ownership."""
+
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            executor = _require_executor(record, action_id, generation)
+            worker = executor.get("worker")
+            if worker is None:
+                return deepcopy(record)
+            if not isinstance(worker, dict) or (
+                worker.get("pid") != pid
+                or worker.get("process_start_token") != process_start_token
+            ):
+                raise ActionReconciliationError("Worker completion binding does not match")
+            executor.pop("worker", None)
+            record["updated_at"] = _now()
+            self._write_unlocked(task, record)
+            return deepcopy(record)
+
     def finish_executor(
         self,
         task: TaskKey,
@@ -1243,6 +1550,17 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
             raise TaskControlError(
                 "Task Control Record Action Run ID pointer is invalid"
             )
+        target_executor = action.get("target_executor")
+        if target_executor is not None:
+            if action.get("kind") not in {"stop", "abandon"} or not isinstance(
+                target_executor, dict
+            ):
+                raise TaskControlError("Control Action target Executor is invalid")
+            _validate_executor_snapshot(target_executor)
+            if target_executor.get("run_id") != action.get("run_id"):
+                raise TaskControlError(
+                    "Control Action target Executor Run ID is invalid"
+                )
     executor = record.get("executor")
     if executor is not None:
         if not isinstance(executor, dict):
@@ -1265,6 +1583,9 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
         runner_binding = executor.get("runner_binding")
         if runner_binding is not None:
             _validate_runner_binding(runner_binding)
+        worker = executor.get("worker")
+        if worker is not None:
+            _validate_worker_snapshot(worker)
         if isinstance(action, dict):
             if executor.get("action_id") != action.get("action_id"):
                 raise TaskControlError(
@@ -1282,6 +1603,35 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
                 raise TaskControlError(
                     "Task Control Record Action/Executor Run ID is invalid"
                 )
+
+
+def _validate_executor_snapshot(executor: Mapping[str, Any]) -> None:
+    if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES | {"exited", "absent"}:
+        raise TaskControlError("Control Action target Executor status is invalid")
+    if not isinstance(executor.get("action_id"), str) or not executor["action_id"]:
+        raise TaskControlError("Control Action target Executor identity is invalid")
+    _positive_integer(executor.get("generation"))
+    if executor.get("run_id") is not None and not isinstance(executor.get("run_id"), str):
+        raise TaskControlError("Control Action target Executor Run ID is invalid")
+    pid = executor.get("pid")
+    if pid is not None and (type(pid) is not int or pid <= 0):
+        raise TaskControlError("Control Action target Executor PID is invalid")
+    worker = executor.get("worker")
+    if worker is not None:
+        _validate_worker_snapshot(worker)
+
+
+def _validate_worker_snapshot(worker: object) -> None:
+    if not isinstance(worker, Mapping):
+        raise TaskControlError("Executor Worker binding is invalid")
+    if type(worker.get("pid")) is not int or int(worker["pid"]) <= 0:
+        raise TaskControlError("Executor Worker PID is invalid")
+    token = worker.get("process_start_token")
+    if not isinstance(token, str) or not token:
+        raise TaskControlError("Executor Worker start token is invalid")
+    started_at = worker.get("started_at")
+    if started_at is not None and not isinstance(started_at, str):
+        raise TaskControlError("Executor Worker start timestamp is invalid")
 
 
 def _verify_record_matches_run(

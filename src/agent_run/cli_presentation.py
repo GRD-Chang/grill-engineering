@@ -90,6 +90,7 @@ def _print_precondition_failure(
                     "scope_change": state.get("unsupported_scope_change"),
                     "abandonment": state.get("run_abandonment"),
                     "delivery_cleanup": _public_delivery_cleanup(state),
+                    "next_action": _next_action(state),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -502,6 +503,8 @@ def _next_action(state: dict[str, Any]) -> str:
         return "处理诊断中的确定性矛盾；如需终止执行 agent-run abandon"
     if status == "abandonment_pending" and isinstance(run_id, str):
         return f"agent-run abandon {run_id}"
+    if status == "operator_stopped" and isinstance(run_id, str):
+        return f"agent-run resume {run_id}"
     if status == "requeue_required" and isinstance(run_id, str):
         return f"agent-run requeue {run_id}"
     if invocation_is_explicitly_resumable(state) and isinstance(run_id, str):
@@ -870,6 +873,7 @@ def _display_term(value: object) -> object:
         "abandonment_pending": "等待放弃恢复",
         "progress_exhausted": "无可推进任务",
         "execution_failed": "执行失败，可恢复",
+        "operator_stopped": "操作者已停止，可恢复",
         "supervision_timeout": "监督超时暂停，可恢复",
         "blocked": "已阻塞",
         "incompatible_run_state": "状态协议不兼容",

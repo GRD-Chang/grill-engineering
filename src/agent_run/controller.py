@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
 from agent_run.agent_profiles import AgentProfileStore
-from agent_run.agent_invocation import fail_interrupted_invocation
+from agent_run.agent_invocation import fail_interrupted_invocation, restore_operator_stop
 from agent_run.change_currentness import (
     candidate_or_acceptance_is_inconsistent,
     has_currentness_facts,
@@ -261,6 +261,7 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
+        resuming_operator_stop = existing.get("status") == "operator_stopped"
         if prepare_state is not None:
             prepare_state(existing)
         effective_budget_policy = self.delivery_policy
@@ -338,6 +339,12 @@ class Controller:
                 new_thread=new_thread,
                 human_response_supplied=human_response is not None,
             )
+        if resuming_operator_stop:
+            if new_thread or human_response is not None:
+                raise ValueError(
+                    "operator_stopped resume does not accept Agent or Human Blocker options"
+                )
+            restore_operator_stop(existing)
         if human_response is not None:
             self.states.save_run(run_id, existing)
         resuming_supervision_timeout = existing.get("status") == "supervision_timeout"

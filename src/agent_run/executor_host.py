@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import signal
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -88,6 +89,10 @@ class ExecutorHost(Protocol):
     ) -> HostObservation: ...
 
     def cleanup_startup(self, spec: ExecutorSpec) -> None: ...
+
+    def terminate_control_target(
+        self, target_executor: Mapping[str, Any], *, timeout: float = 1.0
+    ) -> None: ...
 
 
 def _bind_execute_callback(
@@ -169,6 +174,11 @@ class FakeExecutorHost:
     def _checkpoint(self, name: str) -> None:
         if self.fault_hook is not None:
             self.fault_hook(name)
+
+    def terminate_control_target(
+        self, target_executor: Mapping[str, Any], *, timeout: float = 1.0
+    ) -> None:
+        _terminate_control_target(target_executor, timeout=timeout)
 
     def ensure(
         self,
@@ -659,6 +669,11 @@ class BoundExecutorHost:
     def cleanup_startup(self, spec: ExecutorSpec) -> None:
         self._validate(spec)
 
+    def terminate_control_target(
+        self, target_executor: Mapping[str, Any], *, timeout: float = 1.0
+    ) -> None:
+        _terminate_control_target(target_executor, timeout=timeout)
+
     def _validate(self, spec: ExecutorSpec) -> None:
         if spec.action_id != self.action_id or spec.generation != self.generation:
             raise ExecutorHostError("Executor 不能接管另一个 Action/generation")
@@ -691,3 +706,104 @@ def _process_binding_status(
     except OSError:
         return "unknown"
     return "unknown"
+
+
+def _terminate_control_target(
+    target_executor: Mapping[str, Any], *, timeout: float = 1.0
+) -> None:
+    """Terminate only the process identity captured by a Stop/Abandon fence.
+
+    A Worker is a separate process group and is always preferred.  When the
+    Executor is in external supervision or Publisher work, no Worker exists;
+    then the exact Executor process is terminated so the fenced session ends
+    without waiting for another polling boundary.
+    """
+
+    worker = target_executor.get("worker")
+    if isinstance(worker, Mapping):
+        pid = worker.get("pid")
+        token = worker.get("process_start_token")
+        if type(pid) is not int or not isinstance(token, str) or not token:
+            raise ExecutorStartUnknownError("Worker ownership 无法确认；不会终止进程")
+        status = _process_binding_status(pid, token)
+        if status == "matches":
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _wait_for_process_exit(pid, token, timeout=timeout)
+            return
+        if status == "unknown":
+            raise ExecutorStartUnknownError("Worker ownership 无法确认；不会终止进程")
+
+    pid = target_executor.get("pid")
+    token = target_executor.get("process_start_token")
+    if type(pid) is not int or not isinstance(token, str) or not token:
+        raise ExecutorStartUnknownError("Executor ownership 无法确认；不会终止进程")
+    status = _process_binding_status(pid, token)
+    if status == "absent":
+        return
+    if status != "matches":
+        raise ExecutorStartUnknownError("Executor ownership 无法确认；不会终止进程")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + min(0.2, max(0.01, timeout))
+    while time.monotonic() < deadline and _process_is_live_binding(pid, token):
+        time.sleep(0.01)
+    if _process_is_live_binding(pid, token):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _wait_for_process_exit(pid, token, timeout=timeout)
+
+
+def validate_control_target(target_executor: Mapping[str, Any]) -> None:
+    """Fail closed unless the Worker or Executor target has exact live identity."""
+
+    worker = target_executor.get("worker")
+    if isinstance(worker, Mapping):
+        worker_pid = worker.get("pid")
+        worker_token = worker.get("process_start_token")
+        if type(worker_pid) is int and isinstance(worker_token, str) and worker_token:
+            status = _process_binding_status(worker_pid, worker_token)
+            if status == "matches":
+                return
+            if status == "unknown":
+                raise ExecutorStartUnknownError(
+                    "Worker ownership 无法确认；不会提交控制栅栏"
+                )
+    pid = target_executor.get("pid")
+    token = target_executor.get("process_start_token")
+    if type(pid) is not int or not isinstance(token, str) or not token:
+        raise ExecutorStartUnknownError(
+            "Executor ownership 无法确认；不会提交控制栅栏"
+        )
+    if _process_binding_status(pid, token) != "matches":
+        raise ExecutorStartUnknownError(
+            "Executor ownership 无法确认；不会提交控制栅栏"
+        )
+
+
+def _wait_for_process_exit(pid: int, token: str, *, timeout: float) -> None:
+    deadline = time.monotonic() + max(0.01, timeout)
+    while time.monotonic() < deadline:
+        if not _process_is_live_binding(pid, token):
+            return
+        time.sleep(0.01)
+    if _process_is_live_binding(pid, token):
+        raise ExecutorStartUnknownError("已发送终止信号，但进程退出结果无法确认")
+
+
+def _process_is_live_binding(pid: int, token: str) -> bool:
+    if _process_binding_status(pid, token) != "matches":
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    closing = raw.rfind(")")
+    fields = raw[closing + 2 :].split() if closing >= 0 else []
+    return bool(fields) and fields[0] != "Z"

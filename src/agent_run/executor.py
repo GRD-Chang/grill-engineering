@@ -6,7 +6,7 @@ import argparse
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
@@ -14,9 +14,17 @@ from agent_run.runner_lease import runner_usage_lease
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlError, TaskKey
 
+if TYPE_CHECKING:
+    from agent_run.run_driver import ControlRunOperation
+
 
 class _RunDriver(Protocol):
-    def advance(self, state: dict[str, Any]) -> Mapping[str, Any]: ...
+    def advance(
+        self,
+        state: dict[str, Any],
+        *,
+        control_operation: ControlRunOperation | None = None,
+    ) -> Mapping[str, Any]: ...
 
 
 _ExecutorBinding = tuple[str, int, str]
@@ -53,6 +61,7 @@ class DeliveryExecutor:
         *,
         action_id: str | None = None,
         generation: int | None = None,
+        control_operation: ControlRunOperation | None = None,
     ) -> Mapping[str, Any]:
         if (action_id is None) != (generation is None):
             raise TaskControlError("Executor action/generation binding 不完整")
@@ -70,12 +79,29 @@ class DeliveryExecutor:
         if state is None:
             raise TaskControlError("Executor 找不到要推进的 Delivery Run")
         try:
-            return self.driver_factory(states, binding).advance(state)
+            driver = self.driver_factory(states, binding)
+            if control_operation is None:
+                return driver.advance(state)
+            return driver.advance(state, control_operation=control_operation)
         except KeyboardInterrupt:
             if self.record_execution_failure is not None:
                 self.record_execution_failure(
-                    states, run_id, "executor_agent_interrupted", binding
+                    states,
+                    run_id,
+                    (
+                        "control_executor_interrupted"
+                        if control_operation is not None
+                        else "executor_agent_interrupted"
+                    ),
+                    binding,
                 )
+            raise
+        except BaseException as error:
+            if (
+                control_operation is not None
+                and self.record_execution_failure is not None
+            ):
+                self.record_execution_failure(states, run_id, str(error), binding)
             raise
 
 

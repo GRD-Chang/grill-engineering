@@ -6,6 +6,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -27,6 +28,22 @@ _STREAM_CHUNK_BYTES = 64 * 1024
 _STDOUT_CAPTURE_BYTES = 64 * 1024
 _STDERR_CAPTURE_BYTES = 64 * 1024
 _JSONL_LINE_BYTES = 64 * 1024
+_WORKER_BOOTSTRAP = """\
+import os
+import sys
+import time
+gate = int(sys.argv[1])
+deadline = float(sys.argv[2])
+try:
+    released = os.read(gate, 1)
+finally:
+    os.close(gate)
+if released != b"1":
+    raise SystemExit(125)
+if deadline >= 0 and time.monotonic() >= deadline:
+    raise SystemExit(124)
+os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
+"""
 
 
 class _BoundedBytesTail:
@@ -557,18 +574,74 @@ def run_worker_process(
     abort_reason: Callable[[], str] | None = None,
     on_process_started: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        arguments,
-        cwd=cwd,
-        env=environment,
-        text=False,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    if on_process_started is not None:
-        on_process_started(process.pid)
+    gate_write: int | None = None
+    if on_process_started is None:
+        process = subprocess.Popen(
+            arguments,
+            cwd=cwd,
+            env=environment,
+            text=False,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    else:
+        gate_read, gate_write = os.pipe()
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _WORKER_BOOTSTRAP,
+                    str(gate_read),
+                    str(
+                        deadline_at_monotonic
+                        if deadline_at_monotonic is not None
+                        else -1.0
+                    ),
+                    *arguments,
+                ],
+                cwd=cwd,
+                env=environment,
+                text=False,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(gate_read,),
+            )
+        finally:
+            os.close(gate_read)
+    try:
+        if on_process_started is not None:
+            on_process_started(process.pid)
+        if gate_write is not None:
+            if (
+                deadline_at_monotonic is not None
+                and time.monotonic() >= deadline_at_monotonic
+            ):
+                raise WorkerDeadlineExceeded("Codex worker timed out")
+            os.write(gate_write, b"1")
+            if (
+                deadline_at_monotonic is not None
+                and time.monotonic() >= deadline_at_monotonic
+            ):
+                raise WorkerDeadlineExceeded("Codex worker timed out")
+    except BaseException:
+        if gate_write is not None:
+            os.close(gate_write)
+        try:
+            _terminate_process_group(process)
+            process.wait()
+        finally:
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+        raise
+    else:
+        if gate_write is not None:
+            os.close(gate_write)
     stdin = process.stdin
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr

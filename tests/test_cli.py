@@ -50,7 +50,8 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
 
     assert "doctor" in help_text
     assert "创建或继续 Parent 的自动交付，停在需要操作者处理的边界" in help_text
-    assert "恢复失败/Human Blocker Invocation 或监督超时窗口" in help_text
+    assert "恢复 Stop、失败/Human Blocker Invocation 或监督超时窗口" in help_text
+    assert "立即停止活动 Executor 并保留可显式恢复的现场" in help_text
     assert "仅从 requeue_required 创建新的 Change Job Generation" in help_text
     assert "显示当前状态与下一条允许的操作" in help_text
     assert "显示有界 Invocation 与状态时间线" in help_text
@@ -1530,7 +1531,16 @@ def run_cli(
         machine_output
         and command_arguments
         and command_arguments[0]
-        in {"run", "resume", "approve", "revise", "requeue", "abandon", "configure"}
+        in {
+            "run",
+            "resume",
+            "approve",
+            "revise",
+            "requeue",
+            "stop",
+            "abandon",
+            "configure",
+        }
         and "--json" not in command_arguments
     ):
         command_arguments.append("--json")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from agent_run.external_supervision import ExternalSupervisor
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_driver import (
+    ControlRunOperation,
     DirectRunOperations,
     RunDriver,
     RunOutcome,
@@ -137,6 +139,53 @@ def test_driver_never_auto_dispatches_a_non_progress_boundary(status: str) -> No
     result = RunDriver(operations=Operations(), states=States(), supervisor=object()).advance(state)  # type: ignore[arg-type]
 
     assert result is state
+
+
+def test_driver_applies_stop_control_before_automatic_progress() -> None:
+    state = {"run_id": "run-1", "status": "active", "diagnostics": []}
+
+    class States:
+        current = state
+
+        @classmethod
+        def load_current_run(cls, _run_id: str):
+            return cls.current
+
+        @classmethod
+        def save_run(cls, _run_id: str, value: dict[str, object]) -> None:
+            cls.current = value
+
+    states = States()
+    terminated: list[dict[str, object]] = []
+    target = {
+        "action_id": "old-action",
+        "run_id": "run-1",
+        "generation": 1,
+    }
+    operations = DirectRunOperations(
+        controller=object(),
+        states=states,
+        git=object(),
+        github_reader=object(),
+        publisher_factory=lambda: object(),
+        agents=object(),
+        executor_host=SimpleNamespace(
+            terminate_control_target=lambda value: terminated.append(dict(value))
+        ),
+    )
+    driver = RunDriver(operations=operations, states=states, supervisor=object())
+
+    result = driver.advance(
+        state,
+        control_operation=ControlRunOperation(
+            kind="stop",
+            target_executor=target,
+        ),
+    )
+
+    assert terminated == [target]
+    assert result["status"] == "operator_stopped"
+    assert states.load_current_run("run-1") == result
 
 
 def test_driver_persists_backoff_before_sleep_and_a_restart_uses_it(tmp_path) -> None:

@@ -49,6 +49,8 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
         return True
 
     status = state.get("status")
+    if status == "operator_stopped":
+        return isinstance(state.get("operator_stop"), dict)
     if status == "supervision_timeout":
         wait = state.get("supervision_wait")
         return isinstance(wait, dict) and wait.get("resume_status") in {

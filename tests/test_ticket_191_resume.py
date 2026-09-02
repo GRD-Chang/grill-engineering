@@ -502,8 +502,5 @@ def test_ordinary_run_preserves_an_operator_stopped_boundary(
 
     assert stopped.returncode == 2, stopped.stderr
     assert stdout_json(stopped)["status"] == "operator_stopped"
-    persisted = load_only_run_state(git_repo)
-    receipt = persisted.pop("action_application_receipt")
-    assert receipt["kind"] == "run"
-    assert persisted == state
+    assert load_only_run_state(git_repo) == state
     assert fixture.read_bytes() == fixture_before

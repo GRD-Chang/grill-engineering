@@ -184,6 +184,8 @@ def _local_gate_matches_top_status(
     status = state.get("status")
     location, subject = local
     phase = subject.get("phase")
+    if status == "operator_stopped":
+        return True
     if status in {"waiting_external", "supervision_timeout", "abandonment_pending"}:
         return True
     if status == "ready_for_human":
@@ -420,6 +422,45 @@ def _global_gate_subject(
         active = state.get("active_ticket_job")
         if isinstance(active, dict):
             return f"ticket:{active.get('ticket_number')}", active
+    if status == "operator_stopped":
+        invocation = state.get("active_agent_invocation")
+        work_subject = (
+            invocation.get("work_subject")
+            if isinstance(invocation, dict)
+            else None
+        )
+        if isinstance(work_subject, str):
+            resolved = _work_subject(state, work_subject)
+            if resolved is not None:
+                return resolved
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict) and active.get("phase") not in {
+            "merged",
+            "completed",
+            "abandoned",
+        }:
+            return f"ticket:{active.get('ticket_number')}", active
+        parent = state.get("parent_job")
+        if isinstance(parent, dict) and parent.get("phase") not in {
+            "merged",
+            "completed",
+            "abandoned",
+        }:
+            return "parent", parent
+        acceptance = state.get("run_acceptance")
+        if isinstance(acceptance, dict):
+            repair = acceptance.get("repair_job")
+            if isinstance(repair, dict) and repair.get("phase") not in {
+                "merged",
+                "completed",
+                "abandoned",
+            }:
+                return "run_repair", repair
+            if acceptance.get("phase") not in {"accepted", "completed"}:
+                return "run_acceptance", acceptance
+        publication = state.get("run_publication")
+        if isinstance(publication, dict):
+            return "run_publication", publication
     if status == "supervision_timeout":
         active = state.get("active_ticket_job")
         if isinstance(active, dict):

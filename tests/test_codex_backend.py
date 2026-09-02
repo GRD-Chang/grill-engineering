@@ -4048,24 +4048,19 @@ def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
     assert not reader_threads
 
 
-def test_absolute_deadline_includes_popen_startup_and_kills_process_group(
+def test_absolute_deadline_includes_popen_startup_and_prevents_worker_start(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     child_pid_file = tmp_path / "delayed-start-child.pid"
     process_ids: list[int] = []
+    process_group_ids: list[int] = []
     timed_waits: list[float] = []
     real_popen = worker_sandbox_module.subprocess.Popen
     real_wait = real_popen.wait
 
     def delayed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
         process = real_popen(*args, **kwargs)
-        child_start_deadline = time.monotonic() + 1
-        while (
-            not child_pid_file.exists()
-            and time.monotonic() < child_start_deadline
-        ):
-            time.sleep(0.005)
-        assert child_pid_file.exists()
+        process_group_ids.append(os.getpgid(process.pid))
         time.sleep(0.2)
         return process
 
@@ -4098,10 +4093,88 @@ def test_absolute_deadline_includes_popen_startup_and_kills_process_group(
         )
 
     assert len(process_ids) == 1
+    assert process_group_ids == process_ids
     assert timed_waits == []
-    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    assert not child_pid_file.exists()
     with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+        os.killpg(process_ids[0], 0)
+
+
+def test_bootstrap_rechecks_absolute_deadline_at_gate_release(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    side_effect = tmp_path / "worker-started"
+    gate_write_started = threading.Event()
+    release_gate_write = threading.Event()
+    processes: list[subprocess.Popen[bytes]] = []
+    bootstrap_return_codes: list[int] = []
+    process_ids: list[int] = []
+    result: list[subprocess.CompletedProcess[str]] = []
+    failure: list[BaseException] = []
+    real_popen = worker_sandbox_module.subprocess.Popen
+    real_write = worker_sandbox_module.os.write
+
+    def capture_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def write_after_deadline(fd: int, data: bytes) -> int:
+        if data == b"1":
+            gate_write_started.set()
+            assert release_gate_write.wait(3)
+            written = real_write(fd, data)
+            bootstrap_return_codes.append(processes[0].wait(timeout=3))
+            return written
+        return real_write(fd, data)
+
+    monkeypatch.setattr(worker_sandbox_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(worker_sandbox_module.os, "write", write_after_deadline)
+    deadline_at = time.monotonic() + 2.0
+
+    def run_worker() -> None:
+        try:
+            result.append(
+                run_worker_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; Path({str(side_effect)!r}).touch()",
+                    ],
+                    cwd=tmp_path,
+                    prompt="",
+                    environment=os.environ.copy(),
+                    timeout=10,
+                    deadline_at_monotonic=deadline_at,
+                    on_process_started=process_ids.append,
+                )
+            )
+        except BaseException as error:
+            failure.append(error)
+
+    worker = threading.Thread(target=run_worker)
+    worker.start()
+    try:
+        assert gate_write_started.wait(3)
+        remaining = deadline_at - time.monotonic()
+        assert remaining > 0
+        assert not release_gate_write.wait(remaining + 0.02)
+        release_gate_write.set()
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+
+        assert bootstrap_return_codes == [124]
+        assert result == []
+        assert len(failure) == 1
+        assert isinstance(failure[0], WorkerSandboxError)
+        assert "timed out" in str(failure[0])
+        assert len(process_ids) == 1
+        assert not side_effect.exists()
+        with pytest.raises(ProcessLookupError):
+            os.killpg(process_ids[0], 0)
+    finally:
+        release_gate_write.set()
+        worker.join(timeout=3)
 
 
 def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(

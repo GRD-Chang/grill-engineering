@@ -10,6 +10,7 @@ import pytest
 from agent_run.delivery_policy import DeliveryPolicyStore
 from agent_run.git import GitRepository
 from agent_run.state import StateStore
+from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_run, write_fixture
 from test_cli import (
     load_only_run_state,
@@ -3523,6 +3524,16 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
         check=True,
     ).stdout
     frozen_mutations = after["delivery"]["mutations"]
+    frozen_state = load_only_run_state(git_repo)
+
+    repeated_abandon = run_cli(git_repo, fixture, "abandon", "1")
+
+    assert repeated_abandon.returncode == 0, repeated_abandon.stderr
+    assert stdout_json(repeated_abandon)["status"] == "abandoned"
+    assert load_only_run_state(git_repo) == frozen_state
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "mutations"
+    ] == frozen_mutations
 
     replayed = run_internal_stage(
         git_repo,
@@ -3603,15 +3614,26 @@ def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
         == mutations_before
     )
     assert checkout.exists()
+    task_control = TaskControlStore(git_repo / ".agent-run").load(
+        TaskKey(git_repo, "example/project", 1)
+    )
+    action = (
+        task_control.get("action") if isinstance(task_control, dict) else None
+    )
+    assert not (
+        isinstance(action, dict)
+        and action.get("status") in {"accepted", "applying"}
+    )
 
     discarded = run_cli(git_repo, fixture, "abandon", run_id, "--discard-worktree")
 
     assert discarded.returncode == 0, discarded.stderr
     assert stdout_json(discarded)["status"] == "abandoned"
     assert not checkout.exists()
-    assert {"action": "close_parent_pr", "pr_number": 1} in json.loads(
-        fixture.read_text(encoding="utf-8")
-    )["delivery"]["mutations"]
+    mutations = json.loads(fixture.read_text(encoding="utf-8"))["delivery"][
+        "mutations"
+    ]
+    assert mutations.count({"action": "close_parent_pr", "pr_number": 1}) == 1
 
 
 @pytest.mark.parametrize(

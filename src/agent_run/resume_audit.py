@@ -168,6 +168,7 @@ def bind_resume_to_successor(
         "execution_failure",
         "github_refresh_retry",
         "human_blocker",
+        "operator_stopped",
     }:
         return None
     if event.get("successor_invocation_started_at") is not None:
@@ -196,6 +197,8 @@ def bind_resume_to_successor(
 def _resume_kind(
     state: dict[str, Any], invocation: dict[str, Any] | None
 ) -> str:
+    if state.get("status") == "operator_stopped":
+        return "operator_stopped"
     if state.get("status") == "supervision_timeout":
         return "supervision_timeout"
     if is_github_refresh_wait(state):

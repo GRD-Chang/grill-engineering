@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -20,7 +21,7 @@ from agent_run.executor_environment import (
     consume_environment_carrier,
     write_environment_carrier,
 )
-from agent_run.executor_host import ExecutorSpec
+from agent_run.executor_host import ExecutorSpec, ExecutorStartUnknownError
 from agent_run.runner_lease import (
     RunnerLeaseBusy,
     runner_management_lease,
@@ -63,6 +64,74 @@ def _admit(control: TaskControlStore, spec: ExecutorSpec) -> ExecutorSpec:
     action_id = action["action_id"]
     assert isinstance(action_id, str)
     return replace(spec, action_id=action_id)
+
+
+def _start_token(pid: int) -> str:
+    return (
+        Path(f"/proc/{pid}/stat")
+        .read_text(encoding="ascii")
+        .rsplit(")", 1)[1]
+        .split()[19]
+    )
+
+
+def test_systemd_host_terminates_exact_worker_and_external_wait_executor(
+    tmp_path: Path,
+) -> None:
+    host = SystemdUserExecutorHost(
+        transport=FakeSystemdTransport(),
+        runtime_directory=tmp_path / "runtime",
+        environment={},
+        executor_python=Path(sys.executable),
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import signal; signal.pause()"],
+        start_new_session=True,
+    )
+    external_wait = subprocess.Popen(
+        [sys.executable, "-c", "import signal; signal.pause()"],
+        start_new_session=True,
+    )
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import signal; signal.pause()"],
+        start_new_session=True,
+    )
+    try:
+        host.terminate_control_target(
+            {
+                "pid": os.getpid(),
+                "process_start_token": None,
+                "worker": {
+                    "pid": worker.pid,
+                    "process_start_token": _start_token(worker.pid),
+                },
+            }
+        )
+        assert worker.wait(timeout=3) == -signal.SIGKILL
+        assert unrelated.poll() is None
+
+        with pytest.raises(ExecutorStartUnknownError, match="ownership"):
+            host.terminate_control_target(
+                {"pid": external_wait.pid, "process_start_token": None}
+            )
+        assert external_wait.poll() is None
+
+        host.terminate_control_target(
+            {
+                "pid": external_wait.pid,
+                "process_start_token": _start_token(external_wait.pid),
+            }
+        )
+        assert external_wait.wait(timeout=3) in {
+            -signal.SIGTERM,
+            -signal.SIGKILL,
+        }
+        assert unrelated.poll() is None
+    finally:
+        for process in (worker, external_wait, unrelated):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
 
 
 def test_environment_carrier_is_bounded_private_exact_and_single_use(

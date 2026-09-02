@@ -69,6 +69,7 @@ agent-run resume <parent-issue> [--new-thread] [--message "..."] --repo OWNER/RE
 agent-run requeue <parent-issue> --repo OWNER/REPO
 agent-run approve <parent-issue> --repo OWNER/REPO
 agent-run revise <parent-issue> --message '未经改写的维护者反馈' --repo OWNER/REPO
+agent-run stop <parent-issue> --repo OWNER/REPO
 agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 ```
 
@@ -183,17 +184,18 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 
 ### 命令边界与状态轮转
 
-下表是 `run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。Controller
+下表是 `run/resume/requeue/status/history/approve/revise/stop/abandon` 的稳定操作合同。Controller
 内部阶段不是维护者操作；它们不能越过下表中的人工边界。
 
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
 | `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；或为同一等待身份开启新监督窗口 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker、`operator_stopped`，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
 | `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
+| `stop` | 任意已知、未终止且有活动 Executor 的 Run | 原子撤销旧 Executor 写入权，定向终止其 Worker 进程组，并把 Run 置为可显式恢复的 `operator_stopped` | 不把 Stop 记为失败，不删除 checkout、Thread、Attempt 或 Artifact；确认无活动 Executor 及重复 Stop 都严格只读 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
 ### Output Repair、Resume 与 Requeue

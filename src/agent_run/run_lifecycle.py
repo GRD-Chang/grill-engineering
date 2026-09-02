@@ -31,6 +31,7 @@ from agent_run.task_control import (
     TASK_CONTROL_PROTOCOL,
     action_receipt_matches,
     payload_digest,
+    unresolved_control_target,
 )
 
 
@@ -456,6 +457,207 @@ class RunLifecycle:
             replace_receipt_action_id=replace_receipt_action_id,
         )
 
+    def submit_control(
+        self,
+        request: LifecycleRequest,
+    ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
+        """Fence an old Executor and run Stop/Abandon under a new Executor.
+
+        Admission is deliberately separate from ordinary lifecycle submission:
+        Stop may be a strictly read-only no-op when the Host proves there is no
+        active Executor, while Abandon is still a mutation in that state.
+        """
+
+        if request.task != self.task or request.kind not in {"stop", "abandon"}:
+            raise ValueError("unsupported control Lifecycle Action")
+        current = self.preflight()
+        if current is None:
+            raise ActionReconciliationError(
+                f"{request.kind} 找不到 Delivery Run"
+            )
+        run_id = _string_field(current, "run_id")
+        record = self.control.load(self.task)
+        action = record.get("action") if isinstance(record, Mapping) else None
+        unresolved_target = unresolved_control_target(action)
+        active_action = (
+            action
+            if isinstance(action, Mapping)
+            and action.get("status") in {"accepted", "applying"}
+            else None
+        )
+        requested_digest = payload_digest(request.payload)
+        attached = bool(
+            active_action is not None
+            and active_action.get("kind") == request.kind
+            and active_action.get("payload_digest") == requested_digest
+            and active_action.get("run_id") == run_id
+        )
+        if active_action is not None and not attached:
+            raise ActionBusyError(
+                "当前 Delivery Task 已有未完成 Lifecycle Action；不会等待或排队",
+                action=active_action,
+            )
+        if (
+            (
+                current.get("status") in {"completed", "abandoned"}
+                or (
+                    request.kind == "stop"
+                    and current.get("status") == "operator_stopped"
+                )
+            )
+            and unresolved_target is None
+        ):
+            if not attached:
+                return current, True, None
+            assert active_action is not None
+            active_executor = (
+                record.get("executor") if isinstance(record, Mapping) else None
+            )
+            completed: Mapping[str, Any] | None = None
+            if not isinstance(active_executor, Mapping):
+                completed = self.control.complete_control_action(
+                    self.task,
+                    action_id=_string_field(active_action, "action_id"),
+                    result_status=_string_field(current, "status"),
+                )
+            elif active_executor.get("status") in {"exited", "absent"}:
+                application_receipt = current.get("action_application_receipt")
+                if not isinstance(application_receipt, Mapping):
+                    raise ActionReconciliationError(
+                        "终态 Control Action 缺少 Application Receipt"
+                    )
+                completed = self.control.complete_action_from_application_receipt(
+                    self.task,
+                    action_id=_string_field(active_action, "action_id"),
+                    generation=_positive_integer(
+                        active_executor.get("generation")
+                    ),
+                    application_receipt=application_receipt,
+                    result_status=_string_field(current, "status"),
+                )
+            if completed is not None:
+                return (
+                    current,
+                    True,
+                    self.receipt_from_record(
+                        completed,
+                        action_id=_string_field(active_action, "action_id"),
+                        attached=True,
+                    ),
+                )
+
+        executor = record.get("executor") if isinstance(record, Mapping) else None
+        if attached:
+            assert active_action is not None
+            claimed_action = active_action
+        else:
+            if (
+                request.kind == "stop"
+                and unresolved_target is None
+            ):
+                if record is None:
+                    raise ExecutorStartUnknownError(
+                        "Task Control ownership 缺失；不会猜测或终止进程"
+                    )
+                if not isinstance(executor, Mapping) or executor.get("status") in {
+                    "exited",
+                    "absent",
+                }:
+                    return self._reload_no_active_run(run_id, record), True, None
+                if executor.get("status") not in {"starting", "running"}:
+                    raise ExecutorStartUnknownError(
+                        "Executor ownership 无法确认；不会提交控制栅栏"
+                    )
+                old_action_id = _string_field(executor, "action_id")
+                old_generation = _positive_integer(executor.get("generation"))
+                old_run_id = executor.get("run_id")
+                observation = self.host.observe(
+                    replace(
+                        self.executor_spec(
+                            old_run_id if isinstance(old_run_id, str) else None,
+                            old_action_id,
+                            old_generation,
+                        ),
+                        runner_binding=(
+                            executor.get("runner_binding")
+                            if isinstance(executor.get("runner_binding"), str)
+                            else None
+                        ),
+                    ),
+                    self.control,
+                )
+                if observation.status in {"absent", "exited"}:
+                    return (
+                        self._reload_no_active_run(
+                            run_id,
+                            record,
+                            host_absent_executor=(old_action_id, old_generation),
+                        ),
+                        True,
+                        None,
+                    )
+                if observation.status != "running":
+                    raise ExecutorStartUnknownError(
+                        observation.reason
+                        or "Executor ownership 无法确认；不会提交控制栅栏"
+                    )
+            claim = self.control.claim_control_action(
+                self.task,
+                kind=request.kind,
+                payload=request.payload,
+                run_id=run_id,
+                state_dir=self.states.root,
+            )
+            if claim is None:
+                if record is None:
+                    raise ActionReconciliationError(
+                        "Stop ownership 缺失；不会返回 no-active 结果"
+                    )
+                return self._reload_no_active_run(run_id, record), True, None
+            claimed_action = claim.action
+            attached = claim.attached
+
+        replace_receipt_action_id = _receipt_owner_action_id(record, current)
+        return self._continue_action(
+            claimed_action,
+            current,
+            replace_receipt_action_id=replace_receipt_action_id,
+            attached=attached,
+        )
+
+    def _reload_no_active_run(
+        self,
+        run_id: str,
+        record: Mapping[str, Any],
+        *,
+        host_absent_executor: tuple[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Reload the exact Run after proving Stop is a read-only no-op."""
+
+        current = self._state_store_for_record(record).load_current_run(run_id)
+        if current is None or current.get("run_id") != run_id:
+            raise ActionReconciliationError(
+                "Stop 无法重新读取准确 Delivery Run；不会返回过期状态"
+            )
+        parent = current.get("parent")
+        if (
+            current.get("repository") != self.task.repository
+            or not isinstance(parent, Mapping)
+            or parent.get("number") != self.task.parent_number
+        ):
+            raise ActionReconciliationError(
+                "Stop 重新读取的 Delivery Run 与 Delivery Task 不匹配"
+            )
+        if not self.control.proves_read_only_stop(
+            self.task,
+            current,
+            host_absent_executor=host_absent_executor,
+        ):
+            raise ActionReconciliationError(
+                "Stop 的 no-active 证明在读取结果前已变化；不会返回过期状态"
+            )
+        return current
+
     def execute_claimed(
         self, *, action_id: str, generation: int
     ) -> tuple[dict[str, Any], bool, ActionReceipt]:
@@ -477,7 +679,12 @@ class RunLifecycle:
             raise ActionReconciliationError("Executor generation binding 不匹配")
         run_id = _record_run_id(record)
         current = self._load_action_run(run_id, {}, record=record)
-        return self._continue_action(action, current, executor_generation=generation)
+        return self._continue_action(
+            action,
+            current,
+            replace_receipt_action_id=_receipt_owner_action_id(record, current),
+            executor_generation=generation,
+        )
 
     def _claim(self, request: LifecycleRequest) -> ActionClaim:
         return self.control.claim_action(
@@ -578,6 +785,7 @@ class RunLifecycle:
         *,
         replace_receipt_action_id: str | None = None,
         executor_generation: int | None = None,
+        attached: bool = True,
     ) -> tuple[dict[str, Any], bool, ActionReceipt]:
         action_id = _string_field(action, "action_id")
         latest = self.control.snapshot(self.task, action_id)
@@ -651,6 +859,7 @@ class RunLifecycle:
                     generation=bound_generation,
                     resumed=True,
                     execution_context=execution_context,
+                    replace_receipt_action_id=replace_receipt_action_id,
                     state_store=state_store,
                 )
 
@@ -664,7 +873,7 @@ class RunLifecycle:
             return self._run_executor(
                 action_id=action_id,
                 run_id=run_id,
-                attached=True,
+                attached=attached,
                 resumed=True,
                 state=state,
                 generation=generation,
@@ -674,7 +883,7 @@ class RunLifecycle:
         return self._start_action(
             action,
             current,
-            attached=True,
+            attached=attached,
             replace_receipt_action_id=replace_receipt_action_id,
         )
 
@@ -724,6 +933,13 @@ class RunLifecycle:
         execution_context.update(
             {"run_id": run_id, "resumed": resumed, "state": prepared}
         )
+        kind = _string_field(action, "kind")
+        if kind in {"stop", "abandon"}:
+            if self.execute_with_binding is None:
+                raise ActionReconciliationError(
+                    "Control Action 缺少绑定业务执行入口"
+                )
+            return self.execute_with_binding(run_id, action_id, generation)
         result_status = prepared.get("status")
         self.control.complete_action(
             self.task,

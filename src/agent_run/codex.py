@@ -98,9 +98,14 @@ class CodexCliBackend:
         self,
         executable: str = "codex",
         credential_provider: CredentialProvider | None = None,
+        *,
+        on_worker_started: Callable[[int], None] | None = None,
+        on_worker_finished: Callable[[int], None] | None = None,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
+        self.on_worker_started = on_worker_started
+        self.on_worker_finished = on_worker_finished
 
     def develop(
         self, request: dict[str, Any]
@@ -860,7 +865,23 @@ class CodexCliBackend:
                         worker_options["on_stdout_line"] = _thread_line_callback(
                             expected=thread_id, callback=on_thread
                         )
-                    result = run_worker_process(arguments, **worker_options)
+                    worker_pid: int | None = None
+
+                    def worker_started(pid: int) -> None:
+                        nonlocal worker_pid
+                        worker_pid = pid
+                        if self.on_worker_started is not None:
+                            self.on_worker_started(pid)
+
+                    if "on_process_started" in inspect.signature(
+                        run_worker_process
+                    ).parameters:
+                        worker_options["on_process_started"] = worker_started
+                    try:
+                        result = run_worker_process(arguments, **worker_options)
+                    finally:
+                        if worker_pid is not None and self.on_worker_finished is not None:
+                            self.on_worker_finished(worker_pid)
             except InitialCredentialUnavailable:
                 raise
             except WorkerDeadlineExceeded as error:

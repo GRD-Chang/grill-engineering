@@ -27,6 +27,7 @@ from agent_run.executor_host import (
     ExecutorHostError,
     ExecutorSpec,
     HostObservation,
+    _terminate_control_target,
 )
 from agent_run.runner_lease import default_runner_lock_path
 from agent_run.task_control import TaskControlStore
@@ -344,6 +345,13 @@ class SystemdUserExecutorHost:
             self._capture(tuple(command))
         except EnvironmentCarrierError as error:
             raise SystemdExecutionReadinessError(str(error)) from error
+
+    def terminate_control_target(
+        self, target_executor: Mapping[str, object], *, timeout: float = 1.0
+    ) -> None:
+        """Terminate the exact Linux process identity captured by the fence."""
+
+        _terminate_control_target(target_executor, timeout=timeout)
 
     def ensure(
         self,

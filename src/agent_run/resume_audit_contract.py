@@ -14,6 +14,7 @@ RESUME_AUDIT_KINDS = frozenset(
         "execution_failure",
         "github_refresh_retry",
         "human_blocker",
+        "operator_stopped",
         "supervision_timeout",
     }
 )

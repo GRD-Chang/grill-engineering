@@ -279,6 +279,66 @@ def record_session_interruption(
     save(state)
 
 
+def record_operator_stop(
+    state: dict[str, Any], *, save: Callable[[dict[str, Any]], object]
+) -> None:
+    """Persist a reversible operator boundary without discarding run evidence."""
+
+    if state.get("status") == "operator_stopped":
+        return
+    state["operator_stop"] = {
+        "resume_status": state.get("status"),
+        "resume_terminal_kind": state.get("terminal_kind"),
+        "resume_diagnostics": deepcopy(state.get("diagnostics", [])),
+        "stopped_at": datetime.now(UTC).isoformat(),
+    }
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
+        failed = dict(active)
+        failed.update(
+            {
+                "status": "failed",
+                "ended_at": datetime.now(UTC).isoformat(),
+                "error": "operator_stopped",
+            }
+        )
+        state["active_agent_invocation"] = failed
+        _sync_invocation_history(state, failed)
+    state.update(
+        {
+            "status": "operator_stopped",
+            "terminal_kind": "operator_stopped",
+            "diagnostics": [
+                {
+                    "code": "operator_stopped",
+                    "message": "操作者已停止 Executor；现场已保留，仅显式 Resume 可继续",
+                }
+            ],
+        }
+    )
+    save(state)
+
+
+def restore_operator_stop(state: dict[str, Any]) -> None:
+    """Consume the reversible Stop boundary for an explicit Resume."""
+
+    stop = state.get("operator_stop")
+    if state.get("status") != "operator_stopped" or not isinstance(stop, dict):
+        return
+    resume_status = stop.get("resume_status")
+    if not isinstance(resume_status, str) or resume_status == "operator_stopped":
+        raise ValueError("operator_stopped Run 缺少可恢复状态")
+    state["status"] = resume_status
+    terminal_kind = stop.get("resume_terminal_kind")
+    if terminal_kind is None:
+        state.pop("terminal_kind", None)
+    else:
+        state["terminal_kind"] = terminal_kind
+    diagnostics = stop.get("resume_diagnostics")
+    state["diagnostics"] = deepcopy(diagnostics) if isinstance(diagnostics, list) else []
+    state.pop("operator_stop", None)
+
+
 def session_interruption_is_persisted(state: dict[str, Any]) -> bool:
     diagnostics = state.get("diagnostics")
     receipt = state.get("action_application_receipt")
