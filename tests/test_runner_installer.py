@@ -104,6 +104,12 @@ def _fake_codex(
         "    time.sleep(130)\n"
         "if behavior == 'sleep':\n"
         "    time.sleep(2)\n"
+        "if behavior == 'wait-for-release':\n"
+        "    deadline = time.monotonic() + 30\n"
+        "    while not pid_file.with_name('codex-release').exists():\n"
+        "        if time.monotonic() >= deadline:\n"
+        "            sys.exit(8)\n"
+        "        time.sleep(0.01)\n"
         "if behavior == 'fork-setsid':\n"
         "    if '--output-last-message' not in sys.argv:\n"
         "        sys.exit(0)\n"
@@ -2300,7 +2306,8 @@ def test_concurrent_management_operations_have_one_winner_and_keep_invariants(
     (source / "src" / "agent_run" / "__init__.py").write_text(
         "__version__ = 'third'\n", encoding="utf-8"
     )
-    (tmp_path / "codex-behavior").write_text("sleep", encoding="utf-8")
+    (tmp_path / "codex-behavior").write_text("wait-for-release", encoding="utf-8")
+    release = tmp_path / "codex-release"
     environment = os.environ.copy()
     environment.update(
         {
@@ -2319,25 +2326,37 @@ def test_concurrent_management_operations_have_one_winner_and_keep_invariants(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + 5
-    lock_held = False
-    while time.monotonic() < deadline:
-        with lock.open("a+") as handle:
+    try:
+        deadline = time.monotonic() + 5
+        lock_held = False
+        while time.monotonic() < deadline:
+            with lock.open("a+") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lock_held = True
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if lock_held:
+                break
+            time.sleep(0.01)
+        assert lock_held, "first install did not acquire the management lock"
+        second = _run(source, home, fake_bin, *second_arguments)
+    finally:
+        # Release only after the competing operation has observed the real lock.
+        # Always release on assertion/error paths so no waiting child is left.
+        release.touch()
+        try:
+            first_stdout, first_stderr = first.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            first.terminate()
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock_held = True
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        if lock_held:
-            break
-        time.sleep(0.01)
-    if not lock_held:
-        first.kill()
-        first.communicate(timeout=10)
-        raise AssertionError("first install did not acquire the management lock")
-    second = _run(source, home, fake_bin, *second_arguments)
-    first_stdout, first_stderr = first.communicate(timeout=240)
+                first.communicate(timeout=10)
+            finally:
+                if first.poll() is None:
+                    first.kill()
+                    first.communicate(timeout=5)
+            raise
 
     assert first.returncode == 0, first_stderr
     assert first_stdout

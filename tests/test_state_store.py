@@ -376,17 +376,67 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
         }
     ]
 
-    final_revision = f"observed-{MAX_TIMELINE_EVENTS * 2 + 9}"
-    for number in range(MAX_TIMELINE_EVENTS * 2 + 10):
-        change = state["unsupported_scope_change"]
-        assert isinstance(change, dict)
-        change["observed_graph_revision"] = f"observed-{number}"
-        store.save_run("run-1", state)
+    assert store.load_run("run-1")["timeline"] == state["timeline"]
+    assert MAX_TIMELINE_EVENTS == MAX_TIMELINE_CONTINUATION_EVENTS == 256
+    first_event = dict(state["timeline"][0])
+    change = state["unsupported_scope_change"]
+    # Existing history is input data. Exercise the actual persistence boundary
+    # at its last ordinary slot, capacity marker, and continuation rollover.
+    state["timeline"] += [
+        {**first_event, "observed_graph_revision": f"history-{number}"}
+        for number in range(1, MAX_TIMELINE_EVENTS - 2)
+    ]
+    change["observed_graph_revision"] = "history-253"
+    store.save_run("run-1", state)
+    assert len(store.load_run("run-1")["timeline"]) == 254
 
-    assert len(state["timeline"]) == MAX_TIMELINE_EVENTS
-    assert state["timeline"][-1]["kind"] == "timeline_capacity"
-    assert state["timeline_at_capacity"] is True
-    assert len(state["timeline_continuation"]) == MAX_TIMELINE_CONTINUATION_EVENTS
-    assert state["timeline_continuation"][-1]["observed_graph_revision"] == (
-        final_revision
+    change["observed_graph_revision"] = "last-ordinary-event"
+    store.save_run("run-1", state)
+    persisted = store.load_run("run-1")
+    assert len(persisted["timeline"]) == 255
+    assert persisted["timeline"][-1]["observed_graph_revision"] == "last-ordinary-event"
+    assert persisted.get("timeline_at_capacity", False) is False
+
+    change["observed_graph_revision"] = "first-continuation-event"
+    store.save_run("run-1", state)
+    persisted = store.load_run("run-1")
+    assert len(persisted["timeline"]) == 256
+    assert persisted["timeline"][0] == first_event
+    assert persisted["timeline"][-1]["kind"] == "timeline_capacity"
+    assert persisted["timeline_at_capacity"] is True
+    frozen_timeline = persisted["timeline"]
+    first_continuation = persisted["timeline_continuation"][0]
+    assert first_continuation["observed_graph_revision"] == "first-continuation-event"
+
+    state["timeline_continuation"] += [
+        {**first_continuation, "observed_graph_revision": f"continuation-{number}"}
+        for number in range(1, MAX_TIMELINE_CONTINUATION_EVENTS - 1)
+    ]
+    change["observed_graph_revision"] = "continuation-254"
+    store.save_run("run-1", state)
+    assert len(store.load_run("run-1")["timeline_continuation"]) == 255
+
+    change["observed_graph_revision"] = "last-continuation-slot"
+    store.save_run("run-1", state)
+    persisted = store.load_run("run-1")
+    assert len(persisted["timeline_continuation"]) == 256
+    assert persisted["timeline_continuation"][0] == first_continuation
+    assert persisted["timeline_continuation"][-1]["observed_graph_revision"] == (
+        "last-continuation-slot"
     )
+
+    change["observed_graph_revision"] = "continuation-after-rollover"
+    store.save_run("run-1", state)
+    persisted = store.load_run("run-1")
+    assert persisted["timeline"] == frozen_timeline
+    assert persisted["timeline_at_capacity"] is True
+    assert len(persisted["timeline_continuation"]) == 256
+    assert persisted["timeline_continuation"][0]["observed_graph_revision"] == (
+        "continuation-1"
+    )
+    assert persisted["timeline_continuation"][-1]["observed_graph_revision"] == (
+        "continuation-after-rollover"
+    )
+
+    store.save_run("run-1", state)
+    assert store.load_run("run-1") == persisted

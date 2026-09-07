@@ -1822,12 +1822,15 @@ def test_parent_only_uses_configured_paired_rounds_and_shared_publication_gate(
     assert stdout_json(approved)["status"] == "completed"
 
 
-def test_parent_only_default_paired_budget_reaches_the_tenth_reviewer(
+def test_parent_only_default_paired_policy_reaches_publication(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    agents = git_repo / "parent-default-ten-rounds.json"
-    agents.write_text(json.dumps(parent_round_agents(10, passing_last=True)), encoding="utf-8")
+    # Exact default limits live at the public policy/budget boundary. Keep the
+    # ten-round failure below and configured final-round success above as the
+    # real Git/StateStore integration checks for the two terminal outcomes.
+    agents = git_repo / "parent-default-policy.json"
+    agents.write_text(json.dumps(parent_round_agents(1, passing_last=True)), encoding="utf-8")
 
     result = run_cli(
         git_repo,
@@ -1843,9 +1846,10 @@ def test_parent_only_default_paired_budget_reaches_the_tenth_reviewer(
     state = load_only_run_state(git_repo)
     job = state["parent_job"]
     assert state["policy_snapshot"]["parent_only_paired_rounds"] == 10
-    assert job["review_budget"]["development_attempts"] == 10
-    assert job["review_budget"]["reviewer_invocations"] == 10
-    assert len(job["review_budget"]["review_artifacts"]) == 10
+    assert job["policy_snapshot"] == state["policy_snapshot"]
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["review_budget"]["reviewer_invocations"] == 1
+    assert len(job["review_budget"]["review_artifacts"]) == 1
     assert job["phase"] == "ready_for_approval"
     assert "fallback_publication_receipt" not in job
 
