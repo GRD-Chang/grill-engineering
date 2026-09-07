@@ -1870,6 +1870,8 @@ def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
                 "repository_root": str(git_repo.resolve()),
                 "state_dir": str((git_repo / ".agent-run").resolve()),
                 "updated_at": locator["entries"][0]["updated_at"],
+                "repository": "example/project",
+                "parent_number": 1,
             }
         ]
     }

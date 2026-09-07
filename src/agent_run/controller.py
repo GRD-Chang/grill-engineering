@@ -1378,6 +1378,8 @@ class Controller:
             run_id=run_id,
             repository_root=self.checkout,
             state_dir=self.states.root,
+            repository=str(state["repository"]),
+            parent_number=state["parent"]["number"],
         )
         state.pop("locator_registration_pending")
         self.states.save_run(run_id, state)

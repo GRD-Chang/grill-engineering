@@ -319,7 +319,7 @@ _Avoid_: 裸 `run_id`、单张 Child Ticket、整个 Repository、主机全局�
 _Avoid_: 单张 Ticket、单次 Codex 执行、长期后台服务、同一 Parent 的并行 Run、复活或覆盖终态 Run、额外 `--new-run`
 
 **Run 定位索引（Run Locator Index）**:
-本机维护的最小 Run ID 到仓库根和 state 目录的定位记录。它只让新版本创建的 Run 在任意目录下由 `status` 与 `history` 找到正确的本地 state，不回填或迁移历史 Run；记录失效或冲突时要求维护者显式指定 state 目录，不扫描磁盘。索引最多保留最近 32 条，且不参与 Agent 编排、GitHub 状态、权限或生命周期 mutation。
+本机维护的最小 Run ID 到仓库根和 state 目录的定位记录。新登记同时保存 Repository 与 Parent number，作为 state 或 checkout 丢失时仍可核验的路由身份，不复制生命周期状态。查询兼容缺少这对字段的旧记录；可读取的 state、checkout 与路由身份必须一致，只有身份足以证明无关的记录才可排除。可能匹配但身份不足、状态失效或身份冲突时要求维护者显式消歧；查询成功和失败均不回填、删除或迁移索引与历史 Run，不扫描磁盘。索引最多保留最近 32 条，且不参与 Agent 编排、GitHub 状态、权限或生命周期 mutation。
 _Avoid_: 全盘搜索、历史 state 迁移、跨仓库自动 mutation、Agent 执行日志、第二套 Run state
 
 **Local Delivery Task Index（本地交付任务索引）**:

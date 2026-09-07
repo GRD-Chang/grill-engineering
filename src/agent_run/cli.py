@@ -83,6 +83,7 @@ from agent_run.run_lifecycle import (
 )
 from agent_run.run_locator import (
     MAX_LOCATOR_ENTRIES,
+    LocatorEntry,
     RunLocatorError,
     RunLocatorIndex,
 )
@@ -3108,30 +3109,7 @@ def _selector_records(
             for entry in entries
             if Path(entry["repository_root"]).resolve() == expected_root
         ]
-    all_records = [_read_locator_entry(entry, read_only=read_only) for entry in entries]
-    records = all_records
-
-    if repository is not None:
-        records = [
-            record
-            for record in records
-            if record[0].get("repository") == repository
-            or record[0].get("repository") is None
-        ]
-    elif current_root is not None:
-        current_root = current_root.resolve()
-        repository_root = str(current_root)
-        current_repository = _current_repository_name(all_records, repository_root)
-        records = [
-            record
-            for record in records
-            if record[0].get("repository_root") == repository_root
-            or record[1] is None
-            or (
-                current_repository is not None
-                and record[0].get("repository") == current_repository
-            )
-        ]
+    records = [_read_locator_entry(entry, read_only=read_only) for entry in entries]
 
     # A current checkout is an already-known, bounded location.  It remains a
     # useful fallback when an older/newly interrupted Run has not completed its
@@ -3145,28 +3123,6 @@ def _selector_records(
         local_records = _read_state_directory(
             local_root, current_root.resolve(), read_only=read_only
         )
-        if repository is not None:
-            local_records = [
-                record
-                for record in local_records
-                if record[0].get("repository") == repository
-                or record[0].get("repository") is None
-            ]
-        elif current_repository is None:
-            local_repositories: set[str] = set()
-            for public, state in local_records:
-                repository_name = public.get("repository")
-                if state is not None and isinstance(repository_name, str):
-                    local_repositories.add(repository_name)
-            if len(local_repositories) == 1:
-                current_repository = next(iter(local_repositories))
-        if repository is None and current_repository is not None:
-            local_records = [
-                record
-                for record in local_records
-                if record[0].get("repository") == current_repository
-                or record[1] is None
-            ]
         records.extend(
             record
             for record in local_records
@@ -3176,7 +3132,16 @@ def _selector_records(
             )
             not in indexed_runs
         )
-
+        # Resolve local identity only after the bounded fallback is included.
+        # Otherwise an unregistered local Run can silently lose other clones.
+        if repository is None:
+            repository = _current_repository_name(records, str(current_root.resolve()))
+    if repository is not None:
+        records = [
+            record
+            for record in records
+            if record[0].get("repository") in (None, repository)
+        ]
     return records
 
 
@@ -3219,17 +3184,22 @@ def _current_repository_name(
     ).repository_hint()
     if repository_hint is not None:
         return repository_hint
-    for public, state in records:
-        if public.get("repository_root") != repository_root or state is None:
-            continue
-        repository = public.get("repository")
-        if isinstance(repository, str):
-            return repository
+    repositories = {
+        public["repository"]
+        for public, state in records
+        if public.get("repository_root") == repository_root
+        and state is not None
+        and isinstance(public.get("repository"), str)
+    }
+    if len(repositories) == 1:
+        repository = next(iter(repositories))
+        assert isinstance(repository, str)
+        return repository
     return None
 
 
 def _verified_locator_checkout(
-    entry: dict[str, str],
+    entry: LocatorEntry,
 ) -> tuple[GitRepository, str | None]:
     recorded_root = Path(entry["repository_root"]).resolve()
     checkout = GitRepository.discover(recorded_root)
@@ -3262,7 +3232,7 @@ def _read_state_directory(
     )
     records: list[tuple[dict[str, object], dict[str, Any] | None]] = []
     for path in paths:
-        entry = {
+        entry: LocatorEntry = {
             "run_id": path.stem,
             "repository_root": repository_root_value,
             "state_dir": str(state_dir.resolve()),
@@ -3278,7 +3248,7 @@ def _read_state_directory(
 
 
 def _read_locator_entry(
-    entry: dict[str, str],
+    entry: LocatorEntry,
     *,
     verify_checkout: bool = True,
     read_only: bool = False,
@@ -3294,26 +3264,70 @@ def _read_locator_entry(
         state_error = "定位索引记录的状态文件不存在"
     else:
         try:
-            state = (
-                _load_read_only_state(StateStore(state_dir), run_id)
-                if read_only
-                else StateStore(state_dir).load_current_run(run_id)
-            )
+            # Identity must be checked before validating the lifecycle payload:
+            # a broken payload cannot hide a contradictory routing identity.
+            state = StateStore(state_dir).load_run(run_id)
         except (OSError, ValueError) as error:
             state_error = bounded_error(str(error))
         if state is None:
             if state_error is None:
                 state_error = "状态文件中的 Run ID 与定位索引不一致"
         elif state.get("run_id") != run_id:
-            state = None
-            state_error = "状态文件中的 Run ID 与定位索引不一致"
-    if state_error is not None:
+            return _candidate(
+                entry,
+                error="状态文件中的 Run ID 与定位索引不一致",
+                identity_conflict=True,
+            ), None
+        if state is not None:
+            repository = state.get("repository")
+            parent = state.get("parent")
+            parent_number = parent.get("number") if isinstance(parent, dict) else None
+            if (
+                (
+                    repository is not None
+                    and (
+                        not isinstance(repository, str)
+                        or len(repository.split("/")) != 2
+                        or not all(repository.split("/"))
+                        or any(character.isspace() for character in repository)
+                    )
+                )
+                or (
+                    parent_number is not None
+                    and (type(parent_number) is not int or parent_number <= 0)
+                )
+            ):
+                return _candidate(
+                    entry,
+                    error="状态文件中的 Repository/Parent 定位身份格式无效",
+                    identity_conflict=True,
+                ), None
+        if state is not None and "repository" in entry:
+            parent = state.get("parent")
+            if (
+                state.get("repository") != entry["repository"]
+                or not isinstance(parent, dict)
+                or parent.get("number") != entry["parent_number"]
+            ):
+                return _candidate(
+                    entry,
+                    error="状态文件中的 Repository/Parent 与定位索引不一致",
+                    identity_conflict=True,
+                ), None
+        if state is not None:
+            try:
+                require_current_run_state(state)
+            except IncompatibleRunStateError as error:
+                if not (read_only and _is_legacy_run_state(state)):
+                    state_error = bounded_error(str(error))
+    if state is None and state_error is not None:
         if not verify_checkout:
             return _candidate(entry, error=state_error), None
         try:
             _checkout, checkout_repository = _verified_locator_checkout(entry)
         except (GitError, OSError) as error:
-            unavailable = {**entry, "repository_root": "unavailable"}
+            unavailable = entry.copy()
+            unavailable["repository_root"] = "unavailable"
             return (
                 _candidate(
                     unavailable,
@@ -3323,6 +3337,12 @@ def _read_locator_entry(
             )
         candidate = _candidate(entry, error=state_error)
         if checkout_repository is not None:
+            if "repository" in entry and entry["repository"] != checkout_repository:
+                return _candidate(
+                    entry,
+                    error="checkout repository 与定位索引不一致",
+                    identity_conflict=True,
+                ), None
             candidate["repository"] = checkout_repository
         return candidate, None
     if state is None:  # pragma: no cover - state errors return above
@@ -3331,7 +3351,8 @@ def _read_locator_entry(
         try:
             checkout, checkout_repository = _verified_locator_checkout(entry)
         except (GitError, OSError) as error:
-            unavailable = {**entry, "repository_root": "unavailable"}
+            unavailable = entry.copy()
+            unavailable["repository_root"] = "unavailable"
             return (
                 _candidate(
                     unavailable,
@@ -3340,6 +3361,14 @@ def _read_locator_entry(
                 ),
                 None,
             )
+        state_repository = state.get("repository")
+        if checkout_repository is not None and state_repository != checkout_repository:
+            return _candidate(
+                entry,
+                state=state,
+                error="定位索引记录的 checkout repository 与 Run 不一致",
+                identity_conflict=True,
+            ), None
         checkout_identity = checkout.checkout_identity()
         state_identity = state.get("checkout_identity")
         if (
@@ -3347,37 +3376,31 @@ def _read_locator_entry(
             or checkout_identity is None
             or checkout_identity != state_identity
         ):
-            unavailable = {**entry, "repository_root": "unavailable"}
+            unavailable = entry.copy()
+            unavailable["repository_root"] = "unavailable"
             return (
                 _candidate(
                     unavailable,
                     state=state,
                     error="定位索引记录的 checkout identity 不一致或不可用",
+                    identity_conflict=state_identity is not None,
                 ),
                 None,
             )
-        state_repository = state.get("repository")
-        if checkout_repository is not None and state_repository != checkout_repository:
-            unavailable = {**entry, "repository_root": "unavailable"}
-            return (
-                _candidate(
-                    unavailable,
-                    state=state,
-                    error="定位索引记录的 checkout repository 与 Run 不一致",
-                ),
-                None,
-            )
-    return _candidate(entry, state=state), state
+    return _candidate(entry, state=state, error=state_error), (
+        state if state_error is None else None
+    )
 
 
 def _candidate(
-    entry: dict[str, str],
+    entry: LocatorEntry,
     *,
     state: dict[str, Any] | None = None,
     error: str | None = None,
+    identity_conflict: bool = False,
 ) -> dict[str, object]:
-    parent: object = None
-    repository: object = None
+    parent: object = entry.get("parent_number")
+    repository: object = entry.get("repository")
     status: object = "unavailable"
     started_at: object = None
     if state is not None:
@@ -3398,6 +3421,8 @@ def _candidate(
     }
     if error is not None:
         candidate["error"] = error
+    if identity_conflict:
+        candidate.update(repository=None, parent=None, repository_root="unavailable")
     return candidate
 
 
@@ -3411,6 +3436,12 @@ def _select_one_record(
     ready_command: str | None = None,
     current_root: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, Any]]:
+    if parent_number is not None:
+        records = [
+            record
+            for record in records
+            if record[0].get("parent") in (None, parent_number)
+        ]
     public_records = [record[0] for record in records]
     invalid = [public for public, state in records if state is None]
     if invalid:
