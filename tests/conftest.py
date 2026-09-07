@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -21,15 +22,44 @@ from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
 
 
-@pytest.fixture
-def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
+def _user_environment(root: Path) -> dict[str, str]:
+    environment = {}
+    for variable, directory in (
+        ("HOME", "home"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_RUNTIME_DIR", "runtime"),
+    ):
+        path = root / directory
+        path.mkdir(parents=True, mode=0o700)
+        environment[variable] = str(path)
+    return environment
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Helpers and CLI children share one private user environment per case."""
+
+    for variable, value in _user_environment(tmp_path / "user").items():
+        monkeypatch.setenv(variable, value)
+
+
+@pytest.fixture(scope="session")
+def git_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build once per worker; tests only receive independent copies."""
+
+    root = tmp_path_factory.mktemp("git-template")
+    environment = os.environ | _user_environment(root / "user")
+    repo = root / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Agent Run Tests"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, env=environment, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Agent Run Tests"], cwd=repo, env=environment, check=True)
     subprocess.run(
         ["git", "config", "user.email", "agent-run-tests@example.invalid"],
         cwd=repo,
+        env=environment,
         check=True,
     )
     (repo / "README.md").write_text("# fixture\n", encoding="utf-8")
@@ -41,9 +71,14 @@ def git_repo(tmp_path: Path) -> Path:
         ']\n',
         encoding="utf-8",
     )
-    subprocess.run(["git", "add", "README.md", "pyproject.toml"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "README.md", "pyproject.toml"], cwd=repo, env=environment, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, env=environment, check=True, capture_output=True)
     return repo
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path, git_template: Path) -> Path:
+    return Path(shutil.copytree(git_template, tmp_path / "repo"))
 
 
 def write_fixture(path: Path, *, issues: dict[str, Any], **overrides: Any) -> Path:
