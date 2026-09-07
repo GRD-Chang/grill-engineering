@@ -122,9 +122,13 @@ editable 安装仅用于本仓库开发和测试，不是普通用户的安装�
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
-python -m pytest -q
-python -m mypy src/agent_run
+make test-policy  # 示例：策略模块的局部反馈
+make test        # 最终完整测试
+make typecheck
 ```
+
+修改后按影响选择[测试入口](docs/agents/test-commands.md)；测试编写、扩大验证和隔离要求见
+[测试指南](docs/agents/testing.md)。CI 保留完整测试、类型检查与安装后 CLI 检查。
 
 ## 常用命令
 
