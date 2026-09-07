@@ -1438,7 +1438,7 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert "没有具体风险依据时，避免重复或嵌套相同的 Review" in development
     assert "Prompt 只提供判断框架" not in development
     assert "E2E、Standards 和 Spec 三种独立视角" in acceptance
-    assert "E2E 默认负责代码稳定后的广泛运行验证" in acceptance
+    assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in acceptance
     assert "Standards 与 Spec 默认使用静态证据" in acceptance
     assert "skill:code-review" in acceptance
     assert "确保 E2E、Standards 和 Spec 三种独立视角均形成可复核结论" in acceptance

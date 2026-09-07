@@ -510,6 +510,12 @@ def test_development_prompt_uses_risk_proportional_verification_and_stops_at_com
     assert "不要为未来需求、其他 Ticket、假想调用方" in prompt
     assert "根据实际改动风险自主选择最低充分验证" in prompt
     assert "完整测试套件不是每轮默认的固定门槛" in prompt
+    assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt
+    assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt
+    assert "稳定候选是已知实现修改、相关验证及需先处理的问题已经收口" in prompt
+    assert "完整套件失败后，先定向诊断、修复并验证受影响路径" in prompt
+    assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt
+    assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
     assert "达到完成条件后停止扩展" in prompt
     assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in prompt
     assert "没有具体风险依据时，避免重复或嵌套相同的 Review" in prompt
@@ -533,7 +539,10 @@ def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestra
     )
 
     assert "E2E、Standards 和 Spec 三种独立视角" in prompt
-    assert "E2E 默认负责代码稳定后的广泛运行验证" in prompt
+    assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in prompt
+    assert "记录实际验证对象、命令、exit code、结果和相关环境" in prompt
+    assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
+    assert "完整测试失败时提供具体失败证据和复验要求" in prompt
     assert "Standards 与 Spec 默认使用静态证据" in prompt
     assert "Deferred to #N：…" in prompt
     assert "Non-blocking observation：…" in prompt
@@ -767,6 +776,21 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             },
             (parent_url, "CI_EVIDENCE_SENTINEL"),
         ),
+        *(
+            (
+                f"{scope}_integrity_repair",
+                "develop",
+                {
+                    "acceptance_scope": scope,
+                    "repair_source": "git_integrity",
+                    "git_integrity_evidence": {"failure": "GIT_INTEGRITY_SENTINEL"},
+                    **({"task_issue_url": task_url} if scope == "ticket" else {}),
+                    **({"repair_scope": "run_repair"} if scope == "run" else {}),
+                },
+                (parent_url, "GIT_INTEGRITY_SENTINEL"),
+            )
+            for scope in ("ticket", "parent_only", "run")
+        ),
         (
             "run_acceptance_repair",
             "develop",
@@ -801,6 +825,16 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             (parent_url, "HUMAN_FEEDBACK_SENTINEL"),
         ),
         (
+            "parent_human_repair",
+            "develop",
+            {
+                "acceptance_scope": "parent_only",
+                "repair_source": "human_revision",
+                "human_feedback": "HUMAN_FEEDBACK_SENTINEL",
+            },
+            (parent_url, "HUMAN_FEEDBACK_SENTINEL"),
+        ),
+        (
             "run_conflict_repair",
             "develop",
             {
@@ -827,6 +861,12 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             "run_acceptance",
             "review",
             {"acceptance_scope": "run"},
+            (parent_url,),
+        ),
+        (
+            "run_repair_acceptance",
+            "review",
+            {"acceptance_scope": "run", "repair_scope": "run_repair"},
             (parent_url,),
         ),
         (
@@ -919,6 +959,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for evidence_key in (
                 "acceptance_artifact",
                 "ci_evidence",
+                "git_integrity_evidence",
             ):
                 if evidence_key in role_request:
                     assert json.dumps(
@@ -939,6 +980,13 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
                 assert "当前 checkout 是程序管理的受管开发工作区" in prompt
+                assert "完整测试套件不是每轮默认的固定门槛" in prompt, active_case
+                assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt, active_case
+                assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt, active_case
+                assert "稳定候选是已知实现修改、相关验证及需先处理的问题已经收口" in prompt, active_case
+                assert "完整套件失败后，先定向诊断、修复并验证受影响路径" in prompt, active_case
+                assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt, active_case
+                assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
                 assert "Git 历史只向前推进" in prompt
                 assert "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit" in prompt
                 assert "你只整理 checkout，不执行这些写入" in prompt
@@ -960,6 +1008,10 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 ), active_case
             elif method == "review":
                 assert "E2E、Standards 和 Spec 三种独立视角" in prompt, active_case
+                assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in prompt, active_case
+                assert "Standards 与 Spec 默认使用静态证据" in prompt, active_case
+                assert "记录实际验证对象、命令、exit code、结果和相关环境" in prompt, active_case
+                assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
                 assert "不得修复源码、测试、配置或 `.gitignore`" in prompt, active_case
                 if name == "run_acceptance":
                     assert "跨 Ticket 交互" in prompt
