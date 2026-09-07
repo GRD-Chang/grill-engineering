@@ -76,10 +76,15 @@ def _capture_public_prompt(
         Path(arguments[output_index]).write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8"
         )
+        reported_thread = request.get("thread_id", "public-prompt-test")
         return subprocess.CompletedProcess(
             arguments,
             0,
-            stdout='{"type":"thread.started","thread_id":"public-prompt-test"}\n',
+            stdout=(
+                '{"type":"thread.started","thread_id":"'
+                + str(reported_thread)
+                + '"}\n'
+            ),
             stderr="",
         )
 
@@ -146,6 +151,7 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
                 "previous_review_identity": {
                     "reviewed_base_sha": "TICKET_PREVIOUS_BASE",
                     "reviewed_candidate_sha": "TICKET_PREVIOUS_CANDIDATE",
+                    "reviewed_candidate_tree": "TICKET_PREVIOUS_TREE",
                 },
             },
             (
@@ -154,6 +160,7 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
                 "TICKET_CURRENT_TREE",
                 "TICKET_PREVIOUS_BASE",
                 "TICKET_PREVIOUS_CANDIDATE",
+                "TICKET_PREVIOUS_TREE",
                 "Previous reviewed Candidate",
             ),
         ),
@@ -222,6 +229,11 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
         assert "Reviewer 2+" not in prompt
         assert "本窗口 Reviewer" not in prompt
         assert "因前次调用失败而继续的同 Thread Resume" not in prompt
+        assert "优先核销上一轮 Findings" in prompt
+        assert "repair delta" in prompt
+        assert "直接回归" in prompt
+        assert "缺少具体风险依据时，避免对未变化代码重复完整扫描" in prompt
+        assert "当前证据或实际影响需要时，自主扩大检查范围" in prompt
 
     r2_prompt = _capture_public_prompt(
         tmp_path,
@@ -517,10 +529,79 @@ def test_development_prompt_uses_risk_proportional_verification_and_stops_at_com
     assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt
     assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
     assert "达到完成条件后停止扩展" in prompt
-    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in prompt
-    assert "没有具体风险依据时，避免重复或嵌套相同的 Review" in prompt
-    assert "Prompt 只提供判断框架" not in prompt
-    assert "两个不同 subagent" not in prompt
+    assert "先自行检查当前完整工作树、已知风险与未处理问题" in prompt
+    assert "低风险局部改动可以直接收口" in prompt
+    assert "默认最多进行一个 Development Preflight Round" in prompt
+    assert "一轮可以包含多个不同风险方向的审查型 subagent" in prompt
+    assert 'fork_turns: "none"' in prompt
+    assert "完成审查所需的中立任务事实、当前范围和真实证据" in prompt
+    assert "当前未提交工作树及未跟踪的交付内容" in prompt
+    assert "不常规启动第二轮内部 Reviewer" in prompt
+    assert "内部预检不形成 Acceptance Artifact" in prompt
+    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" not in prompt
+    assert "取得有效复查" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("request_extra", "evidence_marker"),
+    [
+        (
+            {
+                "repair_source": "acceptance",
+                "acceptance_artifact": {"repair": "ACCEPTANCE_REPAIR"},
+            },
+            "ACCEPTANCE_REPAIR",
+        ),
+        (
+            {
+                "repair_source": "required_checks",
+                "ci_evidence": {"repair": "REQUIRED_CHECKS_REPAIR"},
+            },
+            "REQUIRED_CHECKS_REPAIR",
+        ),
+        (
+            {
+                "repair_source": "git_integrity",
+                "git_integrity_evidence": {"repair": "GIT_INTEGRITY_REPAIR"},
+            },
+            "GIT_INTEGRITY_REPAIR",
+        ),
+        (
+            {
+                "repair_source": "human_revision",
+                "human_feedback": "HUMAN_REVISION_REPAIR",
+            },
+            "HUMAN_REVISION_REPAIR",
+        ),
+        (
+            {
+                "repair_source": "merge_conflict",
+                "merge_conflict_evidence": "MERGE_CONFLICT_REPAIR",
+            },
+            "MERGE_CONFLICT_REPAIR",
+        ),
+    ],
+)
+def test_directed_repair_self_checks_without_internal_reviewer(
+    tmp_path: Path,
+    monkeypatch: Any,
+    request_extra: dict[str, Any],
+    evidence_marker: str,
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {"acceptance_scope": "ticket", **request_extra},
+        name=f"directed-repair-{request_extra['repair_source']}",
+    )
+
+    assert evidence_marker in prompt
+    assert "自行检查当前工作树并完成与风险相称的验证" in prompt
+    assert "本轮不需要启动开发侧 Reviewer" in prompt
+    assert "Development Preflight Round" not in prompt
+    assert "审查型 subagent" not in prompt
+    assert "取得有效复查" not in prompt
 
 
 def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestration(
@@ -543,6 +624,7 @@ def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestra
     assert "记录实际验证对象、命令、exit code、结果和相关环境" in prompt
     assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
     assert "完整测试失败时提供具体失败证据和复验要求" in prompt
+    assert "没有 Previous Acceptance Context 时，对完整 Review Boundary 建立基线" in prompt
     assert "Standards 与 Spec 默认使用静态证据" in prompt
     assert "Deferred to #N：…" in prompt
     assert "Non-blocking observation：…" in prompt
@@ -931,12 +1013,12 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     prior_blockers = ["  PRIOR_BLOCKER_SENTINEL must remain verbatim.  "]
 
     for name, method, role_request, required in cases:
-        for resumed in (False, True):
-            active_case = f"{name}_{'resume' if resumed else 'normal'}"
+        for with_human_context in (False, True):
+            active_case = f"{name}_{'new_thread_blocker' if with_human_context else 'normal'}"
             active_method = method
             active_thread = (
                 f"PRIVATE_THREAD_SENTINEL_{name}"
-                if resumed
+                if with_human_context
                 else f"{name}-thread"
             )
             request = {
@@ -945,11 +1027,15 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 "checkout": str(checkout),
                 "parent_issue_url": parent_url,
             }
-            if resumed:
+            if with_human_context:
                 request.update(
                     {
-                        "thread_id": active_thread,
+                        "_invocation_mode": "new-thread",
                         "prior_human_blockers": prior_blockers,
+                        "human_response_history": [
+                            {"response": "OLD_RESPONSE_SENTINEL"},
+                            {"response": "LATEST_RESPONSE_SENTINEL"},
+                        ],
                     }
                 )
             getattr(backend, method)(request)
@@ -971,9 +1057,12 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for evidence_key in ("human_feedback", "merge_conflict_evidence"):
                 if evidence_key in role_request:
                     assert role_request[evidence_key] in prompt
-            if resumed:
+            if with_human_context:
                 assert json.dumps(prior_blockers[0], ensure_ascii=False) in prompt
                 assert "不表示问题已经解决" in prompt
+                assert "Human Blocker 恢复" not in prompt
+                assert "LATEST_RESPONSE_SENTINEL" in prompt
+                assert "OLD_RESPONSE_SENTINEL" not in prompt
             else:
                 assert "PRIOR_BLOCKER_SENTINEL" not in prompt
             for marker in forbidden:
@@ -1234,16 +1323,274 @@ def test_human_blocker_resume_context_reaches_original_thread_stdin_verbatim(
 
     assert "resume" in captured["arguments"]
     assert "original-thread" in captured["arguments"]
-    expected_context = {
-        "parent_issue_url": "https://github.com/example/project/issues/1",
-        "prior_human_blockers": blockers,
-        "task_issue_url": "https://github.com/example/project/issues/2",
+    assert blockers[0] in captured["prompt"]
+    assert "你是当前 Ticket 的开发工程师" in captured["prompt"]
+    assert "继续完成你负责的当前开发交付" in captured["prompt"]
+    assert "Development Brief" not in captured["prompt"]
+    assert "完整测试套件" not in captured["prompt"]
+    assert "Thread" not in captured["prompt"]
+    assert "Resume" not in captured["prompt"]
+    assert "execution_failed" not in captured["prompt"]
+
+
+def test_human_blocker_continuation_uses_only_current_blocker_and_latest_reply(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "thread_id": "blocked-development-thread",
+            "prior_human_blockers": ["CURRENT_BLOCKER_SENTINEL"],
+            "human_response_history": [
+                {"response": "OLD_RESPONSE_SENTINEL"},
+                {"response": "LATEST_RESPONSE_SENTINEL"},
+            ],
+        },
+        name="development-human-continuation",
+    )
+
+    assert "CURRENT_BLOCKER_SENTINEL" in prompt
+    assert "LATEST_RESPONSE_SENTINEL" in prompt
+    assert "OLD_RESPONSE_SENTINEL" not in prompt
+    assert "Human Blocker 恢复" not in prompt
+
+
+def test_human_blocker_continuations_keep_each_roles_current_object_facts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    shared = {
+        "thread_id": "blocked-role-thread",
+        "prior_human_blockers": ["CURRENT_BLOCKER_SENTINEL"],
+        "human_response_history": [
+            {"response": "OLD_RESPONSE_SENTINEL"},
+            {"response": "LATEST_RESPONSE_SENTINEL"},
+        ],
     }
-    assert json.dumps(
-        expected_context, ensure_ascii=False, indent=2, sort_keys=True
-    ) in captured["prompt"]
-    assert "不表示问题已经解决" in captured["prompt"]
-    assert "重新读取权威来源、重新检查受影响工作" in captured["prompt"]
+    development = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            **shared,
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "DEVELOPMENT_PARENT_SENTINEL",
+            "task_issue_url": "DEVELOPMENT_TICKET_SENTINEL",
+        },
+        name="development-human-object-facts",
+    )
+    review = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            **shared,
+            "acceptance_scope": "ticket",
+            "current_review_identity": {
+                "reviewed_base_sha": "REVIEW_BASE_SENTINEL",
+                "reviewed_candidate_sha": "REVIEW_CANDIDATE_SENTINEL",
+                "reviewed_candidate_tree": "REVIEW_TREE_SENTINEL",
+            },
+        },
+        name="review-human-object-facts",
+    )
+    publication = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            **shared,
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "PUBLICATION_PARENT_SENTINEL",
+            "task_issue_url": "PUBLICATION_TICKET_SENTINEL",
+            "acceptance_artifact": {},
+        },
+        name="publication-human-object-facts",
+    )
+
+    for prompt in (development, review, publication):
+        assert "CURRENT_BLOCKER_SENTINEL" in prompt
+        assert "LATEST_RESPONSE_SENTINEL" in prompt
+        assert "OLD_RESPONSE_SENTINEL" not in prompt
+        assert "Human Blocker 恢复" not in prompt
+        assert "Thread" not in prompt
+        assert "Resume" not in prompt
+    assert "DEVELOPMENT_PARENT_SENTINEL" in development
+    assert "DEVELOPMENT_TICKET_SENTINEL" in development
+    assert "REVIEW_BASE_SENTINEL" in review
+    assert "REVIEW_CANDIDATE_SENTINEL" in review
+    assert "REVIEW_TREE_SENTINEL" in review
+    assert "PUBLICATION_PARENT_SENTINEL" in publication
+    assert "PUBLICATION_TICKET_SENTINEL" in publication
+    assert "完整独立验收证据" in publication
+
+
+def test_new_semantic_repair_on_development_thread_uses_full_repair_prompt(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "thread_id": "persistent-development-thread",
+            "repair_source": "acceptance",
+            "acceptance_artifact": {"finding": "REPAIR_SENTINEL"},
+        },
+        name="new-semantic-repair",
+    )
+
+    assert "Acceptance Repair" in prompt
+    assert "Development Brief" in prompt
+    assert "REPAIR_SENTINEL" in prompt
+    assert "继续完成你负责的当前修复交付" not in prompt
+
+
+def test_resume_mode_without_a_valid_thread_uses_the_full_role_prompt(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "_invocation_mode": "resume",
+        },
+        name="development-resume-without-thread",
+    )
+
+    assert "Development Brief" in prompt
+    assert "以当前 Ticket 和代码事实为依据" in prompt
+    assert "继续完成你负责的当前开发交付" not in prompt
+
+
+def test_role_continuations_use_short_role_specific_prompts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    artifact = {
+        "checks": {
+            lane: {
+                "status": "pass",
+                "evidence": PASS_EVIDENCE[lane],
+                "findings": [],
+            }
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    development = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/2",
+            "thread_id": "development-thread",
+            "_invocation_mode": "resume",
+        },
+        name="development-execution-continuation",
+    )
+    repair = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "run",
+            "repair_scope": "run_repair",
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "repair_source": "required_checks",
+            "ci_evidence": {"check": "CURRENT_CI_SENTINEL"},
+            "thread_id": "repair-thread",
+            "_invocation_mode": "resume",
+        },
+        name="repair-execution-continuation",
+    )
+    review = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            "acceptance_scope": "run",
+            "thread_id": "reviewer-thread",
+            "current_review_identity": {
+                "default_base_sha": "CURRENT_BASE_SENTINEL",
+                "run_head_sha": "CURRENT_HEAD_SENTINEL",
+                "expected_merge_tree": "CURRENT_TREE_SENTINEL",
+            },
+            "previous_acceptance_artifact": {"old": "OLD_ARTIFACT_SENTINEL"},
+        },
+        name="reviewer-execution-continuation",
+    )
+    publication = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/2",
+            "acceptance_artifact": artifact,
+            "thread_id": "publication-thread",
+            "_invocation_mode": "resume",
+        },
+        name="publication-execution-continuation",
+    )
+    fallback_publication = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "https://github.com/example/project/issues/1",
+            "task_issue_url": "https://github.com/example/project/issues/2",
+            "fallback_publication_context": {
+                "receipt": "UNCHANGED_FALLBACK_EVIDENCE_SENTINEL"
+            },
+            "thread_id": "fallback-publication-thread",
+            "_invocation_mode": "resume",
+        },
+        name="fallback-publication-execution-continuation",
+    )
+
+    assert "你是当前 Ticket 的开发工程师" in development
+    assert "继续完成你负责的当前开发交付" in development
+    assert "https://github.com/example/project/issues/1" in development
+    assert "https://github.com/example/project/issues/2" in development
+    assert "Development Brief" not in development
+    assert "你是本次 Delivery Run 的修复工程师" in repair
+    assert "继续完成你负责的当前修复交付" in repair
+    assert "https://github.com/example/project/issues/1" in repair
+    assert "CURRENT_CI_SENTINEL" in repair
+    assert "Development Brief" not in repair
+    assert "你是独立 Run 整体验收工程师" in review
+    assert "继续完成你负责的当前独立验收" in review
+    assert "CURRENT_BASE_SENTINEL" in review
+    assert "CURRENT_HEAD_SENTINEL" in review
+    assert "CURRENT_TREE_SENTINEL" in review
+    assert "OLD_ARTIFACT_SENTINEL" not in review
+    assert "E2E、Standards 和 Spec 三种独立视角" not in review
+    assert "你是当前 Ticket PR 的发布叙事工程师" in publication
+    assert "继续完成你负责的当前发布叙事" in publication
+    assert "https://github.com/example/project/issues/1" in publication
+    assert "https://github.com/example/project/issues/2" in publication
+    assert "完整独立验收证据" in publication
+    assert "最小 Fallback Publication Context" in fallback_publication
+    assert "UNCHANGED_FALLBACK_EVIDENCE_SENTINEL" not in fallback_publication
+    assert "What Problem This Solves" not in publication
+    for prompt in (
+        development,
+        repair,
+        review,
+        publication,
+        fallback_publication,
+    ):
+        assert "Thread" not in prompt
+        assert "Resume" not in prompt
+        assert "execution_failed" not in prompt
 
 
 def test_human_blocker_resume_rejects_a_different_reported_thread(

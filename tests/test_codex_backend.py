@@ -251,12 +251,14 @@ def test_publication_repairs_invalid_output_in_same_thread(
     tmp_path: Path, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     attempts: list[list[str]] = []
+    prompts: list[str] = []
     events: list[tuple[str, dict[str, object]]] = []
 
     def fake_run(
         arguments: list[str], **options: Any
     ) -> subprocess.CompletedProcess[str]:
         attempts.append(arguments)
+        prompts.append(str(options["prompt"]))
         output = Path(arguments[arguments.index("--output-last-message") + 1])
         if len(attempts) == 1:
             output.write_text('{"invalid":"publication"}', encoding="utf-8")
@@ -299,6 +301,10 @@ def test_publication_repairs_invalid_output_in_same_thread(
     assert isinstance(result, PublicationResult)
     assert len(attempts) == 2
     assert "resume" in attempts[1]
+    assert "你已完成当前发布叙事" in prompts[1]
+    assert "Publication wire JSON" in prompts[1]
+    assert "不重新读取项目、改写交付事实或调用工具" in prompts[1]
+    assert "上一输出未通过本地 Publication Artifact contract" not in prompts[1]
     assert events[-1] == (
         "completed",
         {"reported_thread_id": "publication-thread", "attempt_count": 2},
@@ -319,12 +325,14 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     attempts: list[list[str]] = []
+    prompts: list[str] = []
     events: list[tuple[str, dict[str, object]]] = []
 
     def fake_run(
         arguments: list[str], **options: Any
     ) -> subprocess.CompletedProcess[str]:
         attempts.append(arguments)
+        prompts.append(str(options["prompt"]))
         output = Path(arguments[arguments.index("--output-last-message") + 1])
         artifact = {
             "result_kind": "publication",
@@ -365,6 +373,10 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
     assert result["_thread_id"] == "run-publication-thread"
     assert len(attempts) == 2
     assert "resume" in attempts[1]
+    assert "你已完成当前发布叙事" in prompts[1]
+    assert "Publication wire JSON" in prompts[1]
+    assert "不重新读取项目、改写交付事实或调用工具" in prompts[1]
+    assert "Final Run Publication" not in prompts[1]
     assert events[-1] == (
         "completed",
         {"reported_thread_id": "run-publication-thread", "attempt_count": 2},
@@ -422,11 +434,13 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     attempts: list[list[str]] = []
+    prompts: list[str] = []
 
     def fake_run(
-        arguments: list[str], **_options: Any
+        arguments: list[str], **options: Any
     ) -> subprocess.CompletedProcess[str]:
         attempts.append(arguments)
+        prompts.append(str(options["prompt"]))
         output = Path(arguments[arguments.index("--output-last-message") + 1])
         output.write_text(
             json.dumps(
@@ -455,6 +469,48 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     assert result.thread_id == "development-thread"
     assert len(attempts) == 2
     assert "resume" in attempts[1]
+    assert "你已完成当前开发或修复工作" in prompts[1]
+    assert "Development wire JSON" in prompts[1]
+    assert "不重新执行开发、验证或工具调用" in prompts[1]
+    assert "上一输出未通过本地 Development result contract" not in prompts[1]
+
+
+def test_reviewer_repairs_invalid_output_with_reviewer_only_prompt(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompts: list[str] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        prompts.append(str(options["prompt"]))
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(
+            json.dumps(
+                {"invalid": "acceptance"}
+                if len(prompts) == 1
+                else passing_acceptance_artifact()
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            '{"type":"thread.started","thread_id":"reviewer-thread"}\n',
+            "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").review(
+        {"checkout": str(tmp_path), "acceptance_scope": "ticket"}
+    )
+
+    assert result.thread_id == "reviewer-thread"
+    assert len(prompts) == 2
+    assert "你已完成当前独立验收" in prompts[1]
+    assert "Acceptance Artifact" in prompts[1]
+    assert "不重新执行审查、验证或工具调用" in prompts[1]
+    assert "上一输出未通过本地 Acceptance Artifact contract" not in prompts[1]
 
 
 def test_bound_model_and_effort_are_sent_on_fresh_resume_and_output_repair(
@@ -600,7 +656,8 @@ def test_failure_resume_rechecks_current_workspace_before_development(
     )
 
     assert "因前次调用失败而继续的同 Thread Resume" not in prompts[0]
-    assert "Development Brief:" in prompts[0]
+    assert "继续完成你负责的当前开发交付" in prompts[0]
+    assert "Development Brief:" not in prompts[0]
 
 
 def test_failure_resume_rechecks_current_workspace_before_publication(
@@ -1439,8 +1496,9 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     development, acceptance = prompts
     assert "skill:implement" in development
     assert "skill:code-review" in development
-    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in development
-    assert "没有具体风险依据时，避免重复或嵌套相同的 Review" in development
+    assert "默认最多进行一个 Development Preflight Round" in development
+    assert 'fork_turns: "none"' in development
+    assert "不常规启动第二轮内部 Reviewer" in development
     assert "Prompt 只提供判断框架" not in development
     assert "E2E、Standards 和 Spec 三种独立视角" in acceptance
     assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in acceptance
@@ -1655,10 +1713,14 @@ def test_development_prompt_matches_normal_and_repair_contracts(
     assert mode_text in prompt
     assert "直接影响的成功路径、失败路径和边界情况" in prompt
     assert "根据实际改动风险自主选择最低充分验证" in prompt
-    assert "低风险局部改动可以自行做简短收口检查" in prompt
-    assert "大型、跨模块或触及认证、权限" in prompt
-    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" in prompt
-    assert "Prompt 只提供判断框架" not in prompt
+    if request_extra:
+        assert "自行检查当前工作树并完成与风险相称的验证" in prompt
+        assert "本轮不需要启动开发侧 Reviewer" in prompt
+        assert "Development Preflight Round" not in prompt
+    else:
+        assert "低风险局部改动可以直接收口" in prompt
+        assert "默认最多进行一个 Development Preflight Round" in prompt
+        assert 'fork_turns: "none"' in prompt
     if evidence is not None:
         assert evidence in prompt
         source = (
