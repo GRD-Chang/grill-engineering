@@ -1224,6 +1224,7 @@ class PassAgents(ScriptedAgents):
 
 class HumanThenHistoricalReviewerAgents(PassAgents):
     def review(self, request: dict[str, Any]) -> ReviewResult:
+        self.review_requests.append(request)
         result = super().review(request)
         if self.review_count == 1:
             artifact = result.artifact
@@ -2102,6 +2103,12 @@ def test_fresh_validation_human_resume_with_new_thread_replaces_blocker_artifact
 
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
+    assert "previous_acceptance_artifact" not in agents.review_requests[1]
+    assert "previous_review_identity" not in agents.review_requests[1]
+    assert agents.review_requests[1]["review_budget_context"] == {
+        "current_review_attempt": 1,
+        "remaining_review_attempts": 2,
+    }
     completed_job = persisted["ticket_jobs"]["3"]
     assert completed_job["review_budget"]["reviewer_invocations"] == 1
     assert len(completed_job["review_budget"]["review_artifacts"]) == 1

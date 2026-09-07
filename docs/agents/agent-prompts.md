@@ -31,8 +31,8 @@ Prompt 从被调用 Agent 的视角书写，而不是从项目负责人或 Contr
 只有会改变本轮判断或动作的相邻结果才进入 Prompt。例如 Development 需要知道当前 checkout 最终保留
 的交付修改会整体成为 Candidate Commit，因此应清理中间产物且不能自行 commit；Reviewer 需要知道当前
 checkout 是哪个 base/Candidate 或合并预览；fallback Publication 需要知道当前 Candidate 没有独立 pass，
-因此不能写成已验收。Reviewer 与 Acceptance Repair 还会看到简短的已完成/剩余自动验收次数，帮助在不
-降低标准的前提下尽量一次收口。预算窗口、checkpoint、`resume`、后继阶段和 canonical state 字段仍由
+因此不能写成已验收。Reviewer 会看到当前与剩余自动验收次数，各类定向 Repair 会看到已完成与剩余
+次数，帮助在不降低标准的前提下尽量一次收口。预算窗口、checkpoint、`resume`、后继阶段和 canonical state 字段仍由
 Controller 管理，不注入 Agent Prompt。
 
 ### 单一交付
@@ -57,7 +57,7 @@ Reviewer 不交付额外对照报告，Publication 不重新验收代码。
 
 Prompt 负责角色判断、开发、审查和叙事；Controller 负责 currentness、预算计数、SHA/Revision 绑定、
 Artifact schema、Git/GitHub 写入和发布门禁。Controller 只把会影响收口策略的简短审查次数投影给
-Reviewer 与 Acceptance Repair，不暴露预算窗口或状态迁移。Prompt 不要求 Agent 报告 Controller 可以
+Reviewer 与各类定向 Repair，不暴露预算窗口或状态迁移。Prompt 不要求 Agent 报告 Controller 可以
 机械得到的事实，Controller 也不解析 Development Summary 来判断 Finding 是否关闭。
 
 ### 完整合同与角色化短 Prompt
@@ -466,8 +466,9 @@ Parent Issue 的 title、body 和 Acceptance Criteria 是本轮完整验收合�
 
 ### 紧邻上一轮 Artifact block
 
-只有存在紧邻上一轮 Reviewer Artifact 时才内联对应角色的 block。Agent 不需要知道它是第几轮，也不
-需要知道本窗口的最大轮数。
+只有存在紧邻上一轮已经收口的 Reviewer Attempt Artifact 时才内联对应角色的 block。当前 Reviewer
+Attempt 因 Human Blocker 继续时，它自己的 blocked Artifact 不得伪装成上一轮 repair context。Agent 会
+看到当前独立验收次数和剩余自动验收次数，但不需要知道预算窗口或最大轮数。
 
 Ticket 与 Parent-only Candidate 使用：
 

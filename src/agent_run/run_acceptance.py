@@ -267,6 +267,9 @@ class RunAcceptanceEngine:
                     semantic_attempt.get("budget_consumed") is True
                 ),
             )
+            if semantic_attempt.get("budget_consumed") is True:
+                request.pop("previous_acceptance_artifact", None)
+                request.pop("previous_review_identity", None)
             run["phase"] = "reviewing"
             self._save(state)
             if run.get("reviewer_new_thread") is True:

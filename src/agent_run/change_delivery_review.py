@@ -66,6 +66,9 @@ def review(
             stage.review_budget_policy(),
             current_attempt_consumed=semantic_attempt.get("budget_consumed") is True,
         )
+        if semantic_attempt.get("budget_consumed") is True:
+            request.pop("previous_acceptance_artifact", None)
+            request.pop("previous_review_identity", None)
         request["_invocation_event"] = stage._invocation_events(
             state,
             job,
