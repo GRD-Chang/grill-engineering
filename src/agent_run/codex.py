@@ -280,6 +280,7 @@ class CodexCliBackend:
                 repair_scope=request.get("repair_scope"),
                 repair_source=repair_source,
             )
+            + _review_budget_block(request, reviewer=False)
             + "\n\n最后只输出完整 Development "
             'wire JSON：正常完成时 `{"result_kind":"development","summary":"...",'
             '"human_blockers":null}`；Human Blocker 时 summary 必须是 null。\n\n'
@@ -752,6 +753,7 @@ class CodexCliBackend:
                 acceptance_scope=request.get("acceptance_scope"),
                 repair_scope=request.get("repair_scope"),
             )
+            + _review_budget_block(request, reviewer=True)
             + current_review
             + previous_review
             + "\n\n"
@@ -1451,6 +1453,7 @@ def _development_continuation_prompt(
     return (
         f"你是{role}。{instruction}"
         + _current_object_block(request)
+        + _review_budget_block(request, reviewer=False)
         + _human_continuation_block(request)
         + "\n\n完成后只输出 Development wire JSON；summary 只陈述实际改动、实际验证和已知限制。"
     )
@@ -1461,7 +1464,39 @@ def _review_continuation_prompt(request: dict[str, Any], *, role: str) -> str:
         f"你是{role}。继续完成你负责的当前独立验收。以当前 Validation Checkout 和下面的准确"
         "验收对象为准，完成尚未收口的核验，并只输出当前对象的新 Acceptance Artifact。"
         + _review_identity_block(request)
+        + _review_budget_block(request, reviewer=True)
         + _human_continuation_block(request)
+    )
+
+
+def _review_budget_block(request: dict[str, Any], *, reviewer: bool) -> str:
+    context = request.get("review_budget_context")
+    if context is None:
+        return ""
+    if not isinstance(context, dict):
+        raise ValueError("review_budget_context must be an object")
+    remaining = context.get("remaining_review_attempts")
+    if type(remaining) is not int or remaining < 0:
+        raise ValueError("remaining_review_attempts must be a non-negative integer")
+    if reviewer:
+        current = context.get("current_review_attempt")
+        if type(current) is not int or current < 1:
+            raise ValueError("current_review_attempt must be a positive integer")
+        summary = (
+            f"这是当前对象的第 {current} 次独立验收；本轮之后还剩 {remaining} 次自动验收机会。"
+        )
+    else:
+        completed = context.get("completed_review_attempts")
+        if type(completed) is not int or completed < 0:
+            raise ValueError("completed_review_attempts must be a non-negative integer")
+        summary = (
+            f"当前对象已经完成 {completed} 次独立验收；当前还剩 {remaining} 次自动验收机会。"
+        )
+    return (
+        "\n\n"
+        + summary
+        + "该信息只用于合理组织本轮工作并尽量一次收口，不改变验收标准；"
+        "不得隐瞒、降级或放行必须修复的问题。"
     )
 
 
@@ -1723,7 +1758,8 @@ def _repair_contract(repair_source: object) -> str:
     if repair_source == "acceptance":
         return (
             "Acceptance Artifact 是未经改写的修复依据；其中当前 Review Boundary 内的 `findings` 是"
-            "本轮必须处理的问题。"
+            "本轮必须处理的问题证据，但不限定实现方案，也不表示问题只存在于列出的示例。"
+            "结合当前代码理解根因，检查同一决策点直接影响的场景，并覆盖本次修复可能造成的直接回归。"
             "`evidence` 中的 `Deferred to #N：…` 和 `Non-blocking observation：…` 不是自动修改"
             "指令。只有解决 Finding、防止本次修复直接回归或满足当前 Acceptance Criteria 确有需要时，"
             "才调整相关 evidence 或代码。"
@@ -1756,9 +1792,8 @@ def _repair_completion_instruction(repair_source: object) -> str:
     if repair_source != "acceptance":
         return ""
     return (
-        "Acceptance Repair 的完成条件还包括：逐项解决当前 Review Boundary 内的每个 Finding，"
-        "按每条 Finding 自带的 `复验` 要求执行验证并取得充分、可复核的证据；不能以一次笼统的"
-        "风险验证替代逐项复验。"
+        "Acceptance Repair 的完成条件还包括：解决当前 Review Boundary 内全部有证据支持的"
+        "Finding，并取得足以证明根因关闭、直接同族场景和直接回归受到覆盖的可复核证据。"
     )
 
 
@@ -1804,27 +1839,17 @@ def _development_contract(
         + "\n"
         + _repair_completion_instruction(repair_source)
         + "\n\n"
-        + "目标是最小充分改动：完整满足当前范围的 Acceptance Criteria，处理本次改动直接造成的"
-        "工程风险，同时不增加无关行为、状态、依赖、配置、公开入口或抽象层。优先沿用直接适用"
-        "的现有 Module、Interface 和仓库约定；只有当前正确性、可测试性、已经存在的具体重复"
-        "或既有设计确有需要时，才做局部重构。不要为未来需求、其他 Ticket、假想调用方或可能"
-        "复用增加通用框架、配置、回调、状态、Adapter 或公开 Interface。代码稳定并确认每处改动"
-        "服务当前范围后，删除不需要的代码、状态、分支、配置和依赖；达到完成条件后停止扩展。"
+        + "采用最小且可维护的方案完整满足当前范围，并遵循现有仓库约定。验收示例不是完整问题"
+        "空间；涉及共享决策点时，检查当前需求直接影响的同族场景，避免只修补一个表面案例。"
+        "范围外能力、可选重构和未来扩展不属于本轮交付。"
         + "\n\n"
-        + "当前 checkout 是受管开发工作区。每次 Development 或 Repair 的结果以新的 Candidate "
-        "Commit 记录，Git 历史只向前推进。你可以使用 `git log`、`git show`、"
-        "`git diff` 等只读操作检查历史和旧版本，但只修改当前 checkout 的文件树。如果先前 "
-        "Candidate 中有文件改错，直接在当前 checkout 删除、恢复或重写相关内容，并将修正保留为"
-        "未提交变更；不要回退、替换或修改旧 commit。不得执行暂存、commit、`commit --amend`、"
-        "`reset`、`rebase`、`revert`、`cherry-pick`、切换到旧 commit 或其他 branch、merge、push，"
-        "以及其他会移动、创建或改写 Git 历史的操作。当前 checkout 中保留的完整结果是新 Candidate "
-        "Commit 的唯一内容来源；你只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入。"
-        "因此，新的 Candidate 可以撤销、删除或重写先前 "
-        "Candidate 引入的内容，最终 diff 可以比上一轮更小。"
+        + "当前 checkout 最终保留的交付修改（包括应交付的未跟踪文件）会整体成为本轮 Candidate "
+        "Commit 的内容。可以用只读 Git 命令理解历史；只整理当前工作树，不暂存、commit、改写 "
+        "Git 历史或写入远端。修正先前改动时直接形成当前正确文件树。"
         + "\n\n"
         + _human_blocker_instruction()
         + "\n\n阅读适用的 AGENTS.md、相关实现、测试和真实调用入口；在适合的位置采用 TDD。"
-        "根据实际改动风险自主选择最低充分验证：覆盖直接影响的成功路径、失败路径和边界情况，"
+        "根据实际风险取得最低充分证据：覆盖直接影响的成功路径、失败路径和边界情况，"
         "并优先从真实用户入口复验核心路径。选择相关单测、typecheck、lint、完整测试套件或其他"
         "检查时记录实际命令、exit code、可观察结果和必要状态变化；完整测试套件不是每轮默认的"
         "固定门槛，未运行的检查不得声称已通过。不要用 mock、单元测试或代码阅读替代能够真实"
@@ -1866,7 +1891,8 @@ def _acceptance_contract(
         + _review_boundary_instruction(acceptance_scope, repair_scope=repair_scope)
         + "\n\n不要依赖开发者总结、自测、开发侧 Review、PR 文案或 Publication Artifact；使用真实 "
         "Git/gh 自行建立事实。本次验收必须分别形成 E2E、Standards 和 Spec 三种独立视角，"
-        "并将每条 lane 的证据和结论完整写入 Acceptance Artifact。E2E 负责当前稳定 Candidate 或"
+        "并对这三个维度分别形成可复核的证据与结论，完整写入 Acceptance Artifact。"
+        "你对三个维度的最终判断负责。E2E 负责当前稳定 Candidate 或"
         "合并预览的完整测试与必要检查，按适用 AGENTS.md 和仓库测试指南执行，独立取得实际结果；"
         "Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令，避免重复相同"
         "的完整测试套件，除非某个具体 Finding 确实需要。"
@@ -1875,18 +1901,19 @@ def _acceptance_contract(
         "完整测试失败时提供具体失败证据和复验要求，使修复先定向诊断与验证、收口后再完整复验；"
         "你仍保持只读，不负责修改候选。未执行或未完成的检查不得声称通过。"
         + "\n\n"
-        + "每次 Reviewer 都必须调用 `skill:code-review`，并将其作为 Standards 与 Spec 的实际审查 SOP。"
-        "根据当前 Review Boundary 和实际风险选择审查分工与复核强度，确保 E2E、Standards 和 Spec 三种独立视角均形成可复核"
-        "结论。没有具体风险依据时，避免重复派发同类 Reviewer、嵌套相同 Review，或由多个视角重复"
-        "执行相同的昂贵测试。不得用父 Reviewer 自己的判断替代缺失的独立审查视角；派发或验证遇到"
-        "问题时，先处理具体问题再形成可复核结论。"
+        + "每次 Reviewer 都必须调用 `skill:code-review` 作为审查方法。根据当前 Review Boundary 和"
+        "实际风险组织审查、subagent 与验证，不要求每个维度对应一个独立 subagent。所有审查或"
+        "评价型 subagent 必须使用 fork_turns: \"none\"，并只接收当前范围、对象身份和中立事实，"
+        "不得继承开发者的修复叙事或结论。没有具体风险依据时，不重复同类审查或昂贵测试。"
         + "\n\n"
-        + "Reviewer 应一次报告当前 Review Boundary 内已经能够证明的全部必须修复 Finding，但不得为追求穷尽"
-        "而扩大 Review Boundary 或进行无边界探索。`findings` 只包含当前 Change Job 必须处理、"
-        "有可复核证据且能由当前 Job 修复的问题；已由明确 sibling/follow-on Issue 承接的内容只以"
-        "`Deferred to #N：…` 写入最相关 lane 的 `evidence`，纯维护性建议、可选重构和文件大小偏好"
-        "只以 `Non-blocking observation：…` 写入 `evidence`。两者都不得进入 `findings`、改变 lane"
-        "状态或成为自动修复指令。"
+        + "只有同时满足以下条件的问题才进入 `findings`：属于当前 Review Boundary；有可复现、"
+        "可定位的证据；违反明确当前需求或硬性工程合同，或者形成具体风险；保持现状会使当前"
+        "验收对象不可接受；并且能由当前 Change Job 修复。明确需求或硬性合同的真实缺陷即使修复"
+        "很小也仍是 Finding。同一根因的多个表现应合并报告，并说明受影响的直接同族场景。"
+        "已由明确 sibling/follow-on Issue 承接的内容只以 `Deferred to #N：…` 写入最相关 lane 的"
+        "`evidence`。不影响当前可接受性的主观偏好、可选重构或轻微维护性问题不得进入 findings；"
+        "确有后续价值时可记为 `Non-blocking observation：…`，没有实际后续价值的轻微问题直接"
+        "省略。两者都不得改变 lane 状态或成为自动修复指令。"
         + "\n\n"
         + "Validation Checkout 是只读的，不得创建、修改或删除其中的文件。可构建、测试和"
         "产生验证中间产物，但任何需要写入的内容必须放在 checkout 外可定位、只服务本轮的"

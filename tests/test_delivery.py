@@ -1855,7 +1855,15 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         "/example/project/issues/1"
     )
     assert "development_summary" not in agents.review_requests[0]
+    assert agents.review_requests[0]["review_budget_context"] == {
+        "current_review_attempt": 1,
+        "remaining_review_attempts": 2,
+    }
     assert agents.development_requests[1]["repair_source"] == "acceptance"
+    assert agents.development_requests[1]["review_budget_context"] == {
+        "completed_review_attempts": 1,
+        "remaining_review_attempts": 2,
+    }
     assert agents.development_requests[1]["acceptance_artifact"] == {
         "checks": {
             "e2e": {
@@ -1881,6 +1889,10 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         agents.development_requests[1]["head_sha"]
         == agents.review_requests[0]["candidate_sha"]
     )
+    assert agents.review_requests[1]["review_budget_context"] == {
+        "current_review_attempt": 2,
+        "remaining_review_attempts": 1,
+    }
     assert len(set(agents.reviewer_thread_ids)) == 2
     assert len(set(agents.validation_checkouts)) == 2
     assert all(not path.exists() for path in agents.validation_checkouts)

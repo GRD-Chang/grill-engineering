@@ -159,7 +159,8 @@ Ticket、Parent-only 和 Run Repair
 不会自动重试或替换 Thread。`resume` 默认复用已保存 Thread，并使用当前 Development、Repair、Reviewer
 或 Publication 角色的短 Prompt，只补充完成本轮仍然需要的动态证据；`--new-thread` 只替换
 Invocation/Thread，不替换 Semantic Attempt，并使用当前角色和任务模式的完整标准 Prompt 新开 Thread。
-模型 Prompt 不说明 Thread、Resume、`execution_failed`、预算或后继流程。`--message` 只允许用于当前 Human Blocker；它 trim
+模型 Prompt 不说明 Thread、Resume、`execution_failed`、预算窗口或后继流程；Reviewer 与定向 Repair
+只接收从现有预算投影的简短审查次数。`--message` 只允许用于当前 Human Blocker；它 trim
 后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
@@ -286,9 +287,9 @@ generation、payload digest 等稳定机器审计事实只在显式 `--json` 输
 正常 Run Acceptance Attempt 在一次性、只读的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得
 复用任意 Ticket 的 Development/Reviewer Thread。它从 Parent Issue 与 GitHub 独立读取
 最终 Ticket 集合和依赖，
-检查准备好的累计 diff，并形成实际 E2E、Standards、Spec 三条独立验证 lane。E2E 默认负责代码
-稳定后的广泛运行验证，Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令；
-`skill:code-review` 是 Standards/Spec 审查使用的固定 SOP，且不得由父 Reviewer 替代缺失 lane。Run Reviewer 不得修改 Validation Checkout；
+检查准备好的累计 diff，并形成实际 E2E、Standards、Spec 三条独立验证 lane。Reviewer 必须调用
+`skill:code-review`，并对三个维度的最终判断负责；Prompt 不额外要求每个维度对应一个 subagent，
+所有审查或评价型 subagent 使用 `fork_turns: "none"` 和中立任务事实。Run Reviewer 不得修改 Validation Checkout；
 需要写入的构建、测试与验证中间产物必须放在 checkout 外可定位、仅服务本轮且结束前清理的临时路径。
 Reviewer 不得修复源码、测试、配置或 `.gitignore`。Ticket Completion
 Revision 按 Ticket number 数值排序，且只绑定已集成 SHA、冻结 Effective Revision 与已验收
@@ -409,12 +410,14 @@ subagent 使用 `fork_turns: "none"`，由 Development 自行提供必要的中�
 修复并自行复验后收口，不常规启动下一轮。已有 Acceptance、Required Checks、Git Integrity、人工修订
 或合并冲突等权威 Repair Evidence 时不启动内部 Reviewer。Fresh Acceptance
 不接收 Development Summary 或开发侧验证结论，在独立只读 Validation Checkout 中形成
-E2E、Standards 和 Spec 三条独立验收 lane；`skill:code-review` 是 Standards/Spec 审查使用的
-固定 SOP。需要写入的验证中间产物必须放在 checkout 外可定位、只服务本轮并在结束前清理
+E2E、Standards 和 Spec 三条独立验收 lane；Reviewer 必须调用 `skill:code-review` 并对三条 lane
+的最终判断负责。所有审查或评价型 subagent 使用 `fork_turns: "none"`。需要写入的验证中间产物
+必须放在 checkout 外可定位、只服务本轮并在结束前清理
 的临时路径。Prompt 不固定预检任务包字段、subagent 数量、检查命令、调用顺序或嵌套层级。
 Controller 不解析 Codex 内部事件流来审计 subagent 身份或 skill 调用；它信任上述
 Prompt 合同，并确定性校验 Fresh 父 Reviewer 不复用 Development/旧 Reviewer Thread、
-三个 lane 均有合法状态和证据，以及外层 SHA/Revision 绑定。
+三个 lane 均有合法状态和证据，以及外层 SHA/Revision 绑定。Reviewer Prompt 显示当前和剩余自动
+验收次数，定向 Repair 显示已完成和剩余次数；该投影不改变门禁或预算计数。
 
 Acceptance Artifact 根对象只包含 `checks`，其中固定 `e2e`、`standards`、`spec` 三条
 lane；每条 lane 只含 `status`、`evidence` 和 `findings`。任何 lane 的 Finding 都随完整

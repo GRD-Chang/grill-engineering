@@ -20,7 +20,8 @@ currentness。Controller 按 Development、Reviewer 或 Publication 角色选择
 显式 `--new-thread` 或没有可恢复 Thread 时才以当前角色和任务模式的完整标准 Prompt 新开。恢复原
 Thread 时，Controller 根据 Development、定向 Repair、Reviewer 或 Publication 角色选择短 Prompt，
 只重新提供完成本轮仍然需要的动态证据；Human Blocker 还提供当前 blocker 与维护者最新回复。模型
-不接收 Thread、Resume、`execution_failed`、预算或后继状态说明。Resume 是同一 Job Generation 内的
+不接收 Thread、Resume、`execution_failed`、预算窗口或后继状态说明；Reviewer 与定向 Repair 可继续
+接收从现有预算投影的简短审查次数。Resume 是同一 Job Generation 内的
 Invocation successor，不迁移或重置 Candidate、Acceptance、Human Response 或 branch/PR。只有到达
 适用的预算耗尽检查点后，维护者显式 Resume 才按当前 Delivery Policy 创建新的编号预算窗口；普通
 执行失败或 Human Blocker 继续原 Semantic Agent Attempt，不重置预算。

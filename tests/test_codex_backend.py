@@ -1504,10 +1504,12 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in acceptance
     assert "Standards 与 Spec 默认使用静态证据" in acceptance
     assert "skill:code-review" in acceptance
-    assert "确保 E2E、Standards 和 Spec 三种独立视角均形成可复核结论" in acceptance
-    assert "避免重复派发同类 Reviewer、嵌套相同 Review" in acceptance
-    assert "不规定固定 subagent 数量" not in acceptance
-    assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" in acceptance
+    assert "你对三个维度的最终判断负责" in acceptance
+    assert "不要求每个维度对应一个独立 subagent" in acceptance
+    assert 'fork_turns: "none"' in acceptance
+    assert "保持现状会使当前验收对象不可接受" in acceptance
+    assert "同一根因的多个表现应合并报告" in acceptance
+    assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in acceptance
     assert "每条 Finding 都必须写在最合适 lane 的 findings 中" in acceptance
     assert "pass 与 blocked 的 findings 必须为空" in acceptance
     assert "blocked 的 evidence 必须说明发生了什么" in acceptance
@@ -1712,7 +1714,7 @@ def test_development_prompt_matches_normal_and_repair_contracts(
     prompt = prompts[0]
     assert mode_text in prompt
     assert "直接影响的成功路径、失败路径和边界情况" in prompt
-    assert "根据实际改动风险自主选择最低充分验证" in prompt
+    assert "根据实际风险取得最低充分证据" in prompt
     if request_extra:
         assert "自行检查当前工作树并完成与风险相称的验证" in prompt
         assert "本轮不需要启动开发侧 Reviewer" in prompt

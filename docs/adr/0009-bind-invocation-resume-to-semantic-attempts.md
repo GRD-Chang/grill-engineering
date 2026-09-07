@@ -25,6 +25,6 @@ Managed Development Checkout 是尚未形成 Candidate 时的交付成果边界�
 
 Agent Invocation 必须持久化并校验它所属的 Semantic Agent Attempt；各角色必须在启动 Codex 前保存可恢复的 pending identity，在形成权威角色结果后才收口。新 Runner 对不含规范 Attempt identity 的旧 Run 和 Job、Attempt、Active Invocation 相互矛盾的状态都拒绝执行，停止 Codex、Publisher mutation 与自动 cleanup，且不提供迁移器。`status` 与 `history` 需要区分 Semantic Agent Attempt、Agent Invocation、Output Attempt 和 Publication Operation Retry。本 ADR 记录的是已接受但尚待实现的目标合同；在源码、公共 CLI 测试与运行手册原子切换前，`docs/agent-run.md` 仍描述当前 Runner 的实际行为。
 
-该规则属于 Controller 私有流程；Development、Reviewer 和 Publication Prompt 仍只接收完成局部交付所需的任务事实，不注入 Attempt 序号、剩余预算、Resume 次数或后继状态机。实现必须以 Development、Reviewer 和 Publication 的公共 CLI 恢复路径验证 Resume 不重复计数，并覆盖 Currentness 失效、真正预算检查点、Ctrl-C、dirty checkout、普通 `abandon` 与 `--discard-worktree` 的反向边界。
+该规则属于 Controller 私有流程；Development、Reviewer 和 Publication Prompt 仍只接收完成局部交付所需的任务事实。Reviewer 接收当前与剩余自动验收次数，定向 Repair 接收已完成与剩余次数；这些值从现有计数机械投影，不暴露 Budget Window、Resume 次数或后继状态机，也不改变验收标准。实现必须以 Development、Reviewer 和 Publication 的公共 CLI 恢复路径验证 Resume 不重复计数，并覆盖 Currentness 失效、真正预算检查点、Ctrl-C、dirty checkout、普通 `abandon` 与 `--discard-worktree` 的反向边界。
 
 本 ADR 扩展 ADR 0003 对 Invocation Resume、Output Repair 与 Requeue 的分层：进程失败仍不自动重试，Output Repair 仍是同一 Invocation 内最多两次的有界格式修复，Requeue 仍只处理 stale Job Generation。ADR 0003 中“十次 Ticket Repair Budget Window”的旧数量已由 ADR 0007 的四次普通 Development 加一次条件式 Final CI-fix 决策替代，本 ADR 不恢复该旧数量。

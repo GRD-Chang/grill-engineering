@@ -13,8 +13,8 @@ Initial Development 在实现、验证和自行检查后按风险判断独立预
 需要预检时由 Prompt 规定默认最多一轮，一轮可以包含多个风险定向审查型 subagent。审查型 subagent
 使用 `fork_turns: "none"`，由 Development 提供完成审查所需的中立任务事实、当前范围和真实证据；
 明确 Repair source 的定向 Repair 不启动内部 Reviewer。Fresh Acceptance 与 Run Acceptance 继续形成
-独立的 E2E、Standards、Spec 三条正式验收 lane，并使用 `skill:code-review` 作为 Standards/Spec 的
-固定 SOP。Reviewer 1 建立完整基线；Reviewer 2+ 优先核销原 Findings、检查 repair delta 与直接回归，
+独立的 E2E、Standards、Spec 三条正式验收 lane，并必须调用 `skill:code-review`。Reviewer 对三条
+lane 的最终判断负责；所有审查或评价型 subagent 使用 `fork_turns: "none"` 和中立任务事实。Reviewer 1 建立完整基线；Reviewer 2+ 优先核销原 Findings、检查 repair delta 与直接回归，
 缺少具体风险依据时避免重复完整扫描，并可按当前证据和实际影响自主扩大范围。Prompt 不固定
-subagent 数量、任务包字段、检查命令、调用顺序或嵌套层级。Controller 只校验父 Reviewer Thread 的
+每个维度对应的 subagent、任务包字段、检查命令、调用顺序或嵌套层级。Controller 只校验父 Reviewer Thread 的
 新鲜性、固定三 lane 的状态/证据和外层 SHA/Revision 绑定，不增加内部 Review 状态机或调用图审计。

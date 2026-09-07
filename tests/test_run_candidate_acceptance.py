@@ -99,8 +99,20 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert agents.development_requests[0]["repair_scope"] == "run_repair"
     assert agents.development_requests[0]["repair_source"] == "acceptance"
     assert agents.development_requests[0]["acceptance_artifact"] == _repair_artifact()
+    assert agents.development_requests[0]["review_budget_context"] == {
+        "completed_review_attempts": 1,
+        "remaining_review_attempts": 10,
+    }
     assert len(agents.review_requests) == 2
+    assert agents.review_requests[0]["review_budget_context"] == {
+        "current_review_attempt": 1,
+        "remaining_review_attempts": 10,
+    }
     candidate_request = agents.review_requests[1]
+    assert candidate_request["review_budget_context"] == {
+        "current_review_attempt": 2,
+        "remaining_review_attempts": 9,
+    }
     assert candidate_request["candidate_acceptance"] is True
     assert candidate_request["repair_scope"] == "run_repair"
     assert candidate_request["previous_acceptance_artifact"] == _repair_artifact()

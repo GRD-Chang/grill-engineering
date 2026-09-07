@@ -368,16 +368,12 @@ def test_development_prompt_keeps_git_authority_local_to_the_role(
         name="development-authority",
     )
 
-    assert "当前 checkout 是受管开发工作区" in prompt
-    assert "Git 历史只向前推进" in prompt
-    assert "只修改当前 checkout 的文件树" in prompt
-    assert "如果先前 Candidate 中有文件改错" in prompt
-    assert "不要回退、替换或修改旧 commit" in prompt
-    assert "`git log`、`git show`、`git diff` 等只读操作" in prompt
-    assert "最终 diff 可以比上一轮更小" in prompt
-    assert "当前 checkout 中保留的完整结果是新 Candidate Commit 的唯一内容来源" in prompt
-    assert "你只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入" in prompt
-    assert "不得执行暂存、commit、`commit --amend`、`reset`、`rebase`" in prompt
+    assert "当前 checkout 最终保留的交付修改" in prompt
+    assert "包括应交付的未跟踪文件" in prompt
+    assert "会整体成为本轮 Candidate Commit 的内容" in prompt
+    assert "可以用只读 Git 命令理解历史" in prompt
+    assert "只整理当前工作树，不暂存、commit、改写 Git 历史或写入远端" in prompt
+    assert "修正先前改动时直接形成当前正确文件树" in prompt
     assert "Controller" not in prompt
     assert "Publisher" not in prompt
     assert "后续 Git/GitHub 交付" not in prompt
@@ -413,13 +409,14 @@ def test_repair_prompt_preserves_raw_evidence_without_controller_triage(
     )
 
     assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
-    assert "`findings` 是本轮必须处理的问题" in prompt
+    assert "`findings` 是本轮必须处理的问题证据" in prompt
     assert "Deferred to #N：…" in prompt
     assert "Non-blocking observation：…" in prompt
     assert "不是自动修改指令" in prompt
-    assert "逐项解决当前 Review Boundary 内的每个 Finding" in prompt
-    assert "按每条 Finding 自带的 `复验` 要求执行验证并取得充分、可复核的证据" in prompt
-    assert "不能以一次笼统的风险验证替代逐项复验" in prompt
+    assert "不限定实现方案，也不表示问题只存在于列出的示例" in prompt
+    assert "结合当前代码理解根因" in prompt
+    assert "同一决策点直接影响的场景" in prompt
+    assert "本次修复可能造成的直接回归" in prompt
 
 
 def test_git_integrity_prompt_preserves_only_raw_integrity_evidence(
@@ -521,10 +518,11 @@ def test_development_prompt_uses_risk_proportional_verification_and_stops_at_com
         name="risk-proportional-development",
     )
 
-    assert "最小充分改动" in prompt
-    assert "不增加无关行为、状态、依赖、配置、公开入口或抽象层" in prompt
-    assert "不要为未来需求、其他 Ticket、假想调用方" in prompt
-    assert "根据实际改动风险自主选择最低充分验证" in prompt
+    assert "最小且可维护的方案" in prompt
+    assert "验收示例不是完整问题空间" in prompt
+    assert "涉及共享决策点时" in prompt
+    assert "当前需求直接影响的同族场景" in prompt
+    assert "根据实际风险取得最低充分证据" in prompt
     assert "完整测试套件不是每轮默认的固定门槛" in prompt
     assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt
     assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt
@@ -750,15 +748,62 @@ def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestra
     assert "完整测试失败时提供具体失败证据和复验要求" in prompt
     assert "没有 Previous Acceptance Context 时，对完整 Review Boundary 建立基线" in prompt
     assert "Standards 与 Spec 默认使用静态证据" in prompt
+    assert "必须调用 `skill:code-review`" in prompt
+    assert "你对三个维度的最终判断负责" in prompt
+    assert "不要求每个维度对应一个独立 subagent" in prompt
+    assert 'fork_turns: "none"' in prompt
     assert "Deferred to #N：…" in prompt
     assert "Non-blocking observation：…" in prompt
-    assert "一次报告当前 Review Boundary 内已经能够证明的全部必须修复 Finding" in prompt
+    assert "保持现状会使当前验收对象不可接受" in prompt
+    assert "同一根因的多个表现应合并报告" in prompt
+    assert "没有实际后续价值的轻微问题直接省略" in prompt
     assert "问题：…；证据：…；必须修复：…；复验：…" in prompt
-    assert "确保 E2E、Standards 和 Spec 三种独立视角均形成可复核结论" in prompt
-    assert "避免重复派发同类 Reviewer、嵌套相同 Review" in prompt
-    assert "不规定固定 subagent 数量" not in prompt
     assert "必须派发三个不同 subagent" not in prompt
+    assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in prompt
     assert "任一 fail 将回到 Development" not in prompt
+
+
+def test_review_and_directed_repair_prompts_receive_bounded_budget_context(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    review = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
+        {
+            "acceptance_scope": "ticket",
+            "review_budget_context": {
+                "current_review_attempt": 2,
+                "remaining_review_attempts": 1,
+            },
+        },
+        name="review-budget-context",
+    )
+    repair = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "repair_source": "acceptance",
+            "acceptance_artifact": {"finding": "CURRENT_FINDING"},
+            "review_budget_context": {
+                "completed_review_attempts": 2,
+                "remaining_review_attempts": 1,
+            },
+        },
+        name="repair-budget-context",
+    )
+
+    assert "这是当前对象的第 2 次独立验收" in review
+    assert "本轮之后还剩 1 次自动验收机会" in review
+    assert "已经完成 2 次独立验收" in repair
+    assert "当前还剩 1 次自动验收机会" in repair
+    for prompt in (review, repair):
+        assert "不改变验收标准" in prompt
+        assert "不得隐瞒、降级或放行必须修复的问题" in prompt
+        assert "Review Budget Window" not in prompt
+        assert "checkpoint" not in prompt
 
 
 def test_run_repair_review_prompt_describes_the_merge_preview_boundary(
@@ -1192,7 +1237,6 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
-                assert "当前 checkout 是受管开发工作区" in prompt
                 assert "完整测试套件不是每轮默认的固定门槛" in prompt, active_case
                 assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt, active_case
                 assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt, active_case
@@ -1200,9 +1244,9 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "完整套件失败后，先定向诊断、修复并验证受影响路径" in prompt, active_case
                 assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt, active_case
                 assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
-                assert "Git 历史只向前推进" in prompt
-                assert "当前 checkout 中保留的完整结果是新 Candidate Commit 的唯一内容来源" in prompt
-                assert "你只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入" in prompt
+                assert "当前 checkout 最终保留的交付修改" in prompt
+                assert "会整体成为本轮 Candidate Commit 的内容" in prompt
+                assert "只整理当前工作树" in prompt
                 if role_request.get("repair_scope") == "run_repair":
                     assert "Run Repair 的完整 Parent、最终 Ticket Set" in prompt, active_case
             else:
@@ -1214,11 +1258,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             if method == "develop":
                 assert "在当前 checkout 中检查全部未提交内容" in prompt, active_case
                 assert "仅长期、可再生且不应版本控制的项目产物" in prompt, active_case
-                assert (
-                    "不得执行暂存、commit、`commit --amend`、`reset`、`rebase`、`revert`、"
-                    "`cherry-pick`"
-                    in prompt
-                ), active_case
+                assert "不暂存、commit、改写 Git 历史或写入远端" in prompt, active_case
             elif method == "review":
                 assert "E2E、Standards 和 Spec 三种独立视角" in prompt, active_case
                 assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in prompt, active_case
