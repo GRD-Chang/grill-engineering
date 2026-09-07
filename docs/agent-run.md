@@ -5,7 +5,7 @@
 - 从 Parent Issue 启动或恢复 Delivery Run；
 - 按 GitHub 原生依赖图确定性选择且始终只运行一个 Active Ticket Job；
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
-- 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
+- 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；同一 Reviewer 因 `execution_failed` 或 Human Blocker 继续当前对象时复用原 Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
 - `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，发起终端退出或 Ctrl-C 只离开观察；
 - Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。不存在同时生效的当前 Work Subject 的 Run-wide Operator Gate 时，维护者显式执行同一 Parent 的 `run <parent-issue>` 或 `resume <parent-issue>` 开始新的等待窗口，不需要另启 watcher；若仍有人工作业、批准或发布门禁，则必须先执行该门禁要求的专用动作；
@@ -155,9 +155,11 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 Acceptance Artifact。
 Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
-同一 Thread、只读 checkout 中最多修复两次，且不增加领域 attempt；进程失败不会自动重试或替换
-Thread。`resume` 默认复用已保存 Thread，`--new-thread` 只替换 Invocation/Thread，不替换 Semantic
-Attempt，并使用标准阶段 Prompt 新开 Thread。`--message` 只允许用于当前 Human Blocker；它 trim
+同一 Thread、只读 checkout 中使用角色化短格式 Prompt 最多修复两次，且不增加领域 attempt；进程失败
+不会自动重试或替换 Thread。`resume` 默认复用已保存 Thread，并使用当前 Development、Repair、Reviewer
+或 Publication 角色的短 Prompt，只补充完成本轮仍然需要的动态证据；`--new-thread` 只替换
+Invocation/Thread，不替换 Semantic Attempt，并使用当前角色和任务模式的完整标准 Prompt 新开 Thread。
+模型 Prompt 不说明 Thread、Resume、`execution_failed`、预算或后继流程。`--message` 只允许用于当前 Human Blocker；它 trim
 后必须非空、最多 8 KiB，以不可变 Human Response 绑定当前 Job Generation，并进入后续 Development
 和 Fresh Acceptance 的权威上下文。当前 Generation 的响应按顺序保存、不按容量截断；替换
 Generation 从空响应序列开始，绝不向新 Generation 注入旧响应。它不修改 Issue、不触发 Requeue、
@@ -208,7 +210,7 @@ Control 文件不存在也不能证明没有 Executor。
 
 三者按失败层级分开，不可替换：
 
-- **Output Repair**：同一个 Invocation 的 Codex 进程零退出、Thread 身份正确，但最终结构化输出不符合完整阶段 contract 时自动执行。它最多追加两次同 Thread、只读的输出请求；不创建新的 Invocation，也不增加领域 attempt。
+- **Output Repair**：同一个 Invocation 的 Codex 进程零退出、Thread 身份正确，但最终结构化输出不符合完整阶段 contract 时自动执行。它最多追加两次同 Thread、只读、按 Development/Reviewer/Publication 角色区分的短格式修复请求；只要求重发合法输出，不重新执行语义工作，不创建新的 Invocation，也不增加领域 attempt。
 - **Resume**：进程、凭据、sandbox、timeout、signal、非零退出、缺少最终输出或 Thread mismatch 导致 `execution_failed`，或 Agent 成功给出 Human Blocker 时，由维护者显式在当前 Semantic Attempt 内启动 successor Invocation。
 - **Requeue**：Currentness Boundary 已经 stale 时替换整个 Job Generation。它不是失败进程的 retry；Ticket 与 Parent-only Change Job 只有在 `requeue_required` 才能执行，Run Acceptance 与 Final Run Publication 的漂移则回到 fresh Run Acceptance。
 
@@ -286,7 +288,7 @@ generation、payload digest 等稳定机器审计事实只在显式 `--json` 输
 最终 Ticket 集合和依赖，
 检查准备好的累计 diff，并形成实际 E2E、Standards、Spec 三条独立验证 lane。E2E 默认负责代码
 稳定后的广泛运行验证，Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令；
-`skill:code-review` 是可使用的推荐 SOP，且不得由父 Reviewer 替代缺失 lane。Run Reviewer 不得修改 Validation Checkout；
+`skill:code-review` 是 Standards/Spec 审查使用的固定 SOP，且不得由父 Reviewer 替代缺失 lane。Run Reviewer 不得修改 Validation Checkout；
 需要写入的构建、测试与验证中间产物必须放在 checkout 外可定位、仅服务本轮且结束前清理的临时路径。
 Reviewer 不得修复源码、测试、配置或 `.gitignore`。Ticket Completion
 Revision 按 Ticket number 数值排序，且只绑定已集成 SHA、冻结 Effective Revision 与已验收
@@ -300,13 +302,15 @@ Required Checks、Published-Head Gate 与实际合入；Controller 只在 Candid
 default head、Parent/Graph revision 和 Ticket Completion records 全部精确匹配时提升该结论。若仅 default head
 前进，Controller 在原 Repair Cycle 重新预演并验收最新组合；其余权威边界失配才废弃 Candidate，并进入新的
 Run Acceptance Generation。
-仅当 Run Reviewer 报告 Human Blocker 后执行 `resume` 时，Controller 复用刚刚被阻塞的
-Reviewer Thread，但仍创建新的 Validation Checkout，并要求它重新读取权威状态和重新验收。
+同一 Run Reviewer 因 `execution_failed` 或 Human Blocker 继续当前对象时，Controller 复用对应
+Reviewer Thread，但仍创建新的 Validation Checkout，并以角色化短 Prompt 提供准确验收对象、适用的
+当前失败或 blocker 证据以及维护者最新回复。
 无代码变化不消耗预算，配置的 `N` 次仍不能通过或确实需要人工决定时才进入 `ready_for_human`。
 通过只进入 `run_publication_pending`，不会创建最终 PR 或合并默认分支。`run` 随后推进
 正常 Run Publication Attempt：由新的、只读的 Run Publication Codex 根据
-Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；仅 Human Blocker resume
-复用刚刚被阻塞的 Run Publication Thread，并要求它重新读取权威状态。Publisher 维护同一个
+Parent Issue、累计 diff 与 Fresh Run Acceptance 生成最终 PR 叙事；同一 Publication Agent 因
+`execution_failed` 或 Human Blocker 继续当前对象时复用对应 Run Publication Thread，并只补充当前必要
+发布证据、blocker 与维护者最新回复。Publisher 维护同一个
 Run Branch → 默认分支的最终 PR，并渲染 Parent Issue、Delivery Type 及每张已完成 Ticket 的链接；它将
 Parent/Graph revision、Run/default/PR head 与预期 merge tree 写入独立 Publication Record。
 Publication Agent 返回合法叙事时 Semantic Attempt 即完成；之后 GitHub 写入、读取与对账失败只增加
@@ -395,13 +399,19 @@ Codex 可以返回 Development Summary、Publication Artifact 或 Acceptance Art
 普通测试使用 fake broker、fake `gh` 和本地 bubblewrap，不调用真实 Codex。真实 Codex command-tool
 compatibility acceptance 只允许显式 opt-in，不进入普通 pytest、每轮 Development 或常规 CI。
 
-Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证，并根据实际
-改动风险选择 self-preflight、定向 Reviewer 或 `skill:code-review`。低风险局部改动不固定
-支付完整开发侧预审成本；大型、跨模块或高风险改动仍应取得足够审查。Fresh Acceptance
+Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证；当前角色 Prompt 的
+风险相称验证、预检与只修改工作树边界优先于该通用 skill 的完整测试、Review 或 commit 建议。Development
+先自行检查当前完整工作树、已知风险与未处理问题。低风险局部改动可以直接收口；独立风险预检能增加价值时，Prompt
+规定默认最多一个 Development Preflight Round，一轮可按风险派发多个审查型 subagent。审查型
+subagent 使用 `fork_turns: "none"`，由 Development 自行提供必要的中立任务事实、当前范围和真实证据；
+探索、调研与并行实现等其他 subagent 是否继承上下文仍由 Development 判断。内部审查遵循
+`skill:code-review` 的 Standards/Spec 方法并覆盖未提交和未跟踪交付内容；Development 汇总 findings、
+修复并自行复验后收口，不常规启动下一轮。已有 Acceptance、Required Checks、Git Integrity、人工修订
+或合并冲突等权威 Repair Evidence 时不启动内部 Reviewer。Fresh Acceptance
 不接收 Development Summary 或开发侧验证结论，在独立只读 Validation Checkout 中形成
-E2E、Standards 和 Spec 三条独立验收 lane；`skill:code-review` 是 Standards/Spec 可使用的
-推荐 SOP。需要写入的验证中间产物必须放在 checkout 外可定位、只服务本轮并在结束前清理
-的临时路径。Prompt 不规定固定 subagent 数量、精确调用次数、调用顺序或嵌套层级。
+E2E、Standards 和 Spec 三条独立验收 lane；`skill:code-review` 是 Standards/Spec 审查使用的
+固定 SOP。需要写入的验证中间产物必须放在 checkout 外可定位、只服务本轮并在结束前清理
+的临时路径。Prompt 不固定预检任务包字段、subagent 数量、检查命令、调用顺序或嵌套层级。
 Controller 不解析 Codex 内部事件流来审计 subagent 身份或 skill 调用；它信任上述
 Prompt 合同，并确定性校验 Fresh 父 Reviewer 不复用 Development/旧 Reviewer Thread、
 三个 lane 均有合法状态和证据，以及外层 SHA/Revision 绑定。
