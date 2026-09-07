@@ -241,9 +241,18 @@ Preflight Round。一轮可以包含多个不同风险方向的审查型 subagen
 
 ## Repair Prompt
 
-Repair 复用对应 Development 角色与共享完成 block，只在中间注入一个来源 block。它不接收 Initial
-Development 自检与预检 block，也不需要知道本次修改属于哪个预算额度。所有 Repair source 共用以下
-收口原则：
+Repair 复用对应 Development 角色、需求边界与共享完成 block，只在中间注入一个来源 block。
+它始终接收当前对象的 Issue URL，但不复用 Initial Development 的固定重读要求：
+
+```text
+当前 Issue URL 用于确认本轮修复对象和需求边界。以本轮原始 Repair Evidence、当前 checkout 和
+已经掌握的当前需求为主要输入；如果无法据此判断修复范围、证据与当前需求存在冲突，或需要
+核对具体 Acceptance Criteria，再通过只读 `gh issue view` 回查对应 Issue。不要仅因开始本轮修复而
+重复读取没有变化的需求。
+```
+
+Repair 不接收 Initial Development 自检与预检 block，也不需要知道本次修改属于哪个预算额度。
+所有 Repair source 共用以下收口原则：
 
 ```text
 本轮以随后提供的原始 Repair Evidence 为权威修复入口。处理问题及避免直接回归所需的影响后，自行

@@ -608,6 +608,81 @@ def test_directed_repair_self_checks_without_internal_reviewer(
     assert "取得有效复查" not in prompt
 
 
+@pytest.mark.parametrize(
+    ("acceptance_scope", "request_urls", "required_urls"),
+    [
+        (
+            "ticket",
+            {
+                "parent_issue_url": "DIRECTED_REPAIR_PARENT_URL",
+                "task_issue_url": "DIRECTED_REPAIR_TICKET_URL",
+            },
+            ("DIRECTED_REPAIR_PARENT_URL", "DIRECTED_REPAIR_TICKET_URL"),
+        ),
+        (
+            "parent_only",
+            {"parent_issue_url": "DIRECTED_REPAIR_PARENT_ONLY_URL"},
+            ("DIRECTED_REPAIR_PARENT_ONLY_URL",),
+        ),
+        (
+            "run",
+            {"parent_issue_url": "DIRECTED_REPAIR_RUN_PARENT_URL"},
+            ("DIRECTED_REPAIR_RUN_PARENT_URL",),
+        ),
+    ],
+)
+def test_directed_repair_keeps_issue_urls_without_mandatory_reread(
+    tmp_path: Path,
+    monkeypatch: Any,
+    acceptance_scope: str,
+    request_urls: dict[str, str],
+    required_urls: tuple[str, ...],
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": acceptance_scope,
+            **request_urls,
+            "repair_source": "required_checks",
+            "ci_evidence": {"check": "DIRECTED_REPAIR_CI_EVIDENCE"},
+        },
+        name=f"directed-repair-issue-context-{acceptance_scope}",
+    )
+
+    for url in required_urls:
+        assert url in prompt
+    assert "当前 Issue URL 用于确认本轮修复对象和需求边界" in prompt
+    assert "以本轮原始 Repair Evidence、当前 checkout" in prompt
+    assert "再通过只读 `gh issue view` 回查对应 Issue" in prompt
+    assert "不要仅因开始本轮修复而重复读取没有变化的需求" in prompt
+    assert "开始前必须通过只读 `gh issue view`" not in prompt
+    assert "开始前也必须通过只读 `gh issue view`" not in prompt
+
+
+def test_initial_development_still_requires_reading_issue_contracts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "parent_issue_url": "INITIAL_PARENT_URL",
+            "task_issue_url": "INITIAL_TICKET_URL",
+        },
+        name="initial-development-issue-reading",
+    )
+
+    assert "INITIAL_PARENT_URL" in prompt
+    assert "INITIAL_TICKET_URL" in prompt
+    assert "开始前必须通过只读 `gh issue view`" in prompt
+    assert "开始前也必须通过只读 `gh issue view`" in prompt
+    assert "当前 Issue URL 用于确认本轮修复对象和需求边界" not in prompt
+
+
 def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
