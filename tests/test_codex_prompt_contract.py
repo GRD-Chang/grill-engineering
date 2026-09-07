@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agent_run.codex import CodexCliBackend, CodexProcessError
+from agent_run.delivery_loop import TicketDeliveryAdapter
 
 
 PUBLICATION_BLOCKER_SHAPE = (
@@ -351,7 +353,7 @@ def test_non_publication_prompt_keeps_exact_human_blocker_result(
     assert PUBLICATION_BLOCKER_SHAPE not in development
 
 
-def test_development_prompt_assigns_candidate_and_publication_authority(
+def test_development_prompt_keeps_git_authority_local_to_the_role(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     prompt = _capture_public_prompt(
@@ -366,17 +368,19 @@ def test_development_prompt_assigns_candidate_and_publication_authority(
         name="development-authority",
     )
 
-    assert "当前 checkout 是程序管理的受管开发工作区" in prompt
+    assert "当前 checkout 是受管开发工作区" in prompt
     assert "Git 历史只向前推进" in prompt
     assert "只修改当前 checkout 的文件树" in prompt
     assert "如果先前 Candidate 中有文件改错" in prompt
     assert "不要回退、替换或修改旧 commit" in prompt
     assert "`git log`、`git show`、`git diff` 等只读操作" in prompt
     assert "最终 diff 可以比上一轮更小" in prompt
-    assert "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit" in prompt
-    assert "执行后续 Git/GitHub 交付" in prompt
-    assert "你只整理 checkout，不执行这些写入" in prompt
+    assert "当前 checkout 中保留的完整结果是新 Candidate Commit 的唯一内容来源" in prompt
+    assert "你只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入" in prompt
     assert "不得执行暂存、commit、`commit --amend`、`reset`、`rebase`" in prompt
+    assert "Controller" not in prompt
+    assert "Publisher" not in prompt
+    assert "后续 Git/GitHub 交付" not in prompt
 
 
 def test_repair_prompt_preserves_raw_evidence_without_controller_triage(
@@ -602,6 +606,51 @@ def test_directed_repair_self_checks_without_internal_reviewer(
     assert "Development Preflight Round" not in prompt
     assert "审查型 subagent" not in prompt
     assert "取得有效复查" not in prompt
+
+
+def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    adapter = TicketDeliveryAdapter(
+        git=SimpleNamespace(checkout_head=lambda _checkout: "HEAD_SHA"),
+        github=SimpleNamespace(),
+    )
+    state = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1},
+        "ticket_graph": {"tickets": {"3": {"number": 3}}},
+    }
+    shared_job = {
+        "ticket_number": 3,
+        "effective_revision": "revision-1",
+        "base_sha": "BASE_SHA",
+        "repair_source": "required_checks",
+        "ci_evidence": {"check": "EXACT_HEAD_CI_EVIDENCE"},
+    }
+    prompts: list[str] = []
+
+    for attempt_kind in ("ordinary", "final_ci_fix"):
+        request = adapter.development_request(
+            state,
+            {**shared_job, "next_attempt_kind": attempt_kind},
+            tmp_path,
+        )
+        assert "next_attempt_kind" not in request
+        prompts.append(
+            _capture_public_prompt(
+                tmp_path,
+                monkeypatch,
+                "develop",
+                request,
+                name=f"required-checks-{attempt_kind}",
+            )
+        )
+
+    assert prompts[0] == prompts[1]
+    assert "Required-Checks Repair" in prompts[0]
+    assert "EXACT_HEAD_CI_EVIDENCE" in prompts[0]
+    assert "本轮不需要启动开发侧 Reviewer" in prompts[0]
 
 
 def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestration(
@@ -1068,7 +1117,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
-                assert "当前 checkout 是程序管理的受管开发工作区" in prompt
+                assert "当前 checkout 是受管开发工作区" in prompt
                 assert "完整测试套件不是每轮默认的固定门槛" in prompt, active_case
                 assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt, active_case
                 assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt, active_case
@@ -1077,14 +1126,14 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt, active_case
                 assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
                 assert "Git 历史只向前推进" in prompt
-                assert "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit" in prompt
-                assert "你只整理 checkout，不执行这些写入" in prompt
+                assert "当前 checkout 中保留的完整结果是新 Candidate Commit 的唯一内容来源" in prompt
+                assert "你只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入" in prompt
                 if role_request.get("repair_scope") == "run_repair":
                     assert "Run Repair 的完整 Parent、最终 Ticket Set" in prompt, active_case
             else:
-                assert "Controller" not in prompt, active_case
-                assert "Publisher" not in prompt, active_case
                 assert "受管开发工作区" not in prompt, active_case
+            assert "Controller" not in prompt, active_case
+            assert "Publisher" not in prompt, active_case
             assert "动态 Context 中的 URL 不是需求摘要" in prompt, active_case
             assert "Acceptance Criteria" in prompt, active_case
             if method == "develop":

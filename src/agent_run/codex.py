@@ -407,7 +407,7 @@ class CodexCliBackend:
             artifact_input = (
                 "Fallback Publication Context:\n"
                 + _pretty(fallback_context)
-                + "\n\n这是 Controller 从已验证发布凭据投影的最小叙事事实。"
+                + "\n\n这是从已验证发布凭据投影的最小叙事事实。"
                 "它不证明三个验收 lane 通过，不得把它写成 Acceptance Record、Review pass 或 CI pass；"
                 "Publication 只负责生成叙事，不重新验收代码。"
             )
@@ -524,11 +524,6 @@ class CodexCliBackend:
                 notify("failed", attempt_count=attempt - 1, error=str(stale))
                 raise stale
             notify("output_step", output_attempt=attempt, validation_error=validation_error)
-            attempt_prompt = prompt
-            if attempt > 1:
-                attempt_prompt = _structured_output_repair_prompt(
-                    output_name, validation_error[:2000]
-                )
             remaining = deadline_at - time.monotonic()
             if remaining <= 0:
                 deadline_error = CodexProcessError(
@@ -542,6 +537,11 @@ class CodexCliBackend:
                     signal=None,
                 )
                 raise deadline_error
+            attempt_prompt = prompt
+            if attempt > 1:
+                attempt_prompt = _structured_output_repair_prompt(
+                    output_name, validation_error[:2000]
+                )
             try:
                 execution_binding = request.get("_execution_binding")
                 model = None
@@ -1492,12 +1492,14 @@ def _structured_output_repair_prompt(output_name: str, contract_error: str) -> s
             f"Contract error：{contract_error}\n\n"
             "只输出修正后的 JSON；不重新执行审查、验证或工具调用。"
         )
-    return (
-        "你已完成当前发布叙事。本轮唯一任务是根据已经形成的发布事实，重新输出满足 contract 的 "
-        "Publication wire JSON。\n\n"
-        f"Contract error：{contract_error}\n\n"
-        "只输出修正后的 JSON；不重新读取项目、改写交付事实或调用工具。"
-    )
+    if output_name == "Publication Artifact":
+        return (
+            "你已完成当前发布叙事。本轮唯一任务是根据已经形成的发布事实，重新输出满足 contract 的 "
+            "Publication wire JSON。\n\n"
+            f"Contract error：{contract_error}\n\n"
+            "只输出修正后的 JSON；不重新读取项目、改写交付事实或调用工具。"
+        )
+    raise ValueError(f"unknown structured output role: {output_name}")
 
 
 def _review_identity_block(request: dict[str, Any]) -> str:
@@ -1699,7 +1701,7 @@ def _repair_contract(repair_source: object) -> str:
         return (
             "Git Integrity Evidence 是未经改写的修复依据。恢复当前受管 checkout 的合法 Git 边界，"
             "只处理证据及其直接影响；不要执行 commit、reset、rebase、merge、push 或其他 Git 历史写入。"
-            "程序会在你返回后重新执行完整性检查并创建新的 Candidate。"
+            "当前职责只整理文件树为合法、完整、可交付的 Candidate，不自行创建 Candidate Commit。"
         )
     if repair_source == "required_checks":
         return (
@@ -1734,7 +1736,7 @@ def _development_closeout_instruction(repair_source: object) -> str:
         return (
             "本轮以提供的原始 Repair Evidence 为权威修复入口。处理问题及避免直接回归所需的"
             "影响后，自行检查当前工作树并完成与风险相称的验证，然后返回 Development wire "
-            "JSON。正式结论由后续独立验收或确定性门禁形成，本轮不需要启动开发侧 Reviewer。"
+            "JSON。本轮只负责修复，不形成独立验收或确定性门禁结论。本轮不需要启动开发侧 Reviewer。"
         )
     return (
         "完成实现和受影响路径验证后，先自行检查当前完整工作树、已知风险与未处理问题。根据实际"
@@ -1774,15 +1776,15 @@ def _development_contract(
         "复用增加通用框架、配置、回调、状态、Adapter 或公开 Interface。代码稳定并确认每处改动"
         "服务当前范围后，删除不需要的代码、状态、分支、配置和依赖；达到完成条件后停止扩展。"
         + "\n\n"
-        + "当前 checkout 是程序管理的受管开发工作区。程序会用新的 Candidate Commit 记录每次 "
-        "Development 或 Repair 的结果，Git 历史只向前推进。你可以使用 `git log`、`git show`、"
+        + "当前 checkout 是受管开发工作区。每次 Development 或 Repair 的结果以新的 Candidate "
+        "Commit 记录，Git 历史只向前推进。你可以使用 `git log`、`git show`、"
         "`git diff` 等只读操作检查历史和旧版本，但只修改当前 checkout 的文件树。如果先前 "
         "Candidate 中有文件改错，直接在当前 checkout 删除、恢复或重写相关内容，并将修正保留为"
         "未提交变更；不要回退、替换或修改旧 commit。不得执行暂存、commit、`commit --amend`、"
         "`reset`、`rebase`、`revert`、`cherry-pick`、切换到旧 commit 或其他 branch、merge、push，"
-        "以及其他会移动、创建或改写 Git 历史的操作。Agent 返回后，程序会通过 Controller/Publisher "
-        "根据当前 checkout 中保留的完整结果创建新的不可变 Candidate Commit，并执行后续 Git/GitHub "
-        "交付；你只整理 checkout，不执行这些写入。因此，新的 Candidate 可以撤销、删除或重写先前 "
+        "以及其他会移动、创建或改写 Git 历史的操作。当前 checkout 中保留的完整结果是新 Candidate "
+        "Commit 的唯一内容来源；你只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入。"
+        "因此，新的 Candidate 可以撤销、删除或重写先前 "
         "Candidate 引入的内容，最终 diff 可以比上一轮更小。"
         + "\n\n"
         + _human_blocker_instruction()

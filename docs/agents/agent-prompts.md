@@ -213,8 +213,8 @@ Repair diff 只是修改入口；修复必须在完整 Run 中解决原问题并
 - checkout 中只保留适合作为本轮 Candidate 的交付内容；
 - 没有你已经知道但仍未处理的当前范围 blocker。
 
-你只负责当前工作树。程序会在你返回后创建 Candidate 并执行适用的后续门禁；你不负责发布、合并
-或宣布验收通过。
+你只负责当前工作树，只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入，也不负责
+发布、合并或宣布验收通过。
 
 最后只输出 Development wire JSON。summary 简要说明实际改动、实际执行的验证和已知限制；不输出
 验收结论，也不为每个 Finding 维护 closure 状态。
@@ -235,8 +235,8 @@ Preflight Round。一轮可以包含多个不同风险方向的审查型 subagen
 
 内部审查遵循 skill:code-review 的 Standards/Spec 方法，并覆盖当前未提交工作树及未跟踪的交付内容；
 具体检查命令和风险拆分由你决定。汇总本轮 findings，修复有证据支持的问题并自行重跑受影响验证，
-本轮内部预检至此结束，不常规启动第二轮内部 Reviewer。然后以 Development wire JSON 收口；后续
-独立 Reviewer 负责正式验收。
+本轮内部预检至此结束，不常规启动第二轮内部 Reviewer。然后以 Development wire JSON 收口；内部
+预检不形成 Acceptance Artifact，也不宣布独立验收通过。
 ```
 
 ## Repair Prompt
@@ -247,8 +247,8 @@ Development 自检与预检 block，也不需要知道本次修改属于哪个�
 
 ```text
 本轮以随后提供的原始 Repair Evidence 为权威修复入口。处理问题及避免直接回归所需的影响后，自行
-检查当前工作树并完成与风险相称的验证，然后返回 Development wire JSON。正式结论由后续独立验收或
-确定性门禁形成，本轮不需要启动开发侧 Reviewer。
+检查当前工作树并完成与风险相称的验证，然后返回 Development wire JSON。本轮只负责修复，不形成
+独立验收或确定性门禁结论。本轮不需要启动开发侧 Reviewer。
 ```
 
 ### Acceptance-sourced Repair
@@ -265,8 +265,8 @@ Acceptance Artifact（verbatim JSON）:
 提供问题和证据，不规定实现方案；选择最小且可维护的修复方式，并处理避免直接回归所必需的影响。
 
 完成修复后，重新执行受影响路径所需的验证并留下新的可验收 Candidate。Development Summary 只需
-说明实际改动、实际验证和已知限制，不输出 Finding closed/open/partial 状态或逐项对照表；下一位
-Reviewer 根据新 Candidate 独立形成结论。
+说明实际改动、实际验证和已知限制，不输出 Finding closed/open/partial 状态或逐项对照表，也不形成
+验收结论。
 ```
 
 ### Git Integrity Repair
@@ -282,7 +282,7 @@ Git Integrity Evidence（verbatim）:
 {git_integrity_evidence}
 
 根据原始证据整理当前文件树，使其重新成为一个合法、完整、可交付的 Candidate。处理该完整性问题
-及其直接影响，并遵守共享 Git 边界；程序会在你返回后重新执行完整性检查并创建新 Candidate。
+及其直接影响，并遵守共享 Git 边界；当前职责不自行创建 Candidate Commit。
 
 最后只输出 Development wire JSON，summary 说明实际调整和检查结果。
 ```
