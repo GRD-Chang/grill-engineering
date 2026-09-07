@@ -13,6 +13,49 @@ from conftest import seed_run, write_fixture
 from test_cli import run_cli, stdout_json
 
 
+def test_empty_checkout_without_origin_does_not_list_another_repository(
+    git_repo: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    assert seed_run(git_repo, fixture).returncode == 0
+    empty = tmp_path / "empty-checkout"
+    subprocess.run(["git", "init", "-b", "main", str(empty)], check=True, capture_output=True)
+    before = _snapshot(git_repo / ".agent-run", RunLocatorIndex.default().path.parent)
+    monkeypatch.chdir(empty)
+
+    assert main(["runs", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["runs"] == []
+    assert _snapshot(git_repo / ".agent-run", RunLocatorIndex.default().path.parent) == before
+
+
+@pytest.mark.parametrize("explicit_directory", [False, True])
+def test_readable_legacy_state_with_unknown_parent_requires_disambiguation(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], explicit_directory: bool,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    target = stdout_json(seed_run(git_repo, fixture))["run_id"]
+    state_dir = git_repo / ".agent-run"
+    target_state = json.loads((state_dir / "runs" / f"{target}.json").read_text())
+    legacy = {
+        "run_id": "legacy-unknown-parent", "repository": "example/project",
+        "schema_version": 1, "checkout_identity": target_state["checkout_identity"],
+    }
+    (state_dir / "runs" / "legacy-unknown-parent.json").write_text(json.dumps(legacy))
+    before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
+    monkeypatch.chdir(git_repo)
+    directory = ["--state-dir", str(state_dir)] if explicit_directory else []
+
+    for command in ("status", "history"):
+        assert main([command, "--parent", "1", *directory, "--json"]) == 2
+        output = json.loads(capsys.readouterr().out)
+        assert output["diagnostics"][0]["code"] == "run_locator_stale"
+        assert main([command, target, *directory, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["run_id"] == target
+    assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
+
+
 def test_repository_parent_queries_ignore_a_deleted_unrelated_checkout(
     git_repo: Path, tmp_path: Path
 ) -> None:

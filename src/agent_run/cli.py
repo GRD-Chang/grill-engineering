@@ -3142,6 +3142,14 @@ def _selector_records(
             for record in records
             if record[0].get("repository") in (None, repository)
         ]
+    elif current_root is not None:
+        # With no Repository identity, only this checkout is a known target.
+        # Unreadable identities still need explicit disambiguation.
+        records = [
+            record for record in records
+            if record[0].get("repository_root") == str(current_root.resolve())
+            or record[1] is None
+        ]
     return records
 
 
@@ -3302,6 +3310,8 @@ def _read_locator_entry(
                     error="状态文件中的 Repository/Parent 定位身份格式无效",
                     identity_conflict=True,
                 ), None
+            if repository is None or parent_number is None:
+                state_error = "状态文件缺少 Repository/Parent 定位身份；请使用完整 Run ID 消歧"
         if state is not None and "repository" in entry:
             parent = state.get("parent")
             if (
