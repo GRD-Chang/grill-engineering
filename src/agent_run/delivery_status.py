@@ -28,15 +28,15 @@ def status_progress_view(
         worker if isinstance(worker, dict) else None,
         current_object=current_object,
     )
-    executor_control = audit.get("executor_control")
-    if (
-        current_agent is not None
-        and isinstance(executor_control, dict)
-        and executor_control.get("activity") != "running"
-    ):
-        # Run state is still trusted history, but it cannot prove that the
-        # recorded Agent process remains active without live ownership.
-        current_agent = {**current_agent, "is_active": False}
+    activity = invocation_activity(invocation, audit)
+    if current_agent is not None:
+        current_agent["activity"] = activity
+        if activity != "running":
+            current_agent.update(
+                is_active=False,
+                duration_seconds=_invocation_duration(invocation or {}),
+                remaining_seconds=None,
+            )
     return {
         "repository": state.get("repository"),
         "parent": {
@@ -51,9 +51,41 @@ def status_progress_view(
         "run_repair": _run_repair_progress(audit.get("run_repair")),
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
+        "execution_activity": activity,
         "findings": _current_findings(state),
         "next_action": audit.get("next_action"),
     }
+
+
+def invocation_activity(
+    invocation: dict[str, Any] | None, audit: dict[str, Any]
+) -> str:
+    """Project execution evidence separately from persisted Invocation status."""
+    if not invocation or invocation.get("status") not in {"running", "resuming"}:
+        return "not_running"
+    control = audit.get("executor_control")
+    activity = control.get("activity") if isinstance(control, dict) else "unknown"
+    if activity == "not_running":
+        return "interrupted"
+    if activity != "running":
+        return "unknown"
+    if invocation.get("recovery_waiting") is True:
+        return (
+            "capacity_wait"
+            if invocation.get("recovery_kind") == "capacity"
+            else "recovery_wait"
+        )
+    return "running"
+
+
+def execution_guidance(state: dict[str, Any], activity: str) -> str:
+    if activity == "capacity_wait":
+        return "模型容量不足，等待 30 秒后自动续接；当前 Agent 未在生成，可使用 stop 停止。"
+    if activity == "recovery_wait":
+        return "执行异常，正在自动续接原工作；当前 Agent 未在生成。"
+    if activity == "interrupted":
+        return f"执行已中断，等待恢复；使用 agent-run resume {state.get('run_id')} 继续原工作。"
+    return "运行状态无法确认；请先检查 Executor Host 与 Task Control，再决定是否恢复。"
 
 
 def print_status_progress(
@@ -112,7 +144,10 @@ def print_status_progress(
         isinstance(executor_control, dict)
         and executor_control.get("activity") == "unknown"
     ):
-        print("  Agent 活跃状态: 无法确认")
+        print("  Agent 活跃状态: 无法确认（运行状态无法确认）")
+    activity = view["execution_activity"]
+    if activity == "interrupted":
+        print("  执行已中断，等待恢复")
     agent = view["current_agent"]
     if agent is None:
         print("  当前没有运行中的 Agent")
@@ -121,6 +156,10 @@ def print_status_progress(
         print(f"  {agent_label}: {agent['role']} · {agent['object']}")
         print(f"  模型                  {agent['model']}")
         print(f"  推理强度              {agent['reasoning_effort']}")
+        if agent.get("started_at"):
+            print(f"  开始时间              {agent['started_at']}")
+        if agent["duration_seconds"] is None:
+            print("  实际执行时长未知")
         if agent["duration_seconds"] is not None:
             duration_label = "本轮已运行" if agent["is_active"] else "本轮耗时"
             print(f"  {duration_label:<20}{_duration(agent['duration_seconds'])}")
@@ -134,6 +173,11 @@ def print_status_progress(
             print(f"  {index}. {finding}")
     else:
         print("  无")
+
+    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+        print("\n下一步")
+        print(f"  {execution_guidance(state, activity)}")
+        return
 
     operator_action = audit.get("operator_action")
     if not isinstance(operator_action, dict):
@@ -200,6 +244,7 @@ def _agent_view(
     )
     return {
         "role": _role_label(str(role)),
+        "started_at": started_at,
         "model": source.get("model") or "未绑定",
         "reasoning_effort": source.get("reasoning_effort") or "未绑定",
         "duration_seconds": (
@@ -382,9 +427,8 @@ def _role_label(role: str) -> str:
 def _invocation_duration(invocation: dict[str, Any]) -> int | None:
     start = _parse_optional_timestamp(invocation.get("started_at"))
     end = _parse_optional_timestamp(invocation.get("ended_at"))
-    if start is None:
+    if start is None or end is None:
         return None
-    end = end or datetime.now(UTC)
     return max(0, int((end - start).total_seconds()))
 
 

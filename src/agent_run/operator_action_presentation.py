@@ -97,6 +97,8 @@ def print_operator_action(
         )
     print(f"已保留成果: {_human_preserved_results(action['preserved'])}")
     print("全局暂停: 整个 Delivery Run 已暂停；其他 Ticket 不会推进")
+    if action["type"] == "Review Budget Checkpoint":
+        print("恢复授权: resume 将授权新的预算窗口，继续已有工作。")
     print(
         "唯一下一步: "
         f"{human_next_action(action['next_action'], run_id=run_id)}"
