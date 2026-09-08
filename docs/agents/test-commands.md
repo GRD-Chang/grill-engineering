@@ -19,7 +19,7 @@
 CLI、安装器等未单列的模块直接选择其测试文件。公共接口、共享状态、生命周期、依赖和测试基础设施
 变化应扩大到直接调用方、同族场景及历史回归；无法界定影响范围时运行完整套件。
 
-`make test` 执行完整套件，固定两个 pytest worker；`make typecheck` 执行完整类型检查。
+`make test` 先检查 pip 和 Linux `os.memfd_create` 能力，再执行完整套件，固定两个 pytest worker；`make typecheck` 执行完整类型检查。
 等价的全量命令为 `python -m pytest -q -n 2 --dist worksteal`。
 调试顺序问题用 `make test PYTEST_ARGS='-q -n 0'`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。

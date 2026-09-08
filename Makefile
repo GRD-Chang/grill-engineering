@@ -15,6 +15,7 @@ TESTS_executor = tests/test_cli_run*.py tests/test_run_lifecycle.py tests/test_r
 
 # Complete suite on one runner, with a fixed process limit.
 test:
+	$(PYTHON) -c 'import os, pip, sys; sys.exit(0 if hasattr(os, "memfd_create") else "完整测试需要支持 os.memfd_create 的 Linux Python")'
 	$(PYTHON) -m pytest -n 2 --dist worksteal $(PYTEST_ARGS)
 
 test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor: test-%:
