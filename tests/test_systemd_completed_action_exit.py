@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from copy import deepcopy
 from dataclasses import replace
 from itertools import count
 from pathlib import Path
@@ -11,6 +12,8 @@ import pytest
 
 from agent_run.executor_host import ExecutorSpec, ExecutorStartUnknownError
 from agent_run.cli_presentation import human_next_action_for_state
+from agent_run.git import GitRepository
+from agent_run.review_budget import new_budget
 from agent_run.run_lifecycle import (
     LifecycleRequest,
     RunLifecycle,
@@ -23,9 +26,8 @@ from agent_run.systemd_executor_host import (
     SystemdUserExecutorHost,
 )
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_run_lifecycle import _file_snapshot, _isolated_environment
-from test_ticket_191_resume import _fail_parent_run
 
 
 @pytest.fixture
@@ -35,13 +37,35 @@ def completed_action(
     for name, value in _isolated_environment(tmp_path / "environment").items():
         monkeypatch.setenv(name, value)
     fixture = write_fixture(git_repo / "github.json", issues={})
-    _fail_parent_run(git_repo, fixture)
+    assert seed_run(git_repo, fixture).returncode == 0
     states = StateStore(git_repo / ".agent-run")
     state = states.find_unfinished_runs("example/project", 1)[0]
-    state["status"] = "parent_delivery_pending"
-    state["terminal_kind"] = None
-    state["diagnostics"] = []
+    assert state["status"] == "parent_delivery_pending"
     run_id = state["run_id"]
+    # Host reconciliation observes existing work; no failed Agent invocation is
+    # needed to establish it. Keep a real checkout and nonempty job to protect.
+    state["parent_job"] = {
+        "run_id": run_id,
+        "parent_branch": state["parent_branch"],
+        "base_sha": state["base"]["sha"],
+        "effective_revision": state["parent"]["revision"],
+        "parent_generation": 1,
+        "phase": "developing",
+        "development_thread_id": "parent-development",
+        "development_thread_history": [],
+        "reviewer_thread_ids": [],
+        "modification_attempts": 1,
+        "validation_attempts": 0,
+        "acceptance_artifact": None,
+        "policy_snapshot": deepcopy(state["policy_snapshot"]),
+        "review_budget": {**new_budget(), "development_attempts": 1},
+        "review_budget_history": [],
+    }
+    checkout = states.root / "worktrees" / run_id / "parent"
+    GitRepository(git_repo).prepare_ticket_checkout(
+        branch=state["parent_branch"], base_sha=state["base"]["sha"], checkout=checkout,
+    )
+    (checkout / "partial-work.txt").write_text("preserve the unfinished work\n")
     task = TaskKey(git_repo, "example/project", 1)
     control = TaskControlStore(states.root)
     claim = control.claim_action(task, kind="run", payload={"parent": 1})

@@ -26,7 +26,8 @@ def _git(root: Path, *args: str) -> str:
 @pytest.mark.parametrize("revocation", ["stop", "generation", "none"])
 @pytest.mark.parametrize("operation", ["candidate", "restore", "worktree", "integration"])
 def test_git_successor_write_rechecks_executor_ownership(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, revocation: str
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    operation: str, revocation: str,
 ) -> None:
     # Every Git mutation in this test belongs to a disposable real repository.
     home = tmp_path / "home"
@@ -35,14 +36,8 @@ def test_git_successor_write_rechecks_executor_ownership(
     for variable in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
         monkeypatch.setenv(variable, str(home / variable))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    root = tmp_path / "repository"
-    root.mkdir()
-    _git(root, "init", "-b", "agent-run/test")
-    _git(root, "config", "user.name", "Fence test")
-    _git(root, "config", "user.email", "fence@example.invalid")
-    (root / "tracked").write_text("base\n")
-    _git(root, "add", ".")
-    _git(root, "commit", "-m", "base")
+    root = git_repo
+    _git(root, "branch", "-m", "agent-run/test")
     head = _git(root, "rev-parse", "HEAD")
     default_head = head
     if operation == "integration":
@@ -58,7 +53,7 @@ def test_git_successor_write_rechecks_executor_ownership(
         head = _git(root, "rev-parse", "HEAD")
         _git(root, "merge", "--no-commit", "--no-ff", "default")
     else:
-        (root / "tracked").write_text("candidate\n")
+        (root / "README.md").write_text("candidate\n")
     untracked = root / "untracked"
     untracked.write_text("must survive rejected clean\n")
 
