@@ -44,6 +44,7 @@ from agent_run.worker_sandbox import (
     bubblewrap_command,
     run_worker_process,
     worker_environment,
+    _BoundedJsonlStream,
 )
 from agent_run.worker_credentials import (
     InitialCredentialUnavailable,
@@ -3887,11 +3888,13 @@ def test_sigint_terminates_worker_process_group(
 ) -> None:
     project_root = Path(__file__).parents[1]
     child_path = tmp_path / "child.pid"
+    # Reap the child in its owning shell, including on group termination. A
+    # runner's init/subreaper need not reap orphans before our exit assertion.
     code = f"""
 from pathlib import Path
 from agent_run.worker_sandbox import run_worker_process
 run_worker_process(
-    ["sh", "-c", "sleep 60 & echo $! > child.pid; wait"],
+    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; wait"],
     cwd=Path({str(tmp_path)!r}),
     prompt="",
     environment={{"PATH": "/usr/bin:/bin"}},
@@ -4047,24 +4050,19 @@ def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
     assert not reader_threads
 
 
-def test_absolute_deadline_includes_popen_startup_and_kills_process_group(
+def test_absolute_deadline_includes_popen_startup_and_prevents_worker_start(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     child_pid_file = tmp_path / "delayed-start-child.pid"
     process_ids: list[int] = []
+    process_group_ids: list[int] = []
     timed_waits: list[float] = []
     real_popen = worker_sandbox_module.subprocess.Popen
     real_wait = real_popen.wait
 
     def delayed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
         process = real_popen(*args, **kwargs)
-        child_start_deadline = time.monotonic() + 1
-        while (
-            not child_pid_file.exists()
-            and time.monotonic() < child_start_deadline
-        ):
-            time.sleep(0.005)
-        assert child_pid_file.exists()
+        process_group_ids.append(os.getpgid(process.pid))
         time.sleep(0.2)
         return process
 
@@ -4097,10 +4095,88 @@ def test_absolute_deadline_includes_popen_startup_and_kills_process_group(
         )
 
     assert len(process_ids) == 1
+    assert process_group_ids == process_ids
     assert timed_waits == []
-    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    assert not child_pid_file.exists()
     with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+        os.killpg(process_ids[0], 0)
+
+
+def test_bootstrap_rechecks_absolute_deadline_at_gate_release(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    side_effect = tmp_path / "worker-started"
+    gate_write_started = threading.Event()
+    release_gate_write = threading.Event()
+    processes: list[subprocess.Popen[bytes]] = []
+    bootstrap_return_codes: list[int] = []
+    process_ids: list[int] = []
+    result: list[subprocess.CompletedProcess[str]] = []
+    failure: list[BaseException] = []
+    real_popen = worker_sandbox_module.subprocess.Popen
+    real_write = worker_sandbox_module.os.write
+
+    def capture_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def write_after_deadline(fd: int, data: bytes) -> int:
+        if data == b"1":
+            gate_write_started.set()
+            assert release_gate_write.wait(3)
+            written = real_write(fd, data)
+            bootstrap_return_codes.append(processes[0].wait(timeout=3))
+            return written
+        return real_write(fd, data)
+
+    monkeypatch.setattr(worker_sandbox_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(worker_sandbox_module.os, "write", write_after_deadline)
+    deadline_at = time.monotonic() + 2.0
+
+    def run_worker() -> None:
+        try:
+            result.append(
+                run_worker_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; Path({str(side_effect)!r}).touch()",
+                    ],
+                    cwd=tmp_path,
+                    prompt="",
+                    environment=os.environ.copy(),
+                    timeout=10,
+                    deadline_at_monotonic=deadline_at,
+                    on_process_started=process_ids.append,
+                )
+            )
+        except BaseException as error:
+            failure.append(error)
+
+    worker = threading.Thread(target=run_worker)
+    worker.start()
+    try:
+        assert gate_write_started.wait(3)
+        remaining = deadline_at - time.monotonic()
+        assert remaining > 0
+        assert not release_gate_write.wait(remaining + 0.02)
+        release_gate_write.set()
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+
+        assert bootstrap_return_codes == [124]
+        assert result == []
+        assert len(failure) == 1
+        assert isinstance(failure[0], WorkerSandboxError)
+        assert "timed out" in str(failure[0])
+        assert len(process_ids) == 1
+        assert not side_effect.exists()
+        with pytest.raises(ProcessLookupError):
+            os.killpg(process_ids[0], 0)
+    finally:
+        release_gate_write.set()
+        worker.join(timeout=3)
 
 
 def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(
@@ -4127,3 +4203,187 @@ def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(
         )
 
     assert time.monotonic() - started < 2
+
+
+def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> None:
+    stream = _BoundedJsonlStream(capture_bytes=4096, line_bytes=1024)
+    stream.feed(b'{"type":"thread.started","thread_id":"thread-189"}\n')
+    noise_chunk = b"noise" * 1000
+    for _ in range(500):
+        stream.feed(noise_chunk)
+    stream.feed(
+        b'\n{"type":"turn.failed","error":{"message":"bounded failure"}}\n'
+    )
+    stream.finish()
+
+    captured = stream.text()
+    assert "thread-189" in captured
+    assert "bounded failure" in captured
+    assert len(captured.encode("utf-8")) <= 4096
+
+
+def test_worker_process_bounds_stdout_and_stderr_without_rss_assertions(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "large-output.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'thread-189'}))\n"
+        "for _ in range(512):\n"
+        "    print('x' * 8192)\n"
+        "    print('y' * 8192, file=sys.stderr)\n"
+        "print(json.dumps({'type': 'turn.failed', 'error': {'message': 'tail failure'}}))\n",
+        encoding="utf-8",
+    )
+
+    result = run_worker_process(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        prompt="",
+        environment=os.environ.copy(),
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert "thread-189" in result.stdout
+    assert "tail failure" in result.stdout
+    assert len(result.stdout.encode("utf-8")) <= 256 * 1024
+    assert len(result.stderr.encode("utf-8")) <= 128 * 1024
+
+
+def test_worker_descendant_inherits_hidden_control_and_runner_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is unavailable")
+    checkout = tmp_path / "repo" / ".agent-run" / "worktrees" / "run" / "ticket"
+    checkout.mkdir(parents=True)
+    control_root = tmp_path / "repo" / ".agent-run"
+    for child in ("runs", "task-control", "profiles"):
+        directory = control_root / child
+        directory.mkdir(parents=True)
+        (directory / "authority.json").write_text("secret", encoding="utf-8")
+    custom_state_root = tmp_path / "custom-state"
+    for child in ("runs", "task-control", "profiles"):
+        directory = custom_state_root / child
+        directory.mkdir(parents=True)
+        (directory / "authority.json").write_text("authority", encoding="utf-8")
+    (custom_state_root / ".lock").write_text("authority", encoding="utf-8")
+    custom_run = custom_state_root / "runs" / "authority.json"
+    custom_control = custom_state_root / "task-control" / "authority.json"
+    custom_profile = custom_state_root / "profiles" / "authority.json"
+    custom_lock = custom_state_root / ".lock"
+    data_home = tmp_path / "data"
+    runner_root = data_home / "agent-run"
+    runner_root.mkdir(parents=True)
+    (runner_root / "management-secret").write_text("secret", encoding="utf-8")
+    state_home = tmp_path / "state"
+    locator_root = state_home / "agent-run"
+    locator_root.mkdir(parents=True)
+    (locator_root / "run-locator.json").write_text("secret", encoding="utf-8")
+    runtime_home = tmp_path / "runtime"
+    systemd_private = runtime_home / "systemd" / "private"
+    systemd_private.parent.mkdir(parents=True)
+    systemd_private.write_text("fake-systemd-socket", encoding="utf-8")
+    user_bus = runtime_home / "bus"
+    user_bus.write_text("fake-user-bus", encoding="utf-8")
+    carrier_root = runtime_home / "agent-run" / "executor"
+    carrier_root.mkdir(parents=True)
+    carrier = carrier_root / "environment-other-generation.json"
+    carrier.write_text("secret-terminal-environment", encoding="utf-8")
+    temporary = tmp_path / "worker-temp"
+    temporary.mkdir()
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_home))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={user_bus}")
+    monkeypatch.setenv("AGENT_RUN_EXECUTOR_ACTION_ID", "secret-action")
+    monkeypatch.setenv("AGENT_RUN_INTERNAL_STATE_ROOT", str(custom_state_root))
+    environment = worker_environment(tmp_path / "gh", "read-token")
+    hidden = codex_module._worker_hidden_paths(None, checkout=checkout)
+    probe = checkout / "probe.py"
+    probe.write_text(
+        "import json, os, subprocess, sys\n"
+        "code = 'import json, os, subprocess; from pathlib import Path; "
+        "custom = Path(os.environ[\\\"CUSTOM_STATE\\\"]); "
+        "custom_before = custom.read_text() == \\\"authority\\\" if custom.exists() else False; "
+        "custom.write_text(\\\"mutated\\\"); "
+        "control = Path(os.environ[\\\"CUSTOM_CONTROL\\\"]); "
+        "control_before = control.read_text() == \\\"authority\\\" if control.exists() else False; "
+        "control.write_text(\\\"mutated\\\"); "
+        "profile = Path(os.environ[\\\"CUSTOM_PROFILE\\\"]); "
+        "profile_before = profile.read_text() == \\\"authority\\\" if profile.exists() else False; "
+        "profile.write_text(\\\"mutated\\\"); "
+        "lock = Path(os.environ[\\\"CUSTOM_LOCK\\\"]); "
+        "lock_before = subprocess.run([\\\"/bin/cat\\\", str(lock)], "
+        "capture_output=True, text=True).stdout == \\\"authority\\\"; "
+        "lock_write = subprocess.run([\\\"/usr/bin/tee\\\", str(lock)], "
+        "input=\\\"mutated\\\", text=True, capture_output=True).returncode == 0; "
+        "print(json.dumps({\\\"executor_env\\\": any(k.startswith(\\\"AGENT_RUN_EXECUTOR_\\\") for k in os.environ), "
+        "\\\"control\\\": Path(os.environ[\\\"CONTROL_SECRET\\\"]).exists(), "
+        "\\\"custom_before\\\": custom_before, "
+        "\\\"custom_control_before\\\": control_before, "
+        "\\\"custom_profile_before\\\": profile_before, "
+        "\\\"custom_lock_before\\\": lock_before, "
+        "\\\"custom_lock_write\\\": lock_write, "
+        "\\\"runner\\\": Path(os.environ[\\\"RUNNER_SECRET\\\"]).exists(), "
+        "\\\"locator\\\": Path(os.environ[\\\"LOCATOR_SECRET\\\"]).exists(), "
+        "\\\"carrier\\\": Path(os.environ[\\\"CARRIER_SECRET\\\"]).exists(), "
+        "\\\"user_bus\\\": subprocess.run([\\\"/bin/cat\\\", os.environ[\\\"USER_BUS\\\"]], capture_output=True, text=True).stdout == \\\"fake-user-bus\\\", "
+        "\\\"systemd_private\\\": subprocess.run([\\\"/bin/cat\\\", os.environ[\\\"SYSTEMD_PRIVATE\\\"]], capture_output=True, text=True).stdout == \\\"fake-systemd-socket\\\", "
+        "\\\"dbus_env\\\": \\\"DBUS_SESSION_BUS_ADDRESS\\\" in os.environ}))'\n"
+        "subprocess.run([sys.executable, '-c', code], check=True)\n",
+        encoding="utf-8",
+    )
+    environment.update(
+        {
+            "CONTROL_SECRET": str(control_root / "runs" / "authority.json"),
+            "CUSTOM_STATE": str(custom_run),
+            "CUSTOM_CONTROL": str(custom_control),
+            "CUSTOM_PROFILE": str(custom_profile),
+            "CUSTOM_LOCK": str(custom_lock),
+            "RUNNER_SECRET": str(runner_root / "management-secret"),
+            "LOCATOR_SECRET": str(locator_root / "run-locator.json"),
+            "CARRIER_SECRET": str(carrier),
+            "USER_BUS": str(user_bus),
+            "SYSTEMD_PRIVATE": str(systemd_private),
+        }
+    )
+    command = bubblewrap_command(
+        [sys.executable, str(probe)],
+        checkout=checkout,
+        temporary=temporary,
+        writable_checkout=True,
+        environment=environment,
+        hidden_paths=hidden,
+    )
+
+    result = subprocess.run(
+        command,
+        cwd=checkout,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert custom_run.read_text(encoding="utf-8") == "authority"
+    assert custom_control.read_text(encoding="utf-8") == "authority"
+    assert custom_profile.read_text(encoding="utf-8") == "authority"
+    assert custom_lock.read_text(encoding="utf-8") == "authority"
+    assert json.loads(result.stdout) == {
+        "carrier": False,
+        "control": False,
+        "custom_before": False,
+        "custom_control_before": False,
+        "custom_profile_before": False,
+        "custom_lock_before": False,
+        "custom_lock_write": False,
+        "dbus_env": False,
+        "executor_env": False,
+        "locator": False,
+        "runner": False,
+        "systemd_private": False,
+        "user_bus": False,
+    }

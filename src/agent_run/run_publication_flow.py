@@ -53,15 +53,14 @@ class RunPublicationFlow(RunPublicationShared):
     """Create and publish the PR for an already accepted Final Run."""
 
     def publish(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            publication = self._publication_state(state)
-            try:
-                return self._publish_locked(state, publication)
-            except GitHubReadError as error:
-                return self._handle_github_error(state, publication, error)
+        state = self._load(run_id)
+        publication = self._publication_state(state)
+        try:
+            return self._publish(state, publication)
+        except GitHubReadError as error:
+            return self._handle_github_error(state, publication, error)
 
-    def _publish_locked(
+    def _publish(
         self, state: dict[str, Any], publication: dict[str, Any]
     ) -> dict[str, Any]:
         if not self._refresh_currentness(state):
@@ -181,7 +180,7 @@ class RunPublicationFlow(RunPublicationShared):
             publication.get("write_intent"), dict
         ):
             return self._wait_for_github_convergence(state, publication, error)
-        if error.code == "github_write_failed":
+        if error.code in {"github_write_failed", "github_write_outcome_unknown"}:
             return self._hold_unknown_write_outcome(state, publication, error)
         if not is_github_convergence_error(error.code):
             raise error

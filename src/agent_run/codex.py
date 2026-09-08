@@ -37,6 +37,8 @@ from agent_run.github_auth_profile import (
 )
 from agent_run.error_safety import bounded_error
 from agent_run.execution_binding import emit_execution_binding
+from agent_run.executor_environment import ensure_executor_runtime_directory
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.worker_sandbox import (
     WorkerDeadlineExceeded,
     WorkerSandboxError,
@@ -84,6 +86,7 @@ _DEFAULT_INVOCATION_TIMEOUT_SECONDS = {
     "review": 2 * 60 * 60,
     "publication": 60 * 60,
 }
+_MAX_FINAL_OUTPUT_BYTES = 1024 * 1024
 
 
 class CodexCliBackend:
@@ -95,9 +98,14 @@ class CodexCliBackend:
         self,
         executable: str = "codex",
         credential_provider: CredentialProvider | None = None,
+        *,
+        on_worker_started: Callable[[int], None] | None = None,
+        on_worker_finished: Callable[[int], None] | None = None,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
+        self.on_worker_started = on_worker_started
+        self.on_worker_finished = on_worker_finished
 
     def develop(
         self, request: dict[str, Any]
@@ -773,7 +781,7 @@ class CodexCliBackend:
                     raise WorkerSandboxError(
                         "当前 GitHub repository identity 不可确定，已拒绝 Worker GitHub read"
                     )
-                hidden_paths = _worker_hidden_paths(profile)
+                hidden_paths = _worker_hidden_paths(profile, checkout=checkout)
                 if repository is not None:
                     environment["GH_REPO"] = repository
                 credential_exhausted = threading.Event()
@@ -857,7 +865,23 @@ class CodexCliBackend:
                         worker_options["on_stdout_line"] = _thread_line_callback(
                             expected=thread_id, callback=on_thread
                         )
-                    result = run_worker_process(arguments, **worker_options)
+                    worker_pid: int | None = None
+
+                    def worker_started(pid: int) -> None:
+                        nonlocal worker_pid
+                        worker_pid = pid
+                        if self.on_worker_started is not None:
+                            self.on_worker_started(pid)
+
+                    if "on_process_started" in inspect.signature(
+                        run_worker_process
+                    ).parameters:
+                        worker_options["on_process_started"] = worker_started
+                    try:
+                        result = run_worker_process(arguments, **worker_options)
+                    finally:
+                        if worker_pid is not None and self.on_worker_finished is not None:
+                            self.on_worker_finished(worker_pid)
             except InitialCredentialUnavailable:
                 raise
             except WorkerDeadlineExceeded as error:
@@ -891,8 +915,15 @@ class CodexCliBackend:
                     return_code=result.returncode,
                     signal_number=signal_number,
                 )
-            if not output_path.exists():
-                raise CodexProcessError("Codex worker did not produce a final response")
+            try:
+                with output_path.open("rb") as output_file:
+                    final_output = output_file.read(_MAX_FINAL_OUTPUT_BYTES + 1)
+            except FileNotFoundError as error:
+                raise CodexProcessError(
+                    "Codex worker did not produce a final response"
+                ) from error
+            if len(final_output) > _MAX_FINAL_OUTPUT_BYTES:
+                raise CodexProcessError("Codex worker final response is too large")
             reported_thread = _thread_id(result.stdout)
             if (
                 thread_id is not None
@@ -905,7 +936,7 @@ class CodexCliBackend:
             actual_thread = reported_thread or thread_id
             if actual_thread is None:
                 raise CodexProcessError("Codex worker did not report a Thread ID")
-            return output_path.read_text(encoding="utf-8"), actual_thread
+            return final_output.decode("utf-8"), actual_thread
 
 
 def _looks_like_worker_gh_binding_failure(
@@ -1550,7 +1581,9 @@ def _publication_human_blocker_instruction() -> str:
     )
 
 
-def _worker_hidden_paths(profile: object) -> tuple[Path, ...]:
+def _worker_hidden_paths(
+    profile: object, *, checkout: Path | None = None
+) -> tuple[Path, ...]:
     paths: list[Path] = []
     for variable in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
         value = os.environ.get(variable)
@@ -1560,6 +1593,33 @@ def _worker_hidden_paths(profile: object) -> tuple[Path, ...]:
     private_key_path = getattr(profile, "private_key_path", None)
     if isinstance(private_key_path, Path):
         paths.append(private_key_path)
+    data_home = Path(
+        os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")
+    ).expanduser()
+    paths.append(data_home / "agent-run")
+    paths.append(RunLocatorIndex.default().path.parent)
+    paths.append(ensure_executor_runtime_directory())
+    runtime_home = Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
+    ).expanduser()
+    paths.extend((runtime_home / "bus", runtime_home / "systemd" / "private"))
+    if checkout is not None:
+        resolved_checkout = checkout.resolve()
+        state_roots: set[Path] = set()
+        local_root = resolved_checkout / ".agent-run"
+        if local_root.exists():
+            state_roots.add(local_root)
+        for parent in resolved_checkout.parents:
+            if parent.name == "worktrees" and parent.parent.name == ".agent-run":
+                state_roots.add(parent.parent)
+        configured_root = os.environ.get("AGENT_RUN_INTERNAL_STATE_ROOT")
+        if configured_root:
+            state_roots.add(Path(configured_root).expanduser())
+        for root in state_roots:
+            paths.extend(
+                root / child
+                for child in ("runs", "task-control", "profiles", ".lock")
+            )
     return tuple(paths)
 
 

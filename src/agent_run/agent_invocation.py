@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from copy import deepcopy
 from typing import Any, Callable
 
+from agent_run.requeue import RequeueError, current_change_job
 from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
 from agent_run.resume_audit import bind_resume_to_successor
 
@@ -212,3 +213,153 @@ def fail_interrupted_invocation(
     )
     save(state)
     return True
+
+
+def record_session_interruption(
+    state: dict[str, Any], *, save: Callable[[dict[str, Any]], object]
+) -> None:
+    """Persist a proven Executor Session loss without replaying its work."""
+
+    if session_interruption_is_persisted(state):
+        # The Run commit and Task Control close are deliberately separated by
+        # one local transaction boundary.  A crash in that window must only
+        # finish the original Control record on retry; deriving the gate again
+        # from the now-terminal Run would change its durable identity.
+        return
+
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
+        failed = dict(active)
+        failed.update(
+            {
+                "status": "failed",
+                "ended_at": datetime.now(UTC).isoformat(),
+                "error": "session_interrupted",
+            }
+        )
+        state["active_agent_invocation"] = failed
+        _sync_invocation_history(state, failed)
+    diagnostic: dict[str, Any] = {
+        "code": "session_interrupted",
+        "message": "Executor Session 已退出；保留现场并等待显式 Resume",
+    }
+    receipt = state.get("action_application_receipt")
+    if (
+        isinstance(receipt, dict)
+        and isinstance(receipt.get("action_id"), str)
+        and type(receipt.get("executor_generation")) is int
+    ):
+        diagnostic["action_identity"] = {
+            "action_id": receipt["action_id"],
+            "executor_generation": receipt["executor_generation"],
+        }
+    try:
+        work_subject, subject, _container = current_change_job(state)
+    except RequeueError:
+        subject = None
+    if subject is not None:
+        phase = subject.get("phase")
+        diagnostic["operator_gate"] = {
+            "work_subject": work_subject,
+            "action_kind": "execution_failure",
+            "phase": (
+                phase
+                if isinstance(phase, str) and phase
+                else str(state.get("status") or "execution_failed")
+            ),
+            "reason": "session_interrupted",
+        }
+    state.update(
+        {
+            "status": "execution_failed",
+            "terminal_kind": "execution_failed",
+            "diagnostics": [diagnostic],
+        }
+    )
+    save(state)
+
+
+def record_operator_stop(
+    state: dict[str, Any], *, save: Callable[[dict[str, Any]], object]
+) -> None:
+    """Persist a reversible operator boundary without discarding run evidence."""
+
+    if state.get("status") == "operator_stopped":
+        return
+    state["operator_stop"] = {
+        "resume_status": state.get("status"),
+        "resume_terminal_kind": state.get("terminal_kind"),
+        "resume_diagnostics": deepcopy(state.get("diagnostics", [])),
+        "stopped_at": datetime.now(UTC).isoformat(),
+    }
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict) and active.get("status") in {"running", "resuming"}:
+        failed = dict(active)
+        failed.update(
+            {
+                "status": "failed",
+                "ended_at": datetime.now(UTC).isoformat(),
+                "error": "operator_stopped",
+            }
+        )
+        state["active_agent_invocation"] = failed
+        _sync_invocation_history(state, failed)
+    state.update(
+        {
+            "status": "operator_stopped",
+            "terminal_kind": "operator_stopped",
+            "diagnostics": [
+                {
+                    "code": "operator_stopped",
+                    "message": "操作者已停止 Executor；现场已保留，仅显式 Resume 可继续",
+                }
+            ],
+        }
+    )
+    save(state)
+
+
+def restore_operator_stop(state: dict[str, Any]) -> None:
+    """Consume the reversible Stop boundary for an explicit Resume."""
+
+    stop = state.get("operator_stop")
+    if state.get("status") != "operator_stopped" or not isinstance(stop, dict):
+        return
+    resume_status = stop.get("resume_status")
+    if not isinstance(resume_status, str) or resume_status == "operator_stopped":
+        raise ValueError("operator_stopped Run 缺少可恢复状态")
+    state["status"] = resume_status
+    terminal_kind = stop.get("resume_terminal_kind")
+    if terminal_kind is None:
+        state.pop("terminal_kind", None)
+    else:
+        state["terminal_kind"] = terminal_kind
+    diagnostics = stop.get("resume_diagnostics")
+    state["diagnostics"] = deepcopy(diagnostics) if isinstance(diagnostics, list) else []
+    state.pop("operator_stop", None)
+
+
+def session_interruption_is_persisted(state: dict[str, Any]) -> bool:
+    diagnostics = state.get("diagnostics")
+    receipt = state.get("action_application_receipt")
+    if not (
+        isinstance(receipt, dict)
+        and isinstance(receipt.get("action_id"), str)
+        and type(receipt.get("executor_generation")) is int
+    ):
+        return False
+    expected_identity = {
+        "action_id": receipt["action_id"],
+        "executor_generation": receipt["executor_generation"],
+    }
+    return (
+        state.get("status") == "execution_failed"
+        and state.get("terminal_kind") == "execution_failed"
+        and isinstance(diagnostics, list)
+        and any(
+            isinstance(diagnostic, dict)
+            and diagnostic.get("code") == "session_interrupted"
+            and diagnostic.get("action_identity") == expected_identity
+            for diagnostic in diagnostics
+        )
+    )

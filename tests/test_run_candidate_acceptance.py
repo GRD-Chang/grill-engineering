@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.change_currentness import unknown_pr_mutation
@@ -23,6 +24,7 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 
+from conftest import seed_idle_control
 from test_cli import run_cli, stdout_json
 
 from run_acceptance_test_support import (
@@ -165,6 +167,12 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    seed_idle_control(
+        TaskControlStore(states.root),
+        TaskKey(git_repo, str(state["repository"]), 1),
+        str(state["run_id"]),
+        state_dir=states.root,
+    )
     run_branch = str(state["run_branch"])
     base_sha = git.resolve(run_branch)
     artifact = _repair_artifact()

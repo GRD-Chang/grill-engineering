@@ -11,7 +11,7 @@ from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
 )
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import issue, load_only_run_state, run_cli, stdout_json
 from run_acceptance_test_support import _canonical_run_budget
 
@@ -32,7 +32,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     git_repo: Path, repair_mode: object, phase: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     repair_job: dict[str, object] = {
         "phase": phase,
@@ -80,7 +80,7 @@ def test_canonical_run_repair_modes_pass_state_validation(
     git_repo: Path, repair_mode: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -104,7 +104,7 @@ def test_run_repair_snapshot_is_required_for_materialized_projections(
     git_repo: Path, missing: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     run_snapshot = deepcopy(state["policy_snapshot"])
     repair_snapshot = deepcopy(run_snapshot)
@@ -134,7 +134,7 @@ def test_old_run_policy_snapshot_is_incompatible_without_inference(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     old_snapshot = deepcopy(state["policy_snapshot"])
     old_snapshot.pop("run_repair_rounds")
@@ -148,7 +148,7 @@ def test_old_run_review_history_without_policy_snapshot_is_incompatible(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["active_ticket_job"] = None
     state["run_acceptance"] = {
@@ -178,7 +178,7 @@ def test_run_repair_budget_window_must_match_run_acceptance(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     run_budget = _canonical_run_budget()
     repair_budget = _canonical_run_budget()
@@ -205,7 +205,7 @@ def test_run_repair_cannot_use_ticket_fallback_authority(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -230,7 +230,7 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -253,7 +253,7 @@ def test_waiting_run_repair_requires_an_exact_head_observation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -279,7 +279,7 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -322,7 +322,7 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
     git_repo: Path, result: str, checks: list[dict[str, str]]
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -354,7 +354,7 @@ def test_fallback_receipt_observation_without_job_observation_is_incompatible(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["active_ticket_job"] = {
         "phase": "candidate",
@@ -425,7 +425,7 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     git_repo: Path, phase: str, marker: object
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -461,7 +461,7 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",
@@ -485,7 +485,7 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["run_acceptance"] = {
         "phase": "repairing",

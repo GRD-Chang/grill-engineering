@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
+from agent_run.agent_invocation import record_operator_stop
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.codex import CodexProcessError
 from agent_run.delivery import TicketDeliveryEngine
@@ -19,14 +21,18 @@ from agent_run.external_supervision import (
     is_proven_github_state_contradiction,
     public_supervision_snapshot,
 )
+from agent_run.executor_host import ExecutorHost
+from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
+from agent_run.github_publish import GhGitHubPublisher
 from agent_run.operator_gate import has_run_operator_gate
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_publication import RunPublicationEngine
-from agent_run.state import StateStore
+from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.task_control import TaskControlBusyError
 
 
 class RunOutcomeKind(str, Enum):
@@ -50,6 +56,15 @@ class RunStep(str, Enum):
 
 
 @dataclass(frozen=True)
+class ControlRunOperation:
+    """One admitted Stop or Abandon consumed by the shared Run Driver."""
+
+    kind: Literal["stop", "abandon"]
+    target_executor: Mapping[str, Any] | None
+    discard_worktree: bool = False
+
+
+@dataclass(frozen=True)
 class RunOutcome:
     """The only result shape consumed by :class:`RunDriver`."""
 
@@ -61,7 +76,12 @@ class RunOutcome:
 class RunController(Protocol):
     def resume(self, run_id: str) -> tuple[dict[str, Any], bool]: ...
 
-    def requeue(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
+    def requeue(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]: ...
 
     def reject_requeue_after_pr_race(self, run_id: str) -> dict[str, Any]: ...
 
@@ -72,6 +92,62 @@ class RunController(Protocol):
     def record_deterministic_contradiction(
         self, run_id: str, code: str, message: str
     ) -> bool: ...
+
+
+class _FencedExternal:
+    """Check Executor ownership before every call into an external seam."""
+
+    def __init__(self, target: Any, fence: Callable[[], None]) -> None:
+        self._target = target
+        self._fence = fence
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._target, name)
+        if not callable(value):
+            return value
+
+        def fenced_call(*args: Any, **kwargs: Any) -> Any:
+            self._fence()
+            return value(*args, **kwargs)
+
+        return fenced_call
+
+
+def _fenced_publisher(
+    publisher: Any,
+    *,
+    fenced_git: Any,
+    fence: Callable[[], None],
+) -> Any:
+    """Keep publisher implementations from retaining an unfenced Git seam."""
+
+    if hasattr(publisher, "git"):
+        publisher.git = fenced_git
+    if isinstance(publisher, GhGitHubPublisher):
+        publisher._set_write_guard(fence)
+    return _FencedExternal(publisher, fence)
+
+
+def _fence_controller_dependencies(
+    controller: Any,
+    *,
+    git: Any,
+    github: Any,
+    fence: Callable[[], None],
+) -> None:
+    """Apply the same fences to Controller calls made from a Driver step."""
+
+    controller_states = getattr(controller, "states", None)
+    set_write_guard = getattr(controller_states, "_set_write_guard", None)
+    if callable(set_write_guard) and getattr(
+        controller_states, "_write_transaction", None
+    ) is None:
+        set_write_guard(fence)
+    if hasattr(controller, "github"):
+        controller.github = github
+    publisher = getattr(controller, "publisher", None)
+    if publisher is not None and hasattr(publisher, "git"):
+        publisher.git = git
 
 
 class DirectRunOperations:
@@ -87,15 +163,55 @@ class DirectRunOperations:
         publisher_factory: Callable[[], Any],
         agents: Any,
         profiles: AgentProfileStore | None = None,
+        before_external_step: Callable[[], None] | None = None,
+        resume_pending_refresh: Callable[
+            [str], tuple[dict[str, Any], bool]
+        ]
+        | None = None,
+        use_current_state_once: bool = False,
+        executor_host: ExecutorHost | None = None,
     ) -> None:
-        self.controller = controller
+        self.controller: Any = controller
         self.states = states
-        self.git = git
-        self.github_reader = github_reader
-        self._publisher_factory = publisher_factory
+        self.before_external_step = before_external_step
+        self.resume_pending_refresh = resume_pending_refresh
+        self.use_current_state_once = use_current_state_once
+        self.executor_host = executor_host
+        self.git: Any
+        self.github_reader: Any
+        self._publisher_factory: Callable[[], Any]
+        if before_external_step is not None:
+            if getattr(states, "_write_transaction", None) is None:
+                states._set_write_guard(before_external_step)
+            if isinstance(git, GitRepository):
+                git._set_write_guard(before_external_step)
+            fenced_git = _FencedExternal(git, before_external_step)
+            fenced_github_reader = _FencedExternal(
+                github_reader, before_external_step
+            )
+            self.git = fenced_git
+            self.github_reader = fenced_github_reader
+            self._publisher_factory = lambda: _fenced_publisher(
+                publisher_factory(),
+                fenced_git=fenced_git,
+                fence=before_external_step,
+            )
+            _fence_controller_dependencies(
+                controller,
+                git=fenced_git,
+                github=fenced_github_reader,
+                fence=before_external_step,
+            )
+            self.controller = _FencedExternal(controller, before_external_step)
+        else:
+            self.git = git
+            self.github_reader = github_reader
+            self._publisher_factory = publisher_factory
         self._publisher: Any | None = None
         self.agents = agents
         self.profiles = profiles
+        if before_external_step is not None:
+            self.agents = _FencedExternal(agents, before_external_step)
 
     @property
     def publisher(self) -> Any:
@@ -103,8 +219,66 @@ class DirectRunOperations:
             self._publisher = self._publisher_factory()
         return self._publisher
 
+    def apply_control(
+        self, run_id: str, operation: ControlRunOperation
+    ) -> RunOutcome:
+        """Apply one fenced control operation without entering automatic progress."""
+
+        if operation.kind not in {"stop", "abandon"}:
+            raise ValueError("unsupported control operation")
+        if self.before_external_step is not None:
+            self.before_external_step()
+        if operation.target_executor is not None:
+            if self.executor_host is None:
+                raise ValueError("Control operation 缺少 Executor Host")
+            self.executor_host.terminate_control_target(operation.target_executor)
+        state = self.states.load_current_run(run_id)
+        if state is None:
+            raise ValueError("Control Executor 找不到 Delivery Run")
+        if operation.kind == "stop":
+            if state.get("status") not in {
+                "completed",
+                "abandoned",
+                "operator_stopped",
+            }:
+                record_operator_stop(
+                    state,
+                    save=lambda value: self.states.save_run(run_id, value),
+                )
+            return self.classify(state)
+        if state.get("status") in {"abandoned", "completed"}:
+            return self.classify(state)
+        repository = self.github_reader.repository()
+        default_head = self.git.resolve_base(
+            repository.default_branch, repository.default_head_sha
+        )
+        if state.get("delivery_type") == "parent_only":
+            result = ParentDeliveryEngine(
+                git=self.git,
+                states=self.states,
+                github=self.publisher,
+                agents=self.agents,
+            ).abandon(
+                run_id,
+                discard_worktree=operation.discard_worktree,
+            )
+        else:
+            result = RunPublicationEngine(
+                git=self.git,
+                states=self.states,
+                agents=self.agents,
+                github=self.publisher,
+                default_branch=repository.default_branch,
+                default_head_sha=default_head,
+                currentness_reader=self.github_reader,
+            ).abandon(
+                run_id,
+                discard_worktree=operation.discard_worktree,
+            )
+        return self.classify(result)
+
     def deliver(self, run_id: str) -> RunOutcome:
-        refreshed, _ = self.controller.resume(run_id)
+        refreshed, _ = self._refresh(run_id)
         if self._cannot_advance(refreshed):
             return self.classify(refreshed)
         refreshed = DeliveryCleanupEngine(
@@ -163,7 +337,7 @@ class DirectRunOperations:
         return self.classify(state)
 
     def accept(self, run_id: str) -> RunOutcome:
-        refreshed, _ = self.controller.resume(run_id)
+        refreshed, _ = self._refresh(run_id)
         if _has_pending_stale_dirty_checkout(refreshed):
             refreshed = DeliveryCleanupEngine(
                 git=self.git, states=self.states, github=self.publisher
@@ -208,7 +382,7 @@ class DirectRunOperations:
         return self.classify(state)
 
     def publish(self, run_id: str) -> RunOutcome:
-        refreshed, _ = self.controller.resume(run_id)
+        refreshed, _ = self._refresh(run_id)
         if self._cannot_advance(refreshed):
             return self.classify(refreshed)
         publication = refreshed.get("run_publication")
@@ -255,8 +429,100 @@ class DirectRunOperations:
             state = publication_engine.approve(run_id)
         return self.classify(state)
 
-    def requeue(self, run_id: str) -> RunOutcome:
-        state, retired = self.controller.requeue(run_id)
+    def _refresh(self, run_id: str) -> tuple[dict[str, Any], bool]:
+        current = self.states.load_current_run(run_id)
+        if (
+            self.resume_pending_refresh is not None
+            and isinstance(current, dict)
+            and is_github_refresh_wait(current)
+        ):
+            self.use_current_state_once = False
+            retry_result = self.resume_pending_refresh(run_id)
+            if not is_github_refresh_wait(retry_result[0]):
+                self.resume_pending_refresh = None
+            return retry_result
+        if self.use_current_state_once and isinstance(current, dict):
+            self.use_current_state_once = False
+            self.resume_pending_refresh = None
+            return current, True
+        normal_refresh: tuple[dict[str, Any], bool] = self.controller.resume(run_id)
+        return normal_refresh
+
+    def approve(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> RunOutcome:
+        refreshed, _ = self._refresh(run_id)
+        if self._cannot_advance(refreshed) and refreshed.get("status") not in {
+            "run_approval_pending",
+            "parent_approval_pending",
+            "parent_closeout_pending",
+        }:
+            return self.classify(refreshed)
+        if refreshed.get("delivery_type") == "parent_only":
+            parent = ParentDeliveryEngine(
+                git=self.git,
+                states=self.states,
+                github=self.publisher,
+                agents=self.agents,
+            )
+            state = (
+                parent.recover_closeout(run_id, prepare_state=prepare_state)
+                if refreshed.get("status") == "parent_closeout_pending"
+                else parent.approve(run_id, prepare_state=prepare_state)
+            )
+            return self.classify(state)
+        repository = self.github_reader.repository()
+        publication = RunPublicationEngine(
+            git=self.git,
+            states=self.states,
+            agents=self.agents,
+            github=self.publisher,
+            default_branch=repository.default_branch,
+            default_head_sha=self.git.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            ),
+            currentness_reader=self.github_reader,
+        )
+        state = (
+            publication.recover_closeout(run_id, prepare_state=prepare_state)
+            if refreshed.get("status") == "parent_closeout_pending"
+            else publication.approve(run_id, prepare_state=prepare_state)
+        )
+        return self.classify(state)
+
+    def revise(
+        self,
+        run_id: str,
+        feedback: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> RunOutcome:
+        repository = self.github_reader.repository()
+        state = RunPublicationEngine(
+            git=self.git,
+            states=self.states,
+            agents=self.agents,
+            github=self.publisher,
+            default_branch=repository.default_branch,
+            default_head_sha=self.git.resolve_base(
+                repository.default_branch, repository.default_head_sha
+            ),
+            currentness_reader=self.github_reader,
+        ).revise(run_id, feedback, prepare_state=prepare_state)
+        return self.classify(state)
+
+    def requeue(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> RunOutcome:
+        state, retired = self.controller.requeue(
+            run_id, prepare_state=prepare_state
+        )
         if is_github_refresh_wait(state):
             return self.classify(state)
         transition = state.get("requeue_transition")
@@ -290,6 +556,8 @@ class DirectRunOperations:
     def dispatch(self, step: RunStep, run_id: str) -> RunOutcome:
         """Execute a typed step; the Driver never dispatches on raw state."""
 
+        if self.before_external_step is not None:
+            self.before_external_step()
         # The direct engine seam is also used by legacy in-process callers
         # that predate the public profile-aware CLI.  Seed only that seam's
         # independent control plane; the CLI passes an existing store and
@@ -300,12 +568,13 @@ class DirectRunOperations:
         if callable(set_run_id):
             set_run_id(run_id)
 
-        return {
-            RunStep.DELIVER: self.deliver,
-            RunStep.ACCEPT: self.accept,
-            RunStep.PUBLISH: self.publish,
-            RunStep.REQUEUE: self.requeue,
-        }[step](run_id)
+        if step is RunStep.DELIVER:
+            return self.deliver(run_id)
+        if step is RunStep.ACCEPT:
+            return self.accept(run_id)
+        if step is RunStep.PUBLISH:
+            return self.publish(run_id)
+        return self.requeue(run_id)
 
     @staticmethod
     def classify(state: dict[str, Any]) -> RunOutcome:
@@ -361,10 +630,17 @@ class RunDriver:
         self.states = states
         self.supervisor = supervisor
 
-    def advance(self, state: dict[str, Any]) -> dict[str, Any]:
+    def advance(
+        self,
+        state: dict[str, Any],
+        *,
+        control_operation: ControlRunOperation | None = None,
+    ) -> dict[str, Any]:
         run_id = state.get("run_id")
         if not isinstance(run_id, str):
             raise ValueError("Delivery Run is missing its Run ID")
+        if control_operation is not None:
+            return self.operations.apply_control(run_id, control_operation).state
         outcome = self.operations.classify(state)
         previous_marker: tuple[object, ...] | None = None
         try:
@@ -372,10 +648,25 @@ class RunDriver:
                 step = outcome.next_step
                 if step is None:
                     return state
+                progress_marker_before_dispatch = _progress_marker(state)
                 outcome = self.operations.dispatch(step, run_id)
                 state = outcome.state
+                if (
+                    outcome.kind is RunOutcomeKind.PROGRESS
+                    and _progress_marker(state) == progress_marker_before_dispatch
+                ):
+                    recorded = self.operations.controller.record_execution_failure(
+                        run_id,
+                        "controller_no_progress: Run Controller returned Progress "
+                        "without changing its durable progress identity",
+                    )
+                    if not recorded:
+                        return state
+                    failed = self.states.load_current_run(run_id)
+                    if failed is None:  # pragma: no cover - Controller just wrote it
+                        return state
+                    return failed
                 if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
-                    previous_marker = None
                     if clear_supervision_window(state):
                         self.states.save_run(run_id, state)
                     if outcome.kind in {
@@ -389,12 +680,14 @@ class RunDriver:
                         return state
                     continue
                 previous_window = state.get("supervision_window")
+                self._before_external_step()
                 self.supervisor.observe(state)
                 if state.get("supervision_window") != previous_window:
                     self.states.save_run(run_id, state)
-                marker = _progress_marker(state)
+                marker = _external_wait_marker(state)
                 credential_wait = isinstance(state.get("credential_availability"), dict)
                 if credential_wait or marker == previous_marker:
+                    self._before_external_step()
                     if not self.supervisor.before_retry(
                         state,
                         persist_before_sleep=lambda: self.states.save_run(run_id, state),
@@ -405,6 +698,7 @@ class RunDriver:
                     # reads observe the same durable wait contract.
                     self.states.save_run(run_id, state)
                 previous_marker = marker
+                self._before_external_step()
                 wait = public_supervision_snapshot(state, now=self.supervisor.now())
                 if wait is None:  # pragma: no cover - external waits always create one
                     print(f"推进: {state['status']} → {step.value}", file=sys.stderr)
@@ -434,6 +728,17 @@ class RunDriver:
             if failed is None:  # pragma: no cover - Controller just wrote it
                 raise
             return failed
+
+        except SimulatedProcessCrash:
+            # Fault injection models an abrupt Executor exit.  Do not convert
+            # it into a normal Run execution failure: the Host must retain the
+            # unresolved ownership record for the next command to reconcile.
+            raise
+        except TaskControlBusyError:
+            # Short Task Control contention is not an execution failure.  The
+            # state store retries its own commit boundary; any remaining
+            # contention must reach the caller without changing Run status.
+            raise
         except (CodexProcessError, OSError, ValueError) as error:
             if not self.operations.controller.record_execution_failure(run_id, str(error)):
                 raise
@@ -441,6 +746,11 @@ class RunDriver:
             if failed is None:  # pragma: no cover - Controller just wrote it
                 raise
             return failed
+
+    def _before_external_step(self) -> None:
+        fence = getattr(self.operations, "before_external_step", None)
+        if callable(fence):
+            fence()
 
 
 def _next_step(state: dict[str, Any]) -> RunStep | None:
@@ -498,7 +808,46 @@ def _has_pending_stale_dirty_checkout(state: dict[str, Any]) -> bool:
     )
 
 
+_PROGRESS_VOLATILE_KEYS = frozenset(
+    {
+        "diagnostics",
+        "last_retry_delay_seconds",
+        "latest_observation",
+        "last_publication_error",
+        "retry_count",
+        "timeline",
+        "timeline_continuation",
+    }
+)
+_PROGRESS_VOLATILE_FIELDS = {
+    "publication_operation_retry": frozenset({"attempts"}),
+}
+
+
 def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
+    """Return the durable identity used to detect a controller no-op.
+
+    The projection deliberately keeps the state machine's durable business
+    fields, including subject/generation/attempt/invocation/candidate/PR/head,
+    and cleanup/waiting identities. Timestamps, supervision retry metadata,
+    diagnostics, and timeline entries are observations rather than progress.
+    """
+
+    next_step = _next_step(state)
+    return (
+        next_step.value if next_step is not None else None,
+        _stable_progress_value(state),
+    )
+
+
+def _external_wait_marker(state: dict[str, Any]) -> tuple[object, ...]:
+    """Return the lifecycle identity used to gate repeated external polls.
+
+    External observations and retry bookkeeping are intentionally excluded.
+    A phase, attempt, candidate, or pull-request transition still represents
+    progress and allows the next poll to run without consuming another retry.
+    """
+
     active = state.get("active_ticket_job")
     parent = state.get("parent_job")
     acceptance = state.get("run_acceptance")
@@ -527,6 +876,32 @@ def _progress_marker(state: dict[str, Any]) -> tuple[object, ...]:
         publication.get("publication_attempts") if isinstance(publication, dict) else None,
         publication.get("pr_number") if isinstance(publication, dict) else None,
     )
+
+
+def _stable_progress_value(value: object, *, key: str | None = None) -> object:
+    if key is not None and (
+        key in _PROGRESS_VOLATILE_KEYS or key.endswith("_at")
+    ):
+        return None
+    if isinstance(value, dict):
+        volatile_fields = (
+            _PROGRESS_VOLATILE_FIELDS.get(key, frozenset())
+            if key is not None
+            else frozenset()
+        )
+        return tuple(
+            (name, _stable_progress_value(child, key=name))
+            for name, child in sorted(value.items())
+            if isinstance(name, str)
+            and name not in _PROGRESS_VOLATILE_KEYS
+            and name not in volatile_fields
+            and not name.endswith("_at")
+        )
+    if isinstance(value, list):
+        return tuple(_stable_progress_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
 
 
 def _is_currentness_human_blocker(state: dict[str, Any]) -> bool:

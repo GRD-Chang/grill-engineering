@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import passing_acceptance
+from test_cli_delivery import final_run_publication, passing_acceptance
 
 
 def _ticket() -> dict[str, Any]:
@@ -109,6 +109,13 @@ def _write_replacement_agents(path: Path) -> Path:
                         "The current candidate passed.",
                     )
                 ],
+                "run_reviews": [
+                    passing_acceptance(
+                        "run-reviewer-current",
+                        "The rebuilt Run passed.",
+                    )
+                ],
+                "run_publications": [final_run_publication()],
             }
         ),
         encoding="utf-8",
@@ -142,7 +149,7 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
         git_repo / "replacement-agents.json"
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     delivered = run_internal_stage(
@@ -173,7 +180,7 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
     assert requeued.returncode == 0, requeued.stdout
     state = load_only_run_state(git_repo)
     job = state["ticket_jobs"]["2"]
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     assert job["phase"] == "completed"
     assert job["ticket_branch_generation"] == 2
     assert job["development_thread_id"] == "developer-current"
@@ -181,20 +188,20 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
     assert job["acceptance_record"]["reviewer_thread_id"] == "reviewer-current"
     live = json.loads(fixture.read_text(encoding="utf-8"))
     pull_states = [pull["state"] for pull in live["delivery"]["pull_requests"]]
-    assert pull_states[-1] == "MERGED"
-    assert "OPEN" not in pull_states
+    assert pull_states[-2:] == ["MERGED", "OPEN"]
+    assert "OPEN" not in pull_states[:-1]
     if action == "publish_branch":
-        assert pull_states == ["MERGED"]
+        assert pull_states == ["MERGED", "OPEN"]
     else:
-        assert pull_states == ["CLOSED", "MERGED"]
+        assert pull_states == ["CLOSED", "MERGED", "OPEN"]
     assert live["delivery"]["acceptance_records"] == []
     statuses = live["delivery"]["agent_run_status"]
     if action == "publish_branch":
-        assert len(statuses) == 1
+        assert len(statuses) == 2
     else:
         assert statuses[0]["scope"] == "superseded_generation"
         assert statuses[0]["generation"] == 1
-        assert len(statuses) == 2
+        assert len(statuses) == 3
     assert live["delivery"]["closed_issues"] == [2]
 
 
@@ -219,7 +226,7 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
         git_repo / "agents.json", two_revisions=False
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1")
     )["run_id"]
 
     delivered = run_internal_stage(
@@ -259,7 +266,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
         delivery={"required_checks": ["none"]},
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -404,7 +411,7 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
         delivery={"required_checks": ["pending"]},
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     waiting = run_internal_stage(
         git_repo,
         fixture,
@@ -455,7 +462,7 @@ def test_abandon_recovers_lost_change_pr_close_response(
         },
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     waiting = run_internal_stage(
         git_repo,
         fixture,
@@ -490,7 +497,11 @@ def test_abandon_recovers_lost_change_pr_close_response(
         assert "原因: Run abandonment recovery is incomplete." in text_view.stdout
         assert "已保留成果:" in text_view.stdout
         assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in text_view.stdout
-        assert "唯一下一步: agent-run abandon <run-id>" in text_view.stdout
+        assert (
+            "唯一下一步: agent-run abandon 1 --repo example/project"
+            in text_view.stdout
+        )
+        assert "<run-id>" not in text_view.stdout
         assert run_id not in text_view.stdout
     after_interruption = json.loads(fixture.read_text(encoding="utf-8"))
     assert after_interruption["delivery"]["pull_requests"][0]["state"] == "CLOSED"
@@ -525,7 +536,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
         },
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     recovered = run_internal_stage(
         git_repo,
         fixture,
@@ -592,7 +603,7 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         git_repo / "agents-first.json", two_revisions=False
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -649,7 +660,7 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
     assert requeued.returncode == 0, requeued.stdout
     state = load_only_run_state(git_repo)
     job = state["ticket_jobs"]["2"]
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     assert job["phase"] == "completed"
     assert job["ticket_branch_generation"] == 2
     assert job["development_thread_id"] == "developer-current"
@@ -661,19 +672,19 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
     pull_states = [pull["state"] for pull in delivery["pull_requests"]]
-    assert pull_states[-1] == "MERGED"
+    assert pull_states[-2:] == ["MERGED", "OPEN"]
     if action == "publish_branch":
-        assert pull_states == ["MERGED"]
+        assert pull_states == ["MERGED", "OPEN"]
     else:
-        assert pull_states == ["CLOSED", "MERGED"]
+        assert pull_states == ["CLOSED", "MERGED", "OPEN"]
     assert delivery["acceptance_records"] == []
     statuses = delivery["agent_run_status"]
     if action == "publish_branch":
-        assert len(statuses) == 1
+        assert len(statuses) == 2
     else:
         assert statuses[0]["scope"] == "superseded_generation"
         assert statuses[0]["generation"] == 1
-        assert len(statuses) == 2
+        assert len(statuses) == 3
     assert delivery["closed_issues"] == [2]
     expected_mutations = [
         "completion_comment",

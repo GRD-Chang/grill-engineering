@@ -15,7 +15,7 @@ import pytest
 
 from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 
 
@@ -1583,10 +1583,9 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
             str(shell),
             "--login",
             "-c",
-            'cd "$1" && agent-run start 1 --github-fixture "$2"',
+            'cd "$1" && agent-run --help',
             "agent-run-quickstart",
             str(delivery),
-            str(fixture),
         ],
         env=isolated_environment,
         text=True,
@@ -1594,7 +1593,14 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
         check=False,
     )
     assert first_run.returncode == 0, first_run.stderr
-    assert json.loads(first_run.stdout)["run_id"]
+    assert "start" not in first_run.stdout
+    assert "--new-run" not in first_run.stdout
+    seeded = seed_run(
+        delivery,
+        fixture,
+        extra_env={"XDG_STATE_HOME": str(home / "state")},
+    )
+    assert seeded.returncode == 0, seeded.stderr
     target_state_before_uninstall = _file_tree(delivery / ".agent-run")
 
     count_before_repeat = int(count.read_text(encoding="utf-8"))
@@ -2391,13 +2397,10 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
         }
     )
     entry = home / ".local" / "bin" / "agent-run"
-    started = subprocess.run(
-        [str(entry), "start", "1", "--github-fixture", str(fixture)],
-        cwd=delivery,
-        env=cli_environment,
-        text=True,
-        capture_output=True,
-        check=False,
+    started = seed_run(
+        delivery,
+        fixture,
+        extra_env={"XDG_STATE_HOME": str(home / "state")},
     )
     assert started.returncode == 0, started.stderr
     started_output = json.loads(started.stdout)
@@ -2410,7 +2413,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     updated = _run(source, home, fake_bin)
     assert updated.returncode == 0, updated.stderr
     continued = subprocess.run(
-        [str(entry), "start", "1", "--github-fixture", str(fixture)],
+        [str(entry), "status", run_id, "--json"],
         cwd=delivery,
         env=cli_environment,
         text=True,
@@ -2419,13 +2422,12 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert continued.returncode == 0, continued.stderr
     continued_output = json.loads(continued.stdout)
-    assert continued_output["result"] == "resumed"
     assert continued_output["run_id"] == run_id
 
     rollback = _run(source, home, fake_bin, "--rollback")
     assert rollback.returncode == 0, rollback.stderr
     continued_after_rollback = subprocess.run(
-        [str(entry), "start", "1", "--github-fixture", str(fixture)],
+        [str(entry), "status", run_id, "--json"],
         cwd=delivery,
         env=cli_environment,
         text=True,
@@ -2434,7 +2436,6 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     )
     assert continued_after_rollback.returncode == 0, continued_after_rollback.stderr
     rollback_output = json.loads(continued_after_rollback.stdout)
-    assert rollback_output["result"] == "resumed"
     assert rollback_output["run_id"] == run_id
 
     incompatible = json.loads(state_path.read_text(encoding="utf-8"))
@@ -2453,7 +2454,14 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
         for path in (delivery / ".agent-run").rglob("*")
     )
     rejected = subprocess.run(
-        [str(entry), "run", "1", "--github-fixture", str(fixture)],
+        [
+            str(entry),
+            "run",
+            "1",
+            "--json",
+            "--github-fixture",
+            str(fixture),
+        ],
         cwd=delivery,
         env=cli_environment,
         text=True,
@@ -2480,7 +2488,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     installed_with_incompatible_state = _run(source, home, fake_bin)
     assert installed_with_incompatible_state.returncode == 0, installed_with_incompatible_state.stderr
     rejected_after_install = subprocess.run(
-        [str(entry), "run", "1", "--github-fixture", str(fixture)],
+        [str(entry), "run", "1", "--json", "--github-fixture", str(fixture)],
         cwd=delivery,
         env=cli_environment,
         text=True,
@@ -2504,7 +2512,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     rolled_back_with_incompatible_state = _run(source, home, fake_bin, "--rollback")
     assert rolled_back_with_incompatible_state.returncode == 0, rolled_back_with_incompatible_state.stderr
     rejected_after_rollback = subprocess.run(
-        [str(entry), "run", "1", "--github-fixture", str(fixture)],
+        [str(entry), "run", "1", "--json", "--github-fixture", str(fixture)],
         cwd=delivery,
         env=cli_environment,
         text=True,

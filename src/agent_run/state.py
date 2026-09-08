@@ -4,20 +4,41 @@ import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
-from agent_run.error_safety import bounded_error
+from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.resume_audit import latest_resume_audit
+from agent_run.task_control import TaskControlBusyError
 
 
 MAX_TIMELINE_EVENTS = 256
 MAX_TIMELINE_CONTINUATION_EVENTS = 256
+MAX_DIAGNOSTIC_ENTRIES = 32
+MAX_DIAGNOSTIC_BYTES = 16 * 1024
+MAX_RUN_STATE_BYTES = 4 * 1024 * 1024
+# Bound transient Task Control contention without relying on scheduler yield
+# counts; the interval stays short while the total wait remains finite.
+_STATE_COMMIT_RETRY_WINDOW_SECONDS = 0.25
+_STATE_COMMIT_RETRY_INTERVAL_SECONDS = 0.001
+_T = TypeVar("_T")
+
+
+def _load_bounded_json(path: Path) -> object:
+    with path.open("rb") as source:
+        encoded = source.read(MAX_RUN_STATE_BYTES + 1)
+    if len(encoded) > MAX_RUN_STATE_BYTES:
+        raise ValueError(
+            f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit: {path}"
+        )
+    return json.loads(encoded.decode("utf-8"))
 
 
 class SimulatedProcessCrash(OSError):
@@ -28,19 +49,166 @@ class StateStore:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.runs_directory = root / "runs"
+        self._lock_depth = 0
+        self._lock_owner: int | None = None
+        self._write_guard: Callable[[], None] | None = None
+        self._write_transaction: Callable[[], Any] | None = None
+
+    def _set_write_guard(
+        self,
+        guard: Callable[[], None] | None,
+        *,
+        transaction: Callable[[], Any] | None = None,
+    ) -> None:
+        """Set the short-transaction guard used before a Run state commit."""
+
+        self._write_guard = guard
+        self._write_transaction = transaction
 
     @contextmanager
     def locked(self) -> Iterator[None]:
+        owner = threading.get_ident()
+        if self._lock_owner == owner:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
         self.root.mkdir(parents=True, exist_ok=True)
         lock_path = self.root / ".lock"
         with lock_path.open("a+", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._lock_depth = 1
+            self._lock_owner = owner
             try:
                 yield
             finally:
+                self._lock_depth = 0
+                self._lock_owner = None
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def save_run(self, run_id: str, state: dict[str, Any]) -> None:
+        self._commit_run(
+            lambda: self._save_run_and_notify_unlocked(run_id, state)
+        )
+
+    @contextmanager
+    def _write_boundary(self) -> Iterator[None]:
+        if self._write_transaction is not None:
+            with self._write_transaction():
+                yield
+        else:
+            if self._write_guard is not None:
+                self._write_guard()
+            yield
+
+    def _commit_run(self, operation: Callable[[], _T]) -> _T:
+        retry_deadline = (
+            time.monotonic() + _STATE_COMMIT_RETRY_WINDOW_SECONDS
+        )
+        while True:
+            try:
+                # Acquire Task Control before Run state.  Every retry leaves
+                # both short-transaction contexts before trying again.
+                with self._write_boundary():
+                    with self.locked():
+                        return operation()
+            except TaskControlBusyError:
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                # Release the StateStore lock before retrying the short
+                # Task Control transaction.  Use a bounded interval rather
+                # than a fixed number of scheduler yields so a legal,
+                # millisecond-scale transaction can finish.
+                time.sleep(
+                    min(_STATE_COMMIT_RETRY_INTERVAL_SECONDS, remaining)
+                )
+
+    def create_run_if_absent(
+        self, run_id: str, state: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically create one Run or return the existing Run."""
+
+        custom_save = self._custom_save_run()
+        if custom_save is not None:
+            with self.locked():
+                existing = self.load_run(run_id)
+                if existing is not None:
+                    return existing, False
+                custom_save(run_id, state)
+                return deepcopy(state), True
+
+        def create() -> tuple[dict[str, Any], bool]:
+            existing = self.load_run(run_id)
+            if existing is not None:
+                return existing, False
+            self._save_run_and_notify_unlocked(run_id, state)
+            return deepcopy(state), True
+
+        return self._commit_run(create)
+
+    def create_run_if_unfinished_absent(
+        self,
+        repository: str,
+        parent_number: int,
+        run_id: str,
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically reuse an unfinished Parent Run or create one."""
+
+        custom_save = self._custom_save_run()
+        if custom_save is not None:
+            with self.locked():
+                unfinished = self.find_unfinished_runs(repository, parent_number)
+                if len(unfinished) > 1:
+                    run_ids = ", ".join(str(item.get("run_id")) for item in unfinished)
+                    raise ValueError(
+                        "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                        f"{run_ids}"
+                    )
+                if unfinished:
+                    return unfinished[0], False
+                return self.create_run_if_absent(run_id, state)
+
+        def create() -> tuple[dict[str, Any], bool]:
+            unfinished = self.find_unfinished_runs(repository, parent_number)
+            if len(unfinished) > 1:
+                run_ids = ", ".join(str(item.get("run_id")) for item in unfinished)
+                raise ValueError(
+                    "multiple unfinished Delivery Runs exist for this Parent Issue: "
+                    f"{run_ids}"
+                )
+            if unfinished:
+                return unfinished[0], False
+            existing = self.load_run(run_id)
+            if existing is not None:
+                return existing, False
+            self._save_run_and_notify_unlocked(run_id, state)
+            return deepcopy(state), True
+
+        return self._commit_run(create)
+
+    def _custom_save_run(self) -> Callable[[str, dict[str, Any]], None] | None:
+        instance_method = self.__dict__.get("save_run")
+        if callable(instance_method):
+            return cast(Callable[[str, dict[str, Any]], None], instance_method)
+        class_method = getattr(type(self), "save_run", None)
+        if class_method is not StateStore.save_run:
+            return self.save_run
+        return None
+
+    def _save_run_and_notify_unlocked(
+        self, run_id: str, state: dict[str, Any]
+    ) -> None:
+        self._save_run_unlocked(run_id, state)
+        self._after_run_saved()
+
+    def _after_run_saved(self) -> None:
+        """Hook for durable-write fault injection."""
+
+    def _save_run_unlocked(self, run_id: str, state: dict[str, Any]) -> None:
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         destination = self.runs_directory / f"{run_id}.json"
         previous = self.load_run(run_id)
@@ -53,6 +221,19 @@ class StateStore:
             continuation = durable_state.get("timeline_continuation")
             if isinstance(continuation, list):
                 state["timeline_continuation"] = continuation
+        serialized = (
+            json.dumps(
+                durable_state,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        if len(serialized.encode("utf-8")) > MAX_RUN_STATE_BYTES:
+            raise ValueError(
+                f"Run state exceeds {MAX_RUN_STATE_BYTES} byte persistence limit"
+            )
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.runs_directory,
             prefix=f".{run_id}.",
@@ -62,14 +243,7 @@ class StateStore:
         temporary_path = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-                json.dump(
-                    durable_state,
-                    temporary_file,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                temporary_file.write("\n")
+                temporary_file.write(serialized)
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
             os.replace(temporary_path, destination)
@@ -82,7 +256,7 @@ class StateStore:
         path = self.runs_directory / f"{run_id}.json"
         if not path.exists():
             return None
-        loaded: object = json.loads(path.read_text(encoding="utf-8"))
+        loaded = _load_bounded_json(path)
         if not isinstance(loaded, dict):
             raise ValueError(f"Invalid run state: {path}")
         return loaded
@@ -102,7 +276,7 @@ class StateStore:
             return None
         matches: list[dict[str, Any]] = []
         for path in self.runs_directory.glob("*.json"):
-            loaded: object = json.loads(path.read_text(encoding="utf-8"))
+            loaded = _load_bounded_json(path)
             if not isinstance(loaded, dict):
                 continue
             parent = loaded.get("parent")
@@ -123,7 +297,7 @@ class StateStore:
             return []
         runs: list[dict[str, Any]] = []
         for path in self.runs_directory.glob("*.json"):
-            loaded: object = json.loads(path.read_text(encoding="utf-8"))
+            loaded = _load_bounded_json(path)
             if not isinstance(loaded, dict):
                 continue
             parent = loaded.get("parent")
@@ -559,29 +733,145 @@ def _timeline_result(state: dict[str, Any]) -> object:
 
 
 def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
-    """Redact only error-bearing fields before a Run state reaches disk."""
+    """Bound diagnostics and exclude ephemeral or sensitive payloads from disk."""
 
     sanitized = _sanitize_error_value(value)
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
         raise ValueError("durable Run state must be a mapping")
+    diagnostics = sanitized.get("diagnostics")
+    if isinstance(diagnostics, list):
+        sanitized["diagnostics"] = [
+            _bound_diagnostic(item)
+            for item in diagnostics[:MAX_DIAGNOSTIC_ENTRIES]
+            if isinstance(item, dict)
+        ]
     return sanitized
 
 
-def _sanitize_error_value(value: object, *, diagnostic: bool = False) -> object:
+def _sanitize_error_value(
+    value: object, *, diagnostic: bool = False, path: tuple[str, ...] = ()
+) -> object:
     if isinstance(value, list):
-        return [_sanitize_error_value(item, diagnostic=diagnostic) for item in value]
+        return [
+            _sanitize_error_value(item, diagnostic=diagnostic, path=path)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return bounded_error(value) if diagnostic else redact_credentials(value)
     if not isinstance(value, dict):
         return value
     sanitized: dict[object, object] = {}
     for key, item in value.items():
+        if isinstance(key, str) and _is_ephemeral_payload_key(key):
+            continue
+        item_path = (*path, key) if isinstance(key, str) else path
+        if (
+            isinstance(key, str)
+            and _is_credential_key(key)
+            and not _is_durable_protocol_identity(item_path)
+        ):
+            sanitized[key] = "[REDACTED]"
+            continue
         is_diagnostic = key == "diagnostics"
-        if (key == "error" or key.endswith("_error")) and isinstance(item, str):
+        if diagnostic and isinstance(item, str):
             sanitized[key] = bounded_error(item)
-        elif key == "message" and diagnostic and isinstance(item, str):
+        elif isinstance(key, str) and (
+            key == "error" or key.endswith("_error")
+        ) and isinstance(item, str):
             sanitized[key] = bounded_error(item)
         else:
-            sanitized[key] = _sanitize_error_value(item, diagnostic=is_diagnostic)
+            sanitized[key] = _sanitize_error_value(
+                item,
+                diagnostic=diagnostic or is_diagnostic,
+                path=item_path,
+            )
     return sanitized
+
+
+def _normalized_key(value: str) -> str:
+    return value.casefold().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _is_ephemeral_payload_key(value: str) -> bool:
+    normalized = _normalized_key(value)
+    return (
+        normalized in {"env", "stdout", "stderr"}
+        or "environment" in normalized
+        or "transcript" in normalized
+        or "rawoutput" in normalized
+    )
+
+
+def _is_credential_key(value: str) -> bool:
+    normalized = _normalized_key(value)
+    return "credential" in normalized or normalized.endswith(
+        (
+            "authorization",
+            "token",
+            "secret",
+            "password",
+            "apikey",
+            "privatekey",
+            "cookie",
+        )
+    )
+
+
+def _is_durable_protocol_identity(path: tuple[str, ...]) -> bool:
+    return path in {
+        ("action_application_receipt", "target_executor", "process_start_token"),
+        (
+            "action_application_receipt", "target_executor", "worker",
+            "process_start_token",
+        ),
+    } or path[-2:] == ("candidate_commit_intent", "token") or (
+        bool(path)
+        and path[-1]
+        in {
+            "credential_availability",
+            "credential_failure_class",
+            "credential_http_status",
+            "previous_publication_authorization",
+        }
+    )
+
+
+def _diagnostic_size(value: dict[object, object]) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _truncate_utf8(value: str, limit: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    suffix = "...[truncated]"
+    budget = max(0, limit - len(suffix.encode("utf-8")))
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _bound_diagnostic(value: dict[object, object]) -> dict[object, object]:
+    if _diagnostic_size(value) <= MAX_DIAGNOSTIC_BYTES:
+        return value
+    bounded: dict[object, object] = {}
+    code = value.get("code")
+    message = value.get("message")
+    operator_gate = value.get("operator_gate")
+    if isinstance(code, str):
+        bounded["code"] = _truncate_utf8(code, 512)
+    if isinstance(message, str):
+        bounded["message"] = _truncate_utf8(message, 10 * 1024)
+    if isinstance(operator_gate, dict):
+        bounded["operator_gate"] = {
+            key: _truncate_utf8(item, 512)
+            for key, item in operator_gate.items()
+            if key in {"work_subject", "action_kind", "phase", "reason"}
+            and isinstance(item, str)
+        }
+    if _diagnostic_size(bounded) > MAX_DIAGNOSTIC_BYTES:
+        bounded["message"] = _truncate_utf8(str(bounded.get("message", "")), 8 * 1024)
+    return bounded
 
 
 class FaultInjectingStateStore(StateStore):
@@ -595,8 +885,7 @@ class FaultInjectingStateStore(StateStore):
         self.save_count = 0
         self.injected = False
 
-    def save_run(self, run_id: str, state: dict[str, Any]) -> None:
-        super().save_run(run_id, state)
+    def _after_run_saved(self) -> None:
         self.save_count += 1
         if not self.injected and self.save_count == self.crash_after_save:
             self.injected = True

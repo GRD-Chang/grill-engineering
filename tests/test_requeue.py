@@ -18,7 +18,8 @@ from agent_run.requeue import RequeueError, requeue_change_job
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
-from conftest import write_fixture
+from agent_run.task_control import TaskControlStore, TaskKey
+from conftest import seed_idle_control, seed_run, write_fixture
 from test_cli import issue, run_cli, stdout_json
 
 
@@ -407,6 +408,11 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
     states = StateStore(git_repo / ".agent-run")
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     state, _ = controller.start(1)
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        str(state["run_id"]),
+    )
     active = state["active_ticket_job"]
     assert isinstance(active, dict)
     active.update(
@@ -516,7 +522,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
@@ -577,7 +583,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["crash_after_ensure_run_branch_once"] = True
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    blocked_start = run_cli(git_repo, fixture, "start", "1")
+    blocked_start = seed_run(git_repo, fixture, "1")
 
     assert blocked_start.returncode == 2
     assert stdout_json(blocked_start)["status"] == "blocked"
@@ -597,7 +603,7 @@ def test_requeue_blocks_an_external_close_during_retirement(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
     state = states.load_run(run_id)
@@ -665,7 +671,7 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
     state = states.load_run(run_id)
@@ -698,7 +704,7 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
         issues={"7": issue(7)},
         delivery={"pull_requests": []},
     )
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
@@ -737,18 +743,24 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
 
     waiting = run_cli(git_repo, fixture, "requeue", run_id)
 
-    assert waiting.returncode == 0, waiting.stderr
-    assert stdout_json(waiting)["status"] == "waiting_external"
+    assert waiting.returncode == 2, waiting.stderr
+    output = stdout_json(waiting)
+    assert output["status"] == "supervision_timeout"
+    assert output["action"]["status"] == "applied"
     persisted = states.load_run(run_id)
     assert persisted is not None
-    assert persisted["terminal_kind"] == "waiting_external"
-    assert persisted["diagnostics"][0]["code"] == "missing_pull_request"
-    assert persisted["diagnostics"][0]["waiting_for"] == "GitHub authority refresh"
+    assert persisted["terminal_kind"] == "supervision_timeout"
+    assert persisted["diagnostics"][0]["code"] == "supervision_timeout"
+    assert persisted["diagnostics"][0]["last_error"]["code"] == "missing_pull_request"
+    receipt = persisted["action_application_receipt"]
+    assert receipt["kind"] == "requeue"
+    delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
+    assert delivery.get("mutations", []) == []
 
 
 def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     states = StateStore(git_repo / ".agent-run")
     state = states.load_run(run_id)
     assert state is not None
@@ -781,30 +793,29 @@ def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) ->
     ]
     states.save_run(run_id, state)
     data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["supervision_clock_multiplier"] = 1
     data["repository_read_failures"] = [
         {"code": "github_read_failed", "message": "repository unavailable"}
+        for _ in range(32)
     ]
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
     waiting = run_cli(git_repo, fixture, "requeue", run_id)
 
-    assert waiting.returncode == 0, waiting.stderr
-    assert stdout_json(waiting)["status"] == "waiting_external"
+    assert waiting.returncode == 2, waiting.stderr
+    assert stdout_json(waiting)["status"] == "supervision_timeout"
     persisted = states.load_run(run_id)
     assert persisted is not None
     assert persisted["github_refresh_pending"] is True
-    assert persisted["diagnostics"][0] == {
-        "code": "github_read_failed",
-        "message": "repository unavailable",
-        "waiting_for": "GitHub repository binding",
-    }
+    assert persisted["diagnostics"][0]["code"] == "supervision_timeout"
+    assert persisted["diagnostics"][0]["last_error"]["code"] == "github_read_failed"
 
 
 def test_deliver_cannot_restart_a_stale_generation_without_requeue(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     states = StateStore(git_repo / ".agent-run")
     state = states.load_run(run_id)
@@ -901,7 +912,7 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
     state = states.load_run(run_id)

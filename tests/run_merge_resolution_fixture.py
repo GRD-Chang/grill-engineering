@@ -487,8 +487,13 @@ class MergeResolutionFixture:
                 Path(str(prior_job["repair_checkout"]))
             )
 
-    def assert_completed(self, result: dict[str, Any]) -> None:
-        assert result["status"] == "run_publication_pending", result
+    def assert_completed(
+        self,
+        result: dict[str, Any],
+        *,
+        expected_status: str = "run_publication_pending",
+    ) -> None:
+        assert result["status"] == expected_status, result
         run = result["run_acceptance"]
         candidate = str(run["candidate_sha"])
         publication = str(run["publication_sha"])

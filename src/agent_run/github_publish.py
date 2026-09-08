@@ -29,6 +29,12 @@ class GhGitHubPublisher:
     def __init__(self, repository: str, git: GitRepository) -> None:
         self.repository = repository
         self.git = git
+        self._write_guard: Callable[[], None] | None = None
+
+    def _set_write_guard(self, guard: Callable[[], None]) -> None:
+        """Bind the owning Executor check to each actual mutation dispatch."""
+
+        self._write_guard = guard
 
     def ensure_change_branch(
         self,
@@ -48,7 +54,7 @@ class GhGitHubPublisher:
             raise GitError("Change ref has a foreign identity")
         if expected_remote_sha != expected_base_sha:
             raise GitError("Change ref is missing after publication")
-        created = run_write_command(
+        created = self._write_command(
             [
                 "git",
                 "push",
@@ -56,7 +62,6 @@ class GhGitHubPublisher:
                 f"{expected_base_sha}:refs/heads/{branch}",
                 f"--force-with-lease=refs/heads/{branch}:",
             ],
-            cwd=self.git.root,
         )
         if created.returncode != 0:
             if self._remote_branch_sha(branch) == expected_base_sha:
@@ -76,9 +81,8 @@ class GhGitHubPublisher:
             raise GitError(remote.stderr.strip() or "could not inspect remote branch")
         if not remote.stdout.strip():
             return
-        deleted = run_write_command(
+        deleted = self._write_command(
             ["git", "push", "origin", "--delete", branch],
-            cwd=self.git.root,
         )
         if deleted.returncode != 0:
             raise GitError(deleted.stderr.strip() or "could not delete remote branch")
@@ -288,37 +292,12 @@ class GhGitHubPublisher:
             "## Run Publication Record\n\n```json\n"
             f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n```"
         )
-        comments = self._json(
-            "api", f"repos/{self.repository}/issues/{pr_number}/comments", "--paginate"
+        self._record_marker_comment(
+            pr_number=pr_number,
+            marker=_RUN_PUBLICATION_MARKER,
+            body=body,
+            label="Run publication record",
         )
-        if not isinstance(comments, list):
-            raise GitHubReadError(
-                "github_invalid_response", "comments must be an array"
-            )
-        existing = next(
-            (
-                _mapping(comment)
-                for comment in comments
-                if _RUN_PUBLICATION_MARKER in str(_mapping(comment).get("body", ""))
-            ),
-            None,
-        )
-        if existing is None:
-            self._json(
-                "api",
-                f"repos/{self.repository}/issues/{pr_number}/comments",
-                "-f",
-                f"body={body}",
-            )
-        else:
-            self._json(
-                "api",
-                "--method",
-                "PATCH",
-                f"repos/{self.repository}/issues/comments/{_integer(existing, 'id')}",
-                "-f",
-                f"body={body}",
-            )
 
     def normal_merge(
         self,
@@ -398,16 +377,30 @@ class GhGitHubPublisher:
             )
         )
         marker = f"<!-- agent-run:{run_id}:parent-completed -->"
-        comments = issue.get("comments")
-        already_recorded = isinstance(comments, list) and any(
-            marker in str(_mapping(comment).get("body", "")) for comment in comments
+        body = (
+            f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
+            f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
+            "is verified on the default branch."
         )
-        if not already_recorded:
-            body = (
-                f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
-                f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
-                "is verified on the default branch."
+        comments = issue.get("comments")
+        marker_comments = (
+            [
+                _mapping(comment)
+                for comment in comments
+                if marker in str(_mapping(comment).get("body", ""))
+            ]
+            if isinstance(comments, list)
+            else []
+        )
+        if marker_comments and not any(
+            comment.get("body") == body for comment in marker_comments
+        ):
+            raise GitHubReadError(
+                "github_write_outcome_unknown",
+                "Parent Issue completion marker body does not match the intent",
             )
+        already_recorded = bool(marker_comments)
+        if not already_recorded:
             self._require(
                 "issue",
                 "comment",
@@ -424,6 +417,30 @@ class GhGitHubPublisher:
                 str(parent_number),
                 "--repo",
                 self.repository,
+            )
+        observed = _mapping(
+            self._json(
+                "issue",
+                "view",
+                str(parent_number),
+                "--repo",
+                self.repository,
+                "--json",
+                "state,comments,updatedAt",
+            )
+        )
+        observed_comments = observed.get("comments")
+        if (
+            observed.get("state") != "CLOSED"
+            or not isinstance(observed_comments, list)
+            or not any(
+                _mapping(comment).get("body") == body
+                for comment in observed_comments
+            )
+        ):
+            raise GitHubReadError(
+                "github_write_outcome_unknown",
+                "Parent Issue close remote readback did not match the intent",
             )
 
     def abandon_run_pr(self, pr_number: int) -> None:
@@ -449,7 +466,7 @@ class GhGitHubPublisher:
             return
         if remote_sha is not None:
             raise GitError("Run ref has a foreign identity")
-        pushed = run_write_command(
+        pushed = self._write_command(
             [
                 "git",
                 "push",
@@ -457,7 +474,6 @@ class GhGitHubPublisher:
                 f"{expected_sha}:refs/heads/{branch}",
                 f"--force-with-lease=refs/heads/{branch}:",
             ],
-            cwd=self.git.root,
         )
         if pushed.returncode != 0:
             if self._remote_branch_sha(branch) == expected_sha:
@@ -485,7 +501,7 @@ class GhGitHubPublisher:
             f"{head_sha}:refs/heads/{branch}",
             f"--force-with-lease=refs/heads/{branch}:{expected_remote_sha}",
         ]
-        pushed = run_write_command(arguments, cwd=self.git.root)
+        pushed = self._write_command(arguments)
         if pushed.returncode != 0:
             if self._remote_branch_sha(branch) == head_sha:
                 return
@@ -1093,58 +1109,34 @@ class GhGitHubPublisher:
             f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n"
             "```"
         )
-        comments = self._json(
-            "api",
-            f"repos/{self.repository}/issues/{pr_number}/comments",
-            "--paginate",
+        self._record_marker_comment(
+            pr_number=pr_number,
+            marker=_ACCEPTANCE_MARKER,
+            body=body,
+            label="Acceptance record",
         )
-        if not isinstance(comments, list):
-            raise GitHubReadError(
-                "github_invalid_response", "comments must be an array"
-            )
-        existing = next(
-            (
-                _mapping(comment)
-                for comment in comments
-                if _ACCEPTANCE_MARKER in str(_mapping(comment).get("body", ""))
-            ),
-            None,
-        )
-        if existing is None:
-            self._json(
-                "api",
-                f"repos/{self.repository}/issues/{pr_number}/comments",
-                "-f",
-                f"body={body}",
-            )
-        else:
-            comment_id = _integer(existing, "id")
-            self._json(
-                "api",
-                "--method",
-                "PATCH",
-                f"repos/{self.repository}/issues/comments/{comment_id}",
-                "-f",
-                f"body={body}",
-            )
 
     def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         body = _render_agent_run_status(status)
-        comments = self._json(
-            "api",
-            f"repos/{self.repository}/issues/{pr_number}/comments",
-            "--paginate",
-            "--slurp",
+        self._record_marker_comment(
+            pr_number=pr_number,
+            marker=_AGENT_RUN_STATUS_MARKER,
+            body=body,
+            label="Agent Run status",
         )
-        comments = _flatten_pages(comments, "comments")
+
+    def _record_marker_comment(
+        self, *, pr_number: int, marker: str, body: str, label: str
+    ) -> None:
+        """Apply one marker-owned comment and prove its exact remote body."""
+
+        comments = self._marker_comments(pr_number)
         existing = next(
-            (
-                _mapping(comment)
-                for comment in comments
-                if _AGENT_RUN_STATUS_MARKER in str(_mapping(comment).get("body", ""))
-            ),
+            (comment for comment in comments if marker in str(comment.get("body", ""))),
             None,
         )
+        if existing is not None and existing.get("body") == body:
+            return
         if existing is None:
             self._json(
                 "api",
@@ -1161,6 +1153,24 @@ class GhGitHubPublisher:
                 "-f",
                 f"body={body}",
             )
+        if not any(
+            comment.get("body") == body for comment in self._marker_comments(pr_number)
+        ):
+            raise GitHubReadError(
+                "github_write_outcome_unknown",
+                f"{label} remote readback did not match the intended body",
+            )
+
+    def _marker_comments(self, pr_number: int) -> list[dict[str, Any]]:
+        comments = self._json(
+            "api",
+            f"repos/{self.repository}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
+        )
+        return [
+            _mapping(comment) for comment in _flatten_pages(comments, "comments")
+        ]
 
     def has_supersession_close_receipt(
         self, pr_number: int, generation: object, close_nonce: object
@@ -1294,9 +1304,8 @@ class GhGitHubPublisher:
         )
 
     def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
-        fetched = run_read_command(
-            ["git", "fetch", "--no-tags", "origin", run_branch],
-            cwd=self.git.root,
+        fetched = self._write_command(
+            ["git", "fetch", "--no-tags", "origin", run_branch]
         )
         if fetched.returncode != 0:
             raise GitError(
@@ -1305,11 +1314,9 @@ class GhGitHubPublisher:
         fetched_sha = self.git.resolve("FETCH_HEAD")
         if fetched_sha != integrated_sha:
             raise GitError("remote Run Branch does not match integrated commit")
-        subprocess.run(
-            ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha],
-            cwd=self.git.root,
-            check=True,
-        )
+        self._write_command(
+            ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha]
+        ).check_returncode()
 
     def prepare_primary_ticket_close(
         self,
@@ -2088,6 +2095,18 @@ class GhGitHubPublisher:
         command = ["gh", *arguments]
         if retry if retry is not None else _is_read_command(arguments):
             return run_read_command(command, cwd=self.git.root)
+        if (
+            arguments[:1] == ("api",)
+            and "--method" in arguments
+            and arguments[arguments.index("--method") + 1 :][:1] == ("GET",)
+        ):
+            # Explicit GET keeps its existing single-dispatch readback behavior.
+            return run_write_command(command, cwd=self.git.root)
+        return self._write_command(command)
+
+    def _write_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        if self._write_guard is not None:
+            self._write_guard()
         return run_write_command(command, cwd=self.git.root)
 
 

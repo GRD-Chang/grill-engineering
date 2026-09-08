@@ -17,7 +17,8 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_thread_identity import prior_thread_identities
 
-from conftest import write_fixture
+from conftest import seed_idle_control, seed_run, write_fixture
+from agent_run.task_control import TaskControlStore, TaskKey
 from test_cli import failed_invocation, run_internal_stage, run_cli, stdout_json
 
 from run_acceptance_test_support import (
@@ -102,7 +103,7 @@ def test_accept_run_cli_enters_publication_pending_after_fresh_run_review(
         ),
         encoding="utf-8",
     )
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
@@ -188,6 +189,12 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        str(state["run_id"]),
+        state_dir=states.root,
+    )
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     run_id = str(state["run_id"])
@@ -322,9 +329,15 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert cleanup["items"][0]["checkout"] == str(checkout)
     assert "agent-run run 1" in cleanup["items"][0]["recovery_action"]
     assert "agent-run run 1" in output["next_action"]
-    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
-        delivery_before
+    delivery_after_resume = json.loads(fixture.read_text(encoding="utf-8"))[
+        "delivery"
+    ]
+    expected_delivery = deepcopy(delivery_before)
+    expected_delivery["published_branches"].pop(ticket_branch)
+    expected_delivery["mutations"].append(
+        {"action": "delete_managed_branch", "branch": ticket_branch}
     )
+    assert delivery_after_resume == expected_delivery
 
     no_agents = git_repo / "no-agents.json"
     no_agents.write_text("{}", encoding="utf-8")
@@ -344,6 +357,9 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert dirty_state["retired_semantic_attempt_owners"] == persisted[
         "retired_semantic_attempt_owners"
     ]
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == (
+        delivery_after_resume
+    )
     assert tracked.is_file()
     assert untracked.is_file()
 

@@ -28,6 +28,15 @@ def status_progress_view(
         worker if isinstance(worker, dict) else None,
         current_object=current_object,
     )
+    executor_control = audit.get("executor_control")
+    if (
+        current_agent is not None
+        and isinstance(executor_control, dict)
+        and executor_control.get("activity") != "running"
+    ):
+        # Run state is still trusted history, but it cannot prove that the
+        # recorded Agent process remains active without live ownership.
+        current_agent = {**current_agent, "is_active": False}
     return {
         "repository": state.get("repository"),
         "parent": {
@@ -98,6 +107,12 @@ def print_status_progress(
         )
 
     print("\n当前工作")
+    executor_control = audit.get("executor_control")
+    if (
+        isinstance(executor_control, dict)
+        and executor_control.get("activity") == "unknown"
+    ):
+        print("  Agent 活跃状态: 无法确认")
     agent = view["current_agent"]
     if agent is None:
         print("  当前没有运行中的 Agent")

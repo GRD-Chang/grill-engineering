@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_run.executor_host import _process_start_token
 from cli_fixtures import run_agents
 from test_cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, publication
@@ -163,12 +165,13 @@ def _run_until_pending_window(
                 )
             time.sleep(0.01)
     except BaseException:
-        _interrupt_run(process)
+        _interrupt_run(process, repo)
         raise
-    _interrupt_run(process)
+    _interrupt_run(process, repo)
     pytest.fail("agent-run run did not reach its pending-window barrier before timeout")
 
-def _interrupt_run(process: subprocess.Popen[str]) -> None:
+
+def _interrupt_run(process: subprocess.Popen[str], repo: Path) -> None:
     if process.poll() is None:
         process.terminate()
     try:
@@ -177,6 +180,60 @@ def _interrupt_run(process: subprocess.Popen[str]) -> None:
         process.kill()
         process.communicate(timeout=3)
     assert process.returncode is not None
+    executors: list[tuple[int, str]] = []
+    for path in (repo / ".agent-run" / "task-control").glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        executor = record.get("executor")
+        if (
+            isinstance(executor, dict)
+            and executor.get("status") in {"starting", "running"}
+            and type(executor.get("pid")) is int
+            and isinstance(executor.get("process_start_token"), str)
+        ):
+            executors.append(
+                (executor["pid"], executor["process_start_token"])
+            )
+    for pid, start_token in executors:
+        if not _fixture_process_matches(pid, start_token):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 3
+    for pid, start_token in executors:
+        while time.monotonic() < deadline and _fixture_process_matches(
+            pid, start_token
+        ):
+            time.sleep(0.01)
+        if _fixture_process_matches(pid, start_token):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        kill_deadline = time.monotonic() + 3
+        while time.monotonic() < kill_deadline and _fixture_process_matches(
+            pid, start_token
+        ):
+            time.sleep(0.01)
+        assert not _fixture_process_matches(pid, start_token)
+
+
+def _fixture_process_matches(pid: int, start_token: str) -> bool:
+    if _process_start_token(pid) != start_token:
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return False
+    closing = raw.rfind(")")
+    if closing < 0:
+        return False
+    fields = raw[closing + 2 :].split()
+    return bool(fields) and fields[0] != "Z"
 
 def _repair_agents(path: Path, *, repair_generations: int) -> Path:
     agents = run_agents(path)

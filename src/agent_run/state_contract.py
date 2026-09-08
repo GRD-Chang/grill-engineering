@@ -51,6 +51,7 @@ from agent_run.semantic_attempt import (
     require_semantic_attempt,
     require_semantic_attempt_record,
 )
+from agent_run.task_control import TASK_CONTROL_PROTOCOL
 
 
 _CHANGE_JOB_PHASES = frozenset(phase.value for phase in TicketPhase)
@@ -117,6 +118,10 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     if "schema_version" in state:
         raise IncompatibleRunStateError(
             "legacy state is incompatible with the Invocation/Generation contract"
+        )
+    if state.get("lifecycle_action_protocol") != TASK_CONTROL_PROTOCOL:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Lifecycle Action protocol"
         )
     if type(state.get("branch_authority_protocol")) is not int or state.get(
         "branch_authority_protocol"
@@ -206,6 +211,16 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError("legacy state has an invalid frontier")
     if not all(isinstance(event, dict) for event in state["timeline"]):
         raise IncompatibleRunStateError("legacy state has an invalid timeline")
+    from agent_run.state import (
+        MAX_DIAGNOSTIC_ENTRIES,
+        MAX_TIMELINE_CONTINUATION_EVENTS,
+        MAX_TIMELINE_EVENTS,
+    )
+
+    if len(state["timeline"]) > MAX_TIMELINE_EVENTS:
+        raise IncompatibleRunStateError("legacy state has an oversized timeline")
+    if len(state["diagnostics"]) > MAX_DIAGNOSTIC_ENTRIES:
+        raise IncompatibleRunStateError("legacy state has oversized diagnostics")
     timeline_continuation = state.get("timeline_continuation", [])
     if not isinstance(timeline_continuation, list) or not all(
         isinstance(event, dict) for event in timeline_continuation
@@ -213,8 +228,6 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an invalid timeline_continuation"
         )
-    from agent_run.state import MAX_TIMELINE_CONTINUATION_EVENTS
-
     if len(timeline_continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
         raise IncompatibleRunStateError(
             "legacy state has an oversized timeline_continuation"

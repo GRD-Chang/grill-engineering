@@ -7,7 +7,7 @@ import pytest
 
 from cli_fixtures import run_agents
 from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
+from test_cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
 from test_cli_delivery import (
     HUMAN_BLOCKER,
     passing_acceptance,
@@ -411,7 +411,7 @@ def test_run_repair_resume_preserves_partial_worker_edits_and_thread(
     assert recovered.returncode == 0, recovered.stderr
     completed = load_only_run_state(git_repo)
     completed_run = completed["run_acceptance"]
-    assert stdout_json(recovered)["status"] == "run_publication_pending"
+    assert stdout_json(recovered)["status"] == "run_approval_pending"
     assert completed_run["repair_generation"] == generation
     assert completed_run["repair_cycle"]["status"] == "promoted"
     assert completed_run["repair_cycle"]["code_modification_attempts"] == 1
@@ -435,7 +435,7 @@ def test_run_supervises_repair_trigger_live_pr_readback(
         {"required_checks": ["fail"], "check_position": 0}
     )
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    queued = run_cli(git_repo, fixture, "approve", run_id)
+    queued = run_internal_stage(git_repo, fixture, "approve", run_id)
     assert stdout_json(queued)["status"] == "run_acceptance_pending"
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
@@ -455,7 +455,12 @@ def test_run_supervises_repair_trigger_live_pr_readback(
     )
 
     paused = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(recovery_agents)
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(recovery_agents),
     )
 
     assert paused.returncode == 2
@@ -696,8 +701,8 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
 
     waiting = run_cli(git_repo, fixture, "approve", run_id)
-    assert waiting.returncode == 0
-    assert stdout_json(waiting)["status"] == "waiting_external"
+    assert waiting.returncode == 2
+    assert stdout_json(waiting)["status"] == "supervision_timeout"
     waiting_state = load_only_run_state(git_repo)
     grant = waiting_state["run_publication"]["approval_grant"]
     assert waiting_state["run_acceptance"].get("repair_generation", 0) == 0
@@ -706,13 +711,8 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
         for invocation in waiting_state["agent_invocation_history"]
     )
 
-    paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    assert paused.returncode == 2
-    paused_state = load_only_run_state(git_repo)
-    assert paused_state["status"] == "supervision_timeout"
-    assert paused_state["supervision_wait"]["kind"] == "github_convergence"
-    assert paused_state["run_publication"]["approval_grant"] == grant
-    assert paused_state["run_acceptance"].get("repair_generation", 0) == 0
+    assert waiting_state["supervision_wait"]["kind"] == "github_convergence"
+    assert waiting_state["run_publication"]["approval_grant"] == grant
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery"].update(

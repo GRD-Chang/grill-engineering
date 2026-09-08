@@ -10,7 +10,7 @@ import pytest
 
 from agent_run.semantic_attempt import canonical_fingerprint
 from cli_fixtures import run_agents as _run_agents
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import (
     git_fetch_failure_wrapper,
     load_only_run_state,
@@ -118,7 +118,7 @@ def test_displayed_final_approval_selects_the_unique_active_run(
     assert stdout_json(first_approved)["status"] == "completed"
 
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    second_start = run_cli(git_repo, fixture, "start", "1", "--new-run")
+    second_start = seed_run(git_repo, fixture, reuse_existing=False)
     second_run_id = str(stdout_json(second_start)["run_id"])
     assert second_run_id != first_run_id
     second_agents = _run_agents(git_repo / "second-agents.json")
@@ -358,7 +358,7 @@ def test_history_renders_device_timezone_and_keeps_json_events_in_utc(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state["timeline"] = [
         {
@@ -506,6 +506,7 @@ def test_run_drives_ticket_lifecycle_through_the_internal_driver(
             str(fixture),
             "--agent-fixture",
             str(agents),
+            "--json",
         ]
     )
     output = capsys.readouterr()
@@ -931,19 +932,17 @@ def test_run_supervises_initial_repository_read_lag_in_one_call(
     assert state["base"]["branch"] == "main"
 
 
-@pytest.mark.parametrize("command", ["start", "run"])
 @pytest.mark.parametrize("legacy_protocol", [None, 1, 2.0, "2"])
 def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
     git_repo: Path,
     tmp_path: Path,
-    command: str,
     legacy_protocol: object,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     agents = _run_agents(git_repo / "agents.json")
     locator_home = tmp_path / "locator-home"
     locator_env = {"XDG_STATE_HOME": str(locator_home)}
-    started = run_cli(git_repo, fixture, "start", "1", extra_env=locator_env)
+    started = seed_run(git_repo, fixture, "1", extra_env=locator_env)
     assert started.returncode == 0, started.stderr
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     legacy = json.loads(state_path.read_text(encoding="utf-8"))
@@ -979,9 +978,7 @@ def test_legacy_run_is_rejected_before_initial_repository_wait_mutates_it(
     git_config_before = (git_repo / ".git" / "config").read_bytes()
     agent_before = agents.read_text(encoding="utf-8")
 
-    arguments = (command, "1")
-    if command == "run":
-        arguments += ("--agent-fixture", str(agents))
+    arguments = ("run", "1", "--agent-fixture", str(agents))
     rejected = run_cli(git_repo, fixture, *arguments, extra_env=locator_env)
 
     assert rejected.returncode == 2
@@ -1011,7 +1008,7 @@ def test_run_routes_a_structured_graph_contradiction_to_a_typed_human_boundary(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery_graph_read_failures"] = [
         {"code": "invalid_parent", "message": "parent graph contradicts itself"}
@@ -1190,7 +1187,7 @@ def test_status_and_history_show_started_development_attempt(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_cli(
         git_repo,
@@ -1224,7 +1221,7 @@ def test_status_and_history_show_started_development_attempt(
 
 def test_status_offers_run_for_automatic_recovery_states(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
 
@@ -1240,7 +1237,7 @@ def test_premature_approve_does_not_mark_run_as_execution_failed(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["error"] = {
         "code": "github_timeout",
@@ -1291,7 +1288,7 @@ def test_run_supervises_initial_graph_read_lag_in_one_call(git_repo: Path) -> No
 def test_run_restarts_a_paused_supervision_window(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
@@ -1345,7 +1342,7 @@ def test_run_supervises_read_failures_after_supervision_timeout(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
@@ -1377,7 +1374,7 @@ def test_run_repauses_after_a_fresh_external_wait_window(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(
@@ -1532,7 +1529,9 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
         str(agents),
     )
     assert resumed.returncode == 0, resumed.stdout
-    assert stdout_json(resumed)["status"] == "active"
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    recovered_state = load_only_run_state(git_repo)
+    recovered_fixture = fixture.read_text(encoding="utf-8")
 
     recovered = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
@@ -1540,6 +1539,17 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
 
     assert recovered.returncode == 0, recovered.stdout
     assert stdout_json(recovered)["status"] == "run_approval_pending"
+    held_state = load_only_run_state(git_repo)
+    assert held_state["ticket_jobs"] == recovered_state["ticket_jobs"]
+    assert held_state["run_publication"] == recovered_state["run_publication"]
+    assert (
+        held_state["agent_invocation_history"]
+        == recovered_state["agent_invocation_history"]
+    )
+    assert held_state["review_budget_protocol"] == recovered_state[
+        "review_budget_protocol"
+    ]
+    assert fixture.read_text(encoding="utf-8") == recovered_fixture
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert len(fixture_data["delivery"]["pull_requests"]) == 2
     assert fixture_data["delivery"]["closed_issues"] == [3]
@@ -1655,13 +1665,26 @@ def test_ticket_linked_branch_display_crash_is_not_retried_on_recovery(
         str(agents),
     )
     assert resumed.returncode == 0, resumed.stdout
-    assert stdout_json(resumed)["status"] == "active"
+    assert stdout_json(resumed)["status"] == "run_approval_pending"
+    recovered_state = load_only_run_state(git_repo)
+    recovered_fixture = fixture.read_text(encoding="utf-8")
 
     recovered = run_cli(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
     )
     assert recovered.returncode == 0, recovered.stdout
     assert stdout_json(recovered)["status"] == "run_approval_pending"
+    held_state = load_only_run_state(git_repo)
+    assert held_state["ticket_jobs"] == recovered_state["ticket_jobs"]
+    assert held_state["run_publication"] == recovered_state["run_publication"]
+    assert (
+        held_state["agent_invocation_history"]
+        == recovered_state["agent_invocation_history"]
+    )
+    assert held_state["review_budget_protocol"] == recovered_state[
+        "review_budget_protocol"
+    ]
+    assert fixture.read_text(encoding="utf-8") == recovered_fixture
     job = load_only_run_state(git_repo)["ticket_jobs"]["3"]
     assert job["linked_branch_display"] == {
         "display_attempted": True,

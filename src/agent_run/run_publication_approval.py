@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from agent_run.approval_grant import (
@@ -32,270 +33,273 @@ from agent_run.run_publication_shared import RunPublicationShared
 class RunPublicationApproval(RunPublicationShared):
     """Handle approval, revision, abandonment, and closeout of a Final Run PR."""
 
-    def approve(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            if not self._refresh_currentness(state):
-                return self._save(state)
-            publication = self._publication_state(state)
-            recovering_merge = (
-                publication["phase"] == "waiting_external"
-                and isinstance(publication.get("merge_intent"), dict)
-            )
-            if publication["phase"] == "merged":
-                return self._complete_parent_closeout(state)
-            if publication["phase"] not in {
-                "ready_for_approval",
-                "waiting_checks",
-                "waiting_external",
-            }:
-                raise ValueError("Run Publication is not ready for explicit approval")
-            run = self._mapping(state, "run_acceptance")
-            record = self._mapping(publication, "record")
-            pr_number = self._integer(publication, "pr_number")
-            try:
-                live = self.github.live_pull_request(pr_number)
-            except (GitHubReadError, OSError, TimeoutError) as error:
-                if recovering_merge:
-                    return self._wait_for_merge_convergence(
-                        state, publication, str(error)
-                    )
-                if isinstance(error, GitHubReadError) and not is_github_convergence_error(
-                    error.code
-                ):
-                    raise
-                publication["required_checks_observation_status"] = "unavailable"
-                publication["phase"] = "waiting_external"
-                if isinstance(error, GitHubReadError):
-                    code = error.code
-                    message = error.message
-                else:
-                    code = "github_final_run_pr_observation_failed"
-                    message = str(error)
-                wait_for_github_convergence(
-                    state,
-                    code=code,
-                    message=message,
-                    waiting_for=f"Run PR #{pr_number} Required Checks observation",
-                )
-                ensure_supervision_window(state)
-                return self._save(state)
-            run_head = self.git.resolve(str(state["run_branch"]))
-            if live.get("state") == "MERGED":
-                self._require_persisted_merge_intent(
-                    publication, state, record, pr_number, run_head
-                )
-                # A merged PR's live base SHA is now the advanced default ref;
-                # the original base SHA is verified below as the first parent.
-                self._require_final_pr_identity(
-                    live=live,
-                    run_head=run_head,
-                    branch=str(state["run_branch"]),
-                    repository=str(state["repository"]),
-                    expected_base_sha=None,
-                )
-                integrated = live.get("integrated_sha")
-                if (
-                    isinstance(integrated, str)
-                    and record.get("pr_head_sha") == live.get("head_sha")
-                    and live.get("integrated_parents")
-                    == [record.get("default_head_sha"), record.get("run_head_sha")]
-                    and live.get("integrated_tree") == record.get("expected_merge_tree")
-                ):
-                    return self._mark_merged_and_close_parent(state, integrated)
-                return self._block_merged_boundary(
-                    state,
-                    "merged final Run PR does not match its reviewed publication boundary",
-                )
-            try:
-                self._require_final_pr_identity(
-                    live=live,
-                    run_head=run_head,
-                    branch=str(state["run_branch"]),
-                    repository=str(state["repository"]),
-                    expected_base_sha=self.default_head_sha,
-                )
-            except GitHubReadError as error:
-                if (
-                    recovering_merge
-                    and error.code == "foreign_run_pr"
-                    and isinstance(publication.get("approval_grant"), dict)
-                ):
-                    return self._invalidate_for_fresh_acceptance(state)
-                raise
-            if record.get("default_head_sha") != self.default_head_sha:
-                return self._handle_default_drift(state)
-            if not self._acceptance_is_current(state, run):
-                return self._invalidate_for_fresh_acceptance(state)
-            if (
-                record.get("pr_head_sha") != live.get("head_sha")
-                or record.get("run_head_sha") != run_head
-                or record.get("default_head_sha") != self.default_head_sha
-                or record.get("ticket_completion_records")
-                != ticket_completion_records(state)
-                or live.get("base_sha") != self.default_head_sha
-                or live.get("base_branch") != self.default_branch
-            ):
-                return self._invalidate_for_fresh_acceptance(state)
-            authority = self._approval_grant_authority(
-                state, run, pr_number, run_head
-            )
-            if recovering_merge and not grant_matches(
-                publication.get("approval_grant"), authority
-            ):
-                return self._invalidate_for_fresh_acceptance(state)
-            if not recovering_merge and not grant_matches(
-                publication.get("approval_grant"), authority
-            ):
-                publication["approval_grant"] = create_grant(authority)
-                self._save(state)
-            if live.get("state") != "OPEN":
-                raise GitHubReadError(
-                    "final_run_pr_not_open",
-                    "Final Run PR is not open at the approved publication boundary",
-                )
-            if live.get("mergeable") is not True:
-                return self._preview_current_merge(state)
-            observation = self._observe_required_checks(
-                state, run, publication, pr_number, run_head
-            )
-            if observation is None:
-                return state
-            checks = str(observation["result"])
-            self._record_agent_run_status(pr_number, run, run_head, checks)
-            if checks == "fail":
-                self._save(state)
-                evidence = self._required_check_evidence(
-                    state, publication, pr_number, run_head
-                )
-                if evidence is None:
-                    return state
-                if not self._revalidate_final_run_pr_before_repair(
-                    state, publication, pr_number, run_head
-                ):
-                    return state
-                if not (
-                    failure_evidence_matches_observation(
-                        observation,
-                        evidence,
-                        pr_number=pr_number,
-                        head_sha=run_head,
-                    )
-                    and is_explicitly_repairable_code_failure(evidence)
-                ):
-                    supervise_unrepairable_check_failure(
-                        state,
-                        publication,
-                        phase="waiting_external",
-                        waiting_for=(
-                            f"Run PR #{pr_number} Required Check repairability"
-                        ),
-                    )
-                    return self._save(state)
-                return self._save(
-                    self._queue_repair(
-                        state,
-                        repair_source="required_checks",
-                        ci_evidence=evidence,
-                    )
-                )
-            if checks == "pending":
-                publication["phase"] = "waiting_checks"
-                state["status"] = "waiting_checks"
-                state["terminal_kind"] = "waiting_checks"
-                state["diagnostics"] = []
-                ensure_supervision_window(state)
-                return self._save(state)
-            if checks == "unknown":
-                publication["required_checks_observation_status"] = "unknown"
-                publication["phase"] = "waiting_external"
-                wait_for_github_convergence(
-                    state,
-                    code="github_checks_observation_unknown",
-                    message="GitHub Required Checks returned an unknown state",
-                    waiting_for=f"Run PR #{pr_number} Required Checks observation",
-                )
-                ensure_supervision_window(state)
-                return self._save(state)
-            if not grant_matches(publication.get("approval_grant"), authority):
-                return self._invalidate_for_fresh_acceptance(state)
-            if not self._revalidate_final_run_pr_before_merge(
-                state, publication, pr_number, run_head
-            ):
-                return state
-            merge_intent = self._prepare_merge_intent(
-                publication, state, record, pr_number, run_head
-            )
-            attempts = merge_intent["attempts"]
-            if attempts >= 3:
-                return self._wait_for_merge_convergence(
-                    state,
-                    publication,
-                    "Final Run merge intent exhausted exact reconciliation attempts",
-                )
-            merge_intent["attempts"] = attempts + 1
-            self._save(state)
-            try:
-                integrated = self.github.normal_merge(
-                    pr_number=pr_number,
-                    expected_head_sha=run_head,
-                    expected_head_branch=str(state["run_branch"]),
-                    expected_head_repository=str(state["repository"]),
-                    expected_base_branch=self.default_branch,
-                    expected_base_sha=self.default_head_sha,
-                    expected_base_repository=str(state["repository"]),
-                )
-                merged = self.github.live_pull_request(pr_number)
-            except (MergeOutcomeUnknownError, OSError, TimeoutError) as error:
-                return self._wait_for_merge_convergence(state, publication, str(error))
-            except GitHubReadError as error:
-                if not is_github_convergence_error(error.code):
-                    raise
+    def approve(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        state = self._load(run_id)
+        publication = self._publication_state(state)
+        recovering_merge = (
+            publication["phase"] == "waiting_external"
+            and isinstance(publication.get("merge_intent"), dict)
+        )
+        if publication["phase"] == "merged":
+            return self._complete_parent_closeout(state)
+        if publication["phase"] not in {
+            "ready_for_approval",
+            "waiting_checks",
+            "waiting_external",
+        }:
+            raise ValueError("Run Publication is not ready for explicit approval")
+        run = self._mapping(state, "run_acceptance")
+        record = self._mapping(publication, "record")
+        pr_number = self._integer(publication, "pr_number")
+        run_head = self.git.resolve(str(state["run_branch"]))
+        authority = self._approval_grant_authority(
+            state, run, pr_number, run_head
+        )
+        if not grant_matches(publication.get("approval_grant"), authority):
+            publication["approval_grant"] = create_grant(authority)
+        if prepare_state is not None:
+            prepare_state(state)
+        self._save(state)
+        if not self._refresh_currentness(state):
+            return self._save(state)
+        try:
+            live = self.github.live_pull_request(pr_number)
+        except (GitHubReadError, OSError, TimeoutError) as error:
+            if recovering_merge:
                 return self._wait_for_merge_convergence(
                     state, publication, str(error)
                 )
-            # The merge has advanced the live base ref; its original SHA is
-            # still verified as the first parent below.
+            if isinstance(error, GitHubReadError) and not is_github_convergence_error(
+                error.code
+            ):
+                raise
+            publication["required_checks_observation_status"] = "unavailable"
+            publication["phase"] = "waiting_external"
+            if isinstance(error, GitHubReadError):
+                code = error.code
+                message = error.message
+            else:
+                code = "github_final_run_pr_observation_failed"
+                message = str(error)
+            wait_for_github_convergence(
+                state,
+                code=code,
+                message=message,
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+            return self._save(state)
+        if live.get("state") == "MERGED":
+            self._require_persisted_merge_intent(
+                publication, state, record, pr_number, run_head
+            )
+            # A merged PR's live base SHA is now the advanced default ref;
+            # the original base SHA is verified below as the first parent.
             self._require_final_pr_identity(
-                live=merged,
+                live=live,
                 run_head=run_head,
                 branch=str(state["run_branch"]),
                 repository=str(state["repository"]),
                 expected_base_sha=None,
             )
+            integrated = live.get("integrated_sha")
             if (
-                merged.get("state") != "MERGED"
-                or merged.get("integrated_sha") != integrated
-                or merged.get("integrated_parents")
-                != [self.default_head_sha, live.get("head_sha")]
-                or merged.get("integrated_tree") != record.get("expected_merge_tree")
+                isinstance(integrated, str)
+                and record.get("pr_head_sha") == live.get("head_sha")
+                and live.get("integrated_parents")
+                == [record.get("default_head_sha"), record.get("run_head_sha")]
+                and live.get("integrated_tree") == record.get("expected_merge_tree")
             ):
-                return self._block_merged_boundary(
-                    state,
-                    "final Run merge result does not preserve the reviewed boundary",
+                return self._mark_merged_and_close_parent(state, integrated)
+            return self._block_merged_boundary(
+                state,
+                "merged final Run PR does not match its reviewed publication boundary",
+            )
+        try:
+            self._require_final_pr_identity(
+                live=live,
+                run_head=run_head,
+                branch=str(state["run_branch"]),
+                repository=str(state["repository"]),
+                expected_base_sha=self.default_head_sha,
+            )
+        except GitHubReadError as error:
+            if (
+                recovering_merge
+                and error.code == "foreign_run_pr"
+                and isinstance(publication.get("approval_grant"), dict)
+            ):
+                return self._invalidate_for_fresh_acceptance(state)
+            raise
+        if record.get("default_head_sha") != self.default_head_sha:
+            return self._handle_default_drift(state)
+        if not self._acceptance_is_current(state, run):
+            return self._invalidate_for_fresh_acceptance(state)
+        if (
+            record.get("pr_head_sha") != live.get("head_sha")
+            or record.get("run_head_sha") != run_head
+            or record.get("default_head_sha") != self.default_head_sha
+            or record.get("ticket_completion_records")
+            != ticket_completion_records(state)
+            or live.get("base_sha") != self.default_head_sha
+            or live.get("base_branch") != self.default_branch
+        ):
+            return self._invalidate_for_fresh_acceptance(state)
+        if recovering_merge and not grant_matches(
+            publication.get("approval_grant"), authority
+        ):
+            return self._invalidate_for_fresh_acceptance(state)
+        if live.get("state") != "OPEN":
+            raise GitHubReadError(
+                "final_run_pr_not_open",
+                "Final Run PR is not open at the approved publication boundary",
+            )
+        if live.get("mergeable") is not True:
+            return self._preview_current_merge(state)
+        observation = self._observe_required_checks(
+            state, run, publication, pr_number, run_head
+        )
+        if observation is None:
+            return state
+        checks = str(observation["result"])
+        self._record_agent_run_status(pr_number, run, run_head, checks)
+        if checks == "fail":
+            self._save(state)
+            evidence = self._required_check_evidence(
+                state, publication, pr_number, run_head
+            )
+            if evidence is None:
+                return state
+            if not self._revalidate_final_run_pr_before_repair(
+                state, publication, pr_number, run_head
+            ):
+                return state
+            if not (
+                failure_evidence_matches_observation(
+                    observation,
+                    evidence,
+                    pr_number=pr_number,
+                    head_sha=run_head,
                 )
-            return self._mark_merged_and_close_parent(state, integrated)
+                and is_explicitly_repairable_code_failure(evidence)
+            ):
+                supervise_unrepairable_check_failure(
+                    state,
+                    publication,
+                    phase="waiting_external",
+                    waiting_for=(
+                        f"Run PR #{pr_number} Required Check repairability"
+                    ),
+                )
+                return self._save(state)
+            return self._save(
+                self._queue_repair(
+                    state,
+                    repair_source="required_checks",
+                    ci_evidence=evidence,
+                )
+            )
+        if checks == "pending":
+            publication["phase"] = "waiting_checks"
+            state["status"] = "waiting_checks"
+            state["terminal_kind"] = "waiting_checks"
+            state["diagnostics"] = []
+            ensure_supervision_window(state)
+            return self._save(state)
+        if checks == "unknown":
+            publication["required_checks_observation_status"] = "unknown"
+            publication["phase"] = "waiting_external"
+            wait_for_github_convergence(
+                state,
+                code="github_checks_observation_unknown",
+                message="GitHub Required Checks returned an unknown state",
+                waiting_for=f"Run PR #{pr_number} Required Checks observation",
+            )
+            ensure_supervision_window(state)
+            return self._save(state)
+        if not grant_matches(publication.get("approval_grant"), authority):
+            return self._invalidate_for_fresh_acceptance(state)
+        if not self._revalidate_final_run_pr_before_merge(
+            state, publication, pr_number, run_head
+        ):
+            return state
+        merge_intent = self._prepare_merge_intent(
+            publication, state, record, pr_number, run_head
+        )
+        attempts = merge_intent["attempts"]
+        if attempts >= 3:
+            return self._wait_for_merge_convergence(
+                state,
+                publication,
+                "Final Run merge intent exhausted exact reconciliation attempts",
+            )
+        merge_intent["attempts"] = attempts + 1
+        self._save(state)
+        try:
+            integrated = self.github.normal_merge(
+                pr_number=pr_number,
+                expected_head_sha=run_head,
+                expected_head_branch=str(state["run_branch"]),
+                expected_head_repository=str(state["repository"]),
+                expected_base_branch=self.default_branch,
+                expected_base_sha=self.default_head_sha,
+                expected_base_repository=str(state["repository"]),
+            )
+            merged = self.github.live_pull_request(pr_number)
+        except (MergeOutcomeUnknownError, OSError, TimeoutError) as error:
+            return self._wait_for_merge_convergence(state, publication, str(error))
+        except GitHubReadError as error:
+            if not is_github_convergence_error(error.code):
+                raise
+            return self._wait_for_merge_convergence(
+                state, publication, str(error)
+            )
+        # The merge has advanced the live base ref; its original SHA is
+        # still verified as the first parent below.
+        self._require_final_pr_identity(
+            live=merged,
+            run_head=run_head,
+            branch=str(state["run_branch"]),
+            repository=str(state["repository"]),
+            expected_base_sha=None,
+        )
+        if (
+            merged.get("state") != "MERGED"
+            or merged.get("integrated_sha") != integrated
+            or merged.get("integrated_parents")
+            != [self.default_head_sha, live.get("head_sha")]
+            or merged.get("integrated_tree") != record.get("expected_merge_tree")
+        ):
+            return self._block_merged_boundary(
+                state,
+                "final Run merge result does not preserve the reviewed boundary",
+            )
+        return self._mark_merged_and_close_parent(state, integrated)
 
     def has_current_approval_grant(self, run_id: str) -> bool:
         """Check whether an earlier human approval still binds this final PR."""
-        with self.states.locked():
-            state = self._load(run_id)
-            publication = self._publication_state(state)
-            run = state.get("run_acceptance")
-            pr_number = publication.get("pr_number")
-            if not isinstance(run, dict) or not isinstance(pr_number, int):
-                return False
-            if publication.get("phase") == "waiting_external":
-                return isinstance(publication.get("approval_grant"), dict)
-            try:
-                authority = self._approval_grant_authority(
-                    state,
-                    run,
-                    pr_number,
-                    self.git.resolve(str(state["run_branch"])),
-                )
-            except (KeyError, TypeError, ValueError):
-                return False
+        state = self._load(run_id)
+        publication = self._publication_state(state)
+        run = state.get("run_acceptance")
+        pr_number = publication.get("pr_number")
+        if not isinstance(run, dict) or not isinstance(pr_number, int):
+            return False
+        if publication.get("phase") == "waiting_external":
+            return isinstance(publication.get("approval_grant"), dict)
+        try:
+            authority = self._approval_grant_authority(
+                state,
+                run,
+                pr_number,
+                self.git.resolve(str(state["run_branch"])),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
         return grant_matches(publication.get("approval_grant"), authority)
 
     def _wait_for_merge_convergence(
@@ -311,124 +315,137 @@ class RunPublicationApproval(RunPublicationShared):
         ensure_supervision_window(state)
         return self._save(state)
 
-    def recover_closeout(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            publication = self._publication_state(state)
-            if publication.get("phase") != "merged":
-                raise ValueError("Run Publication is not awaiting Parent closeout")
-            return self._complete_parent_closeout(state)
+    def recover_closeout(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        state = self._load(run_id)
+        publication = self._publication_state(state)
+        if publication.get("phase") != "merged":
+            raise ValueError("Run Publication is not awaiting Parent closeout")
+        if prepare_state is not None:
+            prepare_state(state)
+            self._save(state)
+        return self._complete_parent_closeout(state)
 
-    def revise(self, run_id: str, feedback: str) -> dict[str, Any]:
+    def revise(
+        self,
+        run_id: str,
+        feedback: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         if not feedback.strip():
             raise ValueError("revision feedback must be non-empty")
-        with self.states.locked():
-            state = self._load(run_id)
-            publication = self._publication_state(state)
-            if publication["phase"] in {"merged", "abandoned"}:
-                raise ValueError("a completed or abandoned Run cannot be revised")
-            if state.get("status") not in {"ready_for_human", "run_approval_pending"}:
-                raise ValueError("revise is available only at an explicit human gate")
-            self._queue_repair(
-                state,
-                repair_source="human_revision",
-                human_feedback=feedback.strip(),
-            )
-            publication["phase"] = "stale"
-            state["terminal_kind"] = "final_revision_requested"
-            return self._save(state)
+        state = self._load(run_id)
+        publication = self._publication_state(state)
+        if publication["phase"] in {"merged", "abandoned"}:
+            raise ValueError("a completed or abandoned Run cannot be revised")
+        if state.get("status") not in {"ready_for_human", "run_approval_pending"}:
+            raise ValueError("revise is available only at an explicit human gate")
+        self._queue_repair(
+            state,
+            repair_source="human_revision",
+            human_feedback=feedback.strip(),
+        )
+        publication["phase"] = "stale"
+        state["terminal_kind"] = "final_revision_requested"
+        if prepare_state is not None:
+            prepare_state(state)
+        return self._save(state)
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
-        with self.states.locked():
-            state = self._load(run_id)
-            if state.get("status") in {"completed", "abandoned"}:
-                return state
-            publication = self._publication_state(state)
-            if publication["phase"] == "merged":
-                raise ValueError("a merged Run cannot be abandoned")
-            if publication["phase"] == "abandoned":
-                return state
-            if not discard_worktree:
-                require_clean_run_worktrees(self.git, self.states, run_id)
-            abandonment = state.get("run_abandonment")
-            if not isinstance(abandonment, dict):
-                final_pr_number = publication.get("pr_number")
-                abandonment = {
-                    "phase": "pending",
-                    "kind": "ticket_run",
-                    "change_prs": [
-                        {"pr_number": number, "status": "pending"}
-                        for number in _change_pr_numbers(state)
-                    ],
-                    "tickets": _ticket_recovery_obligations(state),
-                    "final_pr": (
-                        {"pr_number": final_pr_number, "status": "pending"}
-                        if isinstance(final_pr_number, int)
-                        else None
-                    ),
-                }
-                state.update(
-                    {
-                        "run_abandonment": abandonment,
-                        "status": "abandonment_pending",
-                        "terminal_kind": "abandonment_pending",
-                        "diagnostics": [],
-                    }
-                )
-                self._save(state)
-            for ticket in _obligation_list(abandonment, "tickets"):
-                if ticket.get("eligible") is None:
-                    recorded_ownership = (
-                        ticket.get("recorded_ownership")
-                        if isinstance(ticket.get("recorded_ownership"), dict)
-                        else None
-                    )
-                    ownership = self.github.ticket_close_ownership(
-                        ticket_number=int(ticket["ticket_number"]),
-                        run_id=run_id,
-                        recorded_ownership=recorded_ownership,
-                    )
-                    ticket["expected_ownership"] = ownership
-                    ticket["eligible"] = ownership is not None
-                    self._save(state)
-            for change_pr in _obligation_list(abandonment, "change_prs"):
-                if change_pr.get("status") != "completed":
-                    self.github.abandon_change_pr(int(change_pr["pr_number"]))
-                    change_pr["status"] = "completed"
-                    self._save(state)
-            for ticket in _obligation_list(abandonment, "tickets"):
-                if ticket.get("eligible") is True and ticket.get("status") != "completed":
-                    expected_ownership = ticket.get("expected_ownership")
-                    if not isinstance(expected_ownership, dict):
-                        raise ValueError("eligible Ticket recovery requires ownership")
-                    recovered = self.github.recover_abandoned_ticket(
-                        ticket_number=int(ticket["ticket_number"]),
-                        run_id=run_id,
-                        pr_number=int(ticket["pr_number"]),
-                        integrated_sha=str(ticket["integrated_sha"]),
-                        expected_ownership=expected_ownership,
-                    )
-                    ticket["status"] = "completed" if recovered else "not_owned"
-                    self._save(state)
-                elif ticket.get("eligible") is False:
-                    ticket["status"] = "not_owned"
-            final_pr = abandonment.get("final_pr")
-            if isinstance(final_pr, dict) and final_pr.get("status") != "completed":
-                self.github.abandon_run_pr(int(final_pr["pr_number"]))
-                final_pr["status"] = "completed"
-                self._save(state)
-            remove_run_worktrees(
-                self.git,
-                self.states,
-                run_id,
-                discard_worktree=discard_worktree,
-            )
-            abandonment["phase"] = "completed"
-            publication["phase"] = "abandoned"
+        state = self._load(run_id)
+        if state.get("status") in {"completed", "abandoned"}:
+            return state
+        publication = self._publication_state(state)
+        if publication["phase"] == "merged":
+            raise ValueError("a merged Run cannot be abandoned")
+        if publication["phase"] == "abandoned":
+            return state
+        if not discard_worktree:
+            require_clean_run_worktrees(self.git, self.states, run_id)
+        abandonment = state.get("run_abandonment")
+        if not isinstance(abandonment, dict):
+            final_pr_number = publication.get("pr_number")
+            abandonment = {
+                "phase": "pending",
+                "kind": "ticket_run",
+                "change_prs": [
+                    {"pr_number": number, "status": "pending"}
+                    for number in _change_pr_numbers(state)
+                ],
+                "tickets": _ticket_recovery_obligations(state),
+                "final_pr": (
+                    {"pr_number": final_pr_number, "status": "pending"}
+                    if isinstance(final_pr_number, int)
+                    else None
+                ),
+            }
             state.update(
-                {"status": "abandoned", "terminal_kind": "abandoned", "diagnostics": []}
+                {
+                    "run_abandonment": abandonment,
+                    "status": "abandonment_pending",
+                    "terminal_kind": "abandonment_pending",
+                    "diagnostics": [],
+                }
             )
-            return self._save(state)
+            self._save(state)
+        for ticket in _obligation_list(abandonment, "tickets"):
+            if ticket.get("eligible") is None:
+                recorded_ownership = (
+                    ticket.get("recorded_ownership")
+                    if isinstance(ticket.get("recorded_ownership"), dict)
+                    else None
+                )
+                ownership = self.github.ticket_close_ownership(
+                    ticket_number=int(ticket["ticket_number"]),
+                    run_id=run_id,
+                    recorded_ownership=recorded_ownership,
+                )
+                ticket["expected_ownership"] = ownership
+                ticket["eligible"] = ownership is not None
+                self._save(state)
+        for change_pr in _obligation_list(abandonment, "change_prs"):
+            if change_pr.get("status") != "completed":
+                self.github.abandon_change_pr(int(change_pr["pr_number"]))
+                change_pr["status"] = "completed"
+                self._save(state)
+        for ticket in _obligation_list(abandonment, "tickets"):
+            if ticket.get("eligible") is True and ticket.get("status") != "completed":
+                expected_ownership = ticket.get("expected_ownership")
+                if not isinstance(expected_ownership, dict):
+                    raise ValueError("eligible Ticket recovery requires ownership")
+                recovered = self.github.recover_abandoned_ticket(
+                    ticket_number=int(ticket["ticket_number"]),
+                    run_id=run_id,
+                    pr_number=int(ticket["pr_number"]),
+                    integrated_sha=str(ticket["integrated_sha"]),
+                    expected_ownership=expected_ownership,
+                )
+                ticket["status"] = "completed" if recovered else "not_owned"
+                self._save(state)
+            elif ticket.get("eligible") is False:
+                ticket["status"] = "not_owned"
+        final_pr = abandonment.get("final_pr")
+        if isinstance(final_pr, dict) and final_pr.get("status") != "completed":
+            self.github.abandon_run_pr(int(final_pr["pr_number"]))
+            final_pr["status"] = "completed"
+            self._save(state)
+        remove_run_worktrees(
+            self.git,
+            self.states,
+            run_id,
+            discard_worktree=discard_worktree,
+        )
+        abandonment["phase"] = "completed"
+        publication["phase"] = "abandoned"
+        state.update(
+            {"status": "abandoned", "terminal_kind": "abandoned", "diagnostics": []}
+        )
+        return self._save(state)
 
     def _handle_default_drift(self, state: dict[str, Any]) -> dict[str, Any]:
         return self._preview_current_merge(state)

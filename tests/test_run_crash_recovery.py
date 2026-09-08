@@ -1,18 +1,13 @@
 from __future__ import annotations
 
 import json
-from copy import deepcopy
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agent_run.state import StateStore
-from agent_run.resume_audit_contract import resume_event_digest, resume_history_digest
-from agent_run.state_contract import require_current_run_state
-from agent_run.state_errors import IncompatibleRunStateError
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import passing_acceptance
 
@@ -77,6 +72,12 @@ def _write_agents(
                         reviewer, "The real CLI delivery path passed."
                     )
                 ],
+                "run_reviews": [
+                    passing_acceptance(
+                        "run-reviewer-recovery", "The complete Run passed."
+                    )
+                ],
+                "run_publications": [_publication()],
             }
         ),
         encoding="utf-8",
@@ -87,7 +88,7 @@ def _write_agents(
 def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     state = load_only_run_state(repo)
     job = state["ticket_jobs"]["2"]
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     assert job["phase"] == "completed"
     assert job["validation_attempts"] >= 1
     record = job["acceptance_record"]
@@ -96,9 +97,9 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
 
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
-    assert len(delivery["pull_requests"]) == 1
+    assert len(delivery["pull_requests"]) == 2
     assert delivery["acceptance_records"] == []
-    assert len(delivery["agent_run_status"]) == 1
+    assert len(delivery["agent_run_status"]) == 2
     assert delivery["closed_issues"] == [2]
     assert [
         mutation["action"] for mutation in delivery["mutations"]
@@ -116,7 +117,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -209,7 +210,7 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
     first_agents = _write_agents(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_internal_stage(
         git_repo,
@@ -247,7 +248,7 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
     _assert_exactly_once_delivery(git_repo, fixture)
 
 
-def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
+def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket()})
@@ -270,7 +271,7 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1", "--development-deadline", "42s")
+        seed_run(git_repo, fixture, "1", "--development-deadline", "42s", idle_control=True)
     )["run_id"]
     failed = run_cli(
         git_repo,
@@ -333,8 +334,12 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
     )
     assert interrupted_again.returncode == 2
     after_second = load_only_run_state(git_repo)
-    assert after_second["resume_audit"]["total"] == 2
-    assert after_second["active_agent_invocation"]["status"] == "resuming"
+    assert after_second["resume_audit"]["total"] == 1
+    assert after_second["active_agent_invocation"]["status"] == "failed"
+    assert after_second["active_agent_invocation"]["error"] == (
+        "session_interrupted"
+    )
+    assert after_second["status"] == "execution_failed"
 
     recovered = run_cli(
         git_repo,
@@ -344,89 +349,46 @@ def test_each_public_resume_is_a_distinct_attempt_bound_audit_event(
         "--agent-fixture",
         str(recovery_agents),
     )
-    assert recovered.returncode == 0, recovered.stdout
+    assert recovered.returncode == 0, f"{recovered.stdout}\n{recovered.stderr}"
     final_state = load_only_run_state(git_repo)
-    resumes = final_state["resume_audit"]["history"]
-    assert [event["sequence"] for event in resumes] == [1, 2, 3]
-    assert {event["semantic_attempt_id"] for event in resumes} == {attempt_id}
-    assert final_state["resume_audit"]["total"] == 3
-    successor = next(
-        invocation
-        for invocation in final_state["agent_invocation_history"]
-        if invocation.get("resume_id") == resumes[-1]["resume_id"]
-    )
-    assert successor["semantic_attempt"]["attempt_id"] == attempt_id
-    assert successor["resume_sequence"] == resumes[-1]["sequence"]
-    assert successor["deadline_seconds"] == 42
-    assert datetime.fromisoformat(successor["deadline_at"]) - datetime.fromisoformat(
-        successor["started_at"]
-    ) == timedelta(seconds=42)
-    development_invocations = [
-        invocation
-        for invocation in final_state["agent_invocation_history"]
-        if invocation.get("role") == "development"
-        and invocation.get("semantic_attempt", {}).get("attempt_id") == attempt_id
-    ]
-    assert len(development_invocations) == 2
+    assert final_state["status"] == "run_approval_pending"
+    assert final_state["resume_audit"]["total"] == 2
     assert final_state["ticket_jobs"]["2"]["review_budget"][
         "development_attempts"
     ] == 1
-    require_current_run_state(final_state)
-    successor_index = final_state["agent_invocation_history"].index(successor)
-    for field, value in (
-        ("event_started_at", "2099-01-01T00:00:00+00:00"),
-        ("event_attempt_id", "sha256:" + "0" * 64),
-        ("invocation_resume_id", "sha256:" + "1" * 64),
-    ):
-        malformed = deepcopy(final_state)
-        if field == "event_started_at":
-            malformed["resume_audit"]["history"][-1][
-                "successor_invocation_started_at"
-            ] = value
-        elif field == "event_attempt_id":
-            malformed["resume_audit"]["history"][-1][
-                "semantic_attempt_id"
-            ] = value
-        else:
-            malformed["agent_invocation_history"][successor_index][
-                "resume_id"
-            ] = value
-        with pytest.raises(IncompatibleRunStateError):
-            require_current_run_state(malformed)
+    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    final_control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert final_control["action"]["kind"] == "resume"
+    assert final_control["action"]["status"] == "completed"
+    assert final_control["action"]["executor_generation"] == 3
+    assert final_control["executor"]["generation"] == 3
 
-    fabricated = deepcopy(final_state)
-    fabricated_successor = fabricated["agent_invocation_history"][successor_index]
-    fabricated_successor["resume_id"] = "sha256:" + "2" * 64
-    fabricated_successor["resume_sequence"] = 4
-    with pytest.raises(IncompatibleRunStateError):
-        require_current_run_state(fabricated)
-
-    for mutation in ("failure_code", "rolling_digest", "unknown_field"):
-        malformed_audit = deepcopy(final_state)
-        if mutation == "failure_code":
-            malformed_audit["resume_audit"]["history"][0][mutation] = "forged"
-        elif mutation == "rolling_digest":
-            malformed_audit["resume_audit"][mutation] = "sha256:" + "3" * 64
-        else:
-            malformed_audit["resume_audit"]["history"][0][mutation] = "private"
-        with pytest.raises(IncompatibleRunStateError):
-            require_current_run_state(malformed_audit)
-
-    forged_identity = deepcopy(final_state)
-    forged_event = forged_identity["resume_audit"]["history"][0]
-    forged_event["resume_id"] = "sha256:" + "4" * 64
-    forged_event["event_digest"] = resume_event_digest(forged_event)
-    forged_identity["resume_audit"]["rolling_digest"] = resume_history_digest(
-        forged_identity["resume_audit"]["history"]
+    fixture_before_repeat = fixture.read_bytes()
+    history_before_repeat = list(final_state["agent_invocation_history"])
+    repeated = run_cli(
+        git_repo,
+        fixture,
+        "resume",
+        run_id,
+        "--agent-fixture",
+        str(recovery_agents),
     )
-    with pytest.raises(IncompatibleRunStateError, match="noncanonical"):
-        require_current_run_state(forged_identity)
-
-    status = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
-    history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))
-    assert status["latest_resume"]["sequence"] == 3
-    assert history["agent_resumes"] == resumes
-    assert history["resume_audit"]["total"] == 3
+    assert repeated.returncode == 2
+    assert stdout_json(repeated)["diagnostics"] == [
+        {
+            "code": "command_precondition",
+            "message": "当前交付运行尚未满足此命令的执行条件",
+        }
+    ]
+    repeated_control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert repeated_control["action"]["action_id"] == final_control["action"][
+        "action_id"
+    ]
+    assert repeated_control["executor"]["generation"] == 3
+    repeated_state = load_only_run_state(git_repo)
+    assert repeated_state["resume_audit"]["total"] == 2
+    assert repeated_state["agent_invocation_history"] == history_before_repeat
+    assert fixture.read_bytes() == fixture_before_repeat
 
 
 @pytest.mark.parametrize(
@@ -453,7 +415,7 @@ def test_public_cli_recovers_after_external_response_loss(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -528,7 +490,7 @@ def test_abandon_recovers_ticket_after_close_response_loss(
     agents = _write_agents(
         git_repo / "agents.json", reviewer="reviewer-first"
     )
-    run_id = stdout_json(run_cli(git_repo, fixture, "start", "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     interrupted = run_internal_stage(
         git_repo,
         fixture,
@@ -598,7 +560,7 @@ def test_triage_remainder_is_not_a_gate_after_independent_work(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1")
     )["run_id"]
 
     result = run_internal_stage(
@@ -657,7 +619,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        run_cli(git_repo, fixture, "start", "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(

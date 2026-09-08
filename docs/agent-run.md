@@ -7,7 +7,8 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；Human Blocker 恢复时复用原 Reviewer Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
-- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。维护者显式执行同一 Parent 的 `run <parent-issue>` 或 `resume <parent-issue>` 开始新的等待窗口，不需要另启 watcher；
+- `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，发起终端退出或 Ctrl-C 只离开观察；
+- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样在不解析 stderr 原因的前提下进入有界、封顶退避监督。不存在同时生效的当前 Work Subject 的 Run-wide Operator Gate 时，维护者显式执行同一 Parent 的 `run <parent-issue>` 或 `resume <parent-issue>` 开始新的等待窗口，不需要另启 watcher；若仍有人工作业、批准或发布门禁，则必须先执行该门禁要求的专用动作；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -65,10 +66,11 @@ Invocation 内的初始调用和 Output Repair 共用该 deadline。
 
 ```bash
 agent-run resume <parent-issue> [--new-thread] [--message "..."] --repo OWNER/REPO
-agent-run requeue <run-id> --repo OWNER/REPO
+agent-run requeue <parent-issue> --repo OWNER/REPO
 agent-run approve <parent-issue> --repo OWNER/REPO
-agent-run revise <run-id> --message '未经改写的维护者反馈' --repo OWNER/REPO
-agent-run abandon <run-id> [--discard-worktree] --repo OWNER/REPO
+agent-run revise <parent-issue> --message '未经改写的维护者反馈' --repo OWNER/REPO
+agent-run stop <parent-issue> --repo OWNER/REPO
+agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 ```
 
 ### GitHub 只读身份
@@ -105,9 +107,9 @@ Thread。Publication 默认继续引用 Development；显式覆盖后即使切�
 恢复引用才重新跟随 Development：
 
 ```bash
-agent-run configure <run-id> --development-model gpt-5.6-luna
-agent-run configure <run-id> --publication-model gpt-5.6-sol
-agent-run configure <run-id> --publication-from-development
+agent-run configure <parent-issue> --development-model gpt-5.6-luna
+agent-run configure <parent-issue> --publication-model gpt-5.6-sol
+agent-run configure <parent-issue> --publication-from-development
 ```
 
 Profile Revision 同时保留各角色的 preset 与显式覆盖来源。Publication 从 Development
@@ -134,10 +136,9 @@ code-failure-steps = [
 
 `status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。处于
 外部等待或监督超时时，两种格式均显示等待种类、对象、head/base、窗口开始与截止、剩余时间、
-重试次数、脱敏的最新观测，以及超时后的唯一恢复操作。前台等待每个轮询间隔至多输出一次同样
-脱敏的进度记录，不会打印凭据或原始响应体。
-在前台窗口仍运行时，这个恢复操作仅说明窗口到期或进程中断后的下一步，不要求维护者重复输入
-`run`；当前进程会继续自行监督。
+重试次数、脱敏的最新观测，以及超时后的唯一恢复操作。Lifecycle Action 已应用且 Executor 完成
+握手后，发起 CLI 可以返回；后续轮询与自动推进由独立 Run Executor Session 承担，不依赖原终端
+或发起命令继续存活。Executor 在窗口到期时保存 `supervision_timeout`，再由明确的恢复操作开启新窗口。
 Semantic Agent Attempt 在预算门禁通过后、首个 Codex 进程启动前写入状态；Development 与 Reviewer
 Attempt 绑定当时的 Review Budget Window，Publication Attempt 则不绑定该窗口。一次 Attempt 可包含
 初始 Invocation、同 Thread 的 Output Repair、进程失败后的 successor Invocation、Human Blocker Resume
@@ -182,19 +183,27 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 
 ### 命令边界与状态轮转
 
-下表是 `start/run/resume/requeue/status/history/approve/revise/abandon` 的稳定操作合同。Controller
+下表是 `run/resume/requeue/status/history/approve/revise/stop/abandon` 的稳定操作合同。Controller
 内部阶段不是维护者操作；它们不能越过下表中的人工边界。
 
 | 命令 | 允许的起点 | 作用 | 不做什么 |
 | --- | --- | --- | --- |
-| `start` | 新 Run 或同一 Parent 的现有 Run | 创建或幂等返回本地 Run 记录及其受管 Run Branch，供集成或排障检查身份与状态 | 不推进自动生命周期；日常交付不以它替代 `run` |
-| `run` | 新 Run、正常可推进状态或监督超时暂停 | 创建或继续正常 Job Loop；在 checks、GitHub 读取/对账未收敛时在本次调用内监督，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
-| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker，或当前 `supervision_timeout` 有受支持等待边界 | 在同一 Semantic Attempt 内创建 successor Invocation；或为同一等待身份开启新监督窗口 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge |
+| `run` | 新 Run、正常可推进状态或不存在当前 Work Subject 的 Run-wide Operator Gate 的纯监督超时暂停 | 提交或附着普通 Lifecycle Action；准确的 Executor 握手后可返回，由独立 Run Executor Session 持续监督 checks 与 GitHub 读取/对账，至 Human Blocker、`execution_failed`、`requeue_required`、范围变化或最终批准边界为止 | 不隐式恢复失败的 Agent Invocation、Requeue、批准或合并 |
+| `resume` | 当前唯一 Agent Invocation 为 `execution_failed`、当前唯一对象为 Human Blocker、`operator_stopped`，或当前 `supervision_timeout` 有受支持等待边界 | 通过统一 Executor 在同一 Semantic Attempt 内创建 successor Invocation，并连续推进后续自动工作到下一真实边界；解除 Stop 时恢复原现场 | 不增加领域 attempt、不重置预算或 Publication Operation Retry；超时恢复不创建 Worker、PR 或 merge；发起 CLI 退出不停止 Executor |
 | `requeue` | 仅 `requeue_required` | 从命令时读取的最新权威事实创建新 Generation，并封存旧 Generation | 不 rebase、不迁移 Candidate/Acceptance/Human Response/Thread/worktree |
 | `status` / `history` | 任意已知 Run | 分层查看 Attempt、Invocation、Output Attempt、Budget Window、Publication Operation Retry 与下一步 | 不改变状态或恢复工作 |
 | `approve` | `run_approval_pending` 或 Parent-only 的 `parent_approval_pending` | 重新核验当前事实后，授权 Publisher 合并最终 PR | 不跳过 Fresh/Run Acceptance、Required Checks 或 Published-Head Gate |
 | `revise` | `ready_for_human` 或 `run_approval_pending` | 原样保存 Run 级维护者反馈，并进入 Run Repair | 不是 Human Blocker 的响应通道 |
+| `stop` | 任意已知、未终止且有活动 Executor 的 Run | 原子撤销旧 Executor 写入权，定向终止其 Worker 进程组，并把 Run 置为可显式恢复的 `operator_stopped` | 不把 Stop 记为失败，不删除 checkout、Thread、Attempt 或 Artifact；确认无活动 Executor 及重复 Stop 都严格只读 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
+
+Task Control 缺失或损坏时，下一次生命周期命令先按准确 Run receipt、Host ownership、Runner binding
+和执行代次对账。Run 已到人工边界或原命令参数相同，都不能替代旧 Executor 的退出证明。
+未完成 Run 若同时缺少准确 receipt，则所有生命周期命令在准入、环境准备和业务写入前拒绝执行；
+Control 文件不存在也不能证明没有 Executor。
+证据充分时，重复原命令只补完原回执；当前状态允许的专用动作才可继续。Stop 确认无活动执行者后仍不创建新 Action。
+失败 Stop/Abandon 的 receipt 还保留原目标的必要进程身份；必须确认准确目标已退出或完成准确终止，
+才能释放准入。缺少目标身份的旧 receipt 会持续拒绝恢复，不能靠反复重试推断目标已退出。
 
 ### Output Repair、Resume 与 Requeue
 
@@ -240,13 +249,16 @@ Development 与 Fresh Acceptance 的权威上下文。它不修改 Issue、不�
 
 ```bash
 agent-run status --repo OWNER/REPO --parent <parent-issue>
-agent-run requeue <run-id> --repo OWNER/REPO
+agent-run requeue <parent-issue> --repo OWNER/REPO
 ```
 
-`run` 创建或恢复 Run、Run Branch 和工作前沿，并在同一进程中逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
+`run` 创建或恢复 Run、Run Branch 和工作前沿，并由准确的 Run Executor 逐张交付完整 DAG。每张 Ticket 完成后都会重新读取 GitHub 权威状态，
 重新计算 frontier；某条分支等待人工时，不依赖它的其他可执行 Ticket 仍会继续。
-Required Checks 仍为 pending 时，`run` 在有限窗口内监督；窗口到期后保存
-`supervision_timeout`，状态提示的恢复操作是 `resume`（同一 Parent 的显式 `run` 同样允许）；两者均不会重复创建 PR 或消耗修改预算。
+Required Checks 仍为 pending 时，独立 Run Executor Session 在有限窗口内监督；窗口到期后保存
+`supervision_timeout`，状态提示的恢复操作是 `resume`。仅当没有同时生效的当前 Work Subject 的
+Run-wide Operator Gate 时，
+同一 Parent 的显式 `run` 也可开启新窗口；否则必须先执行该门禁要求的专用动作。两条超时恢复路径
+均不会重复创建 PR 或消耗修改预算。
 Required Check 失败时，Controller 读取失败 check 的名称、workflow、描述和链接，并读取其
 Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置明确声明的 code/test step
 被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
@@ -255,8 +267,13 @@ Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置�
 最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；
 `status`、`history` 可以按当前仓库的唯一进行中 Run、`--parent`，或任意目录的
 `--repo + --parent` 选择。若没有唯一候选、存在多个 clone、索引失效或冲突，命令会列出候选并
-停止，绝不按最近时间猜测或全盘搜索。其他会推进 Run 或改变外部状态的命令仍必须从目标仓库运行，
-或显式指定 state 目录。
+停止，绝不按最近时间猜测或全盘搜索。普通 mutation 与 Run-scoped `configure` 同样使用 Parent
+位置参数并执行零匹配、多匹配和 repository mismatch 检查；完整 Run ID 与显式 state 目录仅是
+自动化和精确排障入口。改变 Run 的命令仍必须从目标仓库运行。
+
+Lifecycle mutation 默认输出面向维护者的回执，只显示仓库、Parent、操作、是否附着原操作、动作是否
+已应用、当前交付状态与下一步；动作应用完成不代表整个交付已经完成。Action ID、Run ID、Executor
+generation、payload digest 等稳定机器审计事实只在显式 `--json` 输出中提供。
 
 如果 merge 的写入响应出现网络错误或无法解析的响应，Publisher 不盲目重放：先在 GitHub 对账。PR 已
 合并即恢复成功；PR 仍 OPEN 且 live head/base、Required Checks 与 mergeability 均保持当前时，最多重试

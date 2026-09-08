@@ -43,12 +43,18 @@ _MAX_ERROR_BYTES = 8 * 1024
 def bounded_error(value: str) -> str:
     """Redact common credential forms and retain at most 8 KiB of UTF-8 text."""
 
+    return _truncate(redact_credentials(value))
+
+
+def redact_credentials(value: str) -> str:
+    """Redact common credential forms without changing the caller's size bound."""
+
     json_value = _redact_json_credentials(value)
     if json_value is not None:
         value = json.dumps(json_value, ensure_ascii=False, separators=(",", ":"))
     else:
         value = _redact_embedded_json_credentials(value)
-    return _truncate(_redact_text(value))
+    return _redact_text(value)
 
 
 def _redact_text(value: str) -> str:

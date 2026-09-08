@@ -137,6 +137,7 @@ def _operator_action_kind(
         "deterministic_contradiction": "deterministic_contradiction",
         "unsupported_scope_change": "deterministic_contradiction",
         "supervision_timeout": "supervision_timeout",
+        "operator_stopped": "operator_stopped",
         "requeue_required": "requeue_required",
         "run_approval_pending": "final_approval",
         "parent_approval_pending": "final_approval",
@@ -152,6 +153,7 @@ def _operator_action_label(kind: str) -> str:
         "execution_failure": "Execution Failure",
         "deterministic_contradiction": "Deterministic Contradiction",
         "supervision_timeout": "Supervision Timeout Pause",
+        "operator_stopped": "Operator Stopped",
         "requeue_required": "Requeue Required",
         "final_approval": "Final Approval",
         "publication_retry_exhausted": "Publication Retry Exhausted",
@@ -275,6 +277,7 @@ def _operator_next_action(
         "review_budget_checkpoint",
         "execution_failure",
         "supervision_timeout",
+        "operator_stopped",
     } and isinstance(repository, str) and isinstance(parent_number, int):
         return f"agent-run resume {parent_number} --repo {repository}"
     if (

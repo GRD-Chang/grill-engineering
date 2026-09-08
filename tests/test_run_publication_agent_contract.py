@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.codex import CodexCliBackend, CodexProcessError
@@ -18,6 +19,7 @@ from agent_run.run_publication import RunPublicationEngine
 from agent_run.run_repair_requests import RunRepairRequests
 
 from run_acceptance_test_support import _completed_run, _passing_artifact
+from conftest import seed_idle_control
 from test_cli import run_internal_stage, run_cli, stdout_json
 
 from run_publication_test_support import (
@@ -471,6 +473,12 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
     git_repo: Path,
 ) -> None:
     state, states, _git, _publisher = _accepted_run(git_repo)
+    seed_idle_control(
+        TaskControlStore(states.root),
+        TaskKey(git_repo, str(state["repository"]), 1),
+        str(state["run_id"]),
+        state_dir=states.root,
+    )
     failed_agents = git_repo / "failed-run-publication.json"
     failed_agents.write_text(
         json.dumps(

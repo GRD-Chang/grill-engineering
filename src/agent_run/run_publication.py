@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from agent_run.agents import AgentBackend
@@ -36,17 +37,37 @@ class RunPublicationEngine:
     def publish(self, run_id: str) -> dict[str, Any]:
         return self._flow().publish(run_id)
 
-    def approve(self, run_id: str) -> dict[str, Any]:
-        return self._approval().approve(run_id)
+    def approve(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        return self._approval().approve(run_id, prepare_state=prepare_state)
 
     def has_current_approval_grant(self, run_id: str) -> bool:
         return self._approval().has_current_approval_grant(run_id)
 
-    def recover_closeout(self, run_id: str) -> dict[str, Any]:
-        return self._approval().recover_closeout(run_id)
+    def recover_closeout(
+        self,
+        run_id: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        return self._approval().recover_closeout(
+            run_id, prepare_state=prepare_state
+        )
 
-    def revise(self, run_id: str, feedback: str) -> dict[str, Any]:
-        return self._approval().revise(run_id, feedback)
+    def revise(
+        self,
+        run_id: str,
+        feedback: str,
+        *,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        return self._approval().revise(
+            run_id, feedback, prepare_state=prepare_state
+        )
 
     def abandon(self, run_id: str, *, discard_worktree: bool = False) -> dict[str, Any]:
         return self._approval().abandon(run_id, discard_worktree=discard_worktree)

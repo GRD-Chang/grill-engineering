@@ -232,11 +232,22 @@ def test_supersession_status_scan_flattens_comment_pages(
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     calls: list[tuple[str, ...]] = []
+    recorded: dict[str, object] | None = None
 
     def fake_json(*arguments: str, **_kwargs: object) -> object:
+        nonlocal recorded
         calls.append(arguments)
         if "comments" in arguments[1]:
-            return [[{"id": 9, "body": "ordinary", "user": {"login": "x"}}], []]
+            if "-f" not in arguments:
+                comments = [
+                    {"id": 9, "body": "ordinary", "user": {"login": "x"}}
+                ]
+                if recorded is not None:
+                    comments.append(recorded)
+                return [comments, []]
+            body_argument = next(value for value in arguments if value.startswith("body="))
+            recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
+            return recorded
         return {"id": 10}
 
     monkeypatch.setattr(publisher, "_json", fake_json)
@@ -252,6 +263,94 @@ def test_supersession_status_scan_flattens_comment_pages(
     )
 
     assert "--slurp" in calls[0]
+
+
+def test_marker_comment_requires_exact_remote_readback(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    reads = 0
+
+    def fake_json(*arguments: str, **_kwargs: object) -> object:
+        nonlocal reads
+        if "comments" in arguments[1] and "-f" not in arguments:
+            reads += 1
+            return [[]]
+        return {"id": 10}
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+
+    with pytest.raises(GitHubReadError) as captured:
+        publisher.record_run_publication(12, {"run_id": "run-1"})
+
+    assert captured.value.code == "github_write_outcome_unknown"
+    assert reads == 2
+
+
+def test_marker_comment_lost_response_is_reconciled_without_second_write(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    recorded: dict[str, object] | None = None
+    writes = 0
+
+    def fake_json(*arguments: str, **_kwargs: object) -> object:
+        nonlocal recorded, writes
+        if "comments" in arguments[1] and "-f" not in arguments:
+            return [[recorded] if recorded is not None else []]
+        writes += 1
+        body_argument = next(value for value in arguments if value.startswith("body="))
+        recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
+        raise OSError("lost response after comment write")
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    record = {"run_id": "run-1", "candidate_sha": "abc123"}
+
+    with pytest.raises(OSError, match="lost response"):
+        publisher.record_run_publication(12, record)
+    publisher.record_run_publication(12, record)
+
+    assert writes == 1
+
+
+@pytest.mark.parametrize(
+    "existing_body", [None, "<!-- agent-run:acceptance-record -->\nstale"]
+)
+def test_acceptance_comment_lost_response_is_reconciled_without_second_write(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_body: str | None,
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    recorded: dict[str, object] | None = (
+        {"id": 10, "body": existing_body} if existing_body is not None else None
+    )
+    writes = 0
+    mutations: list[tuple[str, ...]] = []
+
+    def fake_json(*arguments: str, **_kwargs: object) -> object:
+        nonlocal recorded, writes
+        if "comments" in arguments[1] and "-f" not in arguments:
+            return [[recorded] if recorded is not None else []]
+        writes += 1
+        mutations.append(arguments)
+        body_argument = next(value for value in arguments if value.startswith("body="))
+        recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
+        raise OSError("lost response after acceptance write")
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    record = {"status": "pass", "candidate_sha": "abc123"}
+
+    with pytest.raises(OSError, match="lost response"):
+        publisher.record_acceptance(12, record)
+    publisher.record_acceptance(12, record)
+
+    assert writes == 1
+    assert ("--method" in mutations[0]) is (existing_body is not None)
+    if existing_body is not None:
+        assert mutations[0][mutations[0].index("--method") + 1] == "PATCH"
+    assert recorded is not None
+    assert '"candidate_sha": "abc123"' in str(recorded["body"])
 
 
 def test_publish_branch_refuses_remote_drift(
@@ -331,14 +430,25 @@ def test_close_parent_issue_passes_repository_to_gh(
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(
-        publisher,
-        "_json",
-        lambda *_arguments: {"state": "OPEN", "comments": []},
-    )
-    monkeypatch.setattr(
-        publisher, "_require", lambda *arguments: calls.append(arguments)
-    )
+    closed = False
+    comment_body: str | None = None
+
+    def fake_json(*_arguments: str) -> object:
+        return {
+            "state": "CLOSED" if closed else "OPEN",
+            "comments": ([{"body": comment_body}] if comment_body is not None else []),
+        }
+
+    def fake_require(*arguments: str) -> None:
+        nonlocal closed, comment_body
+        calls.append(arguments)
+        if arguments[0:2] == ("issue", "comment"):
+            comment_body = arguments[-1]
+        elif arguments[0:2] == ("issue", "close"):
+            closed = True
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    monkeypatch.setattr(publisher, "_require", fake_require)
 
     publisher.close_parent_issue(
         parent_number=1,
@@ -349,6 +459,38 @@ def test_close_parent_issue_passes_repository_to_gh(
     )
 
     assert calls[-1] == ("issue", "close", "1", "--repo", "example/project")
+
+
+def test_close_parent_issue_rejects_a_drifted_completion_marker(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(
+        publisher,
+        "_json",
+        lambda *_arguments: {
+            "state": "CLOSED",
+            "comments": [
+                {
+                    "body": (
+                        "<!-- agent-run:run-1:parent-completed -->\n"
+                        "completion for a different merge"
+                    )
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(GitHubReadError) as captured:
+        publisher.close_parent_issue(
+            parent_number=1,
+            run_id="run-1",
+            pr_number=2,
+            integrated_sha="abc123",
+            delivery_type="Final Run",
+        )
+
+    assert captured.value.code == "github_write_outcome_unknown"
 
 
 @pytest.mark.parametrize(

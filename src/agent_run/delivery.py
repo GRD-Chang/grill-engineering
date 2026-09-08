@@ -42,104 +42,103 @@ class TicketDeliveryEngine:
         self.agents = agents
 
     def deliver(self, run_id: str) -> dict[str, Any]:
-        with self.states.locked():
-            state = self.states.load_current_run(run_id)
-            if state is None:
-                raise ValueError(f"unknown Delivery Run: {run_id}")
-            job = self._job(state)
-            if state.get("status") in {"blocked", "requeue_required"}:
-                return state
-            if job.get("phase") in {
-                "accepted",
-                "publication_pending",
-                "publishing",
+        state = self.states.load_current_run(run_id)
+        if state is None:
+            raise ValueError(f"unknown Delivery Run: {run_id}")
+        job = self._job(state)
+        if state.get("status") in {"blocked", "requeue_required"}:
+            return state
+        if job.get("phase") in {
+            "accepted",
+            "publication_pending",
+            "publishing",
+            "waiting_checks",
+            "waiting_merge",
+            "merging",
+        }:
+            candidate_sha = job.get("candidate_sha")
+            if not isinstance(candidate_sha, str) or not candidate_sha.strip():
+                raise ValueError(
+                    "active Ticket publication is missing candidate_sha"
+                )
+            candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
+            require_active_ticket_publication_authorization(
+                job,
+                candidate_tree=candidate_tree,
+                location=f"ticket_jobs[{job.get('ticket_number', 'active')}]",
+            )
+        ticket_number = int(job["ticket_number"])
+        checkout = (
+            self.states.root
+            / "worktrees"
+            / run_id
+            / f"ticket-{ticket_number}"
+        )
+        preserve_checkout = False
+        checkout_prepared = False
+        checkout_existed_before_attempt = checkout.exists()
+        checkout_recoverable = self.git.ticket_checkout_matches(
+            checkout, str(job["ticket_branch"])
+        )
+        try:
+            self._ensure_ticket_branch(state, job)
+            self.git.prepare_ticket_checkout(
+                branch=str(job["ticket_branch"]),
+                base_sha=str(job["base_sha"]),
+                checkout=checkout,
+            )
+            checkout_prepared = True
+            result = TicketDeliveryLoop(
+                git=self.git,
+                states=self.states,
+                github=self.github,
+                agents=self.agents,
+            ).run(state, job, checkout)
+            if job.get("phase") == TicketPhase.COMPLETED.value:
+                result = DeliveryCleanupEngine(
+                    git=self.git, states=self.states, github=self.github
+                ).complete_ticket(result, job)
+            preserve_checkout = result.get("status") in {
                 "waiting_checks",
-                "waiting_merge",
-                "merging",
-            }:
-                candidate_sha = job.get("candidate_sha")
-                if not isinstance(candidate_sha, str) or not candidate_sha.strip():
-                    raise ValueError(
-                        "active Ticket publication is missing candidate_sha"
-                    )
-                candidate_tree = self.git.resolve(f"{candidate_sha}^{{tree}}")
-                require_active_ticket_publication_authorization(
-                    job,
-                    candidate_tree=candidate_tree,
-                    location=f"ticket_jobs[{job.get('ticket_number', 'active')}]",
-                )
-            ticket_number = int(job["ticket_number"])
-            checkout = (
-                self.states.root
-                / "worktrees"
-                / run_id
-                / f"ticket-{ticket_number}"
+                "waiting_external",
+                "requeue_required",
+                "blocked",
+                "ready_for_human",
+            } or (
+                job.get("blocked_reason") == "agent_requires_human"
+                and job.get("human_blocker_phase")
+                in {"developing", "repairing"}
             )
-            preserve_checkout = False
-            checkout_prepared = False
-            checkout_existed_before_attempt = checkout.exists()
-            checkout_recoverable = self.git.ticket_checkout_matches(
-                checkout, str(job["ticket_branch"])
+            return result
+        except KeyboardInterrupt:
+            preserve_checkout = (
+                checkout_existed_before_attempt
+                or checkout_recoverable
+                or checkout_prepared
             )
-            try:
-                self._ensure_ticket_branch(state, job)
-                self.git.prepare_ticket_checkout(
-                    branch=str(job["ticket_branch"]),
-                    base_sha=str(job["base_sha"]),
-                    checkout=checkout,
+            raise
+        except BaseException:
+            # Once the stable checkout is ready, any interrupted Worker or
+            # Publisher phase may have recoverable uncommitted state.
+            # Abrupt process exits leave it behind too, so surfaced errors
+            # must preserve the same resume semantics.
+            preserve_checkout = (
+                checkout_existed_before_attempt
+                or checkout_recoverable
+                or checkout_prepared
+            )
+            raise
+        finally:
+            if not preserve_checkout:
+                self.git.remove_worktree(
+                    checkout,
+                    discard_worktree=not (
+                        checkout_existed_before_attempt
+                        or checkout_recoverable
+                        or checkout_prepared
+                    ),
                 )
-                checkout_prepared = True
-                result = TicketDeliveryLoop(
-                    git=self.git,
-                    states=self.states,
-                    github=self.github,
-                    agents=self.agents,
-                ).run(state, job, checkout)
-                if job.get("phase") == TicketPhase.COMPLETED.value:
-                    result = DeliveryCleanupEngine(
-                        git=self.git, states=self.states, github=self.github
-                    ).complete_ticket(result, job)
-                preserve_checkout = result.get("status") in {
-                    "waiting_checks",
-                    "waiting_external",
-                    "requeue_required",
-                    "blocked",
-                    "ready_for_human",
-                } or (
-                    job.get("blocked_reason") == "agent_requires_human"
-                    and job.get("human_blocker_phase")
-                    in {"developing", "repairing"}
-                )
-                return result
-            except KeyboardInterrupt:
-                preserve_checkout = (
-                    checkout_existed_before_attempt
-                    or checkout_recoverable
-                    or checkout_prepared
-                )
-                raise
-            except BaseException:
-                # Once the stable checkout is ready, any interrupted Worker or
-                # Publisher phase may have recoverable uncommitted state.
-                # Abrupt process exits leave it behind too, so surfaced errors
-                # must preserve the same resume semantics.
-                preserve_checkout = (
-                    checkout_existed_before_attempt
-                    or checkout_recoverable
-                    or checkout_prepared
-                )
-                raise
-            finally:
-                if not preserve_checkout:
-                    self.git.remove_worktree(
-                        checkout,
-                        discard_worktree=not (
-                            checkout_existed_before_attempt
-                            or checkout_recoverable
-                            or checkout_prepared
-                        ),
-                    )
-                    self._remove_empty_worktree_directories(checkout)
+                self._remove_empty_worktree_directories(checkout)
 
     def _ensure_ticket_branch(
         self, state: dict[str, Any], job: dict[str, Any]

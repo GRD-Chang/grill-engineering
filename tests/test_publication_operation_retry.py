@@ -17,7 +17,7 @@ from agent_run.publication_operation_retry import (
 from agent_run.semantic_attempt import allocate_semantic_attempt, close_semantic_attempt
 from agent_run.review_budget import TICKET_POLICY, new_budget
 from agent_run.state_contract import IncompatibleRunStateError, require_current_run_state
-from conftest import write_fixture
+from conftest import seed_run, write_fixture
 from test_cli import issue, load_only_run_state, run_cli, stdout_json
 
 
@@ -167,7 +167,7 @@ def test_state_contract_rejects_conflicting_live_and_archived_retry_authority(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     owner: dict[str, object] = {"phase": "pending", "publication_attempts": 1}
     attempt = allocate_semantic_attempt(
@@ -216,7 +216,7 @@ def test_state_contract_binds_publication_pending_to_exhaustion(
     git_repo: Path, owner: dict[str, object], message: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    run_cli(git_repo, fixture, "start", "1")
+    seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["active_ticket_job"] = None
     if owner.get("publication_operation_retry") is not None:
@@ -239,7 +239,7 @@ def test_public_command_rejects_corrupt_publication_retry_before_mutation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    started = run_cli(git_repo, fixture, "start", "1")
+    started = seed_run(git_repo, fixture, "1")
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
