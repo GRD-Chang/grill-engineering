@@ -81,6 +81,7 @@ from agent_run.run_lifecycle import (
     RunLifecycle,
     prepare_action_application_receipt,
 )
+from agent_run.resume_intent import bind_resume_intent, validate_resume_intent
 from agent_run.run_locator import (
     MAX_LOCATOR_ENTRIES,
     RunLocatorError,
@@ -644,7 +645,7 @@ def _main_with_parser_resources(
             "next_action": cli_presentation._next_action(state),
         }
         if lifecycle_receipt is not None:
-            output["action"] = cli_presentation.public_action_receipt(
+            public_receipt = cli_presentation.public_action_receipt(
                 lifecycle_receipt,
                 repository=state.get("repository"),
                 parent=state.get("parent"),
@@ -652,6 +653,11 @@ def _main_with_parser_resources(
                     output["next_action"], run_id=state.get("run_id")
                 ),
             )
+            if lifecycle_receipt.resume_intent is not None:
+                public_receipt["resume_authorization"] = (
+                    lifecycle_receipt.resume_intent["authorization"]
+                )
+            output["action"] = public_receipt
         if getattr(parsed, "as_json", False):
             if lifecycle_receipt is not None:
                 output["action_audit"] = _action_audit(lifecycle_receipt)
@@ -926,6 +932,7 @@ def _main_with_parser_resources(
             if locator_error
             or isinstance(error, DirtyManagedCheckoutError)
             or isinstance(error, DeliveryPolicyError)
+            or isinstance(error, TaskControlError)
             or incompatible_state
             or durable_status not in {"blocked", "deterministic_contradiction"}
             or durable_diagnostics is None
@@ -1059,6 +1066,11 @@ def _print_lifecycle_result(
         print("Agent: 当前没有正在运行的 Agent；未创建 Action")
     if receipt is not None:
         print(f"操作: {receipt.kind}")
+        if (
+            receipt.resume_intent is not None
+            and receipt.resume_intent.get("authorization") == "new_budget_window"
+        ):
+            print("恢复授权: 本次操作授权开启一个新的预算窗口；重复附着不会再次授权")
         print("提交结果: 已附着到原操作" if receipt.attached else "提交结果: 已接受新操作")
         if receipt.status == "failed":
             print("动作状态: 应用失败")
@@ -1132,6 +1144,7 @@ def _action_audit(receipt: ActionReceipt) -> dict[str, object]:
         "handshake": receipt.handshake,
         "payload_digest": receipt.payload_digest,
         "failure": receipt.failure,
+        "resume_intent": receipt.resume_intent,
     }
 
 
@@ -1283,6 +1296,7 @@ def _resume_action_payload(
         "new_thread": bool(parsed.new_thread),
         "message": parsed.message,
         "resume_budget_checkpoint": budget_checkpoint_resume,
+        "resume_intent": bind_resume_intent(current),
         "policy": policy.snapshot(),
     }
 
@@ -1889,11 +1903,16 @@ def _run_lifecycle(
             if not isinstance(policy_snapshot, Mapping):
                 raise TaskControlError("resume Action 缺少 Policy Snapshot")
             resume_policy = parse_policy_snapshot(policy_snapshot)
+            retry_intent = payload.get("resume_intent")
 
             def retry_resume_refresh(run_id: str) -> tuple[dict[str, Any], bool]:
                 return run_controller.resume(
                     run_id,
-                    resume_human_blocker=initial_status != "supervision_timeout",
+                    resume_human_blocker=(
+                        isinstance(retry_intent, Mapping)
+                        and retry_intent.get("authorization")
+                        == "human_response"
+                    ),
                     new_thread=payload.get("new_thread") is True,
                     human_response=(
                         payload.get("message")
@@ -1906,6 +1925,9 @@ def _run_lifecycle(
                         payload.get("resume_budget_checkpoint") is True
                     ),
                     budget_policy=resume_policy,
+                    validate_resume_state=lambda state: validate_resume_intent(
+                        state, retry_intent
+                    ),
                 )
 
             resume_retry = retry_resume_refresh
@@ -1975,7 +1997,6 @@ def _run_lifecycle(
         driver_factory=lifecycle_driver_factory,
         record_execution_failure=record_lifecycle_failure,
     )
-    initial_status = current.get("status") if current is not None else None
 
     def select_run(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         if action_kind == "resume":
@@ -1993,9 +2014,14 @@ def _run_lifecycle(
             )
             if not isinstance(budget_checkpoint_resume, bool):
                 raise TaskControlError("resume Action 的 Budget Window binding 无效")
+            bound_intent = action_payload.get("resume_intent")
             return controller.resume(
                 run_id,
-                resume_human_blocker=initial_status != "supervision_timeout",
+                resume_human_blocker=(
+                    isinstance(bound_intent, Mapping)
+                    and bound_intent.get("authorization")
+                    == "human_response"
+                ),
                 new_thread=action_payload.get("new_thread") is True,
                 human_response=(
                     action_payload.get("message")
@@ -2009,6 +2035,9 @@ def _run_lifecycle(
                 ),
                 resume_budget_checkpoint=budget_checkpoint_resume,
                 budget_policy=parse_policy_snapshot(policy_snapshot),
+                validate_resume_state=lambda state: validate_resume_intent(
+                    state, bound_intent
+                ),
                 prepare_state=lambda state: prepare_action_application_receipt(
                     state, action
                 ),

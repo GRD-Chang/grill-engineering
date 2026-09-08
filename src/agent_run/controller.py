@@ -253,6 +253,7 @@ class Controller:
         resume_budget_checkpoint: bool = False,
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
         budget_policy: DeliveryPolicy | None = None,
+        validate_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         if message is not None:
             if human_response is not None:
@@ -264,6 +265,12 @@ class Controller:
         resuming_operator_stop = existing.get("status") == "operator_stopped"
         if prepare_state is not None:
             prepare_state(existing)
+        if validate_resume_state is not None:
+            validate_resume_state(existing)
+        resume_pause = {
+            key: deepcopy(existing.get(key))
+            for key in ("status", "operator_stop", "supervision_wait")
+        }
         effective_budget_policy = self.delivery_policy
         if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
             effective_budget_policy = budget_policy or self._policy_for_new_run()
@@ -429,6 +436,14 @@ class Controller:
             self._ensure_delivery_branch(state, base_sha)
             self.states.save_run(run_id, state)
             return state, True
+        if validate_resume_state is not None:
+            validation_state = state
+            if resuming_operator_stop or resuming_supervision_timeout:
+                # These pauses were consumed above by this authorized action.
+                # Recheck refreshed work identities against the original pause,
+                # without mistaking our own consumption for external drift.
+                validation_state = {**state, **resume_pause}
+            validate_resume_state(validation_state)
         if hold_operator_gate:
             return existing, True
         resuming_run_acceptance = False
