@@ -40,7 +40,7 @@ jobs:
         run: agent-run --help
 
       - name: Run tests
-        run: python -m pytest -q -n 2 --dist worksteal
+        run: make test-full
 
       - name: Run type checks
         run: python -m mypy src/agent_run

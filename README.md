@@ -123,7 +123,8 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 make test-policy  # 示例：策略模块的局部反馈
-make test        # 最终完整测试
+make test         # 本地快速回归，再补测受影响模块
+make test-full    # 完整测试，CI 与最终验收使用
 make typecheck
 ```
 

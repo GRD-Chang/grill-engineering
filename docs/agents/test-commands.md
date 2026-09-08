@@ -4,6 +4,9 @@
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行
 `python -m pytest tests/文件.py::用例名 -q`。
 
+`make test` 默认依次运行下表前四组快速回归；交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
+快速回归通过仅代表这四组通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
+
 | 入口 | 验证范围 | 需要补充的直接影响 |
 | --- | --- | --- |
 | `make test-policy` | Delivery Policy、Review Budget | 策略改变时补 Ticket / Parent-only / Run Repair 的实际调用路径 |
@@ -19,9 +22,9 @@
 CLI、安装器等未单列的模块直接选择其测试文件。公共接口、共享状态、生命周期、依赖和测试基础设施
 变化应扩大到直接调用方、同族场景及历史回归；无法界定影响范围时运行完整套件。
 
-`make test` 先检查 pip 和 Linux `os.memfd_create` 能力，再执行完整套件，固定两个 pytest worker；`make typecheck` 执行完整类型检查。
-等价的全量命令为 `python -m pytest -q -n 2 --dist worksteal`。
-调试顺序问题用 `make test PYTEST_ARGS='-q -n 0'`；临时追加过滤或诊断参数，例如
+CI 和最终验收使用 `make test-full`：先检查 pip 和 Linux `os.memfd_create` 能力，再执行完整套件，固定两个 pytest worker；`make typecheck` 执行完整类型检查。
+等价的全量测试命令为 `python -m pytest -q -n 2 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
+调试顺序问题用 `make test-full PYTEST_ARGS='-q -n 0'`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。
 
 普通 pytest 自动按用例隔离 HOME/XDG；共享准备与 CLI 子进程使用同一环境。

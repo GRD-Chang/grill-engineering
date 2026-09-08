@@ -11,10 +11,18 @@ TESTS_delivery = tests/test_delivery.py tests/test_cli_delivery.py tests/test_cl
 TESTS_run = tests/test_run_*.py tests/test_ticket_*.py
 TESTS_executor = tests/test_cli_run*.py tests/test_run_lifecycle.py tests/test_runner_lease.py tests/test_systemd_executor_host.py
 
-.PHONY: test test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
+.PHONY: test test-full test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
 
-# Complete suite on one runner, with a fixed process limit.
+# Local feedback; run the changed module's tests as well.
 test:
+	@echo "本地快速回归：Policy / State / Prompts / Locator；完整套件请运行 make test-full"
+	$(MAKE) test-policy
+	$(MAKE) test-state
+	$(MAKE) test-prompts
+	$(MAKE) test-locator
+
+# Complete suite for CI and final validation, with a fixed process limit.
+test-full:
 	$(PYTHON) -c 'import os, pip, sys; sys.exit(0 if hasattr(os, "memfd_create") else "完整测试需要支持 os.memfd_create 的 Linux Python")'
 	$(PYTHON) -m pytest -n 2 --dist worksteal $(PYTEST_ARGS)
 
