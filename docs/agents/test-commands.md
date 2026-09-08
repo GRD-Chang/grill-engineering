@@ -22,9 +22,10 @@
 CLI、安装器等未单列的模块直接选择其测试文件。公共接口、共享状态、生命周期、依赖和测试基础设施
 变化应扩大到直接调用方、同族场景及历史回归；无法界定影响范围时运行完整套件。
 
-CI 和最终验收使用 `make test-full`：先检查 pip 和 Linux `os.memfd_create` 能力，再执行完整套件，固定两个 pytest worker；`make typecheck` 执行完整类型检查。
-等价的全量测试命令为 `python -m pytest -q -n 2 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
-调试顺序问题用 `make test-full PYTEST_ARGS='-q -n 0'`；临时追加过滤或诊断参数，例如
+本地最终验收使用 `make test-full`：先检查 pip 和 Linux `os.memfd_create` 能力，再执行完整套件，默认固定六个 pytest worker；`make typecheck` 执行完整类型检查。
+六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`；CI 显式使用这个双 worker 命令，runner 规格和 job 数量不变。
+本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
+调试顺序问题用 `make test-full TEST_WORKERS=0`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。
 
 普通 pytest 自动按用例隔离 HOME/XDG；共享准备与 CLI 子进程使用同一环境。

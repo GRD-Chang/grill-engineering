@@ -40,7 +40,7 @@ jobs:
         run: agent-run --help
 
       - name: Run tests
-        run: make test-full
+        run: make test-full TEST_WORKERS=2
 
       - name: Run type checks
         run: python -m mypy src/agent_run

@@ -1,5 +1,6 @@
 PYTHON ?= python
 PYTEST_ARGS ?= -q
+TEST_WORKERS ?= 6
 
 # Groups are starting points; shared changes also need their callers' tests.
 TESTS_policy = tests/test_delivery_policy.py tests/test_review_budget.py
@@ -24,7 +25,7 @@ test:
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:
 	$(PYTHON) -c 'import os, pip, sys; sys.exit(0 if hasattr(os, "memfd_create") else "完整测试需要支持 os.memfd_create 的 Linux Python")'
-	$(PYTHON) -m pytest -n 2 --dist worksteal $(PYTEST_ARGS)
+	$(PYTHON) -m pytest -n $(TEST_WORKERS) --dist worksteal $(PYTEST_ARGS)
 
 test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor: test-%:
 	$(PYTHON) -m pytest $(TESTS_$*) $(PYTEST_ARGS)
