@@ -983,31 +983,11 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         "operator_stopped",
     ],
 )
-@pytest.mark.parametrize(
-    "run_arguments",
-    [
-        pytest.param((), id="ordinary"),
-        pytest.param(
-            (
-                "--development-model",
-                "future-model",
-                "--development-effort",
-                "high",
-            ),
-            id="with-profile-options",
-        ),
-        pytest.param(
-            ("--ticket-review-rounds", "1"),
-            id="with-policy-options",
-        ),
-    ],
-)
 def test_ordinary_run_preserves_explicit_authorization_boundaries(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     boundary: str,
-    run_arguments: tuple[str, ...],
 ) -> None:
     fixture = write_fixture(
         git_repo / "github.json",
@@ -1062,57 +1042,76 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
     marker = git_repo / "unexpected-successor.txt"
     assert not marker.exists()
 
-    rejected = run_cli(
-        git_repo,
-        fixture,
-        "run",
-        "1",
-        *run_arguments,
-        "--agent-fixture",
-        str(unused_agents),
-    )
+    # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
+    for run_arguments in (
+        (),
+        ("--development-model", "future-model", "--development-effort", "high"),
+        ("--ticket-review-rounds", "1"),
+    ):
+        try:
+            with monkeypatch.context() as argument_patch:
+                capsys.readouterr()
+                rejected = run_cli(
+                    git_repo,
+                    fixture,
+                    "run",
+                    "1",
+                    *run_arguments,
+                    "--agent-fixture",
+                    str(unused_agents),
+                )
 
-    expected_return_code = (
-        0
-        if expected_status
-        in {"run_approval_pending", "parent_approval_pending"}
-        else 2
-    )
-    assert rejected.returncode == expected_return_code, rejected.stderr
-    output = stdout_json(rejected)
-    assert output["status"] == expected_status, output
-    if expected_status == "publication_pending":
-        assert output["result"] == "rejected"
-    assert state_path.read_bytes() == state_before
-    assert control_path.read_bytes() == control_before
-    assert _tree_snapshot(state_root) == state_tree_before
-    assert load_only_run_state(git_repo)["action_application_receipt"] == receipt_before
-    control_document_after = json.loads(control_path.read_bytes())
-    assert control_document_after["action"]["executor_generation"] == (
-        control_document_before["action"]["executor_generation"]
-    )
-    assert control_document_after["action_history"] == control_document_before[
-        "action_history"
-    ]
-    assert fixture.read_bytes() == fixture_before
-    assert not marker.exists()
+                expected_return_code = (
+                    0
+                    if expected_status
+                    in {"run_approval_pending", "parent_approval_pending"}
+                    else 2
+                )
+                assert rejected.returncode == expected_return_code, rejected.stderr
+                output = stdout_json(rejected)
+                assert output["status"] == expected_status, output
+                if expected_status == "publication_pending":
+                    assert output["result"] == "rejected"
+                assert state_path.read_bytes() == state_before
+                assert control_path.read_bytes() == control_before
+                assert _tree_snapshot(state_root) == state_tree_before
+                assert (
+                    load_only_run_state(git_repo)["action_application_receipt"]
+                    == receipt_before
+                )
+                control_document_after = json.loads(control_path.read_bytes())
+                assert control_document_after["action"]["executor_generation"] == (
+                    control_document_before["action"]["executor_generation"]
+                )
+                assert (
+                    control_document_after["action_history"]
+                    == control_document_before["action_history"]
+                )
+                assert fixture.read_bytes() == fixture_before
+                assert not marker.exists()
 
-    if expected_status not in {"run_approval_pending", "parent_approval_pending"}:
-        _assert_production_run_rejects_before_readiness(
-            git_repo,
-            fixture,
-            monkeypatch,
-            capsys,
-            run_arguments,
-            expected_status=expected_status,
-        )
-    else:
-        _assert_production_run_does_not_prepare_executor(
-            git_repo,
-            fixture,
-            monkeypatch,
-            run_arguments,
-            expected_return_code=expected_return_code,
-        )
-    assert state_path.read_bytes() == state_before
-    assert control_path.read_bytes() == control_before
+                if expected_status not in {
+                    "run_approval_pending", "parent_approval_pending"
+                }:
+                    _assert_production_run_rejects_before_readiness(
+                        git_repo,
+                        fixture,
+                        argument_patch,
+                        capsys,
+                        run_arguments,
+                        expected_status=expected_status,
+                    )
+                else:
+                    _assert_production_run_does_not_prepare_executor(
+                        git_repo,
+                        fixture,
+                        argument_patch,
+                        run_arguments,
+                        expected_return_code=expected_return_code,
+                    )
+                assert state_path.read_bytes() == state_before
+                assert control_path.read_bytes() == control_before
+                capsys.readouterr()
+        except AssertionError as error:
+            error.add_note(f"run_arguments={run_arguments!r}")
+            raise

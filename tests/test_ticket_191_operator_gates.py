@@ -69,25 +69,11 @@ def test_ordinary_run_gate_covers_every_review_budget_checkpoint_subject(
     "blocked_reason",
     ["review_budget_exhausted", "modification_budget_exhausted"],
 )
-@pytest.mark.parametrize(
-    "run_arguments",
-    [
-        pytest.param((), id="ordinary"),
-        pytest.param(
-            ("--development-model", "future-model"),
-            id="with-profile-options",
-        ),
-        pytest.param(
-            ("--ticket-review-rounds", "1"),
-            id="with-policy-options",
-        ),
-    ],
-)
 def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
     git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
     subject_location: str,
     blocked_reason: str,
-    run_arguments: tuple[str, ...],
 ) -> None:
     state, states, _git = _completed_run(git_repo)
     budget = _canonical_run_budget()
@@ -145,39 +131,35 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
     fixture = git_repo / "github.json"
     fixture_before = fixture.read_bytes()
 
-    rejected = run_cli(git_repo, fixture, "run", "1", *run_arguments)
+    # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
+    for run_arguments in (
+        (),
+        ("--development-model", "future-model"),
+        ("--ticket-review-rounds", "1"),
+    ):
+        try:
+            with monkeypatch.context():
+                rejected = run_cli(git_repo, fixture, "run", "1", *run_arguments)
 
-    assert rejected.returncode == 2, rejected.stderr
-    assert stdout_json(rejected)["status"] == "blocked"
-    assert _tree_snapshot(state_root) == state_before
-    assert fixture.read_bytes() == fixture_before
-    assert not list((state_root / "task-control").glob("*.json"))
+                assert rejected.returncode == 2, rejected.stderr
+                assert stdout_json(rejected)["status"] == "blocked"
+                assert _tree_snapshot(state_root) == state_before
+                assert fixture.read_bytes() == fixture_before
+                assert not list((state_root / "task-control").glob("*.json"))
+        except AssertionError as error:
+            error.add_note(f"run_arguments={run_arguments!r}")
+            raise
 
 
 @pytest.mark.parametrize(
     "subject_location",
     ["ticket", "parent", "run_acceptance", "run_repair", "run_publication"],
 )
-@pytest.mark.parametrize(
-    "run_arguments",
-    [
-        pytest.param((), id="ordinary"),
-        pytest.param(
-            ("--development-model", "future-model"),
-            id="with-profile-options",
-        ),
-        pytest.param(
-            ("--ticket-review-rounds", "1"),
-            id="with-policy-options",
-        ),
-    ],
-)
 def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     subject_location: str,
-    run_arguments: tuple[str, ...],
 ) -> None:
     state, states, _git = _completed_run(git_repo)
     subject = {
@@ -251,25 +233,38 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
     fixture = git_repo / "github.json"
     fixture_before = fixture.read_bytes()
 
-    rejected = run_cli(git_repo, fixture, "run", "1", *run_arguments)
+    # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
+    for run_arguments in (
+        (),
+        ("--development-model", "future-model"),
+        ("--ticket-review-rounds", "1"),
+    ):
+        try:
+            with monkeypatch.context() as argument_patch:
+                capsys.readouterr()
+                rejected = run_cli(git_repo, fixture, "run", "1", *run_arguments)
 
-    assert rejected.returncode == 2, rejected.stderr
-    assert stdout_json(rejected)["status"] == "supervision_timeout"
-    assert _tree_snapshot(state_root) == state_before
-    assert fixture.read_bytes() == fixture_before
-    assert not list((state_root / "task-control").glob("*.json"))
+                assert rejected.returncode == 2, rejected.stderr
+                assert stdout_json(rejected)["status"] == "supervision_timeout"
+                assert _tree_snapshot(state_root) == state_before
+                assert fixture.read_bytes() == fixture_before
+                assert not list((state_root / "task-control").glob("*.json"))
 
-    _assert_production_run_rejects_before_readiness(
-        git_repo,
-        fixture,
-        monkeypatch,
-        capsys,
-        run_arguments,
-        expected_status="supervision_timeout",
-    )
-    assert _tree_snapshot(state_root) == state_before
-    assert fixture.read_bytes() == fixture_before
-    assert not list((state_root / "task-control").glob("*.json"))
+                _assert_production_run_rejects_before_readiness(
+                    git_repo,
+                    fixture,
+                    argument_patch,
+                    capsys,
+                    run_arguments,
+                    expected_status="supervision_timeout",
+                )
+                assert _tree_snapshot(state_root) == state_before
+                assert fixture.read_bytes() == fixture_before
+                assert not list((state_root / "task-control").glob("*.json"))
+                capsys.readouterr()
+        except AssertionError as error:
+            error.add_note(f"run_arguments={run_arguments!r}")
+            raise
 
 
 def test_production_run_locates_custom_state_gate_before_readiness(
@@ -424,26 +419,12 @@ def _assert_run_preserves_boundary(
 
 
 @pytest.mark.parametrize(
-    "run_arguments",
-    [
-        pytest.param((), id="ordinary"),
-        pytest.param(
-            ("--development-model", "future-model"),
-            id="with-profile-options",
-        ),
-        pytest.param(
-            ("--parent-only-paired-rounds", "2"),
-            id="with-policy-options",
-        ),
-    ],
-)
-@pytest.mark.parametrize(
     "blocked_reason",
     ["review_budget_exhausted", "modification_budget_exhausted"],
 )
 def test_ordinary_run_preserves_parent_budget_checkpoint(
     git_repo: Path,
-    run_arguments: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
     blocked_reason: str,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -469,12 +450,23 @@ def test_ordinary_run_preserves_parent_budget_checkpoint(
         state["parent_job"]["review_budget"]["checkpoint_reason"] = blocked_reason
         StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
 
-    _assert_run_preserves_boundary(
-        git_repo,
-        fixture,
-        expected_status="blocked",
-        run_arguments=run_arguments,
-    )
+    # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
+    for run_arguments in (
+        (),
+        ("--development-model", "future-model"),
+        ("--parent-only-paired-rounds", "2"),
+    ):
+        try:
+            with monkeypatch.context():
+                _assert_run_preserves_boundary(
+                    git_repo,
+                    fixture,
+                    expected_status="blocked",
+                    run_arguments=run_arguments,
+                )
+        except AssertionError as error:
+            error.add_note(f"run_arguments={run_arguments!r}")
+            raise
 
 
 def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
@@ -656,25 +648,10 @@ def test_progressing_run_reports_execution_readiness_when_unavailable(
     assert fixture.read_bytes() == fixture_before
 
 
-@pytest.mark.parametrize(
-    "run_arguments",
-    [
-        pytest.param((), id="ordinary"),
-        pytest.param(
-            ("--development-model", "future-model"),
-            id="with-profile-options",
-        ),
-        pytest.param(
-            ("--ticket-review-rounds", "1"),
-            id="with-policy-options",
-        ),
-    ],
-)
 def test_ordinary_run_preserves_requeue_required_boundary(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    run_arguments: tuple[str, ...],
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
@@ -707,17 +684,30 @@ def test_ordinary_run_preserves_requeue_required_boundary(
     assert stale.returncode == 2, stale.stderr
     assert stdout_json(stale)["status"] == "requeue_required"
 
-    _assert_run_preserves_boundary(
-        git_repo,
-        fixture,
-        expected_status="requeue_required",
-        run_arguments=run_arguments,
-    )
-    _assert_production_run_rejects_before_readiness(
-        git_repo,
-        fixture,
-        monkeypatch,
-        capsys,
-        run_arguments,
-        expected_status="requeue_required",
-    )
+    # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
+    for run_arguments in (
+        (),
+        ("--development-model", "future-model"),
+        ("--ticket-review-rounds", "1"),
+    ):
+        try:
+            with monkeypatch.context() as argument_patch:
+                capsys.readouterr()
+                _assert_run_preserves_boundary(
+                    git_repo,
+                    fixture,
+                    expected_status="requeue_required",
+                    run_arguments=run_arguments,
+                )
+                _assert_production_run_rejects_before_readiness(
+                    git_repo,
+                    fixture,
+                    argument_patch,
+                    capsys,
+                    run_arguments,
+                    expected_status="requeue_required",
+                )
+                capsys.readouterr()
+        except AssertionError as error:
+            error.add_note(f"run_arguments={run_arguments!r}")
+            raise
