@@ -20,6 +20,7 @@ from agent_run.executor_host import (
     ExecutorStartUnknownError,
     HostObservation,
 )
+from agent_run.operator_gate import has_run_operator_gate
 from agent_run.state import StateStore
 from agent_run.task_control import (
     ActionClaim,
@@ -459,6 +460,7 @@ class RunLifecycle:
                 if observation.status == "running":
                     break
                 if observation.status in {"absent", "exited"}:
+                    state = self._load_action_run(run_id, state, record=claim_record)
                     if _safe_supervision_recovery(state):
                         self.control.mark_executor_absent(
                             self.task,
@@ -1189,6 +1191,8 @@ class RunLifecycle:
                 # binding and handshake transaction is still being committed.
                 self.sleep(self.poll_interval)
             if observation.status in {"absent", "exited"}:
+                state = self._load_action_run(run_id, state, record=record)
+                recover = _safe_supervision_recovery(state)
                 if applied_at_non_replayable_boundary:
                     return self._complete_applied_action_after_executor_exit(
                         state,
@@ -1328,6 +1332,44 @@ class RunLifecycle:
             raise ExecutorLostError(
                 "Executor 已退出，但当前 Delivery Run 无法证明原 Action；"
                 "不会改写状态或启动第二个 Executor"
+            )
+        latest = self.control.load(self.task)
+        latest_action = latest.get("action") if isinstance(latest, Mapping) else None
+        latest_executor = latest.get("executor") if isinstance(latest, Mapping) else None
+        if not (
+            isinstance(latest_action, Mapping)
+            and isinstance(latest_executor, Mapping)
+            and latest_action.get("action_id") == action_id
+            and latest_action.get("executor_generation") == generation
+            and latest_executor.get("action_id") == action_id
+            and latest_executor.get("generation") == generation
+            and (
+                action_receipt_matches(current, latest_action)
+                or _unbound_action_matches_run_receipt(current, latest_action)
+            )
+        ):
+            raise ExecutorLostError(
+                "Executor 已退出，但当前 Action/generation 已改变；不会改写状态"
+            )
+        assert latest is not None
+        # Host inspection can race with the original Executor's final commit.
+        # Its latest durable boundary wins over the caller's progress snapshot.
+        if (
+            current.get("status") in {"completed", "abandoned"}
+            or has_run_operator_gate(current)
+        ) and not session_interruption_is_persisted(current):
+            if latest_action.get("status") != "completed":
+                return self._complete_applied_action_after_executor_exit(
+                    current,
+                    action_id=action_id,
+                    generation=generation,
+                    resumed=resumed,
+                    attached=attached,
+                )
+            return (
+                current,
+                resumed,
+                self.receipt_from_record(latest, action_id=action_id, attached=attached),
             )
         if self.initialize_profile is not None:
             # The earliest durable receipt can precede the frozen profile

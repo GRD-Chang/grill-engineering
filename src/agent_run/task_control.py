@@ -258,13 +258,20 @@ class TaskControlStore:
                 isinstance(executor, dict)
                 and executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
             ):
-                same_executor_action = (
+                can_observe_executor = (
                     isinstance(current, dict)
                     and current.get("action_id") == executor.get("action_id")
-                    and current.get("kind") == kind
-                    and current.get("payload_digest") == payload_digest
+                    and (
+                        (
+                            current.get("kind") == kind
+                            and current.get("payload_digest") == payload_digest
+                        )
+                        # Ordinary run can observe a session started by any
+                        # completed lifecycle intent; Host still proves ownership.
+                        or (kind == "run" and current.get("status") == "completed")
+                    )
                 )
-                if same_executor_action:
+                if can_observe_executor:
                     return ActionClaim(
                         action=None,
                         attached=True,
