@@ -1032,6 +1032,11 @@ def _require_invocation(
         or len(invocation["validation_error"]) > 2000
     ):
         raise IncompatibleRunStateError(f"invalid {location}.validation_error")
+    if invocation.get("machine_error") is not None and (
+        not isinstance(invocation["machine_error"], str)
+        or len(invocation["machine_error"]) > 2000
+    ):
+        raise IncompatibleRunStateError(f"invalid {location}.machine_error")
     resume_id = invocation.get("resume_id")
     if resume_id is not None and (
         not isinstance(resume_id, str)

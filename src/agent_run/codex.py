@@ -66,12 +66,16 @@ class CodexProcessError(RuntimeError):
         signal_number: int | None = None,
         recoverable: bool = True,
         capacity_failure: bool = False,
+        machine_error: str | None = None,
+        completed_output: bool = False,
     ) -> None:
         super().__init__(message)
         self.return_code = return_code
         self.signal_number = signal_number
         self.recoverable = recoverable
         self.capacity_failure = capacity_failure
+        self.machine_error = machine_error
+        self.completed_output = completed_output
 
 
 class _CodexThreadResumeError(CodexProcessError):
@@ -602,6 +606,7 @@ class CodexCliBackend:
                         "ordinary_recovery_used": ordinary_recovery_used,
                         "capacity_recovery_count": capacity_recovery_count,
                         "error": _bounded_error(str(error)),
+                        "machine_error": getattr(error, "machine_error", None),
                         "return_code": getattr(error, "return_code", None),
                         "signal": getattr(error, "signal_number", None),
                     }
@@ -628,7 +633,8 @@ class CodexCliBackend:
                     "signal": getattr(error, "signal_number", None),
                 }
                 if process_started:
-                    failure_facts["execution_interrupted"] = True
+                    failure_facts["execution_interrupted"] = not getattr(error, "completed_output", False)
+                    failure_facts["machine_error"] = getattr(error, "machine_error", None)
                 notify("failed", **failure_facts)
                 raise error
             if current_thread is not None and reported_thread != current_thread:
@@ -1002,20 +1008,23 @@ class CodexCliBackend:
                         "worker_gh_binding_failed: Codex worker did not start"
                     )
                 signal_number = -result.returncode if result.returncode < 0 else None
+                capacity_failure, machine_error = _failure_diagnostic(result.stdout)
                 if thread_id is not None:
                     raise _CodexThreadResumeError(
                         message,
                         return_code=result.returncode,
                         signal_number=signal_number,
                         recoverable=not binding_failed,
-                        capacity_failure=_is_capacity_failure(result.stdout),
+                        capacity_failure=capacity_failure,
+                        machine_error=machine_error,
                     )
                 raise CodexProcessError(
                     message,
                     return_code=result.returncode,
                     signal_number=signal_number,
                     recoverable=not binding_failed,
-                    capacity_failure=_is_capacity_failure(result.stdout),
+                    capacity_failure=capacity_failure,
+                    machine_error=machine_error,
                 )
             try:
                 with output_path.open("rb") as output_file:
@@ -1025,7 +1034,10 @@ class CodexCliBackend:
                     "Codex worker did not produce a final response"
                 ) from error
             if len(final_output) > _MAX_FINAL_OUTPUT_BYTES:
-                raise CodexProcessError("Codex worker final response is too large")
+                raise CodexProcessError(
+                    "Codex worker final response is too large",
+                    recoverable=False, completed_output=True,
+                )
             reported_thread = _thread_id(result.stdout)
             if (
                 thread_id is not None
@@ -1038,7 +1050,14 @@ class CodexCliBackend:
             actual_thread = reported_thread or thread_id
             if actual_thread is None:
                 raise CodexProcessError("Codex worker did not report a Thread ID")
-            return final_output.decode("utf-8"), actual_thread
+            try:
+                decoded = final_output.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise CodexProcessError(
+                    "Codex worker final response is not valid UTF-8",
+                    recoverable=False, completed_output=True,
+                ) from error
+            return decoded, actual_thread
 
 
 def _looks_like_worker_gh_binding_failure(
@@ -1126,8 +1145,8 @@ def _is_retryable_initial_credential_error(error: WorkerCredentialError) -> bool
     return not any(marker in message for marker in permanent_markers)
 
 
-def _is_capacity_failure(stdout: str) -> bool:
-    """Only confirmed failed turns grant the capacity-specific retry policy."""
+def _failure_diagnostic(stdout: str) -> tuple[bool, str | None]:
+    """Machine failure types take precedence over compatibility message matching."""
     for line in reversed(stdout.splitlines()):
         try:
             value = json.loads(line)
@@ -1138,9 +1157,13 @@ def _is_capacity_failure(stdout: str) -> bool:
         }:
             continue
         error = value.get("error")
+        if isinstance(error, dict) and "codex_error_info" in error:
+            machine = error["codex_error_info"]
+            diagnostic = machine if isinstance(machine, str) else json.dumps(machine, ensure_ascii=False)
+            return machine == "server_overloaded", _bounded_error(diagnostic)[:2000]
         message = error.get("message") if isinstance(error, dict) else error
-        return message == "Selected model is at capacity. Please try a different model."
-    return False
+        return message == "Selected model is at capacity. Please try a different model.", None
+    return False, None
 
 
 def _terminal_error(stdout: str, stderr: str) -> str:

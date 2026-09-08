@@ -32,6 +32,7 @@ def worker_fixture(
     *,
     report_thread: bool = True,
     failure_event: bool = True,
+    machine_info: object = None,
 ) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
@@ -54,7 +55,19 @@ def worker_fixture(
                 line
                 + (
                     "\n"
-                    + json.dumps({"type": "turn.failed", "error": {"message": outcome}})
+                    + json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": outcome,
+                                **(
+                                    {"codex_error_info": machine_info}
+                                    if machine_info is not None
+                                    else {}
+                                ),
+                            },
+                        }
+                    )
                     if failure_event
                     else ""
                 ),
@@ -407,3 +420,74 @@ def test_signal_exit_preserves_diagnostics_and_continues(
     failure = next(facts for kind, facts in events.events if kind == "recovery_waiting")
     assert failure["return_code"] == -9
     assert failure["signal"] == 9
+
+
+@pytest.mark.parametrize(
+    ("machine_info", "message", "capacity"),
+    [
+        ("server_overloaded", "Temporarily overloaded", True),
+        ("usage_limit_reached", CAPACITY, False),
+        ("future_error_type", CAPACITY, False),
+        ({"unknown_error": {"detail": "bounded diagnostic"}}, CAPACITY, False),
+    ],
+)
+def test_machine_failure_type_takes_precedence_over_message(
+    tmp_path: Path, monkeypatch: Any, machine_info: object, message: str, capacity: bool
+) -> None:
+    calls = worker_fixture(
+        monkeypatch, [message, message, "success"], machine_info=machine_info
+    )
+    monkeypatch.setattr("agent_run.codex.time.sleep", lambda _seconds: None)
+    events = Events()
+    backend = CodexCliBackend(credential_provider=lambda: "reader")
+    request = {
+        "checkout": str(tmp_path),
+        "_invocation_event": events,
+        "_currentness_check": lambda: True,
+    }
+    if capacity:
+        backend.develop(request)
+        assert len(calls) == 3
+    else:
+        with pytest.raises(CodexProcessError):
+            backend.develop(request)
+        assert len(calls) == 2
+    failures = [
+        facts for kind, facts in events.events if kind in {"recovery_waiting", "failed"}
+    ]
+    assert all(facts["machine_error"] for facts in failures)
+    assert failures[0]["recovery_kind"] == ("capacity" if capacity else "ordinary")
+
+
+@pytest.mark.parametrize(
+    "payload", [b"x" * (1024 * 1024 + 1), b"\xff"], ids=["oversized", "invalid-utf8"]
+)
+def test_normal_unusable_output_does_not_restart_work(
+    tmp_path: Path, monkeypatch: Any, payload: bytes
+) -> None:
+    calls = []
+
+    def run(
+        arguments: list[str], *, on_stdout_line: Any = None, **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        line = json.dumps({"type": "thread.started", "thread_id": "original-thread"})
+        if on_stdout_line:
+            on_stdout_line(line)
+        Path(arguments[arguments.index("--output-last-message") + 1]).write_bytes(
+            payload
+        )
+        return subprocess.CompletedProcess(arguments, 0, line, "")
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", run)
+    events = Events()
+    with pytest.raises(CodexProcessError):
+        CodexCliBackend(credential_provider=lambda: "reader").develop(
+            {
+                "checkout": str(tmp_path),
+                "_invocation_event": events,
+                "_currentness_check": lambda: True,
+            }
+        )
+    assert len(calls) == 1
+    assert events.events[-1][1]["execution_interrupted"] is False

@@ -20,7 +20,7 @@ def recovery_cli(
     capsys: pytest.CaptureFixture[str],
 ) -> Any:
     fixture = write_fixture(git_repo / 'github.json', issues={})
-    outcomes: list[str] = []
+    outcomes: list[Any] = []
     waits: list[float] = []
     calls: list[dict[str, Any]] = []
 
@@ -31,9 +31,9 @@ def recovery_cli(
         if on_stdout_line:
             on_stdout_line(line)
         outcome = outcomes.pop(0)
-        if outcome not in {'invalid', 'blocker'}:
+        if isinstance(outcome, dict) or outcome not in {'invalid', 'blocker'}:
             return subprocess.CompletedProcess(arguments, 1, line + '\n' + json.dumps({
-                'type': 'turn.failed', 'error': {'message': ('unexpected worker exit' if outcome == 'failure' else outcome)},
+                'type': 'turn.failed', 'error': (outcome if isinstance(outcome, dict) else {'message': ('unexpected worker exit' if outcome == 'failure' else outcome)}),
             }), '')
         artifact = ({'invalid': True} if outcome == 'invalid' else {
             'result_kind': 'human_blocker', 'summary': None,
@@ -92,10 +92,14 @@ def test_manual_resume_preserves_spent_recovery_and_interrupted_json_step(recove
     assert blocked['parent_job']['review_budget'] == budget
 
 
-def test_capacity_continuation_keeps_bounded_history_and_one_business_attempt(recovery_cli: Any) -> None:
+@pytest.mark.parametrize("machine_error", [None, "server_overloaded"])
+def test_capacity_continuation_keeps_bounded_history_and_one_business_attempt(
+    recovery_cli: Any, machine_error: str | None,
+) -> None:
     command, outcomes, calls, waits = recovery_cli
     capacity = "Selected model is at capacity. Please try a different model."
-    outcomes.extend([capacity] * 6 + ['blocker'])
+    failure = capacity if machine_error is None else {'message': '服务暂时无法处理请求', 'codex_error_info': machine_error}
+    outcomes.extend([failure] * 6 + ['blocker'])
     code, state = command('run')
     assert code == 2
     assert len(calls) == 7
@@ -103,6 +107,7 @@ def test_capacity_continuation_keeps_bounded_history_and_one_business_attempt(re
     assert len(state['agent_invocation_history']) == 1
     active = state['active_agent_invocation']
     assert active['capacity_recovery_count'] == 6
+    assert active.get('machine_error') == machine_error
     assert active['ordinary_recovery_used'] is False
     assert active['status'] == 'completed'
     assert state['parent_job']['review_budget']['development_attempts'] == 1
