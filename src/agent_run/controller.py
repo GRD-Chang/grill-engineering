@@ -64,6 +64,7 @@ from agent_run.requeue_supervision import (
     wait_for_recoverable_github_read,
 )
 from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_audit
+from agent_run.resume_intent import resume_pause_state
 from agent_run.scope_changes import reconcile_structure
 from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
@@ -262,6 +263,17 @@ class Controller:
         if human_response is not None:
             human_response = _validated_human_response(human_response)
         existing = self._load_run(run_id)
+        retry_window = None
+        if (
+            validate_resume_state is not None
+            and existing.get("status") == "waiting_external"
+            and is_github_refresh_wait(existing)
+        ):
+            # A failed refresh retained the pause facts but projected its
+            # observable status as an external wait. Validate the same pause
+            # again before consuming it, keeping this wait's existing deadline.
+            retry_window = deepcopy(existing.get("supervision_window"))
+            existing = resume_pause_state(existing)
         resuming_operator_stop = existing.get("status") == "operator_stopped"
         if prepare_state is not None:
             prepare_state(existing)
@@ -271,6 +283,17 @@ class Controller:
             key: deepcopy(existing.get(key))
             for key in ("status", "operator_stop", "supervision_wait")
         }
+
+        def save_refresh_wait(state: dict[str, Any]) -> None:
+            if validate_resume_state is not None and resume_pause["status"] in {
+                "operator_stopped", "supervision_timeout"
+            }:
+                for key in ("operator_stop", "supervision_wait"):
+                    value = resume_pause[key]
+                    if value is not None:
+                        state[key] = deepcopy(value)
+            self.states.save_run(run_id, state)
+
         effective_budget_policy = self.delivery_policy
         if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
             effective_budget_policy = budget_policy or self._policy_for_new_run()
@@ -307,7 +330,7 @@ class Controller:
                 waiting_for="GitHub repository binding",
             )
             existing["updated_at"] = _now()
-            self.states.save_run(run_id, existing)
+            save_refresh_wait(existing)
             return existing, True
         if existing.get("status") in {
             "abandoned",
@@ -368,6 +391,8 @@ class Controller:
                     "supervision timeout resume does not accept Agent or Human Blocker options"
                 )
             restore_supervision_wait(existing)
+            if retry_window is not None:
+                existing["supervision_window"] = retry_window
         parent = _state_mapping(existing, "parent")
         parent_number = int(parent["number"])
         if existing.get("base_resolution_pending") is True:
@@ -383,7 +408,7 @@ class Controller:
                     waiting_for="GitHub repository binding",
                 )
                 existing["updated_at"] = _now()
-                self.states.save_run(run_id, existing)
+                save_refresh_wait(existing)
                 return existing, True
             return self._start(
                 repository,
@@ -397,7 +422,7 @@ class Controller:
         if is_github_refresh_wait(state):
             if hold_operator_gate:
                 return existing, True
-            self.states.save_run(run_id, state)
+            save_refresh_wait(state)
             return state, True
         if state.get("status") in {
             "unsupported_scope_change",

@@ -15,9 +15,23 @@ class ResumeIntentError(TaskControlError):
     """The admitted Resume no longer grants authority over this pause."""
 
 
+def resume_pause_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Recover unconsumed pause facts behind a temporary GitHub refresh wait."""
+    current = dict(state)
+    if (
+        current.get("status") == "waiting_external"
+        and current.get("github_refresh_pending") is True
+    ):
+        if isinstance(current.get("operator_stop"), Mapping):
+            current["status"] = "operator_stopped"
+        elif isinstance(current.get("supervision_wait"), Mapping):
+            current["status"] = "supervision_timeout"
+    return current
+
+
 def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
     """Bind pause facts, excluding observation timestamps and refresh metadata."""
-    current = dict(state)
+    state = current = resume_pause_state(state)
     checkpoints = budget_checkpoint_subjects(current)
     gates = operator_gate_subjects(current)
     human = [
