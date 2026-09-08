@@ -1479,6 +1479,10 @@ class RunLifecycle:
 
             observation = self.host.inspect(spec, self.control)
             if observation.status in {"absent", "exited"}:
+                # Completion can be persisted after our snapshot but before
+                # Host inspection. Re-read changed receipts before declaring loss.
+                if self.control.snapshot(self.task, action_id) != record:
+                    continue
                 self.host.cleanup_startup(spec)
                 raise ExecutorLostError(
                     "Executor 在 Action 完成前退出；只完成原 execution generation 对账，不自动重放 Agent"
