@@ -20,6 +20,7 @@ from agent_run.executor_host import (
     ExecutorStartUnknownError,
     HostObservation,
 )
+from agent_run.operator_gate import has_run_operator_gate
 from agent_run.state import StateStore
 from agent_run.task_control import (
     ActionClaim,
@@ -349,13 +350,24 @@ class RunLifecycle:
                 "Task Control 不可用；仅凭 Delivery Run Receipt 无法证明原 "
                 "Executor 已退出。请恢复对应 Task Control 后重试。"
             )
+        invocation = (
+            current.get("active_agent_invocation") if current is not None else None
+        )
+        observing_active_invocation = (
+            request.kind == "run"
+            and isinstance(invocation, Mapping)
+            and invocation.get("status") in {"running", "resuming"}
+        )
         if (
             current is not None
             and isinstance(record, Mapping)
             and isinstance(action, Mapping)
             and isinstance(executor, Mapping)
             and executor.get("status") in {"absent", "exited"}
-            and action.get("kind") not in {"approve", "revise", "requeue"}
+            and (
+                action.get("kind") not in {"approve", "revise", "requeue"}
+                or observing_active_invocation
+            )
             and action_receipt_matches(current, action)
             and not reconciling_receipt_predecessor
             and (
@@ -365,6 +377,7 @@ class RunLifecycle:
                     and (
                         executor.get("status") == "absent"
                         or isinstance(executor.get("failure"), str)
+                        or observing_active_invocation
                     )
                 )
             )
@@ -411,6 +424,11 @@ class RunLifecycle:
             and action.get("payload_digest") == payload_digest(request.payload)
             and action.get("run_id") == current_run_id
             and not request.allow_terminal_successor
+            and not (
+                request.kind == "run"
+                and isinstance(executor, Mapping)
+                and executor.get("status") in {"starting", "running"}
+            )
             and (
                 request.kind in {"approve", "revise", "requeue"}
                 or not _restartable_after_executor_exit(current)
@@ -459,6 +477,7 @@ class RunLifecycle:
                 if observation.status == "running":
                     break
                 if observation.status in {"absent", "exited"}:
+                    state = self._load_action_run(run_id, state, record=claim_record)
                     if _safe_supervision_recovery(state):
                         self.control.mark_executor_absent(
                             self.task,
@@ -1189,6 +1208,8 @@ class RunLifecycle:
                 # binding and handshake transaction is still being committed.
                 self.sleep(self.poll_interval)
             if observation.status in {"absent", "exited"}:
+                state = self._load_action_run(run_id, state, record=record)
+                recover = _safe_supervision_recovery(state)
                 if applied_at_non_replayable_boundary:
                     return self._complete_applied_action_after_executor_exit(
                         state,
@@ -1328,6 +1349,44 @@ class RunLifecycle:
             raise ExecutorLostError(
                 "Executor 已退出，但当前 Delivery Run 无法证明原 Action；"
                 "不会改写状态或启动第二个 Executor"
+            )
+        latest = self.control.load(self.task)
+        latest_action = latest.get("action") if isinstance(latest, Mapping) else None
+        latest_executor = latest.get("executor") if isinstance(latest, Mapping) else None
+        if not (
+            isinstance(latest_action, Mapping)
+            and isinstance(latest_executor, Mapping)
+            and latest_action.get("action_id") == action_id
+            and latest_action.get("executor_generation") == generation
+            and latest_executor.get("action_id") == action_id
+            and latest_executor.get("generation") == generation
+            and (
+                action_receipt_matches(current, latest_action)
+                or _unbound_action_matches_run_receipt(current, latest_action)
+            )
+        ):
+            raise ExecutorLostError(
+                "Executor 已退出，但当前 Action/generation 已改变；不会改写状态"
+            )
+        assert latest is not None
+        # Host inspection can race with the original Executor's final commit.
+        # Its latest durable boundary wins over the caller's progress snapshot.
+        if (
+            current.get("status") in {"completed", "abandoned"}
+            or has_run_operator_gate(current)
+        ) and not session_interruption_is_persisted(current):
+            if latest_action.get("status") != "completed":
+                return self._complete_applied_action_after_executor_exit(
+                    current,
+                    action_id=action_id,
+                    generation=generation,
+                    resumed=resumed,
+                    attached=attached,
+                )
+            return (
+                current,
+                resumed,
+                self.receipt_from_record(latest, action_id=action_id, attached=attached),
             )
         if self.initialize_profile is not None:
             # The earliest durable receipt can precede the frozen profile
@@ -1479,6 +1538,10 @@ class RunLifecycle:
 
             observation = self.host.inspect(spec, self.control)
             if observation.status in {"absent", "exited"}:
+                # Completion can be persisted after our snapshot but before
+                # Host inspection. Re-read changed receipts before declaring loss.
+                if self.control.snapshot(self.task, action_id) != record:
+                    continue
                 self.host.cleanup_startup(spec)
                 raise ExecutorLostError(
                     "Executor 在 Action 完成前退出；只完成原 execution generation 对账，不自动重放 Agent"

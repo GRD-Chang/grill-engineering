@@ -258,13 +258,20 @@ class TaskControlStore:
                 isinstance(executor, dict)
                 and executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
             ):
-                same_executor_action = (
+                can_observe_executor = (
                     isinstance(current, dict)
                     and current.get("action_id") == executor.get("action_id")
-                    and current.get("kind") == kind
-                    and current.get("payload_digest") == payload_digest
+                    and (
+                        (
+                            current.get("kind") == kind
+                            and current.get("payload_digest") == payload_digest
+                        )
+                        # Ordinary run can observe a session started by any
+                        # completed lifecycle intent; Host still proves ownership.
+                        or (kind == "run" and current.get("status") == "completed")
+                    )
                 )
-                if same_executor_action:
+                if can_observe_executor:
                     return ActionClaim(
                         action=None,
                         attached=True,
@@ -1171,6 +1178,8 @@ class TaskControlStore:
         generation: int,
         result_status: str | None = None,
         failure: str | None = None,
+        run_id: str | None = None,
+        runner_binding: str | None = None,
     ) -> dict[str, Any]:
         with self._locked(task):
             record = self._require_unlocked(task)
@@ -1180,6 +1189,28 @@ class TaskControlStore:
                 raise ActionReconciliationError(
                     "Executor Action 不再是当前 Task Action"
                 )
+            if run_id is not None or runner_binding is not None:
+                # Startup can reserve a Run-bound Executor before the Action
+                # application binds the Task/Action records to that Run.
+                action_run_ids = {run_id}
+                if action.get("application_observed") is not True:
+                    action_run_ids.add(None)
+                if (
+                    executor.get("run_id") != run_id
+                    or action.get("run_id") not in action_run_ids
+                    or record.get("run_id") not in action_run_ids
+                    or (
+                        runner_binding is not None
+                        and executor.get("runner_binding") != runner_binding
+                    )
+                ):
+                    raise ActionReconciliationError(
+                        "Executor Host exit 的 Run/Runner binding 不匹配"
+                    )
+                # A later Host read must not rewrite a reconciled exit,
+                # especially its durable session_interrupted evidence.
+                if executor.get("status") in {"exited", "absent"}:
+                    return deepcopy(record)
             executor["status"] = "exited"
             executor["exited_at"] = _now()
             if failure is not None:

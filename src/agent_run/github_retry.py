@@ -83,13 +83,33 @@ def _run_bounded_command(
     stdout = bytearray()
     stderr = bytearray()
 
+    stop_readers = threading.Event()
+
     def drain(stream: object, destination: bytearray) -> None:
         fileno = getattr(stream, "fileno", None)
         if not callable(fileno):
             return
         try:
             descriptor = fileno()
-            while chunk := os.read(descriptor, 64 * 1024):
+            os.set_blocking(descriptor, False)
+            deadline: float | None = None
+            while True:
+                if stop_readers.is_set():
+                    # Drain buffered output, but escaped pipe holders cannot
+                    # extend cleanup indefinitely by keeping the pipe open.
+                    if deadline is None:
+                        deadline = time.monotonic() + 0.1
+                    if time.monotonic() >= deadline:
+                        return
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    if deadline is not None:
+                        return
+                    stop_readers.wait(0.05)
+                    continue
+                if not chunk:
+                    return
                 destination.extend(chunk)
                 if len(destination) > MAX_COMMAND_OUTPUT_BYTES:
                     del destination[:-MAX_COMMAND_OUTPUT_BYTES]
@@ -102,27 +122,34 @@ def _run_bounded_command(
         threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
     )
-    for reader in readers:
-        reader.start()
+    timed_out = False
     try:
+        for reader in readers:
+            reader.start()
         returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        # A successful command may leave descendants holding the output pipes.
+        # Close the owned group on every path before waiting for EOF readers.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.wait()
+        stop_readers.set()
+        for reader in readers:
+            if reader.ident is not None:
+                reader.join()
+        process.stdout.close()
+        process.stderr.close()
+    if timed_out:
         raise subprocess.TimeoutExpired(
             arguments,
             timeout,
             output=bytes(stdout),
             stderr=bytes(stderr),
         )
-    finally:
-        for reader in readers:
-            reader.join(timeout=1)
-        process.stdout.close()
-        process.stderr.close()
     return subprocess.CompletedProcess(
         arguments,
         returncode,

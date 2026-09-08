@@ -3888,11 +3888,13 @@ def test_sigint_terminates_worker_process_group(
 ) -> None:
     project_root = Path(__file__).parents[1]
     child_path = tmp_path / "child.pid"
+    # Reap the child in its owning shell, including on group termination. A
+    # runner's init/subreaper need not reap orphans before our exit assertion.
     code = f"""
 from pathlib import Path
 from agent_run.worker_sandbox import run_worker_process
 run_worker_process(
-    ["sh", "-c", "sleep 60 & echo $! > child.pid; wait"],
+    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; wait"],
     cwd=Path({str(tmp_path)!r}),
     prompt="",
     environment={{"PATH": "/usr/bin:/bin"}},

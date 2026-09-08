@@ -1502,9 +1502,25 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
             sys.stdout = attached_output.open("w", encoding="utf-8")
             original_observe = cli_module.RunLifecycle._observe_action
 
-            def observe_after_attach(lifecycle: object, *args: object, **kwargs: object):
-                os.write(attached_write, b"1")
-                os.close(attached_write)
+            def observe_after_attach(
+                lifecycle: RunLifecycle, *args: object, **kwargs: object
+            ):
+                original_inspect = lifecycle.host.inspect
+
+                def inspect_after_completion(
+                    spec: ExecutorSpec, store: TaskControlStore
+                ) -> HostObservation:
+                    lifecycle.host.inspect = original_inspect  # type: ignore[method-assign]
+                    # Complete between the observer's Action snapshot and Host
+                    # inspection, so the completion/exit race is deterministic.
+                    os.write(attached_write, b"1")
+                    os.close(attached_write)
+                    assert executor_pid_fd is not None
+                    exited, _, _ = select.select([executor_pid_fd], [], [], 3)
+                    assert exited == [executor_pid_fd]
+                    return original_inspect(spec, store)
+
+                lifecycle.host.inspect = inspect_after_completion  # type: ignore[method-assign]
                 return original_observe(
                     lifecycle, *args, **kwargs  # type: ignore[arg-type]
                 )
@@ -1534,7 +1550,9 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
 
         _, reobserver_status = os.waitpid(reobserver_pid, 0)
         assert os.WIFEXITED(reobserver_status)
-        assert os.WEXITSTATUS(reobserver_status) == 0
+        assert os.WEXITSTATUS(reobserver_status) == 0, attached_output.read_text(
+            encoding="utf-8"
+        )
         completed_output = json.loads(attached_output.read_text(encoding="utf-8"))
         audit = completed_output["action_audit"]
         record = control.load(task)
