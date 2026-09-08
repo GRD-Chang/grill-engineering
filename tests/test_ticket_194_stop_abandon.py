@@ -8,13 +8,14 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from conftest import seed_run, write_fixture
+from conftest import seed_idle_control, seed_run, write_fixture
 from cli_run_supervision_support import _parent_only_agents
 from test_run_publication import RunPublicationAgents, _accepted_run
 from agent_run import cli as cli_module
@@ -29,7 +30,7 @@ from agent_run.executor_host import (
     FakeExecutorHost,
     HostObservation,
 )
-from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.git import GitRepository
 from agent_run.operator_gate import operator_gate_subjects
 from agent_run.run_lifecycle import (
@@ -587,6 +588,11 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
     dirty_checkout: Path | None = None
     mutations_before_failure: list[object] | None = None
     if kind == "abandon":
+        seed_idle_control(
+            TaskControlStore(git_repo / ".agent-run"),
+            TaskKey(git_repo, "example/project", 1),
+            run_id,
+        )
         prepared = _run_cli(
             git_repo,
             fixture,
@@ -686,6 +692,98 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
             assert state_after_run.get(field) == state_before_run.get(field)
         assert control.path_for(task).read_bytes() == control_before_run
 
+        state_path = states.runs_directory / f"{run_id}.json"
+        state_bytes = state_path.read_bytes()
+        fixture_bytes = fixture.read_bytes()
+        for run_arguments in (
+            (),
+            ("--development-model", "future-model"),
+            ("--ticket-review-rounds", "1"),
+        ):
+            for readiness_failure in (
+                "active-runner-missing",
+                "systemd-unavailable",
+            ):
+                calls = {"lease": 0, "runner": 0, "host": 0, "readiness": 0}
+
+                class UsageLease:
+                    def fileno(self) -> int:
+                        return 1
+
+                class UnavailableHost:
+                    def __init__(self, **_options: object) -> None:
+                        calls["host"] += 1
+
+                    def check_readiness(self) -> None:
+                        calls["readiness"] += 1
+                        raise cli_module.SystemdExecutionReadinessError(
+                            "user systemd unavailable"
+                        )
+
+                def observed_lease(_path: Path) -> object:
+                    calls["lease"] += 1
+                    return nullcontext(UsageLease())
+
+                def active_runner_available() -> bool:
+                    calls["runner"] += 1
+                    return readiness_failure == "systemd-unavailable"
+
+                capsys.readouterr()
+                with monkeypatch.context() as readiness:
+                    readiness.chdir(git_repo)
+                    readiness.setenv(
+                        "XDG_DATA_HOME", str(git_repo / "runner-data")
+                    )
+                    readiness.setenv(
+                        "XDG_RUNTIME_DIR", str(git_repo / "runtime")
+                    )
+                    readiness.setattr(
+                        cli_module, "runner_usage_lease", observed_lease
+                    )
+                    readiness.setattr(
+                        cli_module,
+                        "_running_active_runner",
+                        active_runner_available,
+                    )
+                    readiness.setattr(
+                        cli_module, "SystemdUserExecutorHost", UnavailableHost
+                    )
+                    readiness.setattr(
+                        cli_module,
+                        "GhGitHubReader",
+                        lambda _repo, *, working_directory: FixtureGitHubReader(
+                            fixture
+                        ),
+                    )
+                    production_return_code = cli_module.main(
+                        [
+                            "run",
+                            "1",
+                            "--repo",
+                            "example/project",
+                            *run_arguments,
+                            "--json",
+                        ]
+                    )
+
+                production_output = json.loads(capsys.readouterr().out)
+                assert production_return_code == 2
+                assert production_output["result"] == "rejected"
+                assert production_output["status"] == expected_safe_status
+                assert {
+                    "code": "lifecycle_action_failed",
+                    "message": actual_failure,
+                } in production_output["diagnostics"]
+                assert calls == {
+                    "lease": 0,
+                    "runner": 0,
+                    "host": 0,
+                    "readiness": 0,
+                }
+                assert state_path.read_bytes() == state_bytes
+                assert control.path_for(task).read_bytes() == control_before_run
+                assert fixture.read_bytes() == fixture_bytes
+
         if kind == "abandon":
             assert dirty_checkout is not None and dirty_checkout.exists()
             assert mutations_before_failure is not None
@@ -747,6 +845,11 @@ def test_failed_control_retries_the_unresolved_target_before_success(
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     if kind == "abandon":
+        seed_idle_control(
+            TaskControlStore(git_repo / ".agent-run"),
+            TaskKey(git_repo, "example/project", 1),
+            run_id,
+        )
         prepared = _run_cli(
             git_repo,
             fixture,
@@ -776,6 +879,18 @@ def test_failed_control_retries_the_unresolved_target_before_success(
     real_wait_for_exit = executor_host_module._wait_for_process_exit
     sent_signals: list[tuple[int, int]] = []
 
+    def assert_read_only_activity(expected: str) -> None:
+        before = {
+            path: path.read_bytes() for path in states.root.rglob("*.json")
+        }
+        for command in ("status", "history"):
+            assert cli_module.main([command, run_id, "--json"]) == 0
+            view = json.loads(capsys.readouterr().out)
+            assert view["executor_control"]["activity"] == expected
+            assert {
+                path: path.read_bytes() for path in states.root.rglob("*.json")
+            } == before
+
     def target_identity(target: Mapping[str, Any]) -> tuple[int, str]:
         target_worker = target.get("worker")
         assert isinstance(target_worker, Mapping)
@@ -795,7 +910,10 @@ def test_failed_control_retries_the_unresolved_target_before_success(
         raise ExecutorStartUnknownError(failure_text)
 
     def record_signal_without_exit(pid: int, sent_signal: int) -> None:
-        sent_signals.append((pid, sent_signal))
+        if pid == worker.pid:
+            sent_signals.append((pid, sent_signal))
+        else:
+            real_killpg(pid, sent_signal)
 
     def reject_exit_confirmation(_pid: int, _token: str, *, timeout: float) -> None:
         del timeout
@@ -856,6 +974,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
             failed_action_ids.append(str(output["action_audit"]["action_id"]))
             assert worker.poll() is None
             assert unrelated.poll() is None
+            assert_read_only_activity("unknown")
             if becomes_terminal and attempt == 0:
                 terminal = states.load_run(run_id)
                 assert terminal is not None
@@ -904,6 +1023,7 @@ def test_failed_control_retries_the_unresolved_target_before_success(
         assert completed is not None
         assert completed["action"]["status"] == "completed"
         assert target_identity(completed["action"]["target_executor"]) == expected_target
+        assert_read_only_activity("not_running")
         history = completed["action_history"]
         failed_history = {
             entry["action"]["action_id"]: entry["action"]
@@ -997,6 +1117,11 @@ def test_public_abandon_can_permanently_close_an_operator_stopped_run(
     states = StateStore(git_repo / ".agent-run")
     run = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(run["run_id"])
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        run_id,
+    )
     prepared = _run_cli(
         git_repo,
         fixture,
@@ -1164,6 +1289,7 @@ def test_abandon_executor_survives_observer_exit_with_canonical_receipt(
     run_id = str(current["run_id"])
     task = TaskKey(git_repo, "example/project", 1)
     control = TaskControlStore(git_repo / ".agent-run")
+    seed_idle_control(control, task, run_id)
     ready_read, ready_write = os.pipe()
     release_read, release_write = os.pipe()
     effect = git_repo / ".agent-run" / "abandon-effect"
@@ -1290,6 +1416,11 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
     assert seed_run(git_repo, fixture).returncode == 0
     states = StateStore(git_repo / ".agent-run")
     run_id = str(states.find_unfinished_runs("example/project", 1)[0]["run_id"])
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        run_id,
+    )
     prepared = _run_cli(
         git_repo,
         fixture,
@@ -1371,9 +1502,25 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
             sys.stdout = attached_output.open("w", encoding="utf-8")
             original_observe = cli_module.RunLifecycle._observe_action
 
-            def observe_after_attach(lifecycle: object, *args: object, **kwargs: object):
-                os.write(attached_write, b"1")
-                os.close(attached_write)
+            def observe_after_attach(
+                lifecycle: RunLifecycle, *args: object, **kwargs: object
+            ):
+                original_inspect = lifecycle.host.inspect
+
+                def inspect_after_completion(
+                    spec: ExecutorSpec, store: TaskControlStore
+                ) -> HostObservation:
+                    lifecycle.host.inspect = original_inspect  # type: ignore[method-assign]
+                    # Complete between the observer's Action snapshot and Host
+                    # inspection, so the completion/exit race is deterministic.
+                    os.write(attached_write, b"1")
+                    os.close(attached_write)
+                    assert executor_pid_fd is not None
+                    exited, _, _ = select.select([executor_pid_fd], [], [], 3)
+                    assert exited == [executor_pid_fd]
+                    return original_inspect(spec, store)
+
+                lifecycle.host.inspect = inspect_after_completion  # type: ignore[method-assign]
                 return original_observe(
                     lifecycle, *args, **kwargs  # type: ignore[arg-type]
                 )
@@ -1403,7 +1550,9 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
 
         _, reobserver_status = os.waitpid(reobserver_pid, 0)
         assert os.WIFEXITED(reobserver_status)
-        assert os.WEXITSTATUS(reobserver_status) == 0
+        assert os.WEXITSTATUS(reobserver_status) == 0, attached_output.read_text(
+            encoding="utf-8"
+        )
         completed_output = json.loads(attached_output.read_text(encoding="utf-8"))
         audit = completed_output["action_audit"]
         record = control.load(task)
@@ -1470,6 +1619,7 @@ def test_abandon_executor_recovers_api_response_loss_without_duplicate_effect(
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
     task = TaskKey(git_repo, str(state["repository"]), int(state["parent"]["number"]))
     control = TaskControlStore(git_repo / ".agent-run")
+    seed_idle_control(control, task, run_id)
 
     def execute_abandon(
         bound_run_id: str, _action_id: str, _generation: int
@@ -1766,7 +1916,7 @@ def test_public_stop_rejects_unknown_ownership_without_mutating_run(
 
     assert rejected.returncode == 2
     output = json.loads(rejected.stdout)
-    assert output["diagnostics"][0]["code"] == "executor_start_unknown"
+    assert output["diagnostics"][0]["code"] == "task_control"
     assert state_path.read_bytes() == before
 
     run.update({"status": "completed", "terminal_kind": "completed"})

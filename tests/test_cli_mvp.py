@@ -1008,7 +1008,7 @@ def test_run_routes_a_structured_graph_contradiction_to_a_typed_human_boundary(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery_graph_read_failures"] = [
         {"code": "invalid_parent", "message": "parent graph contradicts itself"}
@@ -1187,7 +1187,7 @@ def test_status_and_history_show_started_development_attempt(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_cli(
         git_repo,
@@ -1288,7 +1288,7 @@ def test_run_supervises_initial_graph_read_lag_in_one_call(git_repo: Path) -> No
 def test_run_restarts_a_paused_supervision_window(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
@@ -1342,7 +1342,7 @@ def test_run_supervises_read_failures_after_supervision_timeout(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
@@ -1374,7 +1374,7 @@ def test_run_repauses_after_a_fresh_external_wait_window(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = _run_agents(git_repo / "agents.json")
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(

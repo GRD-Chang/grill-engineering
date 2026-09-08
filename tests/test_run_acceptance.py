@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.controller import Controller, _resume_review_budget_window
@@ -26,6 +27,7 @@ from agent_run.state_contract import (
     require_completed_ticket_integration_records,
 )
 
+from conftest import seed_idle_control
 from test_cli import run_internal_stage, run_cli, stdout_json
 from test_cli_delivery import final_run_publication
 
@@ -1986,6 +1988,12 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
     git_repo: Path,
 ) -> None:
     state, states, _git = _completed_run(git_repo)
+    seed_idle_control(
+        TaskControlStore(states.root),
+        TaskKey(git_repo, str(state["repository"]), 1),
+        str(state["run_id"]),
+        state_dir=states.root,
+    )
     failed_agents = git_repo / "failed-run-review.json"
     failed_agents.write_text(
         json.dumps(

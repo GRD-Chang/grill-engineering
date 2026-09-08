@@ -19,6 +19,7 @@ from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
+from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlStore, TaskKey
 
 
 @pytest.fixture
@@ -79,6 +80,7 @@ def seed_run(
     *options: str,
     extra_env: dict[str, str] | None = None,
     reuse_existing: bool = True,
+    idle_control: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Create test state through Controller.start without a public CLI command.
 
@@ -86,6 +88,7 @@ def seed_run(
     original subject while the public ``start`` command is removed.  Supported
     options are deliberately limited to the legacy fixture setup knobs still
     needed by those tests; this is not a CLI compatibility parser.
+    Explicit idle_control records that this direct setup reserved no Executor.
     """
 
     values = list(options)
@@ -173,6 +176,13 @@ def seed_run(
     )
     state, resumed = controller.start(int(parent), reuse_existing=reuse_existing)
     run_id = str(state["run_id"])
+    if idle_control and not resumed:
+        seed_idle_control(
+            TaskControlStore(repo / ".agent-run"),
+            TaskKey(repo, str(state["repository"]), int(parent)),
+            run_id,
+            state_dir=state_root,
+        )
     if profiles.load(run_id) is None:
         profiles.initialize(
             run_id,
@@ -216,3 +226,39 @@ def seed_run(
         stdout=json.dumps(output, ensure_ascii=False, sort_keys=True),
         stderr="",
     )
+
+
+def seed_idle_control(
+    control: TaskControlStore,
+    task: TaskKey,
+    run_id: str,
+    *,
+    state_dir: Path | None = None,
+) -> None:
+    """Record known idle ownership for a Run created directly by test setup.
+
+    Use only before any Executor is reserved. Missing-ownership fault fixtures
+    deliberately keep using bare seed_run, without this explicit evidence.
+    """
+    path = control.path_for(task)
+    assert not path.exists(), "idle fixture must not replace existing ownership"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "protocol": TASK_CONTROL_PROTOCOL,
+                "task": task.identity,
+                "run_id": run_id,
+                "run_state_dir": (
+                    str(state_dir.resolve()) if state_dir is not None else None
+                ),
+                "next_generation": 1,
+                "action": None,
+                "action_history": [],
+                "executor": None,
+                "updated_at": "2026-09-07T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert control.load(task) is not None

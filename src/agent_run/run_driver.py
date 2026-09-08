@@ -22,7 +22,9 @@ from agent_run.external_supervision import (
     public_supervision_snapshot,
 )
 from agent_run.executor_host import ExecutorHost
+from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
+from agent_run.github_publish import GhGitHubPublisher
 from agent_run.operator_gate import has_run_operator_gate
 from agent_run.parent_delivery import ParentDeliveryEngine
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
@@ -121,6 +123,8 @@ def _fenced_publisher(
 
     if hasattr(publisher, "git"):
         publisher.git = fenced_git
+    if isinstance(publisher, GhGitHubPublisher):
+        publisher._set_write_guard(fence)
     return _FencedExternal(publisher, fence)
 
 
@@ -179,6 +183,8 @@ class DirectRunOperations:
         if before_external_step is not None:
             if getattr(states, "_write_transaction", None) is None:
                 states._set_write_guard(before_external_step)
+            if isinstance(git, GitRepository):
+                git._set_write_guard(before_external_step)
             fenced_git = _FencedExternal(git, before_external_step)
             fenced_github_reader = _FencedExternal(
                 github_reader, before_external_step

@@ -117,7 +117,7 @@ def test_public_cli_recovers_after_every_durable_save_boundary(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -210,7 +210,7 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
     first_agents = _write_agents(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_internal_stage(
         git_repo,
@@ -271,7 +271,7 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1", "--development-deadline", "42s")
+        seed_run(git_repo, fixture, "1", "--development-deadline", "42s", idle_control=True)
     )["run_id"]
     failed = run_cli(
         git_repo,
@@ -415,7 +415,7 @@ def test_public_cli_recovers_after_external_response_loss(
         git_repo / "agents-first.json", reviewer="reviewer-first"
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -490,7 +490,7 @@ def test_abandon_recovers_ticket_after_close_response_loss(
     agents = _write_agents(
         git_repo / "agents.json", reviewer="reviewer-first"
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     interrupted = run_internal_stage(
         git_repo,
         fixture,
@@ -619,7 +619,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(

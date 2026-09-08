@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.git import GitError
 from agent_run.github_fixture import FixtureGitHubPublisher
 
@@ -20,6 +21,7 @@ from run_merge_resolution_fixture import (
     MergeResolutionFixture,
     _git_output,
 )
+from conftest import seed_idle_control
 from test_cli import run_cli
 from run_acceptance_test_support import _passing_artifact
 
@@ -412,6 +414,12 @@ def test_merge_resolution_staged_development_interruption_resumes_same_thread(
     git_repo: Path,
 ) -> None:
     fixture = MergeResolutionFixture(git_repo, "development_staged_interruption")
+    seed_idle_control(
+        TaskControlStore(fixture.states.root),
+        TaskKey(git_repo, str(fixture.state["repository"]), 1),
+        str(fixture.state["run_id"]),
+        state_dir=fixture.states.root,
+    )
 
     with pytest.raises(
         RuntimeError, match="controller interrupted staged resolution"

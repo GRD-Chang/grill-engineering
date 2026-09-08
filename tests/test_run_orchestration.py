@@ -860,7 +860,7 @@ def test_completed_parent_cannot_be_rebound_by_a_diagnostic_gate(
         json.dumps(parent_round_agents(1, passing_last=True)),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -1645,7 +1645,7 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         ),
         encoding="utf-8",
     )
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
 
     result = run_cli(
@@ -1895,7 +1895,7 @@ def test_run_recovers_after_process_failure_between_tickets(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -2023,7 +2023,7 @@ def test_close_response_loss_recovers_completed_job_without_duplicates(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(
@@ -2107,7 +2107,7 @@ def test_provisional_close_intent_can_abandon(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_internal_stage(
         git_repo,

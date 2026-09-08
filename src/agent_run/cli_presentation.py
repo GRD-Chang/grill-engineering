@@ -77,7 +77,7 @@ def _print_precondition_failure(
         print(
             json.dumps(
                 {
-                    "result": "resumed",
+                    "result": "rejected",
                     "run_id": state["run_id"],
                     "status": state["status"],
                     "run_branch": state.get(

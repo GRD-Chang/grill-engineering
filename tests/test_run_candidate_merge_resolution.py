@@ -8,11 +8,13 @@ from typing import Any
 
 import pytest
 
+from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 
+from conftest import seed_idle_control
 from test_cli import run_cli
 
 from run_acceptance_test_support import (
@@ -32,6 +34,13 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     external_base_drift: bool,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    if not latest_combination_has_finding:
+        seed_idle_control(
+            TaskControlStore(states.root),
+            TaskKey(git_repo, str(state["repository"]), 1),
+            str(state["run_id"]),
+            state_dir=states.root,
+        )
     fixture = git_repo / "github.json"
     run_branch = str(state["run_branch"])
 
