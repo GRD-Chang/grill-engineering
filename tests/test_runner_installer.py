@@ -17,9 +17,32 @@ from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
 from conftest import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
+from support.offline_install import offline_pip_environment, prepare_offline_wheels
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
+
+
+@pytest.fixture(scope="session")
+def installer_build_wheels(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    source = Path(os.environ.get("AGENT_RUN_TEST_WHEELHOUSE", PROJECT_ROOT / ".test-wheels"))
+    destination = tmp_path_factory.mktemp("offline-build") / "wheels"
+    prepare_offline_wheels(source, destination, PROJECT_ROOT / "tests" / "build-requirements.txt")
+    return destination
+
+
+@pytest.fixture
+def offline_install_environment(
+    installer_build_wheels: Path, monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str]:
+    # Also drop inherited constraints, remote find-links and pip requirements.
+    for name in tuple(os.environ):
+        if name.startswith("PIP_"):
+            monkeypatch.delenv(name)
+    environment = offline_pip_environment(installer_build_wheels)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    return environment
 
 
 def _source_tree(tmp_path: Path, *, real_install: bool = False) -> Path:
@@ -175,6 +198,24 @@ def _run(
         capture_output=True,
         check=False,
     )
+
+
+def _signal_at_marker(
+    process: subprocess.Popen[str], marker: Path,
+) -> tuple[str, str]:
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert marker.exists(), "installer did not reach the signal boundary"
+        process.send_signal(signal.SIGTERM)
+        return process.communicate(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
 
 
 def _isolated_quickstart_environment(
@@ -807,7 +848,9 @@ def test_git_provenance_marks_an_untracked_source_dirty(tmp_path: Path) -> None:
     assert manifest["source_provenance"] == provenance
 
 
-def test_clean_git_source_is_not_polluted_by_public_install(tmp_path: Path) -> None:
+def test_clean_git_source_is_not_polluted_by_public_install(
+    tmp_path: Path, offline_install_environment: dict[str, str],
+) -> None:
     source = _source_tree(tmp_path, real_install=True)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
     subprocess.run(
@@ -1123,7 +1166,7 @@ def test_public_signal_during_post_activation_cleanup_keeps_new_generation_compl
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "            try:\n                warnings = [\n",
-            f"            try:\n                Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n                time.sleep(2)\n                warnings = [\n",
+            f"            try:\n                Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n                signal.pause()\n                warnings = [\n",
             1,
         ),
         encoding="utf-8",
@@ -1145,15 +1188,7 @@ def test_public_signal_during_post_activation_cleanup_keeps_new_generation_compl
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + 30
-    while not marker.exists() and time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        time.sleep(0.02)
-    assert marker.exists(), process.communicate(timeout=10)[1]
-
-    process.send_signal(signal.SIGTERM)
-    stdout, stderr = process.communicate(timeout=30)
+    stdout, stderr = _signal_at_marker(process, marker)
 
     assert process.returncode == 0, stderr
     assert "已保留新的 Active Runner" in stdout
@@ -1192,7 +1227,7 @@ def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "    _check_prerequisites(source)\n",
-            f"    Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n    time.sleep(2)\n    _check_prerequisites(source)\n",
+            f"    Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n    signal.pause()\n    _check_prerequisites(source)\n",
             1,
         ),
         encoding="utf-8",
@@ -1214,15 +1249,7 @@ def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + 30
-    while not marker.exists() and time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        time.sleep(0.02)
-    assert marker.exists(), process.communicate(timeout=10)[1]
-
-    process.send_signal(signal.SIGTERM)
-    _stdout, stderr = process.communicate(timeout=30)
+    _stdout, stderr = _signal_at_marker(process, marker)
 
     assert process.returncode == 1, stderr
     assert int(count.read_text(encoding="utf-8")) == 2
@@ -1243,7 +1270,7 @@ def test_public_idempotent_signal_restores_profile_and_entry(
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                warnings = [\n",
-            f"            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                if os.environ.get('AGENT_RUN_TEST_IDEMPOTENT_SIGNAL') == '1':\n                    Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n                    time.sleep(2)\n                warnings = [\n",
+            f"            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                if os.environ.get('AGENT_RUN_TEST_IDEMPOTENT_SIGNAL') == '1':\n                    Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n                    signal.pause()\n                warnings = [\n",
             1,
         ),
         encoding="utf-8",
@@ -1284,15 +1311,7 @@ def test_public_idempotent_signal_restores_profile_and_entry(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + 30
-    while not marker.exists() and time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        time.sleep(0.02)
-    assert marker.exists(), process.communicate(timeout=10)[1]
-
-    process.send_signal(signal.SIGTERM)
-    _stdout, stderr = process.communicate(timeout=30)
+    _stdout, stderr = _signal_at_marker(process, marker)
 
     assert process.returncode == 1, stderr
     assert int(count.read_text(encoding="utf-8")) == 1
@@ -1472,13 +1491,15 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
 
 
 def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    offline_install_environment: dict[str, str],
 ) -> None:
     source = _source_tree(tmp_path, real_install=True)
     fake_bin, count, _status_file = _fake_codex(tmp_path, behavior="fork-setsid")
     isolated_environment, tool_directory, markers = (
         _isolated_quickstart_environment(tmp_path, fake_bin)
     )
+    isolated_environment.update(offline_install_environment)
     isolated_path = isolated_environment["PATH"]
     home = Path(isolated_environment["HOME"])
     home.mkdir()

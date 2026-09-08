@@ -1,6 +1,13 @@
 # 测试入口与选测范围
 
-先激活安装了 `.[dev]` 的 Python 环境，在仓库根目录运行。下列入口是相关测试的起点；
+先激活安装了 `.[dev]` 的 Python 环境，在仓库根目录运行。首次完整测试或真实安装测试前执行一次
+`make test-prepare`，按 `tests/build-requirements.txt` 的版本与哈希下载构建 wheel；CI 在依赖安装步骤执行。
+pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命令。wheel 默认缓存在 `.test-wheels/`，
+不提交 Git；更新构建依赖时同步 pins/hash 并重新准备，可清理旧缓存。
+自定义目录用 `make test-prepare TEST_WHEELHOUSE=/专用目录`，全量使用同一 `TEST_WHEELHOUSE`；
+直接运行 pytest 时通过 `AGENT_RUN_TEST_WHEELHOUSE` 指定该目录。准备耗时单列，不计入本地全量五分钟预算。
+
+下列入口是相关测试的起点；
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行
 `python -m pytest tests/文件.py::用例名 -q`。
 
