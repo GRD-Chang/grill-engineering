@@ -20,8 +20,8 @@ REASONING_EFFORTS = frozenset(
 DEFAULT_PRESET = "economy"
 PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "economy": {
-        "development": {"model": "gpt-5.6-luna", "reasoning_effort": "max"},
-        "review": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        "development": {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
+        "review": {"model": "gpt-6-astra", "reasoning_effort": "low"},
     },
     "premium": {
         "development": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"},

@@ -1675,8 +1675,8 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert "阶段: candidate" in status_view.stdout
     assert _human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"] in status_view.stdout
     assert "触发阻塞的 Agent: reviewer" in status_view.stdout
-    assert "model gpt-5.6-sol" in status_view.stdout
-    assert "reasoning effort high" in status_view.stdout
+    assert "model gpt-6-astra" in status_view.stdout
+    assert "reasoning effort low" in status_view.stdout
     assert "本轮时长:" in status_view.stdout
     assert "已保留成果: Candidate 已保存" in status_view.stdout
     assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in status_view.stdout

@@ -93,8 +93,8 @@ agent-run auth app remove
 
 ### 顶层 Codex 执行配置
 
-新 Run 默认使用 `economy`：Development 为 `gpt-5.6-luna/max`，Review 为
-`gpt-5.6-sol/high`，Publication 引用 Development。创建时可选择 `premium` 或覆盖角色配置：
+新 Run 默认使用 `economy`：Development 为 `gpt-5.6-luna/xhigh`，Review 为
+`gpt-6-astra/low`，Publication 引用 Development。创建时可选择 `premium` 或覆盖角色配置：
 
 ```bash
 agent-run run <parent-issue> --preset premium \
