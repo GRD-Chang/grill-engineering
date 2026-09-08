@@ -619,8 +619,9 @@ def test_systemd_host_rejects_oversize_environment_before_executor_reservation(
     assert not list((tmp_path / "runtime").glob("environment-*.json"))
 
 
+@pytest.mark.parametrize("native_status", ["running", "exited"])
 def test_systemd_host_reports_binding_conflict_without_replacing_unit(
-    tmp_path: Path,
+    tmp_path: Path, native_status: str,
 ) -> None:
     spec = _spec(tmp_path)
     spec.cwd.mkdir(parents=True)
@@ -628,7 +629,7 @@ def test_systemd_host_reports_binding_conflict_without_replacing_unit(
     spec = _admit(control, spec)
     transport = FakeSystemdTransport(
         unit=SystemdUnitObservation(
-            status="running",
+            status=native_status,  # type: ignore[arg-type]
             description="agent-run-executor:other-binding",
             pid=os.getpid(),
             reason=None,
@@ -648,8 +649,8 @@ def test_systemd_host_reports_binding_conflict_without_replacing_unit(
     assert not list((tmp_path / "runtime").glob("*.json"))
     record = control.load(spec.task)
     assert record is not None
-    assert record["action"]["status"] == "failed"
-    assert record["executor"]["status"] == "exited"
+    assert record["action"]["status"] == "accepted"
+    assert record["executor"]["status"] == "starting"
 
 
 @pytest.mark.parametrize(

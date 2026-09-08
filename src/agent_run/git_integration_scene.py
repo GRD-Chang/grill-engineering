@@ -29,7 +29,7 @@ class GitSceneOperations(Protocol):
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]: ...
 
     def _run_in(
-        self, directory: Path, *arguments: str
+        self, directory: Path, *arguments: str, input: str | None = None
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -359,13 +359,8 @@ class IntegrationRepairSceneGit:
         if overlay.returncode != 0:
             raise GitError(overlay.stderr.strip() or "could not read replayed finding tree")
         if not self._worktree_matches_tree_paths(checkout, result_tree, paths):
-            applied = subprocess.run(
-                ["git", "apply", "--whitespace=nowarn", "-"],
-                cwd=checkout,
-                input=overlay.stdout,
-                text=True,
-                capture_output=True,
-                check=False,
+            applied = self._git._run_in(
+                checkout, "apply", "--whitespace=nowarn", "-", input=overlay.stdout
             )
             if applied.returncode != 0:
                 raise GitError(
@@ -386,13 +381,9 @@ class IntegrationRepairSceneGit:
                 raise GitError(
                     removed.stderr.strip() or "could not replace finding conflicts"
                 )
-            indexed = subprocess.run(
-                ["git", "update-index", "-z", "--index-info"],
-                cwd=checkout,
+            indexed = self._git._run_in(
+                checkout, "update-index", "-z", "--index-info",
                 input="\0".join(index_entries) + "\0",
-                text=True,
-                capture_output=True,
-                check=False,
             )
             if indexed.returncode != 0:
                 raise GitError(

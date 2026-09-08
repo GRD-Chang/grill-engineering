@@ -512,7 +512,7 @@ def test_user_policy_snapshot_is_frozen_across_human_blocker_resume(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1", extra_env=isolated_env)
+        seed_run(git_repo, fixture, "1", extra_env=isolated_env, idle_control=True)
     )["run_id"]
     blocked = run_cli(
         git_repo,
@@ -605,6 +605,7 @@ def test_existing_run_ignores_invalid_user_policy_on_normal_run(
         fixture,
         "1",
         extra_env=isolated_env,
+        idle_control=True,
     )
     assert started.returncode == 0, started.stderr
     before = load_only_run_state(git_repo)
@@ -746,7 +747,7 @@ def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_cli(
         git_repo,
@@ -901,7 +902,7 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_cli(
         git_repo,
@@ -1243,7 +1244,7 @@ def test_resume_human_blocker_records_bounded_response_and_reuses_development_th
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     blocked = run_cli(
         git_repo,
         fixture,
@@ -1335,7 +1336,7 @@ def test_ticket_human_response_reaches_fresh_acceptance(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1", "--ticket-review-rounds", "1")
+        seed_run(git_repo, fixture, "1", "--ticket-review-rounds", "1", idle_control=True)
     )["run_id"]
     blocked = run_cli(
         git_repo,
@@ -1421,7 +1422,7 @@ def test_human_response_survives_transient_binding_wait_in_one_executor(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1", "--ticket-review-rounds", "1")
+        seed_run(git_repo, fixture, "1", "--ticket-review-rounds", "1", idle_control=True)
     )["run_id"]
     blocked = run_cli(
         git_repo,
@@ -1540,7 +1541,7 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     failed = run_cli(
         git_repo,
         fixture,
@@ -1642,7 +1643,7 @@ def test_last_reviewer_ordinal_process_failure_resumes_without_new_budget(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     failed = run_cli(
         git_repo,
@@ -2001,7 +2002,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
         encoding="utf-8",
     )
 
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
     state = load_only_run_state(git_repo)
@@ -2117,7 +2118,7 @@ def test_parent_only_cli_recovers_lost_change_response_without_duplicate_worker(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     interrupted = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
@@ -2248,7 +2249,7 @@ def test_parent_only_development_human_blocker_stops_before_candidate(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     blocked = run_cli(
         git_repo,
@@ -2352,7 +2353,7 @@ def test_parent_only_publication_human_blocker_stops_before_pr_mutation(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     blocked = run_cli(
         git_repo,
@@ -2428,7 +2429,7 @@ def test_parent_only_malformed_publication_is_execution_failed_and_resumes(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     failed = run_cli(
         git_repo,
@@ -2527,7 +2528,7 @@ def test_parent_only_approve_recovers_after_closeout_response_loss(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agent_fixture)
     )
@@ -2584,7 +2585,7 @@ def test_completed_parent_closeout_assets_remain_frozen_after_graph_drift(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -2656,7 +2657,7 @@ def test_parent_only_approve_supervises_unrepairable_required_checks(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -2749,7 +2750,7 @@ def test_parent_only_approve_queues_only_exact_repairable_failure(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -2830,7 +2831,7 @@ def test_parent_only_approve_blocks_default_base_drift_before_merge(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -2886,7 +2887,7 @@ def test_parent_only_approve_blocks_head_drift_before_merge(git_repo: Path) -> N
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -2944,7 +2945,7 @@ def test_parent_only_final_merge_rechecks_complete_pr_identity(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -3008,7 +3009,7 @@ def test_parent_only_approve_waits_and_recovers_without_duplicate_delivery(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -3126,7 +3127,7 @@ def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
@@ -3165,7 +3166,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     first = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
     )
@@ -3323,7 +3324,7 @@ def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     assert stdout_json(
         run_internal_stage(git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents))
     )["status"] == "parent_approval_pending"
@@ -3445,7 +3446,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -3578,7 +3579,7 @@ def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -4328,7 +4329,7 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
         ),
         encoding="utf-8",
     )
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     delivered = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
@@ -4528,7 +4529,7 @@ def test_ticket_repair_human_blocker_stops_before_new_candidate(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     blocked = run_cli(
         git_repo,
@@ -4585,7 +4586,7 @@ def test_ticket_publication_human_blocker_stops_before_pr_mutation(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
 
     blocked = run_cli(
         git_repo,
@@ -4682,7 +4683,7 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
         ),
         encoding="utf-8",
     )
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
 
     failed = run_cli(
@@ -4829,7 +4830,7 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -5057,7 +5058,7 @@ def test_ticket_revision_change_requires_requeue_instead_of_reusing_job(
         ),
         encoding="utf-8",
     )
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
     waiting = run_internal_stage(
         git_repo,
@@ -5183,7 +5184,7 @@ def test_run_stops_for_an_operator_to_requeue_a_stale_generation(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     waiting = run_internal_stage(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)
     )
@@ -5245,7 +5246,7 @@ def test_run_stops_when_a_replacement_generation_drifts_again(
         ),
         encoding="utf-8",
     )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     assert stdout_json(
         run_internal_stage(
             git_repo, fixture, "deliver", run_id, "--agent-fixture", str(first_agents)

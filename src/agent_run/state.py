@@ -818,7 +818,13 @@ def _is_credential_key(value: str) -> bool:
 
 
 def _is_durable_protocol_identity(path: tuple[str, ...]) -> bool:
-    return path[-2:] == ("candidate_commit_intent", "token") or (
+    return path in {
+        ("action_application_receipt", "target_executor", "process_start_token"),
+        (
+            "action_application_receipt", "target_executor", "worker",
+            "process_start_token",
+        ),
+    } or path[-2:] == ("candidate_commit_intent", "token") or (
         bool(path)
         and path[-1]
         in {

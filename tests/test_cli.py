@@ -62,6 +62,26 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
             build_parser().parse_args([internal_command, "run-id"])
 
 
+@pytest.mark.parametrize(
+    ("command", "executor_bound", "expected"),
+    [
+        ("run", False, False),
+        ("run", True, True),
+        ("publish-run", False, True),
+        ("resume", False, False),
+    ],
+)
+def test_publication_pending_success_depends_on_execution_context(
+    command: str, executor_bound: bool, expected: bool
+) -> None:
+    assert (
+        cli._lifecycle_result_succeeded(
+            command, "publication_pending", executor_bound=executor_bound
+        )
+        is expected
+    )
+
+
 def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     git_repo: Path,
 ) -> None:
@@ -79,7 +99,7 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
         "reviews": [],
     }
     agents.write_text(json.dumps(agent_data), encoding="utf-8")
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     states = StateStore(git_repo / ".agent-run")
     assert Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
@@ -1669,7 +1689,11 @@ def run_internal_stage(
     }
     return subprocess.CompletedProcess(
         args=["internal-stage", stage, run_id],
-        returncode=0 if state.get("status") in cli._SUCCESSFUL_FOREGROUND_STATUSES else 2,
+        returncode=(
+            0
+            if cli._lifecycle_result_succeeded(stage, state.get("status"))
+            else 2
+        ),
         stdout=json.dumps(output, ensure_ascii=False),
         stderr="",
     )
@@ -3037,7 +3061,7 @@ def test_resume_parent_selector_reuses_one_existing_recoverable_run(
         check=True,
     )
     agents = run_agents(git_repo / "agents.json")
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(
@@ -3130,7 +3154,7 @@ def test_resume_rejects_a_run_without_an_agent_boundary(git_repo: Path) -> None:
     resumed = run_cli(git_repo, fixture, "resume", run_id)
 
     assert resumed.returncode == 2
-    assert stdout_json(resumed)["result"] == "resumed"
+    assert stdout_json(resumed)["result"] == "rejected"
     assert stdout_json(resumed)["run_id"] == run_id
     assert stdout_json(resumed)["status"] == "active"
 

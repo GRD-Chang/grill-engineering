@@ -6,6 +6,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -15,10 +16,15 @@ MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 
 
 def run_read_command(
-    arguments: list[str], *, cwd: Path | None = None
+    arguments: list[str],
+    *,
+    cwd: Path | None = None,
+    before_attempt: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     last: subprocess.CompletedProcess[str] | None = None
     for attempt in range(MAX_READ_ATTEMPTS):
+        if before_attempt is not None:
+            before_attempt()
         try:
             result = _run_bounded_command(
                 arguments,

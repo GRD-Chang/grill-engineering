@@ -149,7 +149,7 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
         git_repo / "replacement-agents.json"
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     delivered = run_internal_stage(
@@ -266,7 +266,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
         delivery={"required_checks": ["none"]},
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     delivered = run_internal_stage(
         git_repo,
         fixture,
@@ -411,7 +411,7 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
         delivery={"required_checks": ["pending"]},
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     waiting = run_internal_stage(
         git_repo,
         fixture,
@@ -462,7 +462,7 @@ def test_abandon_recovers_lost_change_pr_close_response(
         },
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     waiting = run_internal_stage(
         git_repo,
         fixture,
@@ -536,7 +536,7 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
         },
     )
     agents = _write_agents(git_repo / "agents.json", two_revisions=False)
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
     recovered = run_internal_stage(
         git_repo,
         fixture,
@@ -603,7 +603,7 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         git_repo / "agents-first.json", two_revisions=False
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1")
+        seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
     interrupted = run_internal_stage(

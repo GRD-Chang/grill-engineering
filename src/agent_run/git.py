@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from agent_run.git_errors import GitError as GitError
@@ -15,6 +16,7 @@ from agent_run.git_errors import (
 from agent_run.git_integration_commit import IntegrationRepairCommitGit
 from agent_run.git_integration_scene import IntegrationRepairSceneGit
 from agent_run.github_retry import run_read_command
+from agent_run.git_output import run_git
 
 
 MANAGED_DELIVERY_BRANCH_PREFIXES = (
@@ -34,18 +36,22 @@ class DirtyManagedCheckoutError(GitError):
 class GitRepository:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._write_guard: Callable[[], None] | None = None
         self._integration_scene = IntegrationRepairSceneGit(self)
         self._integration_commit = IntegrationRepairCommitGit(self)
 
+    def _set_write_guard(self, guard: Callable[[], None]) -> None:
+        """Bind the owning Executor check to each Git dispatch."""
+
+        self._write_guard = guard
+
+    def _check_write_guard(self) -> None:
+        if self._write_guard is not None:
+            self._write_guard()
+
     @classmethod
     def discover(cls, start: Path) -> GitRepository:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=start,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        result = run_git(["git", "rev-parse", "--show-toplevel"], cwd=start)
         if result.returncode != 0:
             raise GitError(result.stderr.strip() or "not inside a Git repository")
         return cls(Path(result.stdout.strip()).resolve())
@@ -75,6 +81,7 @@ class GitRepository:
 
         identity = uuid.uuid4().hex
         try:
+            self._check_write_guard()
             with marker.open("x", encoding="ascii") as marker_file:
                 marker_file.write(identity + "\n")
                 marker_file.flush()
@@ -150,6 +157,7 @@ class GitRepository:
             created = self._run("branch", branch, base_sha)
             if created.returncode != 0:
                 raise GitError(created.stderr.strip() or "could not create ticket branch")
+        self._check_write_guard()
         checkout.parent.mkdir(parents=True, exist_ok=True)
         added = self._run("worktree", "add", "--force", str(checkout), branch)
         if added.returncode != 0:
@@ -166,6 +174,7 @@ class GitRepository:
         self.remove_worktree(checkout)
         if self._resolve(f"refs/heads/{branch}") is None:
             raise GitError(f"Run Branch {branch!r} does not exist")
+        self._check_write_guard()
         checkout.parent.mkdir(parents=True, exist_ok=True)
         added = self._run("worktree", "add", "--force", str(checkout), branch)
         if added.returncode != 0:
@@ -298,6 +307,7 @@ class GitRepository:
         self, *, head_sha: str, checkout: Path
     ) -> None:
         self.remove_worktree(checkout)
+        self._check_write_guard()
         checkout.parent.mkdir(parents=True, exist_ok=True)
         added = self._run(
             "worktree",
@@ -829,6 +839,7 @@ class GitRepository:
             removed = self._run("worktree", "remove", "--force", str(checkout))
             if removed.returncode != 0:
                 if discard_worktree:
+                    self._check_write_guard()
                     shutil.rmtree(checkout)
                     self._run("worktree", "prune")
                     return
@@ -838,6 +849,7 @@ class GitRepository:
                     raise GitError(
                         removed.stderr.strip() or "could not remove ticket checkout"
                     )
+                self._check_write_guard()
                 shutil.rmtree(checkout)
         self._run("worktree", "prune")
 
@@ -859,6 +871,7 @@ class GitRepository:
         result = run_read_command(
             ["git", "fetch", "--no-tags", "origin", default_branch],
             cwd=self.root,
+            before_attempt=self._check_write_guard,
         )
         if result.returncode != 0:
             raise GitError(
@@ -896,25 +909,14 @@ class GitRepository:
         return common_dir.resolve() / "agent-run-checkout-id"
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *arguments],
-            cwd=self.root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        return self._run_in(self.root, *arguments)
 
-    @staticmethod
     def _run_in(
-        directory: Path, *arguments: str
+        self, directory: Path, *arguments: str, input: str | None = None
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *arguments],
-            cwd=directory,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        # Recheck each dispatch, including later commands inside one public call.
+        self._check_write_guard()
+        return run_git(["git", *arguments], cwd=directory, input=input)
 
 
 class Publisher:

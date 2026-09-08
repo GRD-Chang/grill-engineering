@@ -155,7 +155,7 @@ class SubprocessSystemdTransport:
         status: Literal["absent", "starting", "running", "exited", "unknown"]
         if active in {"active", "reloading"}:
             status = "running" if substate == "running" else "starting"
-        elif active in {"inactive", "failed", "deactivating"}:
+        elif active in {"inactive", "failed"}:
             status = "exited"
         elif active == "activating":
             status = "starting"
@@ -164,6 +164,10 @@ class SubprocessSystemdTransport:
         raw_pid = fields.get("ExecMainPID")
         pid = int(raw_pid) if raw_pid and raw_pid.isdigit() and int(raw_pid) > 0 else None
         reason = fields.get("Result") or None
+        if active == "deactivating":
+            # A stop job may still be waiting for the Executor or its children.
+            # Its Result is not proof that the execution generation has exited.
+            reason = "systemd unit 正在停止，尚未确认 Executor 退出"
         if status in {"exited", "unknown"}:
             reason = reason or self.journal(unit)
         return SystemdUnitObservation(
@@ -408,11 +412,9 @@ class SystemdUserExecutorHost:
                 run_id=spec.run_id,
             )
             native = self.transport.inspect(self._unit(spec))
-            if native.status not in {"absent", "exited"}:
+            observation = self._from_native(spec, native)
+            if observation.status not in {"absent", "exited"}:
                 self._release_capture()
-                observation = self._from_native(spec, native)
-                if observation.status == "conflict":
-                    self._finish_terminal(spec, control, observation.reason)
                 return observation
             try:
                 control.assert_executor_current(
@@ -592,7 +594,7 @@ class SystemdUserExecutorHost:
                 False,
                 observation.reason or "systemd 启动结果尚未确认",
             )
-        if observation.status in {"absent", "exited", "conflict"}:
+        if observation.status in {"absent", "exited"}:
             key = self._key(spec)
             self._accepted_launches.discard(key)
             self._launch_pending_path(spec).unlink(missing_ok=True)
