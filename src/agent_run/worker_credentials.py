@@ -576,6 +576,8 @@ class WorkerCredentialChannel:
                     self._condition.wait(self._next_retry_at - now)
                     continue
                 self._renew_locked(require_credential=False)
+                if self._closed:
+                    return
                 if self._credential_is_valid_locked():
                     if self._last_error:
                         self._condition.wait(self._next_retry_at - now)
