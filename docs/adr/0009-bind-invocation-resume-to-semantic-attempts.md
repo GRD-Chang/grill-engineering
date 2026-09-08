@@ -4,6 +4,8 @@ status: accepted
 
 # Invocation Resume 绑定 Semantic Agent Attempt，不按进程重复计数
 
+后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 增加每个 Semantic Agent Attempt 对普通异常最多一次、对准确容量错误持续进行的 Worker 自动恢复，并要求 JSON 修复中断后的默认 Resume 续接原步骤。下文“不自动重试”与格式额度规则按该窄例外解释；本 ADR 的语义计费规则继续适用。
+
 Development、Reviewer 与 Publication 统一以 Semantic Agent Attempt 表达一轮语义工作，不再以 Codex 进程启动次数表达领域 Attempt。每个 Attempt 在首次调用前绑定 role、Work Subject、Job Generation、Currentness Boundary fingerprint 与 role-local ordinal；Development 和 Reviewer 还绑定适用的 Budget Window，Publication 不伪造不存在的业务预算窗口。初始 Agent Invocation、Output Repair、进程失败后的 successor Invocation、Human Blocker Resume 与显式 `--new-thread` 都必须引用同一 Attempt identity；只有当前 Attempt 形成完整角色结果，或其 Currentness Boundary 失效并按现有 stale 规则收口后，才能分配后继 Attempt。
 
 Development 在 Attempt 分配时占用一次 Development Budget，因为 Worker 可能已修改 Managed Development Checkout；Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget；Publication 在分配时计入一次 Publication Attempt。三种角色的 Invocation Resume 都不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须继续该 pending Attempt，不得将它拒绝为预算耗尽。只有不存在 pending Attempt 且真正进入 `modification_budget_exhausted` 或 `review_budget_exhausted` 时，维护者显式 Resume 才开启新的编号 Budget Window，并在该窗口中分配新 Attempt。显式 Resume 没有第二套硬上限；每次人工授权、失败原因与 successor Invocation 都进入 `status`/`history` 审计。本决策不增加自动进程重试：零退出但输出不符合 contract 时仍只在当前 Invocation 内最多执行两次 Output Repair，其他进程、timeout、signal、sandbox、凭据、缺少最终输出或 Thread mismatch 失败仍停在 `execution_failed` 等待显式 Resume。

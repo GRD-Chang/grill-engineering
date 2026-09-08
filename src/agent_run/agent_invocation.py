@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from agent_run.requeue import RequeueError, current_change_job
 from agent_run.semantic_attempt import canonical_fingerprint as canonical_fingerprint
+from agent_run.semantic_attempt import invocation_attempt_is_pending
 from agent_run.resume_audit import bind_resume_to_successor
 
 
@@ -65,6 +66,53 @@ def invocation_event_recorder(
 ) -> Callable[..., None]:
     """Persist the small, durable facts for one active Agent Invocation."""
 
+    recovery_state: dict[str, Any] = {
+        "output_attempt": 1,
+        "validation_error": "",
+        "ordinary_recovery_used": False,
+        "capacity_recovery_count": 0,
+    }
+    previous = state.get("active_agent_invocation")
+    if (
+        isinstance(previous, dict)
+        and isinstance(previous.get("semantic_attempt"), dict)
+        and previous["semantic_attempt"].get("attempt_id")
+        == semantic_attempt.get("attempt_id")
+    ):
+        for key in ("ordinary_recovery_used", "capacity_recovery_count"):
+            recovery_state[key] = previous.get(key, recovery_state[key])
+        if (
+            invocation_input.get("thread_id")
+            and invocation_input.get("thread_id")
+            == (previous.get("reported_thread_id") or previous.get("requested_thread_id"))
+            and previous.get("status") in {"failed", "resuming", "running"}
+            and previous.get("execution_interrupted") is True
+        ):
+            for key in ("output_attempt", "validation_error"):
+                recovery_state[key] = previous.get(key, recovery_state[key])
+            if isinstance(previous.get("deadline_seconds"), (int, float)):
+                invocation_deadline_seconds = previous["deadline_seconds"]
+
+    def recovery_allowed() -> bool:
+        active = state.get("active_agent_invocation")
+        if not (
+            isinstance(active, dict)
+            and active.get("status") in {"running", "resuming"}
+            and isinstance(active.get("semantic_attempt"), dict)
+            and active["semantic_attempt"].get("attempt_id")
+            == semantic_attempt.get("attempt_id")
+            and active.get("currentness_boundary") == currentness_boundary
+            and invocation_attempt_is_pending(state, active)
+            and (active.get("reported_thread_id") or active.get("requested_thread_id"))
+            and state.get("status") not in {
+                "operator_stopped", "abandoned", "execution_failed", "requeue_required"
+            }
+        ):
+            return False
+        # ProfiledAgentBackend separately invokes the Driver's exact ownership
+        # fence. This check only establishes the pending work identity.
+        return True
+
     def record(kind: str, **facts: object) -> None:
         now = datetime.now(UTC).isoformat()
         if kind == "started":
@@ -105,6 +153,7 @@ def invocation_event_recorder(
                 "signal": None,
                 "resume_id": resume_id,
                 "resume_sequence": resume_sequence,
+                **recovery_state,
             }
             deadline_seconds = invocation_deadline_seconds
             if deadline_seconds is None:
@@ -130,6 +179,29 @@ def invocation_event_recorder(
                 raise ValueError("active Agent Invocation is missing")
             invocation = active
             invocation.update(facts)
+            for key in recovery_state:
+                if key in facts:
+                    recovery_state[key] = facts[key]
+            if kind == "output_step":
+                invocation["execution_interrupted"] = True
+            elif kind == "recovery_waiting":
+                invocation["status"] = "resuming"
+                invocation["recovery_waiting"] = True
+                invocation["last_failure_at"] = now
+                invocation["execution_interrupted"] = True
+            elif kind == "recovery_started":
+                invocation["status"] = "running"
+                invocation["recovery_waiting"] = False
+                invocation["last_recovery_started_at"] = now
+                invocation["ended_at"] = None
+                seconds = invocation.get("deadline_seconds")
+                if isinstance(seconds, (int, float)):
+                    try:
+                        invocation["deadline_at"] = (
+                            datetime.fromisoformat(now) + timedelta(seconds=seconds)
+                        ).isoformat()
+                    except OverflowError:
+                        invocation.pop("deadline_at", None)
             if kind == "thread_started":
                 requested = invocation.get("requested_thread_id")
                 if requested is not None and requested != invocation.get(
@@ -154,6 +226,9 @@ def invocation_event_recorder(
             elif kind in {"completed", "failed"}:
                 invocation["status"] = kind
                 invocation["ended_at"] = now
+                invocation["recovery_waiting"] = False
+                if kind == "completed":
+                    invocation["execution_interrupted"] = False
                 if kind == "failed":
                     state.update(
                         {
@@ -174,6 +249,8 @@ def invocation_event_recorder(
         save(state)
 
     setattr(record, "deadline_seconds", invocation_deadline_seconds)
+    setattr(record, "recovery_state", recovery_state)
+    setattr(record, "recovery_allowed", recovery_allowed)
     return record
 
 
@@ -193,7 +270,7 @@ def fail_interrupted_invocation(
     failed.update(
         {
             "status": "failed",
-            "ended_at": datetime.now(UTC).isoformat(),
+            "interruption_observed_at": datetime.now(UTC).isoformat(),
             "error": "controller_interrupted",
         }
     )
@@ -233,7 +310,7 @@ def record_session_interruption(
         failed.update(
             {
                 "status": "failed",
-                "ended_at": datetime.now(UTC).isoformat(),
+                "interruption_observed_at": datetime.now(UTC).isoformat(),
                 "error": "session_interrupted",
             }
         )

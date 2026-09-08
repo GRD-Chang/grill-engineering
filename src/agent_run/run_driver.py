@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, Callable, Literal, Protocol
 
 from agent_run.agent_invocation import record_operator_stop
-from agent_run.agent_profiles import AgentProfileStore
+from agent_run.agent_profiles import AgentProfileStore, ProfiledAgentBackend
 from agent_run.codex import CodexProcessError
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
@@ -209,6 +209,8 @@ class DirectRunOperations:
             self._publisher_factory = publisher_factory
         self._publisher: Any | None = None
         self.agents = agents
+        if isinstance(agents, ProfiledAgentBackend):
+            agents.execution_recovery_guard = before_external_step
         self.profiles = profiles
         if before_external_step is not None:
             self.agents = _FencedExternal(agents, before_external_step)

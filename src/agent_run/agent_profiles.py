@@ -20,12 +20,13 @@ REASONING_EFFORTS = frozenset(
 DEFAULT_PRESET = "economy"
 PRESETS: dict[str, dict[str, dict[str, str]]] = {
     "economy": {
-        "development": {"model": "gpt-5.6-luna", "reasoning_effort": "max"},
-        "review": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        "development": {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
+        "review": {"model": "gpt-6-astra", "reasoning_effort": "low"},
     },
     "premium": {
-        "development": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"},
-        "review": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        "development": {"model": "gpt-6-astra", "reasoning_effort": "low"},
+        "review": {"model": "gpt-6-astra", "reasoning_effort": "low"},
+        "publication": {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
     },
 }
 
@@ -111,11 +112,14 @@ def resolve_profiles(
         }
         for role, values in baseline.items()
     }
-    roles["publication"] = {
-        "model": roles["development"]["model"],
-        "reasoning_effort": roles["development"]["reasoning_effort"],
-        "reference": "development",
-    }
+    roles.setdefault(
+        "publication",
+        {
+            "model": roles["development"]["model"],
+            "reasoning_effort": roles["development"]["reasoning_effort"],
+            "reference": "development",
+        },
+    )
 
     current_profiles: Mapping[str, Any] = {}
     preserve_independent_publication_provenance = False
@@ -525,6 +529,7 @@ class ProfiledAgentBackend:
         self.backend = backend
         self.profiles = profiles
         self.run_id = run_id
+        self.execution_recovery_guard: Callable[[], None] | None = None
 
     def set_run_id(self, run_id: str) -> None:
         self.run_id = run_id
@@ -613,6 +618,19 @@ class ProfiledAgentBackend:
         deadline_seconds = getattr(event, "deadline_seconds", None)
         if deadline_seconds is not None:
             setattr(notify, "deadline_seconds", deadline_seconds)
+        recovery_state = getattr(event, "recovery_state", None)
+        if recovery_state is not None:
+            setattr(notify, "recovery_state", recovery_state)
+        can_recover = getattr(event, "recovery_allowed", None)
+
+        def recovery_allowed() -> bool:
+            guard = self.execution_recovery_guard
+            if guard is None or not callable(can_recover):
+                return False
+            guard()
+            return bool(can_recover())
+
+        setattr(notify, "recovery_allowed", recovery_allowed)
         request["_invocation_event"] = notify
         request["_execution_role"] = role
         try:

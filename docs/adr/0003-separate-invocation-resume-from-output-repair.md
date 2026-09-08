@@ -4,6 +4,8 @@
 
 Accepted
 
+后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 为 Executor 存活时的 Worker 普通异常增加一次同 Thread 自动恢复，并对准确容量错误允许持续恢复，并要求默认 Resume 保留 JSON 修复步骤与只读权限。下文“不自动重试”及恢复后的格式修复额度以该窄例外为准；其他分层继续适用。
+
 ## 决策
 
 Publication 与 Final Publication 使用根级 object Structured Outputs schema。一次 Agent

@@ -1014,6 +1014,29 @@ def _require_invocation(
         raise IncompatibleRunStateError(
             f"legacy state has an invalid {location}.status"
         )
+    for key in ("ordinary_recovery_used", "recovery_waiting", "execution_interrupted"):
+        if key in invocation and type(invocation[key]) is not bool:
+            raise IncompatibleRunStateError(f"invalid {location}.{key}")
+    if "output_attempt" in invocation and (
+        type(invocation["output_attempt"]) is not int
+        or not 1 <= invocation["output_attempt"] <= 3
+    ):
+        raise IncompatibleRunStateError(f"invalid {location}.output_attempt")
+    if "capacity_recovery_count" in invocation and (
+        type(invocation["capacity_recovery_count"]) is not int
+        or invocation["capacity_recovery_count"] < 0
+    ):
+        raise IncompatibleRunStateError(f"invalid {location}.capacity_recovery_count")
+    if "validation_error" in invocation and (
+        not isinstance(invocation["validation_error"], str)
+        or len(invocation["validation_error"]) > 2000
+    ):
+        raise IncompatibleRunStateError(f"invalid {location}.validation_error")
+    if invocation.get("machine_error") is not None and (
+        not isinstance(invocation["machine_error"], str)
+        or len(invocation["machine_error"]) > 2000
+    ):
+        raise IncompatibleRunStateError(f"invalid {location}.machine_error")
     resume_id = invocation.get("resume_id")
     if resume_id is not None and (
         not isinstance(resume_id, str)

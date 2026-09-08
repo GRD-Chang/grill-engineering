@@ -2274,6 +2274,8 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     assert recovered_state["terminal_kind"] == "execution_failed"
     if initial_invocation_status == "running":
         assert recovered_state["active_agent_invocation"]["status"] == "failed"
+        assert recovered_state["active_agent_invocation"]["ended_at"] is None
+        assert recovered_state["active_agent_invocation"]["interruption_observed_at"]
         assert (
             recovered_state["active_agent_invocation"]["error"]
             == "session_interrupted"

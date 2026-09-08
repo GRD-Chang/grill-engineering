@@ -93,17 +93,16 @@ agent-run auth app remove
 
 ### 顶层 Codex 执行配置
 
-新 Run 默认使用 `economy`：Development 为 `gpt-5.6-luna/max`，Review 为
-`gpt-5.6-sol/high`，Publication 引用 Development。创建时可选择 `premium` 或覆盖角色配置：
+新 Run 默认使用 `economy`：Development 为 `gpt-5.6-luna/xhigh`，Review 为
+`gpt-6-astra/low`，Publication 引用 Development。`premium` 的 Development 和 Review 均为
+`gpt-6-astra/low`，Publication 独立使用 `gpt-5.6-luna/xhigh`。创建时选择预设：
 
 ```bash
-agent-run run <parent-issue> --preset premium \
-  --development-model gpt-5.6-sol --development-effort high \
-  --review-model gpt-5.6-sol --review-effort high
+agent-run run <parent-issue> --preset premium
 ```
 
 已有 Run 的配置通过独立命令创建新的 Profile Revision；它不会推进 Run、启动 Agent 或改变已有
-Thread。Publication 默认继续引用 Development；显式覆盖后即使切换 preset 也保持独立，只有明确
+Thread。Publication 的初始引用关系由预设决定；独立配置即使切换 preset 也保持独立，只有明确
 恢复引用才重新跟随 Development：
 
 ```bash

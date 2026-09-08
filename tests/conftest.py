@@ -149,7 +149,7 @@ def seed_run(
     state_home = Path(
         environment.get(
             "XDG_STATE_HOME",
-            os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"),
+            os.environ.get("XDG_STATE_HOME", repo / ".agent-run-test-state"),
         )
     ).expanduser().resolve()
     config_home = Path(

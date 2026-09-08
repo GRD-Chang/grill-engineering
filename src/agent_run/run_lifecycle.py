@@ -22,6 +22,7 @@ from agent_run.executor_host import (
 )
 from agent_run.operator_gate import has_run_operator_gate
 from agent_run.state import StateStore
+from agent_run.resume_intent import action_resume_intent
 from agent_run.task_control import (
     ActionClaim,
     ActionBusyError,
@@ -60,6 +61,7 @@ class ActionReceipt:
     handshake: bool
     payload_digest: str | None
     failure: str | None = None
+    resume_intent: dict[str, Any] | None = None
 
 
 class _ExecutorDispatch:
@@ -1683,6 +1685,7 @@ class RunLifecycle:
             kind=kind if isinstance(kind, str) else "run",
             run_id=run_id if isinstance(run_id, str) else None,
             status="completed",
+            resume_intent=action_resume_intent(action),
             attached=attached,
             executor_status="exited",
             executor_generation=(
@@ -1737,6 +1740,7 @@ class RunLifecycle:
             kind=kind if isinstance(kind, str) else "run",
             run_id=_record_run_id(record),
             status=status if isinstance(status, str) else "unknown",
+            resume_intent=action_resume_intent(action),
             attached=attached,
             executor_status=(
                 executor.get("status") if isinstance(executor, Mapping) else None

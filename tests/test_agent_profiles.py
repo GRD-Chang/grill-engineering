@@ -19,11 +19,11 @@ from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, ticket
 
 
-def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> None:
+def test_preset_resolution_respects_publication_defaults_and_overrides() -> None:
     economy = resolve_profiles(preset="economy")
     assert economy["profiles"]["development"] == {
         "model": "gpt-5.6-luna",
-        "reasoning_effort": "max",
+        "reasoning_effort": "xhigh",
         "reference": None,
         "provenance": {
             "preset": "economy",
@@ -33,6 +33,17 @@ def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> N
     }
     assert economy["profiles"]["publication"]["reference"] == "development"
     assert economy["profiles"]["publication"]["model"] == "gpt-5.6-luna"
+    assert economy["profiles"]["publication"]["reasoning_effort"] == "xhigh"
+    assert economy["profiles"]["review"]["model"] == "gpt-6-astra"
+    assert economy["profiles"]["review"]["reasoning_effort"] == "low"
+
+    defaults = resolve_profiles(preset="premium")["profiles"]
+    for role in ("development", "review"):
+        assert defaults[role]["model"] == "gpt-6-astra"
+        assert defaults[role]["reasoning_effort"] == "low"
+    assert defaults["publication"]["model"] == "gpt-5.6-luna"
+    assert defaults["publication"]["reasoning_effort"] == "xhigh"
+    assert defaults["publication"]["reference"] is None
 
     premium = resolve_profiles(
         preset="premium",
@@ -43,8 +54,8 @@ def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> N
     )
     assert premium["profiles"]["development"]["model"] == "custom-development"
     assert premium["profiles"]["development"]["reasoning_effort"] == "high"
-    assert premium["profiles"]["review"]["model"] == "gpt-5.6-sol"
-    assert premium["profiles"]["publication"]["model"] == "custom-development"
+    assert premium["profiles"]["review"]["model"] == "gpt-6-astra"
+    assert premium["profiles"]["publication"] == defaults["publication"]
 
 
 def test_profile_store_revisions_and_thread_bindings_are_durable(tmp_path: Path) -> None:
@@ -83,7 +94,7 @@ def test_publication_override_is_independent_until_reference_is_restored(
     )
     assert independent["profiles"]["publication"] == {
         "model": "publication-model",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "xhigh",
         "reference": None,
         "provenance": {
             "preset": "premium",
@@ -112,7 +123,7 @@ def test_preset_change_keeps_independent_publication_until_explicit_restore(
     )
     assert changed["profiles"]["publication"] == {
         "model": "custom-pub",
-        "reasoning_effort": "max",
+        "reasoning_effort": "xhigh",
         "reference": None,
         "provenance": {
             "preset": "economy",
@@ -139,7 +150,7 @@ def test_publication_provenance_keeps_preset_and_inherited_effort_source(
     changed = store.configure("run-1", overrides={"review_model": "custom-review"})
     publication = changed["profiles"]["publication"]
     assert publication["model"] == "custom-pub"
-    assert publication["reasoning_effort"] == "max"
+    assert publication["reasoning_effort"] == "xhigh"
     assert publication["provenance"] == {
         "preset": "economy",
         "overrides": ["model"],
@@ -252,7 +263,7 @@ def test_profiled_backend_records_binding_facts_before_agent_starts(tmp_path: Pa
     assert profiled.develop(request) == "ok"
     started = events[0]
     assert started["model"] == "gpt-5.6-luna"
-    assert started["reasoning_effort"] == "max"
+    assert started["reasoning_effort"] == "xhigh"
     assert started["profile_revision"] == 1
     assert started["thread_execution_binding"]["thread_id"] is None
     assert events[1]["thread_execution_binding"]["thread_id"] == "thread-1"
@@ -537,7 +548,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
 
         active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         assert active_before["agent_invocation"]["model"] == "old-development"
-        assert active_before["agent_invocation"]["reasoning_effort"] == "max"
+        assert active_before["agent_invocation"]["reasoning_effort"] == "xhigh"
         assert active_before["agent_invocation"]["profile_revision"] == 1
         active_history = stdout_json(
             run_cli(git_repo, fixture, "history", run_id, "--json")
@@ -574,11 +585,11 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         assert json.loads(stdout)["status"] == "parent_approval_pending"
         assert (
             "Agent Execution Binding: role=development thread=new "
-            "model=old-development reasoning_effort=max profile_revision=1"
+            "model=old-development reasoning_effort=xhigh profile_revision=1"
         ) in stderr
         assert (
             "Agent Execution Binding: role=review thread=new "
-            "model=new-review reasoning_effort=high profile_revision=2"
+            "model=new-review reasoning_effort=low profile_revision=2"
         ) in stderr
         idle = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         assert idle["agent_invocation"] is None
@@ -589,7 +600,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
             if item.get("binding_role") == "development"
         )
         assert development["model"] == "old-development"
-        assert development["reasoning_effort"] == "max"
+        assert development["reasoning_effort"] == "xhigh"
         assert development["profile_revision"] == 1
         review = next(
             item
@@ -600,7 +611,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         assert review["profile_revision"] == 2
         text_history = run_cli(git_repo, fixture, "history", run_id).stdout
         assert "model=old-development" in text_history
-        assert "reasoning_effort=max" in text_history
+        assert "reasoning_effort=xhigh" in text_history
         assert "profile_revision" not in text_history
         publication = next(
             item
@@ -753,8 +764,8 @@ def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
 
         active_before = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
         invocation_before = active_before["agent_invocation"]
-        assert invocation_before["model"] == "gpt-5.6-sol"
-        assert invocation_before["reasoning_effort"] == "high"
+        assert invocation_before["model"] == "gpt-6-astra"
+        assert invocation_before["reasoning_effort"] == "low"
         assert invocation_before["profile_revision"] == 1
         assert invocation_before["invocation_role"] == "review"
         assert invocation_before["binding_role"] == "review"
