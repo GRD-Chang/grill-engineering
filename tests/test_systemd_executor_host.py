@@ -158,11 +158,12 @@ def test_environment_carrier_is_bounded_private_exact_and_single_use(
 def test_environment_carrier_rejects_oversize_before_creating_a_file(
     tmp_path: Path,
 ) -> None:
+    existing_paths = set(tmp_path.rglob("*"))
     with pytest.raises(EnvironmentCarrierError, match="过大"):
         capture_executor_environment(
             {"PATH": "x" * 1024}, command=("run", "189"), max_bytes=128
         )
-    assert list(tmp_path.iterdir()) == []
+    assert set(tmp_path.rglob("*")) == existing_paths
 
 
 def test_wrong_generation_cannot_consume_environment_carrier(tmp_path: Path) -> None:
