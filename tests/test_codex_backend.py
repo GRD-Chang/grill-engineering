@@ -5,6 +5,7 @@ import http.server
 import io
 import json
 import os
+import select
 import signal
 import shutil
 import socket
@@ -19,6 +20,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from support.worker_process_timing import (
+    AdvancingClock,
+    run_worker_expecting_early_failure,
+)
 
 import agent_run.codex as codex_module
 import agent_run.worker_sandbox as worker_sandbox_module
@@ -3401,22 +3406,30 @@ def test_closing_channel_does_not_wait_for_a_blocked_renewal_provider(
         if calls == 1:
             return ReadCredential("reader-one", time.time() + 5)
         renewal_started.set()
-        release_renewal.wait(timeout=5)
+        release_renewal.wait()
         raise RuntimeError("issuer stopped")
 
     credentials = WorkerCredentialChannel(provider, renewal_margin=10)
-    credentials.start(tmp_path / "credential.sock")
-    assert renewal_started.wait(timeout=2)
     closed = threading.Event()
     closer = threading.Thread(
         target=lambda: (credentials.close(), closed.set()), daemon=True
     )
-    closer.start()
-
-    assert closed.wait(timeout=0.5)
-    release_renewal.set()
-    closer.join(timeout=2)
-    assert not closer.is_alive()
+    try:
+        credentials.start(tmp_path / "credential.sock")
+        assert renewal_started.wait(timeout=5)
+        closer.start()
+        assert closed.wait(timeout=5)
+        assert not release_renewal.is_set()
+    finally:
+        release_renewal.set()
+        if closer.ident is not None:
+            closer.join(timeout=5)
+        credentials.close()
+        for thread in (credentials._server_thread, credentials._renewal_thread):
+            if thread is not None:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+        assert not closer.is_alive()
 
 
 def test_app_credential_channel_close_reclaims_a_blocked_signer_tree(
@@ -3965,12 +3978,16 @@ def test_successful_worker_cleans_background_processes(
         pytest.fail("background Worker process survived cleanup")
 
 
-def test_stdout_callback_error_does_not_stop_pipe_drain(tmp_path: Path) -> None:
+def test_stdout_callback_error_does_not_stop_pipe_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     callback_calls = 0
+    ready = threading.Event()
 
     def fail_first_line(_line: str) -> None:
         nonlocal callback_calls
         callback_calls += 1
+        ready.set()
         raise CodexProcessError("reported Thread mismatch")
 
     command = [
@@ -3984,60 +4001,68 @@ def test_stdout_callback_error_does_not_stop_pipe_drain(tmp_path: Path) -> None:
         ),
     ]
 
-    started = time.monotonic()
     with pytest.raises(CodexProcessError, match="Thread mismatch"):
-        run_worker_process(
-            command,
-            cwd=tmp_path,
-            prompt="",
-            environment=os.environ.copy(),
-            timeout=3,
+        run_worker_expecting_early_failure(
+            command, cwd=tmp_path, ready=ready, monkeypatch=monkeypatch,
             on_stdout_line=fail_first_line,
         )
 
     assert callback_calls == 1
-    assert time.monotonic() - started < 2
 
 
-def test_stdout_callback_error_terminates_hanging_worker(tmp_path: Path) -> None:
+def test_stdout_callback_error_terminates_hanging_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = threading.Event()
+
     def reject_thread(_line: str) -> None:
+        ready.set()
         raise CodexProcessError("reported Thread mismatch")
 
-    started = time.monotonic()
     with pytest.raises(CodexProcessError, match="Thread mismatch"):
-        run_worker_process(
+        run_worker_expecting_early_failure(
             ["sh", "-c", "printf 'thread.started\\n'; sleep 60"],
-            cwd=tmp_path,
-            prompt="",
-            environment={"PATH": "/usr/bin:/bin"},
-            timeout=5,
+            cwd=tmp_path, ready=ready, monkeypatch=monkeypatch,
             on_stdout_line=reject_thread,
         )
 
-    assert time.monotonic() - started < 2
 
-
-def test_streaming_timeout_joins_reader_threads(tmp_path: Path) -> None:
+def test_streaming_timeout_joins_reader_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     process_ids: list[int] = []
     child_pid_file = tmp_path / "child.pid"
+    clock = AdvancingClock()
+    ready = threading.Event()
 
+    def expire_after_child_is_ready(line: str) -> None:
+        assert line == "ready"
+        assert child_pid_file.read_text(encoding="utf-8").strip()
+        clock.offset += 30
+        ready.set()
+
+    monkeypatch.setattr(worker_sandbox_module, "time", clock)
+
+    deadline_at = clock.monotonic() + 10
     with pytest.raises(WorkerSandboxError, match="timed out"):
         run_worker_process(
             [
                 "sh",
                 "-c",
-                'sleep 60 & echo "$!" > "$1"; wait',
+                'sleep 60 & echo "$!" > "$1"; printf "ready\\n"; wait',
                 "sh",
                 str(child_pid_file),
             ],
             cwd=tmp_path,
             prompt="",
             environment={"PATH": "/usr/bin:/bin"},
-            timeout=0.1,
-            on_stdout_line=lambda _line: None,
+            timeout=10,
+            deadline_at_monotonic=deadline_at,
+            on_stdout_line=expire_after_child_is_ready,
             on_process_started=process_ids.append,
         )
 
+    assert ready.is_set()
     assert len(process_ids) == 1
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
@@ -4057,13 +4082,14 @@ def test_absolute_deadline_includes_popen_startup_and_prevents_worker_start(
     process_ids: list[int] = []
     process_group_ids: list[int] = []
     timed_waits: list[float] = []
+    clock = AdvancingClock()
     real_popen = worker_sandbox_module.subprocess.Popen
     real_wait = real_popen.wait
 
     def delayed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
         process = real_popen(*args, **kwargs)
         process_group_ids.append(os.getpgid(process.pid))
-        time.sleep(0.2)
+        clock.offset += 30
         return process
 
     def record_wait(
@@ -4075,7 +4101,8 @@ def test_absolute_deadline_includes_popen_startup_and_prevents_worker_start(
 
     monkeypatch.setattr(worker_sandbox_module.subprocess, "Popen", delayed_popen)
     monkeypatch.setattr(real_popen, "wait", record_wait)
-    deadline_at = time.monotonic() + 0.1
+    monkeypatch.setattr(worker_sandbox_module, "time", clock)
+    deadline_at = clock.monotonic() + 10
 
     with pytest.raises(WorkerSandboxError, match="timed out"):
         run_worker_process(
@@ -4106,103 +4133,120 @@ def test_bootstrap_rechecks_absolute_deadline_at_gate_release(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     side_effect = tmp_path / "worker-started"
-    gate_write_started = threading.Event()
-    release_gate_write = threading.Event()
     processes: list[subprocess.Popen[bytes]] = []
     bootstrap_return_codes: list[int] = []
     process_ids: list[int] = []
-    result: list[subprocess.CompletedProcess[str]] = []
-    failure: list[BaseException] = []
+    clock = AdvancingClock()
+    deadline_at = clock.monotonic() + 10
+    child_clock = tmp_path / "bootstrap-clock"
+    child_clock.write_text(str(deadline_at - 1), encoding="utf-8")
+    ready_read, ready_write = os.pipe()
     real_popen = worker_sandbox_module.subprocess.Popen
     real_write = worker_sandbox_module.os.write
 
-    def capture_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
+    def capture_popen(arguments: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        arguments = list(arguments)
+        # Instrument the real bootstrap's clock and announce entry to its gate
+        # read. Advancing time only after that signal also detects a deadline
+        # check incorrectly moved before the gate or a cached pre-gate clock.
+        arguments[2] = (
+            "import os, time\n"
+            "from pathlib import Path\n"
+            f"time.monotonic = lambda: float(Path({str(child_clock)!r}).read_text())\n"
+            "_real_read = os.read\n"
+            "def _announce_gate_read(fd, size):\n"
+            f"    if fd == {int(arguments[3])}:\n"
+            f"        os.write({ready_write}, b'r')\n"
+            "    return _real_read(fd, size)\n"
+            "os.read = _announce_gate_read\n"
+            + arguments[2]
+        )
+        kwargs["pass_fds"] = (*kwargs["pass_fds"], ready_write)
+        process = real_popen(arguments, **kwargs)
         processes.append(process)
         return process
 
     def write_after_deadline(fd: int, data: bytes) -> int:
         if data == b"1":
-            gate_write_started.set()
-            assert release_gate_write.wait(3)
+            readable, _, _ = select.select([ready_read], [], [], 5)
+            assert readable, "bootstrap did not enter its gate read"
+            assert os.read(ready_read, 1) == b"r"
+            child_clock.write_text(str(deadline_at + 1), encoding="utf-8")
+            clock.offset += 30
             written = real_write(fd, data)
-            bootstrap_return_codes.append(processes[0].wait(timeout=3))
+            bootstrap_return_codes.append(processes[0].wait(timeout=5))
             return written
         return real_write(fd, data)
 
+    monkeypatch.setattr(worker_sandbox_module, "time", clock)
     monkeypatch.setattr(worker_sandbox_module.subprocess, "Popen", capture_popen)
     monkeypatch.setattr(worker_sandbox_module.os, "write", write_after_deadline)
-    deadline_at = time.monotonic() + 2.0
 
-    def run_worker() -> None:
-        try:
-            result.append(
-                run_worker_process(
-                    [
-                        sys.executable,
-                        "-c",
-                        f"from pathlib import Path; Path({str(side_effect)!r}).touch()",
-                    ],
-                    cwd=tmp_path,
-                    prompt="",
-                    environment=os.environ.copy(),
-                    timeout=10,
-                    deadline_at_monotonic=deadline_at,
-                    on_process_started=process_ids.append,
-                )
-            )
-        except BaseException as error:
-            failure.append(error)
-
-    worker = threading.Thread(target=run_worker)
-    worker.start()
     try:
-        assert gate_write_started.wait(3)
-        remaining = deadline_at - time.monotonic()
-        assert remaining > 0
-        assert not release_gate_write.wait(remaining + 0.02)
-        release_gate_write.set()
-        worker.join(timeout=3)
-        assert not worker.is_alive()
+        with pytest.raises(WorkerSandboxError, match="timed out"):
+            run_worker_process(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(side_effect)!r}).touch()",
+                ],
+                cwd=tmp_path,
+                prompt="",
+                environment=os.environ.copy(),
+                timeout=10,
+                deadline_at_monotonic=deadline_at,
+                on_process_started=process_ids.append,
+            )
 
         assert bootstrap_return_codes == [124]
-        assert result == []
-        assert len(failure) == 1
-        assert isinstance(failure[0], WorkerSandboxError)
-        assert "timed out" in str(failure[0])
         assert len(process_ids) == 1
         assert not side_effect.exists()
         with pytest.raises(ProcessLookupError):
             os.killpg(process_ids[0], 0)
     finally:
-        release_gate_write.set()
-        worker.join(timeout=3)
+        os.close(ready_read)
+        os.close(ready_write)
 
 
 def test_non_streaming_worker_stops_when_credential_renewal_is_exhausted(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     abort_event = threading.Event()
+    stop_observer = threading.Event()
+    process_ids: list[int] = []
+    ready_fifo = tmp_path / "worker-ready"
+    os.mkfifo(ready_fifo)
+    ready_fd = os.open(ready_fifo, os.O_RDWR | os.O_NONBLOCK)
 
     def exhaust_credentials() -> None:
-        time.sleep(0.1)
-        abort_event.set()
+        while not stop_observer.is_set():
+            readable, _, _ = select.select([ready_fd], [], [], 0.1)
+            if readable and os.read(ready_fd, 5) == b"ready":
+                abort_event.set()
+                return
 
-    threading.Thread(target=exhaust_credentials, daemon=True).start()
-    started = time.monotonic()
-
-    with pytest.raises(WorkerSandboxError, match="credential renewal failed"):
-        run_worker_process(
-            ["sh", "-c", "sleep 60"],
-            cwd=tmp_path,
-            prompt="",
-            environment={"PATH": "/usr/bin:/bin"},
-            timeout=5,
-            abort_event=abort_event,
-            abort_reason=lambda: "Worker credential renewal failed",
-        )
-
-    assert time.monotonic() - started < 2
+    observer = threading.Thread(target=exhaust_credentials)
+    observer.start()
+    try:
+        with pytest.raises(WorkerSandboxError, match="credential renewal failed"):
+            run_worker_expecting_early_failure(
+                ["sh", "-c", 'printf ready > "$1"; sleep 60', "sh", str(ready_fifo)],
+                cwd=tmp_path,
+                ready=abort_event,
+                monkeypatch=monkeypatch,
+                abort_event=abort_event,
+                abort_reason=lambda: "Worker credential renewal failed",
+                on_process_started=process_ids.append,
+            )
+        assert abort_event.is_set()
+        assert len(process_ids) == 1
+        with pytest.raises(ProcessLookupError):
+            os.killpg(process_ids[0], 0)
+    finally:
+        stop_observer.set()
+        observer.join(timeout=5)
+        os.close(ready_fd)
+        assert not observer.is_alive()
 
 
 def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> None:
