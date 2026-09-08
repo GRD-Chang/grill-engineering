@@ -63,7 +63,7 @@ def _collect() -> dict[str, object]:
         "path": _path_check(),
         "worker_read_provider": _provider_check(),
     }
-    installation_keys = ("python", "codex", "active_runner", "path")
+    installation_keys = ("python", "active_runner", "path")
     installation = {
         "status": (
             "ready"
@@ -73,6 +73,14 @@ def _collect() -> dict[str, object]:
         "checks": list(installation_keys),
     }
     execution = execution_readiness()
+    execution_keys = (
+        "git", "codex", "openssl", "bubblewrap", "github", "worker_read_provider",
+    )
+    execution["checks"] = list(execution_keys)
+    missing = [key for key in execution_keys if not _check_is_ok(checks[key])]
+    if _check_is_ok(execution) and missing:
+        execution["status"] = "unavailable"
+        execution["reason"] = "执行依赖不可用：" + ", ".join(missing)
     return {
         "result": "doctor",
         "status": (

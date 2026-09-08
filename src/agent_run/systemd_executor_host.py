@@ -9,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Mapping, Protocol, Sequence
@@ -967,13 +968,33 @@ def _run_bounded(arguments: list[str], *, max_output: int) -> _BoundedResult:
     stdout = bytearray()
     stderr = bytearray()
 
+    stop_readers = threading.Event()
+
     def drain(stream: object, destination: bytearray) -> None:
         fileno = getattr(stream, "fileno", None)
         if not callable(fileno):
             return
         try:
             descriptor = fileno()
-            while chunk := os.read(descriptor, 64 * 1024):
+            os.set_blocking(descriptor, False)
+            deadline: float | None = None
+            while True:
+                if stop_readers.is_set():
+                    # Drain buffered output, but escaped pipe holders cannot
+                    # extend cleanup indefinitely by keeping the pipe open.
+                    if deadline is None:
+                        deadline = time.monotonic() + 0.1
+                    if time.monotonic() >= deadline:
+                        return
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    if deadline is not None:
+                        return
+                    stop_readers.wait(0.05)
+                    continue
+                if not chunk:
+                    return
                 destination.extend(chunk)
                 if len(destination) > max_output:
                     del destination[:-max_output]
@@ -1003,6 +1024,7 @@ def _run_bounded(arguments: list[str], *, max_output: int) -> _BoundedResult:
         cleanup_returncode = process.wait()
         if timed_out:
             returncode = cleanup_returncode
+        stop_readers.set()
         for reader in readers:
             if reader.ident is not None:
                 reader.join()

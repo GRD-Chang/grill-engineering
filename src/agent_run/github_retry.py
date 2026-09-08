@@ -83,13 +83,33 @@ def _run_bounded_command(
     stdout = bytearray()
     stderr = bytearray()
 
+    stop_readers = threading.Event()
+
     def drain(stream: object, destination: bytearray) -> None:
         fileno = getattr(stream, "fileno", None)
         if not callable(fileno):
             return
         try:
             descriptor = fileno()
-            while chunk := os.read(descriptor, 64 * 1024):
+            os.set_blocking(descriptor, False)
+            deadline: float | None = None
+            while True:
+                if stop_readers.is_set():
+                    # Drain buffered output, but escaped pipe holders cannot
+                    # extend cleanup indefinitely by keeping the pipe open.
+                    if deadline is None:
+                        deadline = time.monotonic() + 0.1
+                    if time.monotonic() >= deadline:
+                        return
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    if deadline is not None:
+                        return
+                    stop_readers.wait(0.05)
+                    continue
+                if not chunk:
+                    return
                 destination.extend(chunk)
                 if len(destination) > MAX_COMMAND_OUTPUT_BYTES:
                     del destination[:-MAX_COMMAND_OUTPUT_BYTES]
@@ -117,6 +137,7 @@ def _run_bounded_command(
         except ProcessLookupError:
             pass
         process.wait()
+        stop_readers.set()
         for reader in readers:
             if reader.ident is not None:
                 reader.join()

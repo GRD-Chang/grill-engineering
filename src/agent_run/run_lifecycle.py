@@ -350,13 +350,24 @@ class RunLifecycle:
                 "Task Control 不可用；仅凭 Delivery Run Receipt 无法证明原 "
                 "Executor 已退出。请恢复对应 Task Control 后重试。"
             )
+        invocation = (
+            current.get("active_agent_invocation") if current is not None else None
+        )
+        observing_active_invocation = (
+            request.kind == "run"
+            and isinstance(invocation, Mapping)
+            and invocation.get("status") in {"running", "resuming"}
+        )
         if (
             current is not None
             and isinstance(record, Mapping)
             and isinstance(action, Mapping)
             and isinstance(executor, Mapping)
             and executor.get("status") in {"absent", "exited"}
-            and action.get("kind") not in {"approve", "revise", "requeue"}
+            and (
+                action.get("kind") not in {"approve", "revise", "requeue"}
+                or observing_active_invocation
+            )
             and action_receipt_matches(current, action)
             and not reconciling_receipt_predecessor
             and (
@@ -366,6 +377,7 @@ class RunLifecycle:
                     and (
                         executor.get("status") == "absent"
                         or isinstance(executor.get("failure"), str)
+                        or observing_active_invocation
                     )
                 )
             )
@@ -412,6 +424,11 @@ class RunLifecycle:
             and action.get("payload_digest") == payload_digest(request.payload)
             and action.get("run_id") == current_run_id
             and not request.allow_terminal_successor
+            and not (
+                request.kind == "run"
+                and isinstance(executor, Mapping)
+                and executor.get("status") in {"starting", "running"}
+            )
             and (
                 request.kind in {"approve", "revise", "requeue"}
                 or not _restartable_after_executor_exit(current)

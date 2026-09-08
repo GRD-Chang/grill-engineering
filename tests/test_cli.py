@@ -350,7 +350,6 @@ def test_doctor_reports_host_readiness_without_mutating_user_state(
     assert output["installation_readiness"]["status"] == "issues"
     assert output["installation_readiness"]["checks"] == [
         "python",
-        "codex",
         "active_runner",
         "path",
     ]
