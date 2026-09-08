@@ -796,15 +796,22 @@ class SystemdUserExecutorHost:
         if not isinstance(action, dict) or action.get("status") not in {
             "accepted",
             "applying",
+            "completed",
+            "failed",
         }:
             return
+        if spec.runner_binding is None:
+            raise ExecutorHostError("Executor Host exit 缺少准确 Runner binding")
+        failure = reason
+        if failure is None and action.get("status") in {"accepted", "applying"}:
+            failure = "Executor host terminated before Action completion"
         control.finish_executor(
             spec.task,
             action_id=spec.action_id,
             generation=spec.generation,
-            failure=bounded_error(
-                reason or "Executor host terminated before Action completion"
-            ),
+            run_id=spec.run_id,
+            runner_binding=spec.runner_binding,
+            failure=bounded_error(failure) if failure else None,
         )
 
     def _executor_command(
@@ -979,21 +986,26 @@ def _run_bounded(arguments: list[str], *, max_output: int) -> _BoundedResult:
         threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
     )
-    for reader in readers:
-        reader.start()
     timed_out = False
     try:
+        for reader in readers:
+            reader.start()
         returncode = process.wait(timeout=10)
     except subprocess.TimeoutExpired:
         timed_out = True
+    finally:
+        # Reap the owned group even when its leader exited successfully;
+        # descendants can otherwise keep the pipe readers alive indefinitely.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        returncode = process.wait()
-    finally:
+        cleanup_returncode = process.wait()
+        if timed_out:
+            returncode = cleanup_returncode
         for reader in readers:
-            reader.join(timeout=1)
+            if reader.ident is not None:
+                reader.join()
         process.stdout.close()
         process.stderr.close()
     decoded_stdout = bytes(stdout).decode("utf-8", errors="replace")

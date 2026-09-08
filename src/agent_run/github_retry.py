@@ -102,27 +102,33 @@ def _run_bounded_command(
         threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
     )
-    for reader in readers:
-        reader.start()
+    timed_out = False
     try:
+        for reader in readers:
+            reader.start()
         returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        # A successful command may leave descendants holding the output pipes.
+        # Close the owned group on every path before waiting for EOF readers.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.wait()
+        for reader in readers:
+            if reader.ident is not None:
+                reader.join()
+        process.stdout.close()
+        process.stderr.close()
+    if timed_out:
         raise subprocess.TimeoutExpired(
             arguments,
             timeout,
             output=bytes(stdout),
             stderr=bytes(stderr),
         )
-    finally:
-        for reader in readers:
-            reader.join(timeout=1)
-        process.stdout.close()
-        process.stderr.close()
     return subprocess.CompletedProcess(
         arguments,
         returncode,
