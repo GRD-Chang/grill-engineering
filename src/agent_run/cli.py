@@ -81,7 +81,11 @@ from agent_run.run_lifecycle import (
     RunLifecycle,
     prepare_action_application_receipt,
 )
-from agent_run.resume_intent import bind_resume_intent, validate_resume_intent
+from agent_run.resume_intent import (
+    ResumeIntentError,
+    bind_resume_intent,
+    validate_resume_intent,
+)
 from agent_run.run_locator import (
     MAX_LOCATOR_ENTRIES,
     RunLocatorError,
@@ -932,7 +936,7 @@ def _main_with_parser_resources(
             if locator_error
             or isinstance(error, DirtyManagedCheckoutError)
             or isinstance(error, DeliveryPolicyError)
-            or isinstance(error, TaskControlError)
+            or isinstance(error, ResumeIntentError)
             or incompatible_state
             or durable_status not in {"blocked", "deterministic_contradiction"}
             or durable_diagnostics is None

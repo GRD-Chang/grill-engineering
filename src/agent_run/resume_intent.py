@@ -11,6 +11,10 @@ from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.task_control import TaskControlError
 
 
+class ResumeIntentError(TaskControlError):
+    """The admitted Resume no longer grants authority over this pause."""
+
+
 def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
     """Bind pause facts, excluding observation timestamps and refresh metadata."""
     current = dict(state)
@@ -23,7 +27,7 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
         in {"agent_requires_human", "reviewer_requires_human"}
     ]
     if len(checkpoints) > 1 or len(human) > 1 or (checkpoints and human):
-        raise TaskControlError("resume 暂停对象不唯一；拒绝推断恢复授权")
+        raise ResumeIntentError("resume 暂停对象不唯一；拒绝推断恢复授权")
     if checkpoints:
         reason, authorization = "budget_checkpoint", "new_budget_window"
         subjects = checkpoints
@@ -90,7 +94,7 @@ def validate_resume_intent(
 ) -> None:
     """Never turn an accepted continuation into a different business grant."""
     if not isinstance(intent, Mapping) or dict(intent) != bind_resume_intent(state):
-        raise TaskControlError("resume 暂停对象或授权已变化；原 Action 不能重新解释，请检查状态后重新提交")
+        raise ResumeIntentError("resume 暂停对象或授权已变化；原 Action 不能重新解释，请检查状态后重新提交")
 
 
 def action_resume_intent(action: Mapping[str, Any]) -> dict[str, Any] | None:
