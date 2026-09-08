@@ -57,6 +57,17 @@ def status_progress_view(
     }
 
 
+def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
+    """Summarize cumulative recovery facts without adding timeline events."""
+    details: list[str] = []
+    if invocation.get("ordinary_recovery_used") is True:
+        details.append("本轮累计：普通异常自动续接已触发 1 次")
+    capacity_count = invocation.get("capacity_recovery_count")
+    if type(capacity_count) is int and capacity_count > 0:
+        details.append(f"本轮累计：模型容量不足等待已触发 {capacity_count} 次，每次等待 30 秒后自动续接")
+    return details
+
+
 def invocation_activity(
     invocation: dict[str, Any] | None, audit: dict[str, Any]
 ) -> str:
@@ -165,6 +176,8 @@ def print_status_progress(
             print(f"  {duration_label:<20}{_duration(agent['duration_seconds'])}")
         if agent["remaining_seconds"] is not None:
             print(f"  本轮剩余              {_duration(agent['remaining_seconds'])}")
+        for detail in agent["recovery_details"]:
+            print(f"  {detail}")
 
     findings = view["findings"]
     print(f"\n当前 Findings（{len(findings)}）")
@@ -245,6 +258,7 @@ def _agent_view(
     return {
         "role": _role_label(str(role)),
         "started_at": started_at,
+        "recovery_details": invocation_recovery_details(source),
         "model": source.get("model") or "未绑定",
         "reasoning_effort": source.get("reasoning_effort") or "未绑定",
         "duration_seconds": (

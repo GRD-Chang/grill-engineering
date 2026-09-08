@@ -6,7 +6,11 @@ from datetime import UTC, datetime, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agent_run.delivery_status import execution_guidance, invocation_activity
+from agent_run.delivery_status import (
+    execution_guidance,
+    invocation_activity,
+    invocation_recovery_details,
+)
 from agent_run.presentation_helpers import (
     delivery_object_label,
     human_next_action,
@@ -214,7 +218,7 @@ def _history_events(
                     "profile_revision": invocation.get("profile_revision"),
                     "duration_seconds": _invocation_duration(invocation, audit),
                     "activity": invocation_activity(invocation, audit),
-                    "details": review_details,
+                    "details": review_details + invocation_recovery_details(invocation),
                     "_order": order,
                 }
             )

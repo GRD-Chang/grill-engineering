@@ -134,3 +134,33 @@ def test_budget_checkpoint_explains_new_window_authorization(git_repo: Path) -> 
         assert result.returncode == 0, result.stderr
         assert "resume 将授权新的预算窗口" in result.stdout
     assert _file_snapshot(git_repo) == before
+
+
+def test_completed_invocation_keeps_bounded_recovery_summary(
+    git_repo: Path, tmp_path: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    environment = _isolated_environment(tmp_path / "recovered-history")
+    first = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents),
+        extra_env=environment,
+    )
+    assert first.returncode == 0, first.stderr
+    run_id = stdout_json(first)["run_id"]
+    state_path = next((git_repo / ".agent-run/runs").glob("*.json"))
+    state = json.loads(state_path.read_text())
+    invocation = state["agent_invocation_history"][-1]
+    assert invocation["status"] == "completed"
+    invocation.update(ordinary_recovery_used=True, capacity_recovery_count=3)
+    state_path.write_text(json.dumps(state))
+    before = _file_snapshot(git_repo)
+    for command in ("history", "status"):
+        result = run_cli(
+            git_repo, fixture, command, run_id, extra_env=environment,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "普通异常自动续接已触发 1 次" in result.stdout
+        assert "模型容量不足等待已触发 3 次" in result.stdout
+        assert "ordinary_recovery_used" not in result.stdout
+    assert _file_snapshot(git_repo) == before
