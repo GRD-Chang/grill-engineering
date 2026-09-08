@@ -24,8 +24,9 @@ PRESETS: dict[str, dict[str, dict[str, str]]] = {
         "review": {"model": "gpt-6-astra", "reasoning_effort": "low"},
     },
     "premium": {
-        "development": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"},
-        "review": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        "development": {"model": "gpt-6-astra", "reasoning_effort": "low"},
+        "review": {"model": "gpt-6-astra", "reasoning_effort": "low"},
+        "publication": {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
     },
 }
 
@@ -111,11 +112,14 @@ def resolve_profiles(
         }
         for role, values in baseline.items()
     }
-    roles["publication"] = {
-        "model": roles["development"]["model"],
-        "reasoning_effort": roles["development"]["reasoning_effort"],
-        "reference": "development",
-    }
+    roles.setdefault(
+        "publication",
+        {
+            "model": roles["development"]["model"],
+            "reasoning_effort": roles["development"]["reasoning_effort"],
+            "reference": "development",
+        },
+    )
 
     current_profiles: Mapping[str, Any] = {}
     preserve_independent_publication_provenance = False

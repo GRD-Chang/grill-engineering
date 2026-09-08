@@ -19,7 +19,7 @@ from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, ticket
 
 
-def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> None:
+def test_preset_resolution_respects_publication_defaults_and_overrides() -> None:
     economy = resolve_profiles(preset="economy")
     assert economy["profiles"]["development"] == {
         "model": "gpt-5.6-luna",
@@ -37,6 +37,14 @@ def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> N
     assert economy["profiles"]["review"]["model"] == "gpt-6-astra"
     assert economy["profiles"]["review"]["reasoning_effort"] == "low"
 
+    defaults = resolve_profiles(preset="premium")["profiles"]
+    for role in ("development", "review"):
+        assert defaults[role]["model"] == "gpt-6-astra"
+        assert defaults[role]["reasoning_effort"] == "low"
+    assert defaults["publication"]["model"] == "gpt-5.6-luna"
+    assert defaults["publication"]["reasoning_effort"] == "xhigh"
+    assert defaults["publication"]["reference"] is None
+
     premium = resolve_profiles(
         preset="premium",
         overrides={
@@ -46,8 +54,8 @@ def test_preset_resolution_keeps_publication_linked_and_applies_overrides() -> N
     )
     assert premium["profiles"]["development"]["model"] == "custom-development"
     assert premium["profiles"]["development"]["reasoning_effort"] == "high"
-    assert premium["profiles"]["review"]["model"] == "gpt-5.6-sol"
-    assert premium["profiles"]["publication"]["model"] == "custom-development"
+    assert premium["profiles"]["review"]["model"] == "gpt-6-astra"
+    assert premium["profiles"]["publication"] == defaults["publication"]
 
 
 def test_profile_store_revisions_and_thread_bindings_are_durable(tmp_path: Path) -> None:
@@ -86,7 +94,7 @@ def test_publication_override_is_independent_until_reference_is_restored(
     )
     assert independent["profiles"]["publication"] == {
         "model": "publication-model",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "xhigh",
         "reference": None,
         "provenance": {
             "preset": "premium",

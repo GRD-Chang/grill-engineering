@@ -1,6 +1,6 @@
 # 顶层 Codex 使用 Thread 绑定的角色执行配置
 
-Grill Engineer 为 Development、Review 与 Publication 三类顶层 Codex 保存可在 Delivery Run 期间修改的 Agent Execution Profile，并在创建 Thread 前将当时有效的 model、reasoning effort 与 Profile Revision 固定为不可变 Thread Execution Binding；同一 Thread 的后续 Invocation、Resume 与 Output Repair 始终复用该绑定，配置修改只影响后来创建的新 Thread。配置只约束 Controller 直接启动的顶层 Codex，不约束其内部 subagent。内置 `economy` 预设使用 `gpt-5.6-luna`/`xhigh` 开发与 `gpt-6-astra`/`low` 审核，内置 `premium` 预设使用 `gpt-5.6-sol`/`medium` 开发与 `gpt-5.6-sol`/`high` 审核；Publication 默认引用 Development，用户也可显式覆盖任一角色。选择预设时保存解析后的准确值，不让已有 Run 随预设定义变化，也不在模型不可用时静默降级。
+Grill Engineer 为 Development、Review 与 Publication 三类顶层 Codex 保存可在 Delivery Run 期间修改的 Agent Execution Profile，并在创建 Thread 前将当时有效的 model、reasoning effort 与 Profile Revision 固定为不可变 Thread Execution Binding；同一 Thread 的后续 Invocation、Resume 与 Output Repair 始终复用该绑定，配置修改只影响后来创建的新 Thread。配置只约束 Controller 直接启动的顶层 Codex，不约束其内部 subagent。内置 `economy` 预设使用 `gpt-5.6-luna`/`xhigh` 开发与 `gpt-6-astra`/`low` 审核，其 Publication 默认引用 Development；内置 `premium` 预设使用 `gpt-6-astra`/`low` 开发与审核，Publication 独立使用 `gpt-5.6-luna`/`xhigh`，用户也可显式覆盖任一角色。选择预设时保存解析后的准确值，不让已有 Run 随预设定义变化，也不在模型不可用时静默降级。
 
 可变的当前 Agent Execution Profile 使用独立于 Run 状态的每-Run 控制面、锁和原子写，避免前台 Supervisor 持有的旧 Run 快照覆盖并发配置修改。Controller 在启动新 Thread 前先持久化其 Binding；该写入是本 Thread 的配置选择截止点。每次顶层 Agent Invocation 保存并展示实际 role、Thread、model、reasoning effort 与绑定的 Profile Revision，`history` 保留每次启动事实。第一版不提供主动轮换 Development Thread、交互式模型选择器或旧 Run 迁移。
 
