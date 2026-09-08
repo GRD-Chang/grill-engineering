@@ -615,7 +615,7 @@ Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output At
 不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
 立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
 checkout 只读，且不增加领域 Development Attempt、Reviewer Invocation 或 Publication Attempt。一个 Invocation 只有一个覆盖初始 Output Attempt 与其 Output Repair 的按角色总 Deadline；Development 默认五小时，Review 默认两小时，Publication 默认一小时，均可由 Run Policy Snapshot 中的角色覆盖值替代。successor Invocation 获得新的完整角色 Deadline，但仍可属于同一个 Semantic Agent Attempt。进程失败、缺失或
-不匹配的 Thread 只结束当前 Invocation，不自动重试或创建替代 Thread。操作者可默认 Resume 原
+不匹配的 Thread 结束当前 Invocation；只有符合 Automatic Invocation Recovery 边界的异常才允许自动同 Thread 恢复，普通异常最多一次，准确容量不足可持续恢复，不自动创建替代 Thread。操作者可默认 Resume 原
 Thread，或用 `--new-thread` 明确以标准阶段 Prompt 新开 Thread。
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
 
@@ -659,12 +659,25 @@ Publication attempt，也不适用于进程、凭据、sandbox、timeout、signa
 _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
+调用层的续接动作，其业务含义必须区分 Business Resume 与 Execution Recovery；复用同一 Thread 或生成 successor Invocation 本身不表示授权了新的预算窗口。公开 `resume` 保持单一入口，本次恢复意图绑定准入时的准确暂停原因、对象与授权，不能因后续状态变化被重解释；自动执行续接不具有解除业务阻塞或开启预算窗口的权限。以下保留公开 `resume` 的承载关系，不能据此把两种语义合并。
 维护者以 `agent-run resume <parent-issue>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
 successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。只有这两类开启新预算窗口的 Resume 才能为新窗口解析当前用户级默认或接受本次命令的 Delivery Policy 覆盖；旧窗口用量与策略保持不变。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
 但不把新 Attempt 伪装成旧窗口的额外轮次。若检查点保留了尚需修改代码的准确失败证据，successor Invocation 必须先把该证据交回原 Development Thread，产生新 Candidate 后才启动新窗口的 Reviewer 1；尤其是 Final CI-fix 后准确 PR head 的 Required Checks 再失败时，不得先审查未变化且已知 CI 失败的 Candidate。`--new-thread` 或无可恢复 Thread 时才以该阶段完整标准 Prompt
 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale
-时不启动 Codex，只进入 `requeue_required`。
+时不启动 Codex，只进入 `requeue_required`。JSON 格式修复步骤因执行异常中断后，默认同 Thread Resume 只续接该次只读修复并继承已用次数，不重新开放开发任务。人工 Resume 不重置同一 Semantic Agent Attempt 已用的普通异常自动恢复额度；本次进程异常恢复不改变格式修复额度耗尽后的既有授权规则。上述恢复目标合同见 ADR 0011，尚待实现。
 _Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
+
+**Business Resume（业务恢复）**:
+在明确的业务暂停点，由维护者补充所需回应或授予继续执行的许可；Human Blocker 恢复延续已获授权的工作，预算耗尽检查点的恢复则明确授权新的预算窗口。它不表示修复一个意外退出的 Codex 进程。
+_Avoid_: Execution Recovery、把所有 Resume 都解释为新开预算窗口
+
+**Execution Recovery（执行续接）**:
+Codex 在已获授权的工作尚未完成时异常结束后，对原工作、Thread、权限与执行步骤的续接；它可以按规则自动进行，也可以由维护者触发，但不新增或重置业务预算、窗口与格式修复额度。业务暂停不会仅因底层 Codex 进程已经结束而变成执行异常。
+_Avoid_: Business Resume、重新开发、预算续期、Output Repair
+
+**Automatic Invocation Recovery（调用自动恢复）**:
+Executor 仍存活且确认 Worker 异常结束后，为完成同一 Semantic Agent Attempt 而进行的同 Thread 续接：普通异常最多一次，准确模型容量不足可持续自动恢复且不消耗普通异常额度，不替代 Executor 消失后的人工恢复。续接保留原工作、权限、业务预算与格式修复次数，并获得与原调用等长的新执行时限；JSON 修复中断时只续接该次只读修复，不重开开发或增加格式修复额度。
+_Avoid_: Output Repair、自动替代 Thread、Executor 自动重启、将容量恢复扩大为所有错误的无限重试
 
 **Review Budget Checkpoint（审查预算检查点）**:
 Run 或 Parent-only 已到达当前 Review Budget Window 的自动边界，且仍有明确失败证据时形成的 `ready-for-human` 暂停。Controller 保留当前 Candidate、准确 Findings、Thread、PR 与所有旧窗口用量，不自动启动下一次 Development 或 Reviewer。维护者显式执行 `agent-run resume <parent-issue>` 即表示允许继续：在 Currentness Boundary 仍有效时同时开启该层级新的 Review Budget Window 和新的代码修复预算窗口，先把未解决证据交回原 Development Thread 修复；历史用量不删除，只是新窗口从零开始。Ticket 用尽有效 Policy Snapshot 的 `N` 次 Reviewer Invocation 且最后 Findings 已由后续 Development 处理产生新 Candidate 时，直接进入 Deterministic Ticket Fallback，不进入本 Checkpoint。Reviewer Finding 或 Git Integrity 失败时已无普通 Development 名额、可修复 CI 失败时普通 Development 与 Final CI-fix 均不可用、Final CI-fix 后 Reviewer 失败，或该修复后的准确新 head 再次出现可修复 CI 失败，才以 `modification_budget_exhausted` 等待人工恢复；其他 CI 状态只进入有界监督。

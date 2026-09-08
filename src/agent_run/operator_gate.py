@@ -212,9 +212,15 @@ def _local_gate_matches_top_status(
 def has_run_operator_gate(state: dict[str, Any]) -> bool:
     """Whether automatic selection of another top-level work subject must stop."""
 
-    if next(_iter_local_operator_gate_subjects(state), None) is not None:
+    if has_local_operator_gate(state):
         return True
     return _status_requires_operator_gate(state)
+
+
+def has_local_operator_gate(state: dict[str, Any]) -> bool:
+    """Whether a current Work Subject requires an explicit operator action."""
+
+    return next(_iter_local_operator_gate_subjects(state), None) is not None
 
 
 def has_non_invocation_execution_failure(state: dict[str, Any]) -> bool:

@@ -20,7 +20,9 @@ from agent_run.executor_host import (
     ExecutorStartUnknownError,
     HostObservation,
 )
+from agent_run.operator_gate import has_run_operator_gate
 from agent_run.state import StateStore
+from agent_run.resume_intent import action_resume_intent
 from agent_run.task_control import (
     ActionClaim,
     ActionBusyError,
@@ -59,6 +61,7 @@ class ActionReceipt:
     handshake: bool
     payload_digest: str | None
     failure: str | None = None
+    resume_intent: dict[str, Any] | None = None
 
 
 class _ExecutorDispatch:
@@ -124,6 +127,28 @@ def prepare_action_application_receipt(
         "executor_generation": _positive_integer(action.get("executor_generation")),
         "applied_at": datetime.now(UTC).isoformat(),
     }
+    if action.get("kind") in {"stop", "abandon"}:
+        # The control Executor and its original target have separate ownership.
+        # Explicit null proves that this control action had no target.
+        target = action.get("target_executor")
+        target_receipt = None
+        if isinstance(target, Mapping):
+            target_receipt = {
+                key: target[key]
+                for key in (
+                    "status", "action_id", "run_id", "generation", "runner_binding",
+                    "pid", "process_start_token",
+                )
+                if key in target
+            }
+            worker = target.get("worker")
+            if isinstance(worker, Mapping):
+                target_receipt["worker"] = {
+                    key: worker[key]
+                    for key in ("pid", "process_start_token")
+                    if key in worker
+                }
+        state["action_application_receipt"]["target_executor"] = target_receipt
 
 
 class RunLifecycle:
@@ -224,15 +249,45 @@ class RunLifecycle:
             if isinstance(current, Mapping)
             else None
         )
+        existing_executor = (
+            existing_control.get("executor")
+            if isinstance(existing_control, Mapping)
+            else None
+        )
+        if (
+            request.kind in {"approve", "revise", "requeue"}
+            and isinstance(receipt, Mapping)
+            and receipt.get("kind") == request.kind
+            and receipt.get("payload_digest") == payload_digest(request.payload)
+            and (
+                existing_control is None
+                or (
+                    isinstance(existing_executor, Mapping)
+                    and existing_executor.get("binding_token") == "reconciliation-required"
+                )
+            )
+        ):
+            # Reconstructing the same explicit intent is receipt recovery, even
+            # if the Run still advertises the original command's ready state.
+            request = replace(request, allow_terminal_successor=False)
+        reconciliation_payload: Mapping[str, Any] | None = request.payload
         if (
             existing_control is None
             and isinstance(receipt, Mapping)
             and _has_run_receipt(current)
         ):
             requested_digest = payload_digest(request.payload)
-            if (
+            request_differs_from_receipt = (
                 receipt.get("kind") != request.kind
                 or receipt.get("payload_digest") != requested_digest
+            )
+            terminal_successor = (
+                request.kind in {"resume", "approve", "revise", "requeue"}
+                and request.allow_terminal_successor
+            )
+            if (
+                request_differs_from_receipt
+                and not terminal_successor
             ):
                 raise ActionBusyError(
                     "当前 Delivery Task 的原 Action 尚未对账；不会提交不同 mutation",
@@ -244,48 +299,44 @@ class RunLifecycle:
                         "status": "applying",
                     },
                 )
-        record = self._reconcile_from_run(current, request.payload)
+            if terminal_successor:
+                # A dedicated successor first closes the exact predecessor
+                # named by the Run receipt.  The receipt intentionally omits
+                # its semantic payload, so do not substitute the new mutation,
+                # even when an earlier Resume used the same semantic payload.
+                reconciliation_payload = None
+        record = self._reconcile_from_run(current, reconciliation_payload)
         action = record.get("action") if isinstance(record, Mapping) else None
         executor = record.get("executor") if isinstance(record, Mapping) else None
+        reconciling_receipt_predecessor = bool(
+            request.kind in {"resume", "approve", "revise", "requeue"}
+            and request.allow_terminal_successor
+            and isinstance(current, Mapping)
+            and isinstance(receipt, Mapping)
+            and isinstance(action, Mapping)
+            and isinstance(executor, Mapping)
+            and executor.get("binding_token") == "reconciliation-required"
+            and action_receipt_matches(current, action)
+        )
         reconciled_receipt_only_exit = False
         if isinstance(executor, Mapping) and executor.get(
             "reconciliation_required"
         ) is True:
-            if not (
-                isinstance(current, dict)
-                and isinstance(action, Mapping)
-                and action_receipt_matches(current, action)
-            ):
-                raise _actionable_executor_unknown(
-                    "Task Control 不可用；Delivery Run Receipt 无法绑定原 Action。"
-                )
-            receipt_action_id = _string_field(action, "action_id")
-            receipt_generation = _positive_integer(action.get("executor_generation"))
-            receipt_run_id = _string_field(current, "run_id")
-            observation = self.host.observe(
-                self.executor_spec(
-                    receipt_run_id, receipt_action_id, receipt_generation
-                ),
-                self.control,
-            )
-            if (
-                observation.status != "exited"
-                or observation.generation != receipt_generation
-                or observation.runner_binding is None
-            ):
-                raise _actionable_executor_unknown(
-                    observation.reason
-                    or "Task Control 不可用；Host 未证明原 Executor 已退出。"
-                )
-            record = self.control.record_reconciled_executor_exit(
-                self.task,
-                action_id=receipt_action_id,
-                run_id=receipt_run_id,
-                generation=receipt_generation,
-                observed_status=observation.status,
-                observed_generation=observation.generation,
-                observed_runner_binding=observation.runner_binding,
-            )
+            record = self._reconcile_receipt_executor_exit(current, record)
+            action = record.get("action")
+            executor = record.get("executor")
+            reconciled_receipt_only_exit = True
+        if (
+            reconciling_receipt_predecessor
+            and isinstance(record, Mapping)
+            and isinstance(current, Mapping)
+            and isinstance(receipt, Mapping)
+            and isinstance(action, Mapping)
+            and isinstance(executor, Mapping)
+            and executor.get("status") == "exited"
+            and executor.get("reconciliation_required") is not True
+        ):
+            record = self._close_receipt_predecessor(current, record)
             action = record.get("action")
             executor = record.get("executor")
             reconciled_receipt_only_exit = True
@@ -301,14 +352,26 @@ class RunLifecycle:
                 "Task Control 不可用；仅凭 Delivery Run Receipt 无法证明原 "
                 "Executor 已退出。请恢复对应 Task Control 后重试。"
             )
+        invocation = (
+            current.get("active_agent_invocation") if current is not None else None
+        )
+        observing_active_invocation = (
+            request.kind == "run"
+            and isinstance(invocation, Mapping)
+            and invocation.get("status") in {"running", "resuming"}
+        )
         if (
             current is not None
             and isinstance(record, Mapping)
             and isinstance(action, Mapping)
             and isinstance(executor, Mapping)
             and executor.get("status") in {"absent", "exited"}
-            and action.get("kind") not in {"approve", "revise", "requeue"}
+            and (
+                action.get("kind") not in {"approve", "revise", "requeue"}
+                or observing_active_invocation
+            )
             and action_receipt_matches(current, action)
+            and not reconciling_receipt_predecessor
             and (
                 action.get("status") in {"accepted", "applying"}
                 or (
@@ -316,6 +379,7 @@ class RunLifecycle:
                     and (
                         executor.get("status") == "absent"
                         or isinstance(executor.get("failure"), str)
+                        or observing_active_invocation
                     )
                 )
             )
@@ -362,6 +426,11 @@ class RunLifecycle:
             and action.get("payload_digest") == payload_digest(request.payload)
             and action.get("run_id") == current_run_id
             and not request.allow_terminal_successor
+            and not (
+                request.kind == "run"
+                and isinstance(executor, Mapping)
+                and executor.get("status") in {"starting", "running"}
+            )
             and (
                 request.kind in {"approve", "revise", "requeue"}
                 or not _restartable_after_executor_exit(current)
@@ -410,6 +479,7 @@ class RunLifecycle:
                 if observation.status == "running":
                     break
                 if observation.status in {"absent", "exited"}:
+                    state = self._load_action_run(run_id, state, record=claim_record)
                     if _safe_supervision_recovery(state):
                         self.control.mark_executor_absent(
                             self.task,
@@ -476,8 +546,20 @@ class RunLifecycle:
                 f"{request.kind} 找不到 Delivery Run"
             )
         run_id = _string_field(current, "run_id")
-        record = self.control.load(self.task)
+        record = self._reconcile_from_run(current, None)
         action = record.get("action") if isinstance(record, Mapping) else None
+        executor = record.get("executor") if isinstance(record, Mapping) else None
+        if (
+            isinstance(action, Mapping)
+            and isinstance(executor, Mapping)
+            and executor.get("binding_token") == "reconciliation-required"
+        ):
+            assert isinstance(record, dict)
+            record = self._reconcile_receipt_executor_exit(current, record)
+            action = record.get("action")
+            assert isinstance(action, Mapping)
+            record = self._close_receipt_predecessor(current, record)
+            action = record.get("action")
         unresolved_target = unresolved_control_target(action)
         active_action = (
             action
@@ -607,6 +689,7 @@ class RunLifecycle:
                 payload=request.payload,
                 run_id=run_id,
                 state_dir=self.states.root,
+                before_create=self.prepare_executor_session,
             )
             if claim is None:
                 if record is None:
@@ -694,10 +777,97 @@ class RunLifecycle:
             before_create=self.prepare_executor_session,
         )
 
+    def _close_receipt_predecessor(
+        self, current: Mapping[str, Any], record: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        action = record.get("action")
+        receipt = current.get("action_application_receipt")
+        if not isinstance(action, Mapping) or not isinstance(receipt, Mapping):
+            raise ActionReconciliationError("原 Action 缺少准确 Run receipt")
+        if action.get("status") in {"completed", "failed"}:
+            return dict(record)
+        kind = action.get("kind")
+        if kind in {"stop", "abandon"} and current.get("status") not in (
+            {"operator_stopped", "completed", "abandoned"}
+            if kind == "stop" else {"completed", "abandoned"}
+        ):
+            # Control receipts precede their business effect. An exited control
+            # Executor with no durable outcome failed; it did not complete Stop.
+            if kind == "stop" and not isinstance(action.get("target_executor"), Mapping):
+                raise _actionable_executor_unknown(
+                    "原 Stop 缺少 target ownership 且停止结果未形成；不会返回无需停止。"
+                )
+            return self.control.finish_executor(
+                self.task,
+                action_id=_string_field(action, "action_id"),
+                generation=_positive_integer(action.get("executor_generation")),
+                failure="Control Executor 已退出，但控制动作结果尚未持久形成",
+            )
+        return self.control.complete_action_from_application_receipt(
+            self.task,
+            action_id=_string_field(action, "action_id"),
+            generation=_positive_integer(action.get("executor_generation")),
+            application_receipt=receipt,
+            result_status=_string_field(current, "status"),
+        )
+
+    def _reconcile_receipt_executor_exit(
+        self,
+        current: dict[str, Any] | None,
+        record: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Prove all receipt-bound ownership gone before releasing admission."""
+
+        action = record.get("action") if isinstance(record, Mapping) else None
+        executor = record.get("executor") if isinstance(record, Mapping) else None
+        if not (
+            isinstance(current, dict)
+            and isinstance(record, dict)
+            and isinstance(action, Mapping)
+            and isinstance(executor, Mapping)
+            and action_receipt_matches(current, action)
+        ):
+            raise _actionable_executor_unknown(
+                "Task Control 不可用；Delivery Run Receipt 无法绑定原 Action。"
+            )
+        if executor.get("reconciliation_required") is not True:
+            if executor.get("status") != "exited":
+                raise _actionable_executor_unknown("原 Executor 尚未证明退出。")
+            return record
+        action_id = _string_field(action, "action_id")
+        generation = _positive_integer(action.get("executor_generation"))
+        run_id = _string_field(current, "run_id")
+        observation = self.host.observe(
+            self.executor_spec(run_id, action_id, generation), self.control
+        )
+        if (
+            observation.status != "exited"
+            or observation.generation != generation
+            or observation.runner_binding is None
+        ):
+            raise _actionable_executor_unknown(
+                observation.reason
+                or "Task Control 不可用；Host 未证明原 Executor 已退出。"
+            )
+        target = action.get("target_executor")
+        if isinstance(target, Mapping):
+            # The durable Stop/Abandon fence still authorizes only this target.
+            # A failed termination must not become a successor's exit proof.
+            self.host.terminate_control_target(target)
+        return self.control.record_reconciled_executor_exit(
+            self.task,
+            action_id=action_id,
+            run_id=run_id,
+            generation=generation,
+            observed_status=observation.status,
+            observed_generation=observation.generation,
+            observed_runner_binding=observation.runner_binding,
+        )
+
     def _reconcile_from_run(
         self,
         current: dict[str, Any] | None,
-        payload: Mapping[str, Any],
+        payload: Mapping[str, Any] | None,
     ) -> dict[str, Any] | None:
         return self.control.reconcile_from_run(
             self.task,
@@ -921,10 +1091,7 @@ class RunLifecycle:
                 run_id=run_id,
             )
         prepared = self._persist_application(
-            state,
-            action_id=action_id,
-            kind=_string_field(action, "kind"),
-            payload_digest=_string_field(action, "payload_digest"),
+            action=action,
             run_id=run_id,
             generation=generation,
             replace_receipt_action_id=replace_receipt_action_id,
@@ -1043,6 +1210,8 @@ class RunLifecycle:
                 # binding and handshake transaction is still being committed.
                 self.sleep(self.poll_interval)
             if observation.status in {"absent", "exited"}:
+                state = self._load_action_run(run_id, state, record=record)
+                recover = _safe_supervision_recovery(state)
                 if applied_at_non_replayable_boundary:
                     return self._complete_applied_action_after_executor_exit(
                         state,
@@ -1182,6 +1351,44 @@ class RunLifecycle:
             raise ExecutorLostError(
                 "Executor 已退出，但当前 Delivery Run 无法证明原 Action；"
                 "不会改写状态或启动第二个 Executor"
+            )
+        latest = self.control.load(self.task)
+        latest_action = latest.get("action") if isinstance(latest, Mapping) else None
+        latest_executor = latest.get("executor") if isinstance(latest, Mapping) else None
+        if not (
+            isinstance(latest_action, Mapping)
+            and isinstance(latest_executor, Mapping)
+            and latest_action.get("action_id") == action_id
+            and latest_action.get("executor_generation") == generation
+            and latest_executor.get("action_id") == action_id
+            and latest_executor.get("generation") == generation
+            and (
+                action_receipt_matches(current, latest_action)
+                or _unbound_action_matches_run_receipt(current, latest_action)
+            )
+        ):
+            raise ExecutorLostError(
+                "Executor 已退出，但当前 Action/generation 已改变；不会改写状态"
+            )
+        assert latest is not None
+        # Host inspection can race with the original Executor's final commit.
+        # Its latest durable boundary wins over the caller's progress snapshot.
+        if (
+            current.get("status") in {"completed", "abandoned"}
+            or has_run_operator_gate(current)
+        ) and not session_interruption_is_persisted(current):
+            if latest_action.get("status") != "completed":
+                return self._complete_applied_action_after_executor_exit(
+                    current,
+                    action_id=action_id,
+                    generation=generation,
+                    resumed=resumed,
+                    attached=attached,
+                )
+            return (
+                current,
+                resumed,
+                self.receipt_from_record(latest, action_id=action_id, attached=attached),
             )
         if self.initialize_profile is not None:
             # The earliest durable receipt can precede the frozen profile
@@ -1333,6 +1540,10 @@ class RunLifecycle:
 
             observation = self.host.inspect(spec, self.control)
             if observation.status in {"absent", "exited"}:
+                # Completion can be persisted after our snapshot but before
+                # Host inspection. Re-read changed receipts before declaring loss.
+                if self.control.snapshot(self.task, action_id) != record:
+                    continue
                 self.host.cleanup_startup(spec)
                 raise ExecutorLostError(
                     "Executor 在 Action 完成前退出；只完成原 execution generation 对账，不自动重放 Agent"
@@ -1380,17 +1591,16 @@ class RunLifecycle:
 
     def _persist_application(
         self,
-        state: dict[str, Any],
         *,
-        action_id: str,
-        kind: str,
-        payload_digest: str,
+        action: Mapping[str, Any],
         run_id: str,
         generation: int,
         replace_receipt_action_id: str | None = None,
         state_store: StateStore | None = None,
     ) -> dict[str, Any]:
-        del state
+        action_id = _string_field(action, "action_id")
+        kind = _string_field(action, "kind")
+        payload_digest = _string_field(action, "payload_digest")
         store = state_store or self.states
         current = store.load_current_run(run_id)
         if current is None:
@@ -1429,12 +1639,7 @@ class RunLifecycle:
             )
             prepare_action_application_receipt(
                 current,
-                {
-                    "action_id": action_id,
-                    "kind": kind,
-                    "payload_digest": payload_digest,
-                    "executor_generation": generation,
-                },
+                {**action, "executor_generation": generation},
             )
             self._set_executor_state_fence(
                 store,
@@ -1480,6 +1685,7 @@ class RunLifecycle:
             kind=kind if isinstance(kind, str) else "run",
             run_id=run_id if isinstance(run_id, str) else None,
             status="completed",
+            resume_intent=action_resume_intent(action),
             attached=attached,
             executor_status="exited",
             executor_generation=(
@@ -1534,6 +1740,7 @@ class RunLifecycle:
             kind=kind if isinstance(kind, str) else "run",
             run_id=_record_run_id(record),
             status=status if isinstance(status, str) else "unknown",
+            resume_intent=action_resume_intent(action),
             attached=attached,
             executor_status=(
                 executor.get("status") if isinstance(executor, Mapping) else None

@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -43,7 +43,7 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from conftest import seed_run, write_fixture
+from conftest import seed_idle_control, seed_run, write_fixture
 from cli_fixtures import run_agents
 from cli_run_supervision_support import _parent_only_agents
 from test_cli import load_only_run_state, run_cli, stdout_json
@@ -899,6 +899,7 @@ def test_approval_boundary_is_not_written_before_executor_handshake(
     control = TaskControlStore(tmp_path / "state")
     states = _InMemoryRunState()
     states.value["status"] = "run_approval_pending"
+    seed_idle_control(control, task, str(states.value["run_id"]))
     host = FakeExecutorHost()
     observed: list[bool] = []
 
@@ -1251,6 +1252,304 @@ def test_untrusted_control_receipt_retries_stay_fail_closed(
     assert final is not None
     assert final["next_generation"] == 2
     assert final["action"]["executor_generation"] == 1
+
+
+@pytest.mark.parametrize("control_case", ["missing", "corrupt"])
+@pytest.mark.parametrize("host_status", ["exited", "unknown", "conflict"])
+@pytest.mark.parametrize(
+    ("predecessor_kind", "predecessor_status"),
+    [("run", "supervision_timeout"), ("resume", "execution_failed")],
+)
+def test_resume_reconciles_a_receipt_before_admitting_its_successor(
+    tmp_path: Path,
+    control_case: str,
+    host_status: str,
+    predecessor_kind: str,
+    predecessor_status: str,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    states = _InMemoryRunState()
+    states.value["status"] = predecessor_status
+    if predecessor_status == "supervision_timeout":
+        states.value.update(
+            {
+                "terminal_kind": "supervision_timeout",
+                "supervision_wait": {
+                    "kind": "required_checks",
+                    "resume_status": "waiting_checks",
+                },
+            }
+        )
+    resume_payload = {"parent": 156, "run_id": "run-1"}
+    predecessor_payload = (
+        resume_payload if predecessor_kind == "resume" else {"parent": 156}
+    )
+    claim = control.claim_action(
+        task,
+        kind=predecessor_kind,
+        payload=predecessor_payload,
+    )
+    assert claim.action is not None
+    original_action = claim.action
+    control.bind_run(task, claim.action_id or "", "run-1")
+    prepare_action_application_receipt(states.value, original_action)
+    states.save_run("run-1", states.value)
+    if control_case == "missing":
+        control.path_for(task).unlink()
+    else:
+        control.path_for(task).write_text("not json", encoding="utf-8")
+
+    class ReconciliationHost(FakeExecutorHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observe_count = 0
+
+        def observe(
+            self, spec: ExecutorSpec, store: TaskControlStore
+        ) -> HostObservation:
+            del store
+            self.observe_count += 1
+            return HostObservation(
+                host_status,  # type: ignore[arg-type]
+                spec.generation,
+                None,
+                False,
+                "original Executor ownership is not proven"
+                if host_status != "exited"
+                else None,
+                runner_binding="0" * 16 if host_status == "exited" else None,
+            )
+
+    host = ReconciliationHost()
+    business_calls = 0
+
+    def execute(_run_id: str) -> dict[str, object]:
+        nonlocal business_calls
+        business_calls += 1
+        return dict(states.value)
+
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=host,
+        task=task,
+        preflight=lambda: dict(states.value),
+        select_run=lambda _action: (dict(states.value), True),
+        initialize_profile=None,
+        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
+            task=task,
+            action_id=action_id,
+            run_id=run_id,
+            generation=generation,
+        ),
+        execute=execute,
+    )
+    request = LifecycleRequest(
+        task=task,
+        kind="resume",
+        payload=resume_payload,
+        allow_terminal_successor=True,
+    )
+
+    if host_status == "exited":
+        _state, _resumed, receipt = lifecycle.submit(request)
+        assert receipt.kind == "resume"
+        assert receipt.executor_generation == 2
+        assert host.observe_count == 1
+        assert host.start_count == 1
+        assert business_calls == 1
+        repaired = control.load(task)
+        assert repaired is not None
+        predecessors = [
+            entry["action"]
+            for entry in repaired["action_history"]
+            if entry["action"]["action_id"] == original_action["action_id"]
+        ]
+        assert len(predecessors) == 1
+        assert predecessors[0]["receipt_only_reconciliation"] is True
+        return
+
+    for attempt in range(2):
+        with pytest.raises(ExecutorStartUnknownError):
+            lifecycle.submit(request)
+        assert host.observe_count == attempt + 1
+        assert host.start_count == 0
+        assert business_calls == 0
+        current = control.load(task)
+        assert current is not None
+        assert current["next_generation"] == 2
+        assert current["action"]["action_id"] == original_action["action_id"]
+
+
+@pytest.mark.parametrize(
+    ("crash_after", "proof_damage"),
+    [
+        ("host_proof", None),
+        ("predecessor_completion", None),
+        ("predecessor_completion", "missing_binding"),
+        ("predecessor_completion", "missing_executor"),
+    ],
+)
+def test_resume_finishes_a_receipt_predecessor_after_reconciliation_crash(
+    tmp_path: Path,
+    crash_after: str,
+    proof_damage: str | None,
+) -> None:
+    task = _task(tmp_path)
+
+    class ProofCrashStore(TaskControlStore):
+        injected = False
+
+        def record_reconciled_executor_exit(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            record = super().record_reconciled_executor_exit(*args, **kwargs)  # type: ignore[arg-type]
+            if not self.injected and crash_after == "host_proof":
+                self.injected = True
+                raise SimulatedProcessCrash("after Host exit proof commit")
+            return record
+
+        def complete_action_from_application_receipt(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            record = super().complete_action_from_application_receipt(*args, **kwargs)  # type: ignore[arg-type]
+            if not self.injected and crash_after == "predecessor_completion":
+                self.injected = True
+                raise SimulatedProcessCrash("after predecessor completion commit")
+            return record
+
+    control = ProofCrashStore(tmp_path / "state")
+    states = _InMemoryRunState()
+    states.value.update(
+        {
+            "status": "supervision_timeout",
+            "terminal_kind": "supervision_timeout",
+            "supervision_wait": {
+                "kind": "required_checks",
+                "resume_status": "waiting_checks",
+            },
+        }
+    )
+    claim = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert claim.action is not None
+    original_action = claim.action
+    control.bind_run(task, claim.action_id or "", "run-1")
+    prepare_action_application_receipt(states.value, original_action)
+    states.save_run("run-1", states.value)
+    control.path_for(task).unlink()
+
+    host_status = "exited"
+
+    class ReconciliationHost(FakeExecutorHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observe_count = 0
+
+        def observe(
+            self, spec: ExecutorSpec, store: TaskControlStore
+        ) -> HostObservation:
+            del store
+            self.observe_count += 1
+            return HostObservation(
+                host_status,  # type: ignore[arg-type]
+                spec.generation,
+                None,
+                False,
+                (
+                    "original Executor ownership is not proven"
+                    if host_status != "exited"
+                    else None
+                ),
+                runner_binding="0" * 16 if host_status == "exited" else None,
+            )
+
+    host = ReconciliationHost()
+    business_calls = 0
+
+    def execute(_run_id: str) -> dict[str, object]:
+        nonlocal business_calls
+        business_calls += 1
+        return dict(states.value)
+
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=host,
+        task=task,
+        preflight=lambda: dict(states.value),
+        select_run=lambda _action: (dict(states.value), True),
+        initialize_profile=None,
+        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
+            task=task,
+            action_id=action_id,
+            run_id=run_id,
+            generation=generation,
+        ),
+        execute=execute,
+    )
+    request = LifecycleRequest(
+        task=task,
+        kind="resume",
+        payload={"parent": 156, "run_id": "run-1"},
+        allow_terminal_successor=True,
+    )
+
+    with pytest.raises(SimulatedProcessCrash, match="after .* commit"):
+        lifecycle.submit(request)
+
+    after_proof = control.load(task)
+    assert after_proof is not None
+    assert after_proof["action"]["action_id"] == original_action["action_id"]
+    assert after_proof["action"]["status"] == (
+        "accepted" if crash_after == "host_proof" else "completed"
+    )
+    assert after_proof["action"]["receipt_only_reconciliation"] is True
+    assert after_proof["executor"]["status"] == "exited"
+    assert "reconciliation_required" not in after_proof["executor"]
+    assert after_proof["next_generation"] == 2
+    assert host.observe_count == 1
+    assert host.start_count == 0
+    assert business_calls == 0
+
+    if proof_damage is not None:
+        damaged = json.loads(control.path_for(task).read_text(encoding="utf-8"))
+        if proof_damage == "missing_binding":
+            del damaged["executor"]["runner_binding"]
+        else:
+            damaged["executor"] = None
+        control.path_for(task).write_text(json.dumps(damaged), encoding="utf-8")
+        host_status = "unknown"
+
+        with pytest.raises(ExecutorStartUnknownError):
+            lifecycle.submit(request)
+        repaired_bytes = control.path_for(task).read_bytes()
+        with pytest.raises(ExecutorStartUnknownError):
+            lifecycle.submit(request)
+        assert control.path_for(task).read_bytes() == repaired_bytes
+        assert host.observe_count == 3
+        assert host.start_count == 0
+        assert business_calls == 0
+        return
+
+    _state, _resumed, receipt = lifecycle.submit(request)
+
+    assert receipt.kind == "resume"
+    assert receipt.executor_generation == 2
+    assert host.observe_count == 1
+    assert host.start_count == 1
+    assert business_calls == 1
+    repaired = control.load(task)
+    assert repaired is not None
+    assert repaired["action"]["action_id"] == receipt.action_id
+    assert repaired["action"]["kind"] == "resume"
+    predecessors = [
+        entry["action"]
+        for entry in repaired["action_history"]
+        if entry["action"]["action_id"] == original_action["action_id"]
+    ]
+    assert len(predecessors) == 1
+    assert predecessors[0]["status"] == "completed"
 
 
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
@@ -1975,6 +2274,8 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     assert recovered_state["terminal_kind"] == "execution_failed"
     if initial_invocation_status == "running":
         assert recovered_state["active_agent_invocation"]["status"] == "failed"
+        assert recovered_state["active_agent_invocation"]["ended_at"] is None
+        assert recovered_state["active_agent_invocation"]["interruption_observed_at"]
         assert (
             recovered_state["active_agent_invocation"]["error"]
             == "session_interrupted"
@@ -2234,8 +2535,9 @@ def test_repeated_run_fails_closed_after_action_acceptance_before_run_receipt(
     )
 
 
-def test_missing_control_reconciles_a_terminal_run_from_its_receipt(
-    git_repo: Path, tmp_path: Path
+@pytest.mark.parametrize("control_case", ["missing", "corrupt"])
+def test_terminal_run_receipt_still_requires_host_exit_proof(
+    git_repo: Path, tmp_path: Path, control_case: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
@@ -2254,7 +2556,10 @@ def test_missing_control_reconciles_a_terminal_run_from_its_receipt(
     control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
     state_before = state_path.read_bytes()
     fixture_before = fixture.read_bytes()
-    control_path.unlink()
+    if control_case == "missing":
+        control_path.unlink()
+    else:
+        control_path.write_text("not json", encoding="utf-8")
 
     repeated = run_cli(
         git_repo,
@@ -2267,10 +2572,9 @@ def test_missing_control_reconciles_a_terminal_run_from_its_receipt(
     )
     repeated_output = stdout_json(repeated)
 
-    assert repeated.returncode == 0, f"{repeated.stdout}\n{repeated.stderr}"
-    assert repeated_output["run_id"] == first_output["run_id"]
+    assert repeated.returncode == 2, f"{repeated.stdout}\n{repeated.stderr}"
+    assert repeated_output["diagnostics"][0]["code"] == "executor_start_unknown"
     _assert_public_action_receipt(first_output, submission="started")
-    _assert_public_action_receipt(repeated_output, submission="attached")
     assert state_path.read_bytes() == state_before
     assert fixture.read_bytes() == fixture_before
     repaired_controls = list((git_repo / ".agent-run" / "task-control").glob("*.json"))
@@ -2281,16 +2585,23 @@ def test_missing_control_reconciles_a_terminal_run_from_its_receipt(
         "action_application_receipt"
     ]
     assert repaired_control["run_id"] == receipt["run_id"] == first_output["run_id"]
-    assert repaired_action["status"] == "completed"
+    assert repaired_action["status"] == "accepted"
+    assert repaired_control["executor"]["reconciliation_required"] is True
     assert repaired_action["application_observed"] is True
     assert all(
         repaired_action[key] == receipt[key]
         for key in ("action_id", "kind", "payload_digest", "run_id")
     )
-    machine_audit = stdout_json(
-        run_cli(git_repo, fixture, "status", first_output["run_id"], "--json")
-    )["lifecycle_action"]
-    assert machine_audit == receipt
+    repaired_before = repaired_controls[0].read_bytes()
+    retried = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents),
+        extra_env=environment,
+    )
+    assert retried.returncode == 2
+    assert stdout_json(retried)["diagnostics"][0]["code"] == "executor_start_unknown"
+    assert repaired_controls[0].read_bytes() == repaired_before
+    assert state_path.read_bytes() == state_before
+    assert fixture.read_bytes() == fixture_before
 
     repaired_controls[0].unlink()
     blocked_state = state_path.read_bytes()
@@ -2310,6 +2621,142 @@ def test_missing_control_reconciles_a_terminal_run_from_its_receipt(
     assert state_path.read_bytes() == blocked_state
     assert fixture.read_bytes() == blocked_fixture
     assert not repaired_controls[0].exists()
+
+
+@pytest.mark.parametrize("control_case", ["missing", "corrupt"])
+@pytest.mark.parametrize("host_status", ["exited", "unknown", "conflict"])
+def test_public_run_reconciles_receipt_only_control_before_replay(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    control_case: str,
+    host_status: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    environment = _isolated_environment(tmp_path / "public-reconciliation")
+    first = run_cli(
+        git_repo,
+        fixture,
+        "run",
+        "1",
+        "--agent-fixture",
+        str(agents),
+        "--crash-after-save",
+        "9",
+        extra_env=environment,
+    )
+    assert first.returncode == 2, f"{first.stdout}\n{first.stderr}"
+
+    state_root = git_repo / ".agent-run"
+    state_path = next((state_root / "runs").glob("*.json"))
+    control_path = next((state_root / "task-control").glob("*.json"))
+    original_control = json.loads(control_path.read_text(encoding="utf-8"))
+    original_action = original_control["action"]
+    original_generation = original_action["executor_generation"]
+    state_before = state_path.read_bytes()
+    fixture_before = fixture.read_bytes()
+    agents_before = agents.read_bytes()
+    invocation_history_before = json.loads(state_before)["agent_invocation_history"]
+    if control_case == "missing":
+        control_path.unlink()
+    else:
+        control_path.write_text("not json", encoding="utf-8")
+
+    calls = {"readiness": 0, "observe": 0, "ensure": 0, "prepare": 0}
+
+    class UsageLease:
+        def fileno(self) -> int:
+            return 1
+
+    class ReconciliationHost:
+        def check_readiness(self) -> None:
+            calls["readiness"] += 1
+
+        def prepare_environment(self, _arguments: object) -> None:
+            calls["prepare"] += 1
+
+        def observe(
+            self, spec: ExecutorSpec, _store: TaskControlStore
+        ) -> HostObservation:
+            calls["observe"] += 1
+            assert spec.generation == original_generation
+            return HostObservation(
+                host_status,  # type: ignore[arg-type]
+                original_generation,
+                None,
+                False,
+                "original Executor ownership is not proven"
+                if host_status != "exited"
+                else None,
+                runner_binding="0" * 16 if host_status == "exited" else None,
+            )
+
+        def ensure(self, *_args: object, **_kwargs: object) -> HostObservation:
+            calls["ensure"] += 1
+            raise AssertionError("reconciliation must not start another Executor")
+
+        def cleanup_startup(self, _spec: ExecutorSpec) -> None:
+            pass
+
+    host = ReconciliationHost()
+    monkeypatch.chdir(git_repo)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(cli, "_running_active_runner", lambda: True)
+    monkeypatch.setattr(
+        cli, "runner_usage_lease", lambda _path: nullcontext(UsageLease())
+    )
+    monkeypatch.setattr(cli, "SystemdUserExecutorHost", lambda **_options: host)
+    monkeypatch.setattr(
+        cli,
+        "GhGitHubReader",
+        lambda _repo, *, working_directory: cli.FixtureGitHubReader(fixture),
+    )
+
+    control_after_first: bytes | None = None
+    state_after_first: bytes | None = None
+    for attempt in range(2):
+        capsys.readouterr()
+        return_code = cli.main(
+            ["run", "1", "--repo", "example/project", "--json"]
+        )
+        output = json.loads(capsys.readouterr().out)
+        if host_status == "exited":
+            assert return_code == 2
+            if attempt == 0:
+                assert output["status"] == "execution_failed"
+                _assert_public_action_receipt(output, submission="attached")
+            else:
+                assert output["result"] == "rejected"
+                assert output["status"] == "execution_failed"
+        else:
+            assert return_code == 2
+            assert output["diagnostics"][0]["code"] == "executor_start_unknown"
+        assert fixture.read_bytes() == fixture_before
+        assert agents.read_bytes() == agents_before
+        if attempt == 0:
+            control_after_first = control_path.read_bytes()
+            state_after_first = state_path.read_bytes()
+        else:
+            assert control_path.read_bytes() == control_after_first
+            assert state_path.read_bytes() == state_after_first
+
+    recovered = json.loads(control_path.read_text(encoding="utf-8"))
+    assert recovered["action"]["action_id"] == original_action["action_id"]
+    assert recovered["action"]["executor_generation"] == original_generation
+    assert calls["ensure"] == 0
+    assert calls["prepare"] == 0
+    assert calls["observe"] == (1 if host_status == "exited" else 2)
+    current_state = json.loads(state_path.read_text(encoding="utf-8"))
+    if host_status == "exited":
+        assert current_state["status"] == "execution_failed"
+        assert len(current_state["agent_invocation_history"]) == len(
+            invocation_history_before
+        )
+    else:
+        assert state_path.read_bytes() == state_before
 
 
 def test_status_and_history_do_not_touch_run_or_task_control(
@@ -2779,6 +3226,12 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
         extra_env=environment,
     )
     assert initial.returncode == 0, f"{initial.stdout}\n{initial.stderr}"
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        str(stdout_json(initial)["run_id"]),
+        state_dir=custom_state,
+    )
 
     agent_data = json.loads(agents.read_text(encoding="utf-8"))
     agent_data["invocation_gate"] = {
@@ -2881,6 +3334,12 @@ def test_default_run_routes_to_a_custom_seeded_run(
     )
     started_output = stdout_json(started)
     assert started.returncode == 0, f"{started.stdout}\n{started.stderr}"
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        str(stdout_json(started)["run_id"]),
+        state_dir=custom_state,
+    )
 
     continued = run_cli(
         git_repo,

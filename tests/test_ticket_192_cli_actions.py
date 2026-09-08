@@ -462,11 +462,18 @@ def test_configure_parent_changes_only_the_profile_control_plane(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = str(stdout_json(seed_run(git_repo, fixture))["run_id"])
-    state_path = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    state_root = git_repo / ".agent-run"
+    state_path = state_root / "runs" / f"{run_id}.json"
+    profile_path = state_root / "profiles" / f"{run_id}.json"
+    profile_before = json.loads(profile_path.read_bytes())
     state_before = state_path.read_bytes()
-    task_control = git_repo / ".agent-run" / "task-control"
+    task_control = state_root / "task-control"
     control_before = {
         path.name: path.read_bytes() for path in task_control.glob("*.json")
+    }
+    tree_before = {
+        path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
+        for path in state_root.rglob("*")
     }
 
     configured = _human_cli(
@@ -480,11 +487,27 @@ def test_configure_parent_changes_only_the_profile_control_plane(
     assert {
         path.name: path.read_bytes() for path in task_control.glob("*.json")
     } == control_before
-    profile = json.loads(
-        (git_repo / ".agent-run" / "profiles" / f"{run_id}.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    tree_after = {
+        path.relative_to(state_root): None if path.is_dir() else path.read_bytes()
+        for path in state_root.rglob("*")
+    }
+    profile_relative = profile_path.relative_to(state_root)
+    assert tree_after.keys() == tree_before.keys()
+    assert {
+        path: contents
+        for path, contents in tree_after.items()
+        if path != profile_relative
+    } == {
+        path: contents
+        for path, contents in tree_before.items()
+        if path != profile_relative
+    }
+    profile = json.loads(profile_path.read_bytes())
+    assert profile["profile_revision"] == profile_before["profile_revision"] + 1
+    assert len(profile["revisions"]) == len(profile_before["revisions"]) + 1
+    assert profile["revisions"][-1]["profile_revision"] == profile[
+        "profile_revision"
+    ]
     assert profile["profiles"]["development"]["model"] == "custom-model"
 
 

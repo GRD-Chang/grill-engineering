@@ -17,7 +17,8 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_thread_identity import prior_thread_identities
 
-from conftest import seed_run, write_fixture
+from conftest import seed_idle_control, seed_run, write_fixture
+from agent_run.task_control import TaskControlStore, TaskKey
 from test_cli import failed_invocation, run_internal_stage, run_cli, stdout_json
 
 from run_acceptance_test_support import (
@@ -188,6 +189,12 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    seed_idle_control(
+        TaskControlStore(git_repo / ".agent-run"),
+        TaskKey(git_repo, "example/project", 1),
+        str(state["run_id"]),
+        state_dir=states.root,
+    )
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     run_id = str(state["run_id"])

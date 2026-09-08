@@ -6,6 +6,11 @@ from datetime import UTC, datetime, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from agent_run.delivery_status import (
+    execution_guidance,
+    invocation_activity,
+    invocation_recovery_details,
+)
 from agent_run.presentation_helpers import (
     delivery_object_label,
     human_next_action,
@@ -21,6 +26,7 @@ def history_progress_view(
     events = _history_events(state, audit)
     return {
         "events": events,
+        "execution_activity": invocation_activity(state.get("active_agent_invocation"), audit),
         "summary": {
             "rounds": _round_summary(audit.get("semantic_agent_attempts")),
             "elapsed_seconds": _elapsed_seconds(state, events),
@@ -52,7 +58,9 @@ def print_history_progress(
         isinstance(executor_control, dict)
         and executor_control.get("activity") == "unknown"
     ):
-        print("Agent 活跃状态: 无法确认")
+        print("Agent 活跃状态: 无法确认（运行状态无法确认）")
+    if progress["execution_activity"] == "interrupted":
+        print("执行已中断，等待恢复")
     print("\n事件")
     for event in progress["events"]:
         timestamp = _parse_timestamp(event["at"])
@@ -62,7 +70,13 @@ def print_history_progress(
         round_number = event.get("round")
         role_text = f" · {role}" if role else ""
         round_text = f" 第 {round_number} 轮" if isinstance(round_number, int) else ""
-        status = display_term(event.get("status"))
+        status = (
+            "执行已中断，等待恢复" if event.get("activity") == "interrupted"
+            else "运行状态无法确认" if event.get("activity") == "unknown"
+            else "模型容量不足，等待自动续接" if event.get("activity") == "capacity_wait"
+            else "执行异常，等待自动续接" if event.get("activity") == "recovery_wait"
+            else display_term(event.get("status"))
+        )
         print(f"{local_time}  {subject}{role_text}{round_text} · {status}")
         model = event.get("model")
         effort = event.get("reasoning_effort")
@@ -75,6 +89,8 @@ def print_history_progress(
             config.append(f"model={model}")
         if effort:
             config.append(f"reasoning_effort={effort}")
+        if invocation_role and duration is None:
+            config.append("实际执行时长未知")
         if duration is not None:
             config.append(f"耗时 {_duration(duration)}")
         if config:
@@ -93,6 +109,9 @@ def print_history_progress(
         f"  {'总运行时长':<22}"
         f"{_duration(progress['summary']['elapsed_seconds'])}"
     )
+    if progress["execution_activity"] in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+        print(f"\n下一步: {execution_guidance(state, progress['execution_activity'])}")
+        return
     operator_action = audit.get("operator_action")
     _print_wait(
         audit.get("supervision"),
@@ -197,8 +216,9 @@ def _history_events(
                     "model": invocation.get("model"),
                     "reasoning_effort": invocation.get("reasoning_effort"),
                     "profile_revision": invocation.get("profile_revision"),
-                    "duration_seconds": _invocation_duration(invocation),
-                    "details": review_details,
+                    "duration_seconds": _invocation_duration(invocation, audit),
+                    "activity": invocation_activity(invocation, audit),
+                    "details": review_details + invocation_recovery_details(invocation),
                     "_order": order,
                 }
             )
@@ -489,12 +509,17 @@ def _round_label(key: str) -> str:
     return f"{scope.title()} {'Review' if role == 'review' else role.title()}"
 
 
-def _invocation_duration(invocation: dict[str, Any]) -> int | None:
+def _invocation_duration(
+    invocation: dict[str, Any], audit: dict[str, Any]
+) -> int | None:
     start = _parse_optional_timestamp(invocation.get("started_at"))
     end = _parse_optional_timestamp(invocation.get("ended_at"))
     if start is None:
         return None
-    end = end or datetime.now(UTC)
+    if end is None:
+        if invocation_activity(invocation, audit) != "running":
+            return None
+        end = datetime.now(UTC)
     return max(0, int((end - start).total_seconds()))
 
 

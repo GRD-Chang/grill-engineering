@@ -9,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Mapping, Protocol, Sequence
@@ -155,7 +156,7 @@ class SubprocessSystemdTransport:
         status: Literal["absent", "starting", "running", "exited", "unknown"]
         if active in {"active", "reloading"}:
             status = "running" if substate == "running" else "starting"
-        elif active in {"inactive", "failed", "deactivating"}:
+        elif active in {"inactive", "failed"}:
             status = "exited"
         elif active == "activating":
             status = "starting"
@@ -164,6 +165,10 @@ class SubprocessSystemdTransport:
         raw_pid = fields.get("ExecMainPID")
         pid = int(raw_pid) if raw_pid and raw_pid.isdigit() and int(raw_pid) > 0 else None
         reason = fields.get("Result") or None
+        if active == "deactivating":
+            # A stop job may still be waiting for the Executor or its children.
+            # Its Result is not proof that the execution generation has exited.
+            reason = "systemd unit 正在停止，尚未确认 Executor 退出"
         if status in {"exited", "unknown"}:
             reason = reason or self.journal(unit)
         return SystemdUnitObservation(
@@ -408,11 +413,9 @@ class SystemdUserExecutorHost:
                 run_id=spec.run_id,
             )
             native = self.transport.inspect(self._unit(spec))
-            if native.status not in {"absent", "exited"}:
+            observation = self._from_native(spec, native)
+            if observation.status not in {"absent", "exited"}:
                 self._release_capture()
-                observation = self._from_native(spec, native)
-                if observation.status == "conflict":
-                    self._finish_terminal(spec, control, observation.reason)
                 return observation
             try:
                 control.assert_executor_current(
@@ -592,7 +595,7 @@ class SystemdUserExecutorHost:
                 False,
                 observation.reason or "systemd 启动结果尚未确认",
             )
-        if observation.status in {"absent", "exited", "conflict"}:
+        if observation.status in {"absent", "exited"}:
             key = self._key(spec)
             self._accepted_launches.discard(key)
             self._launch_pending_path(spec).unlink(missing_ok=True)
@@ -794,15 +797,22 @@ class SystemdUserExecutorHost:
         if not isinstance(action, dict) or action.get("status") not in {
             "accepted",
             "applying",
+            "completed",
+            "failed",
         }:
             return
+        if spec.runner_binding is None:
+            raise ExecutorHostError("Executor Host exit 缺少准确 Runner binding")
+        failure = reason
+        if failure is None and action.get("status") in {"accepted", "applying"}:
+            failure = "Executor host terminated before Action completion"
         control.finish_executor(
             spec.task,
             action_id=spec.action_id,
             generation=spec.generation,
-            failure=bounded_error(
-                reason or "Executor host terminated before Action completion"
-            ),
+            run_id=spec.run_id,
+            runner_binding=spec.runner_binding,
+            failure=bounded_error(failure) if failure else None,
         )
 
     def _executor_command(
@@ -958,13 +968,33 @@ def _run_bounded(arguments: list[str], *, max_output: int) -> _BoundedResult:
     stdout = bytearray()
     stderr = bytearray()
 
+    stop_readers = threading.Event()
+
     def drain(stream: object, destination: bytearray) -> None:
         fileno = getattr(stream, "fileno", None)
         if not callable(fileno):
             return
         try:
             descriptor = fileno()
-            while chunk := os.read(descriptor, 64 * 1024):
+            os.set_blocking(descriptor, False)
+            deadline: float | None = None
+            while True:
+                if stop_readers.is_set():
+                    # Drain buffered output, but escaped pipe holders cannot
+                    # extend cleanup indefinitely by keeping the pipe open.
+                    if deadline is None:
+                        deadline = time.monotonic() + 0.1
+                    if time.monotonic() >= deadline:
+                        return
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    if deadline is not None:
+                        return
+                    stop_readers.wait(0.05)
+                    continue
+                if not chunk:
+                    return
                 destination.extend(chunk)
                 if len(destination) > max_output:
                     del destination[:-max_output]
@@ -977,21 +1007,27 @@ def _run_bounded(arguments: list[str], *, max_output: int) -> _BoundedResult:
         threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
     )
-    for reader in readers:
-        reader.start()
     timed_out = False
     try:
+        for reader in readers:
+            reader.start()
         returncode = process.wait(timeout=10)
     except subprocess.TimeoutExpired:
         timed_out = True
+    finally:
+        # Reap the owned group even when its leader exited successfully;
+        # descendants can otherwise keep the pipe readers alive indefinitely.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        returncode = process.wait()
-    finally:
+        cleanup_returncode = process.wait()
+        if timed_out:
+            returncode = cleanup_returncode
+        stop_readers.set()
         for reader in readers:
-            reader.join(timeout=1)
+            if reader.ident is not None:
+                reader.join()
         process.stdout.close()
         process.stderr.close()
     decoded_stdout = bytes(stdout).decode("utf-8", errors="replace")

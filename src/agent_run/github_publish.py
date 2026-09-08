@@ -29,6 +29,12 @@ class GhGitHubPublisher:
     def __init__(self, repository: str, git: GitRepository) -> None:
         self.repository = repository
         self.git = git
+        self._write_guard: Callable[[], None] | None = None
+
+    def _set_write_guard(self, guard: Callable[[], None]) -> None:
+        """Bind the owning Executor check to each actual mutation dispatch."""
+
+        self._write_guard = guard
 
     def ensure_change_branch(
         self,
@@ -48,7 +54,7 @@ class GhGitHubPublisher:
             raise GitError("Change ref has a foreign identity")
         if expected_remote_sha != expected_base_sha:
             raise GitError("Change ref is missing after publication")
-        created = run_write_command(
+        created = self._write_command(
             [
                 "git",
                 "push",
@@ -56,7 +62,6 @@ class GhGitHubPublisher:
                 f"{expected_base_sha}:refs/heads/{branch}",
                 f"--force-with-lease=refs/heads/{branch}:",
             ],
-            cwd=self.git.root,
         )
         if created.returncode != 0:
             if self._remote_branch_sha(branch) == expected_base_sha:
@@ -76,9 +81,8 @@ class GhGitHubPublisher:
             raise GitError(remote.stderr.strip() or "could not inspect remote branch")
         if not remote.stdout.strip():
             return
-        deleted = run_write_command(
+        deleted = self._write_command(
             ["git", "push", "origin", "--delete", branch],
-            cwd=self.git.root,
         )
         if deleted.returncode != 0:
             raise GitError(deleted.stderr.strip() or "could not delete remote branch")
@@ -462,7 +466,7 @@ class GhGitHubPublisher:
             return
         if remote_sha is not None:
             raise GitError("Run ref has a foreign identity")
-        pushed = run_write_command(
+        pushed = self._write_command(
             [
                 "git",
                 "push",
@@ -470,7 +474,6 @@ class GhGitHubPublisher:
                 f"{expected_sha}:refs/heads/{branch}",
                 f"--force-with-lease=refs/heads/{branch}:",
             ],
-            cwd=self.git.root,
         )
         if pushed.returncode != 0:
             if self._remote_branch_sha(branch) == expected_sha:
@@ -498,7 +501,7 @@ class GhGitHubPublisher:
             f"{head_sha}:refs/heads/{branch}",
             f"--force-with-lease=refs/heads/{branch}:{expected_remote_sha}",
         ]
-        pushed = run_write_command(arguments, cwd=self.git.root)
+        pushed = self._write_command(arguments)
         if pushed.returncode != 0:
             if self._remote_branch_sha(branch) == head_sha:
                 return
@@ -1301,9 +1304,8 @@ class GhGitHubPublisher:
         )
 
     def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
-        fetched = run_read_command(
-            ["git", "fetch", "--no-tags", "origin", run_branch],
-            cwd=self.git.root,
+        fetched = self._write_command(
+            ["git", "fetch", "--no-tags", "origin", run_branch]
         )
         if fetched.returncode != 0:
             raise GitError(
@@ -1312,11 +1314,9 @@ class GhGitHubPublisher:
         fetched_sha = self.git.resolve("FETCH_HEAD")
         if fetched_sha != integrated_sha:
             raise GitError("remote Run Branch does not match integrated commit")
-        subprocess.run(
-            ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha],
-            cwd=self.git.root,
-            check=True,
-        )
+        self._write_command(
+            ["git", "update-ref", f"refs/heads/{run_branch}", integrated_sha]
+        ).check_returncode()
 
     def prepare_primary_ticket_close(
         self,
@@ -2095,6 +2095,18 @@ class GhGitHubPublisher:
         command = ["gh", *arguments]
         if retry if retry is not None else _is_read_command(arguments):
             return run_read_command(command, cwd=self.git.root)
+        if (
+            arguments[:1] == ("api",)
+            and "--method" in arguments
+            and arguments[arguments.index("--method") + 1 :][:1] == ("GET",)
+        ):
+            # Explicit GET keeps its existing single-dispatch readback behavior.
+            return run_write_command(command, cwd=self.git.root)
+        return self._write_command(command)
+
+    def _write_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        if self._write_guard is not None:
+            self._write_guard()
         return run_write_command(command, cwd=self.git.root)
 
 

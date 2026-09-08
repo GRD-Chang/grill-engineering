@@ -589,3 +589,19 @@ Final Run Publication 不存在 fallback 分支，继续使用完整 Run Accepta
   已通过；正常 Publication 仍只使用当前 Acceptance Artifact。
 - Development Prompt 不包含预算、Attempt 序号或 fallback 条件；Reviewer Prompt 不包含最大 Review
   次数、checkpoint 或 resume 流程。
+
+
+## 执行中断后的原工作续接
+
+执行异常续接复用当前角色与分支的原任务 Prompt、原 Thread 和当前 checkout。已经进入 JSON 格式修复时，
+自动及人工续接都复用该只读输出步骤，不能重新注入开发 Brief 或开放文件写权限。
+
+JSON 修复 Prompt 只提供本轮交付名称与原校验错误，继承同一 Thread 中的角色、交付对象和事实：
+
+```text
+你仍负责当前 {output_name} 的交付，本轮只修正输出格式。
+上一输出未通过本地 {output_name} contract。只重新输出完整 JSON，不要修改文件或继续开发。
+校验错误：{validation_error}
+```
+
+普通异常和容量不足使用同一原工作输入，不向 Agent 注入恢复次数、等待计时或预算授权。

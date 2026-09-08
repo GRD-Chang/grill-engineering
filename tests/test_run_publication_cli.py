@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 
 
+from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.github_fixture import FixtureGitHubPublisher
 
+from conftest import seed_idle_control
 from test_cli import run_internal_stage, run_cli, stdout_json
 
 from run_publication_test_support import RunPublicationAgents, _accepted_run
@@ -13,7 +15,13 @@ from run_publication_test_support import RunPublicationAgents, _accepted_run
 def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
     git_repo: Path,
 ) -> None:
-    state, _states, _git, _publisher = _accepted_run(git_repo)
+    state, states, _git, _publisher = _accepted_run(git_repo)
+    seed_idle_control(
+        TaskControlStore(states.root),
+        TaskKey(git_repo, str(state["repository"]), 1),
+        str(state["run_id"]),
+        state_dir=states.root,
+    )
     agents = git_repo / "run-publication-agents.json"
     artifact = RunPublicationAgents().run_publication({"run_id": state["run_id"]})
     agents.write_text(json.dumps({"run_publications": [artifact]}), encoding="utf-8")

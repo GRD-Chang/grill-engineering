@@ -40,7 +40,11 @@ from agent_run.github_auth_profile import (
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_retry import MAX_READ_ATTEMPTS
-from agent_run.operator_gate import has_non_invocation_execution_failure
+from agent_run.operator_gate import (
+    has_local_operator_gate,
+    has_non_invocation_execution_failure,
+    has_run_operator_gate,
+)
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.presentation_helpers import human_next_action
@@ -81,6 +85,11 @@ from agent_run.run_lifecycle import (
     RunLifecycle,
     prepare_action_application_receipt,
 )
+from agent_run.resume_intent import (
+    ResumeIntentError,
+    bind_resume_intent,
+    validate_resume_intent,
+)
 from agent_run.run_locator import (
     MAX_LOCATOR_ENTRIES,
     LocatorEntry,
@@ -105,6 +114,7 @@ from agent_run.task_control import (
     TaskKey,
     action_receipt_matches,
     payload_digest,
+    unresolved_control_target,
 )
 from agent_run.worker_sandbox import WorkerSandboxError
 
@@ -116,7 +126,6 @@ _SUCCESSFUL_FOREGROUND_STATUSES = frozenset(
         "parent_delivery_pending",
         "parent_approval_pending",
         "parent_closeout_pending",
-        "publication_pending",
         "run_acceptance_pending",
         "run_publication_pending",
         "run_approval_pending",
@@ -413,6 +422,41 @@ def _main_with_parser_resources(
             "stop",
             "abandon",
         }
+        current_run: dict[str, Any] | None = None
+        control_record: dict[str, Any] | None = None
+        if parsed.command == "run" and executor_binding is None:
+            task = _task_for_parent(parsed, github, git)
+            control = TaskControlStore(git.root / ".agent-run")
+            try:
+                control_record = control.load(task)
+            except TaskControlError:
+                # The lifecycle admission path can reconstruct an unreadable
+                # record from an exact Run receipt and Host observation.
+                control_record = None
+            current_run = _read_only_run_preflight(
+                parsed,
+                task,
+                states,
+                git,
+                control_record,
+            )
+            if current_run is not None and control_record is not None:
+                control_record = control.inspect_run(task, current_run)
+            control_rejection = _failed_control_action_rejection(
+                current_run, control_record
+            )
+            if control_rejection is not None:
+                cli_presentation._print_precondition_failure(
+                    control_rejection, as_json=parsed.as_json
+                )
+                return 2
+            if current_run is not None and _ordinary_run_rejects_before_readiness(
+                current_run
+            ):
+                cli_presentation._print_precondition_failure(
+                    current_run, as_json=parsed.as_json
+                )
+                return 2
         read_only_stop_state = (
             _read_only_stop_result(parsed, states, git)
             if parsed.command == "stop" and executor_binding is None
@@ -473,8 +517,6 @@ def _main_with_parser_resources(
             "abandon",
         } and read_only_stop_state is None:
             _require_profile(profiles, parsed.run_id)
-        if parsed.command in {"resume", "requeue", "approve", "revise"}:
-            _require_task_control_for_existing_receipt(parsed, states, git)
         if (
             read_only_stop_state is None
             and cli_surface._is_lifecycle_action(parsed.command)
@@ -482,7 +524,9 @@ def _main_with_parser_resources(
             local_state = cli_surface._load_local_run(states, parsed.run_id)
             if (
                 not cli_surface._command_is_ready(local_state, parsed.command)
-                and not _lifecycle_action_is_attachable(parsed, github, git)
+                and not _lifecycle_action_is_attachable(
+                    parsed, github, git, local_state
+                )
             ):
                 _reject_if_task_action_pending(parsed, states, git)
                 cli_presentation._print_precondition_failure(
@@ -490,9 +534,6 @@ def _main_with_parser_resources(
                 )
                 return 2
         if parsed.command == "run":
-            task = _task_for_parent(parsed, github, git)
-            current_run = _preflight_run(task, states)
-            control_record = TaskControlStore(git.root / ".agent-run").load(task)
             control_action = (
                 control_record.get("action")
                 if isinstance(control_record, Mapping)
@@ -509,7 +550,10 @@ def _main_with_parser_resources(
                 current_run is not None
                 and (
                     current_run.get("status")
-                    in {"operator_stopped", "abandonment_pending"}
+                    in {
+                        "operator_stopped",
+                        "abandonment_pending",
+                    }
                     or failed_control_action
                 )
             ):
@@ -645,7 +689,7 @@ def _main_with_parser_resources(
             "next_action": cli_presentation._next_action(state),
         }
         if lifecycle_receipt is not None:
-            output["action"] = cli_presentation.public_action_receipt(
+            public_receipt = cli_presentation.public_action_receipt(
                 lifecycle_receipt,
                 repository=state.get("repository"),
                 parent=state.get("parent"),
@@ -653,6 +697,11 @@ def _main_with_parser_resources(
                     output["next_action"], run_id=state.get("run_id")
                 ),
             )
+            if lifecycle_receipt.resume_intent is not None:
+                public_receipt["resume_authorization"] = (
+                    lifecycle_receipt.resume_intent["authorization"]
+                )
+            output["action"] = public_receipt
         if getattr(parsed, "as_json", False):
             if lifecycle_receipt is not None:
                 output["action_audit"] = _action_audit(lifecycle_receipt)
@@ -663,7 +712,15 @@ def _main_with_parser_resources(
             return 2
         if parsed.command == "stop":
             return 0
-        return 0 if state["status"] in _SUCCESSFUL_FOREGROUND_STATUSES else 2
+        return (
+            0
+            if _lifecycle_result_succeeded(
+                parsed.command,
+                state["status"],
+                executor_bound=executor_binding is not None,
+            )
+            else 2
+        )
     except (ExecutorAgentInterruptedError, KeyboardInterrupt) as interruption:
         agent_interrupted = isinstance(interruption, ExecutorAgentInterruptedError)
         executor_backed = parsed.command in {
@@ -927,6 +984,7 @@ def _main_with_parser_resources(
             if locator_error
             or isinstance(error, DirtyManagedCheckoutError)
             or isinstance(error, DeliveryPolicyError)
+            or isinstance(error, ResumeIntentError)
             or incompatible_state
             or durable_status not in {"blocked", "deterministic_contradiction"}
             or durable_diagnostics is None
@@ -1060,6 +1118,11 @@ def _print_lifecycle_result(
         print("Agent: 当前没有正在运行的 Agent；未创建 Action")
     if receipt is not None:
         print(f"操作: {receipt.kind}")
+        if (
+            receipt.resume_intent is not None
+            and receipt.resume_intent.get("authorization") == "new_budget_window"
+        ):
+            print("恢复授权: 本次操作授权开启一个新的预算窗口；重复附着不会再次授权")
         print("提交结果: 已附着到原操作" if receipt.attached else "提交结果: 已接受新操作")
         if receipt.status == "failed":
             print("动作状态: 应用失败")
@@ -1133,6 +1196,7 @@ def _action_audit(receipt: ActionReceipt) -> dict[str, object]:
         "handshake": receipt.handshake,
         "payload_digest": receipt.payload_digest,
         "failure": receipt.failure,
+        "resume_intent": receipt.resume_intent,
     }
 
 
@@ -1162,7 +1226,10 @@ def _read_only_stop_result(
         raise TaskControlError("Delivery Run 缺少准确 Delivery Task identity")
     task = TaskKey(git.root, repository, parent_number)
     control = TaskControlStore(git.root / ".agent-run")
-    if not control.proves_read_only_stop(task, state):
+    try:
+        if not control.proves_read_only_stop(task, state):
+            return None
+    except TaskControlError:
         return None
     result = dict(state)
     if state.get("status") not in {"completed", "abandoned", "operator_stopped"}:
@@ -1184,12 +1251,22 @@ def _reject_conflicting_stop_action(
     if not isinstance(repository, str) or type(parent_number) is not int:
         raise TaskControlError("Delivery Run 缺少准确 Delivery Task identity")
     task = TaskKey(git.root, repository, parent_number)
-    record = TaskControlStore(git.root / ".agent-run").load(task)
+    try:
+        record = TaskControlStore(git.root / ".agent-run").load(task)
+    except TaskControlError:
+        return
     action = record.get("action") if isinstance(record, Mapping) else None
     if not isinstance(action, Mapping) or action.get("status") not in {
         "accepted",
         "applying",
     }:
+        return
+    executor = record.get("executor") if isinstance(record, Mapping) else None
+    if (
+        isinstance(executor, Mapping)
+        and executor.get("binding_token") == "reconciliation-required"
+        and action_receipt_matches(state, action)
+    ):
         return
     if action.get("kind") == "stop" and _mutation_request_matches_action(
         parsed, action, parsed.run_id
@@ -1215,6 +1292,56 @@ def _preflight_run(
     if current is not None:
         require_current_run_state(current)
     return current
+
+
+def _read_only_run_preflight(
+    parsed: argparse.Namespace,
+    task: TaskKey,
+    states: StateStore | FaultInjectingStateStore,
+    git: GitRepository,
+    control_record: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Locate one existing Run without readiness probes or reconciliation writes."""
+
+    requested_root = states.root.resolve()
+    canonical_root = (git.root / ".agent-run").resolve()
+    requested_current = _preflight_run(task, states)
+    bound_root = _control_state_root(control_record)
+    located_root = _located_unfinished_state_root(task, requested_root)
+    if bound_root is not None and located_root is not None:
+        if bound_root != located_root:
+            raise ValueError(
+                "Task Control 与 Run 定位索引指向多个未完成 state directory"
+            )
+    elif bound_root is None and located_root is not None:
+        if requested_root != canonical_root:
+            raise TaskControlError(
+                "同一 Delivery Task 已在另一个 state directory 拥有未完成 Run；"
+                "不会创建第二个 Run"
+            )
+        bound_root = located_root
+    if bound_root is None or bound_root == requested_root:
+        return requested_current
+
+    current = _preflight_run(task, _state_store_for_run(parsed, bound_root))
+    if requested_current is not None and (
+        current is None
+        or requested_current.get("run_id") != current.get("run_id")
+    ):
+        raise ValueError("同一 Delivery Task 在多个 state directory 存在未完成 Run")
+    return current
+
+
+def _lifecycle_result_succeeded(
+    command: str, status: object, *, executor_bound: bool = False
+) -> bool:
+    """Classify command completion without weakening public ``run`` gates."""
+
+    if status in _SUCCESSFUL_FOREGROUND_STATUSES:
+        return True
+    return status == "publication_pending" and (
+        command == "publish-run" or (command == "run" and executor_bound)
+    )
 
 
 def _located_unfinished_state_root(task: TaskKey, requested_root: Path) -> Path | None:
@@ -1284,6 +1411,7 @@ def _resume_action_payload(
         "new_thread": bool(parsed.new_thread),
         "message": parsed.message,
         "resume_budget_checkpoint": budget_checkpoint_resume,
+        "resume_intent": bind_resume_intent(current),
         "policy": policy.snapshot(),
     }
 
@@ -1392,7 +1520,10 @@ def _run_control_action(
     payload: dict[str, Any] = {"parent": parsed.parent, "run_id": run_id}
     if kind == "abandon":
         payload["discard_worktree"] = bool(parsed.discard_worktree)
-        existing = control.load(task)
+        try:
+            existing = control.load(task)
+        except TaskControlError:
+            existing = None
         existing_action = (
             existing.get("action") if isinstance(existing, Mapping) else None
         )
@@ -1554,6 +1685,55 @@ def _run_control_action(
     return state, receipt
 
 
+def _ordinary_run_requires_explicit_action(current: Mapping[str, Any]) -> bool:
+    """Whether only a dedicated operator command may leave this boundary."""
+
+    state = dict(current)
+    if state.get("status") == "supervision_timeout":
+        return has_local_operator_gate(state)
+    return has_run_operator_gate(state)
+
+
+def _failed_control_action_rejection(
+    current: Mapping[str, Any] | None,
+    control_record: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return an accurate read-only rejection for an unresolved control target."""
+
+    if current is None or control_record is None:
+        return None
+    action = control_record.get("action")
+    if not isinstance(action, Mapping) or unresolved_control_target(action) is None:
+        return None
+    if action.get("run_id") != current.get("run_id"):
+        return None
+    failure = action.get("failure")
+    message = (
+        failure
+        if isinstance(failure, str) and failure
+        else "失败 Control Action 的目标 ownership 尚未收口"
+    )
+    rejected = dict(current)
+    diagnostics = rejected.get("diagnostics")
+    current_diagnostics = list(diagnostics) if isinstance(diagnostics, list) else []
+    current_diagnostics.append(
+        {"code": "lifecycle_action_failed", "message": message}
+    )
+    rejected["diagnostics"] = current_diagnostics
+    return rejected
+
+
+def _ordinary_run_rejects_before_readiness(current: Mapping[str, Any]) -> bool:
+    """Reject locally final gates before acquiring execution resources."""
+
+    if current.get("status") in {
+        "run_approval_pending",
+        "parent_approval_pending",
+    }:
+        return False
+    return _ordinary_run_requires_explicit_action(current)
+
+
 def _run_lifecycle(
     parsed: argparse.Namespace,
     states: StateStore | FaultInjectingStateStore,
@@ -1646,6 +1826,10 @@ def _run_lifecycle(
                 )
         if current is not None:
             controller._require_current_checkout(current)
+    if current is not None and current.get("action_application_receipt") is None:
+        existing_control = _reconcile_existing_control(
+            control, task, current, state_dir=states.root
+        )
     existing_action = (
         existing_control.get("action") if isinstance(existing_control, dict) else None
     )
@@ -1677,41 +1861,97 @@ def _run_lifecycle(
             raise TaskControlError(
                 "当前 Lifecycle Action 尚未绑定 Run；不会在另一个 state directory 创建 Run"
             )
+    preflight_override = current
     if (
         action_kind == "run"
         and current is not None
-        and current.get("status") == "execution_failed"
+        and current.get("status")
+        in {"run_approval_pending", "parent_approval_pending"}
+        and not _policy_overrides(parsed)
+        and not _profile_options_are_explicit(creation_profile)
+        and (
+            (
+                isinstance(existing_action, Mapping)
+                and existing_action.get("kind") == "run"
+                and existing_action.get("status") in {"completed", "failed"}
+                and action_receipt_matches(current, existing_action)
+            )
+            or (
+                # Direct engine seams predate Lifecycle Action records.  They
+                # still need bounded approval refresh, never a new Action.
+                existing_action is None
+                and current.get("action_application_receipt") is None
+            )
+        )
+    ):
+        # An unchanged settled Run Action remains idempotent, but approval
+        # replay must first observe bounded GitHub readback so scope drift and
+        # transient graph-read lag are not hidden behind the old Receipt.
+        refreshed = current
+        for _ in range(MAX_READ_ATTEMPTS + 1):
+            refreshed = controller._refresh(current, task.parent_number)
+            if not is_github_refresh_wait(refreshed):
+                break
+        if is_github_refresh_wait(refreshed):
+            return refreshed, True, None
+        if refreshed.get("status") != current.get("status"):
+            current = refreshed
+            preflight_override = refreshed
+    if (
+        action_kind == "run"
+        and current is not None
+        and _ordinary_run_requires_explicit_action(current)
     ):
         receipt = current.get("action_application_receipt")
-        if not isinstance(receipt, Mapping):
-            # Preserve the established repository-binding probe for a legacy
-            # non-invocation failure without creating a new Lifecycle Action.
+        original_action_is_active = (
+            isinstance(receipt, Mapping)
+            and isinstance(existing_action, Mapping)
+            and existing_action.get("status") in {"accepted", "applying"}
+            and action_receipt_matches(current, existing_action)
+        )
+        original_action_is_terminal_replay = (
+            current.get("status")
+            in {
+                "ready_for_human",
+                "run_approval_pending",
+                "parent_approval_pending",
+            }
+            and isinstance(receipt, Mapping)
+            and isinstance(existing_action, Mapping)
+            and existing_action.get("kind") == "run"
+            and existing_action.get("status") in {"completed", "failed"}
+            and action_receipt_matches(current, existing_action)
+            and not _policy_overrides(parsed)
+            and not _profile_options_are_explicit(creation_profile)
+        )
+        original_action_needs_reconciliation = (
+            current.get("status")
+            in {
+                "ready_for_human",
+                "run_approval_pending",
+                "parent_approval_pending",
+            }
+            and isinstance(receipt, Mapping)
+            and receipt.get("kind") == "run"
+            and existing_action is None
+            and not _policy_overrides(parsed)
+            and not _profile_options_are_explicit(creation_profile)
+        )
+        if not (
+            original_action_is_active
+            or original_action_is_terminal_replay
+            or original_action_needs_reconciliation
+        ):
+            # These boundaries require their dedicated Resume, approval, or
+            # revision command.  Preserve the repository-binding probe without
+            # admitting a successor Action or preparing a new Executor session,
+            # even when run carries explicit Profile options.
             repository = github.repository()
             if repository.name_with_owner != task.repository:
                 raise TaskControlError(
                     "configured GitHub repository does not match the Delivery Run"
                 )
             return current, True, None
-    preflight_override = current
-    if (
-        action_kind == "run"
-        and current is not None
-        and current.get("status") in {"run_approval_pending", "parent_approval_pending"}
-        and isinstance(existing_action, Mapping)
-        and existing_action.get("status") in {"completed", "failed"}
-        and action_receipt_matches(current, existing_action)
-    ):
-        # A completed Action is normally idempotent.  Re-read an approval
-        # boundary first so externally changed GitHub facts can request a
-        # fresh Action, while an unchanged boundary remains byte-stable.
-        refreshed = current
-        for _ in range(MAX_READ_ATTEMPTS + 1):
-            refreshed = controller._refresh(current, task.parent_number)
-            if not is_github_refresh_wait(refreshed):
-                break
-        if refreshed.get("status") != current.get("status"):
-            current = refreshed
-            preflight_override = refreshed
     if (
         isinstance(existing_action, dict)
         and (
@@ -1890,11 +2130,16 @@ def _run_lifecycle(
             if not isinstance(policy_snapshot, Mapping):
                 raise TaskControlError("resume Action 缺少 Policy Snapshot")
             resume_policy = parse_policy_snapshot(policy_snapshot)
+            retry_intent = payload.get("resume_intent")
 
             def retry_resume_refresh(run_id: str) -> tuple[dict[str, Any], bool]:
                 return run_controller.resume(
                     run_id,
-                    resume_human_blocker=initial_status != "supervision_timeout",
+                    resume_human_blocker=(
+                        isinstance(retry_intent, Mapping)
+                        and retry_intent.get("authorization")
+                        == "human_response"
+                    ),
                     new_thread=payload.get("new_thread") is True,
                     human_response=(
                         payload.get("message")
@@ -1907,6 +2152,9 @@ def _run_lifecycle(
                         payload.get("resume_budget_checkpoint") is True
                     ),
                     budget_policy=resume_policy,
+                    validate_resume_state=lambda state: validate_resume_intent(
+                        state, retry_intent
+                    ),
                 )
 
             resume_retry = retry_resume_refresh
@@ -1976,7 +2224,6 @@ def _run_lifecycle(
         driver_factory=lifecycle_driver_factory,
         record_execution_failure=record_lifecycle_failure,
     )
-    initial_status = current.get("status") if current is not None else None
 
     def select_run(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         if action_kind == "resume":
@@ -1994,9 +2241,14 @@ def _run_lifecycle(
             )
             if not isinstance(budget_checkpoint_resume, bool):
                 raise TaskControlError("resume Action 的 Budget Window binding 无效")
+            bound_intent = action_payload.get("resume_intent")
             return controller.resume(
                 run_id,
-                resume_human_blocker=initial_status != "supervision_timeout",
+                resume_human_blocker=(
+                    isinstance(bound_intent, Mapping)
+                    and bound_intent.get("authorization")
+                    == "human_response"
+                ),
                 new_thread=action_payload.get("new_thread") is True,
                 human_response=(
                     action_payload.get("message")
@@ -2010,6 +2262,9 @@ def _run_lifecycle(
                 ),
                 resume_budget_checkpoint=budget_checkpoint_resume,
                 budget_policy=parse_policy_snapshot(policy_snapshot),
+                validate_resume_state=lambda state: validate_resume_intent(
+                    state, bound_intent
+                ),
                 prepare_state=lambda state: prepare_action_application_receipt(
                     state, action
                 ),
@@ -2180,9 +2435,17 @@ def _run_lifecycle(
             kind=action_kind,
             payload=payload,
             allow_terminal_successor=(
-                cli_surface._is_lifecycle_action(action_kind)
-                and current is not None
-                and cli_surface._command_is_ready(current, action_kind)
+                current is not None
+                and (
+                    (
+                        action_kind == "resume"
+                        and cli_surface._resume_is_ready(current)
+                    )
+                    or (
+                        cli_surface._is_lifecycle_action(action_kind)
+                        and cli_surface._command_is_ready(current, action_kind)
+                    )
+                )
             ),
         )
     )
@@ -2272,7 +2535,10 @@ def _resume_action_is_attachable(
     """Whether this exact Resume can join the Executor already in flight."""
 
     task = _task_for_parent(parsed, github, git)
-    record = TaskControlStore(git.root / ".agent-run").load(task)
+    try:
+        record = TaskControlStore(git.root / ".agent-run").load(task)
+    except TaskControlError:
+        return False
     action = record.get("action") if isinstance(record, Mapping) else None
     executor = record.get("executor") if isinstance(record, Mapping) else None
     if not isinstance(action, Mapping) or action.get("kind") != "resume":
@@ -2305,11 +2571,26 @@ def _lifecycle_action_is_attachable(
     parsed: argparse.Namespace,
     github: Any,
     git: GitRepository,
+    current: Mapping[str, Any],
 ) -> bool:
     """Whether this command can be reconciled with its in-flight Action."""
 
     task = _task_for_parent(parsed, github, git)
-    record = TaskControlStore(git.root / ".agent-run").load(task)
+    try:
+        record = TaskControlStore(git.root / ".agent-run").load(task)
+    except TaskControlError:
+        record = None
+    if record is None:
+        receipt = current.get("action_application_receipt")
+        if parsed.command in {"approve", "revise", "requeue"} and isinstance(
+            receipt, Mapping
+        ):
+            return (
+                receipt.get("run_id") == current.get("run_id")
+                and receipt.get("kind") == parsed.command
+                and receipt.get("payload_digest")
+                == payload_digest(_mutation_action_payload(parsed, current))
+            )
     action = record.get("action") if isinstance(record, Mapping) else None
     executor = record.get("executor") if isinstance(record, Mapping) else None
     if not isinstance(action, Mapping) or action.get("kind") != parsed.command:
@@ -2387,35 +2668,6 @@ def _reject_if_task_action_pending(
             "无法确认当前 Action/Executor ownership"
         )
     control.require_mutation_available(task)
-
-
-def _require_task_control_for_existing_receipt(
-    parsed: argparse.Namespace,
-    states: StateStore | FaultInjectingStateStore,
-    git: GitRepository,
-) -> None:
-    """Fail closed when a different mutation cannot reconcile Run ownership."""
-
-    run_id = getattr(parsed, "run_id", None)
-    if not isinstance(run_id, str):
-        return
-    state = states.load_run(run_id)
-    if not isinstance(state, dict):
-        return
-    receipt = state.get("action_application_receipt")
-    if not isinstance(receipt, Mapping):
-        return
-    parent = state.get("parent")
-    parent_number = parent.get("number") if isinstance(parent, Mapping) else None
-    repository = state.get("repository")
-    if not isinstance(repository, str) or type(parent_number) is not int:
-        return
-    task = TaskKey(git.root, repository, parent_number)
-    if TaskControlStore(git.root / ".agent-run").load(task) is None:
-        raise TaskControlError(
-            "Task Control Record 缺失；已有 Delivery Run Action Receipt，"
-            "无法确认当前 Action/Executor ownership"
-        )
 
 
 def _run_driver(
@@ -2930,7 +3182,15 @@ def _with_executor_control(
     )
     activity = "unknown"
     reason: str | None = "executor_control_invalid"
-    if isinstance(executor, Mapping) and executor.get(
+    if (
+        isinstance(action, Mapping)
+        and action.get("kind") in {"stop", "abandon"}
+        and action.get("status") != "completed"
+        and isinstance(action.get("target_executor"), Mapping)
+    ):
+        # The Control Executor's exit says nothing about its unresolved target.
+        reason = "control_target_unresolved"
+    elif isinstance(executor, Mapping) and executor.get(
         "reconciliation_required"
     ) is True:
         reason = "executor_reconciliation_required"
