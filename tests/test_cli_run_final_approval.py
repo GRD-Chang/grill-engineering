@@ -291,6 +291,8 @@ def test_parent_approval_supervises_pending_checks_to_timeout(
         git_repo / "github.json",
         issues={},
         delivery={"required_checks": ["none", "pending"]},
+        # Advance the existing clock; keep the real supervision budget.
+        supervision_clock_multiplier=120,
     )
     agents = _parent_only_agents(git_repo / "parent-only-agents.json")
     awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
@@ -302,6 +304,10 @@ def test_parent_approval_supervises_pending_checks_to_timeout(
     assert waiting.returncode == 2, waiting.stderr
     assert stdout_json(waiting)["status"] == "supervision_timeout"
     assert load_only_run_state(git_repo)["supervision_wait"]["kind"] == "required_checks"
+    wait = load_only_run_state(git_repo)["supervision_wait"]
+    assert wait["deadline"] - wait["started_at"] == 45 * 60
+    assert wait["elapsed_seconds"] >= 45 * 60
+    assert wait["retry_count"] > 1
 
 def test_final_approval_supervises_pending_checks_to_timeout(
     git_repo: Path,
@@ -310,6 +316,8 @@ def test_final_approval_supervises_pending_checks_to_timeout(
         git_repo / "github.json",
         issues={"3": ticket()},
         delivery={"required_checks": ["none", "none", "pending"]},
+        # Advance the existing clock; keep the real supervision budget.
+        supervision_clock_multiplier=120,
     )
     agents = run_agents(git_repo / "agents.json")
     awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
@@ -321,6 +329,10 @@ def test_final_approval_supervises_pending_checks_to_timeout(
     assert waiting.returncode == 2, waiting.stderr
     assert stdout_json(waiting)["status"] == "supervision_timeout"
     assert load_only_run_state(git_repo)["supervision_wait"]["kind"] == "required_checks"
+    wait = load_only_run_state(git_repo)["supervision_wait"]
+    assert wait["deadline"] - wait["started_at"] == 45 * 60
+    assert wait["elapsed_seconds"] >= 45 * 60
+    assert wait["retry_count"] > 1
 
 def test_parent_only_pending_window_survives_process_restart(
     git_repo: Path,
