@@ -525,6 +525,7 @@ class ProfiledAgentBackend:
         self.backend = backend
         self.profiles = profiles
         self.run_id = run_id
+        self.execution_recovery_guard: Callable[[], None] | None = None
 
     def set_run_id(self, run_id: str) -> None:
         self.run_id = run_id
@@ -613,6 +614,19 @@ class ProfiledAgentBackend:
         deadline_seconds = getattr(event, "deadline_seconds", None)
         if deadline_seconds is not None:
             setattr(notify, "deadline_seconds", deadline_seconds)
+        recovery_state = getattr(event, "recovery_state", None)
+        if recovery_state is not None:
+            setattr(notify, "recovery_state", recovery_state)
+        can_recover = getattr(event, "recovery_allowed", None)
+
+        def recovery_allowed() -> bool:
+            guard = self.execution_recovery_guard
+            if guard is None or not callable(can_recover):
+                return False
+            guard()
+            return bool(can_recover())
+
+        setattr(notify, "recovery_allowed", recovery_allowed)
         request["_invocation_event"] = notify
         request["_execution_role"] = role
         try:

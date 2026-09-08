@@ -64,10 +64,14 @@ class CodexProcessError(RuntimeError):
         *,
         return_code: int | None = None,
         signal_number: int | None = None,
+        recoverable: bool = True,
+        capacity_failure: bool = False,
     ) -> None:
         super().__init__(message)
         self.return_code = return_code
         self.signal_number = signal_number
+        self.recoverable = recoverable
+        self.capacity_failure = capacity_failure
 
 
 class _CodexThreadResumeError(CodexProcessError):
@@ -482,18 +486,38 @@ class CodexCliBackend:
             invocation_mode=request.get("_invocation_mode"),
         )
         current_thread = thread_id
-        validation_error = ""
+        recovery_state = getattr(event, "recovery_state", {})
+        attempt = int(recovery_state.get("output_attempt", 1))
+        if attempt not in (1, 2, 3):
+            raise CodexProcessError("Invalid persisted output step", recoverable=False)
+        validation_error = str(recovery_state.get("validation_error", ""))[:2000]
+        ordinary_recovery_used = bool(recovery_state.get("ordinary_recovery_used", False))
+        capacity_recovery_count = int(recovery_state.get("capacity_recovery_count", 0))
+        recovery_allowed = getattr(event, "recovery_allowed", None)
         currentness = request.get("_currentness_check")
-        for attempt in range(1, 4):
+        printed_steps: set[int] = set()
+
+        def remember_thread(value: str) -> None:
+            nonlocal current_thread
+            if current_thread is not None and current_thread != value:
+                raise CodexProcessError(
+                    "Codex resume reported a different Thread ID", recoverable=False
+                )
+            notify("thread_started", reported_thread_id=value, attempt_count=attempt)
+            current_thread = value
+
+        while attempt <= 3:
             if callable(currentness) and not currentness():
                 stale = CodexProcessError(
                     f"{output_name} currentness changed before Invocation"
                 )
                 notify("failed", attempt_count=attempt - 1, error=str(stale))
                 raise stale
+            notify("output_step", output_attempt=attempt, validation_error=validation_error)
             attempt_prompt = prompt
             if attempt > 1:
                 attempt_prompt = (
+                    f"你仍负责当前 {output_name} 的交付，本轮只修正输出格式。"
                     f"上一输出未通过本地 {output_name} contract。只重新输出完整 JSON，"
                     "不要修改文件或继续开发。校验错误：" + validation_error[:2000]
                 )
@@ -519,12 +543,14 @@ class CodexCliBackend:
                     reasoning_effort = _optional_string(
                         execution_binding, "reasoning_effort"
                     )
-                self._print_execution_binding(
-                    request,
-                    thread_id=current_thread,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                )
+                if attempt not in printed_steps:
+                    self._print_execution_binding(
+                        request,
+                        thread_id=current_thread,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                    )
+                    printed_steps.add(attempt)
                 output, reported_thread = self._invoke(
                     prompt=attempt_prompt,
                     checkout=checkout,
@@ -536,60 +562,94 @@ class CodexCliBackend:
                     reasoning_effort=reasoning_effort,
                     timeout=remaining,
                     deadline_at_monotonic=deadline_at,
-                    on_thread=lambda value: notify(
-                        "thread_started",
-                        reported_thread_id=value,
-                        attempt_count=attempt,
+                    on_thread=remember_thread,
+                    validate_final_output=lambda value: validate(
+                        _json_object(value, output_name)
                     ),
                 )
-                if time.monotonic() >= deadline_at:
-                    raise CodexProcessError(
-                        f"{output_name} exceeded its Invocation Deadline"
-                    )
             except InitialCredentialUnavailable:
                 raise
-            except _CodexInvocationDeadlineError as error:
-                deadline_error = CodexProcessError(
-                    f"{output_name} exceeded its Invocation Deadline",
-                    return_code=error.return_code,
-                    signal_number=error.signal_number,
-                )
-                notify(
-                    "failed",
-                    attempt_count=attempt if error.process_started else attempt - 1,
-                    error=str(deadline_error),
-                    return_code=deadline_error.return_code,
-                    signal=deadline_error.signal_number,
-                )
-                raise deadline_error from error
             except BaseException as error:
-                notify(
-                    "failed",
-                    attempt_count=attempt,
-                    error=_bounded_error(str(error)),
-                    return_code=getattr(error, "return_code", None),
-                    signal=getattr(error, "signal_number", None),
+                process_started = (
+                    not isinstance(error, _CodexInvocationDeadlineError)
+                    or error.process_started
                 )
-                raise
+                if isinstance(error, _CodexInvocationDeadlineError):
+                    error = CodexProcessError(
+                        f"{output_name} exceeded its Invocation Deadline",
+                        return_code=error.return_code,
+                        signal_number=error.signal_number,
+                        recoverable=process_started,
+                    )
+                resumable = (
+                    isinstance(error, CodexProcessError)
+                    and error.recoverable
+                    and current_thread is not None
+                    and callable(recovery_allowed)
+                    and callable(currentness)
+                    and currentness()
+                    and recovery_allowed()
+                )
+                capacity = isinstance(error, CodexProcessError) and error.capacity_failure
+                if resumable and (capacity or not ordinary_recovery_used):
+                    assert callable(recovery_allowed) and callable(currentness)
+                    if capacity:
+                        capacity_recovery_count += 1
+                    else:
+                        ordinary_recovery_used = True
+                    facts = {
+                        "recovery_kind": "capacity" if capacity else "ordinary",
+                        "ordinary_recovery_used": ordinary_recovery_used,
+                        "capacity_recovery_count": capacity_recovery_count,
+                        "error": _bounded_error(str(error)),
+                        "return_code": getattr(error, "return_code", None),
+                        "signal": getattr(error, "signal_number", None),
+                    }
+                    notify("recovery_waiting", **facts)
+                    if capacity:
+                        for _ in range(30):
+                            if not recovery_allowed():
+                                raise CodexProcessError(
+                                    "Execution recovery authorization changed",
+                                    recoverable=False,
+                                )
+                            time.sleep(1)
+                    if not recovery_allowed() or not currentness():
+                        raise CodexProcessError(
+                            "Execution recovery authorization changed", recoverable=False
+                        )
+                    notify("recovery_started", **facts)
+                    deadline_at = time.monotonic() + deadline_seconds
+                    continue
+                failure_facts: dict[str, object] = {
+                    "attempt_count": attempt if process_started else attempt - 1,
+                    "error": _bounded_error(str(error)),
+                    "return_code": getattr(error, "return_code", None),
+                    "signal": getattr(error, "signal_number", None),
+                }
+                if process_started:
+                    failure_facts["execution_interrupted"] = True
+                notify("failed", **failure_facts)
+                raise error
             if current_thread is not None and reported_thread != current_thread:
-                mismatch = CodexProcessError("Codex resume reported a different Thread ID")
+                mismatch = CodexProcessError(
+                    "Codex resume reported a different Thread ID", recoverable=False
+                )
                 notify("failed", attempt_count=attempt, error=str(mismatch))
                 raise mismatch
             current_thread = reported_thread
             try:
                 validate(_json_object(output, output_name))
             except (CodexProcessError, ValueError) as error:
-                validation_error = str(error)
+                validation_error = str(error)[:2000]
                 if attempt < 3:
+                    attempt += 1
                     continue
-                notify("failed", attempt_count=attempt, error=validation_error)
-                raise CodexProcessError(validation_error) from error
-            if time.monotonic() >= deadline_at:
-                deadline_error = CodexProcessError(
-                    f"{output_name} exceeded its Invocation Deadline"
+                notify(
+                    "failed", attempt_count=attempt, error=validation_error,
+                    execution_interrupted=False,
                 )
-                notify("failed", attempt_count=attempt, error=str(deadline_error))
-                raise deadline_error
+                raise CodexProcessError(validation_error) from error
             if callable(currentness) and not currentness():
                 stale = CodexProcessError(
                     f"{output_name} currentness changed before result application"
@@ -718,11 +778,34 @@ class CodexCliBackend:
         timeout: float = _DIRECT_INVOCATION_TIMEOUT_SECONDS,
         deadline_at_monotonic: float | None = None,
         on_thread: Callable[[str], None] | None = None,
+        validate_final_output: Callable[[str], object] | None = None,
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory(prefix="agent-run-codex-") as temp_name:
             temporary = Path(temp_name)
             output_path = temporary / "last-message.txt"
             schema_path = temporary / "schema.json"
+            observed_thread = thread_id
+
+            def report_thread(value: str) -> None:
+                nonlocal observed_thread
+                if on_thread is not None:
+                    on_thread(value)
+                observed_thread = value
+
+            def accepted_output() -> tuple[str, str] | None:
+                if validate_final_output is None or observed_thread is None:
+                    return None
+                try:
+                    with output_path.open("rb") as output_file:
+                        candidate = output_file.read(_MAX_FINAL_OUTPUT_BYTES + 1)
+                    if len(candidate) > _MAX_FINAL_OUTPUT_BYTES:
+                        return None
+                    candidate_text = candidate.decode("utf-8")
+                    validate_final_output(candidate_text)
+                except (OSError, UnicodeError, ValueError, CodexProcessError):
+                    return None
+                return candidate_text, observed_thread
+
             if schema is not None:
                 schema_path.write_text(json.dumps(schema), encoding="utf-8")
             if thread_id is None:
@@ -863,7 +946,7 @@ class CodexCliBackend:
                         run_worker_process
                     ).parameters:
                         worker_options["on_stdout_line"] = _thread_line_callback(
-                            expected=thread_id, callback=on_thread
+                            expected=thread_id, callback=report_thread
                         )
                     worker_pid: int | None = None
 
@@ -885,21 +968,36 @@ class CodexCliBackend:
             except InitialCredentialUnavailable:
                 raise
             except WorkerDeadlineExceeded as error:
+                completed = accepted_output()
+                if completed is not None:
+                    return completed
                 raise _CodexInvocationDeadlineError(
                     str(error), process_started=True
                 ) from error
             except WorkerSandboxError as error:
-                raise CodexProcessError(str(error)) from error
+                raise CodexProcessError(str(error), recoverable=False) from error
             except WorkerCredentialError as error:
-                raise CodexProcessError(str(error)) from error
+                raise CodexProcessError(str(error), recoverable=False) from error
+            result_thread = _thread_id(result.stdout)
+            if result_thread is not None:
+                if thread_id is not None and thread_id != result_thread:
+                    raise _CodexThreadResumeError(
+                        "Codex resume reported a different Thread ID", recoverable=False
+                    )
+                report_thread(result_thread)
+            if result.returncode != 0:
+                completed = accepted_output()
+                if completed is not None:
+                    return completed
             if result.returncode != 0:
                 message = _terminal_error(result.stdout, result.stderr)
-                if _looks_like_worker_gh_binding_failure(
+                binding_failed = _looks_like_worker_gh_binding_failure(
                     result.stdout,
                     result.stderr,
                     gh_targets=gh_targets,
                     gh_adapter=adapter_directory / "gh",
-                ):
+                )
+                if binding_failed:
                     message = (
                         "worker_gh_binding_failed: Codex worker did not start"
                     )
@@ -909,11 +1007,15 @@ class CodexCliBackend:
                         message,
                         return_code=result.returncode,
                         signal_number=signal_number,
+                        recoverable=not binding_failed,
+                        capacity_failure=_is_capacity_failure(result.stdout),
                     )
                 raise CodexProcessError(
                     message,
                     return_code=result.returncode,
                     signal_number=signal_number,
+                    recoverable=not binding_failed,
+                    capacity_failure=_is_capacity_failure(result.stdout),
                 )
             try:
                 with output_path.open("rb") as output_file:
@@ -931,7 +1033,7 @@ class CodexCliBackend:
                 and reported_thread != thread_id
             ):
                 raise _CodexThreadResumeError(
-                    "Codex resume reported a different Thread ID"
+                    "Codex resume reported a different Thread ID", recoverable=False
                 )
             actual_thread = reported_thread or thread_id
             if actual_thread is None:
@@ -992,8 +1094,10 @@ def _thread_id(output: str) -> str | None:
             value: object = json.loads(line)
         except json.JSONDecodeError:
             continue
-        found = _find_thread_id(value)
-        if found is not None:
+        if not isinstance(value, dict) or value.get("type") != "thread.started":
+            continue
+        found = value.get("thread_id")
+        if isinstance(found, str) and found.strip():
             return found
     return None
 
@@ -1020,6 +1124,23 @@ def _is_retryable_initial_credential_error(error: WorkerCredentialError) -> bool
     )
     message = str(error).lower()
     return not any(marker in message for marker in permanent_markers)
+
+
+def _is_capacity_failure(stdout: str) -> bool:
+    """Only confirmed failed turns grant the capacity-specific retry policy."""
+    for line in reversed(stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict) or value.get("type") not in {
+            "turn.failed", "task_complete"
+        }:
+            continue
+        error = value.get("error")
+        message = error.get("message") if isinstance(error, dict) else error
+        return message == "Selected model is at capacity. Please try a different model."
+    return False
 
 
 def _terminal_error(stdout: str, stderr: str) -> str:
@@ -1130,33 +1251,22 @@ def _thread_line_callback(
             return
         candidate = value.get("thread_id")
         if not isinstance(candidate, str) or not candidate.strip():
-            raise CodexProcessError("Codex worker reported an invalid Thread ID")
+            raise CodexProcessError(
+                "Codex worker reported an invalid Thread ID", recoverable=False
+            )
         if reported is not None and candidate != reported:
-            raise CodexProcessError("Codex worker reported multiple Thread IDs")
+            raise CodexProcessError(
+                "Codex worker reported multiple Thread IDs", recoverable=False
+            )
         if expected is not None and candidate != expected:
-            raise CodexProcessError("Codex resume reported a different Thread ID")
+            raise CodexProcessError(
+                "Codex resume reported a different Thread ID", recoverable=False
+            )
         reported = candidate
         if callback is not None:
             callback(candidate)
 
     return consume
-
-
-def _find_thread_id(value: object) -> str | None:
-    if isinstance(value, dict):
-        direct = value.get("thread_id")
-        if isinstance(direct, str):
-            return direct
-        for child in value.values():
-            found = _find_thread_id(child)
-            if found is not None:
-                return found
-    elif isinstance(value, list):
-        for child in value:
-            found = _find_thread_id(child)
-            if found is not None:
-                return found
-    return None
 
 
 def _json_object(value: str, name: str) -> dict[str, Any]:
