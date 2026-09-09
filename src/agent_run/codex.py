@@ -120,9 +120,13 @@ class CodexCliBackend:
     ) -> DevelopmentResult | HumanBlockerResult:
         checkout = Path(_string(request, "checkout"))
         prompt = self._development_prompt(request)
+        continuation_prompt = self._development_prompt(
+            request, force_continuation=True
+        )
         output, actual_thread = self._invoke_structured_output(
             request=request,
             prompt=prompt,
+            continuation_prompt=continuation_prompt,
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
             repository=_optional_string(request, "repository"),
@@ -163,7 +167,9 @@ class CodexCliBackend:
         )
 
     @staticmethod
-    def _development_prompt(request: dict[str, Any]) -> str:
+    def _development_prompt(
+        request: dict[str, Any], *, force_continuation: bool = False
+    ) -> str:
         is_run_repair = request.get("acceptance_scope") == "run"
         is_parent_only = request.get("acceptance_scope") == "parent_only"
         repair_source = request.get("repair_source")
@@ -264,7 +270,7 @@ class CodexCliBackend:
             raise ValueError(f"unknown repair_source: {repair_source}")
 
         role = _development_role(request)
-        if _uses_short_role_prompt(request):
+        if force_continuation or _uses_short_role_prompt(request):
             return _development_continuation_prompt(
                 request,
                 role=role,
@@ -309,6 +315,9 @@ class CodexCliBackend:
         output, resumed_thread = self._invoke_publication(
             request=request,
             prompt=prompt,
+            continuation_prompt=_publication_continuation_prompt(
+                request, role=_publication_role(request)
+            ),
             checkout=checkout,
             thread_id=thread_id,
             repository=_optional_string(request, "repository"),
@@ -332,6 +341,9 @@ class CodexCliBackend:
         output, thread_id = self._invoke_publication(
             request=request,
             prompt=prompt,
+            continuation_prompt=_publication_continuation_prompt(
+                request, role="本次 Final Run 的发布叙事工程师"
+            ),
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
             repository=_optional_string(request, "repository"),
@@ -348,6 +360,7 @@ class CodexCliBackend:
         *,
         request: dict[str, Any],
         prompt: str,
+        continuation_prompt: str,
         checkout: Path,
         thread_id: str | None,
         repository: str | None,
@@ -365,6 +378,7 @@ class CodexCliBackend:
         return self._invoke_structured_output(
             request=request,
             prompt=prompt,
+            continuation_prompt=continuation_prompt,
             checkout=checkout,
             thread_id=thread_id,
             repository=repository,
@@ -454,6 +468,9 @@ class CodexCliBackend:
         output, thread_id = self._invoke_structured_output(
             request=request,
             prompt=prompt,
+            continuation_prompt=_review_continuation_prompt(
+                request, role=_review_role(request)
+            ),
             checkout=checkout,
             thread_id=_optional_string(request, "thread_id"),
             repository=_optional_string(request, "repository"),
@@ -477,6 +494,7 @@ class CodexCliBackend:
         *,
         request: dict[str, Any],
         prompt: str,
+        continuation_prompt: str | None = None,
         checkout: Path,
         thread_id: str | None,
         repository: str | None = None,
@@ -515,6 +533,7 @@ class CodexCliBackend:
         recovery_allowed = getattr(event, "recovery_allowed", None)
         currentness = request.get("_currentness_check")
         printed_steps: set[int] = set()
+        role_prompt = prompt
 
         def remember_thread(value: str) -> None:
             nonlocal current_thread
@@ -546,7 +565,7 @@ class CodexCliBackend:
                     signal=None,
                 )
                 raise deadline_error
-            attempt_prompt = prompt
+            attempt_prompt = role_prompt
             if attempt > 1:
                 attempt_prompt = _structured_output_repair_prompt(
                     output_name, validation_error[:2000]
@@ -638,6 +657,8 @@ class CodexCliBackend:
                         )
                     notify("recovery_started", **facts)
                     deadline_at = time.monotonic() + deadline_seconds
+                    if attempt == 1 and continuation_prompt is not None:
+                        role_prompt = continuation_prompt
                     continue
                 failure_facts: dict[str, object] = {
                     "attempt_count": attempt if process_started else attempt - 1,

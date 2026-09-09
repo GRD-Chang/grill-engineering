@@ -155,8 +155,9 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 Acceptance Artifact。
 Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
-同一 Thread、只读 checkout 中使用角色化短格式 Prompt 最多修复两次，且不增加领域 attempt；进程失败
-不会自动重试或替换 Thread。已有 Development 角色接收新的定向 Repair 时使用紧凑修复任务 Prompt，
+同一 Thread、只读 checkout 中使用角色化短格式 Prompt 最多修复两次，且不增加领域 attempt。进程异常只在
+ADR 0011 的边界内自动同 Thread 续接：普通异常最多一次，准确容量不足可持续恢复；续接使用当前角色的
+短 Prompt，不自动创建替代 Thread。已有 Development 角色接收新的定向 Repair 时使用紧凑修复任务 Prompt，
 保留当前边界、原始 Repair Evidence、完成条件与 Git 约束，不重复 Initial Development 专属说明。
 `resume` 默认复用已保存 Thread，并使用当前 Development、Repair、Reviewer 或 Publication 角色的更短
 Prompt，只补充继续同一次语义工作仍然需要的动态证据；`--new-thread` 只替换

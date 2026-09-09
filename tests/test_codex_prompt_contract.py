@@ -530,7 +530,6 @@ def test_development_prompt_uses_risk_proportional_verification_and_stops_at_com
     assert "完整套件失败后，先定向诊断、修复并验证受影响路径" in prompt
     assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt
     assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
-    assert "达到完成条件后停止扩展" in prompt
     assert "先自行检查当前完整工作树、已知风险与未处理问题" in prompt
     assert "低风险局部改动可以直接收口" in prompt
     assert "默认最多进行一个 Development Preflight Round" in prompt

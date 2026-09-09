@@ -794,7 +794,7 @@ Contract error：{contract_error}
   两者都从当前可用额度获得“最多还可自动启动”的剩余独立验收次数。Prompt 不包含预算窗口、
   checkpoint、fallback 或 resume 流程，次数信息不得降低验收标准或隐瞒必须修复的问题。
 - 新角色、新对象与新 Thread 使用完整标准 Prompt；已有 Development 角色的新定向 Repair 使用紧凑修复任务
-  Prompt；同一次语义工作继续执行时使用角色化短 Prompt。后两者都只补充当前必要动态证据，
+  Prompt；同一次语义工作自动或人工续接时使用角色化短 Prompt。后两者都只补充当前必要动态证据，
   不向 Agent 暴露 Thread、Resume 或执行失败状态。
 - Development、Reviewer 与 Publication 的 Structured Output Repair 分别只修复本角色输出格式，不重新
   执行语义工作或调用工具。
