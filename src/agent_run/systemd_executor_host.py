@@ -323,7 +323,10 @@ class SystemdUserExecutorHost:
     ) -> None:
         self.transport = transport or SubprocessSystemdTransport()
         self.runtime_directory = Path(runtime_directory)
-        self.executor_python = Path(executor_python).resolve()
+        # Resolve the Snapshot directory, but retain the venv Python symlink:
+        # resolving the executable itself loses pyvenv.cfg and its packages.
+        python = Path(executor_python)
+        self.executor_python = python.parent.resolve() / python.name
         self.environment: Mapping[str, str] | None = environment
         self.max_environment_bytes = max_environment_bytes
         self.runner_lease_fd = runner_lease_fd
