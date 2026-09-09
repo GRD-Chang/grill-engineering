@@ -61,11 +61,11 @@ JSON Schema 只定义形状；以下跨字段规则由本地 parser 强制：
 - 没有 `fail` 但至少一个 lane 为 `blocked`，Controller 进入 Human Blocker。
 - 三个 lane 均为 `pass`，才构成验收通过。
 
-Finding 是一个符合 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串。它表达一个必须处理的问题；任意 Finding 都使所属 lane `fail`。同一问题只进入最合适的一个 lane。只有同时处于当前 Review Boundary 内、违反当前需求或造成明确工程风险、有可复核证据、且能由当前 Job 修复的问题才进入 Finding。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他非阻塞建议不得进入 `findings`；实际遇到且由明确 sibling/follow-on Issue 承接的范围说明，可以用 `Deferred to #N：…` 写入最相关 lane 的 `evidence`，纯维护性建议、可选重构和文件大小偏好可以用 `Non-blocking observation：…` 写入 `evidence`。两者都不改变 lane 状态或触发 Repair；需要产品决定、权限、凭据或不可替代外部操作时使用 `blocked` evidence。
+Finding 是一个符合 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串。它表达一个必须处理的问题；任意 Finding 都使所属 lane `fail`。只有同时满足以下条件的问题才进入 Finding：属于当前 Review Boundary；有可复现、可定位的证据；违反明确当前需求或硬性工程合同，或者形成具体风险；保持现状会使当前验收对象不可接受；并且能由当前 Job 修复。明确需求或硬性合同的真实缺陷即使修复很小也仍是 Finding。同一根因的多个表现合并成最合适 lane 中的一条 Finding，并说明直接影响的同族场景。纯主观偏好、未来建议、基线已有问题、已完成 Ticket 的问题和其他不影响当前可接受性的建议不得进入 `findings`；实际遇到且由明确 sibling/follow-on Issue 承接的范围说明，可以用 `Deferred to #N：…` 写入最相关 lane 的 `evidence`。纯维护性建议或可选重构只有确有后续价值时才以 `Non-blocking observation：…` 写入 `evidence`，没有实际后续价值的轻微问题直接省略。两者都不改变 lane 状态或触发 Repair；需要产品决定、权限、凭据或不可替代外部操作时使用 `blocked` evidence。
 
 ## Reviewer Prompt Contract
 
-Reviewer 必须独立形成 E2E、Standards、Spec 三种视角并汇总其结果；`skill:code-review` 是 Standards 与 Spec 可使用的推荐 SOP，但不规定固定 subagent 数量、精确调用次数、调用顺序或嵌套层级。Harness 不记录、审计或限制内部调用；Reviewer 不得用自身判断替代缺失的独立视角。
+Reviewer 必须调用 `skill:code-review`，独立形成 E2E、Standards、Spec 三个维度并对最终 Artifact 负责。Prompt 不额外要求每个维度对应一个独立 subagent；Reviewer 按当前风险组织检查。所有审查或评价型 subagent 使用 `fork_turns: "none"`，并只接收当前范围、对象身份和中立事实。Harness 不记录、审计或限制内部调用。
 
 每个 lane 的 `evidence` 最低应包含：
 
@@ -73,4 +73,4 @@ Reviewer 必须独立形成 E2E、Standards、Spec 三种视角并汇总其结�
 - Standards：`审查范围或基线：…；结论：…`；
 - Spec：`已核对的验收标准：…；覆盖结论：…`。
 
-不得因为问题严重度低而隐瞒一个有证据且当前范围必须修复的问题；纯主观偏好、风格偏好、未来改进、基线问题和其他非阻塞建议不构成 Finding。
+不得因为修复量小而隐瞒一个违反明确需求或硬性合同、且会使当前对象不可接受的问题；纯主观偏好、风格偏好、未来改进、基线问题和其他非阻塞建议不构成 Finding。

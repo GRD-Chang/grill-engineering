@@ -15,6 +15,7 @@ from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.change_delivery_threads import record_reviewer as _record_reviewer
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.review_budget import reviewer_budget_context
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -60,6 +61,14 @@ def review(
     try:
         stage.publisher.prepare_validation(checkout, job, validation)
         request = stage.adapter.review_request(state, job, validation)
+        request["review_budget_context"] = reviewer_budget_context(
+            job,
+            stage.review_budget_policy(),
+            current_attempt_consumed=semantic_attempt.get("budget_consumed") is True,
+        )
+        if semantic_attempt.get("budget_consumed") is True:
+            request.pop("previous_acceptance_artifact", None)
+            request.pop("previous_review_identity", None)
         request["_invocation_event"] = stage._invocation_events(
             state,
             job,

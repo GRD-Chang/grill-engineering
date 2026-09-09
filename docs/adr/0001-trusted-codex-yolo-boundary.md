@@ -9,10 +9,12 @@ status: accepted
 Worker 只感知普通命令形态的受控只读 `gh`，不承担 adapter、socket、PATH 或挂载机制的知识。PATH 不构成该入口的权威绑定：Execution Guard 只检查 Worker PATH 与 Codex command-tool 的有效前置目录（`CODEX_INSTALL_DIR`，未设置时为 `~/.local/bin`），在其中收集当前存在且可执行的 `gh`，解析并去重 canonical regular-file target，再由 bubblewrap 把同一个 invocation-local adapter 只读绑定到这些 target；任一挂载失败都发生在 Codex payload 启动前。新 adapter 不再 prepend 到 PATH，只清理继承环境中失效的旧 adapter 项；bubblewrap 的原子挂载就是启动保障，不增加 sandbox launcher、`samefile` 或私有 probe，也不增加持久状态。Controller 位于该 mount namespace 外，继续使用原始真实 `gh` 或专用 GitHub App 执行 broker 已允许的读取。该机制不扫描 PATH 外文件、不建设通用 executable replacement、不处理 shell alias/function，也不防御可信 Agent 主动复制或下载替代客户端。普通测试使用 fake/local 边界；真实 Codex command-tool compatibility acceptance 只能显式 opt-in，不进入普通 pytest 或常规 CI。
 
 Controller 同样不审计 Codex 内部 subagent 的事件流、身份或 skill 调用 provenance。
-根据 Issue #125，Development 与 Repair Codex 先按 Review Boundary 做 scope triage，再根据实际
-改动风险选择 self-preflight、定向 Reviewer 或 `skill:code-review`；普通局部改动和已有明确 Finding
-的窄修复不固定派发整套预审，大型、跨模块或高风险改动仍应取得足够的开发侧审查。Fresh Acceptance
-与 Run Acceptance 继续形成独立的 E2E、Standards、Spec 三条正式验收 lane；`skill:code-review`
-是 Standards/Spec 可使用的推荐 SOP，但 Prompt 不规定固定 subagent 数量、精确调用次数、调用顺序
-或嵌套层级。Controller 只校验父 Reviewer Thread 的新鲜性、固定三 lane 的状态/证据和外层
-SHA/Revision 绑定。这是信任 Agent 的行为合同，不是由 Controller 重建的第二套 Agent 编排器。
+Initial Development 在实现、验证和自行检查后按风险判断独立预检能否增加价值；低风险可直接收口，
+需要预检时由 Prompt 规定默认最多一轮，一轮可以包含多个风险定向审查型 subagent。审查型 subagent
+使用 `fork_turns: "none"`，由 Development 提供完成审查所需的中立任务事实、当前范围和真实证据；
+明确 Repair source 的定向 Repair 不启动内部 Reviewer。Fresh Acceptance 与 Run Acceptance 继续形成
+独立的 E2E、Standards、Spec 三条正式验收 lane，并必须调用 `skill:code-review`。Reviewer 对三条
+lane 的最终判断负责；所有审查或评价型 subagent 使用 `fork_turns: "none"` 和中立任务事实。Reviewer 1 建立完整基线；Reviewer 2+ 优先核销原 Findings、检查 repair delta 与直接回归，
+缺少具体风险依据时避免重复完整扫描，并可按当前证据和实际影响自主扩大范围。Prompt 不固定
+每个维度对应的 subagent、任务包字段、检查命令、调用顺序或嵌套层级。Controller 只校验父 Reviewer Thread 的
+新鲜性、固定三 lane 的状态/证据和外层 SHA/Revision 绑定，不增加内部 Review 状态机或调用图审计。

@@ -52,6 +52,7 @@ from agent_run.review_budget import (
     mark_review,
     new_budget,
     previous_review_context,
+    reviewer_budget_context,
 )
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
@@ -259,6 +260,16 @@ class RunAcceptanceEngine:
                 ordinal=validation_attempt,
                 budget_window=int(ensure_budget(run, budget_policy)["window"]),
             )
+            request["review_budget_context"] = reviewer_budget_context(
+                run,
+                budget_policy,
+                current_attempt_consumed=(
+                    semantic_attempt.get("budget_consumed") is True
+                ),
+            )
+            if semantic_attempt.get("budget_consumed") is True:
+                request.pop("previous_acceptance_artifact", None)
+                request.pop("previous_review_identity", None)
             run["phase"] = "reviewing"
             self._save(state)
             if run.get("reviewer_new_thread") is True:

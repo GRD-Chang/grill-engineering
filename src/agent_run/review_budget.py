@@ -125,6 +125,41 @@ def ensure_budget(job: dict[str, Any], policy: ReviewBudgetPolicy) -> ReviewBudg
     return budget
 
 
+def reviewer_budget_context(
+    job: dict[str, Any],
+    policy: ReviewBudgetPolicy,
+    *,
+    current_attempt_consumed: bool,
+) -> dict[str, int]:
+    """Project the small amount of budget context useful to a Reviewer."""
+
+    used = ensure_budget(job, policy)["reviewer_invocations"]
+    if current_attempt_consumed:
+        if used < 1:
+            raise ValueError("a consumed Reviewer attempt requires a prior invocation")
+        current_attempt = used
+    else:
+        if used >= policy.review_limit:
+            raise ValueError("review budget is exhausted")
+        current_attempt = used + 1
+    return {
+        "current_review_attempt": current_attempt,
+        "remaining_review_attempts": policy.review_limit - current_attempt,
+    }
+
+
+def repair_budget_context(
+    job: dict[str, Any], policy: ReviewBudgetPolicy
+) -> dict[str, int]:
+    """Project completed and remaining reviews for a directed repair."""
+
+    completed = ensure_budget(job, policy)["reviewer_invocations"]
+    return {
+        "completed_review_attempts": completed,
+        "remaining_review_attempts": policy.review_limit - completed,
+    }
+
+
 def _validate_budget_projection(
     budget: Mapping[str, Any], location: str, policy: ReviewBudgetPolicy
 ) -> None:

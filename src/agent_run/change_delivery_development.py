@@ -22,6 +22,7 @@ from agent_run.credential_availability import (
 )
 from agent_run.git_errors import GitError, GitIntegrityError
 from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.review_budget import repair_budget_context
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,
@@ -98,6 +99,10 @@ def develop(
         }
     stage.save(state)
     request = stage.adapter.development_request(state, job, checkout)
+    if request.get("repair_source") is not None:
+        request["review_budget_context"] = repair_budget_context(
+            job, stage.review_budget_policy()
+        )
     request["_invocation_event"] = stage._invocation_events(
         state,
         job,

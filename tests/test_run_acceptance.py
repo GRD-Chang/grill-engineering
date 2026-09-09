@@ -1648,6 +1648,12 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     accepted = engine.accept(str(state["run_id"]))
 
     assert accepted["status"] == "run_publication_pending"
+    assert "previous_acceptance_artifact" not in agents.requests[1]
+    assert "previous_review_identity" not in agents.requests[1]
+    assert agents.requests[1]["review_budget_context"] == {
+        "current_review_attempt": 1,
+        "remaining_review_attempts": 10,
+    }
     run = accepted["run_acceptance"]
     assert run["reviewer_thread_ids"] == (
         ["blocked-run-reviewer", "new-run-reviewer"]

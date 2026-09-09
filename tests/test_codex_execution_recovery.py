@@ -100,7 +100,7 @@ def worker_fixture(
     "failures",
     [[CAPACITY, CAPACITY, "unexpected exit"], ["unexpected exit", CAPACITY, CAPACITY]],
 )
-def test_capacity_then_ordinary_continue_original_work(
+def test_capacity_then_ordinary_continue_with_short_role_prompt(
     tmp_path: Path, monkeypatch: Any, failures: list[str]
 ) -> None:
     calls = worker_fixture(monkeypatch, [*failures, "success"])
@@ -118,7 +118,12 @@ def test_capacity_then_ordinary_continue_original_work(
     assert len(calls) == 4
     assert sum(waits) == 60
     assert all("resume" in call["arguments"] for call in calls[1:])
-    assert len({call["prompt"] for call in calls}) == 1
+    assert "Development Brief" in calls[0]["prompt"]
+    assert all(
+        "继续完成你负责的当前开发交付" in call["prompt"]
+        for call in calls[1:]
+    )
+    assert len({call["prompt"] for call in calls[1:]}) == 1
     assert [
         facts["recovery_kind"]
         for kind, facts in events.events
@@ -158,7 +163,10 @@ def test_interrupted_last_json_repair_preserves_step(
     )
     assert len(calls) == 2
     assert all("summary missing" in call["prompt"] for call in calls)
-    assert all("不要修改文件" in call["prompt"] for call in calls)
+    assert all(
+        "不重新执行开发、验证或工具调用" in call["prompt"]
+        for call in calls
+    )
     assert all(
         call["arguments"][call["arguments"].index(str(tmp_path)) - 1] == "--ro-bind"
         for call in calls
@@ -356,7 +364,8 @@ def test_readonly_roles_continue_same_work(
     ) == "original-thread"
     assert len(calls) == 2
     assert "resume" in calls[1]["arguments"]
-    assert calls[0]["prompt"] == calls[1]["prompt"]
+    assert calls[0]["prompt"] != calls[1]["prompt"]
+    assert "继续完成你负责的当前" in calls[1]["prompt"]
     for call in calls:
         arguments = call["arguments"]
         assert arguments[arguments.index(str(tmp_path)) - 1] == "--ro-bind"

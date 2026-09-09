@@ -20,7 +20,9 @@ from agent_run.review_budget import (
     mark_development,
     mark_review,
     previous_review_context,
+    repair_budget_context,
     reset_budget,
+    reviewer_budget_context,
 )
 from agent_run.change_delivery_required_checks import observe_required_checks
 
@@ -73,6 +75,28 @@ def test_ticket_budget_has_bounded_attempts_reviews_and_final_ci_fix() -> None:
     for _ in range(3):
         mark_review(job, TICKET_POLICY)
     assert not can_start_review(job, TICKET_POLICY)
+
+
+def test_agent_facing_review_budget_context_handles_fresh_and_resumed_attempts() -> None:
+    job = _job_with_budget()
+    mark_review(job, TICKET_POLICY)
+
+    assert reviewer_budget_context(
+        job, TICKET_POLICY, current_attempt_consumed=False
+    ) == {
+        "current_review_attempt": 2,
+        "remaining_review_attempts": 1,
+    }
+    assert reviewer_budget_context(
+        job, TICKET_POLICY, current_attempt_consumed=True
+    ) == {
+        "current_review_attempt": 1,
+        "remaining_review_attempts": 2,
+    }
+    assert repair_budget_context(job, TICKET_POLICY) == {
+        "completed_review_attempts": 1,
+        "remaining_review_attempts": 2,
+    }
 
 
 def test_reset_budget_opens_numbered_window_without_old_attempts() -> None:
