@@ -13,6 +13,7 @@ dependencies = []
 dev = [
     "mypy==1.19.1",
     "pytest==9.0.2",
+    "pytest-xdist==3.8.0",
 ]
 
 [project.scripts]
@@ -25,6 +26,8 @@ where = ["src"]
 addopts = "-ra"
 pythonpath = ["src"]
 testpaths = ["tests"]
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 
 [tool.mypy]
 python_version = "3.11"

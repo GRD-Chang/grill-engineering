@@ -262,11 +262,13 @@ Required Check 失败时，Controller 读取失败 check 的名称、workflow、
 Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置明确声明的 code/test step
 被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
 
-新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、仓库根和 `.agent-run` state 目录，最多保留
+新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、仓库根、state 目录及 Repository/Parent 路由身份，最多保留
 最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；
 `status`、`history` 可以按当前仓库的唯一进行中 Run、`--parent`，或任意目录的
-`--repo + --parent` 选择。若没有唯一候选、存在多个 clone、索引失效或冲突，命令会列出候选并
-停止，绝不按最近时间猜测或全盘搜索。普通 mutation 与 Run-scoped `configure` 同样使用 Parent
+`--repo + --parent` 选择。可信身份能证明与目标无关的失效记录不会阻塞查询；旧记录若缺少 Parent 且 state 已丢失，
+则不能据此认定无关。若没有唯一候选、存在多个 clone、可能匹配的失效记录或身份冲突，命令会列出候选并
+停止，绝不按最近时间猜测或全盘搜索。查询成功和失败都不清理、补写或迁移索引与 Run state。
+普通 mutation 与 Run-scoped `configure` 同样使用 Parent
 位置参数并执行零匹配、多匹配和 repository mismatch 检查；完整 Run ID 与显式 state 目录仅是
 自动化和精确排障入口。改变 Run 的命令仍必须从目标仓库运行。
 

@@ -28,6 +28,7 @@ from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -1893,6 +1894,8 @@ def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
                 "repository_root": str(git_repo.resolve()),
                 "state_dir": str((git_repo / ".agent-run").resolve()),
                 "updated_at": locator["entries"][0]["updated_at"],
+                "repository": "example/project",
+                "parent_number": 1,
             }
         ]
     }
@@ -3190,7 +3193,7 @@ def test_status_and_history_show_incompatible_legacy_evidence(
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
-    result = run_cli(git_repo, fixture, command, run_id, "--json")
+    result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
     assert result.returncode == 0
     output = stdout_json(result)
@@ -3216,7 +3219,7 @@ def test_status_and_history_reject_an_invalid_timeline_without_mutation(
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
-    result = run_cli(git_repo, fixture, command, run_id, "--json")
+    result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
@@ -3234,7 +3237,7 @@ def test_history_rejects_a_timeline_with_a_non_event_without_mutation(
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
-    result = run_cli(git_repo, fixture, "history", run_id, "--json")
+    result = invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
@@ -3281,7 +3284,7 @@ def test_status_rejects_malformed_invocation_records(
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
-    result = run_cli(git_repo, fixture, "status", run_id, "--json")
+    result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
     assert result.returncode == 2
     assert stdout_json(result)["status"] == "incompatible_run_state"
@@ -3528,7 +3531,7 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
-    result = run_cli(git_repo, fixture, command, run_id, "--json")
+    result = invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
 
     assert result.returncode == 0
     assert json.loads(state_path.read_text(encoding="utf-8")) == before
@@ -3545,7 +3548,7 @@ def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> N
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
-    result = run_cli(git_repo, fixture, "status", run_id, "--json")
+    result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
     assert result.returncode == 2
     output = stdout_json(result)
@@ -3688,7 +3691,7 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
             ]
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
-        result = run_cli(git_repo, fixture, "status", run_id, "--json")
+        result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
         assert result.returncode == 0
         assert stdout_json(result)["next_action"] == expected_action
@@ -3865,7 +3868,7 @@ def test_triage_ticket_does_not_create_an_operator_gate(
     ]
     for command in ("status", "history"):
         view = stdout_json(
-            run_cli(git_repo, fixture, command, run_id, "--json")
+            invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
         )
         assert view["operator_action"] is None
 

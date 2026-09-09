@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.controller import _resume_review_budget_window
-from agent_run.delivery_policy import DeliveryPolicy
+from agent_run.delivery_policy import (
+    DeliveryPolicy,
+    parent_only_budget_policy,
+    resolve_delivery_policy,
+)
 from agent_run.review_budget import (
     RUN_POLICY,
     TICKET_POLICY,
@@ -115,6 +119,30 @@ def test_run_policy_allows_ten_developments_and_eleven_reviews() -> None:
         mark_review(job, RUN_POLICY)
     assert not can_start_review(job, RUN_POLICY)
     assert can_start_development(job, RUN_POLICY)
+
+
+def test_default_parent_policy_allows_exactly_ten_paired_rounds() -> None:
+    policy = parent_only_budget_policy(resolve_delivery_policy())
+    job = _job_with_budget()
+
+    assert policy.development_limit == policy.review_limit == 10
+    assert policy.fallback is False
+    assert policy.final_ci_fix_limit == 0
+    for ordinal in range(1, 11):
+        assert can_start_development(job, policy)
+        assert mark_development(job, policy, attempt_kind="ordinary") == ordinal
+        assert can_start_review(job, policy)
+        assert mark_review(job, policy) == ordinal
+
+    assert not can_start_development(job, policy)
+    assert not can_start_development(job, policy, attempt_kind="final_ci_fix")
+    assert not can_start_review(job, policy)
+    with pytest.raises(ValueError, match="development budget is exhausted"):
+        mark_development(job, policy, attempt_kind="ordinary")
+    with pytest.raises(ValueError, match="review budget is exhausted"):
+        mark_review(job, policy)
+    assert job["review_budget"]["development_attempts"] == 10
+    assert job["review_budget"]["reviewer_invocations"] == 10
 
 
 def test_parent_budget_resume_validates_old_window_before_applying_new_policy() -> None:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import shutil
 from pathlib import Path
 import subprocess
+from typing import Any
 
 import pytest
 
@@ -11,9 +13,33 @@ from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
 )
-from conftest import seed_run, write_fixture
+from conftest import _user_environment, seed_run, write_fixture
 from test_cli import issue, load_only_run_state, run_cli, stdout_json
 from run_acceptance_test_support import _canonical_run_budget
+
+
+@pytest.fixture(scope="module")
+def _valid_run_state_template(
+    tmp_path_factory: pytest.TempPathFactory, git_template: Path
+) -> dict[str, Any]:
+    """Prepare canonical persisted state once, isolated from every test's user."""
+
+    root = tmp_path_factory.mktemp("repair-state-template")
+    repo = Path(shutil.copytree(git_template, root / "repo"))
+    with pytest.MonkeyPatch.context() as environment:
+        for variable, value in _user_environment(root / "user").items():
+            environment.setenv(variable, value)
+        fixture = write_fixture(repo / "github.json", issues={"2": issue(2)})
+        seed_run(repo, fixture, "1")
+        state = load_only_run_state(repo)
+        require_current_run_state(state)
+    return state
+
+
+@pytest.fixture
+def valid_run_state(_valid_run_state_template: dict[str, Any]) -> dict[str, Any]:
+    # Nested job/budget mutations must never leak into the next parameter case.
+    return deepcopy(_valid_run_state_template)
 
 
 def _git_refs(repo: Path) -> str:
@@ -77,11 +103,9 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
 
 @pytest.mark.parametrize("repair_mode", ["squash", "merge_resolution"])
 def test_canonical_run_repair_modes_pass_state_validation(
-    git_repo: Path, repair_mode: str
+    valid_run_state: dict[str, Any], repair_mode: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -101,11 +125,9 @@ def test_canonical_run_repair_modes_pass_state_validation(
 
 @pytest.mark.parametrize("missing", ["run_acceptance", "repair_job"])
 def test_run_repair_snapshot_is_required_for_materialized_projections(
-    git_repo: Path, missing: str
+    valid_run_state: dict[str, Any], missing: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     run_snapshot = deepcopy(state["policy_snapshot"])
     repair_snapshot = deepcopy(run_snapshot)
     state["run_acceptance"] = {
@@ -131,11 +153,9 @@ def test_run_repair_snapshot_is_required_for_materialized_projections(
 
 
 def test_old_run_policy_snapshot_is_incompatible_without_inference(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     old_snapshot = deepcopy(state["policy_snapshot"])
     old_snapshot.pop("run_repair_rounds")
     state["policy_snapshot"] = old_snapshot
@@ -145,11 +165,9 @@ def test_old_run_policy_snapshot_is_incompatible_without_inference(
 
 
 def test_old_run_review_history_without_policy_snapshot_is_incompatible(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["active_ticket_job"] = None
     state["run_acceptance"] = {
         "phase": "blocked",
@@ -175,11 +193,9 @@ def test_old_run_review_history_without_policy_snapshot_is_incompatible(
 
 
 def test_run_repair_budget_window_must_match_run_acceptance(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     run_budget = _canonical_run_budget()
     repair_budget = _canonical_run_budget()
     repair_budget["window"] = 2
@@ -202,11 +218,9 @@ def test_run_repair_budget_window_must_match_run_acceptance(
 
 
 def test_run_repair_cannot_use_ticket_fallback_authority(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -227,11 +241,9 @@ def test_run_repair_cannot_use_ticket_fallback_authority(
 
 
 def test_direct_state_validation_rejects_missing_active_run_repair_mode(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -250,11 +262,9 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
 
 
 def test_waiting_run_repair_requires_an_exact_head_observation(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -276,11 +286,9 @@ def test_waiting_run_repair_requires_an_exact_head_observation(
 
 
 def test_legacy_projection_conflict_is_rejected_by_state_validation(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -319,11 +327,9 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
     ],
 )
 def test_state_contract_rejects_required_checks_result_bucket_contradictions(
-    git_repo: Path, result: str, checks: list[dict[str, str]]
+    valid_run_state: dict[str, Any], result: str, checks: list[dict[str, str]]
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -351,11 +357,9 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
 
 
 def test_fallback_receipt_observation_without_job_observation_is_incompatible(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["active_ticket_job"] = {
         "phase": "candidate",
         "fallback_publication_receipt": {
@@ -458,11 +462,9 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
 
 
 def test_canonical_integrated_revalidation_merge_passes_state_validation(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -482,11 +484,9 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
 
 
 def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
-    git_repo: Path,
+    valid_run_state: dict[str, Any],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
-    seed_run(git_repo, fixture, "1")
-    state = load_only_run_state(git_repo)
+    state = valid_run_state
     state["run_acceptance"] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),

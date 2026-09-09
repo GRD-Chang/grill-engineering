@@ -7,6 +7,7 @@ import pytest
 
 from cli_fixtures import run_agents
 from conftest import write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
 from test_cli_delivery import (
     HUMAN_BLOCKER,
@@ -276,7 +277,7 @@ def test_public_run_repair_human_blocker_resume_reuses_semantic_attempt(
     assert resume_event["human_response_supplied"] is True
     assert successor["resume_id"] == resume_event["resume_id"]
     history = stdout_json(
-        run_cli(
+        invoke_cli_inprocess(
             git_repo,
             fixture,
             "history",

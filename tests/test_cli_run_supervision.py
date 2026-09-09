@@ -223,6 +223,8 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
         git_repo / "github.json",
         issues={},
         delivery={"required_checks": ["none", "pending"]},
+        # Advance the existing clock; keep the real supervision budget.
+        supervision_clock_multiplier=120,
     )
     agents = _parent_only_agents(git_repo / "parent-only-agents.json")
     initial = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
@@ -231,6 +233,10 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     assert approval.returncode == 2
     assert stdout_json(approval)["status"] == "supervision_timeout"
     assert "approval_grant" in load_only_run_state(git_repo)["parent_job"]
+    wait = load_only_run_state(git_repo)["supervision_wait"]
+    assert wait["deadline"] - wait["started_at"] == 45 * 60
+    assert wait["elapsed_seconds"] >= 45 * 60
+    assert wait["retry_count"] > 1
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["body"] = "Changed after approval."

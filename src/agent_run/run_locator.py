@@ -8,9 +8,19 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NotRequired, TypedDict
 
 
 MAX_LOCATOR_ENTRIES = 32
+
+
+class LocatorEntry(TypedDict):
+    run_id: str
+    repository_root: str
+    state_dir: str
+    updated_at: str
+    repository: NotRequired[str]
+    parent_number: NotRequired[int]
 
 
 class RunLocatorError(ValueError):
@@ -42,13 +52,29 @@ class RunLocatorIndex:
         ).expanduser().resolve()
         return cls(state_home / "agent-run" / "run-locator.json")
 
-    def register(self, *, run_id: str, repository_root: Path, state_dir: Path) -> None:
-        entry = {
+    def register(
+        self,
+        *,
+        run_id: str,
+        repository_root: Path,
+        state_dir: Path,
+        repository: str | None = None,
+        parent_number: int | None = None,
+    ) -> None:
+        entry: LocatorEntry = {
             "run_id": run_id,
             "repository_root": str(repository_root.resolve()),
             "state_dir": str(state_dir.resolve()),
             "updated_at": self._now().isoformat(),
         }
+        if repository is not None or parent_number is not None:
+            if not _valid_route(repository, parent_number):
+                raise ValueError(
+                    "Run locator requires a repository and positive Parent number"
+                )
+            assert repository is not None and parent_number is not None
+            entry["repository"] = repository
+            entry["parent_number"] = parent_number
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._locked():
             entries = self._entries_or_raise()
@@ -107,10 +133,10 @@ class RunLocatorIndex:
             )
         return state_dir
 
-    def entries(self) -> list[dict[str, str]]:
+    def entries(self) -> list[LocatorEntry]:
         """Read the bounded index without pruning or otherwise mutating it."""
 
-        return [dict(entry) for entry in self._entries_or_raise()]
+        return [entry.copy() for entry in self._entries_or_raise()]
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -122,7 +148,7 @@ class RunLocatorIndex:
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    def _entries_or_raise(self) -> list[dict[str, str]]:
+    def _entries_or_raise(self) -> list[LocatorEntry]:
         if not self.path.exists():
             return []
         try:
@@ -144,14 +170,21 @@ class RunLocatorIndex:
             raise RunLocatorError(
                 "run_locator_invalid", "本机 Run 定位索引超过最大条目数；请显式提供 --state-dir。"
             )
-        entries: list[dict[str, str]] = []
+        entries: list[LocatorEntry] = []
+        routes: dict[str, tuple[str, int]] = {}
+        fields = {"run_id", "repository_root", "state_dir", "updated_at"}
         for raw_entry in raw_entries:
-            if not isinstance(raw_entry, dict) or set(raw_entry) != {
-                "run_id",
-                "repository_root",
-                "state_dir",
-                "updated_at",
-            } or not all(isinstance(value, str) and value for value in raw_entry.values()):
+            if (
+                not isinstance(raw_entry, dict)
+                or set(raw_entry) not in (fields, fields | {"repository", "parent_number"})
+                or not all(
+                    isinstance(raw_entry[key], str) and raw_entry[key] for key in fields
+                )
+                or (
+                    "repository" in raw_entry
+                    and not _valid_route(raw_entry["repository"], raw_entry["parent_number"])
+                )
+            ):
                 raise RunLocatorError(
                     "run_locator_invalid", "本机 Run 定位索引格式无效；请显式提供 --state-dir。"
                 )
@@ -162,10 +195,26 @@ class RunLocatorIndex:
                 raise RunLocatorError(
                     "run_locator_invalid", "本机 Run 定位索引格式无效；请显式提供 --state-dir。"
                 )
-            entries.append({key: raw_entry[key] for key in raw_entry})
+            entry: LocatorEntry = {
+                "run_id": raw_entry["run_id"],
+                "repository_root": raw_entry["repository_root"],
+                "state_dir": raw_entry["state_dir"],
+                "updated_at": raw_entry["updated_at"],
+            }
+            if "repository" in raw_entry:
+                entry["repository"] = raw_entry["repository"]
+                entry["parent_number"] = raw_entry["parent_number"]
+                route = (entry["repository"], entry["parent_number"])
+                if entry["run_id"] in routes and routes[entry["run_id"]] != route:
+                    raise RunLocatorError(
+                        "run_locator_conflict",
+                        "本机 Run 定位索引的同一 Run 身份不一致；请显式提供 --state-dir。",
+                    )
+                routes[entry["run_id"]] = route
+            entries.append(entry)
         return entries
 
-    def _write_entries(self, entries: list[dict[str, str]]) -> None:
+    def _write_entries(self, entries: list[LocatorEntry]) -> None:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.path.parent,
             prefix=".run-locator.",
@@ -190,6 +239,17 @@ class RunLocatorIndex:
         except BaseException:
             temporary_path.unlink(missing_ok=True)
             raise
+
+
+def _valid_route(repository: object, parent_number: object) -> bool:
+    return (
+        isinstance(repository, str)
+        and len(repository.split("/")) == 2
+        and all(repository.split("/"))
+        and not any(character.isspace() for character in repository)
+        and type(parent_number) is int
+        and parent_number > 0
+    )
 
 
 def _locator_message(run_id: str, detail: str) -> str:
