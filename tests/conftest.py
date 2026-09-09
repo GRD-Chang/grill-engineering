@@ -56,6 +56,14 @@ def git_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     repo = root / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=repo, env=environment, check=True, capture_output=True)
+    # Automatic maintenance may outlive commit and mutate this shared template
+    # during copytree. Disable dispatch before the first commit; copies inherit it.
+    subprocess.run(
+        ["git", "config", "--local", "maintenance.auto", "false"],
+        cwd=repo,
+        env=environment,
+        check=True,
+    )
     subprocess.run(["git", "config", "user.name", "Agent Run Tests"], cwd=repo, env=environment, check=True)
     subprocess.run(
         ["git", "config", "user.email", "agent-run-tests@example.invalid"],

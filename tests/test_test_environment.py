@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -62,6 +63,8 @@ def test_case(git_repo, tmp_path, case):
     before = {path.relative_to(host): path.read_bytes() for path in host.rglob("*") if path.is_file()}
     environment["PYTHONPATH"] = os.pathsep.join([str(project / "src"), str(project / "tests")])
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    git_trace = tmp_path / "git-trace.jsonl"
+    environment["GIT_TRACE2_EVENT"] = str(git_trace)
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          "--basetemp", str(tmp_path / "nested-tmp"), str(suite)],
@@ -69,4 +72,14 @@ def test_case(git_repo, tmp_path, case):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "2 passed" in result.stdout
+    # Check actual Git child dispatch, including the template's initial commit.
+    # Detached maintenance can otherwise keep mutating the template while copied.
+    automatic_maintenance = [
+        event["argv"]
+        for line in git_trace.read_text(encoding="utf-8").splitlines()
+        if (event := json.loads(line)).get("event") == "child_start"
+        and "--auto" in event["argv"]
+        and {"maintenance", "gc"}.intersection(event["argv"])
+    ]
+    assert not automatic_maintenance, automatic_maintenance
     assert {path.relative_to(host): path.read_bytes() for path in host.rglob("*") if path.is_file()} == before
