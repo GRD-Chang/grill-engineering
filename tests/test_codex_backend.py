@@ -321,7 +321,7 @@ def test_publication_repairs_invalid_output_in_same_thread(
     assert "thread_id=publication-thread" in binding_lines[1]
 
 
-def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
+def test_run_publication_repairs_empty_output_in_same_thread(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     attempts: list[list[str]] = []
@@ -337,7 +337,7 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
         artifact = {
             "result_kind": "publication",
             "commit_message": (
-                "invalid title"
+                "   "
                 if len(attempts) == 1
                 else "fix(run): publish accepted delivery"
             ),
@@ -383,7 +383,7 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
     )
 
 
-def test_run_publication_marks_exhausted_semantic_output_as_failed(
+def test_run_publication_marks_exhausted_empty_output_as_failed(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     events: list[tuple[str, dict[str, object]]] = []
@@ -396,9 +396,9 @@ def test_run_publication_marks_exhausted_semantic_output_as_failed(
             json.dumps(
                 {
                     "result_kind": "publication",
-                    "commit_message": "invalid title",
-                    "pr_title": "invalid title",
-                    "pr_body_markdown": "invalid body",
+                    "commit_message": "   ",
+                    "pr_title": "Publish the completed change",
+                    "pr_body_markdown": "The change is ready for review.",
                     "human_blockers": None,
                 }
             ),
@@ -511,6 +511,44 @@ def test_reviewer_repairs_invalid_output_with_reviewer_only_prompt(
     assert "Acceptance Artifact" in prompts[1]
     assert "不重新执行审查、验证或工具调用" in prompts[1]
     assert "上一输出未通过本地 Acceptance Artifact contract" not in prompts[1]
+
+
+def test_reviewer_accepts_natural_blocker_on_first_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = "发生了什么：缺少测试凭据。已尝试：检查继承环境。需要人工做什么：提供测试访问权限。"
+    artifact = passing_acceptance_artifact()
+    artifact["checks"]["e2e"] = {
+        "status": "blocked", "evidence": evidence, "findings": []
+    }
+    attempts: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(json.dumps(artifact), encoding="utf-8")
+        return subprocess.CompletedProcess(
+            arguments, 0,
+            '{"type":"thread.started","thread_id":"reviewer-thread"}\n', ""
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").review(
+        {
+            "checkout": str(tmp_path),
+            "acceptance_scope": "ticket",
+            "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
+        }
+    )
+
+    assert result.artifact == artifact
+    assert len(attempts) == 1
+    assert events[-1] == (
+        "completed", {"reported_thread_id": "reviewer-thread", "attempt_count": 1}
+    )
 
 
 def test_bound_model_and_effort_are_sent_on_fresh_resume_and_output_repair(
@@ -1510,7 +1548,7 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert "保持现状会使当前验收对象不可接受" in acceptance
     assert "同一根因的多个表现应合并报告" in acceptance
     assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in acceptance
-    assert "每条 Finding 都必须写在最合适 lane 的 findings 中" in acceptance
+    assert "每条 Finding 写明问题、证据、所需修复和复验方式，放在最合适 lane" in acceptance
     assert "pass 与 blocked 的 findings 必须为空" in acceptance
     assert "blocked 的 evidence 必须说明发生了什么" in acceptance
     assert "\"verdict\"" not in acceptance
@@ -1576,8 +1614,8 @@ def test_publication_prompts_require_semantic_titles(
     )
     ticket_prompt, run_prompt = prompts
 
-    assert "Conventional Commit 语义标题格式" in ticket_prompt
-    assert "Conventional Commit 语义标题格式" in run_prompt
+    assert "默认使用 Conventional Commit 标题，可按变更调整" in ticket_prompt
+    assert "默认使用 Conventional Commit 标题，可按变更调整" in run_prompt
     assert "`Primary Ticket: #" not in ticket_prompt
     assert "CI、Candidate、SHA、门禁和生命周期事实不得写入叙事" in run_prompt
 

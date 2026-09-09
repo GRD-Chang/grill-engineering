@@ -787,17 +787,14 @@ class CodexCliBackend:
             + previous_review
             + "\n\n"
             + "汇总三条 lane 的实际证据后，只输出符合 schema 的 Acceptance Artifact。"
-            "每条 Finding 都必须写在最合适 lane 的 findings 中，并严格采用现有 schema 要求的"
-            "字符串格式“问题：…；证据：…；必须修复：…；复验：…”，"
-            "同一问题不得跨 lane 重复。"
+            "每条 Finding 写明问题、证据、所需修复和复验方式，放在最合适 lane，勿跨 lane 重复。"
             "任何当前范围内、有证据且必须修复的 Finding 都使该 lane 为 fail；有 Finding 时绝不能"
             "写 pass。pass 与 blocked 的 findings 必须为空；blocked 的 evidence 必须说明发生了什么、"
             "已经尝试什么、以及人必须做什么。没有 fail 但存在 blocked 才是 Human Blocker；"
             "只有三个 lane 都 pass 才接受。纯主观偏好或当前范围外的未来想法不构成 Finding。"
             "Reviewer 应一次报告当前审查中已经可证明的全部必须修复 Finding，但不得为追求穷尽而扩大"
-            "Review Boundary。pass evidence 必须严格使用以下可复核标记：E2E 使用“操作或命令：…；"
-            "退出码：…；结果：…”，Standards 使用“审查范围或基线：…；结论：…”，Spec 使用“已核对"
-            "的验收标准：…；覆盖结论：…”。\n\n"
+            "Review Boundary。evidence 说明实际检查与结论：E2E 提供操作或命令、退出码和结果，"
+            "Standards 提供审查范围或基线，Spec 提供验收标准及覆盖情况。自由文本自然表达。\n\n"
             f"Acceptance Context:\n{_pretty(context)}"
         )
         return prompt
@@ -2012,11 +2009,8 @@ def _publication_contract(
         "关闭 Finding、Required Checks 通过或取得 Run Acceptance。"
         if fallback
         else (
-            "PR 叙事必须有四个非空二级标题：What Problem This Solves 写改前限制、改后能力和覆盖"
-            "边界；Why This Change Was Made 写关键设计路径与约束，不要逐文件罗列；User Impact 写"
-            "用户可执行的结果和兼容或迁移行为；Evidence 只使用完整独立验收三条 lane 的实际证据，"
-            "每条使用“场景 → 实际操作或命令 → 可观察结果”。不得用“tests passed”“已验证”“修复完成”"
-            "等没有场景、操作和结果的空泛表述，不得把开发者自述当作验证事实。Evidence 中的"
+            "Evidence 只使用完整独立验收三条 lane 的实际证据，说明场景、实际操作或命令与可观察"
+            "结果，不得把开发者自述当作验证事实。Evidence 中的"
             "`Deferred to #N：…` 和 `Non-blocking observation：…` 只是非阻塞审查信息，不得描述为"
             "当前交付范围的交付成果、已实现能力或 User Impact。CI、Candidate、SHA、门禁和生命周期"
             "事实不得写入叙事。"
@@ -2027,12 +2021,11 @@ def _publication_contract(
         + "\n\n只读取事实：不得修改 checkout、执行 Git/GitHub 写操作、执行验收或替代人工批准。"
         "若在 checkout 外创建临时路径，必须使其可定位、只服务本次任务并在完成前清理。"
         + "\n\n"
-        + "PR 叙事必须有四个非空二级标题：What Problem This Solves、Why This Change Was Made、"
-        "User Impact 和 Evidence。"
+        + "PR 默认模板：What Problem This Solves（改前限制与改后能力）、Why This Change Was Made"
+        "（设计理由）、User Impact（用户影响）、Evidence（实际证据）；按变更规模调整章节和措辞。"
         + evidence_contract
-        + "\n\n不得包含 closing keywords。commit_message 与 pr_title 都必须各自采用 Conventional "
-        "Commit 语义标题格式 `type: summary` 或 `type(scope): summary`，其中 type 只能是 "
-        "feat、fix、improve、refactor、docs、test、chore；不要使用自然语言标题。"
+        + "\n\n任务关联、关闭和完成信息由 Runner 填写；不得包含 closing keywords 或冒充发布事实。"
+        "commit_message 与 pr_title 默认使用 Conventional Commit 标题，可按变更调整。"
         + "\n\n"
         + _publication_human_blocker_instruction()
     )

@@ -773,7 +773,7 @@ def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestra
     assert "保持现状会使当前验收对象不可接受" in prompt
     assert "同一根因的多个表现应合并报告" in prompt
     assert "没有实际后续价值的轻微问题直接省略" in prompt
-    assert "问题：…；证据：…；必须修复：…；复验：…" in prompt
+    assert "问题、证据、所需修复和复验方式" in prompt
     assert "必须派发三个不同 subagent" not in prompt
     assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in prompt
     assert "任一 fail 将回到 Development" not in prompt
@@ -1283,12 +1283,19 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "记录实际验证对象、命令、exit code、结果和相关环境" in prompt, active_case
                 assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
                 assert "不得修复源码、测试、配置或 `.gitignore`" in prompt, active_case
+                assert "所需修复和复验方式" in prompt, active_case
+                assert "自由文本自然表达" in prompt, active_case
+                assert "必须严格使用" not in prompt, active_case
+                assert "严格采用" not in prompt, active_case
                 if name == "run_acceptance":
                     assert "跨 Ticket 交互" in prompt
                     assert "预期合并结果" in prompt
             else:
                 assert "What Problem This Solves" in prompt, active_case
-                assert "场景 → 实际操作或命令 → 可观察结果" in prompt, active_case
+                assert "实际操作或命令与可观察结果" in prompt, active_case
+                assert "按变更规模调整章节和措辞" in prompt, active_case
+                assert "任务关联、关闭和完成信息由 Runner 填写" in prompt, active_case
+                assert "必须有四个非空二级标题" not in prompt, active_case
                 assert "CI、Candidate、SHA、门禁和生命周期" in prompt, active_case
 
 

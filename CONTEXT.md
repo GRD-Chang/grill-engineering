@@ -17,7 +17,7 @@ Codex Worker 返回的结构化意图、判断与证据。它可以包含代码�
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **验收 Finding（Acceptance Finding）**:
-独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是符合 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串；它表达一个必须处理的问题，任一 Finding 都使所属 lane `fail`。只有同时处于当前 Review Boundary 内、有可复现和可定位的证据、违反明确当前需求或硬性工程合同或造成具体风险、保持现状会使当前验收对象不可接受、且能由当前 Job 修复的问题才构成 Finding。明确需求或硬性合同的真实缺陷不会因为修复量小而降级；同一根因的多个表现合并成最合适 lane 中的一条，并说明直接影响的同族场景。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。Reviewer 应一次报告当前审查中已经可证明的全部 Findings，不得故意逐轮滴漏；这不要求为追求穷尽而扩大 Review Boundary 或进行无边界探索。纯维护性建议、可选重构、文件大小偏好和其他非阻塞观察不得进入 `findings`，确有后续价值时可按 Non-blocking Observation 写入相关 lane 的 `evidence`，没有实际后续价值的轻微问题直接省略；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
+独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是自然说明问题、证据、所需修复和复验方式的非空字符串，不按固定措辞校验；它表达一个必须处理的问题，任一 Finding 都使所属 lane `fail`。只有同时处于当前 Review Boundary 内、有可复现和可定位的证据、违反明确当前需求或硬性工程合同或造成具体风险、保持现状会使当前验收对象不可接受、且能由当前 Job 修复的问题才构成 Finding。明确需求或硬性合同的真实缺陷不会因为修复量小而降级；同一根因的多个表现合并成最合适 lane 中的一条，并说明直接影响的同族场景。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。Reviewer 应一次报告当前审查中已经可证明的全部 Findings，不得故意逐轮滴漏；这不要求为追求穷尽而扩大 Review Boundary 或进行无边界探索。纯维护性建议、可选重构、文件大小偏好和其他非阻塞观察不得进入 `findings`，确有后续价值时可按 Non-blocking Observation 写入相关 lane 的 `evidence`，没有实际后续价值的轻微问题直接省略；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
 _Avoid_: 非空 Finding 的 pass、无行动依据的泛泛建议、Controller 解释或重写 Finding、重复写入多个 lane、故意逐轮滴漏
 
 **Delivery Quality Floor（交付质量底线）**:
@@ -553,7 +553,7 @@ _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败
 _Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
 
 **Review Finding（审查发现）**:
-Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串表达；所有 Finding 都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
+Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以非空字符串说明问题、证据、所需修复和复验方式，不要求固定格式；所有 Finding 都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
 _Avoid_: 风格意见、无证据猜测、实现方案命令
 
 **Acceptance Repair Loop（验收修复循环）**:

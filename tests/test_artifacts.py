@@ -271,12 +271,16 @@ def test_ticket_and_run_acceptance_share_the_strict_artifact_parser() -> None:
     assert run_acceptance.AcceptanceArtifact is AcceptanceArtifact
 
 
-def test_publication_rejects_non_semantic_commit_message() -> None:
+@pytest.mark.parametrize("title", ["修复状态显示", "feat: x", "Restore status reporting"])
+def test_publication_accepts_titles_and_adjusted_template(title: str) -> None:
     data = publication_data()
-    data["commit_message"] = "feat: x"
+    data["commit_message"] = title
+    data["pr_title"] = title
+    data["pr_body_markdown"] = "## 验证\n测试通过。\n\n## 改动\n恢复状态显示。"
 
-    with pytest.raises(ValueError, match="commit_message"):
-        PublicationArtifact.parse(data, primary_ticket=3)
+    artifact = PublicationArtifact.parse(data, primary_ticket=3)
+    assert artifact.commit_message == artifact.pr_title == title
+    assert artifact.pr_body_markdown == data["pr_body_markdown"]
 
 
 def test_failed_lane_requires_self_contained_findings() -> None:
@@ -360,7 +364,7 @@ def test_lane_rejects_empty_evidence_for_every_status_and_lane(
 
 
 @pytest.mark.parametrize("lane", ("e2e", "standards", "spec"))
-def test_pass_lane_requires_lane_specific_reviewable_evidence(lane: str) -> None:
+def test_pass_lane_accepts_evidence_without_fixed_markers(lane: str) -> None:
     data = passing_acceptance()
     checks = data["checks"]
     assert isinstance(checks, dict)
@@ -368,8 +372,8 @@ def test_pass_lane_requires_lane_specific_reviewable_evidence(lane: str) -> None
     assert isinstance(lane_data, dict)
     lane_data["evidence"] = "The review passed."
 
-    with pytest.raises(ValueError, match="pass evidence"):
-        AcceptanceArtifact.parse(data)
+    artifact = AcceptanceArtifact.parse(data)
+    assert artifact.checks[lane]["evidence"] == "The review passed."
 
 
 @pytest.mark.parametrize(
@@ -380,7 +384,7 @@ def test_pass_lane_requires_lane_specific_reviewable_evidence(lane: str) -> None
         ("spec", "已核对的验收标准：三个 lanes；覆盖结论："),
     ],
 )
-def test_pass_lane_rejects_empty_reviewable_evidence_values(
+def test_pass_lane_does_not_grade_values_inside_nonempty_prose(
     lane: str, evidence: str
 ) -> None:
     data = passing_acceptance()
@@ -390,8 +394,7 @@ def test_pass_lane_rejects_empty_reviewable_evidence_values(
     assert isinstance(lane_data, dict)
     lane_data["evidence"] = evidence
 
-    with pytest.raises(ValueError, match="pass evidence"):
-        AcceptanceArtifact.parse(data)
+    assert AcceptanceArtifact.parse(data).checks[lane]["evidence"] == evidence
 
 
 def test_failure_returns_to_development_before_blocked_lanes_route_to_human() -> None:
@@ -441,13 +444,13 @@ def test_acceptance_artifact_rejects_controller_owned_or_legacy_fields(
         AcceptanceArtifact.parse(data)
 
 
-def test_blocked_lane_requires_all_human_handoff_details() -> None:
+def test_blocked_lane_accepts_natural_language_human_handoff() -> None:
     data = passing_acceptance()
     checks = data["checks"]
     assert isinstance(checks, dict)
     checks["e2e"] = {
         "status": "blocked",
-        "evidence": "发生：permission is missing；尝试：re-ran the flow；人必须：grant access.",
+        "evidence": "发生了什么：访问失败。已尝试：重新运行。需要人工做什么：授予权限。",
         "findings": [],
     }
 
@@ -457,7 +460,7 @@ def test_blocked_lane_requires_all_human_handoff_details() -> None:
     assert artifact.blocker_evidence == (checks["e2e"]["evidence"],)
 
 
-def test_blocked_lane_rejects_incomplete_human_handoff() -> None:
+def test_blocked_lane_does_not_grade_handoff_content() -> None:
     data = passing_acceptance()
     checks = data["checks"]
     assert isinstance(checks, dict)
@@ -467,8 +470,7 @@ def test_blocked_lane_rejects_incomplete_human_handoff() -> None:
         "findings": [],
     }
 
-    with pytest.raises(ValueError, match="blocked evidence"):
-        AcceptanceArtifact.parse(data)
+    assert AcceptanceArtifact.parse(data).requires_human
 
 
 @pytest.mark.parametrize(
@@ -476,10 +478,10 @@ def test_blocked_lane_rejects_incomplete_human_handoff() -> None:
     [
         ("pass", ["问题：x；证据：x；必须修复：x；复验：x"], "pass check"),
         ("blocked", ["问题：x；证据：x；必须修复：x；复验：x"], "blocked check"),
-        ("fail", ["unstructured"], "findings must use"),
+        ("fail", [" \n"], "non-empty strings"),
     ],
 )
-def test_lane_findings_follow_status_and_format_contract(
+def test_lane_findings_follow_status_and_nonempty_contract(
     status: str, findings: list[str], error: str
 ) -> None:
     data = passing_acceptance()
@@ -531,9 +533,11 @@ def test_each_lane_enforces_its_status_to_findings_relationship(
         "问题：候选实现不符合要求；必须修复：修复候选实现；复验：重新执行独立复验。",
         "问题：候选实现不符合要求；证据：独立复验失败；复验：重新执行独立复验。",
         "问题：候选实现不符合要求；证据：独立复验失败；必须修复：修复候选实现。",
+        "The public command exits 1. Restore the missing flow and rerun it.",
+        "### 问题\n命令失败。\n- 修复入口后重新执行命令。",
     ],
 )
-def test_fail_finding_requires_all_four_self_contained_sections(finding: str) -> None:
+def test_fail_finding_accepts_free_text(finding: str) -> None:
     data = passing_acceptance()
     checks = data["checks"]
     assert isinstance(checks, dict)
@@ -543,8 +547,9 @@ def test_fail_finding_requires_all_four_self_contained_sections(finding: str) ->
         "findings": [finding],
     }
 
-    with pytest.raises(ValueError, match="findings must use"):
-        AcceptanceArtifact.parse(data)
+    artifact = AcceptanceArtifact.parse(data)
+    assert artifact.checks["e2e"]["findings"] == [finding]
+    assert artifact.outcome == "findings"
 
 
 @pytest.mark.parametrize("scope", ("root", "checks", "lane"))
@@ -628,7 +633,23 @@ def test_human_blocker_and_acceptance_schemas_expose_the_new_contract() -> None:
     }
     assert set(schema["properties"]) == {"checks"}
     assert acceptance_lane["required"] == ["status", "evidence", "findings"]
-    assert acceptance_lane["properties"]["findings"]["items"] == {"type": "string"}
+    for field in (
+        acceptance_lane["properties"]["evidence"],
+        acceptance_lane["properties"]["findings"]["items"],
+        development_or_human_blocker_schema()["properties"]["summary"],
+        *(
+            publication_or_human_blocker_schema()["properties"][key]
+            for key in ("commit_message", "pr_title", "pr_body_markdown")
+        ),
+    ):
+        assert field["minLength"] == 1
+        assert field["pattern"] == r"\S"
+    for wire_schema in (
+        development_or_human_blocker_schema(),
+        publication_or_human_blocker_schema(),
+    ):
+        assert wire_schema["properties"]["human_blockers"]["minItems"] == 1
+    assert acceptance_lane["properties"]["findings"]["items"]["type"] == "string"
 
 
 def test_prompt_docs_delegate_acceptance_shape_to_the_authoritative_contract() -> None:
