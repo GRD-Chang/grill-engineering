@@ -11,6 +11,7 @@ import pytest
 from agent_run.semantic_attempt import canonical_fingerprint
 from cli_fixtures import run_agents as _run_agents
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import (
     git_fetch_failure_wrapper,
     load_only_run_state,
@@ -270,10 +271,10 @@ def test_current_long_blocker_is_full_in_status_and_bounded_in_history(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
     )
     run_id = str(stdout_json(blocked)["run_id"])
-    status = run_cli(git_repo, fixture, "status", run_id)
-    history = run_cli(git_repo, fixture, "history", run_id)
+    status = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
+    history = invoke_cli_inprocess(git_repo, fixture, "history", run_id)
     history_json = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
 
     assert status.returncode == history.returncode == 0
@@ -321,8 +322,10 @@ def test_history_continues_after_timeline_capacity_without_new_invocations(
     completed = load_only_run_state(git_repo)
     assert len(completed["agent_invocation_history"]) == invocation_count
 
-    history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))
-    text = run_cli(git_repo, fixture, "history", run_id).stdout
+    history = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
+    )
+    text = invoke_cli_inprocess(git_repo, fixture, "history", run_id).stdout
 
     assert history["timeline"][-1]["kind"] == "timeline_capacity"
     assert completed["timeline_at_capacity"] is True
@@ -428,10 +431,10 @@ def test_history_keeps_later_invocations_after_an_early_timeline_tail(
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
-    history = run_cli(git_repo, fixture, "history", run_id, "--json")
+    history = invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     assert history.returncode == 0, (history.stdout, history.stderr)
     audit = stdout_json(history)
-    text = run_cli(git_repo, fixture, "history", run_id).stdout
+    text = invoke_cli_inprocess(git_repo, fixture, "history", run_id).stdout
 
     assert audit["timeline"] == [early_event]
     assert audit["events"][-1]["at"] > early_event["at"]
@@ -481,7 +484,7 @@ def test_status_shows_the_current_review_findings(
     )
     assert failed.returncode == 2
     run_id = stdout_json(failed)["run_id"]
-    status = run_cli(git_repo, fixture, "status", run_id)
+    status = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
     finding = review["checks"]["e2e"]["findings"][0]
 
     assert "当前 Findings（1）" in status.stdout
@@ -1201,16 +1204,18 @@ def test_status_and_history_show_started_development_attempt(
     )
 
     assert interrupted.returncode == 2
-    status = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+    status = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
+    )
     assert status["worker"] == {
         "attempt": 1,
         "phase": "developing",
         "role": "开发工作代理",
         "thread_id": None,
     }
-    timeline = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))[
-        "timeline"
-    ]
+    timeline = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
+    )["timeline"]
     assert any(
         entry.get("worker") == "开发工作代理"
         and entry.get("attempt") == 1
@@ -1228,7 +1233,7 @@ def test_status_offers_run_for_automatic_recovery_states(git_repo: Path) -> None
     for status in ("waiting_merge", "parent_closeout_pending"):
         state["status"] = status
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        rendered = run_cli(git_repo, fixture, "status", run_id)
+        rendered = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
         assert rendered.returncode == 0, rendered.stderr
         assert "下一步: agent-run run 1" in rendered.stdout
 
@@ -1251,7 +1256,9 @@ def test_premature_approve_does_not_mark_run_as_execution_failed(
     assert stdout_json(premature)["diagnostics"][-1]["code"] == "command_precondition"
     assert load_only_run_state(git_repo)["status"] == "active"
 
-    status = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+    status = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
+    )
     assert status["repository"] == "example/project"
     assert status["parent"]["number"] == 1
     assert status["worker"] is None

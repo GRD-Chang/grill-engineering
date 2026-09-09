@@ -12,6 +12,7 @@ from agent_run.git import GitRepository
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import (
     load_only_run_state,
     run_internal_stage,
@@ -791,7 +792,7 @@ def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
         if item["role"] == "development"
     ] == [1, 2, 3]
 
-    status = run_cli(git_repo, fixture, "status", run_id, "--json")
+    status = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
     status_output = stdout_json(status)
     assert status_output["semantic_agent_attempt"]["ordinal"] == 4
     assert status_output["next_action"] == (
@@ -1555,7 +1556,7 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
     failed_job = load_only_run_state(git_repo)["active_ticket_job"]
     failed_attempt = failed_job["pending_semantic_attempt"]
     assert failed_attempt["role"] == "reviewer"
-    status_view = run_cli(git_repo, fixture, "status", run_id).stdout
+    status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
     assert "类型: Execution Failure" in status_view
     assert "对象: Ticket #3" in status_view
     assert "阶段: reviewing" in status_view
@@ -1706,7 +1707,7 @@ def assert_human_status_and_history(
     expected_status: str = "ready_for_human",
 ) -> None:
     status = stdout_json(
-        run_cli(git_repo, fixture, "status", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
     )
     assert status["status"] == expected_status
     if expected_status == "ready_for_human":
@@ -1722,7 +1723,7 @@ def assert_human_status_and_history(
             for remaining in diagnostic.get("remaining_tickets", [])
         )
     history = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
     assert any(
         event.get("human_blockers") == [HUMAN_BLOCKER]
@@ -1813,7 +1814,9 @@ def test_parent_only_uses_configured_paired_rounds_and_shared_publication_gate(
     assert job["review_budget"]["reviewer_invocations"] == 2
     assert "fallback_publication_receipt" not in job
     assert job["phase"] == "ready_for_approval"
-    status = stdout_json(run_cli(git_repo, fixture, "status", state["run_id"], "--json"))
+    status = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "status", state["run_id"], "--json")
+    )
     assert status["review_budget"]["development_limit"] == 2
     assert status["review_budget"]["reviewer_limit"] == 2
 
@@ -3395,17 +3398,17 @@ def test_child_addition_cannot_continue_parent_only_delivery(
         assert stdout_json(result)["status"] == "unsupported_scope_change"
 
     status = stdout_json(
-        run_cli(git_repo, fixture, "status", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
     )
     assert status["scope_change"]["accepted_graph_revision"] == accepted
     assert status["scope_change"]["observed_graph_revision"] == observed
     assert "abandon" in status["next_action"]
-    status_text = run_cli(git_repo, fixture, "status", run_id).stdout
+    status_text = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
     assert accepted not in status_text
     assert observed not in status_text
     assert "Ticket 图变化：新增 1" in status_text
     history = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
     scope_events = [
         event
@@ -3417,7 +3420,7 @@ def test_child_addition_cannot_continue_parent_only_delivery(
     assert scope_events[0]["observed_graph_revision"] == observed
     assert scope_events[0]["graph_change_summary"]["added_tickets"] == [3]
     assert "abandon" in history["next_action"]
-    history_text = run_cli(git_repo, fixture, "history", run_id).stdout
+    history_text = invoke_cli_inprocess(git_repo, fixture, "history", run_id).stdout
     assert accepted not in history_text
     assert observed not in history_text
     assert "新增 Ticket [3]" in history_text
@@ -4189,8 +4192,12 @@ def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effect
     assert after_state["diagnostics"][0]["code"] == "foreign_run_pr"
     assert after_state["run_publication"]["pr_number"] == before_state["run_publication"]["pr_number"]
     assert after_state["agent_invocation_history"] == before_state["agent_invocation_history"]
-    status = run_cli(git_repo, fixture, "status", str(before_state["run_id"]), "--json")
-    history = run_cli(git_repo, fixture, "history", str(before_state["run_id"]), "--json")
+    status = invoke_cli_inprocess(
+        git_repo, fixture, "status", str(before_state["run_id"]), "--json"
+    )
+    history = invoke_cli_inprocess(
+        git_repo, fixture, "history", str(before_state["run_id"]), "--json"
+    )
     assert stdout_json(status)["status"] == "deterministic_contradiction"
     assert "agent-run run" not in stdout_json(status)["next_action"]
     assert "agent-run resume" not in stdout_json(history)["next_action"]
@@ -5023,7 +5030,7 @@ def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:
             "message": "Required Checks snapshot did not match the published PR identity",
         }
     ]
-    status_view = run_cli(git_repo, fixture, "status", run_id).stdout
+    status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
     assert "类型: Deterministic Contradiction" in status_view
     assert "对象: Ticket #3" in status_view
     assert "阶段: blocked" in status_view
