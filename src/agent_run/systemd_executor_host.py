@@ -132,6 +132,7 @@ class SubprocessSystemdTransport:
                 "--user",
                 "show",
                 unit,
+                "--property=LoadState",
                 "--property=ActiveState",
                 "--property=SubState",
                 "--property=ExecMainPID",
@@ -151,6 +152,10 @@ class SubprocessSystemdTransport:
             key, separator, value = line.partition("=")
             if separator:
                 fields[key] = value
+        # systemctl show can succeed for a missing unit with inactive/dead state
+        # and a default Description that carries no Executor binding.
+        if fields.get("LoadState") == "not-found":
+            return SystemdUnitObservation("absent", None, None, None)
         active = fields.get("ActiveState")
         substate = fields.get("SubState")
         status: Literal["absent", "starting", "running", "exited", "unknown"]

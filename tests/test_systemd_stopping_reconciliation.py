@@ -14,6 +14,46 @@ from agent_run.systemd_executor_host import (
 from agent_run.task_control import ActionBusyError, TaskControlStore, TaskKey
 
 
+@pytest.mark.parametrize(
+    "load_state, expected", [("not-found", "absent"), ("loaded", "conflict")]
+)
+def test_missing_unit_does_not_conflict_with_executor_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load_state: str, expected: str
+) -> None:
+    from agent_run import systemd_executor_host as systemd
+
+    def show(arguments: list[str], *, max_output: int) -> systemd._BoundedResult:
+        assert "--property=LoadState" in arguments
+        return systemd._BoundedResult(
+            0,
+            f"LoadState={load_state}\nActiveState=inactive\nSubState=dead\n"
+            "ExecMainPID=0\nDescription=unused.service\nResult=success\n",
+            "",
+        )
+
+    monkeypatch.setattr(systemd, "_run_bounded", show)
+    transport = SubprocessSystemdTransport()
+    transport.systemctl = "systemctl"
+    host = SystemdUserExecutorHost(
+        transport=transport,
+        runtime_directory=tmp_path / "runtime",
+        environment={},
+        executor_python=Path(sys.executable),
+    )
+    task = TaskKey(tmp_path, "owner/repo", 213)
+    spec = ExecutorSpec(
+        task=task,
+        action_id="new-action",
+        generation=1,
+        run_id=None,
+        command=("run", "213"),
+        cwd=tmp_path,
+        state_root=tmp_path / "state",
+        runner_binding="a" * 16,
+    )
+    assert host.observe(spec, TaskControlStore(tmp_path / "control")).status == expected
+
+
 @pytest.mark.parametrize("substate", ["stop-sigterm", "stop-sigkill"])
 @pytest.mark.parametrize("terminal", ["inactive", "failed"])
 def test_stopping_executor_requires_terminal_host_proof_before_successor(
