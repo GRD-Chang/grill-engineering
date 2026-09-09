@@ -245,8 +245,13 @@ Preflight Round。一轮可以包含多个不同风险方向的审查型 subagen
 
 ## Repair Prompt
 
-Repair 复用对应 Development 角色、需求边界与共享完成 block，只在中间注入一个来源 block。
-它始终接收当前对象的 Issue URL，但不复用 Initial Development 的固定重读要求：
+Repair 复用对应 Development 角色和需求边界，只注入一个来源 block。新 Development
+Thread 接收完整共享完成 block；已有 Development 角色开始新一轮定向 Repair 时接收
+紧凑的修复任务 Prompt，保留当前角色、Review Boundary、原始证据、完成条件、Git 边界、
+Human Blocker 和唯一交付物，不重复 Initial Development 专属的预检、完整测试方法和静态
+项目说明。
+
+Repair 始终接收当前对象的 Issue URL，但不复用 Initial Development 的固定重读要求：
 
 ```text
 当前 Issue URL 用于确认本轮修复对象和需求边界。以本轮原始 Repair Evidence、当前 checkout 和
@@ -263,6 +268,39 @@ Repair 不接收 Initial Development 自检与预检 block。它只看到已完�
 本轮以随后提供的原始 Repair Evidence 为权威修复入口。处理问题及避免直接回归所需的影响后，自行
 检查当前工作树并完成与风险相称的验证，然后返回 Development wire JSON。本轮只负责修复，不形成
 独立验收或确定性门禁结论。本轮不需要启动开发侧 Reviewer。
+```
+
+### 已有 Development 角色的新定向 Repair
+
+这是新的修复任务，不是中断执行的简单继续。Controller 从当前 `repair_source` 和已保存的
+Development 角色选择紧凑 Prompt；模型不需要知道 Thread 或流程转换：
+
+```text
+你是{当前 Development 角色}。使用 skill:implement 完成当前定向修复。
+
+{当前 Review Boundary}
+{当前 Repair source 原则}
+
+当前 Issue URL 用于确认修复对象和需求边界。以原始 Repair Evidence、当前 checkout 和已经掌握
+的需求为主要输入；只有在无法判断修复范围、证据与需求冲突，或需要核对具体 Acceptance
+Criteria 时，再通过只读 `gh issue view` 回查对应 Issue。
+
+当前对象：
+{parent_issue_url / task_issue_url}
+
+当前 Repair Evidence（verbatim）：
+{current_repair_evidence}
+
+采用最小且可维护的修复处理根因及其直接影响，并覆盖本次修复可能造成的直接回归；
+范围外能力、可选重构和未来扩展不属于本轮交付。当前 checkout 最终保留的交付修改会整体成为
+新的 Candidate Commit；只整理工作树，不暂存、commit、改写 Git 历史或写入远端。
+
+自行检查当前工作树并完成与风险相称的验证。本轮只负责修复，不形成独立验收或确定性门禁结论。
+本轮不需要启动开发侧 Reviewer。
+
+{根据当前可用额度投影的已完成和剩余独立验收次数}
+
+完成后只输出 Development wire JSON；summary 只陈述实际改动、实际验证和已知限制。
 ```
 
 ### Acceptance-sourced Repair
@@ -619,11 +657,12 @@ Hosted Required Checks 会在 PR 发布后由 Controller 读取；不要预先�
 
 Final Run Publication 不存在 fallback 分支，继续使用完整 Run Acceptance Artifact。
 
-## 角色化继续 Prompt
+## 角色化执行继续 Prompt
 
-同一角色继续完成同一对象时，Controller 根据已保存的角色和任务模式直接选择下列短 Prompt。模型不
-需要知道调用为何再次发生。若当前工作来自 Human Blocker，只在所选角色 Prompt 的动态证据位置提供
-当前 blocker 和维护者最新回复；不注入通用的恢复说明或完整回复历史。
+同一角色继续尚未完成的同一次语义工作时，Controller 根据已保存的角色和任务模式直接选择下列
+短 Prompt。它与“已有 Development 角色开始新定向 Repair”的紧凑修复任务 Prompt 分开。模型不需要
+知道调用为何再次发生。若当前工作来自 Human Blocker，只在所选角色 Prompt 的动态证据位置提供当前
+blocker 和维护者最新回复；不注入通用的恢复说明或完整回复历史。
 
 ### Initial Development 继续
 
@@ -751,10 +790,11 @@ Contract error：{contract_error}
   Reviewer 数量、任务包字段或检查命令；各类定向 Repair 不启动内部 Reviewer。
 - fallback Publication 不要求 `acceptance_artifact`，并明确不声称独立验收、CI、merge 或 Run Acceptance
   已通过；正常 Publication 仍只使用当前 Acceptance Artifact。
-- Initial Development 不包含预算或 Attempt 序号；定向 Repair 收到已完成和剩余自动验收次数，Reviewer
-  收到当前和剩余自动验收次数。Prompt 不包含预算窗口、checkpoint、fallback 或 resume 流程，次数信息
-  不得降低验收标准或隐瞒必须修复的问题。
-- 新角色、新对象与新 Thread 使用完整标准 Prompt；同角色同对象继续时由代码选择角色化短 Prompt，
-  只补充当前必要动态证据，不向 Agent 暴露 Thread、Resume 或执行失败状态。
+- Initial Development 不包含预算或 Attempt 序号；定向 Repair 收到已完成次数，Reviewer 收到当前次数；
+  两者都从当前可用额度获得“最多还可自动启动”的剩余独立验收次数。Prompt 不包含预算窗口、
+  checkpoint、fallback 或 resume 流程，次数信息不得降低验收标准或隐瞒必须修复的问题。
+- 新角色、新对象与新 Thread 使用完整标准 Prompt；已有 Development 角色的新定向 Repair 使用紧凑修复任务
+  Prompt；同一次语义工作继续执行时使用角色化短 Prompt。后两者都只补充当前必要动态证据，
+  不向 Agent 暴露 Thread、Resume 或执行失败状态。
 - Development、Reviewer 与 Publication 的 Structured Output Repair 分别只修复本角色输出格式，不重新
   执行语义工作或调用工具。

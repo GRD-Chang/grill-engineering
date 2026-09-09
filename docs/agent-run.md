@@ -156,8 +156,10 @@ Acceptance Artifact。
 Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中使用角色化短格式 Prompt 最多修复两次，且不增加领域 attempt；进程失败
-不会自动重试或替换 Thread。`resume` 默认复用已保存 Thread，并使用当前 Development、Repair、Reviewer
-或 Publication 角色的短 Prompt，只补充完成本轮仍然需要的动态证据；`--new-thread` 只替换
+不会自动重试或替换 Thread。已有 Development 角色接收新的定向 Repair 时使用紧凑修复任务 Prompt，
+保留当前边界、原始 Repair Evidence、完成条件与 Git 约束，不重复 Initial Development 专属说明。
+`resume` 默认复用已保存 Thread，并使用当前 Development、Repair、Reviewer 或 Publication 角色的更短
+Prompt，只补充继续同一次语义工作仍然需要的动态证据；`--new-thread` 只替换
 Invocation/Thread，不替换 Semantic Attempt，并使用当前角色和任务模式的完整标准 Prompt 新开 Thread。
 模型 Prompt 不说明 Thread、Resume、`execution_failed`、预算窗口或后继流程；Reviewer 与定向 Repair
 只接收从现有预算投影的简短审查次数。`--message` 只允许用于当前 Human Blocker；它 trim
@@ -417,7 +419,8 @@ E2E、Standards 和 Spec 三条独立验收 lane；Reviewer 必须调用 `skill:
 Controller 不解析 Codex 内部事件流来审计 subagent 身份或 skill 调用；它信任上述
 Prompt 合同，并确定性校验 Fresh 父 Reviewer 不复用 Development/旧 Reviewer Thread、
 三个 lane 均有合法状态和证据，以及外层 SHA/Revision 绑定。Reviewer Prompt 显示当前和剩余自动
-验收次数，定向 Repair 显示已完成和剩余次数；该投影不改变门禁或预算计数。
+验收次数，定向 Repair 显示已完成次数；两者都以“根据当前可用额度，最多还可自动启动”表达
+剩余独立验收次数。该投影不改变门禁或预算计数。
 
 Acceptance Artifact 根对象只包含 `checks`，其中固定 `e2e`、`standards`、`spec` 三条
 lane；每条 lane 只含 `status`、`evidence` 和 `findings`。任何 lane 的 Finding 都随完整

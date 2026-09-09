@@ -271,6 +271,14 @@ class CodexCliBackend:
                 repair_source=repair_source,
                 repair_evidence=repair_evidence,
             )
+        if _uses_compact_repair_prompt(request, repair_source=repair_source):
+            return _development_repair_prompt(
+                request,
+                role=role,
+                mode=mode,
+                repair_source=repair_source,
+                repair_evidence=repair_evidence,
+            )
         return (
             f"你是{role}。使用 skill:implement 完成开发或修复。"
             f"{mode}\n\n"
@@ -1405,6 +1413,15 @@ def _uses_short_role_prompt(
     return isinstance(blockers, list) and bool(blockers)
 
 
+def _uses_compact_repair_prompt(
+    request: dict[str, Any], *, repair_source: object
+) -> bool:
+    if repair_source is None or request.get("_invocation_mode") == "new-thread":
+        return False
+    thread_id = request.get("thread_id")
+    return isinstance(thread_id, str) and bool(thread_id.strip())
+
+
 def _human_continuation_block(request: dict[str, Any]) -> str:
     evidence: dict[str, Any] = {}
     blockers = request.get("prior_human_blockers")
@@ -1459,6 +1476,45 @@ def _development_continuation_prompt(
     )
 
 
+def _development_repair_prompt(
+    request: dict[str, Any],
+    *,
+    role: str,
+    mode: str,
+    repair_source: object,
+    repair_evidence: str,
+) -> str:
+    return (
+        f"你是{role}。使用 skill:implement 完成当前定向修复。{mode}\n\n"
+        + _review_boundary_instruction(
+            request.get("acceptance_scope"),
+            repair_scope=request.get("repair_scope"),
+        )
+        + "\n"
+        + _repair_contract(repair_source)
+        + "\n"
+        + _repair_completion_instruction(repair_source)
+        + "\n\n当前 Issue URL 用于确认修复对象和需求边界。以原始 Repair Evidence、当前 "
+        "checkout 和已经掌握的需求为主要输入；只有在无法判断修复范围、证据与"
+        "需求冲突，或需要核对具体 Acceptance Criteria 时，再通过只读 `gh issue view` "
+        "回查对应 Issue。"
+        + _current_object_block(request)
+        + "\n\n当前 Repair Evidence：\n"
+        + repair_evidence
+        + "\n\n采用最小且可维护的修复完成上述要求；范围外能力、可选重构和未来扩展"
+        "不属于本轮交付。"
+        "当前 checkout 最终保留的交付修改会整体成为新的 Candidate Commit；只整理工作树，"
+        "不暂存、commit、改写 Git 历史或写入远端。"
+        + "\n\n完成修复后，自行检查当前工作树并完成与风险相称的验证。本轮只负责修复，"
+        "不形成独立验收或确定性门禁结论。本轮不需要启动开发侧 Reviewer。"
+        + "\n\n保留本轮需要交付的代码、测试、文档和配置，清理本轮产生的临时、构建和测试产物。"
+        + "\n\n"
+        + _human_blocker_instruction()
+        + _review_budget_block(request, reviewer=False)
+        + "\n\n完成后只输出完整 Development wire JSON；summary 只陈述实际改动、实际验证和已知限制。"
+    )
+
+
 def _review_continuation_prompt(request: dict[str, Any], *, role: str) -> str:
     return (
         f"你是{role}。继续完成你负责的当前独立验收。以当前 Validation Checkout 和下面的准确"
@@ -1483,14 +1539,16 @@ def _review_budget_block(request: dict[str, Any], *, reviewer: bool) -> str:
         if type(current) is not int or current < 1:
             raise ValueError("current_review_attempt must be a positive integer")
         summary = (
-            f"这是当前对象的第 {current} 次独立验收；本轮之后还剩 {remaining} 次自动验收机会。"
+            f"这是当前对象的第 {current} 次独立验收；根据当前可用额度，"
+            f"本轮结束后最多还可自动启动 {remaining} 次独立验收。"
         )
     else:
         completed = context.get("completed_review_attempts")
         if type(completed) is not int or completed < 0:
             raise ValueError("completed_review_attempts must be a non-negative integer")
         summary = (
-            f"当前对象已经完成 {completed} 次独立验收；当前还剩 {remaining} 次自动验收机会。"
+            f"当前对象已经完成 {completed} 次独立验收；根据当前可用额度，"
+            f"最多还可自动启动 {remaining} 次独立验收。"
         )
     return (
         "\n\n"

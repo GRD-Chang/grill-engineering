@@ -590,20 +590,37 @@ def test_directed_repair_self_checks_without_internal_reviewer(
     request_extra: dict[str, Any],
     evidence_marker: str,
 ) -> None:
-    prompt = _capture_public_prompt(
+    full_prompt = _capture_public_prompt(
         tmp_path,
         monkeypatch,
         "develop",
         {"acceptance_scope": "ticket", **request_extra},
         name=f"directed-repair-{request_extra['repair_source']}",
     )
+    compact_prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "thread_id": "existing-development-thread",
+            **request_extra,
+        },
+        name=f"compact-directed-repair-{request_extra['repair_source']}",
+    )
 
-    assert evidence_marker in prompt
-    assert "自行检查当前工作树并完成与风险相称的验证" in prompt
-    assert "本轮不需要启动开发侧 Reviewer" in prompt
-    assert "Development Preflight Round" not in prompt
-    assert "审查型 subagent" not in prompt
-    assert "取得有效复查" not in prompt
+    for prompt in (full_prompt, compact_prompt):
+        assert evidence_marker in prompt
+        assert "自行检查当前工作树并完成与风险相称的验证" in prompt
+        assert "本轮不需要启动开发侧 Reviewer" in prompt
+        assert "Development Preflight Round" not in prompt
+        assert "审查型 subagent" not in prompt
+        assert "取得有效复查" not in prompt
+    assert "Development Brief" in full_prompt
+    assert "使用 skill:implement 完成当前定向修复" in compact_prompt
+    assert "Development Brief" not in compact_prompt
+    assert "Thread" not in compact_prompt
+    assert "Resume" not in compact_prompt
 
 
 @pytest.mark.parametrize(
@@ -796,9 +813,10 @@ def test_review_and_directed_repair_prompts_receive_bounded_budget_context(
     )
 
     assert "这是当前对象的第 2 次独立验收" in review
-    assert "本轮之后还剩 1 次自动验收机会" in review
+    assert "根据当前可用额度" in review
+    assert "本轮结束后最多还可自动启动 1 次独立验收" in review
     assert "已经完成 2 次独立验收" in repair
-    assert "当前还剩 1 次自动验收机会" in repair
+    assert "最多还可自动启动 1 次独立验收" in repair
     for prompt in (review, repair):
         assert "不改变验收标准" in prompt
         assert "不得隐瞒、降级或放行必须修复的问题" in prompt
@@ -1591,7 +1609,7 @@ def test_human_blocker_continuations_keep_each_roles_current_object_facts(
     assert "完整独立验收证据" in publication
 
 
-def test_new_semantic_repair_on_development_thread_uses_full_repair_prompt(
+def test_new_semantic_repair_on_development_thread_uses_compact_repair_prompt(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     prompt = _capture_public_prompt(
@@ -1600,6 +1618,8 @@ def test_new_semantic_repair_on_development_thread_uses_full_repair_prompt(
         "develop",
         {
             "acceptance_scope": "ticket",
+            "parent_issue_url": "PARENT_ISSUE_SENTINEL",
+            "task_issue_url": "TICKET_ISSUE_SENTINEL",
             "thread_id": "persistent-development-thread",
             "repair_source": "acceptance",
             "acceptance_artifact": {"finding": "REPAIR_SENTINEL"},
@@ -1607,10 +1627,41 @@ def test_new_semantic_repair_on_development_thread_uses_full_repair_prompt(
         name="new-semantic-repair",
     )
 
+    assert "你是当前 Ticket 的开发工程师" in prompt
+    assert "使用 skill:implement 完成当前定向修复" in prompt
+    assert "Acceptance Repair" in prompt
+    assert "REPAIR_SENTINEL" in prompt
+    assert "PARENT_ISSUE_SENTINEL" in prompt
+    assert "TICKET_ISSUE_SENTINEL" in prompt
+    assert "当前 Review Boundary 是 Ticket Contract" in prompt
+    assert "当前 checkout 最终保留的交付修改会整体成为新的 Candidate Commit" in prompt
+    assert "本轮不需要启动开发侧 Reviewer" in prompt
+    assert "Development Brief" not in prompt
+    assert "Development Preflight Round" not in prompt
+    assert "完整测试套件不是每轮默认的固定门槛" not in prompt
+    assert "继续完成你负责的当前修复交付" not in prompt
+
+
+def test_new_thread_directed_repair_keeps_full_role_contract(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "develop",
+        {
+            "acceptance_scope": "ticket",
+            "_invocation_mode": "new-thread",
+            "repair_source": "acceptance",
+            "acceptance_artifact": {"finding": "NEW_THREAD_REPAIR_SENTINEL"},
+        },
+        name="new-thread-semantic-repair",
+    )
+
     assert "Acceptance Repair" in prompt
     assert "Development Brief" in prompt
-    assert "REPAIR_SENTINEL" in prompt
-    assert "继续完成你负责的当前修复交付" not in prompt
+    assert "NEW_THREAD_REPAIR_SENTINEL" in prompt
+    assert "使用 skill:implement 完成当前定向修复" not in prompt
 
 
 def test_resume_mode_without_a_valid_thread_uses_the_full_role_prompt(
