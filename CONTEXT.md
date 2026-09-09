@@ -585,6 +585,7 @@ Development–Acceptance Engine 在独立验收后本地持久化的权威记录
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Delivery Progress View（交付进度视图）**:
+面向用户的当前工作摘要与关键工作历程；Agent 角色统一称为“开发 Agent／验收 Agent／发布 Agent”，工作动作使用“整体修复／整体验收／发布”等可理解名称。已确认的新版展示合同发布于 相关设计记录，本地副本见 [status/history 展示规格](docs/specs/status-history-human-readable.md)，其中的规则优先于下文旧版展示细节；该规格不代表实现已完成。
 `status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
 _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
 
