@@ -1899,8 +1899,22 @@ def _is_unbound_successor_of_receipt(
     action: Mapping[str, Any],
     receipt: Mapping[str, Any],
 ) -> bool:
+    executor = record.get("executor")
+    # Rejected entry preconditions leave the previous Run receipt untouched;
+    # a proven exited, unapplied successor is not evidence of a conflicting Run.
+    rejected_before_application = (
+        action.get("status") == "failed"
+        and isinstance(executor, Mapping)
+        and executor.get("status") in {"exited", "absent"}
+        and executor.get("action_id") == action.get("action_id")
+        and executor.get("generation") == action.get("executor_generation")
+        and executor.get("run_id") is None
+    )
     if (
-        action.get("status") not in _ACTIVE_ACTION_STATUSES
+        (
+            action.get("status") not in _ACTIVE_ACTION_STATUSES
+            and not rejected_before_application
+        )
         or action.get("run_id") is not None
         or action.get("application_observed") is not False
     ):
@@ -1916,7 +1930,7 @@ def _is_unbound_successor_of_receipt(
             continue
         if all(
             predecessor.get(key) == receipt.get(key)
-            for key in ("action_id", "kind", "payload_digest")
+            for key in ("action_id", "kind", "payload_digest", "executor_generation")
         ) and predecessor.get("run_id") == receipt.get("run_id"):
             return True
     return False

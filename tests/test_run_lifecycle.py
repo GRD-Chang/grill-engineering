@@ -2123,6 +2123,71 @@ def test_executor_caller_can_read_its_action_after_a_successor_is_claimed(
     assert historical["action"]["action_id"] == first.action_id
 
 
+@pytest.mark.parametrize("unknown_receipt", [False, True])
+def test_bound_successor_reconciles_receipt_after_selecting_its_run(
+    tmp_path: Path, unknown_receipt: bool,
+) -> None:
+    task = _task(tmp_path)
+    control = TaskControlStore(tmp_path / "state")
+    states = _InMemoryRunState()
+    first = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert first.action_id is not None
+    control.bind_run(task, first.action_id, "run-1")
+    control.begin_executor(task, action_id=first.action_id, run_id="run-1")
+    prepare_action_application_receipt(states.value, first.action or {})
+    if unknown_receipt:
+        original_receipt = states.value["action_application_receipt"]
+        assert isinstance(original_receipt, dict)
+        states.value["action_application_receipt"] = {
+            **original_receipt,
+            "payload_digest": "unknown-payload",
+        }
+    control.finish_executor(
+        task, action_id=first.action_id, generation=1, result_status="blocked"
+    )
+    successor = control.claim_action(task, kind="run", payload={"parent": 156})
+    assert successor.action_id is not None
+    reservation = control.begin_executor(
+        task, action_id=successor.action_id, run_id=None
+    )
+    states.value["status"] = "blocked"
+    lifecycle = RunLifecycle(
+        states=states,  # type: ignore[arg-type]
+        control=control,
+        host=BoundExecutorHost(
+            action_id=successor.action_id, generation=reservation.generation
+        ),
+        task=task,
+        preflight=lambda: None,
+        select_run=lambda _action: (dict(states.value), True),
+        initialize_profile=None,
+        executor_spec=lambda run_id, action_id, generation: ExecutorSpec(
+            task=task, action_id=action_id, run_id=run_id, generation=generation
+        ),
+        execute=lambda _run_id: dict(states.value),
+        sleep=lambda _seconds: None,
+    )
+
+    if unknown_receipt:
+        before = dict(states.value)
+        with pytest.raises(ActionReconciliationError, match="另一个 Lifecycle Action"):
+            lifecycle.execute_claimed(
+                action_id=successor.action_id, generation=reservation.generation
+            )
+        assert states.value == before
+        return
+
+    state, _resumed, receipt = lifecycle.execute_claimed(
+        action_id=successor.action_id, generation=reservation.generation
+    )
+
+    assert state["status"] == "blocked"
+    assert receipt.status == "completed"
+    assert receipt.action_id == successor.action_id
+    assert state["action_application_receipt"]["action_id"] == successor.action_id
+    assert receipt.executor_generation == 2
+
+
 def test_run_can_replace_a_terminal_receipt_with_a_successor_action(
     tmp_path: Path,
 ) -> None:

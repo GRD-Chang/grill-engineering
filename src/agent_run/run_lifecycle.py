@@ -905,6 +905,13 @@ class RunLifecycle:
             )
             state, resumed = self.select_run(action)
             run_id = _string_field(state, "run_id")
+            # External Executors start with an unbound Action, so its Run (and
+            # predecessor receipt) may only become known during selection.
+            receipt_predecessor = replace_receipt_action_id
+            if receipt_predecessor is None:
+                receipt_predecessor = _receipt_owner_action_id(
+                    self.control.snapshot(self.task, action_id), state
+                )
             self.control.bind_run(
                 self.task,
                 action_id,
@@ -927,7 +934,7 @@ class RunLifecycle:
                 generation=generation,
                 resumed=resumed,
                 execution_context=execution_context,
-                replace_receipt_action_id=replace_receipt_action_id,
+                replace_receipt_action_id=receipt_predecessor,
             )
 
         execute_action = _ExecutorDispatch(
