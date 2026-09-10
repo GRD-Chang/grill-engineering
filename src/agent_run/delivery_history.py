@@ -482,7 +482,7 @@ def _subject_label(state: dict[str, Any], subject: str) -> str:
 def _role_family(role: str) -> str | None:
     if role == "development":
         return "development"
-    if role in {"reviewer", "fresh_acceptance"}:
+    if role in {"review", "reviewer", "fresh_acceptance"}:
         return "review"
     if role in {"publication", "final_publication"}:
         return "publication"

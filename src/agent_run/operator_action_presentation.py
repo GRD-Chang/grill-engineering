@@ -82,7 +82,7 @@ def print_operator_action(
     action: dict[str, Any], *, run_id: object = None
 ) -> None:
     print("操作者动作:")
-    print(f"类型: {action['type']}")
+    print(f"类型: {_human_action_type(action['type'])}")
     print(f"对象: {action['object']}")
     print(f"阶段: {action['phase']}")
     for reason in action["reasons"]:
@@ -91,7 +91,7 @@ def print_operator_action(
     if isinstance(invocation, dict):
         print(
             "触发阻塞的 Agent: "
-            f"{invocation['role']}；model {invocation['model']}；"
+            f"{_human_agent_role(invocation['role'])}；model {invocation['model']}；"
             f"reasoning effort {invocation['reasoning_effort']}；"
             f"本轮时长: {invocation['duration_seconds']} 秒"
         )
@@ -103,6 +103,35 @@ def print_operator_action(
         "唯一下一步: "
         f"{human_next_action(action['next_action'], run_id=run_id)}"
     )
+
+
+def _human_action_type(value: object) -> str:
+    raw = str(value)
+    localized = {
+        "Human Blocker": "需要人工处理",
+        "Review Budget Checkpoint": "验收预算窗口已用尽",
+        "Execution Failure": "执行失败",
+        "Deterministic Contradiction": "确定性矛盾",
+        "Supervision Timeout Pause": "监督超时暂停",
+        "Operator Stopped": "操作者已停止",
+        "Requeue Required": "需要重新排队",
+        "Final Approval": "等待最终批准",
+        "Publication Retry Exhausted": "发布重试已耗尽",
+        "Abandonment Recovery": "放弃恢复处理中",
+    }.get(raw)
+    return f"{raw}（{localized}）" if localized else raw
+
+
+def _human_agent_role(value: object) -> str:
+    raw = str(value)
+    localized = {
+        "development": "开发 Agent",
+        "reviewer": "验收 Agent",
+        "fresh_acceptance": "验收 Agent",
+        "publication": "发布 Agent",
+        "final_publication": "发布 Agent",
+    }.get(raw)
+    return f"{raw}（{localized}）" if localized else raw
 
 
 def _human_preserved_results(value: object) -> str:

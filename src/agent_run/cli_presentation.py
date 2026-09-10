@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,6 +15,7 @@ from agent_run.delivery_policy import (
 from agent_run.delivery_progress import (
     history_progress_view,
     print_history_progress,
+    print_rich_status_progress,
     print_status_progress,
     run_elapsed_seconds,
     status_progress_view,
@@ -107,7 +110,9 @@ def _print_precondition_failure(
     print("下一步: " + str(human_next_action_for_state(state)))
 
 
-def _print_status(state: dict[str, object], *, as_json: bool) -> None:
+def _print_status(
+    state: dict[str, object], *, as_json: bool, plain: bool = False
+) -> None:
     active = _active_ticket_job(state)
     active_ticket = active.get("ticket_number") if active else None
     worker = _current_worker(state)
@@ -176,18 +181,23 @@ def _print_status(state: dict[str, object], *, as_json: bool) -> None:
         output["lifecycle_action"] = state.get("action_application_receipt")
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
-    print_status_progress(
-        state,
-        output,
-        progress,
-        display_term=_display_term,
-        print_operator_action=lambda action: _print_human_operator_action(
-            state, action
-        ),
-    )
+    if _use_rich_status(plain):
+        print_rich_status_progress(state, output, progress)
+    else:
+        print_status_progress(
+            state,
+            output,
+            progress,
+            display_term=_display_term,
+            print_operator_action=lambda action: _print_human_operator_action(
+                state, action
+            ),
+        )
 
 
-def _print_history(state: dict[str, object], *, as_json: bool) -> None:
+def _print_history(
+    state: dict[str, object], *, as_json: bool, plain: bool = False
+) -> None:
     timeline = state.get("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
@@ -258,6 +268,17 @@ def _print_history(state: dict[str, object], *, as_json: bool) -> None:
             state, action
         ),
     )
+
+
+def _use_rich_status(plain: bool) -> bool:
+    """Select decoration only when the output is an interactive color terminal."""
+
+    if plain or "NO_COLOR" in os.environ:
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    isatty = getattr(sys.stdout, "isatty", None)
+    return bool(callable(isatty) and isatty())
 
 
 def _current_semantic_attempt(
@@ -875,6 +896,7 @@ def _display_term(value: object) -> object:
         "execution_failed": "执行失败，可恢复",
         "operator_stopped": "操作者已停止，可恢复",
         "supervision_timeout": "监督超时暂停，可恢复",
+        "pending": "待处理",
         "blocked": "已阻塞",
         "incompatible_run_state": "状态协议不兼容",
         "unreviewed": "未验收",

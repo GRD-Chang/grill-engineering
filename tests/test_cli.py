@@ -63,6 +63,591 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
             build_parser().parse_args([internal_command, "run-id"])
 
 
+def test_status_and_history_expose_plain_output_switch() -> None:
+    status = build_parser().parse_args(["status", "run-id", "--plain"])
+    history = build_parser().parse_args(["history", "run-id", "--plain"])
+
+    assert status.plain is True
+    assert history.plain is True
+
+
+def test_status_does_not_fall_back_to_findings_from_another_work_subject(
+    git_repo: Path,
+) -> None:
+    finding = "问题：旧候选未修复；证据：old；必须修复：修复；复验：重跑"
+    passing_artifact = {
+        "checks": {
+            lane: {"status": "pass", "evidence": "evidence", "findings": []}
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "run_publication_pending",
+        "active_ticket_job": {
+            "ticket_number": 2,
+            "phase": "candidate",
+            "candidate_sha": "current",
+            "acceptance_record": {
+                "reviewed_candidate_sha": "current",
+                "artifact": passing_artifact,
+            },
+        },
+        "parent_job": {
+            "phase": "blocked",
+            "acceptance_artifact": {
+                "checks": {
+                    "e2e": {
+                        "status": "fail",
+                        "evidence": "old evidence",
+                        "findings": [finding],
+                    },
+                    "standards": {
+                        "status": "pass",
+                        "evidence": "old evidence",
+                        "findings": [],
+                    },
+                    "spec": {
+                        "status": "pass",
+                        "evidence": "old evidence",
+                        "findings": [],
+                    },
+                }
+            },
+        },
+        "diagnostics": [],
+    }
+    state["schema_version"] = 1
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+
+    result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
+    output = stdout_json(result)
+
+    assert output["progress"]["findings"] == []
+    assert output["progress"]["conclusion"] == "当前有效通过"
+
+
+@pytest.mark.parametrize(
+    ("publication_head", "expected_conclusion"),
+    [
+        ("run-head", "验收通过，等待发布"),
+        ("old-head", "尚无有效验收结论"),
+    ],
+)
+def test_status_binds_run_acceptance_verdict_to_publication_head(
+    git_repo: Path,
+    publication_head: str,
+    expected_conclusion: str,
+) -> None:
+    passing_artifact = {
+        "checks": {
+            lane: {"status": "pass", "findings": []}
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "publication_pending",
+        "run_acceptance": {
+            "phase": "accepted",
+            "reviewed_head_sha": "run-head",
+            "acceptance_record": {
+                "reviewed_head_sha": "run-head",
+                "artifact": passing_artifact,
+            },
+        },
+        "run_publication": {
+            "phase": "publication_pending",
+            "record": {"run_head_sha": publication_head},
+        },
+        "diagnostics": [],
+    }
+    state["schema_version"] = 1
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+
+    result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
+    output = stdout_json(result)
+
+    assert output["progress"]["current_object"] == "Run Publication"
+    assert output["progress"]["findings"] == []
+    assert output["progress"]["conclusion"] == expected_conclusion
+
+
+@pytest.mark.parametrize("phase", ["candidate", "reviewing"])
+@pytest.mark.parametrize("object_kind", ["ticket", "parent"])
+def test_status_keeps_acceptance_findings_until_repaired_candidate_is_accepted(
+    capsys: pytest.CaptureFixture[str], phase: str, object_kind: str
+) -> None:
+    finding = "问题：修复未完成；证据：旧候选失败；必须修复：完成修复；复验：重新验收"
+    failed_artifact = {
+        "checks": {
+            "e2e": {"status": "fail", "findings": [finding]},
+            "standards": {"status": "pass", "findings": []},
+            "spec": {"status": "pass", "findings": []},
+        }
+    }
+    passing_artifact = {
+        "checks": {
+            lane: {"status": "pass", "findings": []}
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    job: dict[str, object] = {
+        "phase": phase,
+        "repair_source": "acceptance",
+        "candidate_sha": "candidate-b",
+        "modification_attempts": 1,
+        "validation_attempts": 1,
+        "acceptance_record": {
+            "reviewed_candidate_sha": "candidate-a",
+            "artifact": failed_artifact,
+        },
+        "review_budget": _canonical_run_budget(),
+    }
+    if object_kind == "ticket":
+        job["ticket_number"] = 2
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "active",
+        "active_ticket_job": job if object_kind == "ticket" else None,
+        "parent_job": job if object_kind == "parent" else None,
+        "active_agent_invocation": (
+            {
+                "work_subject": (
+                    "ticket:2" if object_kind == "ticket" else "parent-only:run-1"
+                ),
+                "role": "reviewer",
+                "status": "running",
+                "started_at": "2026-09-09T00:00:00+00:00",
+            }
+            if phase == "reviewing"
+            else None
+        ),
+        "_executor_control": {"activity": "running"},
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    cli.cli_presentation._print_status(state, as_json=True)
+    before = json.loads(capsys.readouterr().out)
+
+    assert before["progress"]["findings"] == [finding]
+    assert before["progress"]["conclusion"] == (
+        "修复完成，待复验" if phase == "candidate" else "正在复验"
+    )
+
+    job["phase"] = "accepted"
+    job["acceptance_record"] = {
+        "reviewed_candidate_sha": "candidate-b",
+        "artifact": passing_artifact,
+    }
+    cli.cli_presentation._print_status(state, as_json=True)
+    after = json.loads(capsys.readouterr().out)
+
+    assert after["progress"]["findings"] == []
+    assert after["progress"]["conclusion"] == "当前有效通过"
+
+
+def test_status_uses_saved_publication_boundary_before_publication_record(
+    git_repo: Path,
+) -> None:
+    passing_artifact = {
+        "checks": {
+            lane: {"status": "pass", "findings": []}
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "run_publication_pending",
+        "run_acceptance": {
+            "phase": "accepted",
+            "reviewed_head_sha": "run-head",
+            "acceptance_record": {
+                "reviewed_head_sha": "run-head",
+                "artifact": passing_artifact,
+            },
+        },
+        "run_publication": {
+            "phase": "publishing",
+            "pending_semantic_attempt": {
+                "role": "publication",
+                "currentness_boundary": {"reviewed_head_sha": "run-head"},
+            },
+        },
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+
+    output = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
+    )
+
+    assert output["progress"]["current_object"] == "Run Publication"
+    assert output["progress"]["findings"] == []
+    assert output["progress"]["conclusion"] == "验收通过，等待发布"
+
+
+@pytest.mark.parametrize(
+    ("prior_failure", "activity", "expected"),
+    [
+        (False, "running", "首次验收中"),
+        (False, "not_running", "验收已中断，等待恢复"),
+        (False, "unknown", "验收状态无法确认"),
+        (False, "capacity_wait", "模型容量不足，等待自动续接首次验收"),
+        (False, "recovery_wait", "验收异常，正在自动续接首次验收"),
+        (True, "running", "正在复验"),
+        (True, "not_running", "验收已中断，等待恢复"),
+        (True, "unknown", "验收状态无法确认"),
+        (True, "capacity_wait", "模型容量不足，等待自动续接复验"),
+        (True, "recovery_wait", "验收异常，正在自动续接复验"),
+    ],
+)
+def test_status_distinguishes_first_acceptance_revalidation_and_activity(
+    capsys: pytest.CaptureFixture[str],
+    prior_failure: bool,
+    activity: str,
+    expected: str,
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "run_acceptance_pending",
+        "run_acceptance": {
+            "phase": "reviewing",
+            "validation_attempts": 1,
+            "unresolved_acceptance_artifact": (
+                {
+                    "checks": {
+                        "e2e": {
+                            "status": "fail",
+                            "findings": ["问题：旧失败；证据：e；必须修复：修复；复验：重跑"],
+                        }
+                    }
+                }
+                if prior_failure
+                else None
+            ),
+        },
+        "active_agent_invocation": {
+            "work_subject": "run-acceptance:run-1",
+            "role": "reviewer",
+            "status": "running",
+            "started_at": "2026-09-09T00:00:00+00:00",
+        },
+        "_executor_control": {"activity": activity},
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    if activity in {"capacity_wait", "recovery_wait"}:
+        state["_executor_control"] = {"activity": "running"}
+        state["active_agent_invocation"].update(
+            status="resuming",
+            recovery_waiting=True,
+            recovery_kind=(
+                "capacity" if activity == "capacity_wait" else "ordinary"
+            ),
+        )
+    cli.cli_presentation._print_status(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["progress"]["conclusion"] == expected
+
+
+@pytest.mark.parametrize(
+    ("phase", "activity", "expected"),
+    [
+        ("developing", "running", "上次验收失败，正在修复"),
+        ("developing", "interrupted", "上次验收失败，修复已中断，等待恢复"),
+        ("developing", "unknown", "上次验收失败，修复状态无法确认"),
+        ("developing", "capacity_wait", "上次验收失败，等待模型容量后自动续接修复"),
+        ("developing", "recovery_wait", "上次验收失败，修复异常，正在自动续接"),
+        ("repairing", "running", "上次验收失败，正在修复"),
+        ("repairing", "interrupted", "上次验收失败，修复已中断，等待恢复"),
+        ("repairing", "unknown", "上次验收失败，修复状态无法确认"),
+        ("repairing", "capacity_wait", "上次验收失败，等待模型容量后自动续接修复"),
+        ("repairing", "recovery_wait", "上次验收失败，修复异常，正在自动续接"),
+    ],
+)
+def test_status_repair_conclusion_respects_execution_activity(
+    capsys: pytest.CaptureFixture[str],
+    phase: str,
+    activity: str,
+    expected: str,
+) -> None:
+    finding = "问题：修复未完成；证据：旧候选失败；必须修复：完成修复；复验：重新验收"
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "active",
+        "active_ticket_job": {
+            "ticket_number": 2,
+            "phase": phase,
+            "repair_source": "acceptance",
+            "candidate_sha": "candidate-b",
+            "acceptance_record": {
+                "reviewed_candidate_sha": "candidate-a",
+                "artifact": {
+                    "checks": {
+                        "e2e": {"status": "fail", "findings": [finding]},
+                        "standards": {"status": "pass", "findings": []},
+                        "spec": {"status": "pass", "findings": []},
+                    }
+                },
+            },
+        },
+        "active_agent_invocation": {
+            "work_subject": "ticket:2",
+            "role": "development",
+            "status": "running",
+            "started_at": "2026-09-07T01:39:19+00:00",
+        },
+        "_executor_control": {"activity": "running"},
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    if activity == "interrupted":
+        state["_executor_control"] = {"activity": "not_running"}
+    elif activity == "unknown":
+        state["_executor_control"] = {"activity": "unknown"}
+    elif activity in {"capacity_wait", "recovery_wait"}:
+        state["active_agent_invocation"].update(
+            status="resuming",
+            recovery_waiting=True,
+            recovery_kind=(
+                "capacity" if activity == "capacity_wait" else "ordinary"
+            ),
+        )
+
+    cli.cli_presentation._print_status(state, as_json=True)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["progress"]["execution_activity"] == activity
+    assert output["progress"]["findings"] == [finding]
+    assert output["progress"]["conclusion"] == expected
+
+
+def test_status_exposes_current_cycle_rounds_alongside_window_budget(
+    git_repo: Path,
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "active",
+        "active_ticket_job": {
+            "ticket_number": 2,
+            "phase": "candidate",
+            "modification_attempts": 2,
+            "validation_attempts": 3,
+            "review_budget": {
+                **_canonical_run_budget(),
+                "window": 3,
+                "development_attempts": 5,
+                "reviewer_invocations": 4,
+                "final_ci_fix_used": True,
+            },
+        },
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+
+    json_result = invoke_cli_inprocess(
+        git_repo, fixture, "status", "run-1", "--json"
+    )
+    plain_result = invoke_cli_inprocess(
+        git_repo, fixture, "status", "run-1", "--plain"
+    )
+    output = stdout_json(json_result)
+    rounds = output["progress"]["round_progress"]
+
+    assert rounds["development_attempts"] == 5
+    assert rounds["reviewer_invocations"] == 4
+    assert rounds["cycle_development_attempts"] == 2
+    assert rounds["cycle_review_attempts"] == 3
+    assert rounds["development_attempt"] == 2
+    assert rounds["review_attempt"] == 3
+    assert "预算窗口 3：Development 5 /" in plain_result.stdout
+    assert "Review 4 /" in plain_result.stdout
+    assert "最终 CI 修复          True / 1" in plain_result.stdout
+    assert "当前周期 Ticket Development 2 轮（Attempt #2）" in plain_result.stdout
+    assert "当前周期 Ticket Review 3 轮（Attempt #3）" in plain_result.stdout
+
+
+def test_status_fails_closed_when_current_candidate_identity_is_missing(
+    git_repo: Path,
+) -> None:
+    stale_finding = "问题：旧候选；证据：old；必须修复：修复；复验：重跑"
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "active",
+        "active_ticket_job": {
+            "ticket_number": 2,
+            "phase": "candidate",
+            "review_budget": {
+                "review_artifacts": [
+                    {
+                        "candidate_sha": "old-candidate",
+                        "artifact": {
+                            "checks": {
+                                "e2e": {"status": "fail", "findings": [stale_finding]},
+                            }
+                        },
+                    }
+                ]
+            },
+        },
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+
+    result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
+    output = stdout_json(result)
+
+    assert output["progress"]["findings"] == []
+    assert output["progress"]["conclusion"] == "尚无有效验收结论"
+
+
+def test_plain_status_places_next_action_before_complete_finding_details(
+    git_repo: Path,
+) -> None:
+    finding = "问题：缺少修复；证据：feature.txt 只有一行；必须修复：补齐实现；复验：运行 CLI"
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "active",
+        "active_ticket_job": {
+            "ticket_number": 2,
+            "phase": "repairing",
+            "repair_source": "acceptance",
+            "unresolved_acceptance_artifact": {
+                "checks": {
+                    "e2e": {"findings": [finding]},
+                    "standards": {"findings": []},
+                    "spec": {"findings": []},
+                }
+            },
+        },
+        "diagnostics": [],
+    }
+    state["schema_version"] = 1
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+
+    result = invoke_cli_inprocess(
+        git_repo, fixture, "status", "run-1", "--plain"
+    )
+    output = result.stdout
+
+    assert output.index("下一步") < output.index("当前问题")
+    assert "问题：缺少修复" in output
+    assert "证据：feature.txt 只有一行" in output
+    assert "必须修复：补齐实现" in output
+    assert "复验：运行 CLI" in output
+
+
+@pytest.mark.parametrize("width", [60, 80, 120])
+def test_rich_status_wraps_long_findings_and_next_action(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    from io import StringIO
+    from rich.text import Text
+
+    class TerminalBuffer(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    finding_tail = "证据完整尾标"
+    finding = (
+        "问题：需要保留完整问题正文；证据："
+        f"/tmp/{'long-directory-' * 12}中文文件-{finding_tail}；"
+        "必须修复：完整保留该证据并同步覆盖同族路径；"
+        f"复验：在窄终端逐字符核对-{finding_tail}"
+    )
+    command_tail = "command-tail"
+    command = (
+        "agent-run run 1 --repo "
+        f"{'long-repository-name-' * 12}{command_tail}"
+    )
+    output = TerminalBuffer()
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setenv("COLUMNS", str(width))
+    monkeypatch.setenv("LINES", "40")
+    monkeypatch.setattr(
+        os,
+        "get_terminal_size",
+        lambda _fd: os.terminal_size((width, 40)),
+    )
+
+    cli.cli_presentation.print_rich_status_progress(
+        {},
+        {
+            "operator_action": {
+                "type": "Human Blocker",
+                "reasons": [],
+                "next_action": command,
+                "preserved": "当前状态与已有审计证据",
+                "phase": "developing",
+                "trigger_invocation": {
+                    "role": "review",
+                    "model": "status-model",
+                    "reasoning_effort": "high",
+                    "duration_seconds": 42,
+                },
+            }
+        },
+        {
+            "repository": "example/project",
+            "parent": {"number": 1, "title": "Status card"},
+            "status": "blocked",
+            "conclusion": "需要人工处理",
+            "phase": "developing",
+            "current_object": "Ticket #2",
+            "ticket_progress": None,
+            "round_progress": None,
+            "run_repair": None,
+            "elapsed_seconds": 1,
+            "current_agent": None,
+            "execution_activity": "not_running",
+            "next_action": command,
+            "findings": [finding],
+        },
+    )
+
+    rendered = output.getvalue()
+    visible = Text.from_ansi(rendered).plain
+    assert finding_tail in visible
+    assert command_tail in visible
+    assert f"命令：{command}" in visible
+    assert f"命令：{command}\n" in visible
+    assert visible.index(f"命令：{command}") < visible.index("下一步")
+    assert "触发阻塞的 Agent：验收 Agent（Review Agent）" in visible
+    assert "模型" in visible and "status-model" in visible
+    assert "推理强度" in visible and "high" in visible
+    assert "本轮时长" in visible and "42 秒" in visible
+    assert "\x1b[90m" not in rendered
+
+
 @pytest.mark.parametrize(
     ("command", "executor_bound", "expected"),
     [
@@ -1338,6 +1923,85 @@ def test_status_labels_the_latest_agent_with_its_own_ticket(
     assert "当前对象:   Ticket #3" in output
     assert "最近 Agent: Publication Agent · Ticket #2" in output
     assert "Publication Agent · Ticket #3" not in output
+
+
+def test_status_localizes_profiled_review_agent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "active",
+        "active_ticket_job": {
+            "ticket_number": 2,
+            "phase": "reviewing",
+        },
+        "active_agent_invocation": {
+            "work_subject": "ticket:2",
+            "invocation_role": "review",
+            "status": "failed",
+            "started_at": "2026-08-30T00:01:00+00:00",
+            "ended_at": "2026-08-30T00:02:00+00:00",
+            "model": "review-model",
+            "reasoning_effort": "high",
+        },
+        "agent_invocation_history": [
+            {
+                "work_subject": "ticket:2",
+                "invocation_role": "review",
+                "status": "failed",
+                "started_at": "2026-08-30T00:01:00+00:00",
+                "ended_at": "2026-08-30T00:02:00+00:00",
+                "model": "review-model",
+                "reasoning_effort": "high",
+            }
+        ],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=False)
+    output = capsys.readouterr().out
+
+    assert "最近 Agent: Review Agent · Ticket #2（验收 Agent）" in output
+    assert "最近 Agent: review ·" not in output
+
+    cli.cli_presentation._print_history(state, as_json=False)
+    history_output = capsys.readouterr().out
+
+    assert "Review Agent" in history_output
+    assert "· review ·" not in history_output
+
+
+def test_status_localizes_pending_publication_phase(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "publication_pending",
+        "run_acceptance": {
+            "phase": "accepted",
+            "reviewed_head_sha": "run-head",
+        },
+        "run_publication": {"phase": "pending"},
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_status(state, as_json=False)
+    output = capsys.readouterr().out
+
+    assert "阶段:       待发布" in output
+    assert "阶段:       pending" not in output
+
+    state["run_publication"] = {"phase": "pending"}
+    state["run_acceptance"] = {"phase": "pending"}
+    cli.cli_presentation._print_status(state, as_json=False)
+    output = capsys.readouterr().out
+
+    assert "阶段:       待验收" in output
+    assert "阶段:       pending" not in output
 
 
 def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(

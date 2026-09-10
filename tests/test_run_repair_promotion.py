@@ -665,7 +665,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
             assert "阶段:       开发中" in text_status.stdout
             assert "当前对象:   Run Acceptance" in text_status.stdout
             assert (
-                "最近 Agent: 运行修复开发工作代理 · Run Acceptance"
+                "最近 Agent: Development Agent · Run Acceptance（开发 Agent）"
                 in text_status.stdout
             )
             assert "Run Development     1 / 10 轮" in text_status.stdout

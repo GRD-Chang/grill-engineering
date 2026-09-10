@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import http.server
 import io
 import json
@@ -38,7 +39,9 @@ from agent_run.agents import PublicationResult
 from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.github_auth import (
     GitHubCredentialError,
+    _CancellableHTTPSHandler,
     _GitHubAppCredentialProvider,
+    _SigningProcessRegistry,
     _create_app_jwt,
     mint_read_only_installation_credential,
     mint_read_only_installation_token,
@@ -2834,6 +2837,56 @@ def test_worker_can_inspect_but_cannot_commit_checkout_with_git_directory(
     assert after == before
 
 
+def _install_local_gh_test_boundary(root: Path) -> tuple[Path, Path]:
+    """Provide a test-owned gh executable for direct bubblewrap tests."""
+
+    adapter = root / "local-gh-adapter"
+    target_directory = root / "local-gh-bin"
+    target_directory.mkdir()
+    target = target_directory / "gh"
+    script = """#!/usr/bin/env python3
+import json
+import os
+import ssl
+import sys
+import urllib.request
+
+arguments = sys.argv[1:]
+if arguments == ["--version"]:
+    print("gh version 2.0.0")
+    raise SystemExit(0)
+if arguments == ["auth", "token"]:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GH_ENTERPRISE_TOKEN")
+    if not token:
+        raise SystemExit(1)
+    print(token)
+    raise SystemExit(0)
+if len(arguments) != 4 or arguments[0] != "api" or arguments[2:] != ["--jq", ".number"]:
+    raise SystemExit("unsupported test gh invocation")
+host = os.environ.get("GH_HOST", "")
+if not host.startswith("localhost:"):
+    raise SystemExit("test gh must use the local HTTPS server")
+token = os.environ.get("GH_TOKEN") or os.environ.get("GH_ENTERPRISE_TOKEN")
+if not token:
+    raise SystemExit("test gh received no token")
+request = urllib.request.Request(
+    f"https://{host}/api/v3/{arguments[1]}",
+    headers={"Authorization": f"token {token}"},
+)
+context = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=context),
+)
+with opener.open(request, timeout=5) as response:
+    print(json.load(response)["number"])
+"""
+    for path in (adapter, target):
+        path.write_text(script, encoding="utf-8")
+        path.chmod(0o700)
+    return adapter, target
+
+
 def test_worker_has_real_git_helpers_and_read_only_gh_auth(
     git_repo: Path,
     tmp_path: Path,
@@ -2841,6 +2894,10 @@ def test_worker_has_real_git_helpers_and_read_only_gh_auth(
     temporary = tmp_path / "worker"
     temporary.mkdir()
     environment = worker_environment(temporary / "gh", "reader-secret")
+    gh_adapter, gh_target = _install_local_gh_test_boundary(tmp_path)
+    environment["PATH"] = (
+        f"{gh_target.parent}{os.pathsep}{environment['PATH']}"
+    )
     command = bubblewrap_command(
         [
             "sh",
@@ -2857,6 +2914,8 @@ def test_worker_has_real_git_helpers_and_read_only_gh_auth(
         temporary=temporary,
         writable_checkout=True,
         environment=environment,
+        gh_adapter=gh_adapter,
+        gh_targets=(gh_target,),
     )
 
     attempted = run_worker_process(
@@ -2930,6 +2989,10 @@ def test_worker_uses_gh_for_authenticated_remote_read(
         temporary = tmp_path / "worker"
         temporary.mkdir()
         environment = worker_environment(temporary / "gh", "reader-secret")
+        gh_adapter, gh_target = _install_local_gh_test_boundary(tmp_path)
+        environment["PATH"] = (
+            f"{gh_target.parent}{os.pathsep}{environment['PATH']}"
+        )
         environment.pop("GH_TOKEN")
         environment.update(
             {
@@ -2950,6 +3013,8 @@ def test_worker_uses_gh_for_authenticated_remote_read(
             temporary=temporary,
             writable_checkout=True,
             environment=environment,
+            gh_adapter=gh_adapter,
+            gh_targets=(gh_target,),
         )
 
         attempted = run_worker_process(
@@ -3696,6 +3761,7 @@ def test_app_credential_channel_close_interrupts_network_response(
         capture_output=True,
     )
     response_started = threading.Event()
+    client_read_started = threading.Event()
     release_response = threading.Event()
     calls = 0
     body = json.dumps(
@@ -3759,6 +3825,16 @@ def test_app_credential_channel_close_interrupts_network_response(
         "agent_run.github_auth._create_app_jwt",
         lambda *_arguments, **_options: "jwt",
     )
+    original_read = http.client.HTTPResponse.read
+
+    def synchronized_read(
+        response: http.client.HTTPResponse, *arguments: Any, **options: Any
+    ) -> bytes:
+        if response_started.is_set():
+            client_read_started.set()
+        return original_read(response, *arguments, **options)
+
+    monkeypatch.setattr(http.client.HTTPResponse, "read", synchronized_read)
     monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
     profile = GitHubAppProfile("123", "456", tmp_path / "private.pem")
     profile.private_key_path.write_text("private-key", encoding="utf-8")
@@ -3773,6 +3849,7 @@ def test_app_credential_channel_close_interrupts_network_response(
     try:
         credentials.start(socket_path)
         assert response_started.wait(timeout=2)
+        assert client_read_started.wait(timeout=2)
         renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
         close_started = time.monotonic()
         credentials.close()
@@ -3790,6 +3867,116 @@ def test_app_credential_channel_close_interrupts_network_response(
     assert not renewal_thread.is_alive()
     assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
     assert not socket_path.exists()
+
+
+def test_signing_registry_reclaims_resources_registered_after_cancel() -> None:
+    class Transport:
+        shutdown_called = False
+        close_called = False
+
+        def shutdown(self, _how: int) -> None:
+            self.shutdown_called = True
+
+        def close(self) -> None:
+            self.close_called = True
+
+    class Response:
+        def __init__(self, transport: Transport) -> None:
+            self.fp = type(
+                "FileObject",
+                (),
+                {"raw": type("RawSocket", (), {"_sock": transport})()},
+            )()
+            self.closed = False
+
+        def close(self) -> None:
+            assert self.fp.raw._sock.shutdown_called
+            self.closed = True
+
+    registry = _SigningProcessRegistry()
+    registry.cancel()
+    transport = Transport()
+    response = Response(transport)
+
+    registry.register_response(response)
+
+    assert transport.shutdown_called
+    assert transport.close_called
+    assert response.closed
+
+
+def test_signing_registry_cancels_before_https_connection_can_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    connection_seen = threading.Event()
+    stop_accept = threading.Event()
+
+    def accept_connection() -> None:
+        listener.settimeout(0.05)
+        while not stop_accept.is_set():
+            try:
+                accepted, _address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            connection_seen.set()
+            accepted.close()
+            return
+
+    accept_thread = threading.Thread(target=accept_connection)
+    accept_thread.start()
+    registry = _SigningProcessRegistry()
+    handler = _CancellableHTTPSHandler(registry)
+    connection_ready = threading.Event()
+    release_connection = threading.Event()
+    original_open_connection = handler._open_connection
+
+    def paused_open_connection(host: str, **options: Any) -> Any:
+        connection = original_open_connection(host, **options)
+        connection_ready.set()
+        assert release_connection.wait(timeout=2)
+        return connection
+
+    monkeypatch.setattr(handler, "_open_connection", paused_open_connection)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), handler)
+    request = urllib.request.Request(
+        f"https://127.0.0.1:{listener.getsockname()[1]}/token",
+        data=b"{}",
+        method="POST",
+    )
+    errors: list[BaseException] = []
+
+    def open_request() -> None:
+        try:
+            opener.open(request, timeout=15)
+        except BaseException as error:
+            errors.append(error)
+
+    request_thread = threading.Thread(target=open_request)
+    request_thread.start()
+    try:
+        assert connection_ready.wait(timeout=2)
+        cancel_started = time.monotonic()
+        registry.cancel()
+        release_connection.set()
+        request_thread.join(timeout=2)
+        assert time.monotonic() - cancel_started < 3
+        assert not request_thread.is_alive()
+        assert errors
+        assert not connection_seen.is_set()
+    finally:
+        release_connection.set()
+        registry.cancel()
+        request_thread.join(timeout=2)
+        stop_accept.set()
+        listener.close()
+        accept_thread.join(timeout=2)
+
+    assert not accept_thread.is_alive()
 
 
 def test_worker_gh_adapter_rejects_token_and_write_commands() -> None:
