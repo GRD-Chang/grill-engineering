@@ -15,6 +15,7 @@ from agent_run.delivery_policy import (
 from agent_run.delivery_progress import (
     history_progress_view,
     print_history_progress,
+    print_rich_history_progress,
     print_rich_status_progress,
     print_status_progress,
     run_elapsed_seconds,
@@ -153,8 +154,12 @@ def _print_status(
         "diagnostics": state.get("diagnostics", []),
         "scope_change": state.get("unsupported_scope_change"),
         "abandonment": state.get("run_abandonment"),
-        "agent_invocation": active_invocation,
-        "semantic_agent_attempt": semantic_attempt,
+        "agent_invocation": _public_invocation_view(active_invocation),
+        "semantic_agent_attempt": (
+            _history_attempt_view(semantic_attempt, include_history_facts=False)
+            if isinstance(semantic_attempt, dict)
+            else None
+        ),
         "output_attempt": _output_attempt(active_invocation),
         "budget_window": (
             semantic_attempt.get("budget_window")
@@ -196,7 +201,11 @@ def _print_status(
 
 
 def _print_history(
-    state: dict[str, object], *, as_json: bool, plain: bool = False
+    state: dict[str, object],
+    *,
+    as_json: bool,
+    plain: bool = False,
+    details: bool = False,
 ) -> None:
     timeline = state.get("timeline", [])
     if not isinstance(timeline, list):
@@ -208,6 +217,9 @@ def _print_history(
     if not isinstance(invocations, list):
         raise ValueError("agent_invocation_history must be an array")
     semantic_attempts = _semantic_attempt_history(state)
+    human_semantic_attempts = _semantic_attempt_history(
+        state, include_history_facts=True
+    )
     operation_retries = _publication_operation_retries(state)
     resume_audit = state.get("resume_audit")
     public_resume_audit = resume_audit if isinstance(resume_audit, dict) else {}
@@ -226,7 +238,12 @@ def _print_history(
         ),
         "operator_action": operator_action,
         "abandonment": state.get("run_abandonment"),
-        "agent_invocations": invocations,
+        "agent_invocations": [
+            _public_invocation_view(invocation)
+            if isinstance(invocation, dict)
+            else invocation
+            for invocation in invocations
+        ],
         "semantic_agent_attempts": semantic_attempts,
         "output_attempts": [
             {
@@ -253,21 +270,26 @@ def _print_history(
         progress_source = {
             **output,
             "next_action": human_next_action_for_state(state),
+            "semantic_agent_attempts": human_semantic_attempts,
         }
     progress = history_progress_view(state, progress_source)
     output.update(progress)
     if as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return
-    print_history_progress(
-        state,
-        progress_source,
-        progress,
-        display_term=_display_term,
-        print_operator_action=lambda action: _print_human_operator_action(
-            state, action
-        ),
-    )
+    if _use_rich_status(plain):
+        print_rich_history_progress(state, progress_source, progress, details=details)
+    else:
+        print_history_progress(
+            state,
+            progress_source,
+            progress,
+            display_term=_display_term,
+            print_operator_action=lambda action: _print_human_operator_action(
+                state, action
+            ),
+            details=details,
+        )
 
 
 def _use_rich_status(plain: bool) -> bool:
@@ -304,7 +326,9 @@ def _current_semantic_attempt(
     return pending_attempts[0] if pending_attempts else None
 
 
-def _semantic_attempt_history(state: dict[str, object]) -> list[dict[str, object]]:
+def _semantic_attempt_history(
+    state: dict[str, object], *, include_history_facts: bool = False
+) -> list[dict[str, object]]:
     attempts: list[dict[str, object]] = []
     seen: set[str] = set()
     for subject in semantic_attempt_subjects(state):
@@ -320,8 +344,50 @@ def _semantic_attempt_history(state: dict[str, object]) -> list[dict[str, object
             if not isinstance(attempt_id, str) or attempt_id in seen:
                 continue
             seen.add(attempt_id)
-            attempts.append(attempt)
+            attempts.append(_history_attempt_view(attempt, include_history_facts))
+    # The durable state keeps Attempts on their owning subject.  Accept the
+    # compact top-level projection as a read-only legacy/test input as well;
+    # this does not change the JSON contract emitted by history.
+    projected = state.get("semantic_agent_attempts")
+    if isinstance(projected, list):
+        for attempt in projected:
+            if not isinstance(attempt, dict):
+                continue
+            attempt_id = attempt.get("attempt_id")
+            if not isinstance(attempt_id, str) or attempt_id in seen:
+                continue
+            seen.add(attempt_id)
+            attempts.append(_history_attempt_view(attempt, include_history_facts))
     return attempts
+
+
+def _history_attempt_view(
+    attempt: dict[str, object], include_history_facts: bool
+) -> dict[str, object]:
+    view = dict(attempt)
+    if not include_history_facts:
+        # These bounded facts are for the human history projection only.  The
+        # machine-readable history keeps the existing Attempt shape.
+        view.pop("development_summary", None)
+        view.pop("publication", None)
+        view.pop("budget_snapshot", None)
+    return view
+
+
+def _public_invocation_view(
+    invocation: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """Keep private bounded Attempt facts out of machine-facing CLI JSON."""
+
+    if invocation is None:
+        return None
+    view = dict(invocation)
+    semantic_attempt = view.get("semantic_attempt")
+    if isinstance(semantic_attempt, dict):
+        view["semantic_attempt"] = _history_attempt_view(
+            semantic_attempt, include_history_facts=False
+        )
+    return view
 
 
 def _output_attempt(

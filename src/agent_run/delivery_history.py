@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, tzinfo
 from typing import Any
@@ -19,6 +21,143 @@ from agent_run.presentation_helpers import (
 
 HISTORY_DETAIL_LIMIT = 240
 _TRUNCATION_MARKER = "…（已截断；完整内容见 --json）"
+
+
+def _history_turning_points(
+    state: dict[str, Any], audit: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Project persisted lifecycle facts used as timeline turning points.
+
+    Ordinary timeline snapshots are deliberately omitted.  They describe the
+    same Attempt repeatedly and must not become extra human-facing rounds.
+    The private attempt id is used only for this renderer; it is not added to
+    the public JSON projection.
+    """
+
+    points: list[dict[str, Any]] = []
+    order = 0
+    for timeline in (audit.get("timeline"), audit.get("timeline_continuation")):
+        if not isinstance(timeline, list):
+            continue
+        for raw in timeline:
+            if not isinstance(raw, dict) or not isinstance(raw.get("at"), str):
+                continue
+            timestamp = _utc_timestamp(raw["at"])
+            if timestamp is None:
+                continue
+            blockers = raw.get("human_blockers")
+            details = (
+                [item for item in blockers if isinstance(item, str)]
+                if isinstance(blockers, list)
+                else []
+            )
+            kind = _timeline_kind(raw, details)
+            details.extend(_scope_change_details(raw))
+            event = {
+                "at": timestamp,
+                "kind": kind,
+                "object": _timeline_object(state, raw),
+                "phase": raw.get("phase"),
+                "status": raw.get("status"),
+                "role": raw.get("worker"),
+                "round": raw.get("attempt"),
+                "details": details,
+                "semantic_attempt_id": raw.get("semantic_attempt_id"),
+                "_order": order,
+            }
+            for key in (
+                "pr_number",
+                "commit_sha",
+                "thread_id",
+                "approval_granted_at",
+                "required_checks_result",
+                "required_checks_observed_at",
+                "required_checks_evidence",
+                "next_action",
+                "result",
+            ):
+                if raw.get(key) is not None:
+                    event[key] = raw[key]
+            order += 1
+            if _is_history_turning_point(event):
+                points.append(event)
+
+    responses = _human_responses_by_subject(state)
+    response_audit = state.get("human_response_audit")
+    audited_responses = response_audit if isinstance(response_audit, dict) else {}
+    resumes = audit.get("agent_resumes")
+    if isinstance(resumes, list):
+        for resume in resumes:
+            if not isinstance(resume, dict):
+                continue
+            raw_at = resume.get("requested_at")
+            timestamp = _utc_timestamp(raw_at) if isinstance(raw_at, str) else None
+            if timestamp is None:
+                continue
+            response_details: list[str] = []
+            if resume.get("human_response_supplied") is True:
+                audited_response = audited_responses.get(resume.get("resume_id"))
+                if isinstance(audited_response, str):
+                    response_details.append(audited_response)
+                else:
+                    subject_responses = responses.get(
+                        (
+                            str(resume.get("work_subject") or ""),
+                            resume.get("generation"),
+                        )
+                    )
+                    if subject_responses:
+                        response_details.append(subject_responses.pop(0))
+            points.append(
+                {
+                    "at": timestamp,
+                    "kind": "resume",
+                    "object": _subject_label(
+                        state, str(resume.get("work_subject") or "")
+                    ),
+                    "phase": resume.get("source_status"),
+                    "status": "resumed",
+                    "role": None,
+                    "round": None,
+                    "details": response_details,
+                    "semantic_attempt_id": resume.get("semantic_attempt_id"),
+                    "resume_id": resume.get("resume_id"),
+                    "_order": order,
+                }
+            )
+            order += 1
+    points.sort(key=lambda event: (event["at"], event["_order"]))
+    deduplicated: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for point in points:
+        identity = _history_turning_point_identity(point)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(point)
+    points = deduplicated
+    for point in points:
+        point.pop("_order", None)
+    return points
+
+
+def _history_turning_point_identity(point: dict[str, Any]) -> str:
+    """Deduplicate only the same persisted event, never a later operation."""
+
+    resume_id = point.get("resume_id")
+    if point.get("kind") == "resume" and isinstance(resume_id, str) and resume_id:
+        return json.dumps(
+            {"kind": "resume", "resume_id": resume_id},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    return json.dumps(
+        {key: value for key, value in point.items() if key != "_order"},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
 
 def history_progress_view(
     state: dict[str, Any], audit: dict[str, Any]
@@ -42,14 +181,16 @@ def print_history_progress(
     *,
     display_term: Callable[[object], object],
     print_operator_action: Callable[[dict[str, Any]], None],
+    details: bool = False,
 ) -> None:
     timezone, timezone_label = _local_timezone()
     parent = state.get("parent")
     parent_view = parent if isinstance(parent, dict) else {}
-    print(f"Repository: {state.get('repository') or 'unknown'}")
+    print(f"Repository: {_safe_text(state.get('repository') or 'unknown')}")
     print(
         "Parent:     "
-        f"#{parent_view.get('number', '?')} {parent_view.get('title') or '未命名 Parent'}"
+        f"#{_safe_text(parent_view.get('number', '?'))} "
+        f"{_safe_text(parent_view.get('title') or '未命名 Parent')}"
     )
     print(f"Time zone: {timezone_label}")
     print(f"Elapsed:   {_duration(progress['summary']['elapsed_seconds'])}")
@@ -61,42 +202,19 @@ def print_history_progress(
         print("Agent 活跃状态: 无法确认（运行状态无法确认）")
     if progress["execution_activity"] == "interrupted":
         print("执行已中断，等待恢复")
-    print("\n事件")
-    for event in progress["events"]:
-        timestamp = _parse_timestamp(event["at"])
-        local_time = timestamp.astimezone(timezone).strftime("%Y-%m-%d %H:%M %z")
-        subject = event.get("object") or "Delivery Run"
-        role = event.get("role")
-        round_number = event.get("round")
-        role_text = f" · {role}" if role else ""
-        round_text = f" 第 {round_number} 轮" if isinstance(round_number, int) else ""
-        status = (
-            "执行已中断，等待恢复" if event.get("activity") == "interrupted"
-            else "运行状态无法确认" if event.get("activity") == "unknown"
-            else "模型容量不足，等待自动续接" if event.get("activity") == "capacity_wait"
-            else "执行异常，等待自动续接" if event.get("activity") == "recovery_wait"
-            else display_term(event.get("status"))
-        )
-        print(f"{local_time}  {subject}{role_text}{round_text} · {status}")
-        model = event.get("model")
-        effort = event.get("reasoning_effort")
-        invocation_role = event.get("invocation_role")
-        duration = event.get("duration_seconds")
-        config = []
-        if invocation_role:
-            config.append(f"Agent Invocation {invocation_role}")
-        if model:
-            config.append(f"model={model}")
-        if effort:
-            config.append(f"reasoning_effort={effort}")
-        if invocation_role and duration is None:
-            config.append("实际执行时长未知")
-        if duration is not None:
-            config.append(f"耗时 {_duration(duration)}")
-        if config:
-            print(f"       {' / '.join(config)}")
-        for detail in event.get("details", []):
-            print(f"       - {_truncate_history_detail(str(detail))}")
+    records = history_records(state, audit, progress["events"])
+    print("\n工作时间线")
+    if records:
+        for record in records:
+            for line in _record_lines(record, timezone=timezone, details=details):
+                print(line)
+    else:
+        print("  尚无可确认的 Semantic Agent Attempt 记录")
+    cleanup_lines = _cleanup_history_lines(state, details=details)
+    if cleanup_lines:
+        print("\n交付清理")
+        for line in cleanup_lines:
+            print(line)
 
     print("\n汇总")
     rounds = progress["summary"]["rounds"]
@@ -109,7 +227,12 @@ def print_history_progress(
         f"  {'总运行时长':<22}"
         f"{_duration(progress['summary']['elapsed_seconds'])}"
     )
-    if progress["execution_activity"] in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+    if progress["execution_activity"] in {
+        "interrupted",
+        "unknown",
+        "capacity_wait",
+        "recovery_wait",
+    }:
         print(f"\n下一步: {execution_guidance(state, progress['execution_activity'])}")
         return
     operator_action = audit.get("operator_action")
@@ -133,6 +256,1435 @@ def print_history_progress(
             f"{_operator_instruction(state, None)}"
         )
 
+
+def print_rich_history_progress(
+    state: dict[str, Any],
+    audit: dict[str, Any],
+    progress: dict[str, Any],
+    *,
+    details: bool = False,
+) -> None:
+    """Render a bounded, static Rich timeline for an interactive terminal."""
+
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    timezone, timezone_label = _local_timezone()
+    records = history_records(state, audit, progress["events"])
+    parent = state.get("parent")
+    parent_view = parent if isinstance(parent, dict) else {}
+    # A Panel renders child Text lines with crop semantics. Put each logical
+    # line in a foldable Table column so long URLs, commands, and CJK text wrap
+    # inside the panel and retain their complete content at narrow widths.
+    console = Console(highlight=False, soft_wrap=False)
+    header = [
+        _rich_line(
+            "任务",
+            f"{state.get('repository') or 'unknown'} · "
+            f"#{parent_view.get('number', '?')} "
+            f"{parent_view.get('title') or '未命名 Parent'}",
+        ),
+        _rich_line("时区", timezone_label),
+        _rich_line("任务历时", _duration(progress["summary"]["elapsed_seconds"])),
+    ]
+    if progress.get("execution_activity") in {
+        "interrupted",
+        "unknown",
+        "capacity_wait",
+        "recovery_wait",
+    }:
+        header.append(
+            _rich_line(
+                "活跃状态",
+                _execution_activity_text(str(progress["execution_activity"])),
+            )
+        )
+
+    body: list[Text] = [*header, Text(""), Text("工作时间线", style="bold")]
+    for record in records:
+        body.extend(
+            Text(line) for line in _record_lines(record, timezone=timezone, details=details)
+        )
+        body.append(Text(""))
+    if not records:
+        body.append(Text("  尚无可确认的 Semantic Agent Attempt 记录"))
+    cleanup_lines = _cleanup_history_lines(state, details=details)
+    if cleanup_lines:
+        body.extend([Text(""), Text("交付清理", style="bold")])
+        body.extend(Text(line) for line in cleanup_lines)
+    action = audit.get("operator_action")
+    if isinstance(action, dict):
+        body.extend([Text(""), Text("当前操作边界", style="bold yellow")])
+        body.append(Text(f"  类型：{_safe_text(action.get('type') or '未记录')}"))
+        reasons = action.get("reasons")
+        if isinstance(reasons, list):
+            for reason in reasons:
+                value = _safe_text(reason)
+                if not details:
+                    value = _truncate_history_detail(value)
+                body.append(Text(f"  原因：{value}"))
+        preserved = action.get("preserved")
+        if preserved is not None:
+            body.append(Text(f"  已保留成果：{_safe_text(preserved)}"))
+        phase = action.get("phase")
+        if phase is not None:
+            body.append(Text(f"  阻塞阶段：{_safe_text(phase)}"))
+    body.extend(
+        [
+            Text(""),
+            Text("汇总", style="bold"),
+            Text(
+                f"  Agent 轮次：{_round_summary_text(progress['summary']['rounds'])}"
+            ),
+            Text(
+                f"  总运行时长：{_duration(progress['summary']['elapsed_seconds'])}"
+            ),
+        ]
+    )
+    if progress.get("execution_activity") in {
+        "interrupted",
+        "unknown",
+        "capacity_wait",
+        "recovery_wait",
+    }:
+        body.extend(
+            [
+                Text(""),
+                _rich_line(
+                    "下一步",
+                    execution_guidance(
+                        state,
+                        str(progress["execution_activity"]),
+                    ),
+                ),
+            ]
+        )
+    else:
+        next_action = audit.get("next_action")
+        body.extend(
+            [
+                Text(""),
+                _rich_line(
+                    "下一步",
+                    human_next_action(next_action, run_id=state.get("run_id")),
+                ),
+                Text(_operator_instruction(state, None)),
+            ]
+        )
+    border_style = {
+        "interrupted": "yellow",
+        "unknown": "yellow",
+        "capacity_wait": "yellow",
+        "recovery_wait": "red",
+    }.get(str(progress.get("execution_activity")), "cyan")
+    table = Table.grid(expand=True, padding=(0, 0))
+    table.add_column(no_wrap=False, overflow="fold")
+    for line in body:
+        table.add_row(line)
+    console.print(
+        Panel(
+            table,
+            title=Text("agent-run · 工作时间线", style="bold"),
+            border_style=border_style,
+            expand=True,
+        ),
+        overflow="fold",
+        crop=False,
+    )
+
+
+def history_records(
+    state: dict[str, Any],
+    audit: dict[str, Any],
+    events: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Aggregate raw snapshots and invocations into one record per Attempt.
+
+    This is a read-only projection.  Raw timeline events remain in the JSON
+    audit output; only the human renderer consumes this compact view.
+    """
+
+    attempts = audit.get("semantic_agent_attempts")
+    invocations = audit.get("agent_invocations")
+    attempt_values = attempts if isinstance(attempts, list) else []
+    invocation_values = invocations if isinstance(invocations, list) else []
+    records_by_key: dict[str, dict[str, Any]] = {}
+    for attempt in attempt_values:
+        if not isinstance(attempt, dict):
+            continue
+        _ensure_history_record(records_by_key, attempt=attempt)
+    for invocation in invocation_values:
+        if not isinstance(invocation, dict):
+            continue
+        attempt = invocation.get("semantic_attempt")
+        attempt_view = attempt if isinstance(attempt, dict) else {}
+        _ensure_history_record(
+            records_by_key,
+            attempt=attempt_view,
+            invocation=invocation,
+        )["invocations"].append(invocation)
+
+    raw_events = _history_turning_points(state, audit)
+    if not raw_events and isinstance(events, list):
+        # Keep malformed/legacy state visible when no persisted turning point
+        # can be reconstructed from the raw audit fields. Invocation events
+        # already belong to their Attempt and must not become duplicate
+        # standalone records merely because their review details are long.
+        raw_events = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("details")
+            and _role_family(str(event.get("kind") or "")) is None
+        ]
+    event_by_attempt: dict[str, list[dict[str, Any]]] = {}
+    standalone: list[dict[str, Any]] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            continue
+        attempt_id = raw.get("semantic_attempt_id")
+        if isinstance(attempt_id, str):
+            event_by_attempt.setdefault(attempt_id, []).append(raw)
+        elif _is_history_turning_point(raw):
+            standalone.append(raw)
+    for key, record in records_by_key.items():
+        attempt_id = record.get("attempt_id")
+        if isinstance(attempt_id, str):
+            record["turning_points"] = event_by_attempt.get(attempt_id, [])
+        else:
+            record["turning_points"] = []
+        _finalize_history_record(state, record)
+
+    for index, raw in enumerate(standalone):
+        record = _ensure_history_record(
+            records_by_key,
+            attempt={
+                "attempt_id": (
+                    f"event:{raw.get('at')}:{raw.get('kind')}:{index}"
+                ),
+                "work_subject": raw.get("object"),
+                "role": "event",
+                "ordinal": None,
+                "event_record": True,
+                "event_at": raw.get("at"),
+            },
+        )
+        record.setdefault("turning_points", []).append(raw)
+        _finalize_history_record(state, record)
+
+    result = list(records_by_key.values())
+    result.sort(key=lambda item: (_record_start(item), _record_order(item)))
+    return result
+
+
+def _ensure_history_record(
+    records: dict[str, dict[str, Any]],
+    *,
+    attempt: dict[str, Any],
+    invocation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    key = _attempt_key(attempt, invocation)
+    record = records.get(key)
+    if record is None:
+        record = {
+            "attempt_id": attempt.get("attempt_id"),
+            "role": attempt.get("role")
+            or (invocation or {}).get("role")
+            or (invocation or {}).get("invocation_role"),
+            "work_subject": attempt.get("work_subject")
+            or (invocation or {}).get("work_subject"),
+            "generation": attempt.get("generation")
+            or (invocation or {}).get("generation"),
+            "ordinal": attempt.get("ordinal"),
+            "budget_window": attempt.get("budget_window"),
+            "attempt": attempt,
+            "invocations": [],
+            "turning_points": [],
+            "event_record": attempt.get("event_record") is True,
+            "event_at": attempt.get("event_at"),
+        }
+        records[key] = record
+    elif record.get("attempt") is not attempt and attempt:
+        # The persisted Attempt is authoritative. An Invocation contains a
+        # startup mirror which may still say "pending" after the Attempt was
+        # completed. Only fill genuinely absent identity fields from it.
+        authoritative = record.get("attempt")
+        if not isinstance(authoritative, dict) or not authoritative:
+            record["attempt"] = attempt
+        else:
+            for key in (
+                "attempt_id",
+                "role",
+                "work_subject",
+                "generation",
+                "currentness_boundary_fingerprint",
+                "ordinal",
+                "budget_window",
+            ):
+                if authoritative.get(key) is None and attempt.get(key) is not None:
+                    authoritative[key] = attempt[key]
+                    if record.get(key) is None:
+                        record[key] = attempt[key]
+    return record
+
+
+def _attempt_key(
+    attempt: dict[str, Any], invocation: dict[str, Any] | None = None
+) -> str:
+    attempt_id = attempt.get("attempt_id")
+    if isinstance(attempt_id, str) and attempt_id:
+        return f"id:{attempt_id}"
+    values = {
+        key: attempt.get(key, (invocation or {}).get(key))
+        for key in (
+            "role",
+            "work_subject",
+            "generation",
+            "currentness_boundary_fingerprint",
+            "ordinal",
+            "budget_window",
+        )
+    }
+    return "identity:" + json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _finalize_history_record(state: dict[str, Any], record: dict[str, Any]) -> None:
+    if record.get("event_record") is True:
+        _finalize_event_record(state, record)
+        return
+    invocations = [
+        invocation
+        for invocation in record.get("invocations", [])
+        if isinstance(invocation, dict)
+    ]
+    record["object"] = _subject_label(
+        state, str(record.get("work_subject") or "run")
+    )
+    record["role_label"] = _role_label(str(record.get("role") or "unknown"))
+    record["role_zh"] = _role_zh_label(str(record.get("role") or "unknown"))
+    starts = [
+        timestamp
+        for invocation in invocations
+        if (timestamp := _parse_optional_timestamp(invocation.get("started_at"))) is not None
+    ]
+    ends = [
+        timestamp
+        for invocation in invocations
+        if (timestamp := _parse_optional_timestamp(invocation.get("ended_at"))) is not None
+    ]
+    record["started_at"] = min(starts).isoformat() if starts else None
+    has_unclosed_invocation = any(
+        invocation.get("ended_at") is None for invocation in invocations
+    )
+    if has_unclosed_invocation:
+        record["ended_at"] = None
+    elif ends:
+        record["ended_at"] = max(ends).isoformat()
+    else:
+        record["ended_at"] = None
+    record["activity"] = _record_activity(state, record, invocations)
+    record["span_seconds"] = _record_span_seconds(record)
+    record["execution_seconds"] = _record_execution_seconds(record)
+    record["resumption_count"] = sum(
+        1 for invocation in invocations if invocation.get("resume_id") is not None
+    )
+    record["output_attempts"] = [
+        invocation.get("attempt_count")
+        for invocation in invocations
+        if type(invocation.get("attempt_count")) is int
+    ]
+    record["recovery_details"] = [
+        detail
+        for invocation in invocations
+        for detail in invocation_recovery_details(invocation)
+    ]
+    record["configurations"] = _record_configurations(invocations)
+    details = _history_record_details(state, record)
+    record.update(details)
+    record["status_text"] = _history_record_status(record)
+
+
+def _finalize_event_record(state: dict[str, Any], record: dict[str, Any]) -> None:
+    """Finalize a lifecycle event without inventing an Agent Attempt."""
+
+    event = next(
+        (
+            point
+            for point in record.get("turning_points", [])
+            if isinstance(point, dict)
+        ),
+        {},
+    )
+    event_at = event.get("at") or record.get("event_at")
+    record["object"] = _safe_text(record.get("work_subject") or "Delivery Run")
+    record["role_label"] = "生命周期节点"
+    record["role_zh"] = "节点"
+    record["started_at"] = event_at
+    record["ended_at"] = event_at
+    record["activity"] = "not_running"
+    record["span_seconds"] = None
+    record["execution_seconds"] = None
+    record["resumption_count"] = 0
+    record["output_attempts"] = []
+    record["recovery_details"] = []
+    record["configurations"] = []
+    record["findings"] = []
+    record["acceptance_artifact"] = None
+    record["development_summary"] = None
+    record["publication"] = None
+    record["supporting_records"] = []
+    record["status_text"] = _turning_point_status(event)
+
+
+def _record_start(record: dict[str, Any]) -> datetime:
+    timestamp = _parse_optional_timestamp(record.get("started_at"))
+    if timestamp is not None:
+        return timestamp
+    timestamp = _parse_optional_timestamp(record.get("ended_at"))
+    return timestamp or datetime.max.replace(tzinfo=UTC)
+
+
+def _record_order(record: dict[str, Any]) -> tuple[str, str, int]:
+    ordinal = record.get("ordinal")
+    return (
+        str(record.get("work_subject") or ""),
+        str(record.get("role") or ""),
+        ordinal if type(ordinal) is int else 0,
+    )
+
+
+def _record_span_seconds(record: dict[str, Any]) -> int | None:
+    invocations = record.get("invocations")
+    if isinstance(invocations, list) and any(
+        isinstance(invocation, dict)
+        and _parse_optional_timestamp(invocation.get("started_at")) is not None
+        and _parse_optional_timestamp(invocation.get("ended_at")) is None
+        for invocation in invocations
+    ):
+        # A current, trusted running observation is the one case where query
+        # time is meaningful. Interrupted/unknown observations remain open.
+        if record.get("activity") != "running":
+            return None
+        started = _parse_optional_timestamp(record.get("started_at"))
+        return (
+            max(0, int((datetime.now(UTC) - started).total_seconds()))
+            if started is not None
+            else None
+        )
+    started = _parse_optional_timestamp(record.get("started_at"))
+    ended = _parse_optional_timestamp(record.get("ended_at"))
+    if started is None:
+        return None
+    if ended is None:
+        if record.get("activity") != "running":
+            return None
+        ended = datetime.now(UTC)
+    return max(0, int((ended - started).total_seconds()))
+
+
+def _record_execution_seconds(record: dict[str, Any]) -> int | None:
+    invocations = record.get("invocations")
+    if not isinstance(invocations, list) or not invocations:
+        return None
+    last_invocation_index = len(invocations) - 1
+    open_invocation_indices = [
+        index
+        for index, invocation in enumerate(invocations)
+        if isinstance(invocation, dict)
+        and _parse_optional_timestamp(invocation.get("started_at")) is not None
+        and _parse_optional_timestamp(invocation.get("ended_at")) is None
+    ]
+    if any(index != last_invocation_index for index in open_invocation_indices):
+        # An older invocation without a persisted end is not made complete by
+        # observing a later invocation running.  Its execution interval is
+        # unknowable, so the aggregate must remain unknown.
+        return None
+    total = 0
+    for index, invocation in enumerate(invocations):
+        if not isinstance(invocation, dict):
+            continue
+        started = _parse_optional_timestamp(invocation.get("started_at"))
+        ended = _parse_optional_timestamp(invocation.get("ended_at"))
+        if started is None:
+            return None
+        if ended is None:
+            if record.get("activity") != "running" or index != last_invocation_index:
+                # A wall-clock observation of an interrupted or unknown
+                # process is not a persisted completion time.
+                return None
+            ended = datetime.now(UTC)
+        total += max(0, int((ended - started).total_seconds()))
+    return total
+
+
+def _record_configurations(invocations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    configurations: list[dict[str, Any]] = []
+    for invocation in invocations:
+        configuration = {
+            "started_at": invocation.get("started_at"),
+            "model": invocation.get("model"),
+            "reasoning_effort": invocation.get("reasoning_effort"),
+        }
+        if configurations and (
+            configurations[-1].get("model") == configuration.get("model")
+            and configurations[-1].get("reasoning_effort")
+            == configuration.get("reasoning_effort")
+        ):
+            continue
+        configurations.append(configuration)
+    return configurations
+
+
+def _history_record_status(record: dict[str, Any]) -> str:
+    invocations = record.get("invocations")
+    if isinstance(invocations, list) and invocations:
+        latest = invocations[-1]
+        if isinstance(latest, dict) and latest.get("status") in {
+            "failed",
+            "execution_failed",
+        }:
+            return "执行失败"
+    attempt = record.get("attempt")
+    if isinstance(record.get("findings"), list) and record["findings"]:
+        return "验收未通过"
+    artifact = record.get("acceptance_artifact")
+    if isinstance(artifact, dict):
+        outcome = _artifact_outcome(artifact)
+        if outcome == "pass":
+            return "验收通过"
+        if outcome == "blocked":
+            return "验收受阻"
+    if isinstance(attempt, dict) and attempt.get("status") == "pending":
+        if record.get("activity") == "running":
+            return "进行中"
+        if record.get("activity") in {"interrupted", "unknown"}:
+            return _execution_activity_text(str(record["activity"]))
+        return "待执行"
+    attempt_outcome: object = (
+        attempt.get("outcome") if isinstance(attempt, dict) else None
+    )
+    return {
+        "candidate": "开发完成，待验收",
+        "publication_artifact": "发布说明已完成",
+        "acceptance_artifact": "验收结果已记录",
+        "currentness_invalidated": "因版本变化失效",
+        "no_code_changes": "开发未产生代码变更",
+        "git_integrity_repair": "已记录 Git 修复边界",
+    }.get(str(attempt_outcome), "已完成")
+
+
+def _history_record_details(
+    state: dict[str, Any], record: dict[str, Any]
+) -> dict[str, Any]:
+    attempt = record.get("attempt")
+    attempt_view = dict(attempt) if isinstance(attempt, dict) else {}
+    for key in (
+        "work_subject",
+        "role",
+        "generation",
+        "ordinal",
+        "budget_window",
+    ):
+        if attempt_view.get(key) is None and record.get(key) is not None:
+            attempt_view[key] = record[key]
+    invocations = record.get("invocations")
+    invocation_values = [
+        item
+        for item in (invocations if isinstance(invocations, list) else [])
+        if isinstance(item, dict)
+    ]
+    record["activity"] = _record_activity(state, record, invocation_values)
+    owners = _owners_for_attempt(state, attempt_view)
+    artifact = _review_artifact_for_attempt(owners, attempt_view, invocation_values)
+    if artifact is None and isinstance(attempt_view.get("acceptance_artifact"), dict):
+        artifact = attempt_view["acceptance_artifact"]
+    findings = _artifact_findings(artifact) if isinstance(artifact, dict) else []
+    return {
+        "findings": findings,
+        "acceptance_artifact": artifact,
+        "budget_facts": _budget_facts_for_attempt(state, attempt_view),
+        "development_summary": _development_summary_for_attempt(
+            attempt_view, owners
+        ),
+        "publication": _publication_for_attempt(attempt_view, owners),
+        "supporting_records": _supporting_records(owners),
+    }
+
+
+def _budget_facts_for_attempt(
+    state: dict[str, Any], attempt: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve the immutable budget projection for this Attempt's window."""
+
+    role = _role_family(str(attempt.get("role") or ""))
+    window = attempt.get("budget_window")
+    if role == "publication":
+        return {"window": window}
+    facts: dict[str, Any] = {
+        "window": window,
+        "development_attempts": None,
+        "reviewer_invocations": None,
+    }
+    if not isinstance(window, int):
+        return facts
+    subject = str(attempt.get("work_subject") or "")
+    policy_owner: tuple[str, dict[str, Any]] | None = None
+    historical_policy_owner: tuple[str, dict[str, Any]] | None = None
+    for owner_subject, owner in _subject_variants(state):
+        if owner_subject != subject:
+            continue
+        if policy_owner is None:
+            policy_owner = (owner_subject, owner)
+        history = owner.get("review_budget_history")
+        if not isinstance(history, list):
+            continue
+        for snapshot in history:
+            if not isinstance(snapshot, dict):
+                continue
+            budget = snapshot.get("review_budget")
+            if isinstance(budget, dict) and budget.get("window") == window:
+                historical_policy_owner = (owner_subject, snapshot)
+                break
+        if historical_policy_owner is not None:
+            break
+
+    if historical_policy_owner is not None:
+        policy_owner = historical_policy_owner
+
+    stored_snapshot = attempt.get("budget_snapshot")
+    if isinstance(stored_snapshot, dict) and stored_snapshot.get("window") == window:
+        facts.update(
+            {
+                "development_attempts": stored_snapshot.get("development_attempts"),
+                "reviewer_invocations": stored_snapshot.get("reviewer_invocations"),
+            }
+        )
+    if policy_owner is None:
+        return facts
+    owner_subject, owner = policy_owner
+    try:
+        from agent_run.delivery_policy import (
+            parent_only_budget_policy_for_job,
+            run_repair_budget_policy_for_job,
+            ticket_budget_policy_for_job,
+        )
+
+        if owner_subject.startswith("ticket:") or subject.startswith("ticket:"):
+            policy = ticket_budget_policy_for_job(
+                owner, state_snapshot=state.get("policy_snapshot")
+            )
+        elif owner_subject.startswith("run-") or subject.startswith("run-"):
+            policy = run_repair_budget_policy_for_job(
+                owner, state_snapshot=state.get("policy_snapshot")
+            )
+        else:
+            policy = parent_only_budget_policy_for_job(
+                owner, state_snapshot=state.get("policy_snapshot")
+            )
+        facts.update(
+            {
+                "development_limit": policy.development_limit,
+                "reviewer_limit": policy.review_limit,
+            }
+        )
+    except (TypeError, ValueError, KeyError):
+        # A malformed or absent policy cannot justify an inferred limit.
+        pass
+    return facts
+
+
+def _record_activity(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    invocations: list[dict[str, Any]],
+) -> str:
+    if not invocations:
+        return "not_running"
+    latest = invocations[-1]
+    active = state.get("active_agent_invocation")
+    if isinstance(active, dict) and (
+        latest is active
+        or (
+            latest.get("started_at") == active.get("started_at")
+            and latest.get("work_subject") == active.get("work_subject")
+        )
+    ):
+        audit = {"executor_control": state.get("_executor_control")}
+        return invocation_activity(active, audit)
+    return "not_running"
+
+
+def _owners_for_attempt(
+    state: dict[str, Any], attempt: dict[str, Any]
+) -> list[dict[str, Any]]:
+    attempt_id = attempt.get("attempt_id")
+    subject = str(attempt.get("work_subject") or "")
+    generation = attempt.get("generation")
+    owners: list[dict[str, Any]] = []
+    for work_subject, owner in _subject_variants(state):
+        if work_subject != subject:
+            continue
+        owner_attempts = _owner_attempts(owner)
+        if any(
+            isinstance(candidate, dict)
+            and (
+                candidate.get("attempt_id") == attempt_id
+                if isinstance(attempt_id, str)
+                else candidate.get("generation") == generation
+                and candidate.get("role") == attempt.get("role")
+                and candidate.get("ordinal") == attempt.get("ordinal")
+            )
+            for candidate in owner_attempts
+        ):
+            owners.append(owner)
+    if owners:
+        return owners
+    same_subject = [
+        owner
+        for work_subject, owner in _subject_variants(state)
+        if work_subject == subject
+    ]
+    if isinstance(attempt_id, str) and any(
+        _owner_attempts(owner) for owner in same_subject
+    ):
+        # An identified Attempt which is absent from a retained owner history
+        # cannot safely borrow the current Candidate's Artifact.
+        return []
+    return same_subject
+
+
+def _subject_variants(state: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    run_id = state.get("run_id")
+    values: list[tuple[str, dict[str, Any]]] = []
+    active = state.get("active_ticket_job")
+    if isinstance(active, dict) and isinstance(active.get("ticket_number"), int):
+        values.append((f"ticket:{active['ticket_number']}", active))
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        for number, job in jobs.items():
+            if isinstance(job, dict):
+                values.append((f"ticket:{number}", job))
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        values.append((f"parent-only:{run_id}", parent))
+    acceptance = state.get("run_acceptance")
+    if isinstance(acceptance, dict):
+        values.append((f"run-acceptance:{run_id}", acceptance))
+        repair = acceptance.get("repair_job")
+        if isinstance(repair, dict):
+            values.append((f"run-repair:{run_id}", repair))
+    publication = state.get("run_publication")
+    if isinstance(publication, dict):
+        values.append((f"run-publication:{run_id}", publication))
+    retired = state.get("retired_semantic_attempt_owners")
+    if isinstance(retired, list):
+        values.extend(
+            (str(owner.get("work_subject")), owner)
+            for owner in retired
+            if isinstance(owner, dict) and isinstance(owner.get("work_subject"), str)
+        )
+    variants: list[tuple[str, dict[str, Any]]] = []
+    for subject, owner in values:
+        variants.append((subject, owner))
+        history = owner.get("review_budget_history")
+        if isinstance(history, list):
+            variants.extend(
+                (subject, snapshot)
+                for snapshot in history
+                if isinstance(snapshot, dict)
+            )
+    return variants
+
+
+def _owner_attempts(owner: dict[str, Any]) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    history = owner.get("semantic_attempt_history")
+    if isinstance(history, list):
+        values.extend(item for item in history if isinstance(item, dict))
+    pending = owner.get("pending_semantic_attempt")
+    if isinstance(pending, dict):
+        values.append(pending)
+    return values
+
+
+def _review_artifact_for_attempt(
+    owners: list[dict[str, Any]],
+    attempt: dict[str, Any],
+    invocations: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    for owner in owners:
+        budget = owner.get("review_budget")
+        if not isinstance(budget, dict):
+            continue
+        if budget.get("window") != attempt.get("budget_window"):
+            continue
+        artifacts = budget.get("review_artifacts")
+        if isinstance(artifacts, list):
+            for item in artifacts:
+                if not isinstance(item, dict) or not isinstance(
+                    item.get("artifact"), dict
+                ):
+                    continue
+                identity = json.dumps(
+                    {
+                        "reviewer_thread_id": item.get("reviewer_thread_id"),
+                        "candidate_sha": item.get("candidate_sha"),
+                        "review_identity": item.get("review_identity"),
+                        "artifact": item.get("artifact"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                if identity in seen_candidates:
+                    continue
+                seen_candidates.add(identity)
+                candidates.append(item)
+    if not candidates:
+        return None
+    reviewer_ids = {
+        value
+        for invocation in invocations
+        for key in ("reported_thread_id", "requested_thread_id", "thread_id")
+        if isinstance((value := invocation.get(key)), str) and value
+    }
+    candidate_heads = {
+        value
+        for invocation in invocations
+        for boundary in (invocation.get("currentness_boundary"),)
+        if isinstance(boundary, dict)
+        for key in (
+            "candidate_sha",
+            "reviewed_candidate_sha",
+            "reviewed_head_sha",
+            "run_head_sha",
+            "head_sha",
+            "repair_candidate_sha",
+        )
+        if isinstance((value := boundary.get(key)), str) and value
+    }
+    matched = candidates
+    if reviewer_ids:
+        matched = [
+            item for item in matched if item.get("reviewer_thread_id") in reviewer_ids
+        ]
+    if candidate_heads:
+        matched = [
+            item for item in matched if item.get("candidate_sha") in candidate_heads
+        ]
+    # Both sides of the review identity are required. A canonical Attempt
+    # without its Reviewer and Candidate boundary cannot safely borrow even a
+    # unique Artifact from the same window.
+    if not reviewer_ids or not candidate_heads:
+        return None
+    if len(matched) != 1:
+        return None
+    artifact = matched[0].get("artifact")
+    return artifact if isinstance(artifact, dict) else None
+
+
+def _development_summary_for_attempt(
+    attempt: dict[str, Any], owners: list[dict[str, Any]]
+) -> str | None:
+    value = attempt.get("development_summary")
+    if isinstance(value, str) and value.strip():
+        return value
+    if attempt.get("role") != "development":
+        return None
+    for owner in owners:
+        value = owner.get("development_summary")
+        if isinstance(value, str) and value.strip() and _owner_attempt_is_latest(owner, attempt):
+            return value
+    return None
+
+
+def _publication_for_attempt(
+    attempt: dict[str, Any], owners: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    value = attempt.get("publication")
+    if isinstance(value, dict):
+        return value
+    if attempt.get("role") != "publication":
+        return None
+    for owner in owners:
+        value = owner.get("publication")
+        if isinstance(value, dict) and _owner_attempt_is_latest(owner, attempt):
+            return value
+    return None
+
+
+def _owner_attempt_is_latest(owner: dict[str, Any], attempt: dict[str, Any]) -> bool:
+    field = {
+        "development": "modification_attempts",
+        "reviewer": "validation_attempts",
+        "publication": "publication_attempts",
+    }.get(str(attempt.get("role")))
+    if field is None:
+        return False
+    if field in owner:
+        return owner.get(field) == attempt.get("ordinal")
+    # A legacy/read-only projection with no owner history has no competing
+    # attempt from which this record could have been borrowed.
+    return not _owner_attempts(owner)
+
+
+def _supporting_records(owners: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for owner in owners:
+        for key in (
+            "required_checks_evidence",
+            "deterministic_integration_record",
+            "fallback_publication_receipt",
+        ):
+            value = owner.get(key)
+            if not isinstance(value, dict):
+                continue
+            identity = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            records.append({"kind": key, "value": value})
+    return records
+
+
+def _is_history_turning_point(event: dict[str, Any]) -> bool:
+    details = event.get("details")
+    if isinstance(details, list) and details:
+        return True
+    kind = str(event.get("kind") or "")
+    status = str(event.get("status") or "")
+    return kind in {
+        "human_blocker",
+        "supervision",
+        "required_checks",
+        "integration",
+        "completion",
+        "publication",
+        "resume",
+        "unsupported_scope_change",
+    } or status in {
+        "completed",
+        "abandoned",
+        "abandonment_pending",
+        "deterministic_contradiction",
+        "parent_approval_pending",
+        "parent_closeout_pending",
+        "progress_exhausted",
+        "requeue_required",
+        "operator_stopped",
+        "ready_for_human",
+        "execution_failed",
+        "supervision_timeout",
+        "ticket_completed",
+        "waiting_external",
+        "waiting_checks",
+        "waiting_merge",
+    }
+
+
+def _record_lines(
+    record: dict[str, Any], *, timezone: tzinfo, details: bool
+) -> list[str]:
+    if record.get("event_record") is True:
+        return _event_record_lines(record, timezone=timezone, details=details)
+    started = _format_local_timestamp(record.get("started_at"), timezone)
+    ended_value = record.get("ended_at")
+    ended = (
+        _format_local_timestamp(ended_value, timezone)
+        if ended_value is not None
+        else ("进行中" if record.get("activity") == "running" else "未知时间")
+    )
+    interval = f"{started} → {ended}"
+    ordinal = record.get("ordinal")
+    round_text = f"第 {ordinal} 轮" if isinstance(ordinal, int) else "轮次未记录"
+    finding_values = record.get("findings")
+    findings = finding_values if isinstance(finding_values, list) else []
+    title = (
+        f"{_safe_text(record.get('object') or 'Delivery Run')} · "
+        f"{_safe_text(record.get('role_label') or 'Agent')} {round_text} · "
+        f"{_safe_text(record.get('role_zh') or '')} · "
+        f"{_safe_text(record.get('status_text') or '未知')}"
+    )
+    if findings:
+        title += f"（问题 {len(findings)}）"
+    lines = [
+        f"  {title}",
+        f"    时间区间：{interval}",
+        f"    动作：{_record_action(record)}；结果：{_safe_text(record.get('status_text') or '未知')}",
+    ]
+    lines.append(
+        f"    时长：整轮 {_duration(record.get('span_seconds'))}；"
+        f"累计执行 {_duration(record.get('execution_seconds'))}"
+    )
+    if record.get("span_seconds") is None or record.get("execution_seconds") is None:
+        lines.append("    实际执行时长未知（缺少可信结束证据）")
+    lines.append(f"    {_budget_line(record)}")
+    configurations = record.get("configurations")
+    if isinstance(configurations, list) and configurations:
+        for index, configuration in enumerate(configurations, start=1):
+            lines.append(
+                f"    配置 {index}：模型={_safe_text(configuration.get('model') or '未记录')}；"
+                f"推理强度={_safe_text(configuration.get('reasoning_effort') or '未记录')}"
+            )
+    else:
+        lines.append("    配置：模型=未记录；推理强度=未记录")
+    if record.get("resumption_count", 0):
+        lines.append(f"    显式恢复/继续：{record['resumption_count']} 次，已归入本轮")
+    output_attempts = record.get("output_attempts")
+    if isinstance(output_attempts, list) and any(
+        isinstance(value, int) and value > 1 for value in output_attempts
+    ):
+        lines.append(
+            "    输出续接："
+            f"{max(value for value in output_attempts if isinstance(value, int)) - 1} 次，"
+            "仍归入本轮"
+        )
+    recovery_details = record.get("recovery_details")
+    if isinstance(recovery_details, list):
+        lines.extend(
+            f"    {_truncate_history_detail(_safe_text(detail))}"
+            for detail in recovery_details
+        )
+    if findings:
+        lines.append(f"    问题（{len(findings)}）")
+        lines.extend(
+            f"      {_finding_question(finding)}"
+            for finding in findings
+        )
+    elif record.get("role") in {"reviewer", "fresh_acceptance"} and record.get(
+        "acceptance_artifact"
+    ) is None:
+        lines.append("    验收结论：尚无可确认的验收资料")
+    if details:
+        lines.extend(_record_detail_lines(record, timezone=timezone))
+    turning_points = record.get("turning_points")
+    if isinstance(turning_points, list) and turning_points:
+        lines.append("    关键转折")
+        for point in turning_points:
+            if not isinstance(point, dict):
+                continue
+            point_status = _turning_point_status(point)
+            point_details = point.get("details")
+            lines.append(
+                f"      {_format_local_timestamp(point.get('at'), timezone)} · "
+                f"{_turning_point_kind(point)}：{_safe_text(point_status)}"
+            )
+            if isinstance(point_details, list):
+                lines.extend(
+                    (
+                        f"        - {_safe_text(value)}"
+                        if details
+                        else "        - "
+                        f"{_truncate_history_detail(_safe_text(value))}"
+                    )
+                    for value in point_details
+                )
+            lines.extend(_turning_point_evidence_lines(point, timezone=timezone, details=details))
+    return lines
+
+
+def _event_record_lines(
+    record: dict[str, Any], *, timezone: tzinfo, details: bool
+) -> list[str]:
+    point = next(
+        (
+            value
+            for value in record.get("turning_points", [])
+            if isinstance(value, dict)
+        ),
+        {},
+    )
+    lines = [
+        f"  {_safe_text(record.get('object') or 'Delivery Run')} · 关键节点",
+        f"    时间：{_format_local_timestamp(point.get('at'), timezone)}",
+        f"    事件：{_turning_point_kind(point)}；结果：{_safe_text(_turning_point_status(point))}",
+    ]
+    point_details = point.get("details")
+    if isinstance(point_details, list):
+        lines.extend(
+            f"      - {_safe_text(value) if details else _truncate_history_detail(_safe_text(value))}"
+            for value in point_details
+        )
+    lines.extend(_turning_point_evidence_lines(point, timezone=timezone, details=details))
+    return lines
+
+
+def _budget_line(record: dict[str, Any]) -> str:
+    if _role_family(str(record.get("role") or "")) == "publication":
+        return "业务预算：不适用（发布阶段）"
+    facts = record.get("budget_facts")
+    if not isinstance(facts, dict):
+        return "预算窗口：未记录；Development 用量=未记录 / 未记录；Review 用量=未记录 / 未记录"
+    window = facts.get("window")
+    window_text = window if isinstance(window, int) else "未记录"
+    development = _budget_fraction(
+        facts.get("development_attempts"), facts.get("development_limit")
+    )
+    review = _budget_fraction(
+        facts.get("reviewer_invocations"), facts.get("reviewer_limit")
+    )
+    return (
+        f"预算窗口：{window_text}；Development 用量={development}；"
+        f"Review 用量={review}"
+    )
+
+
+def _budget_fraction(used: object, limit: object) -> str:
+    used_text = str(used) if type(used) is int else "未记录"
+    limit_text = str(limit) if type(limit) is int else "未记录"
+    return f"{used_text} / {limit_text}"
+
+
+def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[str]:
+    lines: list[str] = []
+    summary = record.get("development_summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.extend(["    Development Summary", f"      {_safe_text(summary)}"])
+    elif record.get("role") == "development":
+        lines.append("    Development Summary：未记录")
+    artifact = record.get("acceptance_artifact")
+    if isinstance(artifact, dict):
+        checks = artifact.get("checks")
+        if not _artifact_is_structured(artifact):
+            lines.append(
+                "    验收资料原文："
+                + _safe_text(json.dumps(artifact, ensure_ascii=False, default=str))
+            )
+        if isinstance(checks, dict):
+            lines.append("    验收证据")
+            for lane, label in (
+                ("e2e", "功能验证"),
+                ("standards", "工程审查"),
+                ("spec", "需求核对"),
+            ):
+                check = checks.get(lane)
+                if not isinstance(check, dict):
+                    lines.append(f"      {label}：未记录")
+                    continue
+                lines.append(
+                    f"      {label}：{_safe_text(check.get('status') or '未知')}"
+                )
+                evidence = check.get("evidence")
+                if isinstance(evidence, str) and evidence.strip():
+                    lines.append(f"        证据：{_safe_text(evidence)}")
+                lane_findings = check.get("findings")
+                if isinstance(lane_findings, list):
+                    for finding in lane_findings:
+                        if isinstance(finding, str):
+                            lines.extend(_full_finding_lines(finding, indent="        "))
+    publication = record.get("publication")
+    if isinstance(publication, dict):
+        lines.append("    发布说明")
+        for key, label in (
+            ("commit_message", "提交说明"),
+            ("pr_title", "PR 标题"),
+            ("pr_body_markdown", "PR 正文"),
+        ):
+            value = publication.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append(f"      {label}：{_safe_text(value)}")
+        for key, label in (
+            ("pr_number", "PR 编号"),
+            ("integrated_sha", "集成提交"),
+            ("required_checks_result", "必需检查结果"),
+            ("required_checks_observed_at", "必需检查观测时间"),
+        ):
+            value = publication.get(key)
+            if value is not None:
+                lines.append(f"      {label}：{_safe_text(value)}")
+    invocations = record.get("invocations")
+    if isinstance(invocations, list) and invocations:
+        lines.append("    Invocation 明细")
+        for index, invocation in enumerate(invocations, start=1):
+            if not isinstance(invocation, dict):
+                continue
+            started = _format_local_timestamp(invocation.get("started_at"), timezone)
+            ended_value = invocation.get("ended_at")
+            is_current_running_invocation = (
+                record.get("activity") == "running" and index == len(invocations)
+            )
+            ended = (
+                _format_local_timestamp(ended_value, timezone)
+                if ended_value is not None
+                else ("进行中" if is_current_running_invocation else "未知时间")
+            )
+            duration = _invocation_duration(
+                invocation,
+                {"executor_control": {"activity": "running"}}
+                if is_current_running_invocation
+                else {},
+            )
+            lines.append(
+                f"      {index}：{started} → {ended}；"
+                f"状态={_safe_text(invocation.get('status') or '未记录')}；"
+                f"时长={_duration(duration)}"
+            )
+            lines.append(
+                f"        模型={_safe_text(invocation.get('model') or '未记录')}；"
+                f"推理强度={_safe_text(invocation.get('reasoning_effort') or '未记录')}；"
+                f"输出续接={_safe_text(invocation.get('attempt_count') or 1)} 次"
+            )
+            for key, label in (
+                ("error", "错误"),
+                ("machine_error", "机器错误"),
+                ("validation_error", "验证错误"),
+                ("failure_reason", "失败原因"),
+                ("interruption_observed_at", "中断观测时间"),
+                ("last_failure_at", "最近失败时间"),
+                ("resume_id", "恢复 ID"),
+                ("signal", "信号"),
+                ("return_code", "返回码"),
+            ):
+                value = invocation.get(key)
+                if value is not None:
+                    lines.append(f"        {label}：{_safe_text(value)}")
+    supporting = record.get("supporting_records")
+    if isinstance(supporting, list):
+        for item in supporting:
+            if not isinstance(item, dict) or not isinstance(item.get("value"), dict):
+                continue
+            lines.append(f"    {_supporting_label(str(item.get('kind')))}")
+            for key, value in item["value"].items():
+                if isinstance(value, (str, int, float, bool)):
+                    lines.append(f"      {_safe_text(key)}：{_safe_text(value)}")
+                elif value is not None:
+                    lines.append(f"      {_safe_text(key)}：")
+                    lines.extend(_json_detail_lines(value, indent="        "))
+    return lines
+
+
+def _cleanup_history_lines(state: dict[str, Any], *, details: bool) -> list[str]:
+    cleanup = state.get("delivery_cleanup")
+    if not isinstance(cleanup, dict):
+        return []
+    items = cleanup.get("items")
+    pending_items = [
+        item
+        for item in items.values()
+        if isinstance(item, dict) and item.get("status") != "completed"
+    ] if isinstance(items, dict) else []
+    status = cleanup.get("status")
+    last_error = cleanup.get("last_error")
+    if status == "completed" and not last_error and not pending_items:
+        return []
+    lines = [f"  状态：{_cleanup_status_text(status)}"]
+    if last_error is not None:
+        value = _safe_text(last_error)
+        lines.append(
+            f"  最后错误：{value if details else _truncate_history_detail(value)}"
+        )
+    for item in pending_items:
+        branch = item.get("branch") or "未记录分支"
+        checkout = item.get("checkout") or "未记录工作区"
+        lines.append(
+            f"  待清理：分支={_safe_text(branch)}；工作区={_safe_text(checkout)}；"
+            f"状态={_cleanup_status_text(item.get('status'))}"
+        )
+        if details:
+            recovery_kind = item.get("recovery_kind")
+            if recovery_kind is not None:
+                lines.append(f"    恢复类型：{_safe_text(recovery_kind)}")
+            item_error = item.get("last_error")
+            if item_error is not None:
+                lines.append(f"    项错误：{_safe_text(item_error)}")
+    return lines
+
+
+def _cleanup_status_text(value: object) -> str:
+    return {
+        "pending": "待处理",
+        "cleanup_pending": "等待清理",
+        "completed": "已完成",
+    }.get(str(value or ""), _safe_text(value or "未记录"))
+
+
+def _turning_point_evidence_lines(
+    point: dict[str, Any], *, timezone: tzinfo, details: bool
+) -> list[str]:
+    lines: list[str] = []
+    for key, label in (
+        ("pr_number", "PR 编号"),
+        ("commit_sha", "提交"),
+        ("approval_granted_at", "批准时间"),
+        ("required_checks_result", "必需检查结果"),
+    ):
+        value = point.get(key)
+        if value is not None:
+            lines.append(f"        {label}：{_safe_text(value)}")
+    observed_at = point.get("required_checks_observed_at")
+    if observed_at is not None:
+        lines.append(
+            "        必需检查观测时间："
+            f"{_format_local_timestamp(observed_at, timezone)}"
+        )
+    next_action = point.get("next_action")
+    if next_action is not None:
+        value = _safe_text(next_action)
+        if not details:
+            value = _truncate_history_detail(value)
+        lines.append(f"        下一步：{value}")
+    evidence = point.get("required_checks_evidence")
+    if details and evidence is not None:
+        lines.append("        必需检查证据：")
+        lines.extend(_json_detail_lines(evidence, indent="          "))
+    result = point.get("result")
+    if details and result is not None:
+        lines.append(f"        结果：{_safe_text(result)}")
+    return lines
+
+
+def _json_detail_lines(value: object, *, indent: str) -> list[str]:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, default=str)
+    except (TypeError, ValueError):
+        serialized = _safe_text(value)
+    return [f"{indent}{_safe_text(line)}" for line in serialized.splitlines()]
+
+
+def _artifact_is_structured(artifact: dict[str, Any]) -> bool:
+    checks = artifact.get("checks")
+    if not isinstance(checks, dict) or set(checks) != {"e2e", "standards", "spec"}:
+        return False
+    return all(
+        isinstance(check, dict)
+        and isinstance(check.get("findings"), list)
+        and all(isinstance(finding, str) for finding in check["findings"])
+        for check in checks.values()
+    )
+
+
+def _full_finding_lines(finding: str, *, indent: str) -> list[str]:
+    match = _FINDING.fullmatch(finding)
+    if match is None:
+        return [f"{indent}问题原文：{_safe_text(finding)}"]
+    lines = [f"{indent}{_safe_text(finding)}"]
+    lines.extend(
+        f"{indent}{label}：{_safe_text(value)}"
+        for label, value in zip(("问题", "证据", "必须修复", "复验"), match.groups())
+    )
+    return lines
+
+
+def _finding_question(finding: object) -> str:
+    if not isinstance(finding, str):
+        return str(finding)
+    match = _FINDING.fullmatch(finding)
+    return f"问题：{match.group(1)}" if match is not None else f"问题原文：{finding}"
+
+
+def _record_action(record: dict[str, Any]) -> str:
+    role = _role_family(str(record.get("role") or ""))
+    return {
+        "development": "开发候选",
+        "review": "验收候选",
+        "publication": "发布候选",
+    }.get(role or "", "交付状态变更")
+
+
+def _turning_point_kind(event: dict[str, Any]) -> str:
+    return {
+        "human_blocker": "人工阻塞",
+        "supervision": "监督边界",
+        "required_checks": "必需检查",
+        "integration": "集成",
+        "publication": "发布",
+        "completion": "整体完成",
+        "resume": "恢复",
+        "unsupported_scope_change": "范围变化",
+    }.get(str(event.get("kind") or ""), "状态变化")
+
+
+def _turning_point_status(event: dict[str, Any]) -> str:
+    if event.get("kind") == "resume":
+        return "人工恢复/继续"
+    if event.get("activity") == "interrupted":
+        return "执行已中断，等待恢复"
+    if event.get("activity") == "unknown":
+        return "运行状态无法确认"
+    if event.get("activity") == "capacity_wait":
+        return "模型容量不足，等待自动续接"
+    if event.get("activity") == "recovery_wait":
+        return "执行异常，等待自动续接"
+    return {
+        "completed": "已完成",
+        "abandoned": "已放弃",
+        "abandonment_pending": "等待放弃处理",
+        "deterministic_contradiction": "存在确定性矛盾",
+        "waiting_checks": "等待必需检查",
+        "waiting_external": "等待外部条件",
+        "waiting_merge": "等待集成",
+        "ready_for_human": "等待人工处理",
+        "parent_approval_pending": "等待父项人工批准",
+        "parent_closeout_pending": "等待父项收口",
+        "run_approval_pending": "等待人工批准",
+        "run_acceptance_pending": "等待运行整体验收",
+        "run_publication_pending": "等待运行发布",
+        "abandonment_pending": "等待放弃恢复",
+        "operator_stopped": "操作者已停止，可恢复",
+        "supervision_timeout": "监督超时暂停，可恢复",
+        "execution_failed": "执行失败，可恢复",
+        "requeue_required": "需要重新排队",
+        "parent_delivery_pending": "等待 Parent 交付",
+        "ticket_completed": "Ticket 已完成",
+        "progress_exhausted": "推进次数已耗尽",
+        "unsupported_scope_change": "不支持的范围变化",
+    }.get(
+        str(event.get("status") or ""),
+        _safe_text(event.get("status") or event.get("kind") or "状态变化"),
+    )
+
+
+def _format_local_timestamp(value: object, timezone: tzinfo) -> str:
+    timestamp = _parse_optional_timestamp(value)
+    if timestamp is None:
+        return "未知时间"
+    return timestamp.astimezone(timezone).strftime("%Y-%m-%d %H:%M %z")
+
+
+def _execution_activity_text(activity: str) -> str:
+    return {
+        "running": "正在执行",
+        "interrupted": "执行已中断，等待恢复",
+        "unknown": "运行状态无法确认",
+        "capacity_wait": "模型容量不足，等待自动续接",
+        "recovery_wait": "执行异常，等待自动续接",
+        "not_running": "未在执行",
+    }.get(activity, "未知")
+
+
+def _round_summary_text(rounds: object) -> str:
+    if not isinstance(rounds, dict) or not rounds:
+        return "尚无 Agent 轮次"
+    return "；".join(f"{_round_label(str(key))} {value} 轮" for key, value in rounds.items())
+
+
+def _rich_line(label: object, value: object) -> Any:
+    from rich.text import Text
+
+    line = Text()
+    line.append(f"{_safe_text(label)}：", style="bold")
+    line.append(_safe_text("未知" if value is None else value))
+    return line
+
+
+def _safe_text(value: object) -> str:
+    text = str(value)
+    text = re.sub(
+        r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))",
+        "",
+        text,
+    )
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+
+_FINDING = re.compile(
+    r"问题：(.*?)；证据：(.*?)；必须修复：(.*?)；复验：(.*)", re.DOTALL
+)
 
 def _history_events(
     state: dict[str, Any], audit: dict[str, Any]
@@ -172,7 +1724,6 @@ def _history_events(
             )
             source_order += 1
 
-    findings = _review_findings_by_subject(state)
     invocations = audit.get("agent_invocations")
     if isinstance(invocations, list):
         for order, invocation in enumerate(invocations, start=len(events)):
@@ -183,7 +1734,7 @@ def _history_events(
             if timestamp is None:
                 continue
             attempt = invocation.get("semantic_attempt")
-            attempt_view = attempt if isinstance(attempt, dict) else {}
+            attempt_view = _invocation_attempt_view(invocation)
             work_subject = str(invocation.get("work_subject") or "")
             role = str(
                 attempt_view.get("role")
@@ -192,12 +1743,15 @@ def _history_events(
                 or "unknown"
             )
             round_number = attempt_view.get("ordinal")
-            review_details = _findings_for_review(
-                findings,
-                work_subject,
-                attempt_view.get("budget_window"),
-                round_number,
-                role,
+            artifact = _review_artifact_for_attempt(
+                _owners_for_attempt(state, attempt_view),
+                attempt_view,
+                [invocation],
+            )
+            review_details = (
+                _artifact_findings(artifact)
+                if isinstance(artifact, dict)
+                else []
             )
             status = invocation.get("status")
             if review_details:
@@ -267,76 +1821,6 @@ def _history_events(
     for event in events:
         event.pop("_order", None)
     return events
-
-
-def _review_findings_by_subject(
-    state: dict[str, Any],
-) -> dict[str, dict[int, list[list[str]]]]:
-    pools: dict[str, dict[int, list[list[str]]]] = {}
-    run_id = state.get("run_id")
-    jobs = state.get("ticket_jobs")
-    if isinstance(jobs, dict):
-        for number, job in jobs.items():
-            if isinstance(job, dict):
-                pools[f"ticket:{number}"] = _subject_review_findings(job)
-    parent = state.get("parent_job")
-    if isinstance(parent, dict):
-        pools[f"parent-only:{run_id}"] = _subject_review_findings(parent)
-    acceptance = state.get("run_acceptance")
-    if isinstance(acceptance, dict):
-        pools[f"run-acceptance:{run_id}"] = _subject_review_findings(acceptance)
-        repair = acceptance.get("repair_job")
-        if isinstance(repair, dict):
-            pools[f"run-repair:{run_id}"] = _subject_review_findings(repair)
-    return pools
-
-
-def _subject_review_findings(subject: dict[str, Any]) -> dict[int, list[list[str]]]:
-    budgets = (
-        [
-            snapshot.get("review_budget")
-            for snapshot in subject.get("review_budget_history", [])
-            if isinstance(snapshot, dict)
-        ]
-        if isinstance(subject.get("review_budget_history"), list)
-        else []
-    )
-    budgets.append(subject.get("review_budget"))
-    findings: dict[int, list[list[str]]] = {}
-    for budget in budgets:
-        window = budget.get("window") if isinstance(budget, dict) else None
-        if not isinstance(window, int):
-            continue
-        artifacts = (
-            budget.get("review_artifacts") if isinstance(budget, dict) else None
-        )
-        if not isinstance(artifacts, list):
-            continue
-        window_findings: list[list[str]] = []
-        for record in artifacts:
-            artifact = record.get("artifact") if isinstance(record, dict) else None
-            window_findings.append(
-                _artifact_findings(artifact) if isinstance(artifact, dict) else []
-            )
-        findings[window] = window_findings
-    return findings
-
-
-def _findings_for_review(
-    pools: dict[str, dict[int, list[list[str]]]],
-    subject: str,
-    budget_window: object,
-    ordinal: object,
-    role: str,
-) -> list[str]:
-    if (
-        role not in {"reviewer", "fresh_acceptance"}
-        or not isinstance(budget_window, int)
-        or not isinstance(ordinal, int)
-    ):
-        return []
-    reviews = pools.get(subject, {}).get(budget_window, [])
-    return reviews[ordinal - 1] if 0 < ordinal <= len(reviews) else []
 
 
 def _human_responses_by_subject(
@@ -504,9 +1988,54 @@ def _role_label(role: str) -> str:
     }[family]
 
 
+def _role_zh_label(role: str) -> str:
+    return {
+        "development": "开发",
+        "review": "验收",
+        "publication": "发布",
+    }.get(_role_family(role) or "", "Agent")
+
+
+def _artifact_outcome(artifact: dict[str, Any]) -> str:
+    checks = artifact.get("checks")
+    if not isinstance(checks, dict):
+        return "unknown"
+    statuses = {
+        check.get("status")
+        for check in checks.values()
+        if isinstance(check, dict)
+    }
+    if "fail" in statuses:
+        return "fail"
+    if "blocked" in statuses:
+        return "blocked"
+    if statuses and statuses == {"pass"}:
+        return "pass"
+    return "unknown"
+
+
+def _supporting_label(kind: str) -> str:
+    return {
+        "required_checks_evidence": "必需检查证据",
+        "deterministic_integration_record": "确定性集成记录",
+        "fallback_publication_receipt": "发布回执",
+    }.get(kind, kind)
+
+
 def _round_label(key: str) -> str:
     scope, _, role = key.partition("_")
     return f"{scope.title()} {'Review' if role == 'review' else role.title()}"
+
+
+def _invocation_attempt_view(invocation: dict[str, Any]) -> dict[str, Any]:
+    attempt = invocation.get("semantic_attempt")
+    view = dict(attempt) if isinstance(attempt, dict) else {}
+    for key in ("work_subject", "generation", "role"):
+        if view.get(key) is None and invocation.get(key) is not None:
+            view[key] = invocation[key]
+    if view.get("role") is None and invocation.get("invocation_role") is not None:
+        view["role"] = invocation["invocation_role"]
+    return view
 
 
 def _invocation_duration(

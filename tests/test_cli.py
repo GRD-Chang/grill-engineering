@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -18,6 +19,7 @@ from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
 from agent_run.codex import CodexProcessError
+from agent_run.delivery_history import history_records
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
 from agent_run.operator_action_presentation import print_operator_action
@@ -69,6 +71,33 @@ def test_status_and_history_expose_plain_output_switch() -> None:
 
     assert status.plain is True
     assert history.plain is True
+
+
+def test_history_exposes_details_switch() -> None:
+    history = build_parser().parse_args(["history", "run-id", "--details"])
+
+    assert history.details is True
+
+
+def test_history_details_does_not_change_json_audit_projection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "status": "completed",
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_invocation_history": [],
+        "resume_audit": {"history": []},
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    without_details = json.loads(capsys.readouterr().out)
+    cli.cli_presentation._print_history(state, as_json=True, details=True)
+    with_details = json.loads(capsys.readouterr().out)
+
+    assert with_details == without_details
 
 
 def test_status_does_not_fall_back_to_findings_from_another_work_subject(
@@ -1488,6 +1517,7 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
         "status": "completed",
         "budget_consumed": True,
         "outcome": "candidate",
+        "development_summary": "historical development result",
     }
     pending = {
         "attempt_id": "attempt-reviewer-1",
@@ -1542,7 +1572,9 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
     cli.cli_presentation._print_history(state, as_json=True)
     output = json.loads(capsys.readouterr().out)
 
-    assert output["semantic_agent_attempts"] == [completed, pending]
+    public_completed = dict(completed)
+    public_completed.pop("development_summary")
+    assert output["semantic_agent_attempts"] == [public_completed, pending]
     assert output["agent_invocations"] == [invocation]
     assert output["output_attempts"] == [
         {
@@ -1570,6 +1602,940 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
     assert "Semantic Agent Attempt" not in human
     assert "attempt-reviewer-1" not in human
     assert "sha256:second" not in human
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    detailed_human = capsys.readouterr().out
+    assert "historical development result" in detailed_human
+
+
+def test_history_human_output_groups_invocations_and_keeps_resume_as_a_turning_point(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = "问题：候选缺少边界处理；证据：candidate-a；必须修复：补齐边界；复验：重新运行 CLI。"
+    attempt = {
+        "attempt_id": "attempt-review-1",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "currentness_boundary_fingerprint": "sha256:review-boundary",
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "acceptance_artifact",
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "reviewer",
+        "invocation_role": "fresh_acceptance",
+        "status": "completed",
+        "started_at": "2026-08-24T00:01:00+00:00",
+        "ended_at": "2026-08-24T00:02:00+00:00",
+        "model": "review-model-v1",
+        "reasoning_effort": "high",
+        "reported_thread_id": "reviewer-2",
+        "currentness_boundary": {"run_head_sha": "candidate-a"},
+        "semantic_attempt": deepcopy(attempt),
+    }
+    resumed_invocation = deepcopy(invocation)
+    resumed_invocation.update(
+        {
+            "started_at": "2026-08-24T00:03:00+00:00",
+            "ended_at": "2026-08-24T00:04:00+00:00",
+            "model": "review-model-v2",
+        }
+    )
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "History timeline"},
+        "created_at": "2026-08-24T00:00:00+00:00",
+        "status": "completed",
+        "timeline": [
+            {
+                "at": "2026-08-24T00:01:30+00:00",
+                "kind": "ticket_phase",
+                "ticket": 3,
+                "status": "active",
+                "phase": "reviewing",
+                "semantic_attempt_id": attempt["attempt_id"],
+            },
+            {
+                "at": "2026-08-24T00:04:30+00:00",
+                "kind": "ticket_phase",
+                "ticket": 3,
+                "status": "completed",
+                "phase": "completed",
+                "pr_number": 17,
+                "commit_sha": "candidate-a",
+                "required_checks_result": "pass",
+                "required_checks_observed_at": "2026-08-24T00:04:00+00:00",
+                "next_action": "manual acceptance",
+                "semantic_attempt_id": attempt["attempt_id"],
+            },
+        ],
+        "timeline_continuation": [],
+        "ticket_jobs": {
+            "3": {
+                "ticket_number": 3,
+                "review_budget": {
+                    "window": 1,
+                    "review_artifacts": [
+                        {
+                            "reviewer_thread_id": "reviewer-2",
+                            "candidate_sha": "candidate-a",
+                            "artifact": {
+                                "checks": {
+                                    "e2e": {
+                                        "status": "fail",
+                                        "evidence": "candidate-a",
+                                        "findings": [finding],
+                                    },
+                                    "standards": {
+                                        "status": "pass",
+                                        "evidence": "standards",
+                                        "findings": [],
+                                    },
+                                    "spec": {
+                                        "status": "pass",
+                                        "evidence": "spec",
+                                        "findings": [],
+                                    },
+                                }
+                            },
+                        }
+                    ],
+                },
+            }
+        },
+        "agent_invocation_history": [invocation, resumed_invocation],
+        "semantic_agent_attempts": [attempt],
+        "resume_audit": {
+            "history": [
+                {
+                    "resume_id": "resume-1",
+                    "requested_at": "2026-08-24T00:02:30+00:00",
+                    "kind": "execution_failure",
+                    "work_subject": "ticket:3",
+                    "generation": 1,
+                    "semantic_attempt_id": attempt["attempt_id"],
+                    "human_response_supplied": False,
+                }
+            ]
+        },
+        "delivery_cleanup": {
+            "status": "cleanup_pending",
+            "last_error": "preserved checkout",
+            "items": {
+                "ticket-3": {
+                    "branch": "agent-run/ticket-3",
+                    "checkout": "/tmp/ticket-3",
+                    "status": "cleanup_pending",
+                    "recovery_kind": "stale_dirty_checkout",
+                    "last_error": "tracked modifications",
+                }
+            },
+        },
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True)
+    output = capsys.readouterr().out
+
+    assert output.count("第 1 轮") == 1
+    assert "问题：候选缺少边界处理" in output
+    assert "证据：candidate-a" not in output
+    assert "恢复" in output
+    assert "review-model-v1" in output
+    assert "review-model-v2" in output
+    assert "动作：验收候选；结果：验收未通过" in output
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    details = capsys.readouterr().out
+    assert details.count("第 1 轮") == 1
+    assert finding in details
+    assert "证据：candidate-a" in details
+    assert "PR 编号：17" in details
+    assert "必需检查结果：pass" in details
+    assert "preserved checkout" in details
+    assert "恢复类型：stale_dirty_checkout" in details
+
+    projection = history_records(
+        state,
+        {
+            "semantic_agent_attempts": state["semantic_agent_attempts"],
+            "agent_invocations": state["agent_invocation_history"],
+            "timeline": state["timeline"],
+            "timeline_continuation": state["timeline_continuation"],
+            "agent_resumes": state["resume_audit"]["history"],
+        },
+    )
+    assert projection[0]["ended_at"] == "2026-08-24T00:04:00+00:00"
+
+
+def test_history_does_not_borrow_unique_artifact_for_identified_attempt() -> None:
+    attempt = {
+        "attempt_id": "attempt-without-boundary",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "currentness_boundary_fingerprint": "sha256:boundary",
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "acceptance_artifact",
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {
+            "3": {
+                "ticket_number": 3,
+                "semantic_attempt_history": [attempt],
+                "review_budget": {
+                    "window": 1,
+                    "review_artifacts": [
+                        {
+                            "reviewer_thread_id": "other-reviewer",
+                            "candidate_sha": "other-candidate",
+                            "artifact": {"checks": {"e2e": {"findings": ["wrong"]}}},
+                        }
+                    ],
+                },
+            }
+        },
+        "agent_invocation_history": [
+            {
+                "work_subject": "ticket:3",
+                "role": "reviewer",
+                "reported_thread_id": "missing-reviewer",
+                "currentness_boundary": {"run_head_sha": "missing-candidate"},
+                "semantic_attempt": deepcopy(attempt),
+            }
+        ],
+    }
+    records = history_records(
+        state,
+        {
+            "semantic_agent_attempts": [attempt],
+            "agent_invocations": state["agent_invocation_history"],
+            "timeline": [],
+            "timeline_continuation": [],
+            "agent_resumes": [],
+        },
+    )
+
+    assert records[0]["acceptance_artifact"] is None
+    assert records[0]["findings"] == []
+
+
+def test_history_keeps_authoritative_attempt_and_requires_both_review_identities() -> None:
+    completed = {
+        "attempt_id": "attempt-completed",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "candidate",
+        "development_summary": "completed result",
+    }
+    reviewer = {
+        "attempt_id": "attempt-review",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "acceptance_artifact",
+    }
+    artifact = {
+        "checks": {
+            "e2e": {"findings": ["wrong-round"]},
+            "standards": {"findings": []},
+            "spec": {"findings": []},
+        }
+    }
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [completed, reviewer],
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 4,
+            "reviewer_invocations": 3,
+            "review_artifacts": [
+                {
+                    "reviewer_thread_id": "reviewer-1",
+                    "candidate_sha": "candidate-1",
+                    "artifact": artifact,
+                }
+            ],
+        },
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "reviewer",
+        "status": "completed",
+        "started_at": "2026-08-24T00:01:00+00:00",
+        "ended_at": "2026-08-24T00:02:00+00:00",
+        "semantic_attempt": deepcopy(reviewer),
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "agent_invocation_history": [invocation],
+    }
+    audit = {
+        "semantic_agent_attempts": [completed, reviewer],
+        "agent_invocations": [invocation],
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [],
+    }
+
+    records = history_records(state, audit)
+    completed_record = next(
+        record for record in records if record["attempt_id"] == "attempt-completed"
+    )
+    reviewer_record = next(
+        record for record in records if record["attempt_id"] == "attempt-review"
+    )
+    assert completed_record["attempt"]["status"] == "completed"
+    assert completed_record["development_summary"] == "completed result"
+    assert completed_record["budget_facts"]["development_attempts"] is None
+    assert completed_record["budget_facts"]["reviewer_invocations"] is None
+    assert reviewer_record["acceptance_artifact"] is None
+    assert reviewer_record["budget_facts"]["development_attempts"] is None
+    assert reviewer_record["budget_facts"]["reviewer_invocations"] is None
+
+    invocation["reported_thread_id"] = "reviewer-1"
+    invocation["currentness_boundary"] = {"run_head_sha": "candidate-1"}
+    exact = history_records(state, audit)
+    exact_record = next(
+        record for record in exact if record["attempt_id"] == "attempt-review"
+    )
+    assert exact_record["acceptance_artifact"] == artifact
+
+    legacy_attempt = {
+        key: value
+        for key, value in reviewer.items()
+        if key != "attempt_id"
+    }
+    legacy_invocation = {
+        **invocation,
+        "semantic_attempt": deepcopy(legacy_attempt),
+    }
+    legacy_invocation.pop("reported_thread_id")
+    legacy_invocation.pop("currentness_boundary")
+    legacy_job = {**job, "semantic_attempt_history": [legacy_attempt]}
+    legacy_state = {
+        **state,
+        "ticket_jobs": {"3": legacy_job},
+        "active_ticket_job": deepcopy(legacy_job),
+        "agent_invocation_history": [legacy_invocation],
+    }
+    legacy_audit = {
+        **audit,
+        "semantic_agent_attempts": [legacy_attempt],
+        "agent_invocations": [legacy_invocation],
+    }
+    legacy_record = history_records(legacy_state, legacy_audit)[0]
+    assert legacy_record["acceptance_artifact"] is None
+
+
+def test_history_standalone_events_use_persisted_time_and_skip_snapshots() -> None:
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {},
+        "status": "active",
+    }
+    audit = {
+        "semantic_agent_attempts": [],
+        "agent_invocations": [],
+        "timeline": [
+            {
+                "at": "2026-08-24T00:02:00+00:00",
+                "kind": "ticket_phase",
+                "ticket": 3,
+                "status": "parent_delivery_pending",
+                "thread_id": "internal-thread",
+            },
+            {
+                "at": "2026-08-24T00:01:00+00:00",
+                "kind": "ticket_phase",
+                "ticket": 3,
+                "status": "operator_stopped",
+                "thread_id": "internal-thread",
+            },
+        ],
+        "timeline_continuation": [],
+        "agent_resumes": [
+            {
+                "requested_at": "2026-08-24T00:03:00+00:00",
+                "work_subject": "ticket:3",
+                "source_status": "supervision_timeout",
+                "human_response_supplied": False,
+            }
+        ],
+    }
+
+    records = history_records(state, audit)
+    assert [record["started_at"] for record in records] == [
+        "2026-08-24T00:01:00+00:00",
+        "2026-08-24T00:03:00+00:00",
+    ]
+    assert all(record["event_record"] is True for record in records)
+
+
+def test_history_preserves_distinct_resume_events_with_same_content() -> None:
+    attempt = {
+        "attempt_id": "attempt-resume-history",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "pending",
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {
+            "3": {
+                "ticket_number": 3,
+                "semantic_attempt_history": [attempt],
+                "review_budget": {
+                    "window": 1,
+                    "development_attempts": 1,
+                    "reviewer_invocations": 0,
+                    "review_artifacts": [],
+                },
+            }
+        },
+    }
+    state["human_response_audit"] = {
+        "resume-1": "same response",
+        "resume-2": "same response",
+    }
+    audit = {
+        "semantic_agent_attempts": [attempt],
+        "agent_invocations": [],
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [
+            {
+                "resume_id": "resume-1",
+                "requested_at": "2026-08-24T01:00:00+00:00",
+                "work_subject": "ticket:3",
+                "generation": 1,
+                "semantic_attempt_id": attempt["attempt_id"],
+                "source_status": "execution_failed",
+                "human_response_supplied": True,
+            },
+            {
+                "resume_id": "resume-2",
+                "requested_at": "2026-08-24T02:00:00+00:00",
+                "work_subject": "ticket:3",
+                "generation": 1,
+                "semantic_attempt_id": attempt["attempt_id"],
+                "source_status": "execution_failed",
+                "human_response_supplied": True,
+            },
+        ],
+    }
+
+    records = history_records(state, audit)
+
+    assert len(records) == 1
+    assert [point["resume_id"] for point in records[0]["turning_points"]] == [
+        "resume-1",
+        "resume-2",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("control_activity", "expected_activity"),
+    [("running", "running"), ("unknown", "unknown"), ("not_running", "interrupted")],
+)
+def test_history_open_resumption_does_not_use_prior_end_as_record_end(
+    control_activity: str, expected_activity: str
+) -> None:
+    attempt = {
+        "attempt_id": "attempt-open-resumption",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "pending",
+    }
+    first = {
+        "work_subject": "ticket:3",
+        "role": "development",
+        "status": "completed",
+        "started_at": "2026-08-24T01:00:00+00:00",
+        "ended_at": "2026-08-24T01:01:00+00:00",
+        "semantic_attempt": deepcopy(attempt),
+    }
+    resumed = {
+        "work_subject": "ticket:3",
+        "role": "development",
+        "status": "running",
+        "started_at": "2026-08-24T02:00:00+00:00",
+        "ended_at": None,
+        "semantic_attempt": deepcopy(attempt),
+    }
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [attempt],
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 1,
+            "reviewer_invocations": 0,
+            "review_artifacts": [],
+        },
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "active_agent_invocation": resumed,
+        "_executor_control": {"activity": control_activity},
+    }
+    audit = {
+        "semantic_agent_attempts": [attempt],
+        "agent_invocations": [first, resumed],
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [],
+    }
+
+    record = history_records(state, audit)[0]
+
+    assert record["started_at"] == "2026-08-24T01:00:00+00:00"
+    assert record["ended_at"] is None
+    assert record["activity"] == expected_activity
+    if expected_activity == "running":
+        assert record["span_seconds"] is not None
+        assert record["execution_seconds"] is not None
+    else:
+        assert record["span_seconds"] is None
+        assert record["execution_seconds"] is None
+
+
+@pytest.mark.parametrize(
+    ("latest_status", "control_activity", "expected_activity"),
+    [
+        ("running", "running", "running"),
+        ("running", "unknown", "unknown"),
+        ("running", "not_running", "interrupted"),
+        ("completed", "not_running", "not_running"),
+    ],
+)
+def test_history_does_not_accumulate_prior_unclosed_invocation(
+    latest_status: str,
+    control_activity: str,
+    expected_activity: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    attempt = {
+        "attempt_id": "attempt-prior-unclosed",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "pending",
+    }
+    historical = {
+        "work_subject": "ticket:3",
+        "role": "development",
+        "status": "failed",
+        "started_at": "2000-01-01T00:00:00+00:00",
+        "ended_at": None,
+        "interruption_observed_at": "2000-01-01T00:01:00+00:00",
+        "semantic_attempt": deepcopy(attempt),
+    }
+    latest = {
+        "work_subject": "ticket:3",
+        "role": "development",
+        "status": latest_status,
+        "started_at": "2000-01-01T01:00:00+00:00",
+        "ended_at": (
+            None
+            if latest_status == "running"
+            else "2000-01-01T01:01:00+00:00"
+        ),
+        "semantic_attempt": deepcopy(attempt),
+    }
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [attempt],
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 1,
+            "reviewer_invocations": 0,
+            "review_artifacts": [],
+        },
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "active_agent_invocation": latest,
+        "_executor_control": {"activity": control_activity},
+    }
+    audit = {
+        "semantic_agent_attempts": [attempt],
+        "agent_invocations": [historical, latest],
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [],
+    }
+
+    record = history_records(state, audit)[0]
+
+    assert record["activity"] == expected_activity
+    assert record["execution_seconds"] is None
+    if expected_activity == "running":
+        assert record["span_seconds"] is not None
+    else:
+        assert record["span_seconds"] is None
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True)
+    default_output = capsys.readouterr().out
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    details_output = capsys.readouterr().out
+    assert "累计执行 未知" in default_output
+    assert "累计执行 未知" in details_output
+    assert "→ 未知时间" in details_output
+
+
+def test_history_running_attempt_reports_current_elapsed_time() -> None:
+    attempt = {
+        "attempt_id": "attempt-running",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "pending",
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "development",
+        "status": "running",
+        "started_at": "2000-01-01T00:00:00+00:00",
+        "ended_at": None,
+        "semantic_attempt": deepcopy(attempt),
+    }
+    job = {
+        "ticket_number": 3,
+        "pending_semantic_attempt": attempt,
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 0,
+            "reviewer_invocations": 0,
+        },
+    }
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {"3": job},
+        "active_agent_invocation": invocation,
+        "_executor_control": {"activity": "running"},
+    }
+    audit = {
+        "semantic_agent_attempts": [attempt],
+        "agent_invocations": [invocation],
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [],
+    }
+
+    record = history_records(state, audit)[0]
+    assert record["activity"] == "running"
+    assert record["span_seconds"] is not None
+    assert record["execution_seconds"] is not None
+    assert record["span_seconds"] <= int(
+        (datetime.now(UTC) - datetime(2000, 1, 1, tzinfo=UTC)).total_seconds()
+    )
+    assert record["status_text"] == "进行中"
+
+
+def test_history_details_reuses_development_acceptance_and_publication_records(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def attempt(attempt_id: str, role: str, ordinal: int) -> dict[str, object]:
+        value: dict[str, object] = {
+            "attempt_id": attempt_id,
+            "role": role,
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "currentness_boundary_fingerprint": f"sha256:{attempt_id}",
+            "ordinal": ordinal,
+            "budget_window": 1 if role != "publication" else None,
+            "status": "completed",
+            "outcome": "candidate" if role == "development" else f"{role}_artifact",
+        }
+        if role != "publication":
+            value["budget_snapshot"] = {
+                "window": 1,
+                "development_attempts": 1,
+                "reviewer_invocations": 1,
+            }
+        return value
+
+    development = attempt("attempt-development-1", "development", 1)
+    review = attempt("attempt-reviewer-1", "reviewer", 1)
+    publication = attempt("attempt-publication-1", "publication", 1)
+    review_finding = "问题：需要补充验证；证据：e2e log；必须修复：增加断言；复验：重跑测试。"
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Details"},
+        "created_at": "2026-08-24T00:00:00+00:00",
+        "status": "completed",
+        "timeline": [],
+        "timeline_continuation": [],
+        "ticket_jobs": {
+            "3": {
+                "ticket_number": 3,
+                "development_summary": "Implemented the boundary handling.",
+                "publication": {
+                    "commit_message": "feat: publish ticket",
+                    "pr_title": "feat: publish ticket",
+                    "pr_body_markdown": "The candidate is ready for review.",
+                },
+                "review_budget": {
+                    "window": 1,
+                    "development_attempts": 1,
+                    "reviewer_invocations": 1,
+                    "review_artifacts": [
+                        {
+                            "reviewer_thread_id": "reviewer-thread",
+                            "candidate_sha": "candidate-a",
+                            "artifact": {
+                                "checks": {
+                                    "e2e": {
+                                        "status": "fail",
+                                        "evidence": "e2e log",
+                                        "findings": [review_finding],
+                                    },
+                                    "standards": {
+                                        "status": "pass",
+                                        "evidence": "standards evidence",
+                                        "findings": [],
+                                    },
+                                    "spec": {
+                                        "status": "pass",
+                                        "evidence": "spec evidence",
+                                        "findings": [],
+                                    },
+                                }
+                            },
+                        }
+                    ],
+                },
+            }
+        },
+        "agent_invocation_history": [
+            {
+                "work_subject": "ticket:3",
+                "role": role,
+                "status": "completed",
+                "started_at": f"2026-08-24T00:0{index}:00+00:00",
+                "ended_at": f"2026-08-24T00:0{index + 1}:00+00:00",
+                "reported_thread_id": (
+                    "reviewer-thread" if role == "reviewer" else None
+                ),
+                "currentness_boundary": (
+                    {"run_head_sha": "candidate-a"} if role == "reviewer" else {}
+                ),
+                "semantic_attempt": deepcopy(item),
+            }
+            for index, (role, item) in enumerate(
+                (("development", development), ("reviewer", review), ("publication", publication)),
+                start=1,
+            )
+        ],
+        "semantic_agent_attempts": [development, review, publication],
+        "resume_audit": {"history": []},
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    output = capsys.readouterr().out
+
+    assert "Development Summary" in output
+    assert "Implemented the boundary handling." in output
+    assert "验收证据" in output
+    assert "e2e log" in output
+    assert "必须修复：增加断言" in output
+    assert "feat: publish ticket" in output
+    assert "PR 标题" in output
+    assert "预算窗口：1；Development 用量=1 / 4；Review 用量=1 / 3" in output
+    assert "业务预算：不适用（发布阶段）" in output
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    assert "budget_snapshot" not in capsys.readouterr().out
+
+
+def test_history_default_keeps_the_complete_finding_question(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    question = "中文问题" * 90 + "QUESTION-END"
+    finding = (
+        f"问题：{question}；证据：evidence；必须修复：repair；复验：verify。"
+    )
+    attempt = {
+        "attempt_id": "attempt-long-finding",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "acceptance_artifact",
+    }
+    artifact = {
+        "checks": {
+            "e2e": {"findings": [finding]},
+            "standards": {"findings": []},
+            "spec": {"findings": []},
+        }
+    }
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [attempt],
+        "review_budget": {
+            "window": 1,
+            "development_attempts": 0,
+            "reviewer_invocations": 1,
+            "review_artifacts": [
+                {
+                    "reviewer_thread_id": "reviewer-long",
+                    "candidate_sha": "candidate-long",
+                    "artifact": artifact,
+                }
+            ],
+        },
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "reviewer",
+        "status": "completed",
+        "started_at": "2026-08-24T00:01:00+00:00",
+        "ended_at": "2026-08-24T00:02:00+00:00",
+        "reported_thread_id": "reviewer-long",
+        "currentness_boundary": {"run_head_sha": "candidate-long"},
+        "semantic_attempt": deepcopy(attempt),
+    }
+    state: dict[str, object] = {
+        "run_id": "run-long",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Long finding"},
+        "created_at": "2026-08-24T00:00:00+00:00",
+        "status": "completed",
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "agent_invocation_history": [invocation],
+    }
+    cli.cli_presentation._print_history(state, as_json=False, plain=True)
+    output = capsys.readouterr().out
+
+    assert question in output
+    assert "QUESTION-END" in output
+    assert "已截断" not in output
+
+
+def test_history_matches_review_artifact_by_attempt_candidate_and_reviewer() -> None:
+    def attempt(attempt_id: str, boundary: str) -> dict[str, object]:
+        return {
+            "attempt_id": attempt_id,
+            "role": "reviewer",
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "currentness_boundary_fingerprint": f"fingerprint-{boundary}",
+            "ordinal": 1,
+            "budget_window": 1,
+            "status": "completed",
+            "outcome": "acceptance_artifact",
+        }
+
+    def invocation(
+        semantic_attempt: dict[str, object], candidate: str, reviewer: str
+    ) -> dict[str, object]:
+        return {
+            "work_subject": "ticket:3",
+            "role": "reviewer",
+            "reported_thread_id": reviewer,
+            "currentness_boundary": {"run_head_sha": candidate},
+            "status": "completed",
+            "started_at": "2026-08-24T00:01:00+00:00",
+            "ended_at": "2026-08-24T00:02:00+00:00",
+            "semantic_attempt": deepcopy(semantic_attempt),
+        }
+
+    first = attempt("attempt-a", "candidate-a")
+    second = attempt("attempt-b", "candidate-b")
+
+    def artifact(name: str) -> dict[str, object]:
+        finding = f"问题：{name}；证据：{name}；必须修复：{name}；复验：{name}。"
+        return {
+            "checks": {
+                lane: {
+                    "status": "fail" if lane == "e2e" else "pass",
+                    "findings": [finding] if lane == "e2e" else [],
+                }
+                for lane in ("e2e", "standards", "spec")
+            }
+        }
+
+    state: dict[str, object] = {
+        "run_id": "run-1",
+        "ticket_jobs": {
+            "3": {
+                "ticket_number": 3,
+                "semantic_attempt_history": [first, second],
+                "review_budget": {
+                    "window": 1,
+                    "review_artifacts": [
+                        {
+                            "reviewer_thread_id": "reviewer-a",
+                            "candidate_sha": "candidate-a",
+                            "artifact": artifact("candidate-a"),
+                        },
+                        {
+                            "reviewer_thread_id": "reviewer-b",
+                            "candidate_sha": "candidate-b",
+                            "artifact": artifact("candidate-b"),
+                        },
+                    ],
+                },
+            }
+        },
+    }
+    state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["3"])
+    audit = {
+        "semantic_agent_attempts": [first, second],
+        "agent_invocations": [
+            invocation(first, "candidate-a", "reviewer-a"),
+            invocation(second, "candidate-b", "reviewer-b"),
+        ],
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [],
+    }
+
+    records = history_records(state, audit)
+
+    assert [record["attempt_id"] for record in records] == ["attempt-a", "attempt-b"]
+    assert records[0]["findings"] == [
+        "问题：candidate-a；证据：candidate-a；必须修复：candidate-a；复验：candidate-a。"
+    ]
+    assert records[1]["findings"] == [
+        "问题：candidate-b；证据：candidate-b；必须修复：candidate-b；复验：candidate-b。"
+    ]
 
 
 def test_timeline_projects_semantic_invocation_output_and_retry_counters(
@@ -1749,13 +2715,25 @@ def test_history_matches_responses_and_findings_to_their_subject_and_window(
                     {
                         "review_budget": {
                             "window": 1,
-                            "review_artifacts": [{"artifact": artifact("old-window")}],
+                                "review_artifacts": [
+                                    {
+                                        "reviewer_thread_id": "reviewer-old",
+                                        "candidate_sha": "old-candidate",
+                                        "artifact": artifact("old-window"),
+                                    }
+                                ],
                         }
                     }
                 ],
                 "review_budget": {
                     "window": 2,
-                    "review_artifacts": [{"artifact": artifact("current-window")}],
+                        "review_artifacts": [
+                            {
+                                "reviewer_thread_id": "reviewer-ticket-2",
+                                "candidate_sha": "current-candidate",
+                                "artifact": artifact("current-window"),
+                            }
+                        ],
                 },
             },
             "3": {
@@ -1770,9 +2748,11 @@ def test_history_matches_responses_and_findings_to_their_subject_and_window(
                 "ended_at": "2026-08-30T00:02:00+00:00",
                 "status": "completed",
                 "phase": "candidate",
-                "work_subject": "ticket:2",
-                "invocation_role": "reviewer",
-                "semantic_attempt": {
+                    "work_subject": "ticket:2",
+                    "invocation_role": "reviewer",
+                    "reported_thread_id": "reviewer-ticket-2",
+                    "currentness_boundary": {"run_head_sha": "current-candidate"},
+                    "semantic_attempt": {
                     "role": "reviewer",
                     "ordinal": 1,
                     "budget_window": 2,

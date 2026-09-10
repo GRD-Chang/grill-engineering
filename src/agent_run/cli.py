@@ -258,6 +258,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="使用朴素文本（JSON 不受此选项影响）",
     )
+    history.add_argument(
+        "--details",
+        action="store_true",
+        help="在每轮时间线记录中展开已保存的完整证据与结果",
+    )
     runs = subcommands.add_parser("runs", help="发现本机已登记的 Delivery Run")
     _add_common_options(runs)
     runs.add_argument("--parent", type=_positive_integer, help="仅列出指定 Parent Issue")
@@ -371,7 +376,10 @@ def _main_with_parser_resources(
                 )
             else:
                 cli_presentation._print_history(
-                    state, as_json=parsed.as_json, plain=parsed.plain
+                    state,
+                    as_json=parsed.as_json,
+                    plain=parsed.plain,
+                    details=parsed.details,
                 )
             return 0
         git = GitRepository.discover(Path.cwd())

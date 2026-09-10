@@ -234,7 +234,12 @@ def commit_candidate(
         if semantic_attempt is None and not controller_reprepared:
             raise ValueError("Development closeout is missing its Semantic Attempt")
         if semantic_attempt is not None:
-            close_semantic_attempt(job, semantic_attempt, outcome="no_code_changes")
+            close_semantic_attempt(
+                job,
+                semantic_attempt,
+                outcome="no_code_changes",
+                result=_development_attempt_result(job),
+            )
         job.pop("controller_candidate_reprepare", None)
         job.pop("pending_attempt", None)
         job.pop("candidate_commit_intent", None)
@@ -262,7 +267,12 @@ def commit_candidate(
     if semantic_attempt is None and not controller_reprepared:
         raise ValueError("Candidate closeout is missing its Semantic Attempt")
     if semantic_attempt is not None:
-        close_semantic_attempt(job, semantic_attempt, outcome="candidate")
+        close_semantic_attempt(
+            job,
+            semantic_attempt,
+            outcome="candidate",
+            result=_development_attempt_result(job),
+        )
     job.pop("controller_candidate_reprepare", None)
     job.pop("pending_attempt", None)
     stage.save(state)
@@ -318,6 +328,16 @@ def _route_git_integrity_repair(
     semantic_attempt = pending_semantic_attempt(job, role="development")
     if semantic_attempt is None:
         raise ValueError("Git Integrity closeout is missing its Semantic Attempt")
-    close_semantic_attempt(job, semantic_attempt, outcome="git_integrity_repair")
+    close_semantic_attempt(
+        job,
+        semantic_attempt,
+        outcome="git_integrity_repair",
+        result=_development_attempt_result(job),
+    )
     stage.save(state)
     return True
+
+
+def _development_attempt_result(job: dict[str, Any]) -> dict[str, Any]:
+    summary = job.get("development_summary")
+    return {"development_summary": summary} if isinstance(summary, str) else {}

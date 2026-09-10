@@ -100,6 +100,44 @@ def test_semantic_attempt_identity_changes_only_after_canonical_closeout() -> No
     assert second["budget_window"] is None
 
 
+def test_close_semantic_attempt_retains_only_bounded_history_result_facts() -> None:
+    subject: dict[str, Any] = {}
+    attempt = allocate_semantic_attempt(
+        subject,
+        role="development",
+        work_subject="ticket:141",
+        generation=1,
+        currentness_boundary=_boundary(),
+        ordinal=1,
+        budget_window=1,
+    )
+
+    close_semantic_attempt(
+        subject,
+        attempt,
+        outcome="candidate",
+        result={
+            "development_summary": "kept summary",
+            "publication": {
+                "commit_message": "feat: kept",
+                "pr_title": "feat: kept",
+                "pr_body_markdown": "body",
+                "unexpected_agent_payload": "must not be retained",
+            },
+            "acceptance_artifact": {"checks": "not retained here"},
+        },
+    )
+
+    completed = subject["semantic_attempt_history"][0]
+    assert completed["development_summary"] == "kept summary"
+    assert completed["publication"] == {
+        "commit_message": "feat: kept",
+        "pr_title": "feat: kept",
+        "pr_body_markdown": "body",
+    }
+    assert "acceptance_artifact" not in completed
+
+
 def test_pending_attempt_rejects_currentness_or_generation_drift() -> None:
     subject: dict[str, Any] = {}
     attempt = allocate_semantic_attempt(
