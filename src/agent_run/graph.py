@@ -11,11 +11,7 @@ from agent_run.revisions import (
     ticket_graph_revision,
 )
 from agent_run.ticket_phase import BLOCKED_MESSAGES, TicketPhase
-
-
-DISQUALIFYING_LABELS = frozenset(
-    {"needs-triage", "needs-info", "ready-for-human"}
-)
+from agent_run.ticket_eligibility import label_blocker
 
 
 def state_from_graph(
@@ -69,7 +65,13 @@ def state_from_graph(
     frontier = [
         number
         for number in order
-        if tickets[str(number)]["eligibility"]["eligible"]
+        if (
+            tickets[str(number)]["eligibility"]["eligible"]
+            or (
+                ticket_jobs.get(str(number), {}).get("phase") is not None
+                and _eligibility(graph.issues[number], check_labels=False)[0]
+            )
+        )
         and _job_is_executable(
             ticket_jobs.get(str(number)),
             ticket=tickets[str(number)],
@@ -79,7 +81,13 @@ def state_from_graph(
     ]
     active: dict[str, Any] | None
     if frontier:
-        selected = frontier[0]
+        previous_active = previous.get("active_ticket_job")
+        continuing = (
+            previous_active.get("ticket_number")
+            if isinstance(previous_active, dict) and previous_active.get("phase")
+            else None
+        )
+        selected = continuing if continuing in frontier else frontier[0]
         active = ticket_jobs.get(str(selected), {"ticket_number": selected})
         active["selection_reason"] = (
             "first eligible ticket by parent sub-issue order, then issue number"
@@ -475,14 +483,11 @@ def _ticket_state(issue: Issue, eligible: bool, reason: str) -> dict[str, Any]:
     }
 
 
-def _eligibility(issue: Issue) -> tuple[bool, str]:
+def _eligibility(issue: Issue, *, check_labels: bool = True) -> tuple[bool, str]:
     if issue.state.upper() != "OPEN":
         return False, "ticket_closed"
-    disqualifying = sorted(issue.labels & DISQUALIFYING_LABELS)
-    if disqualifying:
-        return False, f"disqualifying_label:{disqualifying[0]}"
-    if "ready-for-agent" not in issue.labels:
-        return False, "missing_ready_for_agent"
+    if check_labels and (reason := label_blocker(issue.labels)):
+        return False, reason
     if any(
         blocker.state.upper() != "CLOSED" for blocker in issue.blocked_by
     ):

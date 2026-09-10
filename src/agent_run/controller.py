@@ -77,6 +77,7 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.task_control import TASK_CONTROL_PROTOCOL
+from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
 
 
 class GitHubReader(Protocol):
@@ -299,6 +300,8 @@ class Controller:
             effective_budget_policy = budget_policy or self._policy_for_new_run()
         try:
             existing = self._load_bound_run(run_id, state=existing)
+            if explicit_resume or resume_human_blocker or resume_budget_checkpoint:
+                self._require_ticket_labels(existing)
         except GitHubReadError as error:
             if not is_github_convergence_error(error.code):
                 raise
@@ -533,20 +536,23 @@ class Controller:
         ):
             raise RequeueError("requeue is only allowed in requeue_required state")
         if prepare_state is not None:
-            # Persist the accepted requeue intent before its authoritative
-            # GitHub facts are observed.  A convergence wait can then finish
-            # this Action without losing or reapplying the maintainer intent.
+            # Keep the accepted Action in memory until qualification succeeds
+            # or an external wait is durably recorded. Refusal consumes no work.
             prepare_state(existing)
-            self.states.save_run(run_id, existing)
-            prepare_state = None
         try:
             existing = self._load_bound_run(run_id, state=existing)
+            if not isinstance(existing_transition, dict):
+                self._require_ticket_labels(existing)
         except GitHubReadError as error:
             return self._wait_for_github_read(
                 run_id,
                 error,
+                state=existing,
                 waiting_for="GitHub repository binding",
             ), {}
+        if prepare_state is not None:
+            self.states.save_run(run_id, existing)
+            prepare_state = None
         parent_number = int(_state_mapping(existing, "parent")["number"])
         transition = existing.get("requeue_transition")
         if isinstance(transition, dict):
@@ -907,6 +913,22 @@ class Controller:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         require_current_run_state(state)
         return state
+
+    def _require_ticket_labels(self, state: dict[str, Any]) -> None:
+        subject, job, _ = current_change_job(state)
+        if job is None or not subject.startswith("ticket:"):
+            return
+        graph = self.github.delivery_graph(int(state["parent"]["number"]))
+        number = int(job["ticket_number"])
+        ticket = graph.issues.get(number)
+        if ticket is None:
+            # The normal graph/currentness check owns missing scope facts.
+            return
+        if reason := label_blocker(ticket.labels):
+            raise TicketEligibilityError(
+                f"Ticket #{number} 标签不允许开始或恢复：{reason}；"
+                "原任务、阶段和成果已保留，请由维护者调整标签后重试原命令。"
+            )
 
     def _refresh(
         self,

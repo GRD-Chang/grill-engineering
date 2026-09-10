@@ -1667,21 +1667,6 @@ class FixtureGitHubPublisher:
         self._crash_once("recover_abandoned_ticket")
         return True
 
-    def mark_ready_for_human(self, ticket_number: int) -> None:
-        raw_issues = _mutable_mapping(self.data, "issues")
-        issue = raw_issues.get(str(ticket_number))
-        if not isinstance(issue, dict):
-            raise ValueError("fixture ticket is missing")
-        labels = issue.get("labels")
-        if not isinstance(labels, list):
-            raise ValueError("fixture labels must be a list")
-        issue["labels"] = [
-            label for label in labels if label != "ready-for-agent"
-        ]
-        if "ready-for-human" not in issue["labels"]:
-            issue["labels"].append("ready-for-human")
-        self._save()
-
     def current_effective_revision(
         self,
         *,

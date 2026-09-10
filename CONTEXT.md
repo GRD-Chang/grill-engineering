@@ -347,8 +347,12 @@ _Avoid_: 盲目重放未知写入、仅凭 CLI stderr 判定失败、绕过 curr
 _Avoid_: 标签触发、定时触发、自动 intake
 
 **Execution Eligibility（执行资格）**:
-一张 open Ticket 由 triage 标签表达的当前可执行性。`ready-for-agent` 允许激活；`needs-triage`、`needs-info` 和 `ready-for-human` 阻止激活，标签变化本身不启动 Delivery Run。
+一张 open Ticket 由 triage 标签表达的开始或显式恢复工作的资格；`ready-for-agent` 允许，`needs-triage`、`needs-info` 和 `ready-for-human` 阻止。资格不满足不取消既有 Ticket 工作及其成果，标签变化本身不启动或停止 Delivery Run。
 _Avoid_: 启动授权、依赖已解除、完成状态
+
+**Triage Label（分诊标签）**:
+由维护者或独立分诊流程管理的 Issue 分类与领取资格标记，不属于 Runner 的写入权限。它不等同于 Delivery Run 的人工暂停状态。
+_Avoid_: Runner 自动切换标签、以标签代替 Run 暂停记录
 
 **Run Branch（运行分支）**:
 一个 Delivery Run 独有、由 Controller 创建和维护的受管 Run Branch。已通过 Ticket Integration Gate（Fresh Acceptance 或 Deterministic Ticket Fallback）的 Ticket 变更先进入该临时集成分支，整个 Delivery Run 最终通过它接受人工整体验收后才进入默认分支。
