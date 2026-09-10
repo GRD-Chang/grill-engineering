@@ -9,7 +9,10 @@ import pytest
 from agent_run.controller import Controller
 from agent_run.delivery_loop import TicketDeliveryLoop
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.models import DeliveryGraph
+from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.review_budget import new_budget
 from agent_run.ticket_eligibility import TicketEligibilityError
@@ -123,3 +126,67 @@ def test_new_ticket_is_not_started_without_ready_label(git_repo: Path) -> None:
     assert result["active_ticket_job"] is None
     assert result["ticket_jobs"] == {}
     assert result["status"] == "progress_exhausted"
+
+
+@pytest.mark.parametrize("failure_at", ["qualification", "refresh"])
+def test_resume_retry_reuses_only_successful_action_label_qualification(
+    git_repo: Path, failure_at: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+
+    class InterruptedReader(FixtureGitHubReader):
+        reads_until_failure: int | None = None
+
+        def delivery_graph(self, parent_number: int) -> DeliveryGraph:
+            if self.reads_until_failure is not None:
+                self.reads_until_failure -= 1
+                if self.reads_until_failure == 0:
+                    self.reads_until_failure = None
+                    raise GitHubReadError("github_timeout", "temporary graph outage")
+            return super().delivery_graph(parent_number)
+
+    reader = InterruptedReader(fixture)
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(reader, GitRepository(git_repo), states)
+    state, _ = controller.start(1)
+    run_id = state["run_id"]
+    state["active_ticket_job"].update({
+        "phase": "developing", "review_budget": new_budget(), "review_budget_history": [],
+    })
+    states.save_run(run_id, state)
+    controller.record_execution_failure(run_id, "interrupted")
+    action = {
+        "action_id": "resume-1", "kind": "resume",
+        "payload_digest": "first-intent", "executor_generation": 1,
+    }
+    reader.reads_until_failure = 1 if failure_at == "qualification" else 2
+    waiting, _ = controller.resume(
+        run_id, explicit_resume=True,
+        prepare_state=lambda current: prepare_action_application_receipt(current, action),
+    )
+    assert waiting["status"] == "waiting_external"
+    data = json.loads(fixture.read_text())
+    data["issues"]["3"]["labels"] = ["ready-for-human"]
+    fixture.write_text(json.dumps(data))
+    before = deepcopy(states.load_run(run_id))
+
+    if failure_at == "qualification":
+        with pytest.raises(TicketEligibilityError):
+            controller.resume(run_id, explicit_resume=True, record_explicit_resume_audit=False)
+        assert states.load_run(run_id) == before
+        return
+
+    continued, _ = controller.resume(
+        run_id, explicit_resume=True, record_explicit_resume_audit=False,
+    )
+    assert continued["status"] == "active"
+    assert continued["active_ticket_job"]["ticket_number"] == 3
+    before = deepcopy(states.load_run(run_id))
+    # A new explicit Action must qualify again, even for the same Ticket.
+    action.update(action_id="resume-2", payload_digest="new-intent", executor_generation=2)
+    with pytest.raises(TicketEligibilityError):
+        controller.resume(
+            run_id, explicit_resume=True,
+            prepare_state=lambda current: prepare_action_application_receipt(current, action),
+        )
+    assert states.load_run(run_id) == before

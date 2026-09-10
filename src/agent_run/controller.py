@@ -918,8 +918,15 @@ class Controller:
         subject, job, _ = current_change_job(state)
         if job is None or not subject.startswith("ticket:"):
             return
-        graph = self.github.delivery_graph(int(state["parent"]["number"]))
         number = int(job["ticket_number"])
+        receipt = state.get("action_application_receipt")
+        if not isinstance(receipt, dict) or receipt.get("kind") not in {"resume", "requeue"}:
+            receipt = None
+        # A new Action replaces its receipt. Only a successful check attached
+        # to this Action survives an automatic refresh retry.
+        if receipt is not None and receipt.get("qualified_ticket_number") == number:
+            return
+        graph = self.github.delivery_graph(int(state["parent"]["number"]))
         ticket = graph.issues.get(number)
         if ticket is None:
             # The normal graph/currentness check owns missing scope facts.
@@ -929,6 +936,8 @@ class Controller:
                 f"Ticket #{number} 标签不允许开始或恢复：{reason}；"
                 "原任务、阶段和成果已保留，请由维护者调整标签后重试原命令。"
             )
+        if receipt is not None:
+            receipt["qualified_ticket_number"] = number
 
     def _refresh(
         self,
