@@ -169,9 +169,9 @@ def test_publisher_does_not_blindly_retry_a_write(
     writes = 0
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     monkeypatch.setattr(
-        publisher, "_ensure_remote_run_branch", lambda _branch, _sha: None
+        "agent_run.github_publish.run_read_command",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(arguments, 0, "", ""),
     )
-    monkeypatch.setattr(publisher, "_remote_branch_sha", lambda _branch: None)
 
     def fail_write(_arguments, **_kwargs):
         nonlocal writes
@@ -180,7 +180,7 @@ def test_publisher_does_not_blindly_retry_a_write(
 
     monkeypatch.setattr("agent_run.github_publish.run_write_command", fail_write)
 
-    with pytest.raises(GitError, match="dial tcp: i/o timeout"):
+    with pytest.raises(GitHubReadError, match="dial tcp: i/o timeout") as caught:
         publisher.ensure_change_branch(
             branch="agent-run/run-1/example",
             base_branch="main",
@@ -188,6 +188,7 @@ def test_publisher_does_not_blindly_retry_a_write(
             expected_remote_sha="a" * 40,
             recovery_remote_sha="a" * 40,
         )
+    assert caught.value.code == "github_write_failed"
     assert writes == 1
 
 
@@ -207,11 +208,14 @@ def test_publisher_does_not_write_after_branch_read_exhaustion(
     monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
     monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
-    monkeypatch.setattr(
-        publisher, "_ensure_remote_run_branch", lambda _branch, _sha: None
-    )
 
-    with pytest.raises(GitError, match="HTTP 503"):
+    def unexpected_write(arguments, **_kwargs):
+        writes.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr("agent_run.github_publish.run_write_command", unexpected_write)
+
+    with pytest.raises(GitHubReadError, match="HTTP 503") as caught:
         publisher.ensure_change_branch(
             branch="agent-run/run-1/example",
             base_branch="main",
@@ -220,6 +224,7 @@ def test_publisher_does_not_write_after_branch_read_exhaustion(
             recovery_remote_sha="a" * 40,
         )
 
+    assert caught.value.code == "github_read_failed"
     assert reads == 3
     assert writes == []
 
