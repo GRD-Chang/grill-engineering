@@ -86,11 +86,7 @@ def _publication_operation(
 ) -> tuple[bool, Any]:
     try:
         return False, operation()
-    except (GitHubReadError, OSError, TimeoutError) as error:
-        if isinstance(error, GitHubReadError) and not is_github_convergence_error(
-            error.code
-        ):
-            raise
+    except (OSError, TimeoutError) as error:
         if stage._record_publication_operation_failure(state, job, error):
             return True, None
         raise
@@ -130,6 +126,13 @@ def publish_and_merge(
         )
     publication = _mapping(job, "publication")
     branch = stage.contract.branch
+    publish_intent = {
+        "action": "publish_ticket_ref",
+        "branch": branch,
+        "expected_remote_sha": str(job.get("published_sha", job["base_sha"])),
+        "head_sha": str(job["publication_sha"]),
+    }
+    observed_published = False
     existing_pr = job.get("pr_number")
     if isinstance(existing_pr, int):
         try:
@@ -202,6 +205,13 @@ def publish_and_merge(
             state["status"] = "waiting_merge"
             stage.save(state)
             return True
+        observed_published = (
+            existing_live.get("head_sha") == job["publication_sha"]
+            and (
+                job.get("published_sha") == job["publication_sha"]
+                or job.get("ticket_write_intent") == publish_intent
+            )
+        )
     stage._reject_stale(
         state, job, checkout, "Published-Head Gate rejected stale requirements"
     )
@@ -212,33 +222,31 @@ def publish_and_merge(
         lambda: stage.github.verify_ticket_pr_before_publish(
             branch=branch,
             base_branch=stage.contract.base_branch,
-            expected_head_sha=str(job.get("published_sha", job["base_sha"])),
+            expected_head_sha=str(
+                job["publication_sha"] if observed_published
+                else job.get("published_sha", job["base_sha"])
+            ),
             expected_base_sha=str(job["base_sha"]),
         ),
     )
     if exhausted:
         return True
-    publish_intent = {
-        "action": "publish_ticket_ref",
-        "branch": branch,
-        "expected_remote_sha": str(job.get("published_sha", job["base_sha"])),
-        "head_sha": str(job["publication_sha"]),
-    }
-    if job.get("ticket_write_intent") != publish_intent:
+    if not observed_published and job.get("ticket_write_intent") != publish_intent:
         job["ticket_write_intent"] = publish_intent
         stage.save(state)
-    exhausted, _ = _publication_operation(
-        stage,
-        state,
-        job,
-        lambda: stage.github.publish_branch(
-            branch,
-            str(job["publication_sha"]),
-            expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
-        ),
-    )
-    if exhausted:
-        return True
+    if not observed_published:
+        exhausted, _ = _publication_operation(
+            stage,
+            state,
+            job,
+            lambda: stage.github.publish_branch(
+                branch,
+                str(job["publication_sha"]),
+                expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
+            ),
+        )
+        if exhausted:
+            return True
     job.pop("ticket_write_intent", None)
     job["published_sha"] = str(job["publication_sha"])
     stage.save(state)

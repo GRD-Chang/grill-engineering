@@ -503,9 +503,15 @@ class GhGitHubPublisher:
         ]
         pushed = self._write_command(arguments)
         if pushed.returncode != 0:
-            if self._remote_branch_sha(branch) == head_sha:
+            observed = self._remote_branch_sha(branch)
+            if observed == head_sha:
                 return
-            raise GitError(pushed.stderr.strip() or "could not publish ticket branch")
+            if observed != expected_remote_sha:
+                raise GitError("remote ticket branch drifted")
+            raise GitHubReadError(
+                "github_write_failed",
+                pushed.stderr.strip() or "could not publish ticket branch",
+            )
         if self._remote_branch_sha(branch) != head_sha:
             raise GitError("Ticket ref publication readback did not match intent")
 
@@ -648,7 +654,9 @@ class GhGitHubPublisher:
             cwd=self.git.root,
         )
         if remote.returncode != 0:
-            raise GitError(remote.stderr.strip() or "could not read Ticket ref")
+            raise GitHubReadError(
+                "github_read_failed", remote.stderr.strip() or "could not read Ticket ref"
+            )
         return remote.stdout.split()[0] if remote.stdout.strip() else None
 
     def _change_prs(self, branch: str) -> list[object]:
@@ -2001,19 +2009,6 @@ class GhGitHubPublisher:
                 "Ticket updates are newer than the Publisher reopen event",
             )
         return True
-
-    def mark_ready_for_human(self, ticket_number: int) -> None:
-        self._require(
-            "issue",
-            "edit",
-            str(ticket_number),
-            "--repo",
-            self.repository,
-            "--add-label",
-            "ready-for-human",
-            "--remove-label",
-            "ready-for-agent",
-        )
 
     def current_effective_revision(
         self,

@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING, Any, Protocol
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
 from agent_run.runner_lease import runner_usage_lease
-from agent_run.state import StateStore
-from agent_run.task_control import TaskControlError, TaskKey
+from agent_run.state import SimulatedProcessCrash, StateStore
+from agent_run.task_control import TaskControlBusyError, TaskControlError, TaskKey
+from agent_run.ticket_eligibility import TicketEligibilityError
 
 if TYPE_CHECKING:
     from agent_run.run_driver import ControlRunOperation
@@ -96,11 +97,12 @@ class DeliveryExecutor:
                     binding,
                 )
             raise
-        except BaseException as error:
-            if (
-                control_operation is not None
-                and self.record_execution_failure is not None
-            ):
+        except (SimulatedProcessCrash, TaskControlBusyError, TicketEligibilityError):
+            # An abrupt exit, unresolved ownership or rejected precondition
+            # must not be rewritten as an applied business-operation failure.
+            raise
+        except Exception as error:
+            if self.record_execution_failure is not None:
                 self.record_execution_failure(states, run_id, str(error), binding)
             raise
 

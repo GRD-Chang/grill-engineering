@@ -18,6 +18,12 @@ from agent_run.agents import AgentBackend
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
+from agent_run.github import GitHubReadError
+from agent_run.external_supervision import (
+    ensure_supervision_window,
+    is_github_convergence_error,
+    wait_for_github_convergence,
+)
 from agent_run.publication_operation_retry import record_publication_operation_failure
 from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.worker_credentials import InitialCredentialUnavailable
@@ -242,6 +248,20 @@ class ChangeDeliveryEngine:
                 raise ValueError(f"unknown Ticket phase: {job['phase']}")
         except _TerminalChangeJob:
             return state
+        except GitHubReadError as error:
+            # Reads outside the PR/check-specific handlers (for example the
+            # revision fence after creating a Publication Commit) must enter
+            # the same bounded wait, without discarding the saved job phase.
+            if not is_github_convergence_error(error.code):
+                raise
+            wait_for_github_convergence(
+                state,
+                code=error.code,
+                message=str(error),
+                waiting_for=self.contract.label,
+            )
+            ensure_supervision_window(state)
+            return self.save(state)
         except InitialCredentialUnavailable as error:
             self._refund_unstarted_credential_invocation(state, job)
             self._wait_for_initial_credential(state, job, http_status=error.http_status)

@@ -126,7 +126,13 @@ def unknown_pr_mutation(
         return None
     if live.get("state") != "OPEN":
         return "change_pr_closed_or_merged_externally"
-    if live.get("head_sha") != job.get("publication_sha"):
+    known_heads = {job.get("publication_sha")}
+    if job.get("phase") in {
+        "developing", "repairing", "committing_candidate", "candidate",
+        "reviewing", "accepted", "publication_pending", "publishing",
+    } and isinstance(job.get("published_sha"), str):
+        known_heads.add(job["published_sha"])
+    if live.get("head_sha") not in known_heads:
         return "change_pr_head_changed_externally"
     expected_base_branch = (
         state.get("run_branch")
