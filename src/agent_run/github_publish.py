@@ -64,9 +64,14 @@ class GhGitHubPublisher:
             ],
         )
         if created.returncode != 0:
-            if self._remote_branch_sha(branch) == expected_base_sha:
+            observed = self._remote_branch_sha(branch)
+            if observed == expected_base_sha:
                 return
-            raise GitError(created.stderr.strip() or "could not create Change ref")
+            if observed is not None:
+                raise GitError("Change ref has a foreign identity")
+            raise GitHubReadError(
+                "github_write_failed", created.stderr.strip() or "could not create Change ref"
+            )
         if self._remote_branch_sha(branch) != expected_base_sha:
             raise GitError("Change ref creation readback did not match intent")
 
@@ -476,9 +481,14 @@ class GhGitHubPublisher:
             ],
         )
         if pushed.returncode != 0:
-            if self._remote_branch_sha(branch) == expected_sha:
+            observed = self._remote_branch_sha(branch)
+            if observed == expected_sha:
                 return
-            raise GitError(pushed.stderr.strip() or "could not create Run ref")
+            if observed is not None:
+                raise GitError("Run ref has a foreign identity")
+            raise GitHubReadError(
+                "github_write_failed", pushed.stderr.strip() or "could not create Run ref"
+            )
         if self._remote_branch_sha(branch) != expected_sha:
             raise GitError("Run ref creation readback did not match intent")
 
@@ -1316,7 +1326,8 @@ class GhGitHubPublisher:
             ["git", "fetch", "--no-tags", "origin", run_branch]
         )
         if fetched.returncode != 0:
-            raise GitError(
+            raise GitHubReadError(
+                "github_read_failed",
                 fetched.stderr.strip() or "could not fetch merged Run Branch"
             )
         fetched_sha = self.git.resolve("FETCH_HEAD")
