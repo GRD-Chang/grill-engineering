@@ -3510,27 +3510,34 @@ def test_closing_credential_channel_terminates_active_gh_read(
         gh_executable=str(executable),
         gh_environment={"GH_TEST_PID_PATH": str(process_id_path), "PATH": os.environ["PATH"]},
     )
-    credentials.start(tmp_path / "credential.sock")
     worker = threading.Thread(
         target=lambda: credentials._request(  # noqa: SLF001 - lifecycle seam
             {"kind": "run", "arguments": ["issue", "view", "1"]}
         ),
         daemon=True,
     )
-    worker.start()
-    for _ in range(100):
-        if process_id_path.exists():
-            break
-        time.sleep(0.02)
-    assert process_id_path.exists()
-    process_id = int(process_id_path.read_text(encoding="utf-8"))
+    try:
+        credentials.start(tmp_path / "credential.sock")
+        worker.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            # File creation precedes the write; existence alone is not ready.
+            if process_id_path.exists() and process_id_path.read_text().strip():
+                break
+            time.sleep(0.02)
+        assert process_id_path.exists()
+        process_id = int(process_id_path.read_text(encoding="utf-8"))
 
-    credentials.close()
-    worker.join(timeout=2)
+        credentials.close()
+        worker.join(timeout=2)
 
-    assert not worker.is_alive()
-    with pytest.raises(ProcessLookupError):
-        os.kill(process_id, 0)
+        assert not worker.is_alive()
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_id, 0)
+    finally:
+        credentials.close()
+        if worker.ident is not None:
+            worker.join(timeout=5)
 
 
 def test_worker_credential_channel_renews_proactively_and_recovers_transient_failure(
@@ -4226,26 +4233,52 @@ run_worker_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    for _ in range(100):
-        if child_path.exists():
-            break
-        time.sleep(0.02)
-    assert child_path.exists()
-    child_pid = int(child_path.read_text(encoding="utf-8").strip())
+    child_pid: int | None = None
+    child_gone = False
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if child_path.exists() and child_path.read_text().strip():
+                break
+            time.sleep(0.02)
+        assert child_path.exists()
+        child_pid = int(child_path.read_text(encoding="utf-8").strip())
 
-    os.kill(controller.pid, signal.SIGINT)
-    controller.wait(timeout=5)
+        os.kill(controller.pid, signal.SIGINT)
+        controller.wait(timeout=5)
 
-    assert controller.returncode not in {None, 0}
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("background Worker process survived SIGINT cleanup")
+        assert controller.returncode not in {None, 0}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                child_gone = True
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("background Worker process survived SIGINT cleanup")
+    finally:
+        if controller.poll() is None:
+            controller.send_signal(signal.SIGINT)
+            try:
+                controller.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                controller.kill()
+                controller.wait(timeout=5)
+        if not child_gone and child_pid is None and child_path.exists():
+            recorded_pid = child_path.read_text().strip()
+            if recorded_pid:
+                child_pid = int(recorded_pid)
+        if not child_gone and child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if controller.stdout is not None:
+            controller.stdout.close()
+        if controller.stderr is not None:
+            controller.stderr.close()
 
 
 @pytest.mark.parametrize(
@@ -4354,33 +4387,48 @@ run_worker_process(
 def test_successful_worker_cleans_background_processes(
     tmp_path: Path,
 ) -> None:
-    child_path = tmp_path / "child.pid"
-
+    # Own orphan reaping in an isolated probe; kill(pid, 0) also succeeds for
+    # dead zombies and otherwise depends on the CI host's init process.
+    code = r'''
+import ctypes, os, signal, time
+from pathlib import Path
+from agent_run.worker_sandbox import run_worker_process
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+child = None
+reaped = False
+try:
     result = run_worker_process(
-        [
-            "sh",
-            "-c",
-            (
-                "sleep 60 </dev/null >/dev/null 2>&1 & "
-                "echo $! > child.pid"
-            ),
-        ],
-        cwd=tmp_path,
-        prompt="",
-        environment={"PATH": "/usr/bin:/bin"},
-        timeout=5,
+        ["sh", "-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > child.pid"],
+        cwd=Path.cwd(), prompt="", environment={"PATH": "/usr/bin:/bin"}, timeout=5,
     )
-
     assert result.returncode == 0
-    child_pid = int(child_path.read_text(encoding="utf-8").strip())
-    for _ in range(50):
+    child = int(Path("child.pid").read_text().strip())
+    deadline = time.monotonic() + 1
+    while os.waitpid(child, os.WNOHANG)[0] != child:
+        assert time.monotonic() < deadline, "background Worker survived cleanup"
+        time.sleep(0.01)
+    reaped = True
+    child = None
+finally:
+    if not reaped and child is None and Path("child.pid").exists():
+        child = int(Path("child.pid").read_text().strip())
+    if child is not None:
         try:
-            os.kill(child_pid, 0)
+            os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("background Worker process survived cleanup")
+            pass
+        try:
+            os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+'''
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_stdout_callback_error_does_not_stop_pipe_drain(

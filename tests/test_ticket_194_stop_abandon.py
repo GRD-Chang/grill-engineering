@@ -419,7 +419,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     state_path = states.runs_directory / f"{run_id}.json"
     before_state = state_path.read_bytes()
     before_control = control.path_for(task).read_bytes()
-    entered = threading.Barrier(2)
+    entered = threading.Barrier(2, timeout=5)
     release = threading.Event()
     original_preflight = lifecycle.preflight
 
@@ -445,11 +445,16 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
 
     contender = threading.Thread(target=submit_stop)
     contender.start()
-    entered.wait()
-    assert state_path.read_bytes() == before_state
-    assert control.path_for(task).read_bytes() == before_control
-    release.set()
-    contender.join(timeout=2)
+    try:
+        entered.wait()
+        assert state_path.read_bytes() == before_state
+        assert control.path_for(task).read_bytes() == before_control
+    except BaseException:
+        entered.abort()
+        raise
+    finally:
+        release.set()
+        contender.join(timeout=5)
 
     assert not contender.is_alive()
     assert len(failures) == 1
@@ -512,10 +517,15 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     run_id = str(run["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
 
-    stopped = _run_cli(git_repo, fixture, "stop", run_id)
+    try:
+        stopped = _run_cli(git_repo, fixture, "stop", run_id)
 
-    assert stopped.returncode == 0, stopped.stderr
-    assert worker.wait(timeout=2) == -signal.SIGKILL
+        assert stopped.returncode == 0, stopped.stderr
+        assert worker.wait(timeout=2) == -signal.SIGKILL
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
     payload = json.loads(stopped.stdout)
     assert payload["status"] == "operator_stopped"
     assert payload["action"]["operation"] == "stop"

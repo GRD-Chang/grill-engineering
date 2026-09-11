@@ -38,10 +38,10 @@ os.close(ready_read)
 (root / 'child.pid').write_text(str(child))
 print('normal output', flush=True)
 print('error tail', file=sys.stderr, flush=True)
-if outcome == 'normal':
-    os._exit(0)
 with (root / 'ready.fifo').open('w') as ready:
     ready.write('1')
+if outcome == 'normal':
+    os._exit(0)
 signal.pause()
 """
 real_popen = subprocess.Popen
@@ -61,8 +61,6 @@ try:
             global starts
             starts += 1
             if starts == 2:
-                with (sample / 'ready.fifo').open() as ready:
-                    assert ready.read() == '1'
                 raise RuntimeError("can't start new thread")
             return original_start(reader)
         if outcome == 'reader_start_failure':
@@ -70,6 +68,15 @@ try:
         def spawn(*args, **kwargs):
             process = real_popen(*args, **kwargs)
             spawned.append(process)
+            # Fixture startup is not output-reader cleanup time. Wait for the
+            # real descendant/output boundary before arming the rescue guard.
+            ready = os.open(sample / 'ready.fifo', os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                assert select.select([ready], [], [], 5)[0], 'fixture did not become ready'
+                assert os.read(ready, 1) == b'1'
+            finally:
+                os.close(ready)
+            original_start(guard)
             if outcome in {'timeout', 'exception'}:
                 original_wait = process.wait
                 injected = False
@@ -77,8 +84,6 @@ try:
                     nonlocal injected
                     if not injected:
                         injected = True
-                        with (sample / 'ready.fifo').open() as ready:
-                            assert ready.read() == '1'
                         if outcome == 'timeout':
                             raise subprocess.TimeoutExpired(args[0], timeout)
                         raise RuntimeError('injected wait failure')
@@ -87,13 +92,13 @@ try:
             return process
         subprocess.Popen = spawn
         child = None
+        reaped = False
         guard_fired = threading.Event()
         def rescue():
             guard_fired.set()
             if (sample / 'child.pid').exists():
                 os.kill(int((sample / 'child.pid').read_text()), signal.SIGKILL)
         guard = threading.Timer(3, rescue)
-        original_start(guard)
         try:
             arguments = [sys.executable, '-c', command, str(sample), outcome, 'escaped' if escaped else 'owned']
             try:
@@ -128,11 +133,13 @@ try:
                 else:
                     assert select.select([pidfd], [], [], 2)[0] == [pidfd], 'descendant survived return'
             assert os.waitpid(child, 0)[0] == child
+            reaped = True
             child = None
             assert unrelated.poll() is None, 'unrelated process group was killed'
         finally:
             guard.cancel()
-            guard.join()
+            if guard.ident is not None:
+                guard.join()
             subprocess.Popen = real_popen
             threading.Thread.start = original_start
             for process in spawned:
@@ -141,7 +148,7 @@ try:
                 except ProcessLookupError:
                     pass
                 process.wait()
-            if child is None and (sample / 'child.pid').exists():
+            if not reaped and child is None and (sample / 'child.pid').exists():
                 child = int((sample / 'child.pid').read_text())
             if child is not None:
                 try:

@@ -275,7 +275,7 @@ def test_environment_carrier_has_exactly_one_successful_consumer(
         spec,
         capture_executor_environment({"PATH": "/bin"}, command=spec.command),
     )
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=5)
     outcomes: list[str] = []
 
     def consume() -> None:
@@ -288,11 +288,18 @@ def test_environment_carrier_has_exactly_one_successful_consumer(
             outcomes.append("consumed")
 
     workers = [threading.Thread(target=consume) for _ in range(2)]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=5)
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+    finally:
+        barrier.abort()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=5)
 
+    assert not any(worker.is_alive() for worker in workers)
     assert sorted(outcomes) == ["consumed", "rejected"]
 
 
