@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from test_codex_prompt_contract import _capture_public_prompt
 from support.worker_process_timing import (
     AdvancingClock,
     run_worker_expecting_early_failure,
@@ -304,9 +305,9 @@ def test_publication_repairs_invalid_output_in_same_thread(
     assert isinstance(result, PublicationResult)
     assert len(attempts) == 2
     assert "resume" in attempts[1]
-    assert "你已完成当前发布叙事" in prompts[1]
-    assert "Publication wire JSON" in prompts[1]
-    assert "不重新读取项目、改写交付事实或调用工具" in prompts[1]
+    assert "你已完成本次交付说明编写" in prompts[1]
+    assert "文案结果 JSON" in prompts[1]
+    assert "不重新开发、审查、验证、读取项目或调用工具，不改写已有工作事实" in prompts[1]
     assert "上一输出未通过本地 Publication Artifact contract" not in prompts[1]
     assert events[-1] == (
         "completed",
@@ -376,9 +377,9 @@ def test_run_publication_repairs_empty_output_in_same_thread(
     assert result["_thread_id"] == "run-publication-thread"
     assert len(attempts) == 2
     assert "resume" in attempts[1]
-    assert "你已完成当前发布叙事" in prompts[1]
-    assert "Publication wire JSON" in prompts[1]
-    assert "不重新读取项目、改写交付事实或调用工具" in prompts[1]
+    assert "你已完成本次交付说明编写" in prompts[1]
+    assert "文案结果 JSON" in prompts[1]
+    assert "不重新开发、审查、验证、读取项目或调用工具，不改写已有工作事实" in prompts[1]
     assert "Final Run Publication" not in prompts[1]
     assert events[-1] == (
         "completed",
@@ -472,9 +473,9 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     assert result.thread_id == "development-thread"
     assert len(attempts) == 2
     assert "resume" in attempts[1]
-    assert "你已完成当前开发或修复工作" in prompts[1]
-    assert "Development wire JSON" in prompts[1]
-    assert "不重新执行开发、验证或工具调用" in prompts[1]
+    assert "你已完成本次开发或修复" in prompts[1]
+    assert "开发结果 JSON" in prompts[1]
+    assert "不重新开发、审查、验证、读取项目或调用工具" in prompts[1]
     assert "上一输出未通过本地 Development result contract" not in prompts[1]
 
 
@@ -510,9 +511,9 @@ def test_reviewer_repairs_invalid_output_with_reviewer_only_prompt(
 
     assert result.thread_id == "reviewer-thread"
     assert len(prompts) == 2
-    assert "你已完成当前独立验收" in prompts[1]
-    assert "Acceptance Artifact" in prompts[1]
-    assert "不重新执行审查、验证或工具调用" in prompts[1]
+    assert "你已完成本次独立验收" in prompts[1]
+    assert "审查结果 JSON" in prompts[1]
+    assert "不重新开发、审查、验证、读取项目或调用工具" in prompts[1]
     assert "上一输出未通过本地 Acceptance Artifact contract" not in prompts[1]
 
 
@@ -697,7 +698,7 @@ def test_failure_resume_rechecks_current_workspace_before_development(
     )
 
     assert "因前次调用失败而继续的同 Thread Resume" not in prompts[0]
-    assert "继续完成你负责的当前开发交付" in prompts[0]
+    assert "继续完成你负责的开发任务" in prompts[0]
     assert "Development Brief:" not in prompts[0]
 
 
@@ -1537,23 +1538,24 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     development, acceptance = prompts
     assert "skill:implement" in development
     assert "skill:code-review" in development
-    assert "默认最多进行一个 Development Preflight Round" in development
+    assert "建议安排审查子 Agent" in development
+    assert "本次开发最多组织一轮" in development
     assert 'fork_turns: "none"' in development
-    assert "不常规启动第二轮内部 Reviewer" in development
+    assert "不反复启动通用审查" in development
     assert "Prompt 只提供判断框架" not in development
-    assert "E2E、Standards 和 Spec 三种独立视角" in acceptance
-    assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in acceptance
-    assert "Standards 与 Spec 默认使用静态证据" in acceptance
+    assert "除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证" in acceptance
+    assert "完整测试与必要检查" in acceptance
+    assert "Standards 与 Spec 使用静态证据" in acceptance
     assert "skill:code-review" in acceptance
-    assert "你对三个维度的最终判断负责" in acceptance
-    assert "不要求每个维度对应一个独立 subagent" in acceptance
+    assert "对三个维度的最终结果负责" in acceptance
     assert 'fork_turns: "none"' in acceptance
-    assert "保持现状会使当前验收对象不可接受" in acceptance
-    assert "同一根因的多个表现应合并报告" in acceptance
+    assert "使当前交付不可接受" in acceptance
+    assert "同一根因合并为一条" in acceptance
     assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in acceptance
-    assert "每条 Finding 写明问题、证据、所需修复和复验方式，放在最合适 lane" in acceptance
-    assert "pass 与 blocked 的 findings 必须为空" in acceptance
-    assert "blocked 的 evidence 必须说明发生了什么" in acceptance
+    assert "问题、证据、所需修复及复验方式" in acceptance
+    assert "不跨维度重复报告" in acceptance
+    assert "pass 与 blocked 的 findings 为空" in acceptance
+    assert "在 evidence 中说明原因、已尝试的办法和人必须做什么" in acceptance
     assert "\"verdict\"" not in acceptance
     assert "\"human_blockers\"" not in acceptance
     assert len(schemas) == 2
@@ -1617,10 +1619,10 @@ def test_publication_prompts_require_semantic_titles(
     )
     ticket_prompt, run_prompt = prompts
 
-    assert "默认使用 Conventional Commit 标题，可按变更调整" in ticket_prompt
-    assert "默认使用 Conventional Commit 标题，可按变更调整" in run_prompt
+    assert "提交说明和 PR 标题默认使用 Conventional Commit 形式" in ticket_prompt
+    assert "提交说明和 PR 标题默认使用 Conventional Commit 形式" in run_prompt
     assert "`Primary Ticket: #" not in ticket_prompt
-    assert "CI、Candidate、SHA、门禁和生命周期事实不得写入叙事" in run_prompt
+    assert "内部提交身份和门禁信息不写入产品叙事" in run_prompt
 
 
 def test_run_publication_prompt_reserves_identity_for_publisher(
@@ -1670,7 +1672,7 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
         }
     )
 
-    assert "parent_issue_url" in prompts[0]
+    assert "本次负责的完整需求" in prompts[0]
     assert "https://github.com/example/project/issues/1" in prompts[0]
     assert "base-sha" not in prompts[0]
     assert "run-head-sha" not in prompts[0]
@@ -1682,7 +1684,7 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
 @pytest.mark.parametrize(
     ("request_extra", "mode_text", "evidence"),
     [
-        ({}, "Development Brief", None),
+        ({}, "实现本次全部验收条件", None),
         (
             {
                 "repair_source": "acceptance",
@@ -1690,7 +1692,7 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
                     "Preserve this exact acceptance evidence."
                 ),
             },
-            "Acceptance Repair",
+            "这是上一次独立审查的完整结果",
             "Preserve this exact acceptance evidence.",
         ),
         (
@@ -1701,7 +1703,7 @@ def test_run_publication_prompt_reserves_identity_for_publisher(
                     "log": "Preserve this exact CI evidence.",
                 },
             },
-            "Required-Checks Repair",
+            "下列检查失败对应当前提交",
             "Preserve this exact CI evidence.",
         ),
     ],
@@ -1754,15 +1756,17 @@ def test_development_prompt_matches_normal_and_repair_contracts(
 
     prompt = prompts[0]
     assert mode_text in prompt
-    assert "直接影响的成功路径、失败路径和边界情况" in prompt
-    assert "根据实际风险取得最低充分证据" in prompt
+    assert "实际风险验证受影响功能" in prompt
+    assert "影响范围不明或发现具体风险时仍应扩大验证" in prompt
     if request_extra:
-        assert "自行检查当前工作树并完成与风险相称的验证" in prompt
-        assert "本轮不需要启动开发侧 Reviewer" in prompt
+        assert "直接影响的同类场景和本次修复可能造成的回归" in prompt
+        assert "默认不再组织独立审查" in prompt
+        assert "既改变原方案、又引入此前未覆盖的关键风险" in prompt
+        assert "才允许一次针对该风险的审查" in prompt
         assert "Development Preflight Round" not in prompt
     else:
-        assert "低风险局部改动可以直接收口" in prompt
-        assert "默认最多进行一个 Development Preflight Round" in prompt
+        assert "建议安排审查子 Agent" in prompt
+        assert "本次开发最多组织一轮" in prompt
         assert 'fork_turns: "none"' in prompt
     if evidence is not None:
         assert evidence in prompt
@@ -1820,7 +1824,7 @@ def test_merge_conflict_prompt_excludes_unresolved_acceptance_artifact(
     )
 
     prompt = prompts[0]
-    assert "Merge Conflict Evidence (verbatim)" in prompt
+    assert "解决当前工作树中的真实冲突" in prompt
     assert "Unresolved paths:\nshared.txt" in prompt
     assert "Preserve this Candidate finding." not in prompt
     assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) not in prompt
@@ -2198,18 +2202,24 @@ def test_reviewer_uses_a_read_only_checkout(
     assert calls[0]["writable_checkout"] is False
 
 
-def test_reviewer_prompt_requires_external_temporary_paths_for_writes() -> None:
-    prompt = CodexCliBackend._review_prompt(
+def test_reviewer_prompt_requires_external_temporary_paths_for_writes(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
         {
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "task_issue_url": "https://github.com/example/project/issues/2",
-        }
+        },
+        name="reviewer-external-temporary-paths",
     )
 
-    assert "Validation Checkout 是只读的" in prompt
-    assert "不得创建、修改或删除其中的文件" in prompt
-    assert "checkout 外可定位、只服务本轮的临时路径" in prompt
-    assert "并在结束前清理" in prompt
+    assert "整个工作区保持只读" in prompt
+    assert "工作区外仅服务本轮的可定位临时路径" in prompt
+    assert "结束前关闭本轮启动的服务和浏览器" in prompt
+    assert "清理临时副本及其他本轮临时产物" in prompt
 
 
 def test_production_reviewer_cannot_create_modify_or_delete_checkout_files(

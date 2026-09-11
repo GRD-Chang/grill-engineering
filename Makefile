@@ -10,7 +10,7 @@ REPORT_MAKE = $(MAKE)
 # Groups are starting points; shared changes also need their callers' tests.
 TESTS_policy = tests/test_delivery_policy.py tests/test_review_budget.py
 TESTS_state = tests/test_state_store.py tests/test_scope_revision.py
-TESTS_prompts = tests/test_codex_prompt_contract.py
+TESTS_prompts = tests/test_codex_prompt_contract.py tests/test_codex_prompt_refinement.py
 TESTS_locator = tests/test_cli.py tests/test_state_store.py tests/test_run_locator*.py tests/test_test_environment.py -k 'locator or selector or test_pytest_isolates'
 TESTS_github = tests/test_github*.py tests/test_required_checks_observation.py tests/test_external_supervision.py
 TESTS_delivery = tests/test_delivery.py tests/test_cli_delivery.py tests/test_cli_mvp.py tests/test_review_budget.py

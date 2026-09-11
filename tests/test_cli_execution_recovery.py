@@ -80,7 +80,8 @@ def test_manual_resume_preserves_spent_recovery_and_interrupted_json_step(recove
     assert failed_again['active_agent_invocation']['semantic_attempt']['attempt_id'] == attempt_id
     assert failed_again['active_agent_invocation']['ordinary_recovery_used'] is True
     assert calls[2]['prompt'] == calls[3]['prompt'] == calls[4]['prompt']
-    assert '不重新执行开发、验证或工具调用' in calls[4]['prompt']
+    assert '只修正结果格式' in calls[4]['prompt']
+    assert '不重新开发、审查、验证、读取项目或调用工具' in calls[4]['prompt']
     assert all('resume' in call['arguments'] for call in calls[1:])
 
     code, blocked = command('resume')
