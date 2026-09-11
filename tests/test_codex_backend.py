@@ -3771,8 +3771,9 @@ def test_app_credential_channel_close_after_network_timeout_joins_renewal(
     assert not socket_path.exists()
 
 
+@pytest.mark.parametrize("client_reads_first", [False, True])
 def test_app_credential_channel_close_interrupts_network_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_reads_first: bool
 ) -> None:
     certificate = tmp_path / "localhost.crt"
     private_key = tmp_path / "localhost.key"
@@ -3825,11 +3826,17 @@ def test_app_credential_channel_close_interrupts_network_response(
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Test-Token-Request", str(calls))
+            if calls > 1 and not client_reads_first:
+                response_started.set()
             self.end_headers()
             if calls == 1:
                 self.wfile.write(body)
                 return
-            response_started.set()
+            if client_reads_first:
+                if not client_read_started.wait(timeout=2):
+                    return
+                response_started.set()
             release_response.wait(timeout=30)
             try:
                 self.wfile.write(body)
@@ -3868,7 +3875,9 @@ def test_app_credential_channel_close_interrupts_network_response(
     def synchronized_read(
         response: http.client.HTTPResponse, *arguments: Any, **options: Any
     ) -> bytes:
-        if response_started.is_set():
+        # Identify the renewal response itself: the server-side marker may be
+        # published either before or after this client reaches body reading.
+        if response.getheader("X-Test-Token-Request") == "2":
             client_read_started.set()
         return original_read(response, *arguments, **options)
 
@@ -3892,10 +3901,13 @@ def test_app_credential_channel_close_interrupts_network_response(
         close_started = time.monotonic()
         credentials.close()
         assert time.monotonic() - close_started < 3
+        # Prove cancellation joined the renewal while the response is still
+        # withheld; teardown releasing the body must not satisfy this assertion.
+        assert renewal_thread is not None
+        assert not renewal_thread.is_alive()
     finally:
         release_response.set()
-        if renewal_thread is not None and renewal_thread.is_alive():
-            credentials.close()
+        credentials.close()
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
@@ -3905,6 +3917,7 @@ def test_app_credential_channel_close_interrupts_network_response(
     assert not renewal_thread.is_alive()
     assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
     assert not socket_path.exists()
+    assert not server_thread.is_alive()
 
 
 def test_signing_registry_reclaims_resources_registered_after_cancel() -> None:

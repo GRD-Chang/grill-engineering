@@ -270,9 +270,10 @@ def test_sync_fetch_failure_or_foreign_head_does_not_update_local_ref(
     git = GitRepository(git_repo)
     head = git.resolve("HEAD")
     subprocess.run(
-        ["git", "update-ref", "FETCH_HEAD", head], cwd=git_repo,
+        ["git", "fetch", "--no-tags", ".", "HEAD"], cwd=git_repo,
         check=True, capture_output=True,
     )
+    assert git.resolve("FETCH_HEAD") == head
     publisher = GhGitHubPublisher("example/project", git)
     if fetch_fails:
         with pytest.raises(GitHubReadError) as caught:
