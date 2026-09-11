@@ -250,8 +250,6 @@ class GitHubPublisher(Protocol):
         expected_ownership: dict[str, Any],
     ) -> bool: ...
 
-    def mark_ready_for_human(self, ticket_number: int) -> None: ...
-
     def current_effective_revision(
         self,
         *,

@@ -400,7 +400,7 @@ class TaskControlStore:
         normalized_payload = _bounded_payload(payload)
         digest = _payload_digest(normalized_payload)
 
-        # Observe attach/no-op first. Capture the new Session outside the lock,
+        # Observe attachment first. Capture the new Session outside the lock,
         # then repeat all admission checks in the transaction that fences ownership.
         for prepared in (False, True):
             if prepared and before_create is not None:
@@ -454,22 +454,13 @@ class TaskControlStore:
                         "失败 Control Action 的目标与当前 Delivery Run 不匹配；"
                         "不会猜测或跳过进程 ownership"
                     )
-                if (
-                    kind == "stop"
-                    and unresolved_target is None
-                    and (
-                        executor is None
-                        or (
-                            isinstance(executor, dict)
-                            and executor.get("status") in {"exited", "absent"}
-                        )
-                    )
-                ):
-                    return None
                 active_target = (
                     deepcopy(executor)
                     if isinstance(executor, dict)
-                    and executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
+                    and (
+                        executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
+                        or isinstance(executor.get("worker"), Mapping)
+                    )
                     else None
                 )
                 target = active_target or unresolved_target
@@ -1899,8 +1890,22 @@ def _is_unbound_successor_of_receipt(
     action: Mapping[str, Any],
     receipt: Mapping[str, Any],
 ) -> bool:
+    executor = record.get("executor")
+    # Rejected entry preconditions leave the previous Run receipt untouched;
+    # a proven exited, unapplied successor is not evidence of a conflicting Run.
+    rejected_before_application = (
+        action.get("status") == "failed"
+        and isinstance(executor, Mapping)
+        and executor.get("status") in {"exited", "absent"}
+        and executor.get("action_id") == action.get("action_id")
+        and executor.get("generation") == action.get("executor_generation")
+        and executor.get("run_id") is None
+    )
     if (
-        action.get("status") not in _ACTIVE_ACTION_STATUSES
+        (
+            action.get("status") not in _ACTIVE_ACTION_STATUSES
+            and not rejected_before_application
+        )
         or action.get("run_id") is not None
         or action.get("application_observed") is not False
     ):
@@ -1916,7 +1921,7 @@ def _is_unbound_successor_of_receipt(
             continue
         if all(
             predecessor.get(key) == receipt.get(key)
-            for key in ("action_id", "kind", "payload_digest")
+            for key in ("action_id", "kind", "payload_digest", "executor_generation")
         ) and predecessor.get("run_id") == receipt.get("run_id"):
             return True
     return False

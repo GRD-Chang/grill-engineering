@@ -92,69 +92,80 @@ class ExternalSupervisor:
         availability = state.get("credential_availability")
         if isinstance(availability, dict) and boundary.kind == "github_convergence":
             availability["retry_count"] = retries
+        deadline = window["deadline"]
+        if not isinstance(deadline, (int, float)):
+            raise ValueError("supervision window is missing its deadline")
+        remaining = deadline - self.now()
+        if remaining > 0:
+            delay = min(_retry_delay_seconds(retries, self.poll_interval_seconds), remaining)
+            # Persist the intended delay before sleeping, including crash recovery.
+            window["last_retry_delay_seconds"] = delay
+            if persist_before_sleep is not None:
+                persist_before_sleep()
+            remaining = deadline - self.now()
+            if remaining > 0:
+                self.sleeper(min(delay, remaining))
+            if self.now() < deadline:
+                return True
+
+        self._expire(state, boundary, window)
+        return False
+
+    def _expire(
+        self, state: dict[str, Any], boundary: WaitingBoundary, window: dict[str, object]
+    ) -> None:
         started_at = window["started_at"]
         if not isinstance(started_at, (int, float)):
             raise ValueError("supervision window is missing its start time")
-        elapsed = max(0, int(self.now() - started_at))
-        if elapsed >= boundary.budget_seconds:
-            resume_status = state.get("status")
-            last_error = _last_external_error(state)
-            supervision_wait: dict[str, Any] = {
-                "resume_status": resume_status,
-                "kind": boundary.kind,
-                "waiting_for": boundary.waiting_for,
-                "identity": window["identity"],
-                "phase": _phase(state),
-                "started_at": window["started_at"],
-                "deadline": window["deadline"],
-                "elapsed_seconds": elapsed,
-                "budget_seconds": boundary.budget_seconds,
-                "retry_count": retries,
-                "latest_observation": observation,
+        elapsed = max(boundary.budget_seconds, int(self.now() - started_at))
+        resume_status = state.get("status")
+        last_error = _last_external_error(state)
+        supervision_wait: dict[str, Any] = {
+            "resume_status": resume_status,
+            "kind": boundary.kind,
+            "waiting_for": boundary.waiting_for,
+            "identity": window["identity"],
+            "phase": _phase(state),
+            "started_at": window["started_at"],
+            "deadline": window["deadline"],
+            "elapsed_seconds": elapsed,
+            "budget_seconds": boundary.budget_seconds,
+            "retry_count": window["retry_count"],
+            "latest_observation": window["latest_observation"],
+        }
+        diagnostic: dict[str, Any] = {
+            "code": "supervision_timeout",
+            "message": "外部状态在本次监督窗口内未收敛",
+            "waiting_for": boundary.waiting_for,
+            "phase": _phase(state),
+            "elapsed_seconds": elapsed,
+            "budget_seconds": boundary.budget_seconds,
+            "next_action": _run_recovery_action(state),
+        }
+        if last_error is not None:
+            diagnostic["last_error"] = last_error
+        availability = state.get("credential_availability")
+        if isinstance(availability, dict):
+            failure_class = availability.get("failure_class")
+            retry_count = availability.get("retry_count")
+            if isinstance(failure_class, str):
+                supervision_wait["credential_failure_class"] = failure_class
+                diagnostic["credential_failure_class"] = failure_class
+            if isinstance(retry_count, int):
+                supervision_wait["retry_count"] = retry_count
+                diagnostic["retry_count"] = retry_count
+            http_status = availability.get("http_status")
+            if type(http_status) is int and 100 <= http_status <= 599:
+                supervision_wait["credential_http_status"] = http_status
+                diagnostic["credential_http_status"] = http_status
+        state.update(
+            {
+                "status": "supervision_timeout",
+                "terminal_kind": "supervision_timeout",
+                "supervision_wait": supervision_wait,
+                "diagnostics": [diagnostic],
             }
-            diagnostic: dict[str, Any] = {
-                "code": "supervision_timeout",
-                "message": "外部状态在本次监督窗口内未收敛",
-                "waiting_for": boundary.waiting_for,
-                "phase": _phase(state),
-                "elapsed_seconds": elapsed,
-                "budget_seconds": boundary.budget_seconds,
-                "next_action": _run_recovery_action(state),
-            }
-            if last_error is not None:
-                diagnostic["last_error"] = last_error
-            availability = state.get("credential_availability")
-            if isinstance(availability, dict):
-                failure_class = availability.get("failure_class")
-                retry_count = availability.get("retry_count")
-                if isinstance(failure_class, str):
-                    supervision_wait["credential_failure_class"] = failure_class
-                    diagnostic["credential_failure_class"] = failure_class
-                if isinstance(retry_count, int):
-                    supervision_wait["retry_count"] = retry_count
-                    diagnostic["retry_count"] = retry_count
-                http_status = availability.get("http_status")
-                if type(http_status) is int and 100 <= http_status <= 599:
-                    supervision_wait["credential_http_status"] = http_status
-                    diagnostic["credential_http_status"] = http_status
-            state.update(
-                {
-                    "status": "supervision_timeout",
-                    "terminal_kind": "supervision_timeout",
-                    "supervision_wait": supervision_wait,
-                    "diagnostics": [diagnostic],
-                }
-            )
-            return False
-        delay = min(
-            _retry_delay_seconds(retries, self.poll_interval_seconds),
-            boundary.budget_seconds - elapsed,
         )
-        window["last_retry_delay_seconds"] = delay
-        if persist_before_sleep is not None:
-            persist_before_sleep()
-        self.sleeper(delay)
-        return True
 
     def observe(self, state: dict[str, Any]) -> dict[str, object] | None:
         """Create or recover the durable window as soon as a wait is observed.
@@ -240,7 +251,7 @@ def wait_for_github_convergence(
 
 
 def ensure_supervision_window(
-    state: dict[str, Any], *, now: Callable[[], float] = monotonic
+    state: dict[str, Any], *, now: Callable[[], float] | None = None
 ) -> dict[str, object] | None:
     """Save an observable window whenever a public path enters a wait.
 
@@ -252,7 +263,7 @@ def ensure_supervision_window(
     boundary = waiting_boundary(state)
     if boundary is None:
         return None
-    return _supervision_window(state, boundary, now=now())
+    return _supervision_window(state, boundary, now=(now or monotonic)())
 
 
 def supervision_window_matches(

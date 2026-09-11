@@ -32,7 +32,9 @@ pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命�
 CLI、安装器等未单列的模块直接选择其测试文件。公共接口、共享状态、生命周期、依赖和测试基础设施
 变化应扩大到直接调用方、同族场景及历史回归；无法界定影响范围时运行完整套件。
 
-本地最终验收使用 `make test-full`：先检查 pip 和 Linux `os.memfd_create` 能力，再执行完整套件，默认固定六个 pytest worker；`make typecheck` 执行完整类型检查。
+本地最终验收使用 `make test-full`：先检查 pip 和 Linux `os.memfd_create`、`os.pidfd_open` 能力，再执行完整套件，默认固定六个 pytest worker；缺少关键能力时拒绝全量入口，不以跳过进程边界测试代替验收。`make typecheck` 执行完整类型检查。
+
+提交前优先使用 CI 相同的 Python 3.11 与锁定开发依赖；通过环境报告比较 Git、系统能力及依赖版本。Git 测试只使用公开支持的命令构造状态，例如通过本地 fetch 生成 `FETCH_HEAD`，不直接将伪引用交给 `update-ref`。不同版本本地通过不代表 CI 已通过，不应固定旧版 Git 来规避兼容性缺陷。
 六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`；CI 显式使用这个双 worker 命令，runner 规格和 job 数量不变。
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
 调试顺序问题用 `make test-full TEST_WORKERS=0`；临时追加过滤或诊断参数，例如

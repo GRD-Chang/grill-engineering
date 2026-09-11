@@ -74,6 +74,7 @@ def main() -> None:
         "packages": package_versions(),
         "bubblewrap": command("bwrap", "--version"),
         "memfd": memfd_capability(),
+        "pidfd": {"available": hasattr(os, "pidfd_open")},
         "user_namespace": {
             "unprivileged_userns_clone": read_limit(
                 "/proc/sys/kernel/unprivileged_userns_clone"

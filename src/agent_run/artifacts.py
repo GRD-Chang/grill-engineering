@@ -5,10 +5,6 @@ from dataclasses import dataclass
 from typing import Any
 
 
-_SEMANTIC_TITLE = re.compile(
-    r"^(feat|fix|improve|refactor|docs|test|chore)"
-    r"(?:\([a-z0-9][a-z0-9._-]*\))?: .+"
-)
 _CLOSING_KEYWORD = re.compile(
     r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+\b"
 )
@@ -16,12 +12,6 @@ _PUBLISHER_OWNED_CONTEXT = re.compile(
     r"(?im)^\s*(?:Parent Issue|Primary Ticket|Delivery Type|Delivery Run):"
 )
 _PUBLISHER_OWNED_SECTION = re.compile(r"(?im)^## Completed Tickets\s*$")
-_REQUIRED_SECTIONS = (
-    "What Problem This Solves",
-    "Why This Change Was Made",
-    "User Impact",
-    "Evidence",
-)
 
 MAX_HUMAN_BLOCKERS = 8
 MAX_HUMAN_BLOCKER_LENGTH = 2_000
@@ -34,14 +24,6 @@ _PUBLICATION_RESULT_FIELDS = {
     "human_blockers",
 }
 _DEVELOPMENT_RESULT_FIELDS = {"result_kind", "summary", "human_blockers"}
-_FINDING = re.compile(
-    r"^问题：\S(?:.*\S)?；证据：\S(?:.*\S)?；必须修复：\S(?:.*\S)?；复验：\S(?:.*\S)?$"
-)
-_PASS_EVIDENCE_MARKERS = {
-    "e2e": ("操作或命令：", "退出码：", "结果："),
-    "standards": ("审查范围或基线：", "结论："),
-    "spec": ("已核对的验收标准：", "覆盖结论："),
-}
 
 
 @dataclass(frozen=True)
@@ -64,14 +46,6 @@ class PublicationArtifact:
         commit_message = _nonempty_string(data, "commit_message")
         pr_title = _nonempty_string(data, "pr_title")
         body = _nonempty_string(data, "pr_body_markdown")
-        if not _SEMANTIC_TITLE.fullmatch(commit_message):
-            raise ValueError(
-                "commit_message does not match the semantic title contract"
-            )
-        _require_meaningful_outcome(commit_message, "commit_message")
-        if not _SEMANTIC_TITLE.fullmatch(pr_title):
-            raise ValueError("pr_title does not match the semantic title contract")
-        _require_meaningful_outcome(pr_title, "pr_title")
         if (primary_ticket is None) == (delivery_run is None):
             raise ValueError("publication artifact requires exactly one identity")
         if _PUBLISHER_OWNED_CONTEXT.search(body):
@@ -80,8 +54,6 @@ class PublicationArtifact:
             raise ValueError("PR narrative must not contain Publisher-owned sections")
         if _CLOSING_KEYWORD.search(body):
             raise ValueError("PR body must not contain automatic closing keywords")
-        for section in _REQUIRED_SECTIONS:
-            _require_nonempty_section(body, section)
         return cls(
             commit_message=commit_message,
             pr_title=pr_title,
@@ -140,29 +112,12 @@ class AcceptanceArtifact:
                 raise ValueError(f"invalid {lane} check status")
             evidence = _nonempty_string(result, "evidence")
             findings = _string_list(result, "findings")
-            if any(_FINDING.fullmatch(finding) is None for finding in findings):
-                raise ValueError(
-                    f"{lane} findings must use 问题：…；证据：…；必须修复：…；复验：…"
-                )
             if status == "pass" and findings:
                 raise ValueError(f"{lane} pass check must not contain findings")
-            if status == "pass" and not all(
-                _has_marker_value(evidence, marker)
-                for marker in _PASS_EVIDENCE_MARKERS[lane]
-            ):
-                raise ValueError(
-                    f"{lane} pass evidence must contain its reviewable evidence markers"
-                )
             if status == "fail" and not findings:
                 raise ValueError(f"{lane} fail check requires findings")
             if status == "blocked" and findings:
                 raise ValueError(f"{lane} blocked check must not contain findings")
-            if status == "blocked" and not all(
-                marker in evidence for marker in ("发生", "尝试", "人必须")
-            ):
-                raise ValueError(
-                    f"{lane} blocked evidence must state what happened, was tried, and human action"
-                )
             checks[lane] = {
                 "status": status,
                 "evidence": evidence,
@@ -312,23 +267,6 @@ def clear_current_human_blocker(subject: dict[str, Any]) -> None:
         subject.pop("blocked_reason", None)
 
 
-def _require_nonempty_section(body: str, title: str) -> None:
-    pattern = re.compile(
-        rf"(?ms)^## {re.escape(title)}\s*\n+(.+?)(?=^## |\Z)"
-    )
-    match = pattern.search(body)
-    if match is None or not match.group(1).strip():
-        raise ValueError(f"PR body section {title!r} must be non-empty")
-
-
-def _require_meaningful_outcome(value: str, field: str) -> None:
-    outcome = value.split(":", 1)[1].strip()
-    cjk_count = len(re.findall(r"[\u3400-\u9fff]", outcome))
-    word_count = len(re.findall(r"[A-Za-z0-9]+", outcome))
-    if len(outcome) < 8 and cjk_count < 4 and word_count < 3:
-        raise ValueError(f"{field} must describe a meaningful user outcome")
-
-
 def _mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict) or not all(
         isinstance(key, str) for key in value
@@ -357,12 +295,6 @@ def _nonempty_string(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
     return value.strip()
-
-
-def _has_marker_value(evidence: str, marker: str) -> bool:
-    """Require a non-empty value immediately after a documented evidence marker."""
-    _, separator, remainder = evidence.partition(marker)
-    return bool(separator and remainder.split("；", maxsplit=1)[0].strip())
 
 
 def _string_list(data: dict[str, Any], key: str) -> list[str]:

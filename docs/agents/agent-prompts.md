@@ -60,6 +60,10 @@ Artifact schema、Git/GitHub 写入和发布门禁。Controller 只把会影响�
 Reviewer 与各类定向 Repair，不暴露预算窗口或状态迁移。Prompt 不要求 Agent 报告 Controller 可以
 机械得到的事实，Controller 也不解析 Development Summary 来判断 Finding 是否关闭。
 
+所有角色及 Structured Output Repair 仅受结构、非空、资源上限和必要状态一致性校验约束；身份、版本
+与发布权限边界继续保留。自由文本不按关键词、句式、标点或章节拒收；内容要求和默认模板保持精简，
+用于指导 Agent，不构成文字质量门禁。
+
 ### 完整合同与角色化短 Prompt
 
 新角色、新工作对象或显式创建的新 Thread 使用该角色的完整标准 Prompt。同一角色继续完成同一对象时，
@@ -426,6 +430,8 @@ lane 有 Finding 时 status 为 fail；pass 与 blocked 的 findings 为空。�
 处理时使用 blocked，并在 evidence 中说明发生了什么、已经尝试什么和人必须做什么。三个 lane 都
 pass 才表示当前验收对象通过。
 
+Finding 自然说明问题、证据、所需修复和复验方式；evidence 说明实际检查及结论，不要求固定措辞。
+
 你可以构建、测试并清理 checkout 外的验证产物，但保持产品交付物只读。完成条件是对当前 Candidate
 或合并预览形成完整、独立、可复核的 E2E、Standards、Spec 三 lane 结论。
 
@@ -607,13 +613,14 @@ Publication Agent 只负责当前 diff 的语义标题和 PR 正文。它不修�
 你的唯一职责是根据当前需求合同、当前 checkout 的实际累计 diff 和下方允许使用的证据，生成准确、
 简洁的 commit message、PR title 和 PR body。你不负责重新验收代码，也不负责执行 Git/GitHub 写入。
 
-PR body 使用四个非空二级标题：
+PR body 默认采用以下模板，可按变更规模调整章节和措辞：
 - What Problem This Solves：改前限制、改后能力和覆盖边界；
 - Why This Change Was Made：关键设计路径与约束，不逐文件罗列；
 - User Impact：用户可执行结果和兼容/迁移行为；
 - Evidence：只陈述下方证据实际证明的内容。
 
-commit_message 与 pr_title 使用仓库允许的 Conventional Commit 语义标题，不使用 closing keywords。
+commit_message 与 pr_title 默认使用 Conventional Commit 标题，可按变更调整。任务关联、关闭和完成
+信息由 Runner 填写；不使用 closing keywords 或冒充发布事实。
 最后只输出 Publication wire JSON。
 ```
 

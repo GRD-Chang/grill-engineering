@@ -542,7 +542,8 @@ def test_run_supervises_repair_pr_failed_check_evidence_reads(
             "required_checks": ["none", "fail", "fail"],
             "required_check_evidence_failures": failures,
         },
-        supervision_clock_multiplier=120,
+        # Preserve repeated read failures without relying on a post-deadline retry.
+        supervision_clock_multiplier=40,
     )
     agents = _repair_agents(git_repo / "agents.json", repair_generations=2)
 

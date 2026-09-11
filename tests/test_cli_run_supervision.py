@@ -648,7 +648,8 @@ def test_run_bounds_persistent_unknown_repair_checks_without_new_candidate(
         git_repo / "github.json",
         issues={"3": ticket()},
         delivery={"required_checks": ["none", "fail", "unknown"]},
-        supervision_clock_multiplier=120,
+        # Exercise multiple retries before the final sleep exhausts the window.
+        supervision_clock_multiplier=40,
     )
     agents = run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))

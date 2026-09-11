@@ -323,7 +323,10 @@ class SystemdUserExecutorHost:
     ) -> None:
         self.transport = transport or SubprocessSystemdTransport()
         self.runtime_directory = Path(runtime_directory)
-        self.executor_python = Path(executor_python).resolve()
+        # Resolve the Snapshot directory, but retain the venv Python symlink:
+        # resolving the executable itself loses pyvenv.cfg and its packages.
+        python = Path(executor_python)
+        self.executor_python = python.parent.resolve() / python.name
         self.environment: Mapping[str, str] | None = environment
         self.max_environment_bytes = max_environment_bytes
         self.runner_lease_fd = runner_lease_fd
@@ -418,7 +421,7 @@ class SystemdUserExecutorHost:
                 run_id=spec.run_id,
             )
             native = self.transport.inspect(self._unit(spec))
-            observation = self._from_native(spec, native)
+            observation = self._from_native(spec, native, control)
             if observation.status not in {"absent", "exited"}:
                 self._release_capture()
                 return observation
@@ -564,7 +567,9 @@ class SystemdUserExecutorHost:
         """Read exact systemd ownership without cleanup or control writes."""
 
         spec = self._bind_historical_runner(spec, control)
-        observation = self._from_native(spec, self.transport.inspect(self._unit(spec)))
+        observation = self._from_native(
+            spec, self.transport.inspect(self._unit(spec)), control
+        )
         if (
             observation.status == "absent"
             and self._launch_pending_path(spec).exists()
@@ -585,7 +590,7 @@ class SystemdUserExecutorHost:
     ) -> HostObservation:
         spec = self._bind_historical_runner(spec, control)
         native = self.transport.inspect(self._unit(spec))
-        observation = self._from_native(spec, native)
+        observation = self._from_native(spec, native, control)
         if observation.status in {"starting", "running"}:
             key = self._key(spec)
             self._accepted_launches.add(key)
@@ -726,7 +731,8 @@ class SystemdUserExecutorHost:
         threading.Thread(target=guardian.wait, daemon=True).start()
 
     def _from_native(
-        self, spec: ExecutorSpec, native: SystemdUnitObservation
+        self, spec: ExecutorSpec, native: SystemdUnitObservation,
+        control: TaskControlStore,
     ) -> HostObservation:
         if native.status != "absent" and native.description is None:
             return HostObservation(
@@ -741,6 +747,34 @@ class SystemdUserExecutorHost:
             observed_runner_binding = self._runner_binding_from_description(
                 spec, native.description
             )
+            if observed_runner_binding is None and spec.run_id is not None:
+                # systemd retains the launch identity after bind_run. Accept
+                # that identity only when durable control proves the binding.
+                record = control.load(spec.task)
+                action = record.get("action") if isinstance(record, dict) else None
+                executor = record.get("executor") if isinstance(record, dict) else None
+                launch_binding = self._runner_binding_from_description(
+                    replace(spec, run_id=None), native.description
+                )
+                if (
+                    isinstance(record, dict)
+                    and isinstance(action, dict)
+                    and isinstance(executor, dict)
+                    and record.get("run_id") == spec.run_id
+                    and action.get("run_id") == spec.run_id
+                    and executor.get("run_id") == spec.run_id
+                    and action.get("action_id") == spec.action_id
+                    and executor.get("action_id") == spec.action_id
+                    and action.get("executor_generation") == spec.generation
+                    and executor.get("generation") == spec.generation
+                    and launch_binding is not None
+                    and executor.get("runner_binding") == launch_binding
+                    and (
+                        native.pid is None
+                        or executor.get("pid") in {None, native.pid}
+                    )
+                ):
+                    observed_runner_binding = launch_binding
         if native.status != "absent" and observed_runner_binding is None:
             return HostObservation(
                 "conflict",

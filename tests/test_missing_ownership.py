@@ -171,12 +171,10 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
             else:
                 recovered = control.load(task)
                 assert recovered is not None
-                if command in {"run", "stop"}:
+                if command == "run":
                     assert host.start_count == 0, output
                     assert recovered["action"]["action_id"] == receipt["action_id"]
-                    assert recovered["action"]["status"] == (
-                        "failed" if command == "run" else "completed"
-                    )
+                    assert recovered["action"]["status"] == "failed"
                 else:
                     assert host.start_count == 1, output
                     assert len(prepared) == 1

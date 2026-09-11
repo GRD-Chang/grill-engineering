@@ -615,7 +615,6 @@ class TicketDeliveryLoop:
         return False
 
     def _escalate(self, state: dict[str, Any], job: dict[str, Any], code: str) -> None:
-        self.github.mark_ready_for_human(int(job["ticket_number"]))
         job["blocked_reason"] = code
         state["status"] = "blocked"
         state["diagnostics"] = [

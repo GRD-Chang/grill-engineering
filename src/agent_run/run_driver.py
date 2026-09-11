@@ -20,6 +20,7 @@ from agent_run.external_supervision import (
     is_supervised_wait,
     is_proven_github_state_contradiction,
     public_supervision_snapshot,
+    wait_for_github_convergence,
 )
 from agent_run.executor_host import ExecutorHost
 from agent_run.git import GitRepository
@@ -651,7 +652,23 @@ class RunDriver:
                 if step is None:
                     return state
                 progress_marker_before_dispatch = _progress_marker(state)
-                outcome = self.operations.dispatch(step, run_id)
+                try:
+                    outcome = self.operations.dispatch(step, run_id)
+                except GitHubReadError as error:
+                    if is_proven_github_state_contradiction(error.code):
+                        raise
+                    # Initial branch creation and other outer operations can
+                    # fail before entering a Change Delivery loop. Resume the
+                    # durable operation through the same bounded supervisor.
+                    latest = self.states.load_current_run(run_id)
+                    if latest is None:
+                        raise
+                    wait_for_github_convergence(
+                        latest, code=error.code, message=str(error),
+                        waiting_for=step.value,
+                    )
+                    self.states.save_run(run_id, latest)
+                    outcome = self.operations.classify(latest)
                 state = outcome.state
                 if (
                     outcome.kind is RunOutcomeKind.PROGRESS

@@ -275,7 +275,7 @@ def test_environment_carrier_has_exactly_one_successful_consumer(
         spec,
         capture_executor_environment({"PATH": "/bin"}, command=spec.command),
     )
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=5)
     outcomes: list[str] = []
 
     def consume() -> None:
@@ -288,11 +288,18 @@ def test_environment_carrier_has_exactly_one_successful_consumer(
             outcomes.append("consumed")
 
     workers = [threading.Thread(target=consume) for _ in range(2)]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=5)
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+    finally:
+        barrier.abort()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=5)
 
+    assert not any(worker.is_alive() for worker in workers)
     assert sorted(outcomes) == ["consumed", "rejected"]
 
 
@@ -697,6 +704,41 @@ def test_systemd_host_observe_is_exact_and_strictly_read_only(
     assert observation.status == expected_status
     assert control.path_for(spec.task).read_bytes() == before
     assert not (tmp_path / "runtime").exists()
+
+
+@pytest.mark.parametrize("wrong_run", [False, True])
+@pytest.mark.parametrize("native_status", ["running", "exited"])
+def test_started_executor_remains_identifiable_after_run_binding(
+    tmp_path: Path, wrong_run: bool, native_status: str,
+) -> None:
+    spec = _spec(tmp_path)
+    spec.cwd.mkdir(parents=True)
+    control = TaskControlStore(tmp_path / "control")
+    spec = _admit(control, spec)
+    transport = FakeSystemdTransport()
+    host = SystemdUserExecutorHost(
+        transport=transport, runtime_directory=tmp_path / "runtime",
+        environment={}, executor_python=Path(sys.executable),
+    )
+    host.ensure(spec, control)
+    control.bind_run(spec.task, spec.action_id, "run-1", generation=spec.generation)
+    control.mark_handshake(
+        spec.task, action_id=spec.action_id, generation=spec.generation,
+        pid=os.getpid(), process_start_token=_start_token(os.getpid()),
+    )
+    transport.unit = SystemdUnitObservation(
+        native_status,  # type: ignore[arg-type]
+        str(transport.launches[0]["description"]),
+        os.getpid() if native_status == "running" else None, None,
+    )
+    bound = replace(spec, run_id="wrong-run" if wrong_run else "run-1")
+    before = control.path_for(spec.task).read_bytes()
+    observation = host.observe(bound, control)
+    assert observation.status == ("conflict" if wrong_run else native_status)
+    assert control.path_for(spec.task).read_bytes() == before
+    if not wrong_run:
+        assert host.inspect(bound, control).status == native_status
+        assert len(transport.launches) == 1
 
 
 @pytest.mark.parametrize(

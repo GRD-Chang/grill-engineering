@@ -3349,7 +3349,12 @@ def test_parent_only_requeue_blocks_an_externally_closed_old_pr(
 
     assert blocked.returncode == 2
     assert stdout_json(blocked)["status"] == "blocked"
-    assert stdout_json(blocked)["diagnostics"][0]["code"] == (
+    diagnostic = stdout_json(blocked)["diagnostics"][0]
+    assert diagnostic["code"] == "task_control"
+    assert diagnostic["operation"] == "requeue"
+    assert diagnostic["application_status"] == "unknown"
+    # The CLI observation failure and the durable delivery failure are distinct.
+    assert load_only_run_state(git_repo)["diagnostics"][0]["code"] == (
         "change_pr_closed_or_merged_externally"
     )
 

@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from agent_run.state import SimulatedProcessCrash, StateStore
 from conftest import seed_run, write_fixture
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import final_run_publication, passing_acceptance
@@ -573,15 +574,10 @@ def test_abandon_does_not_reopen_ticket_closed_outside_publisher(
 
 
 @pytest.mark.parametrize(
-        ("action", "mismatch_save"),
-        [
-            ("publish_branch", 24),
-            ("ensure_ticket_pr", 26),
-            ("required_checks", 28),
-        ],
+    "action", ["publish_branch", "ensure_ticket_pr", "required_checks"]
 )
 def test_aba_revision_after_crash_requires_explicit_requeue(
-    git_repo: Path, action: str, mismatch_save: int
+    git_repo: Path, action: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_body = _ticket()["body"]
     fixture = write_fixture(
@@ -606,17 +602,36 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         seed_run(git_repo, fixture, "1", idle_control=True)
     )["run_id"]
 
-    interrupted = run_internal_stage(
-        git_repo,
-        fixture,
-        "deliver",
-        run_id,
-        "--agent-fixture",
-        str(first_agents),
-        "--crash-after-save",
-        str(mismatch_save),
-    )
+    save_run = StateStore.save_run
+    crashed = False
 
+    def crash_after_revision_mismatch_save(
+        store: StateStore, saved_run_id: str, state: dict[str, Any]
+    ) -> None:
+        nonlocal crashed
+        save_run(store, saved_run_id, state)
+        job = state.get("ticket_jobs", {}).get("2", {})
+        if (
+            not crashed
+            and saved_run_id == run_id
+            and job.get("phase") == "blocked"
+            and job.get("blocked_reason") == "effective_revision_mismatch"
+        ):
+            crashed = True
+            raise SimulatedProcessCrash("after durable revision mismatch")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(StateStore, "save_run", crash_after_revision_mismatch_save)
+        interrupted = run_internal_stage(
+            git_repo,
+            fixture,
+            "deliver",
+            run_id,
+            "--agent-fixture",
+            str(first_agents),
+        )
+
+    assert crashed, "delivery must durably record the revision mismatch before crashing"
     assert interrupted.returncode == 2
     interrupted_state = load_only_run_state(git_repo)
     assert interrupted_state["ticket_jobs"]["2"]["phase"] == "blocked"

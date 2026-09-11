@@ -419,7 +419,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
     state_path = states.runs_directory / f"{run_id}.json"
     before_state = state_path.read_bytes()
     before_control = control.path_for(task).read_bytes()
-    entered = threading.Barrier(2)
+    entered = threading.Barrier(2, timeout=5)
     release = threading.Event()
     original_preflight = lifecycle.preflight
 
@@ -445,11 +445,16 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
 
     contender = threading.Thread(target=submit_stop)
     contender.start()
-    entered.wait()
-    assert state_path.read_bytes() == before_state
-    assert control.path_for(task).read_bytes() == before_control
-    release.set()
-    contender.join(timeout=2)
+    try:
+        entered.wait()
+        assert state_path.read_bytes() == before_state
+        assert control.path_for(task).read_bytes() == before_control
+    except BaseException:
+        entered.abort()
+        raise
+    finally:
+        release.set()
+        contender.join(timeout=5)
 
     assert not contender.is_alive()
     assert len(failures) == 1
@@ -512,10 +517,15 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     run_id = str(run["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
 
-    stopped = _run_cli(git_repo, fixture, "stop", run_id)
+    try:
+        stopped = _run_cli(git_repo, fixture, "stop", run_id)
 
-    assert stopped.returncode == 0, stopped.stderr
-    assert worker.wait(timeout=2) == -signal.SIGKILL
+        assert stopped.returncode == 0, stopped.stderr
+        assert worker.wait(timeout=2) == -signal.SIGKILL
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
     payload = json.loads(stopped.stdout)
     assert payload["status"] == "operator_stopped"
     assert payload["action"]["operation"] == "stop"
@@ -556,12 +566,10 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
 
     assert no_active_executor.returncode == 0, no_active_executor.stderr
     no_active_payload = json.loads(no_active_executor.stdout)
-    assert no_active_payload["result"] == "no_active_executor"
-    assert no_active_payload["diagnostics"][-1]["code"] == "no_active_executor"
-    assert no_active_payload["status"] == resumed["status"]
-    assert "action" not in no_active_payload
-    assert state_path.read_bytes() == resumed_state
-    assert control.path_for(task).read_bytes() == resumed_control
+    assert no_active_payload["status"] == "operator_stopped"
+    assert no_active_payload["action"]["operation"] == "stop"
+    assert state_path.read_bytes() != resumed_state
+    assert control.path_for(task).read_bytes() != resumed_control
 
 
 @pytest.mark.parametrize(
@@ -1931,7 +1939,7 @@ def test_public_stop_rejects_unknown_ownership_without_mutating_run(
 
 
 @pytest.mark.parametrize("mode", ["recorded_absent", "pid_gone", "token_mismatch"])
-def test_stop_proven_no_active_observations_are_strictly_read_only(
+def test_stop_proven_no_active_observations_admit_pause_action(
     git_repo: Path, mode: str
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -2023,9 +2031,10 @@ def test_stop_proven_no_active_observations_are_strictly_read_only(
     )
 
     assert final["status"] == current["status"]
-    assert receipt is None
-    assert state_path.read_bytes() == before_state
-    assert control_path.read_bytes() == before_control
+    assert receipt is not None and receipt.kind == "stop"
+    assert state_path.read_bytes() != before_state
+    assert states.load_run(run_id)["action_application_receipt"]["kind"] == "stop"
+    assert control_path.read_bytes() != before_control
 
 
 def test_stop_unknown_host_observation_rejects_without_partial_mutation(
@@ -2223,9 +2232,19 @@ def test_public_stop_reloads_state_after_executor_exit(
     observed = threading.Event()
     release = threading.Event()
 
-    class ExitBarrierHost:
+    class ExitBarrierHost(FakeExecutorHost):
         def __init__(self, **_options: object) -> None:
+            super().__init__()
+
+        def prepare_environment(self, _arguments: object) -> None:
             pass
+
+        def terminate_control_target(
+            self, target_executor: Mapping[str, Any], *, timeout: float = 1.0
+        ) -> None:
+            # This Host models the Executor exit at the observation barrier;
+            # only its Worker is a real process owned by this test.
+            assert worker.poll() is not None
 
         def check_readiness(self) -> None:
             pass
@@ -2297,19 +2316,22 @@ def test_public_stop_reloads_state_after_executor_exit(
                 assert output["status"] == "completed"
                 assert output["next_action"] == "无"
             else:
-                assert output["result"] == "no_active_executor"
-                assert output["status"] == current["status"]
-                assert output["next_action"] == "agent-run run 1"
-            assert "action" not in output
+                assert output["status"] == "operator_stopped"
+                assert output["action"]["operation"] == "stop"
+            if becomes_terminal:
+                assert "action" not in output
         elif becomes_terminal:
             assert "当前没有正在运行的 Agent" not in captured.out
             assert "交付状态: 整个交付已完成" in captured.out
             assert "下一步: 无" in captured.out
         else:
-            assert "当前没有正在运行的 Agent" in captured.out
-            assert "下一步: agent-run run 1 --repo example/project" in captured.out
-        assert state_path.read_bytes() == after_exit_state
-        assert control_path.read_bytes() == after_exit_control
+            assert "操作: stop" in captured.out
+            assert "agent-run resume 1 --repo example/project" in captured.out
+        if becomes_terminal:
+            assert state_path.read_bytes() == after_exit_state
+            assert control_path.read_bytes() == after_exit_control
+        else:
+            assert states.load_run(run_id)["status"] == "operator_stopped"
     finally:
         release.set()
         submitter.join(timeout=3)
@@ -2406,7 +2428,7 @@ def test_stop_noop_reload_fails_closed_after_successor_admission(
 
         assert result == []
         assert len(failure) == 1
-        assert isinstance(failure[0], ActionReconciliationError)
+        assert isinstance(failure[0], ActionBusyError)
         latest = control.load(task)
         assert latest is not None
         assert latest["action"]["action_id"] == resume.action_id
@@ -2426,6 +2448,8 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
     states = StateStore(git_repo / ".agent-run")
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
+    current.update({"status": "completed", "terminal_kind": "completed"})
+    states.save_run(run_id, current)
     control, task, worker = _bind_running_executor(git_repo, run_id)
     record = control.load(task)
     assert record is not None
@@ -2573,12 +2597,16 @@ def test_production_read_only_stop_skips_execution_dependencies(
         lambda: unavailable_dependency != "active_runner",
     )
     if unavailable_dependency == "systemd":
+        from agent_run.systemd_executor_host import SystemdExecutionReadinessError
+
+        class UnavailableSystemdHost(AvailableSystemdHost):
+            def check_readiness(self) -> None:
+                raise SystemdExecutionReadinessError("systemd unavailable")
+
         monkeypatch.setattr(
             cli_module,
             "SystemdUserExecutorHost",
-            lambda **_options: pytest.fail(
-                "read-only Stop must not construct a systemd Host"
-            ),
+            UnavailableSystemdHost,
         )
     else:
         monkeypatch.setattr(
@@ -2594,14 +2622,14 @@ def test_production_read_only_stop_skips_execution_dependencies(
             ["stop", "1", "--repo", "example/project", "--json"]
         )
 
-        assert return_code == 0
         output = json.loads(capsys.readouterr().out)
         if executor_proof in {"terminal", "terminal_running"}:
+            assert return_code == 0
             assert output["status"] == "completed"
             assert output["result"] == "resumed"
         else:
-            assert output["result"] == "no_active_executor"
-            assert output["diagnostics"][-1]["code"] == "no_active_executor"
+            assert return_code == 2
+            assert output["diagnostics"][-1]["code"] == "execution_readiness"
         assert "action" not in output
         assert state_path.read_bytes() == before_state
         assert control_path.read_bytes() == before_control

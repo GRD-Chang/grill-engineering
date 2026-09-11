@@ -39,7 +39,7 @@ test:
 
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:
-	$(PYTHON) -c 'import os, pip, sys; sys.exit(0 if hasattr(os, "memfd_create") else "完整测试需要支持 os.memfd_create 的 Linux Python")'
+	$(PYTHON) -c 'import os, pip, sys; sys.exit(0 if all(hasattr(os, name) for name in ("memfd_create", "pidfd_open")) else "完整测试需要支持 os.memfd_create 和 os.pidfd_open 的 Linux Python；请切换解释器，不得以跳过关键进程测试代替完整验收")'
 	AGENT_RUN_TEST_WHEELHOUSE="$(abspath $(TEST_WHEELHOUSE))" $(PYTHON) -m pytest -n $(TEST_WORKERS) --dist worksteal $(PYTEST_ARGS)
 
 # Preserve diagnostics on failure; pipefail retains the test command's failure.

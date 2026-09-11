@@ -17,7 +17,7 @@ Codex Worker 返回的结构化意图、判断与证据。它可以包含代码�
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **验收 Finding（Acceptance Finding）**:
-独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是符合 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串；它表达一个必须处理的问题，任一 Finding 都使所属 lane `fail`。只有同时处于当前 Review Boundary 内、有可复现和可定位的证据、违反明确当前需求或硬性工程合同或造成具体风险、保持现状会使当前验收对象不可接受、且能由当前 Job 修复的问题才构成 Finding。明确需求或硬性合同的真实缺陷不会因为修复量小而降级；同一根因的多个表现合并成最合适 lane 中的一条，并说明直接影响的同族场景。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。Reviewer 应一次报告当前审查中已经可证明的全部 Findings，不得故意逐轮滴漏；这不要求为追求穷尽而扩大 Review Boundary 或进行无边界探索。纯维护性建议、可选重构、文件大小偏好和其他非阻塞观察不得进入 `findings`，确有后续价值时可按 Non-blocking Observation 写入相关 lane 的 `evidence`，没有实际后续价值的轻微问题直接省略；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
+独立验收 Agent 在其负责的验收 lane 中发现的、必须在当前 Change Job 中处理的问题。每条 Finding 是自然说明问题、证据、所需修复和复验方式的非空字符串，不按固定措辞校验；它表达一个必须处理的问题，任一 Finding 都使所属 lane `fail`。只有同时处于当前 Review Boundary 内、有可复现和可定位的证据、违反明确当前需求或硬性工程合同或造成具体风险、保持现状会使当前验收对象不可接受、且能由当前 Job 修复的问题才构成 Finding。明确需求或硬性合同的真实缺陷不会因为修复量小而降级；同一根因的多个表现合并成最合适 lane 中的一条，并说明直接影响的同族场景。E2E、Standards、Spec 三个 lane 各自保存 Findings，Controller 不设顶层 Finding 汇总或 Agent 输出的 verdict：任一 lane 的 Finding 非空即将其原样交回 Development。Reviewer 应一次报告当前审查中已经可证明的全部 Findings，不得故意逐轮滴漏；这不要求为追求穷尽而扩大 Review Boundary 或进行无边界探索。纯维护性建议、可选重构、文件大小偏好和其他非阻塞观察不得进入 `findings`，确有后续价值时可按 Non-blocking Observation 写入相关 lane 的 `evidence`，没有实际后续价值的轻微问题直接省略；需要产品决定、权限、凭据或不可替代外部操作时进入 `blocked` evidence，而非 Finding。
 _Avoid_: 非空 Finding 的 pass、无行动依据的泛泛建议、Controller 解释或重写 Finding、重复写入多个 lane、故意逐轮滴漏
 
 **Delivery Quality Floor（交付质量底线）**:
@@ -291,8 +291,8 @@ _Avoid_: 只靠 Prompt 自律、Worker 自我批准、Publisher 凭证继承、�
 _Avoid_: 公开 `start`、额外 `--new-run`、把 `stop` 当作 `abandon`、手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
 
 **Operator Stop（人工停止）**:
-维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。当 Task Control 与 Executor Host 已能确认没有活动 Executor、没有在途 Stop，`stop` 只返回当前可理解状态和适用的下一步，不创建 Lifecycle Action、不修改 Delivery Run 或 Action history；无法确认是否仍有 Executor 时不得把它当作无操作成功。
-_Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、无活动 Executor 时制造 Stop 历史
+维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
+_Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、已有暂停或终态时重复制造 Stop 历史
 
 **No-progress Guard（无进展保护）**:
 Run Executor Session 对一次自动步骤执行前后的确定性进展身份进行机械比较；若状态、当前 Work Subject、Generation、phase、Semantic Attempt、Invocation、Candidate、PR、准确 head、等待边界、cleanup 与下一步骤均未变化，则保存 `execution_failed/controller_no_progress` 并停止，而不以相同输入忙循环。时间戳、timeline、日志、展示字段与重试计数不构成进展；`waiting_checks`、`waiting_external` 与 `waiting_merge` 由 Run 内部监督负责，不属于无进展。
@@ -347,8 +347,12 @@ _Avoid_: 盲目重放未知写入、仅凭 CLI stderr 判定失败、绕过 curr
 _Avoid_: 标签触发、定时触发、自动 intake
 
 **Execution Eligibility（执行资格）**:
-一张 open Ticket 由 triage 标签表达的当前可执行性。`ready-for-agent` 允许激活；`needs-triage`、`needs-info` 和 `ready-for-human` 阻止激活，标签变化本身不启动 Delivery Run。
+一张 open Ticket 由 triage 标签表达的开始或显式恢复工作的资格；`ready-for-agent` 允许，`needs-triage`、`needs-info` 和 `ready-for-human` 阻止。资格不满足不取消既有 Ticket 工作及其成果，标签变化本身不启动或停止 Delivery Run。
 _Avoid_: 启动授权、依赖已解除、完成状态
+
+**Triage Label（分诊标签）**:
+由维护者或独立分诊流程管理的 Issue 分类与领取资格标记，不属于 Runner 的写入权限。它不等同于 Delivery Run 的人工暂停状态。
+_Avoid_: Runner 自动切换标签、以标签代替 Run 暂停记录
 
 **Run Branch（运行分支）**:
 一个 Delivery Run 独有、由 Controller 创建和维护的受管 Run Branch。已通过 Ticket Integration Gate（Fresh Acceptance 或 Deterministic Ticket Fallback）的 Ticket 变更先进入该临时集成分支，整个 Delivery Run 最终通过它接受人工整体验收后才进入默认分支。
@@ -553,7 +557,7 @@ _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败
 _Avoid_: Run Feedback Revision、Issue 编辑、跨 generation 上下文
 
 **Review Finding（审查发现）**:
-Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以 `问题：…；证据：…；必须修复：…；复验：…` 格式的非空字符串表达；所有 Finding 都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
+Acceptance Artifact 的一个 lane 中可由 Development Codex 独立修复和验证的问题单元。它以非空字符串说明问题、证据、所需修复和复验方式，不要求固定格式；所有 Finding 都要求修复，不存在建议型或非阻塞 Finding。人工产品决策、外部权限或不可替代操作进入该 lane 的 `blocked` evidence，不伪装成 Finding。
 _Avoid_: 风格意见、无证据猜测、实现方案命令
 
 **Acceptance Repair Loop（验收修复循环）**:
@@ -702,7 +706,7 @@ _Avoid_: 两次 Repair Cycle、Reviewer 内部 subagent、Required Check 重跑�
 _Avoid_: Ticket Review Budget Window、把 `N` 次 Development 与 `N+1` 次 Reviewer 混成一个计数、Reviewer N+1 失败后自动 Repair、隐式额外 Reviewer
 
 **Ticket Development Budget（Ticket 开发预算）**:
-一个 Ticket Job 的每个 Ticket Development Budget Window 对初始开发以及 Finding、Git Integrity 和可修复 Required Check 失败后实际启动的普通 Development Attempt 提供统一 `N+1` 次上限；`N` 是有效 Run Policy Snapshot 的 Ticket Review 轮数，内置默认 `N=3`。等待 CI、失败检查本身、重复读取状态、基础设施或未知 CI 状态以及对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的 Development Attempt 才计数；不存在 validation-fix 或 Git-fix 专用额度。普通 `N+1` 次预算耗尽后，任一已发布 Ticket PR 首次出现可修复 Required Checks 失败可使用一次 Final CI-fix Allowance；它仍复用 Development Thread，以 `attempt_kind=final_ci_fix` 独立记录，但不增加 Reviewer 额度。新 Candidate 尚有 Reviewer 名额时必须审查，没有名额时才直接重新发布并运行 CI。没有适用 Final CI-fix、额外修复后的 Reviewer 失败或准确新 head 再次出现可修复 CI 失败时，Ticket 转为 `ready-for-human`，保留 Candidate、PR、findings、失败证据与历史，并建立 Run-wide Operator Gate；不可归因于代码的 CI 状态只走有界监督。只有维护者显式 Resume 才能创建有编号的新 Review 与 Development 窗口并重置 Final CI-fix Allowance；门禁解除并收口该 Ticket 后，Controller 才能选择其他任务。
+一个 Ticket Job 的每个 Ticket Development Budget Window 对初始开发以及 Finding、Git Integrity 和可修复 Required Check 失败后实际启动的普通 Development Attempt 提供统一 `N+1` 次上限；`N` 是有效 Run Policy Snapshot 的 Ticket Review 轮数，内置默认 `N=3`。等待 CI、失败检查本身、重复读取状态、基础设施或未知 CI 状态以及对同一未变化 SHA 重新检查不消耗预算，只有实际启动并允许修改代码的 Development Attempt 才计数；不存在 validation-fix 或 Git-fix 专用额度。普通 `N+1` 次预算耗尽后，任一已发布 Ticket PR 首次出现可修复 Required Checks 失败可使用一次 Final CI-fix Allowance；它仍复用 Development Thread，以 `attempt_kind=final_ci_fix` 独立记录，但不增加 Reviewer 额度。新 Candidate 尚有 Reviewer 名额时必须审查，没有名额时才直接重新发布并运行 CI。没有适用 Final CI-fix、额外修复后的 Reviewer 失败或准确新 head 再次出现可修复 CI 失败时，Ticket 进入人工暂停（不修改 GitHub 标签），保留 Candidate、PR、findings、失败证据与历史，并建立 Run-wide Operator Gate；不可归因于代码的 CI 状态只走有界监督。只有维护者显式 Resume 才能创建有编号的新 Review 与 Development 窗口并重置 Final CI-fix Allowance；门禁解除并收口该 Ticket 后，Controller 才能选择其他任务。
 _Avoid_: CI 等待次数、同一 SHA 重复审查、无限重试
 
 **Ticket Development Budget Window（Ticket 开发预算窗口）**:

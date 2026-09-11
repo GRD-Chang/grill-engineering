@@ -11,7 +11,7 @@ def publication_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["commit_message", "pr_title", "pr_body_markdown"],
         "properties": {
-            key: {"type": "string"}
+            key: {"type": "string", "minLength": 1, "pattern": r"\S"}
             for key in ("commit_message", "pr_title", "pr_body_markdown")
         },
     }
@@ -50,9 +50,10 @@ def development_or_human_blocker_schema() -> dict[str, Any]:
                 "type": "string",
                 "enum": ["development", "human_blocker"],
             },
-            "summary": {"type": ["string", "null"]},
+            "summary": {"type": ["string", "null"], "minLength": 1, "pattern": r"\S"},
             "human_blockers": {
                 "type": ["array", "null"],
+                "minItems": 1,
                 "maxItems": MAX_HUMAN_BLOCKERS,
                 "items": {
                     "type": "string",
@@ -82,11 +83,12 @@ def publication_or_human_blocker_schema() -> dict[str, Any]:
                 "enum": ["publication", "human_blocker"],
             },
             **{
-                key: {"type": ["string", "null"]}
+                key: {"type": ["string", "null"], "minLength": 1, "pattern": r"\S"}
                 for key in ("commit_message", "pr_title", "pr_body_markdown")
             },
             "human_blockers": {
                 "type": ["array", "null"],
+                "minItems": 1,
                 "maxItems": MAX_HUMAN_BLOCKERS,
                 "items": {
                     "type": "string",
@@ -109,8 +111,11 @@ def acceptance_schema() -> dict[str, Any]:
                 "type": "string",
                 "enum": ["pass", "fail", "blocked"],
             },
-            "evidence": {"type": "string"},
-            "findings": {"type": "array", "items": {"type": "string"}},
+            "evidence": {"type": "string", "minLength": 1, "pattern": r"\S"},
+            "findings": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "pattern": r"\S"},
+            },
         },
     }
     return {

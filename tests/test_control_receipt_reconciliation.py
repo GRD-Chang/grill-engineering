@@ -89,20 +89,15 @@ def test_control_command_reconciles_receipt_before_admission(
                 assert state_path.read_bytes() == state_before
                 assert fixture.read_bytes() == fixture_before
                 assert host.observe_count == attempt + 1
-            elif kind == "stop":
-                assert result == 0, output
-                assert host.start_count == 0
-                assert repaired["action"]["action_id"] == action_id
-                assert repaired["action"]["status"] == "completed"
-                assert repaired["next_generation"] == generation + 1
-                assert state_path.read_bytes() == state_before
-                assert fixture.read_bytes() == fixture_before
             else:
                 assert result == 0, output
                 assert host.start_count == 1
-                assert repaired["action"]["kind"] == "abandon"
+                assert repaired["action"]["kind"] == kind
                 assert repaired["action"]["executor_generation"] == generation + 1
-                assert states.load_run(run_id)["status"] == "abandoned"
+                assert states.load_run(run_id)["status"] == (
+                    "operator_stopped" if kind == "stop" else "abandoned"
+                )
+                assert fixture.read_bytes() == fixture_before
                 predecessors = [
                     entry["action"]
                     for entry in repaired["action_history"]

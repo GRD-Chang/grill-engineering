@@ -11,8 +11,6 @@ from agent_run.artifacts import PublicationArtifact, clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.credential_availability import clear_initial_credential_wait
 from agent_run.delivery_policy import invocation_deadline_for_state
-from agent_run.external_supervision import is_github_convergence_error
-from agent_run.github import GitHubReadError
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
@@ -30,6 +28,7 @@ def _invalidate_stale_publication(
     job: dict[str, Any],
     checkout: Path,
 ) -> None:
+    job.pop("pending_publication_result", None)
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is not None:
         close_semantic_attempt(
@@ -52,6 +51,22 @@ def publication(
         if not stage._publication_is_current(state, job):
             _invalidate_stale_publication(stage, state, job, checkout)
             return
+        pending_result = job.get("pending_publication_result")
+        if isinstance(pending_result, dict):
+            publication = PublicationArtifact.from_stored(
+                pending_result,
+                primary_ticket=(
+                    int(job["ticket_number"])
+                    if isinstance(job.get("ticket_number"), int)
+                    else None
+                ),
+                delivery_run=(
+                    None
+                    if isinstance(job.get("ticket_number"), int)
+                    else str(job["run_id"])
+                ),
+            )
+            break
         semantic_attempt = pending_semantic_attempt(job, role="publication")
         if semantic_attempt is None:
             begin_publication_operation_attempt(job)
@@ -67,14 +82,7 @@ def publication(
                 ordinal=ordinal,
             )
         stage.save(state)
-        try:
-            request = stage.adapter.publication_request(state, job, checkout)
-        except GitHubReadError as error:
-            if not is_github_convergence_error(error.code):
-                raise
-            if stage._record_publication_operation_failure(state, job, error):
-                return
-            continue
+        request = stage.adapter.publication_request(state, job, checkout)
         request["_invocation_event"] = stage._invocation_events(
             state,
             job,
@@ -129,6 +137,14 @@ def publication(
             publication = parse_publication(
                 artifact_data, delivery_run=str(job["run_id"])
             )
+        # The Worker has finished. Persist its normalized result before the
+        # next remote fence so a read outage cannot rerun the completed Agent.
+        job["pending_publication_result"] = {
+            "commit_message": publication.commit_message,
+            "pr_title": publication.pr_title,
+            "pr_body_markdown": publication.pr_body_markdown,
+        }
+        stage.save(state)
         break
     clear_current_human_blocker(job)
     if not stage._publication_is_current(state, job):
@@ -142,14 +158,14 @@ def publication(
         "pr_title": publication.pr_title,
         "pr_body_markdown": publication.pr_body_markdown,
     }
+    sha = stage.publisher.create_publication_commit(
+        checkout, job, publication.commit_message
+    )
     close_semantic_attempt(
         job,
         semantic_attempt,
         outcome="publication_artifact",
         result={"publication": publication_result},
-    )
-    sha = stage.publisher.create_publication_commit(
-        checkout, job, publication.commit_message
     )
     bind_new_publication_head(job, sha)
     job.update(
@@ -159,6 +175,7 @@ def publication(
             "phase": "publishing",
         }
     )
+    job.pop("pending_publication_result", None)
     job.pop("last_publication_error", None)
     stage.save(state)
     stage._reject_stale(

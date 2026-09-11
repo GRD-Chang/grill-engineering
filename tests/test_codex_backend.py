@@ -324,7 +324,7 @@ def test_publication_repairs_invalid_output_in_same_thread(
     assert "thread_id=publication-thread" in binding_lines[1]
 
 
-def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
+def test_run_publication_repairs_empty_output_in_same_thread(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     attempts: list[list[str]] = []
@@ -340,7 +340,7 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
         artifact = {
             "result_kind": "publication",
             "commit_message": (
-                "invalid title"
+                "   "
                 if len(attempts) == 1
                 else "fix(run): publish accepted delivery"
             ),
@@ -386,7 +386,7 @@ def test_run_publication_repairs_invalid_semantic_output_in_same_thread(
     )
 
 
-def test_run_publication_marks_exhausted_semantic_output_as_failed(
+def test_run_publication_marks_exhausted_empty_output_as_failed(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     events: list[tuple[str, dict[str, object]]] = []
@@ -399,9 +399,9 @@ def test_run_publication_marks_exhausted_semantic_output_as_failed(
             json.dumps(
                 {
                     "result_kind": "publication",
-                    "commit_message": "invalid title",
-                    "pr_title": "invalid title",
-                    "pr_body_markdown": "invalid body",
+                    "commit_message": "   ",
+                    "pr_title": "Publish the completed change",
+                    "pr_body_markdown": "The change is ready for review.",
                     "human_blockers": None,
                 }
             ),
@@ -514,6 +514,44 @@ def test_reviewer_repairs_invalid_output_with_reviewer_only_prompt(
     assert "Acceptance Artifact" in prompts[1]
     assert "不重新执行审查、验证或工具调用" in prompts[1]
     assert "上一输出未通过本地 Acceptance Artifact contract" not in prompts[1]
+
+
+def test_reviewer_accepts_natural_blocker_on_first_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = "发生了什么：缺少测试凭据。已尝试：检查继承环境。需要人工做什么：提供测试访问权限。"
+    artifact = passing_acceptance_artifact()
+    artifact["checks"]["e2e"] = {
+        "status": "blocked", "evidence": evidence, "findings": []
+    }
+    attempts: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_run(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        attempts.append(arguments)
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(json.dumps(artifact), encoding="utf-8")
+        return subprocess.CompletedProcess(
+            arguments, 0,
+            '{"type":"thread.started","thread_id":"reviewer-thread"}\n', ""
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    result = CodexCliBackend(credential_provider=lambda: "reader-secret").review(
+        {
+            "checkout": str(tmp_path),
+            "acceptance_scope": "ticket",
+            "_invocation_event": lambda kind, **facts: events.append((kind, facts)),
+        }
+    )
+
+    assert result.artifact == artifact
+    assert len(attempts) == 1
+    assert events[-1] == (
+        "completed", {"reported_thread_id": "reviewer-thread", "attempt_count": 1}
+    )
 
 
 def test_bound_model_and_effort_are_sent_on_fresh_resume_and_output_repair(
@@ -1513,7 +1551,7 @@ def test_codex_prompts_require_independent_development_and_acceptance_lanes(
     assert "保持现状会使当前验收对象不可接受" in acceptance
     assert "同一根因的多个表现应合并报告" in acceptance
     assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in acceptance
-    assert "每条 Finding 都必须写在最合适 lane 的 findings 中" in acceptance
+    assert "每条 Finding 写明问题、证据、所需修复和复验方式，放在最合适 lane" in acceptance
     assert "pass 与 blocked 的 findings 必须为空" in acceptance
     assert "blocked 的 evidence 必须说明发生了什么" in acceptance
     assert "\"verdict\"" not in acceptance
@@ -1579,8 +1617,8 @@ def test_publication_prompts_require_semantic_titles(
     )
     ticket_prompt, run_prompt = prompts
 
-    assert "Conventional Commit 语义标题格式" in ticket_prompt
-    assert "Conventional Commit 语义标题格式" in run_prompt
+    assert "默认使用 Conventional Commit 标题，可按变更调整" in ticket_prompt
+    assert "默认使用 Conventional Commit 标题，可按变更调整" in run_prompt
     assert "`Primary Ticket: #" not in ticket_prompt
     assert "CI、Candidate、SHA、门禁和生命周期事实不得写入叙事" in run_prompt
 
@@ -3472,27 +3510,34 @@ def test_closing_credential_channel_terminates_active_gh_read(
         gh_executable=str(executable),
         gh_environment={"GH_TEST_PID_PATH": str(process_id_path), "PATH": os.environ["PATH"]},
     )
-    credentials.start(tmp_path / "credential.sock")
     worker = threading.Thread(
         target=lambda: credentials._request(  # noqa: SLF001 - lifecycle seam
             {"kind": "run", "arguments": ["issue", "view", "1"]}
         ),
         daemon=True,
     )
-    worker.start()
-    for _ in range(100):
-        if process_id_path.exists():
-            break
-        time.sleep(0.02)
-    assert process_id_path.exists()
-    process_id = int(process_id_path.read_text(encoding="utf-8"))
+    try:
+        credentials.start(tmp_path / "credential.sock")
+        worker.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            # File creation precedes the write; existence alone is not ready.
+            if process_id_path.exists() and process_id_path.read_text().strip():
+                break
+            time.sleep(0.02)
+        assert process_id_path.exists()
+        process_id = int(process_id_path.read_text(encoding="utf-8"))
 
-    credentials.close()
-    worker.join(timeout=2)
+        credentials.close()
+        worker.join(timeout=2)
 
-    assert not worker.is_alive()
-    with pytest.raises(ProcessLookupError):
-        os.kill(process_id, 0)
+        assert not worker.is_alive()
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_id, 0)
+    finally:
+        credentials.close()
+        if worker.ident is not None:
+            worker.join(timeout=5)
 
 
 def test_worker_credential_channel_renews_proactively_and_recovers_transient_failure(
@@ -3733,8 +3778,9 @@ def test_app_credential_channel_close_after_network_timeout_joins_renewal(
     assert not socket_path.exists()
 
 
+@pytest.mark.parametrize("client_reads_first", [False, True])
 def test_app_credential_channel_close_interrupts_network_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_reads_first: bool
 ) -> None:
     certificate = tmp_path / "localhost.crt"
     private_key = tmp_path / "localhost.key"
@@ -3787,11 +3833,17 @@ def test_app_credential_channel_close_interrupts_network_response(
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Test-Token-Request", str(calls))
+            if calls > 1 and not client_reads_first:
+                response_started.set()
             self.end_headers()
             if calls == 1:
                 self.wfile.write(body)
                 return
-            response_started.set()
+            if client_reads_first:
+                if not client_read_started.wait(timeout=2):
+                    return
+                response_started.set()
             release_response.wait(timeout=30)
             try:
                 self.wfile.write(body)
@@ -3830,7 +3882,9 @@ def test_app_credential_channel_close_interrupts_network_response(
     def synchronized_read(
         response: http.client.HTTPResponse, *arguments: Any, **options: Any
     ) -> bytes:
-        if response_started.is_set():
+        # Identify the renewal response itself: the server-side marker may be
+        # published either before or after this client reaches body reading.
+        if response.getheader("X-Test-Token-Request") == "2":
             client_read_started.set()
         return original_read(response, *arguments, **options)
 
@@ -3854,10 +3908,13 @@ def test_app_credential_channel_close_interrupts_network_response(
         close_started = time.monotonic()
         credentials.close()
         assert time.monotonic() - close_started < 3
+        # Prove cancellation joined the renewal while the response is still
+        # withheld; teardown releasing the body must not satisfy this assertion.
+        assert renewal_thread is not None
+        assert not renewal_thread.is_alive()
     finally:
         release_response.set()
-        if renewal_thread is not None and renewal_thread.is_alive():
-            credentials.close()
+        credentials.close()
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
@@ -3867,6 +3924,7 @@ def test_app_credential_channel_close_interrupts_network_response(
     assert not renewal_thread.is_alive()
     assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
     assert not socket_path.exists()
+    assert not server_thread.is_alive()
 
 
 def test_signing_registry_reclaims_resources_registered_after_cancel() -> None:
@@ -4175,26 +4233,52 @@ run_worker_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    for _ in range(100):
-        if child_path.exists():
-            break
-        time.sleep(0.02)
-    assert child_path.exists()
-    child_pid = int(child_path.read_text(encoding="utf-8").strip())
+    child_pid: int | None = None
+    child_gone = False
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if child_path.exists() and child_path.read_text().strip():
+                break
+            time.sleep(0.02)
+        assert child_path.exists()
+        child_pid = int(child_path.read_text(encoding="utf-8").strip())
 
-    os.kill(controller.pid, signal.SIGINT)
-    controller.wait(timeout=5)
+        os.kill(controller.pid, signal.SIGINT)
+        controller.wait(timeout=5)
 
-    assert controller.returncode not in {None, 0}
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("background Worker process survived SIGINT cleanup")
+        assert controller.returncode not in {None, 0}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                child_gone = True
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("background Worker process survived SIGINT cleanup")
+    finally:
+        if controller.poll() is None:
+            controller.send_signal(signal.SIGINT)
+            try:
+                controller.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                controller.kill()
+                controller.wait(timeout=5)
+        if not child_gone and child_pid is None and child_path.exists():
+            recorded_pid = child_path.read_text().strip()
+            if recorded_pid:
+                child_pid = int(recorded_pid)
+        if not child_gone and child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if controller.stdout is not None:
+            controller.stdout.close()
+        if controller.stderr is not None:
+            controller.stderr.close()
 
 
 @pytest.mark.parametrize(
@@ -4303,33 +4387,48 @@ run_worker_process(
 def test_successful_worker_cleans_background_processes(
     tmp_path: Path,
 ) -> None:
-    child_path = tmp_path / "child.pid"
-
+    # Own orphan reaping in an isolated probe; kill(pid, 0) also succeeds for
+    # dead zombies and otherwise depends on the CI host's init process.
+    code = r'''
+import ctypes, os, signal, time
+from pathlib import Path
+from agent_run.worker_sandbox import run_worker_process
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+child = None
+reaped = False
+try:
     result = run_worker_process(
-        [
-            "sh",
-            "-c",
-            (
-                "sleep 60 </dev/null >/dev/null 2>&1 & "
-                "echo $! > child.pid"
-            ),
-        ],
-        cwd=tmp_path,
-        prompt="",
-        environment={"PATH": "/usr/bin:/bin"},
-        timeout=5,
+        ["sh", "-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > child.pid"],
+        cwd=Path.cwd(), prompt="", environment={"PATH": "/usr/bin:/bin"}, timeout=5,
     )
-
     assert result.returncode == 0
-    child_pid = int(child_path.read_text(encoding="utf-8").strip())
-    for _ in range(50):
+    child = int(Path("child.pid").read_text().strip())
+    deadline = time.monotonic() + 1
+    while os.waitpid(child, os.WNOHANG)[0] != child:
+        assert time.monotonic() < deadline, "background Worker survived cleanup"
+        time.sleep(0.01)
+    reaped = True
+    child = None
+finally:
+    if not reaped and child is None and Path("child.pid").exists():
+        child = int(Path("child.pid").read_text().strip())
+    if child is not None:
         try:
-            os.kill(child_pid, 0)
+            os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("background Worker process survived cleanup")
+            pass
+        try:
+            os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+'''
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_stdout_callback_error_does_not_stop_pipe_drain(

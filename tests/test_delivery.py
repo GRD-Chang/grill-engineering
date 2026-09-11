@@ -499,7 +499,6 @@ class ScriptedPublisher:
         self.live_head: str | None = None
         self.branch: str | None = None
         self.base_branch: str | None = None
-        self.escalated: list[int] = []
         self.revision_override: str | None = None
         self.checks = ["pass"]
         self.failed_check_evidence = {
@@ -789,9 +788,6 @@ class ScriptedPublisher:
         self.closed_issues.append(ticket_number)
         return {"actor": "scripted-publisher", "event_id": ticket_number}
 
-    def mark_ready_for_human(self, ticket_number: int) -> None:
-        self.escalated.append(ticket_number)
-
     def current_effective_revision(
         self,
         *,
@@ -1078,18 +1074,6 @@ class ExternalMergePublisher(ScriptedPublisher):
                 self.external_sha
             ),
         }
-
-
-class CrashAfterEscalationPublisher(ScriptedPublisher):
-    def __init__(self, repo: Path) -> None:
-        super().__init__(repo)
-        self.crash_once = True
-
-    def mark_ready_for_human(self, ticket_number: int) -> None:
-        super().mark_ready_for_human(ticket_number)
-        if self.crash_once:
-            self.crash_once = False
-            raise OSError("simulated lost escalation response")
 
 
 class AlwaysRejectAgents(ScriptedAgents):
@@ -1906,7 +1890,6 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         "## Evidence\n\nThe scripted end-to-end scenario passed."
     ]
     assert github.closed_issues == [3]
-    assert github.escalated == []
     assert github.acceptance_records == []
     assert github.agent_run_statuses == [
         {
@@ -2168,7 +2151,6 @@ def test_ticket_review_budget_fallback_publishes_without_acceptance_record(
     assert integration["integrated_parents"] == [job["base_sha"]]
     assert integration["pr"]["state"] == "MERGED"
     assert integration["pr"]["merge_commit_sha"] == job["integrated_sha"]
-    assert github.escalated == []
     assert github.created_prs == 1
     assert github.closed_issues == [3]
 
@@ -2579,7 +2561,6 @@ def test_no_change_attempt_does_not_consume_modification_budget(
     assert result["status"] == "blocked"
     assert result["diagnostics"][0]["code"] == "no_code_changes"
     assert result["active_ticket_job"]["modification_attempts"] == 0
-    assert github.escalated == []
 
     resumed, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
@@ -4336,7 +4317,7 @@ def test_publication_success_rechecks_base_before_creating_a_commit(
     assert agents.publication_requests[1]["candidate_sha"] == job["candidate_sha"]
 
 
-def test_exhausted_publication_operation_retry_is_not_reopened_by_base_drift(
+def test_publication_context_outage_waits_and_rechecks_base_before_resuming(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -4359,17 +4340,24 @@ def test_exhausted_publication_operation_retry_is_not_reopened_by_base_drift(
 
     pending_job = pending["active_ticket_job"]
     old_published_sha = str(pending_job["published_sha"])
-    assert pending["status"] == "publication_pending"
+    assert pending["status"] == "waiting_external"
     assert pending_job["pr_number"] == publisher.pr_number
     assert publisher.live_head == old_published_sha
+    for _ in range(6):
+        still_waiting = engine.deliver(state["run_id"])
+        assert still_waiting["status"] == "waiting_external"
+        assert still_waiting["active_ticket_job"]["publication_attempts"] == pending_job[
+            "publication_attempts"
+        ]
+    assert len(agents.publication_requests) == 1
     _advance_branch_with_same_tree(git_repo, str(state["run_branch"]))
     publisher.fail_publication_context = False
 
-    still_pending = engine.deliver(state["run_id"])
+    completed = engine.deliver(state["run_id"])
 
-    assert still_pending["status"] == "publication_pending"
-    assert still_pending["active_ticket_job"]["pr_number"] == publisher.pr_number
-    assert publisher.live_head == old_published_sha
+    assert completed["status"] == "ticket_completed"
+    assert completed["active_ticket_job"]["pr_number"] == publisher.pr_number
+    assert publisher.live_head != old_published_sha
 
 
 def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(
@@ -4552,7 +4540,7 @@ def test_remote_branch_drift_is_not_force_overwritten(
     assert publisher.closed_issues == []
 
 
-def test_ticket_fallback_avoids_unbounded_escalation_response(
+def test_ticket_fallback_completes_without_human_escalation(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
@@ -4561,7 +4549,7 @@ def test_ticket_fallback_avoids_unbounded_escalation_response(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
-    publisher = CrashAfterEscalationPublisher(git_repo)
+    publisher = ScriptedPublisher(git_repo)
     engine = TicketDeliveryEngine(
         git=GitRepository(git_repo),
         states=states,
@@ -4572,7 +4560,6 @@ def test_ticket_fallback_avoids_unbounded_escalation_response(
     result = engine.deliver(state["run_id"])
     assert result["status"] == "ticket_completed"
     assert result["active_ticket_job"]["publication_authority"] == "fallback"
-    assert publisher.escalated == []
 
 
 def test_resume_preserves_frontier_while_an_operator_gate_is_current(

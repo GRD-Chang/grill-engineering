@@ -64,9 +64,14 @@ class GhGitHubPublisher:
             ],
         )
         if created.returncode != 0:
-            if self._remote_branch_sha(branch) == expected_base_sha:
+            observed = self._remote_branch_sha(branch)
+            if observed == expected_base_sha:
                 return
-            raise GitError(created.stderr.strip() or "could not create Change ref")
+            if observed is not None:
+                raise GitError("Change ref has a foreign identity")
+            raise GitHubReadError(
+                "github_write_failed", created.stderr.strip() or "could not create Change ref"
+            )
         if self._remote_branch_sha(branch) != expected_base_sha:
             raise GitError("Change ref creation readback did not match intent")
 
@@ -476,9 +481,14 @@ class GhGitHubPublisher:
             ],
         )
         if pushed.returncode != 0:
-            if self._remote_branch_sha(branch) == expected_sha:
+            observed = self._remote_branch_sha(branch)
+            if observed == expected_sha:
                 return
-            raise GitError(pushed.stderr.strip() or "could not create Run ref")
+            if observed is not None:
+                raise GitError("Run ref has a foreign identity")
+            raise GitHubReadError(
+                "github_write_failed", pushed.stderr.strip() or "could not create Run ref"
+            )
         if self._remote_branch_sha(branch) != expected_sha:
             raise GitError("Run ref creation readback did not match intent")
 
@@ -503,9 +513,15 @@ class GhGitHubPublisher:
         ]
         pushed = self._write_command(arguments)
         if pushed.returncode != 0:
-            if self._remote_branch_sha(branch) == head_sha:
+            observed = self._remote_branch_sha(branch)
+            if observed == head_sha:
                 return
-            raise GitError(pushed.stderr.strip() or "could not publish ticket branch")
+            if observed != expected_remote_sha:
+                raise GitError("remote ticket branch drifted")
+            raise GitHubReadError(
+                "github_write_failed",
+                pushed.stderr.strip() or "could not publish ticket branch",
+            )
         if self._remote_branch_sha(branch) != head_sha:
             raise GitError("Ticket ref publication readback did not match intent")
 
@@ -648,7 +664,9 @@ class GhGitHubPublisher:
             cwd=self.git.root,
         )
         if remote.returncode != 0:
-            raise GitError(remote.stderr.strip() or "could not read Ticket ref")
+            raise GitHubReadError(
+                "github_read_failed", remote.stderr.strip() or "could not read Ticket ref"
+            )
         return remote.stdout.split()[0] if remote.stdout.strip() else None
 
     def _change_prs(self, branch: str) -> list[object]:
@@ -1308,7 +1326,8 @@ class GhGitHubPublisher:
             ["git", "fetch", "--no-tags", "origin", run_branch]
         )
         if fetched.returncode != 0:
-            raise GitError(
+            raise GitHubReadError(
+                "github_read_failed",
                 fetched.stderr.strip() or "could not fetch merged Run Branch"
             )
         fetched_sha = self.git.resolve("FETCH_HEAD")
@@ -2001,19 +2020,6 @@ class GhGitHubPublisher:
                 "Ticket updates are newer than the Publisher reopen event",
             )
         return True
-
-    def mark_ready_for_human(self, ticket_number: int) -> None:
-        self._require(
-            "issue",
-            "edit",
-            str(ticket_number),
-            "--repo",
-            self.repository,
-            "--add-label",
-            "ready-for-human",
-            "--remove-label",
-            "ready-for-agent",
-        )
 
     def current_effective_revision(
         self,
