@@ -106,9 +106,8 @@ def test_control_environment_rejected_before_ownership_changes(
     for _ in range(2):
         code = cli_module.main([kind, "1", "--json"])
         output = json.loads(capsys.readouterr().out)
-        assert code == (0 if kind == "stop" and not active else 2), output
-        if active or kind == "abandon":
-            assert "发起终端环境过大" in json.dumps(output, ensure_ascii=False), output
+        assert code == 2, output
+        assert "发起终端环境过大" in json.dumps(output, ensure_ascii=False), output
         assert control.path_for(task).read_bytes() == before_control
         assert state_path.read_bytes() == before_state
         assert fixture.read_bytes() == before_fixture

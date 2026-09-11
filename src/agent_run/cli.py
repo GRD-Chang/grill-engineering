@@ -351,6 +351,7 @@ def _main_with_parser_resources(
     lifecycle_receipt: ActionReceipt | None = None
     control_failure: str | None = None
     command_dispatched = False
+    executor_binding: tuple[str, int] | None = None
     try:
         _validate_explicit_policy_options(parsed)
         delivery_policy_provider = (
@@ -2590,7 +2591,13 @@ def _reconcile_resume_exit(
         return current
     task = _task_for_parent(parsed, github, git)
     control = TaskControlStore(git.root / ".agent-run")
-    record = control.inspect_run(task, current)
+    try:
+        record = control.inspect_run(task, current)
+    except TaskControlError:
+        # This preflight only repairs an intact, concrete process binding.
+        # Leave receipt-only reconstruction to the existing lifecycle spine,
+        # which requires its own exact Host evidence before admission.
+        return current
     executor = record.get("executor") if isinstance(record, Mapping) else None
     action = record.get("action") if isinstance(record, Mapping) else None
     if not (

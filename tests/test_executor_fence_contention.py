@@ -41,6 +41,10 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
     states = StateStore(git_repo / ".agent-run")
     state = states.find_unfinished_runs("example/project", 1)[0]
     run_id = state["run_id"]
+    # Only a terminal Run now takes the read-only Stop preflight. Keep the
+    # real ownership-lock contention and subsequent fence revocation unchanged.
+    state.update(status="completed", terminal_kind="completed")
+    states.save_run(run_id, state)
     control, task, worker = _bind_running_executor(git_repo, run_id)
     try:
         record = control.load(task)
@@ -147,7 +151,8 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
                         state_dir=states.root,
                     )
                 release_preflight.set()
-                assert stop.result(timeout=5) == 2
+                assert stop.result(timeout=5) == 0
+                assert (states.runs_directory / f"{run_id}.json").read_bytes() == before_state
                 assert control.path_for(task).read_bytes() == before_control
                 if revocation == "stop":
                     control.claim_control_action(

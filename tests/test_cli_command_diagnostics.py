@@ -80,16 +80,17 @@ def test_new_command_error_does_not_replace_or_repeat_old_run_failure(
 
 
 @pytest.mark.parametrize('as_json', [False, True])
+@pytest.mark.parametrize('summary_size', [10, 9000])
 def test_long_multiline_error_preserves_next_step_without_response_body(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str], as_json: bool,
+    capsys: pytest.CaptureFixture[str], as_json: bool, summary_size: int,
 ) -> None:
     monkeypatch.chdir(git_repo)
     fixture = write_fixture(git_repo / 'github.json', issues={})
 
     def unavailable(self: FixtureGitHubReader) -> None:
         raise GitHubReadError(
-            'github_timeout', 'timed out ' + 'x' * 9000 + '\nraw response body',
+            'github_timeout', 'timed out ' + 'x' * summary_size + '\nraw response body',
         )
 
     monkeypatch.setattr(FixtureGitHubReader, 'repository_hint', unavailable)
