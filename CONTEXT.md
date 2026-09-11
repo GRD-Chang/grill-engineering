@@ -2,6 +2,8 @@
 
 本上下文描述以结构化 Agent 工作结果驱动、由确定性程序控制外部写入的自动交付流程。
 
+本轮新增的 Development Thread Policy 按轮新会话模式、Agent Run User Defaults 与 Runner Setup 为已确认、尚未实现的目标术语，见[需求讨论记录](docs/research/2026-09-11-onboarding-config-thread-policy.md)；默认复用、现有配置入口与安装器的运行行为尚未改变。
+
 ## Language
 
 **Codex Worker（Codex 工作器）**:
@@ -70,7 +72,7 @@ Controller 为一个 Change Job 创建并在 Development Attempt、Repair 与 Re
 _Avoid_: 主工作区、共享 scratch worktree、Validation Checkout、以终态名称代替 dirty check、自动强制删除未提交交付成果
 
 **Development Attempt（开发尝试）**:
-Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内部规划、代码编辑和开发验证的一轮工作。同一 Change Job 的各次 Development Attempt 复用其 Development Thread，通过新的 Turn 接收最新版 Development Brief 与 Acceptance Artifact；它直接产出 worktree diff 与 Development Summary，不经过独立 Planning Phase。一次 Attempt 首次分配时只占用一次 Development Budget；为完成该 Attempt 而创建的 successor Invocation、同 Thread Resume 或 Output Repair 均不重复计费。
+Development Codex 在一个 Change Job 的准确 Effective Revision 上完成内部规划、代码编辑和开发验证的一轮工作，其与前后轮的会话关系由 Development Thread Policy 决定。一次 Attempt 只占用一次 Development Budget；为完成该轮工作的执行恢复、人工回应续接或输出格式修复均不构成新开发轮。
 _Avoid_: Change Job、Plan Artifact、Acceptance Attempt、Codex 进程启动次数
 
 **Development Preflight Round（开发预检轮）**:
@@ -78,7 +80,7 @@ Development 在实现或修复完成验证与自行检查后的内部质量预�
 _Avoid_: 内部验收、只审已提交 HEAD、遗漏未跟踪文件、把一轮等同于一个 Reviewer、把开发结论作为审查前提、修复后常规再派 Reviewer、无新增关键风险仍重复审查、Fresh Acceptance
 
 **Development–Acceptance Engine（开发验收引擎）**:
-Controller 复用的单一自动变更循环：持久 Development Thread 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，正常 pass 或 Ticket 预算耗尽后的 Fallback Publication Receipt 允许 Publisher 推送普通 PR，随后等待 Required Checks、执行 Published-Head Gate，并按 Job 的合并策略完成合并；兜底 Ticket 只有在准确 head 形成 Deterministic Integration Record 后才取得合并权限。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文、批准策略和完成规则使用该引擎，不复制控制流；Parent-only 的人工批准只授予一次合并权限，批准后的重新核验、合并与恢复仍由该引擎执行。
+Controller 复用的单一自动变更循环：Development 修改 checkout，Publisher 创建 Candidate 与 Publication Commit，Fresh Reviewer 输出 Acceptance Artifact，可修复 findings 原样返回开发，正常 pass 或 Ticket 预算耗尽后的 Fallback Publication Receipt 允许 Publisher 推送普通 PR，随后等待 Required Checks、执行 Published-Head Gate，并按 Job 的合并策略完成合并；兜底 Ticket 只有在准确 head 形成 Deterministic Integration Record 后才取得合并权限。Ticket Job、Parent-only Delivery 与 Run Repair Job 只通过不同 Job Contract、Prompt、上下文、批准策略和完成规则使用该引擎，不复制控制流；Parent-only 的人工批准只授予一次合并权限，批准后的重新核验、合并与恢复仍由该引擎执行。
 _Avoid_: Ticket 专用流水线、Run Repair 专用流水线、动态 Agent 编排
 
 **Review Optimization Policy（审查优化策略）**:
@@ -102,8 +104,12 @@ Development–Acceptance Engine 处理 Ticket Job、Parent-only Delivery 或 Run
 _Avoid_: Development Brief、Agent Artifact、Controller 全局配置
 
 **Development Thread（开发线程）**:
-一个 Change Job 独有并跨 Development Attempt 复用的持久 Codex Thread。它保存该任务的开发与修复上下文；首次调用、新角色或显式新 Thread 接收完整角色 Prompt，新的定向 Repair Turn 接收对应 Repair source 与当前原始证据，同一角色继续同一对象时只接收角色化短 Prompt 和仍然必要的动态证据。模型不负责判断 Initial Development、Repair、执行恢复或 Controller 流程；其身份由 Change Job Record 保存，不与任何 Reviewer Thread 共享。Thread 无法恢复时停止为 `execution_failed`，只能由维护者显式用 `--new-thread` 开启相应角色与任务模式的完整标准 Prompt。
+Development Codex 完成一轮或连续多轮开发工作的独立会话，其跨 Development Attempt 的复用关系由 Development Thread Policy 决定。它保存本会话的开发与修复上下文，不与任何 Reviewer Thread 共享身份；新会话必须独立建立当前任务与权威需求上下文，不能假定掌握旧会话历史。
 _Avoid_: Development Attempt、Reviewer Thread、Delivery Run 全局会话
+
+**Development Thread Policy（开发会话策略）**:
+各开发轮之间的会话选择规则，包含默认跨轮复用与每个新 Development Attempt 新建会话两种模式，适用于 Ticket、Parent-only 与 Run Repair 开发；新会话接收对应任务的完整角色 Prompt，不重建工作区或重置预算。同轮故障恢复、容量恢复、人工回应续接和输出格式修复继续当前 Thread，不构成新开发轮；显式人工 `resume --new-thread` 保留单次替换的既有例外。
+_Avoid_: 每次进程启动新会话、每张 Ticket 新会话、单次人工替换 Thread、Reviewer Thread 策略
 
 **Change Job Record（变更任务记录）**:
 Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 使用同一规范记录骨架和生命周期语义，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。Review Budget Window、Final CI-fix 与 Deterministic Ticket Fallback 采用同一次规范状态切换：旧 Run 不迁移、不推断剩余额度且不兼容读取，只有按新结构创建的 Run 才使用新策略。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
@@ -170,6 +176,10 @@ _Avoid_: Promotion Audit、Codex 版本门禁、源码验收、状态兼容检�
 **Runner Installation（Runner 安装）**:
 用户在所选源码目录显式执行 `./install.sh`，并在 Runner Management Quiescence 中依次构建候选 Runner Snapshot、执行 Runner Compatibility Check、创建以新 Snapshot 为 current 且以可选旧 current 为 previous 的完整 Runner Generation，并在成功后原子切换 Active Runner 的动作。若存在活跃 Run Executor Session，安装立即拒绝且不修改受管状态。若候选 content identity 已经等于 Active current，安装器直接幂等成功：不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous。首次安装、切换 Git tag、拉取官方修改或构建本地未提交修改都使用同一动作；成功后固定只保留 Active Generation 引用的 current 与可选 previous，更早的 Generation 和 Snapshot 自动清理，失败时清理候选并保持旧 Generation 整体不变。切换后的清理失败只产生有界 warning，并由下一次管理动作重试，不回滚已经成功的 Active Runner。安装器只在 `~/.local/bin/agent-run` 缺失或仍是解析到受管 XDG root 的自有 symlink 时创建或替换入口；同名非受管路径使安装失败，不备份、不覆盖。用户级命令目录通过唯一边界标记的幂等受管块加入 shell PATH；安装器不安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件，也不执行 `sudo`。安装器不检查或提示 Linux Executor Host Availability；公开生命周期动作在实际启动 Executor 前独立检查运行前置。安装不修改既有 Delivery Run 状态，也不创建兼容或迁移路径。
 _Avoid_: 自动更新、重复 PATH 配置、系统包管理、`sudo`、源码热加载、可配置保留策略、无限快照历史、状态迁移、每-Run Runner 绑定
+
+**Runner Setup（Runner 环境准备）**:
+用户开始使用 Runner 前，经统一确认后补齐宿主依赖并获取手动待办清单的一次性引导工作，区别于 Runner 本体安装、目标仓库准备和实际执行就绪判定。不在自动补装范围内的依赖转为手动待办，不因发行版缺少自动适配而中断所有可继续步骤，也不把尚缺关键条件的环境称为已就绪；CI、仓库忽略规则、任务标签与 Skills 由用户自行准备。
+_Avoid_: 安装成功即能运行、自动初始化目标仓库、自动配置 CI、自动管理 Skills、非适配发行版一律拒绝
 
 **Source Runner Installer（源码 Runner 安装器）**:
 随每份源码树提供、只在显式执行 `./install.sh` 时运行的一次性安装程序。它把当前源码目录安装为候选 Snapshot；identity 已经等于 Active current 时直接幂等成功，否则调用 Runner Compatibility Check、创建完整 Runner Generation、切换 Active Runner，并只保留 current 与可选 previous Snapshot。它只检查 Installation Readiness，不查询、提示或启用 systemd、linger 或其他 Executor Host 能力。安装完成后不驻留、不参与 Controller 调用，也不形成独立包、版本或更新生命周期。v0.1 的公开分发入口是 Git clone 或切换到用户选择的 Git revision 后运行该安装器，不要求 PyPI 或 pipx。
@@ -393,7 +403,7 @@ Run Acceptance 通过后由 Controller 启动的只读 YOLO Codex，读取 Paren
 _Avoid_: Run Acceptance Reviewer、Controller 拼接正文、Run Repair Thread
 
 **Run Repair Thread（运行修复线程）**:
-Delivery Run 独有并跨最终集成修复 Attempt 复用的持久 Development Codex Thread。它只接收 Run Acceptance Artifact、Run PR CI Failure Evidence 或默认分支合并冲突证据，以及 Parent Spec、完整 Run diff 和当前 Run Repair checkout，不复用任何 Ticket Development Thread；无法恢复时按 Development Thread 的相同显式 Resume / `--new-thread` 规则停止或恢复。
+为 Delivery Run 最终集成修复服务的 Development Thread，其跨开发轮的会话关系同样遵循 Development Thread Policy。它面对完整 Parent 范围、当前集成代码和准确修复证据，不复用任何 Ticket Development Thread 或 Reviewer Thread。
 _Avoid_: Ticket Development Thread、Run Reviewer Thread、人工修复会话
 
 **Integration-repair Worktree（集成修复工作区）**:
@@ -651,6 +661,10 @@ _Avoid_: Output Attempt、Codex 进程重试次数、Publication Context Fallbac
 **Publication Operation Retry（发布操作重试）**:
 Controller 或 Publisher 在一次 Publication Attempt 内对 GitHub 读取收敛、带精确绑定的写入或结果对账进行的有界确定性重试。它按外部操作风险单独计数，不增加 Publication Attempt，也不被 Invocation Resume 清零或绕过。
 _Avoid_: Publication Attempt、Output Repair、无界 GitHub 重试
+
+**Agent Run User Defaults（个人运行默认配置）**:
+用户创建新 Delivery Run 时采用的统一运行偏好，包括开发与审查轮数、角色调用时限、模型与推理强度、Publication 配置引用以及 Development Thread Policy，修改这些默认值不改变已有 Run。它不同于显式调整某次 Run 的实际配置，也不拥有账号凭据、项目质量规则、运行状态或内部轮询与重试机制。
+_Avoid_: Codex 用户全局配置、活动 Run 快照、项目共享默认、认证配置合并文件
 
 **Agent Execution Profile（Agent 执行配置）**:
 Delivery Run 为未来创建的各顶层 Codex Thread 保存的 model 与 reasoning effort 选择，可以来自命名预设或用户自定义值。它只约束 Controller 直接启动的顶层 Codex，不约束这些 Codex 自行派发的 subagent。
