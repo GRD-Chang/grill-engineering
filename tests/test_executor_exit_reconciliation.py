@@ -2,10 +2,12 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent_run.executor_host import _process_start_token
+from agent_run.cli import main
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
@@ -35,9 +37,11 @@ def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:
     assert control.path_for(task).read_bytes() == before
 
 
-@pytest.mark.parametrize("case", ["exited", "orphan", "recorded_exit_orphan", "unknown"])
+@pytest.mark.parametrize("case", [
+    "exited", "orphan", "recorded_exit_orphan", "unknown", "save_interrupted",
+])
 def test_resume_reconciles_externally_exited_executor(
-    git_repo: Path, case: str,
+    git_repo: Path, case: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
@@ -78,6 +82,27 @@ def test_resume_reconciles_externally_exited_executor(
                     generation=reservation.generation)
         before = states.load_run(run_id)
         control_before = control.path_for(task).read_bytes()
+        if case == "save_interrupted":
+            original_save = StateStore.save_run
+
+            def fail_interruption_save(
+                self: StateStore, selected_run_id: str, value: dict[str, Any],
+            ) -> None:
+                if any(item.get("code") == "session_interrupted"
+                       for item in value.get("diagnostics", [])):
+                    raise OSError("injected Run persistence failure")
+                return original_save(self, selected_run_id, value)
+
+            with monkeypatch.context() as patch:
+                patch.chdir(git_repo)
+                patch.setattr(StateStore, "save_run", fail_interruption_save)
+                assert main([
+                    "resume", run_id, "--json", "--github-fixture",
+                    str(fixture), "--agent-fixture",
+                    str(_parent_only_agents(git_repo / "agents.json")),
+                ]) == 2
+            assert control.load(task)["executor"]["status"] == "exited"
+            assert states.load_run(run_id) == before
         result = _run_cli(git_repo, fixture, "resume", run_id, "--agent-fixture",
             str(_parent_only_agents(git_repo / "agents.json")))
         if case == "unknown":

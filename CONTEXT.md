@@ -292,7 +292,7 @@ _Avoid_: 公开 `start`、额外 `--new-run`、把 `stop` 当作 `abandon`、手
 
 **Operator Stop（人工停止）**:
 维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
-_Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、无活动 Executor 时制造 Stop 历史
+_Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、已有暂停或终态时重复制造 Stop 历史
 
 **No-progress Guard（无进展保护）**:
 Run Executor Session 对一次自动步骤执行前后的确定性进展身份进行机械比较；若状态、当前 Work Subject、Generation、phase、Semantic Attempt、Invocation、Candidate、PR、准确 head、等待边界、cleanup 与下一步骤均未变化，则保存 `execution_failed/controller_no_progress` 并停止，而不以相同输入忙循环。时间戳、timeline、日志、展示字段与重试计数不构成进展；`waiting_checks`、`waiting_external` 与 `waiting_merge` 由 Run 内部监督负责，不属于无进展。

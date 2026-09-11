@@ -77,3 +77,30 @@ def test_new_command_error_does_not_replace_or_repeat_old_run_failure(
     assert output['diagnostics'][0]['code'] == 'execution_readiness'
     assert 'old usage limit' not in json.dumps(output)
     assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize('as_json', [False, True])
+def test_long_multiline_error_preserves_next_step_without_response_body(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], as_json: bool,
+) -> None:
+    monkeypatch.chdir(git_repo)
+    fixture = write_fixture(git_repo / 'github.json', issues={})
+
+    def unavailable(self: FixtureGitHubReader) -> None:
+        raise GitHubReadError(
+            'github_timeout', 'timed out ' + 'x' * 9000 + '\nraw response body',
+        )
+
+    monkeypatch.setattr(FixtureGitHubReader, 'repository_hint', unavailable)
+    assert main(['run', '213', '--github-fixture', str(fixture),
+                 *(['--json'] if as_json else [])]) == 2
+    output = capsys.readouterr().out
+    assert 'raw response body' not in output
+    assert '重试' in output
+    if as_json:
+        diagnostic = json.loads(output)['diagnostics'][0]
+        assert len(diagnostic['message'].encode('utf-8')) <= 8192
+        assert '重试' in diagnostic['next_action']
+    else:
+        assert len(output) < 1000

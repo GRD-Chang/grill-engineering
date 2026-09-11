@@ -986,7 +986,16 @@ def _main_with_parser_resources(
                 f"{bounded_error(str(error)) or type(error).__name__}；"
                 "请排除上述原因后重试；已有交付请先查询 status 确认状态。"
             )
-        diagnostic_message = bounded_error(diagnostic_message)
+        # Show the adapter's summary, not its multiline response/body. Keep the
+        # recovery instruction separate so truncation cannot remove it.
+        diagnostic_message = (
+            bounded_error(diagnostic_message).splitlines() or [type(error).__name__]
+        )[0]
+        diagnostic_next_action = (
+            "请进入目标 Git 仓库目录后重试"
+            if diagnostic_code == "workspace_required"
+            else "请排除上述原因；已有交付先运行 agent-run status 确认状态，再决定是否重试"
+        )
         locator_diagnostic: dict[str, object] = {
             "code": diagnostic_code,
             "message": diagnostic_message,
@@ -996,6 +1005,7 @@ def _main_with_parser_resources(
             locator_diagnostic["application_status"] = (
                 "unknown" if command_dispatched else "not_applied"
             )
+            locator_diagnostic["next_action"] = diagnostic_next_action
         if isinstance(error, RunLocatorError):
             locator_diagnostic["candidates"] = error.candidates
         error_status = (
@@ -1048,6 +1058,7 @@ def _main_with_parser_resources(
                 + f"{cli_presentation.human_delivery_status(error_status)}）"
             )
             print(f"原因: {bounded_error(human_message)[:600]}")
+            print(f"本次命令下一步: {diagnostic_next_action}")
             if failure_state is not None:
                 _print_lifecycle_result(failure_state, {}, None)
             if isinstance(error, RunLocatorError) and error.candidates:
@@ -2588,6 +2599,15 @@ def _reconcile_resume_exit(
         and (
             executor.get("status") in {"running", "starting"}
             or isinstance(executor.get("worker"), Mapping)
+            or (
+                # A previous reconciliation can commit the Host exit before
+                # the Run interruption save fails. Recheck its concrete process
+                # identity and finish that boundary on the next explicit Resume.
+                executor.get("status") in {"exited", "absent"}
+                and not has_run_operator_gate(current)
+                and type(executor.get("pid")) is int
+                and isinstance(executor.get("process_start_token"), str)
+            )
         )
         and action.get("status") in {"completed", "failed"}
         and action_receipt_matches(current, action)
