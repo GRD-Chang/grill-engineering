@@ -8,6 +8,27 @@ Skill 例外、明确需求链接及修复风险审查例外。领域定义见 [
 权限边界见 [ADR 0001](../adr/0001-trusted-codex-yolo-boundary.md)，
 审查结果字段见 [Acceptance Artifact Schema](../acceptance-artifact-schema.md)。
 
+## 查看当前源码生成的 Prompt
+
+在本工作树根目录运行 `./show-prompts.py`，即可查看全部阶段；只需 Python 3.11+，
+无需安装项目或设置 `PYTHONPATH`，也可以从其他目录通过脚本的完整路径运行。
+
+```bash
+./show-prompts.py --list
+./show-prompts.py development
+./show-prompts.py repair-acceptance
+./show-prompts.py run-review
+./show-prompts.py --output /tmp/agent-prompts.md
+```
+
+默认示例使用 #203 作为当前任务、#131 作为背景，不断言两者存在真实父子关系。
+可用 `--task-url`、`--parent-url` 替换链接；SHA、次数、失败及验收证据仍为演示数据。
+脚本覆盖开发、五类修复、新会话、各范围验收、文案、续接、人工回复、格式修复及两个独立探针。
+角色正文直接调用运行时生成函数；安装器兼容性检查和文案 schema 握手的静态 Prompt 从源码字面量读取，
+结构变化时明确报错，避免复制正文后漂移。它不启动 Codex、不访问 GitHub、不读取真实运行状态，
+也不包含 Codex 自身系统指令、自动加载的 `AGENTS.md` 或 Skill 内容。默认只输出到终端，
+只有指定 `--output` 时才写入展示文件。
+
 ## 编写与组装原则
 
 - 通用 Skill 保持不变。Prompt 写清角色、任务、权威输入、角色特有责任、完成条件与唯一交付物；
