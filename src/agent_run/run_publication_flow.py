@@ -138,17 +138,19 @@ class RunPublicationFlow(RunPublicationShared):
                     if created_artifact is None:
                         return self._save(state)
                     artifact = created_artifact
-                    close_semantic_attempt(
-                        publication,
-                        semantic_attempt,
-                        outcome="publication_artifact",
-                    )
-                    self._save(state)
-                    publication["artifact"] = {
+                    publication_result = {
                         "commit_message": artifact.commit_message,
                         "pr_title": artifact.pr_title,
                         "pr_body_markdown": artifact.pr_body_markdown,
                     }
+                    close_semantic_attempt(
+                        publication,
+                        semantic_attempt,
+                        outcome="publication_artifact",
+                        result={"publication": publication_result},
+                    )
+                    self._save(state)
+                    publication["artifact"] = publication_result
             result = self._continue_accepted_publication(state, run, publication)
             if result is not None:
                 return result

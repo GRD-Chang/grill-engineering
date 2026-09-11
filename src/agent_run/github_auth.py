@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import os
+import socket
 import ssl
 import subprocess
 import threading
@@ -39,7 +40,7 @@ class _SigningProcessRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
-        self._network_closer: Callable[[], None] | None = None
+        self._network_closers: list[Callable[[], None]] = []
         self._cancelled = False
 
     def register(self, process: subprocess.Popen[bytes]) -> None:
@@ -61,18 +62,24 @@ class _SigningProcessRegistry:
         with self._lock:
             return self._cancelled
 
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancelled():
+            raise OSError("GitHub App credential provider is closed")
+
     def register_connection(self, connection: http.client.HTTPConnection) -> None:
-        self._register_network_resource(connection.close)
+        self._register_network_resource(
+            lambda: self._interrupt_connection(connection)
+        )
 
     def register_response(self, response: Any) -> None:
-        self._register_network_resource(response.close)
+        self._register_network_resource(lambda: self._interrupt_response(response))
 
     def _register_network_resource(self, close_resource: Callable[[], None]) -> None:
         with self._lock:
             if self._cancelled:
                 close = True
             else:
-                self._network_closer = close_resource
+                self._network_closers.append(close_resource)
                 close = False
         if close:
             try:
@@ -82,24 +89,49 @@ class _SigningProcessRegistry:
 
     def clear_connection(self) -> None:
         with self._lock:
-            self._network_closer = None
+            self._network_closers.clear()
 
     def cancel(self) -> None:
         with self._lock:
             self._cancelled = True
             process = self._process
-            close_network = self._network_closer
-        if process is not None:
-            self._terminate(process)
-        if close_network is not None:
+            close_network = tuple(self._network_closers)
+        for close_resource in close_network:
             try:
-                close_network()
+                close_resource()
             except OSError:
                 pass
+        if process is not None:
+            self._terminate(process)
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> None:
         terminate_process_group(process, timeout=1)
+
+    @classmethod
+    def _interrupt_connection(cls, connection: http.client.HTTPConnection) -> None:
+        cls._interrupt_socket(getattr(connection, "sock", None))
+        connection.close()
+
+    @classmethod
+    def _interrupt_response(cls, response: Any) -> None:
+        file_object = getattr(response, "fp", None)
+        raw = getattr(file_object, "raw", file_object)
+        cls._interrupt_socket(getattr(raw, "_sock", None))
+        response.close()
+
+    @staticmethod
+    def _interrupt_socket(sock: Any) -> None:
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 class _GitHubAppCredentialProvider:
@@ -244,9 +276,38 @@ class _CancellableHTTPSHandler(urllib.request.HTTPSHandler):
     def _open_connection(
         self, host: str, **options: Any
     ) -> http.client.HTTPSConnection:
-        connection = http.client.HTTPSConnection(host, **options)
+        connection = _CancellableHTTPSConnection(
+            self._process_registry,
+            host,
+            **options,
+        )
         self._process_registry.register_connection(connection)
         return connection
+
+
+class _CancellableHTTPSConnection(http.client.HTTPSConnection):
+    """Refuse to establish a transport after its credential channel closes."""
+
+    def __init__(
+        self,
+        process_registry: _SigningProcessRegistry,
+        host: str,
+        **options: Any,
+    ) -> None:
+        super().__init__(host, **options)
+        self._process_registry = process_registry
+
+    def connect(self) -> None:
+        self._process_registry.raise_if_cancelled()
+        try:
+            super().connect()
+        except OSError:
+            if self._process_registry.is_cancelled():
+                _SigningProcessRegistry._interrupt_connection(self)
+            raise
+        if self._process_registry.is_cancelled():
+            _SigningProcessRegistry._interrupt_connection(self)
+            raise OSError("GitHub App credential provider is closed")
 
 
 def _open_installation_token_request(

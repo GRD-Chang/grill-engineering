@@ -1027,6 +1027,22 @@ def _require_invocation(
         or invocation["capacity_recovery_count"] < 0
     ):
         raise IncompatibleRunStateError(f"invalid {location}.capacity_recovery_count")
+    wait_intervals = invocation.get("recovery_wait_intervals")
+    if wait_intervals is not None:
+        if not isinstance(wait_intervals, list):
+            raise IncompatibleRunStateError(
+                f"invalid {location}.recovery_wait_intervals"
+            )
+        for interval in wait_intervals:
+            if not isinstance(interval, dict) or not isinstance(
+                interval.get("started_at"), str
+            ) or (
+                interval.get("ended_at") is not None
+                and not isinstance(interval.get("ended_at"), str)
+            ):
+                raise IncompatibleRunStateError(
+                    f"invalid {location}.recovery_wait_intervals"
+                )
     if "validation_error" in invocation and (
         not isinstance(invocation["validation_error"], str)
         or len(invocation["validation_error"]) > 2000

@@ -8,7 +8,11 @@ from agent_run.operator_gate import (
     operator_gate_evidence,
     operator_gate_subjects,
 )
-from agent_run.presentation_helpers import delivery_object_label, human_next_action
+from agent_run.presentation_helpers import (
+    delivery_object_label,
+    human_next_action,
+    terminal_safe,
+)
 
 
 def operator_action_view(
@@ -82,27 +86,59 @@ def print_operator_action(
     action: dict[str, Any], *, run_id: object = None
 ) -> None:
     print("操作者动作:")
-    print(f"类型: {action['type']}")
-    print(f"对象: {action['object']}")
-    print(f"阶段: {action['phase']}")
+    print(f"类型: {terminal_safe(_human_action_type(action['type']))}")
+    print(f"对象: {terminal_safe(action['object'])}")
+    print(f"阶段: {terminal_safe(action['phase'])}")
     for reason in action["reasons"]:
-        print(f"原因: {reason}")
+        print(f"原因: {terminal_safe(reason)}")
     invocation = action.get("trigger_invocation")
     if isinstance(invocation, dict):
         print(
             "触发阻塞的 Agent: "
-            f"{invocation['role']}；model {invocation['model']}；"
-            f"reasoning effort {invocation['reasoning_effort']}；"
-            f"本轮时长: {invocation['duration_seconds']} 秒"
+            f"{terminal_safe(_human_agent_role(invocation['role']))}；"
+            f"model {terminal_safe(invocation['model'])}；"
+            f"reasoning effort {terminal_safe(invocation['reasoning_effort'])}；"
+            f"本轮时长: {terminal_safe(invocation['duration_seconds'])} 秒"
         )
-    print(f"已保留成果: {_human_preserved_results(action['preserved'])}")
+    print(
+        f"已保留成果: {terminal_safe(_human_preserved_results(action['preserved']))}"
+    )
     print("全局暂停: 整个 Delivery Run 已暂停；其他 Ticket 不会推进")
     if action["type"] == "Review Budget Checkpoint":
         print("恢复授权: resume 将授权新的预算窗口，继续已有工作。")
     print(
         "唯一下一步: "
-        f"{human_next_action(action['next_action'], run_id=run_id)}"
+        f"{terminal_safe(human_next_action(action['next_action'], run_id=run_id))}"
     )
+
+
+def _human_action_type(value: object) -> str:
+    raw = str(value)
+    localized = {
+        "Human Blocker": "需要人工处理",
+        "Review Budget Checkpoint": "验收预算窗口已用尽",
+        "Execution Failure": "执行失败",
+        "Deterministic Contradiction": "确定性矛盾",
+        "Supervision Timeout Pause": "监督超时暂停",
+        "Operator Stopped": "操作者已停止",
+        "Requeue Required": "需要重新排队",
+        "Final Approval": "等待最终批准",
+        "Publication Retry Exhausted": "发布重试已耗尽",
+        "Abandonment Recovery": "放弃恢复处理中",
+    }.get(raw)
+    return f"{raw}（{localized}）" if localized else raw
+
+
+def _human_agent_role(value: object) -> str:
+    raw = str(value)
+    localized = {
+        "development": "开发 Agent",
+        "reviewer": "验收 Agent",
+        "fresh_acceptance": "验收 Agent",
+        "publication": "发布 Agent",
+        "final_publication": "发布 Agent",
+    }.get(raw)
+    return f"{raw}（{localized}）" if localized else raw
 
 
 def _human_preserved_results(value: object) -> str:

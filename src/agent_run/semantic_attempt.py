@@ -134,6 +134,16 @@ def allocate_semantic_attempt(
         **identity,
         "status": "pending",
     }
+    budget = subject.get("review_budget")
+    if budget_window is not None and isinstance(budget, dict):
+        # Capture only the bounded counters that were visible when this
+        # Attempt was allocated. History must not later substitute the
+        # owner's newer cumulative budget for this historical fact.
+        attempt["budget_snapshot"] = {
+            "window": budget_window,
+            "development_attempts": budget.get("development_attempts"),
+            "reviewer_invocations": budget.get("reviewer_invocations"),
+        }
     subject["pending_semantic_attempt"] = attempt
     history = subject.setdefault("semantic_attempt_history", [])
     if not isinstance(history, list):
@@ -244,7 +254,11 @@ def pending_semantic_attempt(
 
 
 def close_semantic_attempt(
-    subject: dict[str, Any], attempt: dict[str, Any], *, outcome: str
+    subject: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    outcome: str,
+    result: dict[str, Any] | None = None,
 ) -> None:
     """Close the exact pending Attempt after a canonical role result exists."""
 
@@ -253,6 +267,40 @@ def close_semantic_attempt(
         raise ValueError("Semantic Agent Attempt closeout does not match pending work")
     completed = deepcopy(pending)
     completed.update({"status": "completed", "outcome": outcome})
+    if isinstance(result, dict):
+        # Keep only the small, human-facing result facts needed when the
+        # owner later advances to another Attempt.  Agent payloads remain
+        # outside the Attempt record.
+        for key in ("development_summary", "publication"):
+            value = result.get(key)
+            if key == "development_summary" and isinstance(value, str) and value.strip():
+                completed[key] = value
+            elif key == "publication" and isinstance(value, dict):
+                publication_facts = {
+                    field: deepcopy(value[field])
+                    for field in ("commit_message", "pr_title", "pr_body_markdown")
+                    if isinstance(value.get(field), str) and value[field].strip()
+                }
+                if set(publication_facts) == {
+                    "commit_message",
+                    "pr_title",
+                    "pr_body_markdown",
+                }:
+                    completed[key] = publication_facts
+        history_facts = result.get("history_facts")
+        if isinstance(history_facts, dict):
+            # These are bounded identity pointers for read-only history
+            # reconstruction.  The artifact itself remains in the owner's
+            # review budget, avoiding a second unbounded payload copy.
+            completed["history_facts"] = {
+                key: deepcopy(history_facts[key])
+                for key in (
+                    "reviewer_thread_id",
+                    "candidate_sha",
+                    "review_identity",
+                )
+                if history_facts.get(key) is not None
+            }
     operation_retry = subject.get("publication_operation_retry")
     if completed.get("role") == "publication" and isinstance(
         operation_retry, dict
@@ -302,15 +350,51 @@ def retire_semantic_attempt_owner(
     retired = state.setdefault("retired_semantic_attempt_owners", [])
     if not isinstance(retired, list):
         raise ValueError("retired_semantic_attempt_owners must be an array")
-    retired.append(
-        {
-            "owner_kind": owner_kind,
-            "work_subject": work_subject,
-            "generation": generation,
-            "review_budget": deepcopy(owner.get("review_budget")),
-            "semantic_attempt_history": deepcopy(history),
-        }
-    )
+    archive = {
+        "owner_kind": owner_kind,
+        "work_subject": work_subject,
+        "generation": generation,
+        "review_budget": deepcopy(owner.get("review_budget")),
+        "semantic_attempt_history": deepcopy(history),
+    }
+    reviewer_attempts = [
+        item
+        for item in history
+        if isinstance(item, dict) and item.get("role") == "reviewer"
+    ]
+    if reviewer_attempts:
+        final_reviewer_id = reviewer_attempts[-1].get("attempt_id")
+        if isinstance(final_reviewer_id, str) and final_reviewer_id:
+            archive["acceptance_attempt_id"] = final_reviewer_id
+            archive["supporting_attempt_id"] = final_reviewer_id
+    # The live repair owner is removed after promotion, but its completed
+    # Attempts are still the only safe owner of the round-specific narrative
+    # and evidence.  Retain only bounded projection facts; never copy the
+    # whole mutable Job or its private Agent request payload.
+    for key in (
+        "review_budget_history",
+        "development_summary",
+        "acceptance_artifact",
+        "acceptance_record",
+        "publication",
+        "required_checks_evidence",
+        "deterministic_integration_record",
+        "fallback_publication_receipt",
+        "required_checks_origin",
+        "ci_evidence",
+        "repair_source",
+        "repair_trigger",
+        "candidate_sha",
+        "publication_sha",
+        "integrated_sha",
+        "reviewed_head_sha",
+        "effective_revision",
+        "pr_number",
+    ):
+        value = owner.get(key)
+        if value is not None:
+            archive[key] = deepcopy(value)
+    retired.append(archive)
     del retired[:-64]
 
 

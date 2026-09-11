@@ -137,18 +137,24 @@ def publication(
     semantic_attempt = pending_semantic_attempt(job, role="publication")
     if semantic_attempt is None:
         raise ValueError("Publication closeout is missing its Semantic Attempt")
-    close_semantic_attempt(job, semantic_attempt, outcome="publication_artifact")
+    publication_result = {
+        "commit_message": publication.commit_message,
+        "pr_title": publication.pr_title,
+        "pr_body_markdown": publication.pr_body_markdown,
+    }
+    close_semantic_attempt(
+        job,
+        semantic_attempt,
+        outcome="publication_artifact",
+        result={"publication": publication_result},
+    )
     sha = stage.publisher.create_publication_commit(
         checkout, job, publication.commit_message
     )
     bind_new_publication_head(job, sha)
     job.update(
         {
-            "publication": {
-                "commit_message": publication.commit_message,
-                "pr_title": publication.pr_title,
-                "pr_body_markdown": publication.pr_body_markdown,
-            },
+            "publication": publication_result,
             "publication_sha": sha,
             "phase": "publishing",
         }

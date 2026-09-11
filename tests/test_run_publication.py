@@ -397,13 +397,14 @@ def test_final_publication_human_resume_clears_current_blocker(
         assert view.returncode == 0, view.stderr
         assert "类型: Human Blocker" in view.stdout
         assert "对象: Run Publication" in view.stdout
-        assert "阶段: pending" in view.stdout
+        if command == "status":
+            assert "阶段:       等待人工处理" in view.stdout
         assert (
             "原因: GitHub denied access; tried gh issue view; grant Issue read access."
             in view.stdout
         )
         assert (
-            "触发阻塞的 Agent: publication；model publication-model；"
+            "触发阻塞的 Agent: publication（发布 Agent）；model publication-model；"
             "reasoning effort high；本轮时长: 0 秒"
             in view.stdout
         )

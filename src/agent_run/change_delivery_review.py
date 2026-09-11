@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Fresh Candidate acceptance and Human Blocker stage for Change Delivery."""
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,7 @@ def complete_review(
         job.pop("final_ci_fix_failure_head", None)
     clear_required_checks_observation(job)
     budget = job.get("review_budget")
+    review_facts: dict[str, Any] = {}
     if isinstance(budget, dict):
         candidate_sha = str(job["candidate_sha"])
         if isinstance(job.get("default_base_sha"), str):
@@ -172,6 +174,10 @@ def complete_review(
             "reviewed_base_sha": str(job["base_sha"]),
             "review_identity": review_identity,
             "artifact": artifact.raw,
+        }
+        review_facts = {
+            key: deepcopy(review_record[key])
+            for key in ("reviewer_thread_id", "candidate_sha", "review_identity")
         }
         matching_index = next(
             (
@@ -218,7 +224,12 @@ def complete_review(
     semantic_attempt = pending_semantic_attempt(job, role="reviewer")
     if semantic_attempt is None:
         raise ValueError("Reviewer closeout is missing its Semantic Attempt")
-    close_semantic_attempt(job, semantic_attempt, outcome="acceptance_artifact")
+    close_semantic_attempt(
+        job,
+        semantic_attempt,
+        outcome="acceptance_artifact",
+        result={"history_facts": review_facts},
+    )
     clear_current_human_blocker(job)
     if isinstance(existing_pr, int):
         stage._record_agent_run_status(

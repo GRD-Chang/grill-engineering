@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.delivery_history import history_records
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
@@ -570,6 +571,60 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     assert repair_branches.isdisjoint(fixture_data["delivery"]["published_branches"])
     assert not repair_checkout.exists()
 
+    archived_owners = second.get("retired_semantic_attempt_owners", [])
+    assert len(archived_owners) == 1
+    archived_owner = archived_owners[0]
+    archived_attempts = archived_owner["semantic_attempt_history"]
+    assert any(
+        attempt.get("role") == "development"
+        and attempt.get("development_summary")
+        for attempt in archived_attempts
+    )
+    assert any(attempt.get("role") == "reviewer" for attempt in archived_attempts)
+    assert isinstance(archived_owner["review_budget_history"], list)
+    assert archived_owner["review_budget"]["review_artifacts"]
+
+    archived_ids = {
+        attempt["attempt_id"]
+        for attempt in archived_attempts
+        if isinstance(attempt.get("attempt_id"), str)
+    }
+    audit = {
+        "semantic_agent_attempts": archived_attempts,
+        "agent_invocations": second.get("agent_invocation_history", []),
+        "timeline": second.get("timeline", []),
+        "timeline_continuation": second.get("timeline_continuation", []),
+        "agent_resumes": [],
+    }
+    archived_records = [
+        record
+        for record in history_records(second, audit)
+        if record.get("attempt_id") in archived_ids
+    ]
+    assert archived_records
+    assert any(record.get("development_summary") for record in archived_records)
+    assert any(
+        isinstance(record.get("acceptance_artifact"), dict)
+        for record in archived_records
+        if record.get("role") == "reviewer"
+    )
+    assert any(record.get("publication") for record in archived_records)
+
+    history = run_cli(
+        git_repo, fixture, "history", str(state["run_id"]), "--plain", "--details"
+    )
+    assert history.returncode == 0, history.stderr
+    assert "Development Summary" in history.stdout
+    assert "必需检查结果" in history.stdout
+    assert "PR 编号" in history.stdout
+    for internal_field in (
+        "reviewer_thread_id",
+        "policy_snapshot",
+        "review_budget",
+        "acceptance_record",
+    ):
+        assert internal_field not in history.stdout
+
 def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     git_repo: Path,
 ) -> None:
@@ -665,7 +720,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
             assert "阶段:       开发中" in text_status.stdout
             assert "当前对象:   Run Acceptance" in text_status.stdout
             assert (
-                "最近 Agent: 运行修复开发工作代理 · Run Acceptance"
+                "最近 Agent: Development Agent · Run Acceptance（开发 Agent）"
                 in text_status.stdout
             )
             assert "Run Development     1 / 10 轮" in text_status.stdout

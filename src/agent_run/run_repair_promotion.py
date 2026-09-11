@@ -18,6 +18,7 @@ from agent_run.semantic_attempt import (
     controller_reprepare_intent,
     detach_active_invocation,
     pending_semantic_attempt,
+    retire_semantic_attempt_owner,
 )
 from agent_run.state_contract import require_candidate_acceptance_history
 
@@ -515,6 +516,13 @@ class RunRepairPromotion:
             completed["linked_branch_display"] = dict(display)
         completed_repairs.append(completed)
         del completed_repairs[:-32]
+        retire_semantic_attempt_owner(
+            state,
+            job,
+            owner_kind="run_repair",
+            work_subject=f"run-repair:{state['run_id']}",
+            generation=int(job["repair_generation"]),
+        )
         run.pop("repair_job", None)
         publication_state = state.get("run_publication")
         if isinstance(publication_state, dict) and publication_state.get("phase") not in {
