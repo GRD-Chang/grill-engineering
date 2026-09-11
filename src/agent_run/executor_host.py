@@ -760,6 +760,26 @@ def _terminate_control_target(
     _wait_for_process_exit(pid, token, timeout=timeout)
 
 
+def validate_executor_exit(target_executor: Mapping[str, Any]) -> None:
+    """Require independent process proof before admitting an explicit Resume."""
+    for label, process in (
+        ("Worker", target_executor.get("worker")),
+        ("Executor", target_executor),
+    ):
+        if process is None and label == "Worker":
+            continue
+        if not isinstance(process, Mapping):
+            raise ExecutorStartUnknownError(f"{label} ownership 无法确认")
+        pid, token = process.get("pid"), process.get("process_start_token")
+        if type(pid) is not int or not isinstance(token, str) or not token:
+            raise ExecutorStartUnknownError(f"{label} 退出证据不足；不会启动第二个 Executor")
+        status = _process_binding_status(pid, token)
+        if status == "matches":
+            raise ExecutorStartUnknownError(f"{label} 仍在运行；请先执行 stop")
+        if status != "absent":
+            raise ExecutorStartUnknownError(f"{label} ownership 无法确认；不会启动第二个 Executor")
+
+
 def validate_control_target(target_executor: Mapping[str, Any]) -> None:
     """Fail closed unless the Worker or Executor target has exact live identity."""
 

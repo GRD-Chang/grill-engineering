@@ -534,8 +534,8 @@ class RunLifecycle:
         """Fence an old Executor and run Stop/Abandon under a new Executor.
 
         Admission is deliberately separate from ordinary lifecycle submission:
-        Stop may be a strictly read-only no-op when the Host proves there is no
-        active Executor, while Abandon is still a mutation in that state.
+        Stop is read-only only for an already stopped or terminal Run. An idle
+        unfinished Run still needs the durable operator pause boundary.
         """
 
         if request.task != self.task or request.kind not in {"stop", "abandon"}:
@@ -641,48 +641,14 @@ class RunLifecycle:
                     raise ExecutorStartUnknownError(
                         "Task Control ownership 缺失；不会猜测或终止进程"
                     )
-                if not isinstance(executor, Mapping) or executor.get("status") in {
-                    "exited",
-                    "absent",
-                }:
+                if isinstance(executor, Mapping):
+                    self._observe_stop_target(executor)
+                latest = self._state_store_for_record(record).load_current_run(run_id)
+                if latest is None:
+                    raise ActionReconciliationError("Stop 无法重新读取准确 Delivery Run")
+                if latest.get("status") in {"completed", "abandoned", "operator_stopped"}:
                     return self._reload_no_active_run(run_id, record), True, None
-                if executor.get("status") not in {"starting", "running"}:
-                    raise ExecutorStartUnknownError(
-                        "Executor ownership 无法确认；不会提交控制栅栏"
-                    )
-                old_action_id = _string_field(executor, "action_id")
-                old_generation = _positive_integer(executor.get("generation"))
-                old_run_id = executor.get("run_id")
-                observation = self.host.observe(
-                    replace(
-                        self.executor_spec(
-                            old_run_id if isinstance(old_run_id, str) else None,
-                            old_action_id,
-                            old_generation,
-                        ),
-                        runner_binding=(
-                            executor.get("runner_binding")
-                            if isinstance(executor.get("runner_binding"), str)
-                            else None
-                        ),
-                    ),
-                    self.control,
-                )
-                if observation.status in {"absent", "exited"}:
-                    return (
-                        self._reload_no_active_run(
-                            run_id,
-                            record,
-                            host_absent_executor=(old_action_id, old_generation),
-                        ),
-                        True,
-                        None,
-                    )
-                if observation.status != "running":
-                    raise ExecutorStartUnknownError(
-                        observation.reason
-                        or "Executor ownership 无法确认；不会提交控制栅栏"
-                    )
+                current = latest
             claim = self.control.claim_control_action(
                 self.task,
                 kind=request.kind,
@@ -692,11 +658,7 @@ class RunLifecycle:
                 before_create=self.prepare_executor_session,
             )
             if claim is None:
-                if record is None:
-                    raise ActionReconciliationError(
-                        "Stop ownership 缺失；不会返回 no-active 结果"
-                    )
-                return self._reload_no_active_run(run_id, record), True, None
+                raise ActionReconciliationError("Stop 未取得控制操作")
             claimed_action = claim.action
             attached = claim.attached
 
@@ -707,6 +669,34 @@ class RunLifecycle:
             replace_receipt_action_id=replace_receipt_action_id,
             attached=attached,
         )
+
+    def _observe_stop_target(self, executor: Mapping[str, Any]) -> None:
+        if executor.get("status") in {"exited", "absent"}:
+            return
+        if executor.get("status") not in {"starting", "running"}:
+            raise ExecutorStartUnknownError(
+                "Executor ownership 无法确认；不会提交控制栅栏"
+            )
+        old_run_id = executor.get("run_id")
+        observation = self.host.observe(
+            replace(
+                self.executor_spec(
+                    old_run_id if isinstance(old_run_id, str) else None,
+                    _string_field(executor, "action_id"),
+                    _positive_integer(executor.get("generation")),
+                ),
+                runner_binding=(
+                    executor.get("runner_binding")
+                    if isinstance(executor.get("runner_binding"), str)
+                    else None
+                ),
+            ),
+            self.control,
+        )
+        if observation.status not in {"running", "absent", "exited"}:
+            raise ExecutorStartUnknownError(
+                observation.reason or "Executor ownership 无法确认；不会提交控制栅栏"
+            )
 
     def _reload_no_active_run(
         self,

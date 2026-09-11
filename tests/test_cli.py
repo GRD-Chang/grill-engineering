@@ -4297,7 +4297,7 @@ def test_lifecycle_commands_do_not_use_cross_directory_locator(
     )
 
     assert result.returncode == 2
-    assert stdout_json(result)["diagnostics"][0]["code"] == "command_failed"
+    assert stdout_json(result)["diagnostics"][0]["code"] == "workspace_required"
     assert state_path.read_text(encoding="utf-8") == before
 
 

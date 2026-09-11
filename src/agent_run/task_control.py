@@ -400,7 +400,7 @@ class TaskControlStore:
         normalized_payload = _bounded_payload(payload)
         digest = _payload_digest(normalized_payload)
 
-        # Observe attach/no-op first. Capture the new Session outside the lock,
+        # Observe attachment first. Capture the new Session outside the lock,
         # then repeat all admission checks in the transaction that fences ownership.
         for prepared in (False, True):
             if prepared and before_create is not None:
@@ -454,22 +454,13 @@ class TaskControlStore:
                         "失败 Control Action 的目标与当前 Delivery Run 不匹配；"
                         "不会猜测或跳过进程 ownership"
                     )
-                if (
-                    kind == "stop"
-                    and unresolved_target is None
-                    and (
-                        executor is None
-                        or (
-                            isinstance(executor, dict)
-                            and executor.get("status") in {"exited", "absent"}
-                        )
-                    )
-                ):
-                    return None
                 active_target = (
                     deepcopy(executor)
                     if isinstance(executor, dict)
-                    and executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
+                    and (
+                        executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
+                        or isinstance(executor.get("worker"), Mapping)
+                    )
                     else None
                 )
                 target = active_target or unresolved_target

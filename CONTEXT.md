@@ -291,7 +291,7 @@ _Avoid_: 只靠 Prompt 自律、Worker 自我批准、Publisher 凭证继承、�
 _Avoid_: 公开 `start`、额外 `--new-run`、把 `stop` 当作 `abandon`、手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
 
 **Operator Stop（人工停止）**:
-维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。当 Task Control 与 Executor Host 已能确认没有活动 Executor、没有在途 Stop，`stop` 只返回当前可理解状态和适用的下一步，不创建 Lifecycle Action、不修改 Delivery Run 或 Action history；无法确认是否仍有 Executor 时不得把它当作无操作成功。
+维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
 _Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、无活动 Executor 时制造 Stop 历史
 
 **No-progress Guard（无进展保护）**:

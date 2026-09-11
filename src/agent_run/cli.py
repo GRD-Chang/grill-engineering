@@ -13,6 +13,7 @@ from typing import Any, Sequence
 from agent_run import cli_presentation, cli_surface
 from agent_run import doctor
 from agent_run.agent_fixture import FixtureAgentBackend
+from agent_run.agent_invocation import record_session_interruption
 from agent_run.agent_profiles import (
     AgentProfileStore,
     ProfileOverrides,
@@ -66,6 +67,7 @@ from agent_run.executor_host import (
     ExecutorStartUnknownError,
     FakeExecutorHost,
     _process_start_token,
+    validate_executor_exit,
 )
 from agent_run.runner_lease import default_runner_lock_path, runner_usage_lease
 from agent_run.systemd_executor_host import (
@@ -348,6 +350,7 @@ def _main_with_parser_resources(
     precondition_failed = False
     lifecycle_receipt: ActionReceipt | None = None
     control_failure: str | None = None
+    command_dispatched = False
     try:
         _validate_explicit_policy_options(parsed)
         delivery_policy_provider = (
@@ -587,6 +590,7 @@ def _main_with_parser_resources(
             state = read_only_stop_state
             resumed = True
         elif executor_backed and parsed.command in {"stop", "abandon"}:
+            command_dispatched = True
             state, lifecycle_receipt = _run_control_action(
                 parsed,
                 states,
@@ -612,6 +616,10 @@ def _main_with_parser_resources(
                         parsed.message = _validated_human_response(parsed.message)
                     except ValueError as error:
                         raise TaskControlError(str(error)) from error
+                if executor_binding is None:
+                    current = _reconcile_resume_exit(
+                        parsed, states, git, github, executor_host, current
+                    )
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
@@ -644,6 +652,7 @@ def _main_with_parser_resources(
                         current, as_json=parsed.as_json
                     )
                     return 2
+            command_dispatched = True
             state, resumed, lifecycle_receipt = _run_lifecycle(
                 parsed,
                 states,
@@ -902,6 +911,7 @@ def _main_with_parser_resources(
             )
             and controller is not None
             and isinstance(selected_run_id, str)
+            and executor_binding is not None
         ):
             if isinstance(error, GitHubReadError) and is_proven_github_state_contradiction(
                 error.code
@@ -915,18 +925,18 @@ def _main_with_parser_resources(
                 )
         failure_state: dict[str, Any] | None = None
         durable_status = None
-        durable_diagnostics: list[object] | None = None
         if not incompatible_state and states is not None and isinstance(run_id, str):
             failure_state = states.load_run(run_id)
             if isinstance(failure_state, dict):
                 durable_status = failure_state.get("status")
-                diagnostics = failure_state.get("diagnostics")
-                if isinstance(diagnostics, list):
-                    durable_diagnostics = diagnostics
         locator_code = error.code if isinstance(error, RunLocatorError) else None
         locator_error = locator_code is not None
         if locator_code is not None:
             diagnostic_code = locator_code
+        elif isinstance(error, GitError) and git is None:
+            diagnostic_code = "workspace_required"
+        elif isinstance(error, GitHubReadError):
+            diagnostic_code = error.code
         elif isinstance(
             error, (ExecutionReadinessError, SystemdExecutionReadinessError)
         ):
@@ -955,7 +965,12 @@ def _main_with_parser_resources(
             or diagnostic_code
             in {"action_busy", "executor_start_unknown", "task_control"}
         ):
-            diagnostic_message = str(error)
+            diagnostic_message = bounded_error(str(error))
+        elif diagnostic_code == "workspace_required":
+            diagnostic_message = (
+                "无法定位当前 Git 仓库；请进入目标仓库目录后重试。"
+                f"原因：{bounded_error(str(error))}"
+            )
         elif diagnostic_code == "incompatible_run_state":
             diagnostic_message = (
                 "本地 Run state 不符合当前唯一 Invocation/Generation 契约；"
@@ -967,11 +982,20 @@ def _main_with_parser_resources(
                 f"{str(error).partition(': ')[2]}。请先人工确定要保留的运行"
             )
         else:
-            diagnostic_message = "命令执行失败；请通过 status 或 history 查看可恢复状态"
+            diagnostic_message = (
+                f"{bounded_error(str(error)) or type(error).__name__}；"
+                "请排除上述原因后重试；已有交付请先查询 status 确认状态。"
+            )
+        diagnostic_message = bounded_error(diagnostic_message)
         locator_diagnostic: dict[str, object] = {
             "code": diagnostic_code,
             "message": diagnostic_message,
         }
+        if parsed.command in {"run", "resume", "stop", "abandon", "approve", "revise", "requeue"}:
+            locator_diagnostic["operation"] = parsed.command
+            locator_diagnostic["application_status"] = (
+                "unknown" if command_dispatched else "not_applied"
+            )
         if isinstance(error, RunLocatorError):
             locator_diagnostic["candidates"] = error.candidates
         error_status = (
@@ -1001,17 +1025,8 @@ def _main_with_parser_resources(
                 )
             )
         )
-        output_diagnostics = (
-            [locator_diagnostic]
-            if locator_error
-            or isinstance(error, DirtyManagedCheckoutError)
-            or isinstance(error, DeliveryPolicyError)
-            or isinstance(error, ResumeIntentError)
-            or incompatible_state
-            or durable_status not in {"blocked", "deterministic_contradiction"}
-            or durable_diagnostics is None
-            else durable_diagnostics
-        )
+        # This command's error must not be replaced by an older Run failure.
+        output_diagnostics = [locator_diagnostic]
         if getattr(parsed, "as_json", False):
             print(
                 json.dumps(
@@ -1029,10 +1044,10 @@ def _main_with_parser_resources(
                 error, diagnostic_message.partition("\n候选：")[0]
             )
             print(
-                "命令状态: 未执行（"
-                f"{cli_presentation.human_delivery_status(error_status)}）"
+                ("命令状态: 应用结果待确认（" if command_dispatched else "命令状态: 未执行（")
+                + f"{cli_presentation.human_delivery_status(error_status)}）"
             )
-            print(f"原因: {human_message}")
+            print(f"原因: {bounded_error(human_message)[:600]}")
             if failure_state is not None:
                 _print_lifecycle_result(failure_state, {}, None)
             if isinstance(error, RunLocatorError) and error.candidates:
@@ -1241,6 +1256,8 @@ def _read_only_stop_result(
     """Return a proven read-only Stop result before execution readiness checks."""
 
     state = cli_surface._load_local_run(states, parsed.run_id)
+    if state.get("status") not in {"completed", "abandoned", "operator_stopped"}:
+        return None
     repository = state.get("repository")
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else None
@@ -2547,6 +2564,72 @@ def _profile_options_are_explicit(
     return preset is not None or any(
         value is not None and value is not False for value in overrides.values()
     )
+
+
+def _reconcile_resume_exit(
+    parsed: argparse.Namespace,
+    states: StateStore | FaultInjectingStateStore,
+    git: GitRepository,
+    github: Any,
+    host: ExecutorHost | None,
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Explicit Resume may close an exactly identified externally stopped session."""
+    if host is None or current.get("status") in {"completed", "abandoned"}:
+        return current
+    task = _task_for_parent(parsed, github, git)
+    control = TaskControlStore(git.root / ".agent-run")
+    record = control.inspect_run(task, current)
+    executor = record.get("executor") if isinstance(record, Mapping) else None
+    action = record.get("action") if isinstance(record, Mapping) else None
+    if not (
+        isinstance(executor, Mapping)
+        and isinstance(action, Mapping)
+        and (
+            executor.get("status") in {"running", "starting"}
+            or isinstance(executor.get("worker"), Mapping)
+        )
+        and action.get("status") in {"completed", "failed"}
+        and action_receipt_matches(current, action)
+    ):
+        return current
+    spec = ExecutorSpec(
+        task=task,
+        action_id=str(action["action_id"]),
+        run_id=str(current["run_id"]),
+        generation=int(executor["generation"]),
+        cwd=git.root,
+        state_root=states.root,
+        runner_binding=executor.get("runner_binding"),
+    )
+    observation = host.observe(spec, control)
+    if observation.status == "running":
+        return current
+    if (
+        observation.status not in {"exited", "absent"}
+        or observation.generation not in {None, spec.generation}
+    ):
+        raise ExecutorStartUnknownError(observation.reason or "原 Executor 退出状态无法确认")
+    validate_executor_exit(executor)
+    latest = states.load_current_run(str(current["run_id"]))
+    if latest is None or not action_receipt_matches(latest, action):
+        raise ExecutorStartUnknownError("Run 与原 Executor 的关联已变化；请重新查询")
+    current = latest
+    if current.get("status") in {"completed", "abandoned"}:
+        return current
+    control.finish_executor(
+        task, action_id=spec.action_id, generation=spec.generation,
+        run_id=spec.run_id, runner_binding=spec.runner_binding,
+    )
+    if not has_run_operator_gate(current):
+        control.fail_session_from_application_receipt(
+            task, action_id=spec.action_id, generation=spec.generation,
+            application_receipt=current["action_application_receipt"],
+            persist_run_failure=lambda: record_session_interruption(
+                current, save=lambda value: states.save_run(str(current["run_id"]), value)
+            ),
+        )
+    return current
 
 
 def _resume_action_is_attachable(
@@ -3872,11 +3955,11 @@ def _human_failure_reason(error: Exception, fallback: str) -> str:
     if isinstance(error, ExecutorLostError):
         return "Executor 已退出；已保留当前交付状态，不会自动重放未知工作。"
     if isinstance(error, ActionBusyError):
-        return "当前交付已有未完成操作；本次命令未等待或排队。"
+        return f"当前交付已有未完成操作；{fallback}"
     if isinstance(error, ExecutorStartUnknownError):
-        return "Executor ownership 暂时无法确认；不会启动第二个 Executor。"
+        return f"运行进程归属暂时无法确认；{fallback}"
     if isinstance(error, TaskControlError):
-        return "Lifecycle 控制状态暂时无法确认；请通过 status 或 history 查看当前交付。"
+        return f"交付控制检查未通过；{fallback}"
     if str(error).startswith("multiple unfinished Delivery Runs"):
         return "同一 Parent Issue 存在多个未完成交付；请先人工消歧。"
     if not isinstance(error, RunLocatorError):
