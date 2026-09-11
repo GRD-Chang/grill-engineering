@@ -989,9 +989,11 @@ def _main_with_parser_resources(
             )
         # Show the adapter's summary, not its multiline response/body. Keep the
         # recovery instruction separate so truncation cannot remove it.
-        diagnostic_message = (
-            bounded_error(diagnostic_message).splitlines() or [type(error).__name__]
-        )[0]
+        diagnostic_message = bounded_error(diagnostic_message)
+        if not locator_error:
+            diagnostic_message = (
+                diagnostic_message.splitlines() or [type(error).__name__]
+            )[0]
         diagnostic_next_action = (
             "请进入目标 Git 仓库目录后重试"
             if diagnostic_code == "workspace_required"
