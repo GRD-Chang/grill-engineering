@@ -4,6 +4,7 @@ import json
 import fcntl
 import os
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -218,6 +219,15 @@ def _signal_at_marker(
         process.communicate(timeout=5)
 
 
+def _write_python_launcher(path: Path) -> None:
+    # An external symlink loses the selected venv's identity when creating venvs.
+    path.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _isolated_quickstart_environment(
     tmp_path: Path, fake_bin: Path
 ) -> tuple[dict[str, str], Path, list[Path]]:
@@ -227,12 +237,11 @@ def _isolated_quickstart_environment(
     sentinel_directory.mkdir()
     markers: list[Path] = []
 
-    for name in ("bash", "sh", "git", "dirname", "python3"):
-        executable = (
-            sys.executable if name == "python3" else shutil.which(name, path=os.defpath)
-        )
+    for name in ("bash", "sh", "git", "dirname"):
+        executable = shutil.which(name, path=os.defpath)
         assert executable is not None, f"{name} is required by quickstart smoke"
         (tool_directory / name).symlink_to(executable)
+    _write_python_launcher(tool_directory / "python3")
     (tool_directory / "codex").symlink_to(fake_bin / "codex")
 
     for name, output in (
@@ -290,7 +299,7 @@ def _isolated_quickstart_environment(
 def _path_without_codex(tmp_path: Path) -> str:
     directory = tmp_path / "path-without-codex"
     directory.mkdir()
-    (directory / "python3").symlink_to(sys.executable)
+    _write_python_launcher(directory / "python3")
     dirname = shutil.which("dirname")
     assert dirname is not None
     (directory / "dirname").symlink_to(dirname)
