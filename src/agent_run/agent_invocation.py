@@ -71,6 +71,7 @@ def invocation_event_recorder(
         "validation_error": "",
         "ordinary_recovery_used": False,
         "capacity_recovery_count": 0,
+        "recovery_wait_intervals": [],
     }
     previous = state.get("active_agent_invocation")
     if (
@@ -79,8 +80,12 @@ def invocation_event_recorder(
         and previous["semantic_attempt"].get("attempt_id")
         == semantic_attempt.get("attempt_id")
     ):
-        for key in ("ordinary_recovery_used", "capacity_recovery_count"):
-            recovery_state[key] = previous.get(key, recovery_state[key])
+        for key in (
+            "ordinary_recovery_used",
+            "capacity_recovery_count",
+        ):
+            value = previous.get(key, recovery_state[key])
+            recovery_state[key] = value
         if (
             invocation_input.get("thread_id")
             and invocation_input.get("thread_id")
@@ -189,11 +194,35 @@ def invocation_event_recorder(
                 invocation["recovery_waiting"] = True
                 invocation["last_failure_at"] = now
                 invocation["execution_interrupted"] = True
+                intervals = invocation.setdefault("recovery_wait_intervals", [])
+                if not isinstance(intervals, list):
+                    intervals = []
+                    invocation["recovery_wait_intervals"] = intervals
+                if not any(
+                    isinstance(interval, dict) and interval.get("ended_at") is None
+                    for interval in intervals
+                ):
+                    intervals.append(
+                        {
+                            "kind": facts.get("recovery_kind"),
+                            "started_at": now,
+                            "ended_at": None,
+                        }
+                    )
             elif kind == "recovery_started":
                 invocation["status"] = "running"
                 invocation["recovery_waiting"] = False
                 invocation["last_recovery_started_at"] = now
                 invocation["ended_at"] = None
+                intervals = invocation.get("recovery_wait_intervals")
+                if isinstance(intervals, list):
+                    for interval in reversed(intervals):
+                        if (
+                            isinstance(interval, dict)
+                            and interval.get("ended_at") is None
+                        ):
+                            interval["ended_at"] = now
+                            break
                 seconds = invocation.get("deadline_seconds")
                 if isinstance(seconds, (int, float)):
                     try:

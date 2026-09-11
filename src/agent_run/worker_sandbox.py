@@ -645,68 +645,88 @@ def run_worker_process(
     stdin = process.stdin
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr
-    assert stdin is not None
-    assert stdout_pipe is not None
-    assert stderr_pipe is not None
     callback_errors: list[BaseException] = []
     reader_errors: list[BaseException] = []
     writer_errors: list[BaseException] = []
-
-    def forward_stdout_line(line: str) -> None:
-        if on_stdout_line is not None and not callback_errors:
-            try:
-                on_stdout_line(line)
-            except BaseException as error:
-                callback_errors.append(error)
-                _terminate_process_group(process)
-
-    stdout_capture = _BoundedJsonlStream(on_line=forward_stdout_line)
-    stderr_capture = _BoundedBytesTail(_STDERR_CAPTURE_BYTES)
-
-    def read_stdout() -> None:
-        try:
-            while chunk := os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES):
-                stdout_capture.feed(chunk)
-            stdout_capture.finish()
-        except BaseException as error:
-            reader_errors.append(error)
-
-    def read_stderr() -> None:
-        try:
-            while chunk := os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES):
-                stderr_capture.append(chunk)
-        except BaseException as error:
-            reader_errors.append(error)
-
-    def write_stdin() -> None:
-        try:
-            stdin.write(prompt.encode("utf-8"))
-            stdin.close()
-        except BrokenPipeError:
-            return
-        except BaseException as error:
-            writer_errors.append(error)
-
-    stdout_reader = threading.Thread(
-        target=read_stdout,
-        daemon=True,
-        name=f"agent-run-worker-{process.pid}-stdout",
-    )
-    stderr_reader = threading.Thread(
-        target=read_stderr,
-        daemon=True,
-        name=f"agent-run-worker-{process.pid}-stderr",
-    )
-    stdin_writer = threading.Thread(
-        target=write_stdin,
-        daemon=True,
-        name=f"agent-run-worker-{process.pid}-stdin",
-    )
-    stdout_reader.start()
-    stderr_reader.start()
-    stdin_writer.start()
+    stdout_capture: _BoundedJsonlStream | None = None
+    stderr_capture: _BoundedBytesTail | None = None
+    stdout_reader: threading.Thread | None = None
+    stderr_reader: threading.Thread | None = None
+    stdin_writer: threading.Thread | None = None
     wait_error: BaseException | None = None
+
+    def join_started(thread: threading.Thread | None) -> None:
+        # A signal or a start failure may leave a later thread unstarted.
+        # Thread.join() raises for that case, so use ident as the public
+        # indication that start() created a thread.
+        if thread is not None and thread.ident is not None:
+            thread.join(timeout=1)
+
     try:
+        # Everything after Popen succeeds belongs to the process lifetime.
+        # In particular, a signal while constructing the first Thread must
+        # still reach the cleanup below; no worker may escape because the
+        # reader/writer objects were not all assigned yet.
+        assert stdin is not None
+        assert stdout_pipe is not None
+        assert stderr_pipe is not None
+
+        def forward_stdout_line(line: str) -> None:
+            if on_stdout_line is not None and not callback_errors:
+                try:
+                    on_stdout_line(line)
+                except BaseException as error:
+                    callback_errors.append(error)
+                    _terminate_process_group(process)
+
+        stdout_capture = _BoundedJsonlStream(on_line=forward_stdout_line)
+        stderr_capture = _BoundedBytesTail(_STDERR_CAPTURE_BYTES)
+
+        def read_stdout() -> None:
+            try:
+                while chunk := os.read(stdout_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                    stdout_capture.feed(chunk)
+                stdout_capture.finish()
+            except BaseException as error:
+                reader_errors.append(error)
+
+        def read_stderr() -> None:
+            try:
+                while chunk := os.read(stderr_pipe.fileno(), _STREAM_CHUNK_BYTES):
+                    stderr_capture.append(chunk)
+            except BaseException as error:
+                reader_errors.append(error)
+
+        def write_stdin() -> None:
+            try:
+                stdin.write(prompt.encode("utf-8"))
+                stdin.close()
+            except BrokenPipeError:
+                return
+            except BaseException as error:
+                writer_errors.append(error)
+
+        stdout_reader = threading.Thread(
+            target=read_stdout,
+            daemon=True,
+            name=f"agent-run-worker-{process.pid}-stdout",
+        )
+        stderr_reader = threading.Thread(
+            target=read_stderr,
+            daemon=True,
+            name=f"agent-run-worker-{process.pid}-stderr",
+        )
+        stdin_writer = threading.Thread(
+            target=write_stdin,
+            daemon=True,
+            name=f"agent-run-worker-{process.pid}-stdin",
+        )
+        # Keep process ownership and all thread startup inside the same
+        # cleanup boundary.  Popen has already created a process group, so a
+        # SIGINT between these start() calls must still terminate that group.
+        stdout_reader.start()
+        stderr_reader.start()
+        stdin_writer.start()
         deadline = (
             deadline_at_monotonic
             if deadline_at_monotonic is not None
@@ -730,15 +750,29 @@ def run_worker_process(
         wait_error = error
     finally:
         _terminate_process_group(process)
-        stdin_writer.join(timeout=1)
-        stdout_reader.join(timeout=1)
-        stderr_reader.join(timeout=1)
-        if stdout_reader.is_alive():
+        join_started(stdin_writer)
+        join_started(stdout_reader)
+        join_started(stderr_reader)
+        if stdin_writer is not None and stdin_writer.is_alive() and stdin is not None:
+            stdin.close()
+            join_started(stdin_writer)
+        if (
+            stdout_reader is not None
+            and stdout_reader.is_alive()
+            and stdout_pipe is not None
+        ):
             stdout_pipe.close()
-            stdout_reader.join(timeout=1)
-        if stderr_reader.is_alive():
+            join_started(stdout_reader)
+        if (
+            stderr_reader is not None
+            and stderr_reader.is_alive()
+            and stderr_pipe is not None
+        ):
             stderr_pipe.close()
-            stderr_reader.join(timeout=1)
+            join_started(stderr_reader)
+        for pipe in (stdin, stdout_pipe, stderr_pipe):
+            if pipe is not None:
+                pipe.close()
     if callback_errors:
         raise callback_errors[0]
     if wait_error is not None:
@@ -747,6 +781,8 @@ def run_worker_process(
         raise reader_errors[0]
     if writer_errors:
         raise writer_errors[0]
+    assert stdout_capture is not None
+    assert stderr_capture is not None
     return subprocess.CompletedProcess(
         arguments,
         process.returncode,

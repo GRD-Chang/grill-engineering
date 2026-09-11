@@ -286,6 +286,17 @@ def test_public_run_repair_human_blocker_resume_reuses_semantic_attempt(
         )
     )
     assert history["agent_resumes"][-1] == resume_event
+    for detail_args in ((), ("--details",)):
+        human_history = invoke_cli_inprocess(
+            git_repo,
+            fixture,
+            "history",
+            str(blocked_state["run_id"]),
+            "--plain",
+            *detail_args,
+        )
+        assert human_history.returncode == 0, human_history.stderr
+        assert human_history.stdout.count("人工阻塞：") == 1
 
 
 def test_public_run_repair_human_blocker_currentness_drift_retires_attempt(
@@ -418,6 +429,24 @@ def test_run_repair_resume_preserves_partial_worker_edits_and_thread(
     assert completed_run["repair_cycle"]["code_modification_attempts"] == 1
     assert completed_run["development_thread_history"] == ["run-repair-developer-1"]
     assert not checkout.exists()
+
+    # Query the persisted promotion produced by real repair/Git/CLI execution.
+    run_id = str(completed["run_id"])
+    record = completed_run["acceptance_record"]
+    assert record["acceptance_state"] == "integrated"
+    assert record["reviewed_candidate_sha"] != record["reviewed_head_sha"]
+    for args in (("--plain",), ("--json",)):
+        status = invoke_cli_inprocess(git_repo, fixture, "status", run_id, *args)
+        assert status.returncode == 0, status.stderr
+        assert "验收通过，等待发布" in status.stdout
+        assert "尚无有效验收结论" not in status.stdout
+    approved = run_cli(git_repo, fixture, "approve", run_id)
+    assert approved.returncode == 0, approved.stderr
+    assert stdout_json(approved)["status"] == "completed"
+    status = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--plain")
+    assert status.returncode == 0, status.stderr
+    assert "当前有效通过" in status.stdout
+    assert "尚无有效验收结论" not in status.stdout
 
 @pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
 def test_run_supervises_repair_trigger_live_pr_readback(

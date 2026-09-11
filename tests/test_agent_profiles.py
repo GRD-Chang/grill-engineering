@@ -610,8 +610,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         assert review["model"] == "new-review"
         assert review["profile_revision"] == 2
         text_history = run_cli(git_repo, fixture, "history", run_id).stdout
-        assert "model=old-development" in text_history
-        assert "reasoning_effort=xhigh" in text_history
+        assert "模型=old-development；推理强度=xhigh" in text_history
         assert "profile_revision" not in text_history
         publication = next(
             item

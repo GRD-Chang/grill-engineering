@@ -243,11 +243,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(status)
     status.add_argument("--parent", type=_positive_integer, help="按 Parent Issue 选择 Run")
     status.add_argument("--json", action="store_true", dest="as_json")
+    status.add_argument(
+        "--plain",
+        action="store_true",
+        help="使用可复制的朴素文本，关闭 Rich 装饰",
+    )
     history = subcommands.add_parser("history", help="显示有界 Invocation 与状态时间线")
     history.add_argument("run_id", nargs="?", help="完整 Run ID；省略时使用 Human Run Selector")
     _add_common_options(history)
     history.add_argument("--parent", type=_positive_integer, help="按 Parent Issue 选择 Run")
     history.add_argument("--json", action="store_true", dest="as_json")
+    history.add_argument(
+        "--plain",
+        action="store_true",
+        help="使用朴素文本（JSON 不受此选项影响）",
+    )
+    history.add_argument(
+        "--details",
+        action="store_true",
+        help="在每轮时间线记录中展开已保存的完整证据与结果",
+    )
     runs = subcommands.add_parser("runs", help="发现本机已登记的 Delivery Run")
     _add_common_options(runs)
     runs.add_argument("--parent", type=_positive_integer, help="仅列出指定 Parent Issue")
@@ -356,9 +371,16 @@ def _main_with_parser_resources(
         if parsed.command in {"status", "history"}:
             state = _load_read_only_run(parsed)
             if parsed.command == "status":
-                cli_presentation._print_status(state, as_json=parsed.as_json)
+                cli_presentation._print_status(
+                    state, as_json=parsed.as_json, plain=parsed.plain
+                )
             else:
-                cli_presentation._print_history(state, as_json=parsed.as_json)
+                cli_presentation._print_history(
+                    state,
+                    as_json=parsed.as_json,
+                    plain=parsed.plain,
+                    details=parsed.details,
+                )
             return 0
         git = GitRepository.discover(Path.cwd())
         state_root = (

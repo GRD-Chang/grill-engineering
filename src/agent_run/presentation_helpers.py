@@ -12,6 +12,17 @@ _CURRENT_PUBLICATION_GATE_PHASES = {
     "ready_for_human",
     "publication_pending",
 }
+_UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def terminal_safe(value: object) -> str:
+    """Render persisted or user-provided text without terminal controls."""
+
+    text = str(value)
+    # Remove control bytes, but keep their printable payload.  For example,
+    # ESC[2J becomes the harmless, copyable text [2J instead of silently
+    # erasing the user's finding content.
+    return _UNSAFE_CONTROL.sub("", text)
 
 
 def current_work_subject(
