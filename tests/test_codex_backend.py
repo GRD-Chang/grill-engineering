@@ -4197,6 +4197,109 @@ run_worker_process(
         pytest.fail("background Worker process survived SIGINT cleanup")
 
 
+@pytest.mark.parametrize(
+    "sigint_phase",
+    [
+        "before_construction",
+        "partial_construction",
+        "before_start",
+        "partial_start",
+        "normal_wait",
+    ],
+)
+def test_sigint_cleans_worker_during_thread_startup_and_wait(
+    tmp_path: Path, sigint_phase: str
+) -> None:
+    project_root = Path(__file__).parents[1]
+    child_path = tmp_path / "child.pid"
+    marker_path = tmp_path / "thread-start.marker"
+    target_start = {"before_start": 1, "partial_start": 2}.get(sigint_phase)
+    code = f"""
+import os
+import signal
+import threading
+from pathlib import Path
+from agent_run.worker_sandbox import run_worker_process
+
+phase = {sigint_phase!r}
+marker = Path({str(marker_path)!r})
+original_init = threading.Thread.__init__
+original_start = threading.Thread.start
+construction_count = 0
+start_count = 0
+
+def controlled_init(thread, *args, **kwargs):
+    global construction_count
+    construction_count += 1
+    if phase in {{"before_construction", "partial_construction"}}:
+        target = {{"before_construction": 1, "partial_construction": 2}}[phase]
+        if construction_count == target:
+            marker.write_text(str(construction_count), encoding="utf-8")
+            signal.pause()
+    return original_init(thread, *args, **kwargs)
+
+def controlled_start(thread, *args, **kwargs):
+    global start_count
+    start_count += 1
+    if phase != "normal_wait" and start_count == {target_start!r}:
+        marker.write_text(str(start_count), encoding="utf-8")
+        signal.pause()
+    return original_start(thread, *args, **kwargs)
+
+threading.Thread.__init__ = controlled_init
+threading.Thread.start = controlled_start
+
+def interrupt_when_ready(line):
+    if line == "ready":
+        os.kill(os.getpid(), signal.SIGINT)
+
+run_worker_process(
+    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; echo ready; wait"],
+    cwd=Path({str(tmp_path)!r}),
+    prompt="",
+    environment={{"PATH": "/usr/bin:/bin"}},
+    timeout=120,
+    on_stdout_line=interrupt_when_ready if phase == "normal_wait" else None,
+)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(project_root / "src")
+    controller = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not child_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert child_path.exists()
+        if sigint_phase != "normal_wait":
+            while not marker_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert marker_path.exists()
+            os.kill(controller.pid, signal.SIGINT)
+        controller.wait(timeout=5)
+    finally:
+        if controller.poll() is None:
+            controller.kill()
+            controller.wait(timeout=5)
+
+    assert controller.returncode not in {None, 0}
+    child_pid = int(child_path.read_text(encoding="utf-8").strip())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(f"background Worker process survived {sigint_phase} cleanup")
+
+
 def test_successful_worker_cleans_background_processes(
     tmp_path: Path,
 ) -> None:

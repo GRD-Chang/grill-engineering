@@ -15,11 +15,13 @@ import pytest
 
 import agent_run.cli as cli
 import agent_run.doctor as doctor
+from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
 from agent_run.codex import CodexProcessError
 from agent_run.delivery_history import history_records
+from agent_run.delivery_status import _status_style, invocation_execution_seconds
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
 from agent_run.operator_action_presentation import print_operator_action
@@ -206,6 +208,200 @@ def test_status_binds_run_acceptance_verdict_to_publication_head(
     assert output["progress"]["current_object"] == "Run Publication"
     assert output["progress"]["findings"] == []
     assert output["progress"]["conclusion"] == expected_conclusion
+
+
+@pytest.mark.parametrize(
+    ("publication_phase", "publication_head", "expected_conclusion"),
+    [
+        ("publication_pending", "integrated-head", "验收通过，等待发布"),
+        ("merged", "integrated-head", "当前有效通过"),
+        ("awaiting_approval", "integrated-head", "验收通过，等待发布"),
+        ("waiting_checks", "integrated-head", "验收通过，等待发布"),
+        ("publication_pending", "drifted-head", "尚无有效验收结论"),
+    ],
+)
+def test_status_binds_promoted_repair_acceptance_to_publication_boundary(
+    git_repo: Path,
+    publication_phase: str,
+    publication_head: str,
+    expected_conclusion: str,
+) -> None:
+    passing_artifact = {
+        "checks": {
+            lane: {"status": "pass", "findings": []}
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    state: dict[str, object] = {
+        "run_id": "run-promoted-repair-status",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Status card"},
+        "status": "completed" if publication_phase == "merged" else "run_publication_pending",
+        "run_acceptance": {
+            "phase": "accepted",
+            "candidate_sha": "repair-candidate",
+            "reviewed_head_sha": "integrated-head",
+            "acceptance_record": {
+                "acceptance_scope": "run",
+                "acceptance_state": "integrated",
+                "reviewed_candidate_sha": "repair-candidate",
+                "reviewed_head_sha": "integrated-head",
+                "artifact": passing_artifact,
+            },
+        },
+        "run_publication": {
+            "phase": publication_phase,
+            "record": {"run_head_sha": publication_head},
+        },
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run(
+        "run-promoted-repair-status", state
+    )
+
+    output = stdout_json(
+        invoke_cli_inprocess(
+            git_repo,
+            fixture,
+            "status",
+            "run-promoted-repair-status",
+            "--json",
+        )
+    )
+
+    assert output["progress"]["current_object"] == "Run Publication"
+    assert output["progress"]["conclusion"] == expected_conclusion
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reviewed_candidate_sha": "stale-candidate"},
+        {"reviewed_head_sha": "stale-head"},
+        {"acceptance_state": "candidate"},
+        {"reviewed_head_sha": None},
+    ],
+)
+def test_status_rejects_invalid_repair_promotion(changes: dict[str, object]) -> None:
+    from agent_run.delivery_status import status_progress_view
+
+    record = {
+        "acceptance_state": "integrated",
+        "reviewed_candidate_sha": "candidate",
+        "reviewed_head_sha": "promoted",
+        "artifact": {"checks": {"spec": {"status": "pass", "findings": []}}},
+        **changes,
+    }
+    state = {
+        "status": "run_approval_pending",
+        "run_acceptance": {
+            "phase": "accepted",
+            "candidate_sha": "candidate",
+            "reviewed_head_sha": "promoted",
+            "acceptance_record": record,
+        },
+        "run_publication": {
+            "phase": "awaiting_approval",
+            "record": {"run_head_sha": "promoted"},
+        },
+    }
+    assert status_progress_view(state, {})["conclusion"] == "尚无有效验收结论"
+
+
+@pytest.mark.parametrize(
+    ("subject_key", "phase"),
+    [("parent_job", "completed"), ("run_acceptance", "accepted")],
+)
+def test_status_keeps_matching_acceptance_conclusion_after_completion(
+    git_repo: Path, subject_key: str, phase: str
+) -> None:
+    passing_artifact = {
+        "checks": {
+            lane: {"status": "pass", "findings": []}
+            for lane in ("e2e", "standards", "spec")
+        }
+    }
+    state: dict[str, object] = {
+        "run_id": "run-completed-conclusion",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Completed Parent"},
+        "status": "completed",
+        subject_key: {
+            "phase": phase,
+            "candidate_sha": "candidate-current",
+            "acceptance_record": {
+                "reviewed_candidate_sha": "candidate-current",
+                "artifact": passing_artifact,
+            },
+        },
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run(
+        "run-completed-conclusion", state
+    )
+
+    json_result = invoke_cli_inprocess(
+        git_repo, fixture, "status", "run-completed-conclusion", "--json"
+    )
+    plain_result = invoke_cli_inprocess(
+        git_repo, fixture, "status", "run-completed-conclusion", "--plain"
+    )
+
+    output = stdout_json(json_result)
+    assert output["progress"]["conclusion"] == "当前有效通过"
+    assert "结论:       当前有效通过" in plain_result.stdout
+
+
+@pytest.mark.parametrize(
+    "acceptance_record",
+    [
+        None,
+        {
+            "reviewed_candidate_sha": "candidate-old",
+            "artifact": {
+                "checks": {
+                    lane: {"status": "pass", "findings": []}
+                    for lane in ("e2e", "standards", "spec")
+                }
+            },
+        },
+    ],
+)
+def test_status_does_not_infer_completed_acceptance_without_matching_record(
+    git_repo: Path, acceptance_record: dict[str, object] | None
+) -> None:
+    state: dict[str, object] = {
+        "run_id": "run-completed-without-proof",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Completed Parent"},
+        "status": "completed",
+        "parent_job": {
+            "phase": "completed",
+            "candidate_sha": "candidate-current",
+        },
+        "diagnostics": [],
+        "schema_version": 1,
+    }
+    parent_job = state["parent_job"]
+    assert isinstance(parent_job, dict)
+    if acceptance_record is not None:
+        parent_job["acceptance_record"] = acceptance_record
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run(
+        "run-completed-without-proof", state
+    )
+
+    output = stdout_json(
+        invoke_cli_inprocess(
+            git_repo, fixture, "status", "run-completed-without-proof", "--json"
+        )
+    )
+
+    assert output["progress"]["conclusion"] == "尚无有效验收结论"
 
 
 @pytest.mark.parametrize("phase", ["candidate", "reviewing"])
@@ -1598,7 +1794,7 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
 
     cli.cli_presentation._print_history(state, as_json=False)
     human = capsys.readouterr().out
-    assert "Review Agent 第 1 轮" in human
+    assert "验收 Agent 第 1 轮" in human
     assert "Semantic Agent Attempt" not in human
     assert "attempt-reviewer-1" not in human
     assert "sha256:second" not in human
@@ -1986,6 +2182,246 @@ def test_history_standalone_events_use_persisted_time_and_skip_snapshots() -> No
         "2026-08-24T00:03:00+00:00",
     ]
     assert all(record["event_record"] is True for record in records)
+
+
+def test_history_merges_internal_publication_snapshots_and_same_integration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    timeline = [
+        {
+            "at": "2026-08-24T00:01:00+00:00",
+            "kind": "run_publication",
+            "phase": "publication_pending",
+            "status": "run_publication_pending",
+            "attempt": 1,
+            "thread_id": "publication-thread",
+            "semantic_attempt_id": "publication-attempt",
+            "pr_number": 31,
+            "commit_sha": "publication-sha",
+        },
+        {
+            "at": "2026-08-24T00:02:00+00:00",
+            "kind": "run_publication",
+            "phase": "publication_pending",
+            "status": "run_publication_pending",
+            "attempt": 1,
+            "thread_id": "publication-thread",
+            "semantic_attempt_id": "publication-attempt",
+            "pr_number": 31,
+            "commit_sha": "publication-sha",
+        },
+        {
+            "at": "2026-08-24T00:03:00+00:00",
+            "kind": "run_publication",
+            "phase": "publication_pending",
+            "status": "run_publication_pending",
+            "attempt": 1,
+            "thread_id": "publication-thread",
+            "semantic_attempt_id": "publication-attempt",
+            "pr_number": 31,
+            "commit_sha": "publication-sha",
+        },
+        {
+            "at": "2026-08-24T00:04:00+00:00",
+            "kind": "integration",
+            "phase": "merged",
+            "status": "merged",
+            "ticket": 3,
+            "pr_number": 17,
+            "commit_sha": "integrated-sha",
+        },
+        {
+            "at": "2026-08-24T00:05:00+00:00",
+            "kind": "integration",
+            "phase": "completed",
+            "status": "completed",
+            "ticket": 3,
+            "pr_number": 17,
+            "commit_sha": "integrated-sha",
+        },
+        {
+            "at": "2026-08-24T00:06:00+00:00",
+            "kind": "integration",
+            "phase": "merged",
+            "status": "merged",
+            "ticket": 3,
+            "pr_number": 18,
+            "commit_sha": "other-integrated-sha",
+        },
+        {
+            "at": "2026-08-24T00:07:00+00:00",
+            "kind": "run_status",
+            "status": "waiting_external",
+        },
+        {
+            "at": "2026-08-24T00:08:00+00:00",
+            "kind": "run_status",
+            "status": "waiting_external",
+        },
+    ]
+    state: dict[str, object] = {
+        "run_id": "run-history-snapshot-merge",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "History snapshots"},
+        "status": "completed",
+        "timeline": timeline,
+        "timeline_continuation": [],
+        "agent_invocation_history": [],
+        "semantic_agent_attempts": [
+            {
+                "attempt_id": "publication-attempt",
+                "role": "publication",
+                "work_subject": "run-publication:run-history-snapshot-merge",
+                "generation": 1,
+                "ordinal": 1,
+                "status": "completed",
+            }
+        ],
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True)
+    output = capsys.readouterr().out
+
+    assert output.count("发布：等待运行发布") == 1
+    assert output.count("事件：集成") == 2
+    assert output.count("事件：监督边界") == 2
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    detailed_output = capsys.readouterr().out
+    assert detailed_output.count("发布：等待运行发布") == 1
+    assert detailed_output.count("事件：集成") == 2
+    assert detailed_output.count("事件：监督边界") == 2
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    machine_output = json.loads(capsys.readouterr().out)
+    assert len(machine_output["timeline"]) == len(timeline)
+    assert len(machine_output["events"]) == len(timeline)
+
+
+def test_history_merges_stale_human_blocker_snapshots_but_keeps_real_pauses() -> None:
+    attempt = {
+        "attempt_id": "attempt-human-pause",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "status": "completed",
+    }
+    timeline = [
+        {
+            "at": "2026-08-24T00:01:00+00:00",
+            "kind": "ticket_phase",
+            "ticket": 3,
+            "phase": "blocked",
+            "status": "ready_for_human",
+            "semantic_attempt_id": attempt["attempt_id"],
+            "human_blockers": ["Need maintainer input."],
+        },
+        {
+            "at": "2026-08-24T00:02:00+00:00",
+            "kind": "ticket_phase",
+            "ticket": 3,
+            "phase": "blocked",
+            "status": "ready_for_human",
+            "semantic_attempt_id": attempt["attempt_id"],
+            "explicit_resume_sequence": 1,
+            "explicit_resume_kind": "human_blocker",
+            "human_blockers": ["Need maintainer input."],
+        },
+        {
+            "at": "2026-08-24T00:03:00+00:00",
+            "kind": "ticket_phase",
+            "ticket": 3,
+            "phase": "developing",
+            "status": "active",
+            "attempt": 0,
+            "semantic_attempt_id": attempt["attempt_id"],
+            "worker": "resumed development worker",
+            "human_blockers": ["Need maintainer input."],
+        },
+        {
+            "at": "2026-08-24T00:05:00+00:00",
+            "kind": "ticket_phase",
+            "ticket": 3,
+            "phase": "blocked",
+            "status": "ready_for_human",
+            "semantic_attempt_id": attempt["attempt_id"],
+            "explicit_resume_sequence": 1,
+            "explicit_resume_kind": "execution_failure",
+            "human_blockers": ["Need maintainer input."],
+        },
+        {
+            "at": "2026-08-24T00:06:00+00:00",
+            "kind": "ticket_phase",
+            "ticket": 3,
+            "phase": "developing",
+            "status": "active",
+            "attempt": 0,
+            "semantic_attempt_id": attempt["attempt_id"],
+            "worker": "resumed development worker",
+            "explicit_resume_sequence": 1,
+            "human_blockers": ["Need maintainer input."],
+        },
+        {
+            "at": "2026-08-24T00:08:00+00:00",
+            "kind": "ticket_phase",
+            "ticket": 3,
+            "phase": "blocked",
+            "status": "ready_for_human",
+            "semantic_attempt_id": attempt["attempt_id"],
+            "explicit_resume_sequence": 1,
+            "explicit_resume_kind": "execution_failure",
+            "human_blockers": ["Need maintainer input."],
+        },
+    ]
+    audit = {
+        "semantic_agent_attempts": [attempt],
+        "agent_invocations": [],
+        "timeline": timeline,
+        "timeline_continuation": [],
+        "agent_resumes": [
+            {
+                "resume_id": "resume-1",
+                "requested_at": "2026-08-24T00:01:30+00:00",
+                "work_subject": "ticket:3",
+                "generation": 1,
+                "semantic_attempt_id": attempt["attempt_id"],
+                "source_status": "ready_for_human",
+                "human_response_supplied": True,
+            },
+            {
+                "resume_id": "resume-2",
+                "requested_at": "2026-08-24T00:07:00+00:00",
+                "work_subject": "ticket:3",
+                "generation": 1,
+                "semantic_attempt_id": attempt["attempt_id"],
+                "source_status": "ready_for_human",
+                "human_response_supplied": False,
+            },
+        ],
+    }
+    state: dict[str, object] = {
+        "run_id": "run-human-pause",
+        "ticket_jobs": {"3": {"ticket_number": 3}},
+        "human_response_audit": {"resume-1": "Access granted."},
+    }
+
+    records = history_records(state, audit)
+    points = records[0]["turning_points"]
+
+    assert [point["kind"] for point in points] == [
+        "human_blocker",
+        "resume",
+        "human_blocker",
+        "resume",
+        "human_blocker",
+    ]
+    assert [point.get("resume_id") for point in points if point["kind"] == "resume"] == [
+        "resume-1",
+        "resume-2",
+    ]
+    assert audit["timeline"] == timeline
 
 
 def test_history_preserves_distinct_resume_events_with_same_content() -> None:
@@ -2949,8 +3385,91 @@ def test_status_localizes_profiled_review_agent(
     cli.cli_presentation._print_history(state, as_json=False)
     history_output = capsys.readouterr().out
 
-    assert "Review Agent" in history_output
+    assert "Review Agent" not in history_output
     assert "· review ·" not in history_output
+
+
+def test_history_uses_chinese_role_names_for_all_role_aliases(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = [
+        ("development", "development"),
+        ("reviewer", "reviewer"),
+        ("fresh_acceptance", "fresh_acceptance"),
+        ("publication", "publication"),
+        ("final_publication", "final_publication"),
+    ]
+    semantic_attempts = []
+    invocations = []
+    for index, (role, invocation_role) in enumerate(attempts, start=1):
+        attempt = {
+            "attempt_id": f"history-role-{index}",
+            "role": role,
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "ordinal": index,
+            "budget_window": 1,
+            "status": "completed",
+        }
+        semantic_attempts.append(attempt)
+        invocations.append(
+            {
+                "work_subject": "ticket:3",
+                "role": role,
+                "invocation_role": invocation_role,
+                "status": "completed",
+                "started_at": f"2026-09-10T00:0{index}:00+00:00",
+                "ended_at": f"2026-09-10T00:0{index}:30+00:00",
+                "semantic_attempt": deepcopy(attempt),
+            }
+        )
+    state: dict[str, object] = {
+        "run_id": "run-history-role-labels",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "History role labels"},
+        "status": "completed",
+        "semantic_agent_attempts": semantic_attempts,
+        "agent_invocation_history": invocations,
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    machine_output = json.loads(capsys.readouterr().out)
+    machine_roles = {
+        event["role"]
+        for event in machine_output["events"]
+        if event.get("kind") in {"development", "review", "publication"}
+    }
+    assert {"Development Agent", "Review Agent", "Publication Agent"} <= (
+        machine_roles
+    )
+
+    cli.cli_presentation._print_history(
+        state, as_json=False, plain=True, details=True
+    )
+    plain_output = capsys.readouterr().out
+    for label in ("开发 Agent", "验收 Agent", "发布 Agent"):
+        assert label in plain_output
+    for label in ("Development Agent", "Review Agent", "Publication Agent"):
+        assert label not in plain_output
+
+    from io import StringIO
+    from rich.text import Text
+
+    class TerminalBuffer(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    rich_output = TerminalBuffer()
+    monkeypatch.setattr(sys, "stdout", rich_output)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    cli.cli_presentation._print_history(state, as_json=False)
+    rich_visible = Text.from_ansi(rich_output.getvalue()).plain
+    for label in ("开发 Agent", "验收 Agent", "发布 Agent"):
+        assert label in rich_visible
+    for label in ("Development Agent", "Review Agent", "Publication Agent"):
+        assert label not in rich_visible
 
 
 def test_status_localizes_pending_publication_phase(
@@ -5606,3 +6125,627 @@ def test_github_read_failure_is_persisted_and_retryable(git_repo: Path) -> None:
     assert retried.returncode == 0, retried.stderr
     assert stdout_json(retried)["result"] == "resumed"
     assert load_only_run_state(git_repo)["status"] == "active"
+
+
+@pytest.mark.parametrize(
+    ("waits", "expected"),
+    [
+        (
+            [
+                {
+                    "started_at": "2026-09-10T00:00:10+00:00",
+                    "ended_at": "2026-09-10T00:00:40+00:00",
+                }
+            ],
+            70,
+        ),
+        (
+            [
+                {
+                    "started_at": "2026-09-10T00:00:10+00:00",
+                    "ended_at": "2026-09-10T00:00:20+00:00",
+                },
+                {
+                    "started_at": "2026-09-10T00:00:30+00:00",
+                    "ended_at": "2026-09-10T00:00:40+00:00",
+                },
+            ],
+            80,
+        ),
+        (
+            [{"started_at": "2026-09-10T00:00:10+00:00"}],
+            None,
+        ),
+    ],
+)
+def test_history_execution_seconds_excludes_only_trusted_recovery_waits(
+    waits: list[dict[str, str]], expected: int | None
+) -> None:
+    attempt = {
+        "attempt_id": "attempt-duration",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "candidate",
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "development",
+        "status": "completed",
+        "started_at": "2026-09-10T00:00:00+00:00",
+        "ended_at": "2026-09-10T00:01:40+00:00",
+        "recovery_wait_intervals": waits,
+        "semantic_attempt": deepcopy(attempt),
+    }
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [attempt],
+        "review_budget": {"window": 1, "review_artifacts": []},
+    }
+    state: dict[str, object] = {"run_id": "run-duration", "ticket_jobs": {"3": job}}
+
+    record = history_records(
+        state,
+        {
+            "semantic_agent_attempts": [attempt],
+            "agent_invocations": [invocation],
+            "timeline": [],
+            "timeline_continuation": [],
+            "agent_resumes": [],
+        },
+    )[0]
+
+    assert record["execution_seconds"] == expected
+
+
+def test_history_supporting_records_are_bound_to_attempt_version(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def attempt(attempt_id: str, ordinal: int) -> dict[str, object]:
+        return {
+            "attempt_id": attempt_id,
+            "role": "reviewer",
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "ordinal": ordinal,
+            "budget_window": 1,
+            "status": "completed",
+            "outcome": "acceptance_artifact",
+        }
+
+    first = attempt("attempt-a", 1)
+    second = attempt("attempt-b", 2)
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [first, second],
+        "review_budget": {
+            "window": 1,
+            "review_artifacts": [],
+            "required_checks_evidence": None,
+        },
+        "required_checks_evidence": {
+            "pr_number": 17,
+            "head_sha": "publication-b",
+            "result": "pass",
+            "checks": [{"name": "fixture", "bucket": "pass"}],
+        },
+        "deterministic_integration_record": {
+            "reviewer_thread_id": "hidden-reviewer-thread",
+            "policy_snapshot": {"hidden-policy-marker": "do not display"},
+            "review_budget": {"hidden-budget-marker": "do not display"},
+            "acceptance_record": {"hidden-acceptance-marker": "do not display"},
+            "candidate_sha": "candidate-b",
+            "publication_sha": "publication-b",
+            "integrated_sha": "integrated-b",
+            "integrated_message": "Merge accepted candidate",
+            "effective_revision": "shared-revision",
+            "base_sha": "base-a",
+            "window": 1,
+            "required_checks_evidence": {
+                "pr_number": 17,
+                "head_sha": "publication-b",
+                "result": "pass",
+                "checks": [{"name": "fixture", "bucket": "pass"}],
+            },
+            "pr": {
+                "number": 17,
+                "state": "MERGED",
+                "head_sha": "publication-b",
+                "base_sha": "base-a",
+                "merge_commit_sha": "integrated-b",
+            },
+        },
+        "fallback_publication_receipt": {
+            "reviewer_thread_id": "hidden-fallback-thread",
+            "policy_snapshot": {"hidden-fallback-policy": True},
+            "candidate_sha": "candidate-b",
+            "publication_sha": "publication-b",
+            "pr_number": 17,
+            "effective_revision": "shared-revision",
+            "base_sha": "base-a",
+            "window": 1,
+            "required_checks_evidence": {
+                "pr_number": 17,
+                "head_sha": "publication-b",
+                "result": "pass",
+                "checks": [{"name": "fixture", "bucket": "pass"}],
+            },
+            "failure_evidence_source": "git_integrity",
+            "failure_evidence": {
+                "kind": "git_integrity",
+                "status": "fail",
+                "reason": "managed checkout changed",
+                "expected_head": "expected-head",
+                "observed_head": "observed-head",
+                "recovery_head": "expected-head",
+                "recovery_action": "controller_reset_and_clean",
+            },
+        },
+    }
+    invocations = [
+        {
+            "work_subject": "ticket:3",
+            "role": "reviewer",
+            "status": "completed",
+            "started_at": "2026-09-10T00:00:00+00:00",
+            "ended_at": "2026-09-10T00:01:00+00:00",
+            "currentness_boundary": {
+                "base_sha": "base-a",
+                "candidate_sha": "candidate-a",
+                "effective_revision": "shared-revision",
+            },
+            "semantic_attempt": deepcopy(first),
+        },
+        {
+            "work_subject": "ticket:3",
+            "role": "reviewer",
+            "status": "completed",
+            "started_at": "2026-09-10T00:02:00+00:00",
+            "ended_at": "2026-09-10T00:03:00+00:00",
+            "currentness_boundary": {
+                "base_sha": "base-a",
+                "candidate_sha": "candidate-b",
+                "effective_revision": "shared-revision",
+            },
+            "semantic_attempt": deepcopy(second),
+        },
+    ]
+    state: dict[str, object] = {
+        "run_id": "run-supporting-records",
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "semantic_agent_attempts": [first, second],
+        "agent_invocation_history": invocations,
+        "timeline": [],
+        "timeline_continuation": [],
+        "resume_audit": {"history": []},
+    }
+    audit = {
+        "semantic_agent_attempts": [first, second],
+        "agent_invocations": invocations,
+        "timeline": [],
+        "timeline_continuation": [],
+        "agent_resumes": [],
+    }
+
+    records = history_records(state, audit)
+
+    assert records[0]["supporting_records"] == []
+    assert [item["kind"] for item in records[1]["supporting_records"]] == [
+        "required_checks_evidence",
+        "deterministic_integration_record",
+        "fallback_publication_receipt",
+    ]
+
+    cli.cli_presentation._print_history(
+        state, as_json=False, plain=True, details=True
+    )
+    details = capsys.readouterr().out
+    assert "PR 编号：17" in details
+    assert "门禁模式：configured" in details
+    assert "必需检查结果：pass" in details
+    assert "检查项：名称=fixture；结果=pass" in details
+    assert "集成提交：integrated-b" in details
+    assert "发布提交：publication-b" in details
+    deterministic_details = details.rsplit("确定性集成记录", 1)[1].split(
+        "发布回执", 1
+    )[0]
+    fallback_details = details.rsplit("发布回执", 1)[1]
+    assert "门禁模式：configured" in deterministic_details
+    assert "门禁模式：configured" in fallback_details
+    assert "Git 完整性失败依据" in fallback_details
+    assert "失败原因：managed checkout changed" in fallback_details
+    assert "期望 HEAD：expected-head" in fallback_details
+    assert "实际 HEAD：observed-head" in fallback_details
+    assert "恢复后 HEAD：expected-head" in fallback_details
+    assert "恢复动作：controller_reset_and_clean" in fallback_details
+    for internal_value in (
+        "hidden-reviewer-thread",
+        "hidden-policy-marker",
+        "hidden-budget-marker",
+        "hidden-acceptance-marker",
+        "hidden-fallback-thread",
+        "hidden-fallback-policy",
+        "reviewer_thread_id",
+        "policy_snapshot",
+        "review_budget",
+        "acceptance_record",
+    ):
+        assert internal_value not in details
+
+    monkeypatch.setattr(
+        cli.cli_presentation,
+        "_use_rich_status",
+        lambda plain: not plain,
+    )
+    cli.cli_presentation._print_history(state, as_json=False, details=True)
+    rich_details = capsys.readouterr().out
+    for internal_value in (
+        "hidden-reviewer-thread",
+        "hidden-policy-marker",
+        "hidden-budget-marker",
+        "hidden-acceptance-marker",
+        "hidden-fallback-thread",
+        "hidden-fallback-policy",
+        "reviewer_thread_id",
+        "policy_snapshot",
+        "review_budget",
+        "acceptance_record",
+    ):
+        assert internal_value not in rich_details
+
+    cli.cli_presentation._print_history(state, as_json=True)
+    without_details = json.loads(capsys.readouterr().out)
+    cli.cli_presentation._print_history(state, as_json=True, details=True)
+    with_details = json.loads(capsys.readouterr().out)
+    assert with_details == without_details
+
+
+def test_history_supporting_records_fail_closed_on_missing_or_conflicting_identity() -> None:
+    attempt = {
+        "attempt_id": "attempt-exact",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+    }
+    invocation = {
+        "work_subject": "ticket:3",
+        "role": "reviewer",
+        "semantic_attempt": deepcopy(attempt),
+        "currentness_boundary": {
+            "base_sha": "base-a",
+            "candidate_sha": "candidate-exact",
+            "effective_revision": "shared-revision",
+        },
+    }
+
+    def record_for(value: dict[str, object]) -> dict[str, object]:
+        job = {
+            "ticket_number": 3,
+            "semantic_attempt_history": [attempt],
+            "review_budget": {"window": 1, "review_artifacts": []},
+            "deterministic_integration_record": value,
+        }
+        state: dict[str, object] = {
+            "run_id": "run-supporting-records-fail-closed",
+            "ticket_jobs": {"3": job},
+        }
+        return history_records(
+            state,
+            {
+                "semantic_agent_attempts": [attempt],
+                "agent_invocations": [invocation],
+                "timeline": [],
+                "timeline_continuation": [],
+                "agent_resumes": [],
+            },
+        )[0]
+
+    exact = record_for(
+        {
+            "candidate_sha": "candidate-exact",
+            "base_sha": "base-a",
+            "effective_revision": "shared-revision",
+            "window": 1,
+        }
+    )
+    assert [item["kind"] for item in exact["supporting_records"]] == [
+        "deterministic_integration_record"
+    ]
+
+    for invalid in (
+        {"candidate_sha": "candidate-exact", "window": 2},
+        {"effective_revision": "shared-revision", "window": 1},
+        {"candidate_sha": "candidate-exact", "base_sha": "base-b", "window": 1},
+        {
+            "candidate_sha": "candidate-exact",
+            "attempt_id": "different-attempt",
+            "window": 1,
+        },
+        {
+            "candidate_sha": "candidate-other",
+            "effective_revision": "shared-revision",
+            "window": 1,
+        },
+    ):
+        assert record_for(invalid)["supporting_records"] == []
+
+
+def test_successor_invocation_starts_with_own_recovery_wait_intervals() -> None:
+    semantic_attempt = {
+        "attempt_id": "attempt-recovery-successor",
+        "role": "development",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+    }
+    state: dict[str, object] = {
+        "run_id": "run-recovery-successor",
+        "status": "execution_failed",
+        "ticket_jobs": {"3": {"pending_semantic_attempt": semantic_attempt}},
+        "agent_invocation_history": [],
+        "active_agent_invocation": {
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "role": "development",
+            "status": "failed",
+            "execution_interrupted": True,
+            "semantic_attempt": deepcopy(semantic_attempt),
+            "ordinary_recovery_used": True,
+            "capacity_recovery_count": 2,
+            "recovery_wait_intervals": [
+                {
+                    "started_at": "2026-09-10T00:00:10+00:00",
+                    "ended_at": "2026-09-10T00:00:20+00:00",
+                }
+            ],
+        },
+    }
+    recorder = invocation_event_recorder(
+        state,
+        role="development",
+        phase="developing",
+        work_subject="ticket:3",
+        generation=1,
+        invocation_input={},
+        currentness_boundary={"candidate_sha": "candidate-1"},
+        semantic_attempt=semantic_attempt,
+        save=lambda _state: None,
+    )
+
+    recorder("started")
+    successor = state["active_agent_invocation"]
+    assert isinstance(successor, dict)
+    assert successor["recovery_wait_intervals"] == []
+    assert successor["ordinary_recovery_used"] is True
+    assert successor["capacity_recovery_count"] == 2
+
+    successor.update(
+        {
+            "started_at": "2026-09-10T00:00:40+00:00",
+            "ended_at": "2026-09-10T00:00:50+00:00",
+            "status": "completed",
+        }
+    )
+    assert invocation_execution_seconds(successor) == 10
+
+
+def test_plain_status_and_history_strip_terminal_controls_but_keep_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    finding = "问题：清屏\x1b[2J；证据：[保留]；必须修复：光标\x1b[10C；复验：重试。"
+    view = {
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "安全展示"},
+        "status": "blocked",
+        "phase": "developing",
+        "conclusion": "需要人工处理",
+        "current_object": "Ticket #3",
+        "ticket_progress": {"completed": 0, "total": 0},
+        "round_progress": None,
+        "run_repair": None,
+        "elapsed_seconds": 1,
+        "current_agent": None,
+        "execution_activity": "not_running",
+        "next_action": None,
+        "findings": [finding],
+    }
+    cli.cli_presentation.print_status_progress(
+        {},
+        {},
+        view,
+        display_term=lambda value: value,
+        print_operator_action=lambda _action: None,
+    )
+    status_output = capsys.readouterr().out
+    assert "\x1b" not in status_output
+    assert "[2J" in status_output
+    assert "[保留]" in status_output
+
+    attempt = {
+        "attempt_id": "attempt-history-controls",
+        "role": "reviewer",
+        "work_subject": "ticket:3",
+        "generation": 1,
+        "ordinal": 1,
+        "budget_window": 1,
+        "status": "completed",
+        "outcome": "acceptance_artifact",
+    }
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": [attempt],
+        "review_budget": {
+            "window": 1,
+            "review_artifacts": [
+                {
+                    "reviewer_thread_id": "history-reviewer",
+                    "candidate_sha": "history-candidate",
+                    "artifact": {
+                        "checks": {
+                            "e2e": {"findings": [finding]},
+                            "standards": {"findings": []},
+                            "spec": {"findings": []},
+                        }
+                    },
+                }
+            ],
+        },
+    }
+    history_state: dict[str, object] = {
+        "run_id": "run-history-controls",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "安全展示"},
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "agent_invocation_history": [
+            {
+                "work_subject": "ticket:3",
+                "role": "reviewer",
+                "status": "completed",
+                "started_at": "2026-09-10T00:00:00+00:00",
+                "ended_at": "2026-09-10T00:01:00+00:00",
+                "reported_thread_id": "history-reviewer",
+                "currentness_boundary": {"candidate_sha": "history-candidate"},
+                "semantic_attempt": deepcopy(attempt),
+            }
+        ],
+    }
+    cli.cli_presentation._print_history(history_state, as_json=False, plain=True)
+    history_output = capsys.readouterr().out
+    assert "\x1b" not in history_output
+    assert "[2J" in history_output
+
+
+def test_history_details_distinguish_output_continuations_and_missing_counts(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    attempts = [
+        {
+            "attempt_id": "attempt-output-first",
+            "role": "development",
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "ordinal": 1,
+            "budget_window": 1,
+            "status": "completed",
+            "outcome": "candidate",
+        },
+        {
+            "attempt_id": "attempt-output-retry",
+            "role": "development",
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "ordinal": 2,
+            "budget_window": 1,
+            "status": "completed",
+            "outcome": "candidate",
+        },
+        {
+            "attempt_id": "attempt-output-missing",
+            "role": "development",
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "ordinal": 3,
+            "budget_window": 1,
+            "status": "completed",
+            "outcome": "candidate",
+        },
+    ]
+    invocations = []
+    for index, attempt in enumerate(attempts, start=1):
+        invocation = {
+            "work_subject": "ticket:3",
+            "role": "development",
+            "status": "completed",
+            "started_at": f"2026-09-10T00:0{index}:00+00:00",
+            "ended_at": f"2026-09-10T00:0{index}:30+00:00",
+            "semantic_attempt": deepcopy(attempt),
+        }
+        if index == 1:
+            invocation["attempt_count"] = 1
+        elif index == 2:
+            invocation["attempt_count"] = 2
+        invocations.append(invocation)
+    job = {
+        "ticket_number": 3,
+        "semantic_attempt_history": attempts,
+        "review_budget": {"window": 1, "review_artifacts": []},
+    }
+    state: dict[str, object] = {
+        "run_id": "run-output-counts",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "输出计数"},
+        "ticket_jobs": {"3": job},
+        "active_ticket_job": deepcopy(job),
+        "agent_invocation_history": invocations,
+    }
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    output = capsys.readouterr().out
+
+    assert "输出续接=0 次" in output
+    assert "输出续接=1 次" in output
+    assert "输出续接=未记录 次" in output
+
+
+def test_history_details_omit_empty_validation_errors_but_keep_real_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    invocations = []
+    attempts = []
+    for index, validation_error in enumerate(("", None, "schema mismatch"), start=1):
+        attempt = {
+            "attempt_id": f"validation-error-{index}",
+            "role": "development",
+            "work_subject": "ticket:3",
+            "generation": 1,
+            "ordinal": index,
+            "budget_window": 1,
+            "status": "completed",
+            "outcome": "candidate",
+        }
+        attempts.append(attempt)
+        invocation = {
+            "work_subject": "ticket:3",
+            "role": "development",
+            "status": "completed",
+            "started_at": f"2026-09-10T00:0{index}:00+00:00",
+            "ended_at": f"2026-09-10T00:0{index}:30+00:00",
+            "semantic_attempt": deepcopy(attempt),
+            "validation_error": validation_error,
+        }
+        if index == 3:
+            invocation["return_code"] = 0
+        invocations.append(invocation)
+    state: dict[str, object] = {
+        "run_id": "run-validation-errors",
+        "repository": "example/project",
+        "parent": {"number": 1, "title": "Validation errors"},
+        "status": "completed",
+        "semantic_agent_attempts": attempts,
+        "agent_invocation_history": invocations,
+        "diagnostics": [],
+    }
+
+    cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
+    output = capsys.readouterr().out
+
+    assert output.count("验证错误：") == 1
+    assert "验证错误：schema mismatch" in output
+    assert "验证错误：\n" not in output
+    assert "返回码：0" in output
+
+
+def test_rich_status_colors_follow_business_conclusion() -> None:
+    assert _status_style("run_publication_pending") == "green"
+    assert _status_style("run_approval_pending") == "yellow"
+    assert _status_style("active") == "cyan"

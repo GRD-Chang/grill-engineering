@@ -11,11 +11,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from agent_run.delivery_status import (
     execution_guidance,
     invocation_activity,
+    invocation_execution_seconds,
     invocation_recovery_details,
 )
 from agent_run.presentation_helpers import (
     delivery_object_label,
     human_next_action,
+    terminal_safe,
 )
 
 
@@ -35,6 +37,7 @@ def _history_turning_points(
     """
 
     points: list[dict[str, Any]] = []
+    timeline_events: list[dict[str, Any]] = []
     order = 0
     for timeline in (audit.get("timeline"), audit.get("timeline_continuation")):
         if not isinstance(timeline, list):
@@ -75,12 +78,18 @@ def _history_turning_points(
                 "required_checks_evidence",
                 "next_action",
                 "result",
+                "explicit_resume_sequence",
+                "explicit_resume_kind",
+                "explicit_resume_thread_id",
+                "explicit_resume_attempt_id",
             ):
                 if raw.get(key) is not None:
                     event[key] = raw[key]
+            timeline_events.append(event)
             order += 1
-            if _is_history_turning_point(event):
-                points.append(event)
+
+    timeline_events.sort(key=lambda event: (event["at"], event["_order"]))
+    points.extend(_collapse_human_blocker_snapshots(timeline_events))
 
     responses = _human_responses_by_subject(state)
     response_audit = state.get("human_response_audit")
@@ -138,11 +147,66 @@ def _history_turning_points(
     points = deduplicated
     for point in points:
         point.pop("_order", None)
+        point.pop("_human_blocker_occurrence", None)
     return points
 
 
+def _collapse_human_blocker_snapshots(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one human pause per blocked interval in the human timeline.
+
+    Resume authorization is persisted before the old blocker is cleared. The
+    resulting ready-for-human snapshot has a newer resume sequence but still
+    belongs to the same blocked interval. A later pause is distinct only
+    after a persisted non-ready snapshot proves that the interval ended.
+    """
+
+    active_scopes: set[tuple[str, str, str, str]] = set()
+    occurrences: dict[tuple[str, str, str, str], int] = {}
+    turning_points: list[dict[str, Any]] = []
+    for event in events:
+        scope = _human_blocker_scope(event)
+        details = event.get("details")
+        is_blocker = (
+            isinstance(details, list)
+            and bool(details)
+            and _is_human_blocker_event(event)
+        )
+        if is_blocker:
+            if scope in active_scopes:
+                continue
+            active_scopes.add(scope)
+            event["_human_blocker_occurrence"] = occurrences.get(scope, 0)
+            occurrences[scope] = occurrences.get(scope, 0) + 1
+        elif str(event.get("status") or "") != "ready_for_human":
+            active_scopes.discard(scope)
+        if _is_history_turning_point(event):
+            turning_points.append(event)
+    return turning_points
+
+
+def _human_blocker_scope(event: dict[str, Any]) -> tuple[str, str, str, str]:
+    semantic_attempt_id = str(event.get("semantic_attempt_id") or "")
+    return (
+        str(event.get("object") or ""),
+        semantic_attempt_id,
+        "" if semantic_attempt_id else str(event.get("role") or ""),
+        "" if semantic_attempt_id else str(event.get("round") or ""),
+    )
+
+
 def _history_turning_point_identity(point: dict[str, Any]) -> str:
-    """Deduplicate only the same persisted event, never a later operation."""
+    """Deduplicate repeated internal snapshots without hiding operations.
+
+    Timeline snapshots can differ only because an invocation counter or its
+    timestamp changed.  Those are not user-visible business transitions.  A
+    concrete publication/check state remains distinct by its business fields;
+    integration records with the same PR and commit are one integration even
+    when persistence observes both the merged and completed phases. Human
+    blockers are keyed by their proven blocked interval so repeated operator
+    actions and later real pauses stay visible.
+    """
 
     resume_id = point.get("resume_id")
     if point.get("kind") == "resume" and isinstance(resume_id, str) and resume_id:
@@ -151,6 +215,85 @@ def _history_turning_point_identity(point: dict[str, Any]) -> str:
             ensure_ascii=False,
             sort_keys=True,
         )
+    kind = point.get("kind")
+    can_deduplicate_snapshot = (
+        kind == "required_checks"
+        and point.get("required_checks_observed_at") is not None
+    ) or (
+        kind == "publication"
+        and any(
+            point.get(key) is not None
+            for key in (
+                "semantic_attempt_id",
+                "round",
+                "thread_id",
+                "pr_number",
+                "commit_sha",
+            )
+        )
+    )
+    if kind == "human_blocker":
+        # A ready_for_human marker is persisted more than once while the
+        # controller waits. The projection assigns an occurrence after a
+        # proven non-ready boundary, so a later real pause remains visible
+        # even when it has the same resume sequence and blocker text.
+        return json.dumps(
+            {
+                "kind": kind,
+                "object": point.get("object"),
+                "semantic_attempt_id": point.get("semantic_attempt_id"),
+                "round": point.get("round"),
+                "role": point.get("role"),
+                "phase": point.get("phase"),
+                "status": point.get("status"),
+                "details": point.get("details"),
+                "human_blocker_occurrence": point.get(
+                    "_human_blocker_occurrence"
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    if can_deduplicate_snapshot:
+        return json.dumps(
+            {
+                "kind": kind,
+                "object": point.get("object"),
+                "semantic_attempt_id": point.get("semantic_attempt_id"),
+                "round": point.get("round"),
+                "role": point.get("role"),
+                "thread_id": point.get("thread_id"),
+                "phase": point.get("phase"),
+                "status": point.get("status"),
+                "details": point.get("details"),
+                "pr_number": point.get("pr_number"),
+                "commit_sha": point.get("commit_sha"),
+                "approval_granted_at": point.get("approval_granted_at"),
+                "required_checks_result": point.get("required_checks_result"),
+                "required_checks_observed_at": point.get(
+                    "required_checks_observed_at"
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    if kind == "integration":
+        pr_number = point.get("pr_number")
+        commit_sha = point.get("commit_sha")
+        if pr_number is not None or commit_sha is not None:
+            return json.dumps(
+                {
+                    "kind": "integration",
+                    "object": point.get("object"),
+                    "pr_number": pr_number,
+                    "commit_sha": commit_sha,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
     return json.dumps(
         {key: value for key, value in point.items() if key != "_order"},
         ensure_ascii=False,
@@ -704,18 +847,16 @@ def _record_execution_seconds(record: dict[str, Any]) -> int | None:
     total = 0
     for index, invocation in enumerate(invocations):
         if not isinstance(invocation, dict):
-            continue
-        started = _parse_optional_timestamp(invocation.get("started_at"))
-        ended = _parse_optional_timestamp(invocation.get("ended_at"))
-        if started is None:
             return None
-        if ended is None:
-            if record.get("activity") != "running" or index != last_invocation_index:
-                # A wall-clock observation of an interrupted or unknown
-                # process is not a persisted completion time.
-                return None
-            ended = datetime.now(UTC)
-        total += max(0, int((ended - started).total_seconds()))
+        allow_open = (
+            index == last_invocation_index
+            and record.get("activity")
+            in {"running", "capacity_wait", "recovery_wait"}
+        )
+        duration = invocation_execution_seconds(invocation, allow_open=allow_open)
+        if duration is None:
+            return None
+        total += duration
     return total
 
 
@@ -809,7 +950,9 @@ def _history_record_details(
             attempt_view, owners
         ),
         "publication": _publication_for_attempt(attempt_view, owners),
-        "supporting_records": _supporting_records(owners),
+        "supporting_records": _supporting_records(
+            owners, attempt_view, invocation_values
+        ),
     }
 
 
@@ -1067,6 +1210,27 @@ def _review_artifact_for_attempt(
         )
         if isinstance((value := boundary.get(key)), str) and value
     }
+    history_facts = attempt.get("history_facts")
+    if isinstance(history_facts, dict):
+        reviewer_thread_id = history_facts.get("reviewer_thread_id")
+        if isinstance(reviewer_thread_id, str) and reviewer_thread_id:
+            reviewer_ids.add(reviewer_thread_id)
+        candidate_sha = history_facts.get("candidate_sha")
+        if isinstance(candidate_sha, str) and candidate_sha:
+            candidate_heads.add(candidate_sha)
+        review_identity = history_facts.get("review_identity")
+        if isinstance(review_identity, dict):
+            for key in (
+                "candidate_sha",
+                "reviewed_candidate_sha",
+                "reviewed_head_sha",
+                "run_head_sha",
+                "head_sha",
+                "repair_candidate_sha",
+            ):
+                value = review_identity.get(key)
+                if isinstance(value, str) and value:
+                    candidate_heads.add(value)
     matched = candidates
     if reviewer_ids:
         matched = [
@@ -1132,17 +1296,272 @@ def _owner_attempt_is_latest(owner: dict[str, Any], attempt: dict[str, Any]) -> 
     return not _owner_attempts(owner)
 
 
-def _supporting_records(owners: list[dict[str, Any]]) -> list[dict[str, Any]]:
+_SUPPORTING_RECORD_KEYS = (
+    "required_checks_evidence",
+    "deterministic_integration_record",
+    "fallback_publication_receipt",
+)
+_SUPPORTING_IDENTITY_GROUPS = {
+    "candidate": {
+        "candidate_sha",
+        "candidate_commit_sha",
+        "reviewed_candidate_sha",
+        "reviewed_head_sha",
+        "run_head_sha",
+        "repair_candidate_sha",
+        "commit_sha",
+    },
+    "publication": {
+        "publication_sha",
+        "published_sha",
+        "integrated_publication_sha",
+    },
+    "integration": {
+        "integrated_sha",
+        "merge_commit_sha",
+    },
+}
+_SUPPORTING_SCOPE_KEYS = {
+    "base_sha",
+    "reviewed_base_sha",
+    "reviewed_default_base_sha",
+    "default_base_sha",
+    "repair_base_run_head_sha",
+    "effective_revision",
+    "parent_revision",
+    "ticket_graph_revision",
+    "candidate_tree",
+    "candidate_tree_sha",
+    "reviewed_candidate_tree",
+    "expected_merge_tree",
+}
+_SUPPORTING_NESTED_KEYS = {
+    "acceptance_record",
+    "candidate",
+    "currentness_boundary",
+    "deterministic_integration_record",
+    "fallback_publication_receipt",
+    "fallback_receipt",
+    "pr",
+    "review_budget",
+    "publication",
+    "required_checks_evidence",
+    "review_identity",
+    "semantic_attempt",
+    "version",
+}
+_SUPPORTING_PUBLICATION_HEAD_KEYS = {"pr", "required_checks_evidence"}
+
+
+def _supporting_scalar_values(value: object) -> set[str]:
+    if isinstance(value, str) and value:
+        return {value}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {str(value)}
+    return set()
+
+
+def _supporting_identity_bundle(
+    value: object, *, default_head_group: str = "candidate"
+) -> dict[str, set[str]]:
+    bundle: dict[str, set[str]] = {
+        "attempt": set(),
+        "candidate": set(),
+        "publication": set(),
+        "integration": set(),
+        "window": set(),
+        "pr": set(),
+        "thread": set(),
+    }
+    bundle.update({key: set() for key in _SUPPORTING_SCOPE_KEYS})
+    if not isinstance(value, dict):
+        return bundle
+    for key, item in value.items():
+        if key in {"attempt_id", "semantic_attempt_id"}:
+            bundle["attempt"].update(_supporting_scalar_values(item))
+        for group, keys in _SUPPORTING_IDENTITY_GROUPS.items():
+            if key in keys:
+                bundle[group].update(_supporting_scalar_values(item))
+        if key == "head_sha":
+            bundle[default_head_group].update(_supporting_scalar_values(item))
+        elif key in _SUPPORTING_SCOPE_KEYS:
+            bundle[key].update(_supporting_scalar_values(item))
+        elif key in {"window", "budget_window"}:
+            bundle["window"].update(_supporting_scalar_values(item))
+        elif key == "pr_number":
+            bundle["pr"].update(_supporting_scalar_values(item))
+        elif key in {
+            "reviewer_thread_id",
+            "reported_thread_id",
+            "requested_thread_id",
+            "thread_id",
+        }:
+            bundle["thread"].update(_supporting_scalar_values(item))
+        if key in _SUPPORTING_NESTED_KEYS:
+            if key == "pr" and isinstance(item, dict):
+                bundle["pr"].update(_supporting_scalar_values(item.get("number")))
+            nested_head_group = (
+                "publication"
+                if key in _SUPPORTING_PUBLICATION_HEAD_KEYS
+                else "candidate"
+            )
+            nested = _supporting_identity_bundle(
+                item, default_head_group=nested_head_group
+            )
+            for nested_key, nested_values in nested.items():
+                bundle[nested_key].update(nested_values)
+    return bundle
+
+
+def _merge_supporting_bundles(*values: object) -> dict[str, set[str]]:
+    merged = _supporting_identity_bundle(None)
+    for value in values:
+        bundle = _supporting_identity_bundle(value)
+        for key, items in bundle.items():
+            merged[key].update(items)
+    return merged
+
+
+def _supporting_attempt_ids(value: object) -> set[str]:
+    return _supporting_identity_bundle(value)["attempt"]
+
+
+def _attempt_invocations(
+    attempt: dict[str, Any], invocations: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    attempt_id = attempt.get("attempt_id")
+    if isinstance(attempt_id, str) and attempt_id:
+        matched = [
+            invocation
+            for invocation in invocations
+            if isinstance(invocation.get("semantic_attempt"), dict)
+            and invocation["semantic_attempt"].get("attempt_id") == attempt_id
+        ]
+        if matched:
+            return matched
+    return [
+        invocation
+        for invocation in invocations
+        if isinstance(invocation.get("semantic_attempt"), dict)
+        and all(
+            invocation["semantic_attempt"].get(key) == attempt.get(key)
+            for key in ("work_subject", "generation", "role", "ordinal")
+            if attempt.get(key) is not None
+        )
+    ]
+
+
+def _supporting_record_matches_attempt(
+    kind: str,
+    value: dict[str, Any],
+    attempt: dict[str, Any],
+    invocations: list[dict[str, Any]],
+) -> bool:
+    record = _supporting_identity_bundle(
+        value,
+        default_head_group=(
+            "publication" if kind == "required_checks_evidence" else "candidate"
+        ),
+    )
+    record_attempt_ids = record["attempt"]
+    attempt_id = attempt.get("attempt_id")
+    if record_attempt_ids:
+        if not isinstance(attempt_id, str) or attempt_id not in record_attempt_ids:
+            return False
+
+    attempt_bundles = [attempt]
+    history_facts = attempt.get("history_facts")
+    if isinstance(history_facts, dict):
+        attempt_bundles.append(history_facts)
+    attempt_bundles.extend(_attempt_invocations(attempt, invocations))
+    expected = _merge_supporting_bundles(*attempt_bundles)
+    for key in (
+        *_SUPPORTING_SCOPE_KEYS,
+        "window",
+        "pr",
+        "thread",
+    ):
+        expected_values = expected[key]
+        record_values = record[key]
+        if len(expected_values) > 1 or len(record_values) > 1:
+            return False
+        if expected_values and record_values and not expected_values & record_values:
+            return False
+
+    # Candidate aliases must all identify one reviewed object. Publication and
+    # integration identities are intentionally separate: a publication commit
+    # and its later merge commit are both valid parts of one record.
+    expected_candidates = expected["candidate"]
+    record_candidates = record["candidate"]
+    if len(expected_candidates) > 1 or len(record_candidates) > 1:
+        return False
+    if record_candidates and not expected_candidates & record_candidates:
+        return False
+    expected_publications = expected["publication"]
+    record_publications = record["publication"]
+    if (
+        expected_publications
+        and record_publications
+        and not expected_publications & record_publications
+    ):
+        return False
+    expected_integrations = expected["integration"]
+    record_integrations = record["integration"]
+    if (
+        expected_integrations
+        and record_integrations
+        and not expected_integrations & record_integrations
+    ):
+        return False
+
+    # A supporting record must prove the reviewed object or publication. A
+    # shared effective revision, base, or window is not sufficient: two
+    # candidates may intentionally share all of those values.
+    identity_matches = bool(
+        record["candidate"] & expected["candidate"]
+        or record["publication"] & expected["publication"]
+        or record["integration"] & expected["integration"]
+    )
+    if not identity_matches:
+        return False
+    return True
+
+
+def _supporting_records(
+    owners: list[dict[str, Any]],
+    attempt: dict[str, Any],
+    invocations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
     for owner in owners:
-        for key in (
-            "required_checks_evidence",
-            "deterministic_integration_record",
-            "fallback_publication_receipt",
-        ):
+        matched_values: dict[str, dict[str, Any]] = {}
+        for key in _SUPPORTING_RECORD_KEYS:
             value = owner.get(key)
-            if not isinstance(value, dict):
+            if isinstance(value, dict) and _supporting_record_matches_attempt(
+                key, value, attempt, invocations
+            ):
+                matched_values[key] = value
+        # The live Job-level Observation has only the published ``head_sha``.
+        # When it is an exact copy of a versioned integration/fallback record's
+        # nested Observation, that parent record supplies the missing Candidate
+        # binding. Otherwise leave the projection explicitly unrecorded.
+        required_checks = owner.get("required_checks_evidence")
+        if isinstance(required_checks, dict):
+            for parent_key in (
+                "deterministic_integration_record",
+                "fallback_publication_receipt",
+            ):
+                parent = matched_values.get(parent_key)
+                if (
+                    parent is not None
+                    and parent.get("required_checks_evidence") == required_checks
+                ):
+                    matched_values["required_checks_evidence"] = required_checks
+                    break
+        for key in _SUPPORTING_RECORD_KEYS:
+            value = matched_values.get(key)
+            if value is None:
                 continue
             identity = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
             if identity in seen:
@@ -1154,7 +1573,7 @@ def _supporting_records(owners: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _is_history_turning_point(event: dict[str, Any]) -> bool:
     details = event.get("details")
-    if isinstance(details, list) and details:
+    if isinstance(details, list) and details and _is_human_blocker_event(event):
         return True
     kind = str(event.get("kind") or "")
     status = str(event.get("status") or "")
@@ -1187,6 +1606,15 @@ def _is_history_turning_point(event: dict[str, Any]) -> bool:
     }
 
 
+_HUMAN_BLOCKER_STATUSES = {"ready_for_human"}
+
+
+def _is_human_blocker_event(event: dict[str, Any]) -> bool:
+    return str(event.get("kind") or "") == "human_blocker" or str(
+        event.get("status") or ""
+    ) in _HUMAN_BLOCKER_STATUSES
+
+
 def _record_lines(
     record: dict[str, Any], *, timezone: tzinfo, details: bool
 ) -> list[str]:
@@ -1207,7 +1635,6 @@ def _record_lines(
     title = (
         f"{_safe_text(record.get('object') or 'Delivery Run')} · "
         f"{_safe_text(record.get('role_label') or 'Agent')} {round_text} · "
-        f"{_safe_text(record.get('role_zh') or '')} · "
         f"{_safe_text(record.get('status_text') or '未知')}"
     )
     if findings:
@@ -1340,6 +1767,288 @@ def _budget_fraction(used: object, limit: object) -> str:
     return f"{used_text} / {limit_text}"
 
 
+def _append_detail_scalar(
+    lines: list[str], *, indent: str, label: str, value: object
+) -> None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return
+    if isinstance(value, (str, int, float, bool)):
+        lines.append(f"{indent}{label}：{_safe_text(value)}")
+
+
+def _first_detail_value(
+    value: dict[str, Any], keys: tuple[str, ...]
+) -> object:
+    for key in keys:
+        candidate = value.get(key)
+        if candidate is not None and (
+            not isinstance(candidate, str) or candidate.strip()
+        ):
+            return candidate
+    return None
+
+
+def _required_checks_mode(value: dict[str, Any]) -> object:
+    mode = _first_detail_value(value, ("required_checks_mode",))
+    if mode is not None:
+        return mode
+    result = _first_detail_value(
+        value, ("result", "required_checks", "required_checks_result")
+    )
+    if result == "none":
+        return "not_configured"
+    if isinstance(result, str) and result in {
+        "pass",
+        "pending",
+        "unknown",
+        "fail",
+    }:
+        return "configured"
+    evidence = value.get("required_checks_evidence")
+    if isinstance(evidence, dict):
+        return _required_checks_mode(evidence)
+    return None
+
+
+def _append_check_observation_detail(
+    lines: list[str],
+    observation: object,
+    *,
+    indent: str,
+    result_label: str = "必需检查结果",
+) -> None:
+    if not isinstance(observation, dict):
+        return
+    _append_detail_scalar(
+        lines,
+        indent=indent,
+        label="PR 编号",
+        value=observation.get("pr_number"),
+    )
+    _append_detail_scalar(
+        lines,
+        indent=indent,
+        label="检查提交",
+        value=observation.get("head_sha"),
+    )
+    _append_detail_scalar(
+        lines,
+        indent=indent,
+        label=result_label,
+        value=_first_detail_value(observation, ("result", "status", "conclusion")),
+    )
+    _append_detail_scalar(
+        lines,
+        indent=indent,
+        label="检查观测时间",
+        value=_first_detail_value(
+            observation, ("observed_at", "required_checks_observed_at")
+        ),
+    )
+    checks = observation.get("checks")
+    if not isinstance(checks, list):
+        return
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = _first_detail_value(check, ("name", "check_name"))
+        result = _first_detail_value(
+            check, ("result", "conclusion", "status", "bucket")
+        )
+        if name is None and result is None:
+            continue
+        details: list[str] = []
+        if isinstance(name, (str, int, float, bool)):
+            details.append(f"名称={_safe_text(name)}")
+        if isinstance(result, (str, int, float, bool)):
+            details.append(f"结果={_safe_text(result)}")
+        for key, label in (
+            ("state", "状态"),
+            ("workflow", "工作流"),
+            ("link", "链接"),
+            ("description", "说明"),
+        ):
+            extra = check.get(key)
+            if isinstance(extra, (str, int, float, bool)) and (
+                not isinstance(extra, str) or extra.strip()
+            ):
+                details.append(f"{label}={_safe_text(extra)}")
+        lines.append(f"{indent}检查项：{'；'.join(details)}")
+
+
+def _git_integrity_detail_lines(
+    evidence: dict[str, Any], *, indent: str
+) -> list[str]:
+    lines: list[str] = []
+    for key, label in (
+        ("status", "结果"),
+        ("reason", "失败原因"),
+        ("expected_head", "期望 HEAD"),
+        ("observed_head", "实际 HEAD"),
+        ("base_sha", "基础 HEAD"),
+        ("previous_candidate_sha", "上一个 Candidate"),
+        ("workspace_clean", "工作区清洁"),
+        ("recovery_head", "恢复后 HEAD"),
+        ("recovery_action", "恢复动作"),
+        ("recovery_error", "恢复错误"),
+    ):
+        _append_detail_scalar(lines, indent=indent, label=label, value=evidence.get(key))
+    return lines
+
+
+def _supporting_record_detail_lines(
+    kind: str, value: dict[str, Any]
+) -> list[str]:
+    """Render the operator-facing subset of a supporting record.
+
+    Supporting records are durable audit objects and intentionally contain
+    reviewer identities, policy snapshots, budgets, and nested authorizations.
+    Human history needs the business result, not a recursive serialization of
+    that internal record. Keep this projection explicit so new private fields
+    cannot leak into ``history --details`` by accident.
+    """
+
+    lines: list[str] = []
+    if kind == "required_checks_evidence":
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="门禁模式",
+            value=_required_checks_mode(value),
+        )
+        _append_check_observation_detail(lines, value, indent="      ")
+        return lines
+
+    if kind == "deterministic_integration_record":
+        _append_detail_scalar(
+            lines, indent="      ", label="来源", value=value.get("source")
+        )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="门禁模式",
+            value=_required_checks_mode(value),
+        )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="必需检查结果",
+            value=_first_detail_value(value, ("required_checks", "required_checks_result")),
+        )
+        _append_detail_scalar(
+            lines, indent="      ", label="PR 编号", value=value.get("pr_number")
+        )
+        pr = value.get("pr")
+        if isinstance(pr, dict):
+            _append_detail_scalar(
+                lines, indent="      ", label="PR 状态", value=pr.get("state")
+            )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="发布提交",
+            value=value.get("publication_sha"),
+        )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="集成提交",
+            value=value.get("integrated_sha"),
+        )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="集成说明",
+            value=value.get("integrated_message"),
+        )
+        evidence = value.get("required_checks_evidence")
+        if isinstance(evidence, dict):
+            lines.append("      必需检查证据")
+            _append_check_observation_detail(lines, evidence, indent="        ")
+        return lines
+
+    if kind == "fallback_publication_receipt":
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="发布路径",
+            value=value.get("repair_source") or "兜底发布",
+        )
+        _append_detail_scalar(
+            lines, indent="      ", label="PR 编号", value=value.get("pr_number")
+        )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="发布提交",
+            value=value.get("publication_sha"),
+        )
+        _append_detail_scalar(
+            lines,
+            indent="      ",
+            label="门禁模式",
+            value=_required_checks_mode(value),
+        )
+        evidence = value.get("required_checks_evidence")
+        if isinstance(evidence, dict):
+            lines.append("      必需检查证据")
+            _append_check_observation_detail(lines, evidence, indent="        ")
+        source = value.get("failure_evidence_source")
+        failure_evidence = (
+            value.get("failure_evidence")
+            if source in ("git_integrity", "acceptance")
+            else _first_detail_value(
+                value, ("required_check_failure_evidence", "failure_evidence")
+            )
+        )
+        if isinstance(failure_evidence, dict):
+            failure_lines: list[str] = []
+            label = "检查失败依据"
+            if source == "git_integrity":
+                label = "Git 完整性失败依据"
+                failure_lines = _git_integrity_detail_lines(
+                    failure_evidence, indent="        "
+                )
+            elif source == "acceptance":
+                label = "验收失败依据"
+                checks = failure_evidence.get("checks")
+                if isinstance(checks, dict):
+                    for lane, lane_label in (
+                        ("e2e", "功能验证"),
+                        ("standards", "工程审查"),
+                        ("spec", "需求核对"),
+                    ):
+                        check = checks.get(lane)
+                        if not isinstance(check, dict):
+                            continue
+                        _append_detail_scalar(
+                            failure_lines, indent="        ", label=lane_label,
+                            value=check.get("status"),
+                        )
+                        _append_detail_scalar(
+                            failure_lines, indent="          ", label="证据",
+                            value=check.get("evidence"),
+                        )
+                        findings = check.get("findings")
+                        if isinstance(findings, list):
+                            for finding in findings:
+                                if isinstance(finding, str) and finding.strip():
+                                    failure_lines.extend(
+                                        _full_finding_lines(finding, indent="          ")
+                                    )
+            else:
+                _append_check_observation_detail(
+                    failure_lines, failure_evidence, indent="        ",
+                    result_label="结果",
+                )
+            if failure_lines:
+                lines.append(f"      {label}")
+                lines.extend(failure_lines)
+        return lines
+
+    return lines
+
+
 def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[str]:
     lines: list[str] = []
     summary = record.get("development_summary")
@@ -1427,7 +2136,7 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
             lines.append(
                 f"        模型={_safe_text(invocation.get('model') or '未记录')}；"
                 f"推理强度={_safe_text(invocation.get('reasoning_effort') or '未记录')}；"
-                f"输出续接={_safe_text(invocation.get('attempt_count') or 1)} 次"
+                f"输出续接={_output_continuation_text(invocation.get('attempt_count'))} 次"
             )
             for key, label in (
                 ("error", "错误"),
@@ -1441,20 +2150,26 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
                 ("return_code", "返回码"),
             ):
                 value = invocation.get(key)
-                if value is not None:
+                if value is not None and (
+                    not isinstance(value, str) or value.strip()
+                ):
                     lines.append(f"        {label}：{_safe_text(value)}")
     supporting = record.get("supporting_records")
     if isinstance(supporting, list):
+        recorded_kinds = {
+            item.get("kind")
+            for item in supporting
+            if isinstance(item, dict)
+        }
+        for kind in _SUPPORTING_RECORD_KEYS:
+            if kind not in recorded_kinds:
+                lines.append(f"    {_supporting_label(kind)}：未记录")
         for item in supporting:
             if not isinstance(item, dict) or not isinstance(item.get("value"), dict):
                 continue
-            lines.append(f"    {_supporting_label(str(item.get('kind')))}")
-            for key, value in item["value"].items():
-                if isinstance(value, (str, int, float, bool)):
-                    lines.append(f"      {_safe_text(key)}：{_safe_text(value)}")
-                elif value is not None:
-                    lines.append(f"      {_safe_text(key)}：")
-                    lines.extend(_json_detail_lines(value, indent="        "))
+            kind = str(item.get("kind"))
+            lines.append(f"    {_supporting_label(kind)}")
+            lines.extend(_supporting_record_detail_lines(kind, item["value"]))
     return lines
 
 
@@ -1572,9 +2287,13 @@ def _full_finding_lines(finding: str, *, indent: str) -> list[str]:
 
 def _finding_question(finding: object) -> str:
     if not isinstance(finding, str):
-        return str(finding)
+        return f"问题原文：{_safe_text(finding)}"
     match = _FINDING.fullmatch(finding)
-    return f"问题：{match.group(1)}" if match is not None else f"问题原文：{finding}"
+    return (
+        f"问题：{_safe_text(match.group(1))}"
+        if match is not None
+        else f"问题原文：{_safe_text(finding)}"
+    )
 
 
 def _record_action(record: dict[str, Any]) -> str:
@@ -1673,13 +2392,7 @@ def _rich_line(label: object, value: object) -> Any:
 
 
 def _safe_text(value: object) -> str:
-    text = str(value)
-    text = re.sub(
-        r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))",
-        "",
-        text,
-    )
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return terminal_safe(value)
 
 
 _FINDING = re.compile(
@@ -1709,6 +2422,7 @@ def _history_events(
             )
             kind = _timeline_kind(raw, details)
             details.extend(_scope_change_details(raw))
+            worker = raw.get("worker")
             events.append(
                 {
                     "at": timestamp,
@@ -1716,7 +2430,11 @@ def _history_events(
                     "object": _timeline_object(state, raw),
                     "phase": raw.get("phase"),
                     "status": raw.get("status"),
-                    "role": raw.get("worker"),
+                    "role": (
+                        _machine_role_label(worker)
+                        if isinstance(worker, str)
+                        else worker
+                    ),
                     "round": raw.get("attempt"),
                     "details": details,
                     "_order": source_order,
@@ -1763,7 +2481,9 @@ def _history_events(
                     "object": _subject_label(state, work_subject),
                     "phase": invocation.get("phase"),
                     "status": status,
-                    "role": _role_label(role),
+                    # Keep the historical JSON contract stable. Localized
+                    # labels belong only to the human renderer below.
+                    "role": _machine_role_label(role),
                     "round": round_number,
                     "invocation_role": invocation.get("invocation_role"),
                     "binding_role": invocation.get("binding_role"),
@@ -1913,7 +2633,7 @@ def _timeline_object(state: dict[str, Any], event: dict[str, Any]) -> str:
 
 
 def _timeline_kind(event: dict[str, Any], details: list[str]) -> str:
-    if details:
+    if _is_human_blocker_event(event):
         return "human_blocker"
     status = str(event.get("status") or "")
     phase = str(event.get("phase") or "")
@@ -1982,6 +2702,19 @@ def _role_label(role: str) -> str:
     if family is None:
         return role
     return {
+        "development": "开发 Agent",
+        "review": "验收 Agent",
+        "publication": "发布 Agent",
+    }[family]
+
+
+def _machine_role_label(role: str) -> str:
+    """Return the stable JSON role value for a semantic role alias."""
+
+    family = _role_family(role)
+    if family is None:
+        return role
+    return {
         "development": "Development Agent",
         "review": "Review Agent",
         "publication": "Publication Agent",
@@ -2041,15 +2774,11 @@ def _invocation_attempt_view(invocation: dict[str, Any]) -> dict[str, Any]:
 def _invocation_duration(
     invocation: dict[str, Any], audit: dict[str, Any]
 ) -> int | None:
-    start = _parse_optional_timestamp(invocation.get("started_at"))
-    end = _parse_optional_timestamp(invocation.get("ended_at"))
-    if start is None:
-        return None
-    if end is None:
-        if invocation_activity(invocation, audit) != "running":
-            return None
-        end = datetime.now(UTC)
-    return max(0, int((end - start).total_seconds()))
+    return invocation_execution_seconds(
+        invocation,
+        allow_open=invocation_activity(invocation, audit)
+        in {"running", "capacity_wait", "recovery_wait"},
+    )
 
 
 def _artifact_findings(artifact: dict[str, Any]) -> list[str]:
@@ -2177,6 +2906,12 @@ def _duration(seconds: object) -> str:
     if minutes:
         return f"{minutes} 分钟"
     return f"{seconds} 秒"
+
+
+def _output_continuation_text(value: object) -> str:
+    if type(value) is int and value >= 1:
+        return str(value - 1)
+    return "未记录"
 
 
 def _truncate_history_detail(value: str) -> str:

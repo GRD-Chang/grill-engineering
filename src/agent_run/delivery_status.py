@@ -11,9 +11,10 @@ if TYPE_CHECKING:
 from agent_run.presentation_helpers import (
     current_work_subject,
     delivery_object_label,
-    elapsed_seconds_since,
     human_next_action,
+    terminal_safe,
 )
+
 
 def status_progress_view(
     state: dict[str, Any], audit: dict[str, Any]
@@ -39,7 +40,10 @@ def status_progress_view(
         if activity != "running":
             current_agent.update(
                 is_active=False,
-                duration_seconds=_invocation_duration(invocation or {}),
+                duration_seconds=_invocation_duration(
+                    invocation or {},
+                    allow_open=activity in {"capacity_wait", "recovery_wait"},
+                ),
                 remaining_seconds=None,
             )
     return {
@@ -76,6 +80,90 @@ def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
     if type(capacity_count) is int and capacity_count > 0:
         details.append(f"本轮累计：模型容量不足等待已触发 {capacity_count} 次，每次等待 30 秒后自动续接")
     return details
+
+
+def invocation_execution_seconds(
+    invocation: dict[str, Any], *, allow_open: bool = False
+) -> int | None:
+    """Return trusted active execution time, excluding persisted recovery waits."""
+
+    started = _parse_optional_timestamp(invocation.get("started_at"))
+    ended = _parse_optional_timestamp(invocation.get("ended_at"))
+    if started is None:
+        return None
+    if ended is None:
+        if not allow_open:
+            return None
+        ended = datetime.now(UTC)
+    if ended < started:
+        return None
+
+    waits = _recovery_wait_intervals(invocation, started=started, ended=ended)
+    if waits is None:
+        return None
+    wait_seconds = 0.0
+    previous_end = started
+    for wait_start, wait_end in sorted(waits):
+        if wait_start < started or wait_end > ended or wait_start < previous_end:
+            return None
+        wait_seconds += (wait_end - wait_start).total_seconds()
+        previous_end = wait_end
+    return max(0, int((ended - started).total_seconds() - wait_seconds))
+
+
+def _recovery_wait_intervals(
+    invocation: dict[str, Any], *, started: datetime, ended: datetime
+) -> list[tuple[datetime, datetime]] | None:
+    raw_intervals = invocation.get("recovery_wait_intervals")
+    if isinstance(raw_intervals, list) and not raw_intervals:
+        # An explicitly persisted empty list belongs to this Invocation. In
+        # particular, a successor may retain the semantic Attempt's cumulative
+        # recovery count while having no waits of its own.
+        if not invocation.get("recovery_waiting") and not any(
+            invocation.get(key)
+            for key in ("last_failure_at", "last_recovery_started_at")
+        ):
+            return []
+        # A legacy/current waiting record can have an empty list because its
+        # interval was not persisted. Fall through to the conservative legacy
+        # reconstruction below rather than claiming all elapsed time ran.
+        raw_intervals = None
+    if raw_intervals is None:
+        # Older records only have enough evidence for one capacity wait. More
+        # than one unversioned wait cannot be reconstructed safely.
+        count = invocation.get("capacity_recovery_count")
+        if count in (None, 0) and not any(
+            invocation.get(key)
+            for key in ("last_failure_at", "last_recovery_started_at")
+        ):
+            return []
+        if count not in (None, 0, 1):
+            return None
+        raw_intervals = [
+            {
+                "started_at": invocation.get("last_failure_at"),
+                "ended_at": invocation.get("last_recovery_started_at"),
+            }
+        ]
+    if not isinstance(raw_intervals, list):
+        return None
+
+    intervals: list[tuple[datetime, datetime]] = []
+    for raw in raw_intervals:
+        if not isinstance(raw, dict):
+            return None
+        wait_start = _parse_optional_timestamp(raw.get("started_at"))
+        wait_end = _parse_optional_timestamp(raw.get("ended_at"))
+        if wait_start is None:
+            return None
+        if wait_end is None:
+            if not invocation.get("recovery_waiting"):
+                return None
+            wait_end = ended
+        if wait_end < wait_start:
+            return None
+        intervals.append((wait_start, wait_end))
+    return intervals
 
 
 def invocation_activity(
@@ -125,16 +213,19 @@ def print_status_progress(
     print_operator_action: Callable[[dict[str, Any]], None],
 ) -> None:
     parent = view["parent"]
-    print(f"Repository: {view['repository'] or 'unknown'}")
+    print(f"Repository: {_terminal_safe(view['repository'] or 'unknown')}")
     print(
         "Parent:     "
-        f"#{parent.get('number', '?')} {parent.get('title') or '未命名 Parent'}"
+        f"#{_terminal_safe(parent.get('number', '?'))} "
+        f"{_terminal_safe(parent.get('title') or '未命名 Parent')}"
     )
-    print(f"Status:     {display_term(view['status'])}")
+    print(f"Status:     {_terminal_safe(display_term(view['status']))}")
     phase = _phase_term(view["phase"], view["current_object"], display_term)
-    print(f"阶段:       {phase if phase is not None else '未进入具体阶段'}")
-    print(f"结论:       {view['conclusion']}")
-    print(f"当前对象:   {view['current_object']}")
+    print(
+        f"阶段:       {_terminal_safe(phase if phase is not None else '未进入具体阶段')}"
+    )
+    print(f"结论:       {_terminal_safe(view['conclusion'])}")
+    print(f"当前对象:   {_terminal_safe(view['current_object'])}")
 
     print("\n进度")
     tickets = view["ticket_progress"]
@@ -169,7 +260,7 @@ def print_status_progress(
             f"{rounds.get('reviewer_limit')}"
         )
         if rounds.get("checkpoint_reason"):
-            print(f"  预算暂停原因       {rounds['checkpoint_reason']}")
+            print(f"  预算暂停原因       {_terminal_safe(rounds['checkpoint_reason'])}")
         print(
             "  最终 CI 修复          "
             f"{rounds.get('final_ci_fix_used')} / "
@@ -184,7 +275,7 @@ def print_status_progress(
         print(f"  Repair Cycle Generation {repair['repair_cycle_generation']}")
         print(
             "  Candidate 验证状态 "
-            f"{display_term(repair['candidate_validation_status'])}"
+            f"{_terminal_safe(display_term(repair['candidate_validation_status']))}"
         )
         print(
             "  Code Modification Attempts "
@@ -208,13 +299,14 @@ def print_status_progress(
     else:
         agent_label = "当前 Agent" if agent["is_active"] else "最近 Agent"
         print(
-            f"  {agent_label}: {_human_role_label(agent['role'])} · "
-            f"{agent['object']}（{_localized_role_label(agent['role'])}）"
+            f"  {agent_label}: {_terminal_safe(_human_role_label(agent['role']))} · "
+            f"{_terminal_safe(agent['object'])}（"
+            f"{_terminal_safe(_localized_role_label(agent['role']))}）"
         )
-        print(f"  模型                  {agent['model']}")
-        print(f"  推理强度              {agent['reasoning_effort']}")
+        print(f"  模型                  {_terminal_safe(agent['model'])}")
+        print(f"  推理强度              {_terminal_safe(agent['reasoning_effort'])}")
         if agent.get("started_at"):
-            print(f"  开始时间              {agent['started_at']}")
+            print(f"  开始时间              {_terminal_safe(agent['started_at'])}")
         if agent["duration_seconds"] is None:
             print("  实际执行时长未知")
         if agent["duration_seconds"] is not None:
@@ -223,11 +315,11 @@ def print_status_progress(
         if agent["remaining_seconds"] is not None:
             print(f"  本轮剩余              {_duration(agent['remaining_seconds'])}")
         for detail in agent["recovery_details"]:
-            print(f"  {detail}")
+            print(f"  {_terminal_safe(detail)}")
 
     if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
         print("\n下一步")
-        print(f"  {execution_guidance(state, activity)}")
+        print(f"  {_terminal_safe(execution_guidance(state, activity))}")
         _print_findings(view["findings"])
         return
 
@@ -247,7 +339,7 @@ def print_status_progress(
         else:
             print(
                 "  下一步: "
-                f"{human_next_action(view['next_action'], run_id=state.get('run_id'))}"
+                f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
             )
         current_invocation = audit.get("agent_invocation")
         running_invocation = (
@@ -287,16 +379,7 @@ def print_rich_status_progress(
     # no-wrap content and clipping their business data at the panel edge.
     console = Console(highlight=False, soft_wrap=False)
     raw_status = str(view.get("status") or "")
-    status_style = {
-        "completed": "green",
-        "active": "cyan",
-        "starting": "cyan",
-        "ready_for_human": "yellow",
-        "blocked": "yellow",
-        "execution_failed": "red",
-        "operator_stopped": "yellow",
-        "supervision_timeout": "yellow",
-    }.get(raw_status, "cyan")
+    status_style = _status_style(raw_status)
 
     parent = view.get("parent")
     parent_view = parent if isinstance(parent, dict) else {}
@@ -500,6 +583,38 @@ def print_rich_status_progress(
     )
 
 
+def _status_style(value: object) -> str:
+    return {
+        "completed": "green",
+        "accepted": "green",
+        "ticket_completed": "green",
+        "merged": "green",
+        "run_publication_pending": "green",
+        "active": "cyan",
+        "starting": "cyan",
+        "developing": "cyan",
+        "repairing": "cyan",
+        "reviewing": "cyan",
+        "validating": "cyan",
+        "publishing": "cyan",
+        "ready_for_human": "yellow",
+        "blocked": "yellow",
+        "pending": "yellow",
+        "run_approval_pending": "yellow",
+        "run_acceptance_pending": "yellow",
+        "ready_for_approval": "yellow",
+        "waiting_checks": "yellow",
+        "waiting_merge": "yellow",
+        "waiting_external": "yellow",
+        "publication_pending": "yellow",
+        "parent_approval_pending": "yellow",
+        "parent_delivery_pending": "yellow",
+        "operator_stopped": "yellow",
+        "supervision_timeout": "yellow",
+        "execution_failed": "red",
+    }.get(str(value), "cyan")
+
+
 def _rich_value(value: object) -> Text:
     from rich.text import Text
 
@@ -515,17 +630,10 @@ def _rich_labeled(label: object, value: object) -> Text:
     return text
 
 
-_ANSI_ESCAPE = re.compile(
-    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
-)
-_UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
 def _terminal_safe(value: object) -> str:
     """Keep persisted/user text from injecting terminal control sequences."""
 
-    text = str(value)
-    return _UNSAFE_CONTROL.sub("", _ANSI_ESCAPE.sub("", text))
+    return terminal_safe(value)
 
 
 def _rich_wait_lines(wait: object, *, run_id: object) -> list[Text]:
@@ -680,11 +788,7 @@ def _agent_view(
         "recovery_details": invocation_recovery_details(source),
         "model": source.get("model") or "未绑定",
         "reasoning_effort": source.get("reasoning_effort") or "未绑定",
-        "duration_seconds": (
-            elapsed_seconds_since(started_at)
-            if is_active
-            else _invocation_duration(source)
-        ),
+        "duration_seconds": _invocation_duration(source, allow_open=is_active),
         "remaining_seconds": _remaining_until(deadline_at) if is_active else None,
         "is_active": is_active and agent_object == current_object,
         "object": agent_object,
@@ -925,6 +1029,33 @@ def _current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _completed_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a terminal acceptance artifact only when its candidate matches."""
+
+    for key in ("parent_job", "active_ticket_job", "run_acceptance"):
+        subject = state.get(key)
+        if not isinstance(subject, dict) or subject.get("phase") not in {
+            "accepted",
+            "completed",
+            "merged",
+        }:
+            continue
+        artifact = _current_artifact(subject)
+        if not isinstance(artifact, dict):
+            continue
+        checks = artifact.get("checks")
+        if not isinstance(checks, dict):
+            continue
+        statuses = {
+            check.get("status")
+            for check in checks.values()
+            if isinstance(check, dict)
+        }
+        if statuses == {"pass"}:
+            return artifact
+    return None
+
+
 def _acceptance_subject(
     state: dict[str, Any], current: tuple[str, dict[str, Any]]
 ) -> dict[str, Any]:
@@ -935,7 +1066,7 @@ def _acceptance_subject(
         acceptance = state.get("run_acceptance")
         publication_head = _publication_boundary_head(subject)
         acceptance_head = (
-            _subject_candidate_identity(acceptance)
+            _acceptance_publication_boundary_head(acceptance)
             if isinstance(acceptance, dict)
             else None
         )
@@ -947,6 +1078,38 @@ def _acceptance_subject(
             return acceptance
         return {}
     return subject
+
+
+def _acceptance_publication_boundary_head(
+    acceptance: dict[str, Any],
+) -> object:
+    """Return the explicitly promoted Run head, when its proof is intact."""
+
+    record = acceptance.get("acceptance_record")
+    if not isinstance(record, dict) or record.get("acceptance_state") != "integrated":
+        return _subject_candidate_identity(acceptance)
+
+    candidate = acceptance.get("candidate_sha")
+    reviewed_candidate = record.get("reviewed_candidate_sha")
+    reviewed_head = record.get("reviewed_head_sha")
+    if (
+        not isinstance(candidate, str)
+        or not candidate
+        or not isinstance(reviewed_candidate, str)
+        or reviewed_candidate != candidate
+        or not isinstance(reviewed_head, str)
+        or not reviewed_head
+    ):
+        return None
+
+    for key in ("reviewed_head_sha", "integrated_sha"):
+        value = acceptance.get(key)
+        if value is not None and value != reviewed_head:
+            return None
+    record_run_head = record.get("run_head_sha")
+    if record_run_head is not None and record_run_head != reviewed_head:
+        return None
+    return reviewed_head
 
 
 def _publication_boundary_head(subject: dict[str, Any]) -> object:
@@ -995,6 +1158,8 @@ def _current_conclusion(
     activity: str,
 ) -> str:
     if current is None:
+        if _completed_acceptance_artifact(state) is not None:
+            return "当前有效通过"
         return "尚无有效验收结论"
     location, public_subject = current
     subject = _acceptance_subject(state, current)
@@ -1136,7 +1301,7 @@ def _print_findings(findings: object) -> None:
         print("  无")
         return
     for index, finding in enumerate(values, start=1):
-        text = str(finding)
+        text = _terminal_safe(finding)
         print(f"  {index}. {text}")
         match = _FINDING_PARTS.fullmatch(text)
         if match is None:
@@ -1144,7 +1309,7 @@ def _print_findings(findings: object) -> None:
         for label, value in zip(
             ("问题", "证据", "必须修复", "复验"), match.groups()
         ):
-            print(f"     {label}：{value}")
+            print(f"     {_terminal_safe(label)}：{_terminal_safe(value)}")
 
 
 def _human_role_label(value: object) -> str:
@@ -1210,12 +1375,10 @@ def _role_label(role: str) -> str:
     }[family]
 
 
-def _invocation_duration(invocation: dict[str, Any]) -> int | None:
-    start = _parse_optional_timestamp(invocation.get("started_at"))
-    end = _parse_optional_timestamp(invocation.get("ended_at"))
-    if start is None or end is None:
-        return None
-    return max(0, int((end - start).total_seconds()))
+def _invocation_duration(
+    invocation: dict[str, Any], *, allow_open: bool = False
+) -> int | None:
+    return invocation_execution_seconds(invocation, allow_open=allow_open)
 
 
 def _remaining_until(value: object) -> int | None:
@@ -1268,8 +1431,8 @@ def _print_wait(
     if not isinstance(wait, dict):
         return
     print("\n当前等待")
-    print(f"  等待种类: {display_term(wait.get('kind'))}")
-    print(f"  等待对象: {wait.get('subject')}")
+    print(f"  等待种类: {_terminal_safe(display_term(wait.get('kind')))}")
+    print(f"  等待对象: {_terminal_safe(wait.get('subject'))}")
     boundary_status = (
         "已记录（完整值见 --json）"
         if wait.get("head_sha") is not None or wait.get("base_sha") is not None
@@ -1278,30 +1441,31 @@ def _print_wait(
     print(f"  等待 head/base: {boundary_status}")
     print(
         "  等待窗口: "
-        f"截止={wait.get('deadline')}；剩余={wait.get('remaining_seconds')} 秒"
+        f"截止={_terminal_safe(wait.get('deadline'))}；"
+        f"剩余={_terminal_safe(wait.get('remaining_seconds'))} 秒"
     )
-    print(f"  重试次数: {wait.get('retry_count')}")
+    print(f"  重试次数: {_terminal_safe(wait.get('retry_count'))}")
     observation = wait.get("latest_observation")
     if isinstance(observation, dict):
-        print(f"  最新观测: {observation.get('message')}")
+        print(f"  最新观测: {_terminal_safe(observation.get('message'))}")
     else:
         print("  最新观测: 无")
     if wait.get("timeout_resume_action"):
         print(
             "  超时恢复: "
-            f"{human_next_action(wait['timeout_resume_action'], run_id=run_id)}"
+            f"{_terminal_safe(human_next_action(wait['timeout_resume_action'], run_id=run_id))}"
         )
     if wait.get("credential_failure_class"):
-        print(f"  凭据失败类别: {wait['credential_failure_class']}")
+        print(f"  凭据失败类别: {_terminal_safe(wait['credential_failure_class'])}")
     if wait.get("credential_http_status") is not None:
-        print(f"  凭据 HTTP 状态: {wait['credential_http_status']}")
+        print(f"  凭据 HTTP 状态: {_terminal_safe(wait['credential_http_status'])}")
 
 
 def _print_cleanup(cleanup: object) -> None:
     if not isinstance(cleanup, dict):
         return
     print("\n交付清理")
-    print(f"  状态: {cleanup.get('status')}")
+    print(f"  状态: {_terminal_safe(cleanup.get('status'))}")
     items = cleanup.get("items")
     if isinstance(items, list):
         pending = sum(1 for item in items if isinstance(item, dict))
@@ -1314,4 +1478,4 @@ def _print_scope_change(scope_change: object) -> None:
     summary = scope_change.get("graph_change_summary")
     print("\nTicket Graph 变化")
     if isinstance(summary, dict):
-        print(f"  {summary.get('summary')}")
+        print(f"  {_terminal_safe(summary.get('summary'))}")

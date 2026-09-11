@@ -371,6 +371,7 @@ def _history_attempt_view(
         view.pop("development_summary", None)
         view.pop("publication", None)
         view.pop("budget_snapshot", None)
+        view.pop("history_facts", None)
     return view
 
 

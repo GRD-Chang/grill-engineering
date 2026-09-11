@@ -452,7 +452,7 @@ def test_history_keeps_later_invocations_after_an_early_timeline_tail(
         for kind, obj, _ in later_facts
     )
     assert any(kind == "publication" for kind, _, _ in later_facts)
-    assert "Run Publication · Publication Agent" in text
+    assert "Run Publication · 发布 Agent" in text
 
 
 def test_status_shows_the_current_review_findings(
