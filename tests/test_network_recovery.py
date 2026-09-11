@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_run.controller import Controller
+from agent_run import external_supervision
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.external_supervision import ExternalSupervisor, restore_supervision_wait
 from agent_run.git import GitError, GitRepository
@@ -22,8 +23,10 @@ from test_delivery import PassAgents, ScriptedPublisher, issue
 
 @pytest.mark.parametrize("failure_point", ["revision", "verify", "publish"])
 def test_publication_read_outage_preserves_work_through_bounded_pause(
-    git_repo: Path, failure_point: str,
+    git_repo: Path, failure_point: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    now = [116.361424302]
+    monkeypatch.setattr(external_supervision, "monotonic", lambda: now[0])
     states = StateStore(git_repo / ".agent-run")
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     state, _ = Controller(
@@ -67,8 +70,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
     assert waiting["diagnostics"][0]["code"] == "github_timeout"
     assert states.load_run(run_id)["diagnostics"] == waiting["diagnostics"]
 
-    started_at = waiting["supervision_window"]["started_at"]
-    now = [started_at]
+    deadline = waiting["supervision_window"]["deadline"]
     supervisor = ExternalSupervisor(
         now=lambda: now[0], sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds)
     )
@@ -76,7 +78,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
         states.save_run(run_id, waiting)
         waiting = engine.deliver(run_id)
         assert waiting["active_ticket_job"] == job
-    assert now[0] - started_at == 600
+    assert now[0] == deadline
     assert waiting["status"] == "supervision_timeout"
     assert waiting["diagnostics"][0]["last_error"]["code"] == "github_timeout"
     assert agents.review_count == 1

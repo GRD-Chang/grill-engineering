@@ -751,7 +751,7 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         "failure_class": "credential_unavailable",
         "phase": "developing",
         "resume_status": "active",
-        "retry_count": 14,
+        "retry_count": 13,
     }
     if http_status is not None:
         availability["http_status"] = http_status
@@ -762,7 +762,8 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         "credential_unavailable"
     )
     assert state["supervision_wait"].get("credential_http_status") == http_status
-    assert state["supervision_wait"]["retry_count"] == 14
+    # The final sleep expires the window; it does not authorize another retry.
+    assert state["supervision_wait"]["retry_count"] == 13
     assert state["active_agent_invocation"] is None
     assert state["agent_invocation_history"] == []
     run_id = str(state["run_id"])
@@ -778,7 +779,7 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         text = run_cli(git_repo, fixture, command, run_id)
         assert text.returncode == 0, text.stderr
         assert "凭据失败类别: credential_unavailable" in text.stdout
-        assert "重试次数: 14" in text.stdout
+        assert "重试次数: 13" in text.stdout
         assert "截止=" in text.stdout
         assert "authorization" not in text.stdout.lower()
         if http_status is None:

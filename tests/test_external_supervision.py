@@ -65,10 +65,58 @@ def test_retries_use_persistent_capped_backoff_without_crossing_deadline() -> No
     assert window["last_retry_delay_seconds"] == 60  # type: ignore[index]
 
     now[0] = 10 * 60 - 3
-    assert supervisor.before_retry(state)
-    assert sleeps[-1] == 3
     assert not supervisor.before_retry(state)
+    assert sleeps[-1] == 3
     assert state["status"] == "supervision_timeout"
+
+
+@pytest.mark.parametrize("started_at", [0.0003, 123.456789, 116.361424302, 10_000_000.123])
+def test_fractional_clock_stops_at_the_persisted_deadline(started_at: float) -> None:
+    now = [started_at]
+    state: dict[str, object] = {"status": "waiting_external"}
+    supervisor = ExternalSupervisor(
+        now=lambda: now[0], sleeper=lambda delay: now.__setitem__(0, now[0] + delay)
+    )
+    window = supervisor.observe(state)
+    assert window is not None
+    for _ in range(30):
+        if not supervisor.before_retry(state):
+            break
+    else:
+        pytest.fail("supervision did not stop within its bounded backoff")
+    assert now[0] == window["deadline"]
+    assert state["status"] == "supervision_timeout"
+    assert state["supervision_wait"]["elapsed_seconds"] == 600  # type: ignore[index]
+    assert state["diagnostics"][0]["elapsed_seconds"] == 600  # type: ignore[index]
+
+
+@pytest.mark.parametrize("offset", [-0.25, 0.0, 0.25])
+@pytest.mark.parametrize(
+    "persist_cost,oversleep", [(0.0, 0.0), (0.125, 0.0), (0.5, 0.0), (0.0, 0.5)]
+)
+def test_deadline_is_rechecked_after_persistence_and_sleep(
+    offset: float, persist_cost: float, oversleep: float,
+) -> None:
+    now = [123.456789]
+    sleeps: list[float] = []
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay + oversleep
+
+    supervisor = ExternalSupervisor(now=lambda: now[0], sleeper=sleep)
+    state: dict[str, object] = {"status": "waiting_external"}
+    window = supervisor.observe(state)
+    assert window is not None
+    deadline = float(window["deadline"])
+    now[0] = deadline + offset
+
+    assert not supervisor.before_retry(
+        state, persist_before_sleep=lambda: now.__setitem__(0, now[0] + persist_cost)
+    )
+    assert state["status"] == "supervision_timeout"
+    assert sleeps == ([-offset - persist_cost] if offset + persist_cost < 0 else [])
+    assert state["supervision_window"] is window
 
 
 def test_restarted_supervisor_reuses_the_window_and_backoff_count() -> None:
