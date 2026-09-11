@@ -18,6 +18,25 @@ from agent_run.state import (
 )
 
 
+def test_run_state_reads_pretty_json_and_saves_the_same_data_compactly(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state")
+    state = {"nested": [{"message": "中文状态", "values": [1, True, None]}]}
+    original = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+    store.runs_directory.mkdir(parents=True)
+    path = store.runs_directory / "run-1.json"
+    path.write_text(original, encoding="utf-8")
+
+    loaded = store.load_run("run-1")
+    assert loaded == state
+    store.save_run("run-1", loaded)
+
+    assert store.load_run("run-1") == state
+    assert loaded == state
+    assert len(path.read_bytes()) < len(original.encode("utf-8"))
+
+
 def test_run_state_persistence_rejects_oversized_write_and_read(
     tmp_path: Path,
 ) -> None:
