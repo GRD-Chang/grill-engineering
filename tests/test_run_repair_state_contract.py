@@ -13,7 +13,7 @@ from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
 )
-from conftest import _user_environment, seed_run, write_fixture
+from conftest import _apply_test_environment, seed_run, write_fixture
 from test_cli import issue, load_only_run_state, run_cli, stdout_json
 from run_acceptance_test_support import _canonical_run_budget
 
@@ -27,8 +27,7 @@ def _valid_run_state_template(
     root = tmp_path_factory.mktemp("repair-state-template")
     repo = Path(shutil.copytree(git_template, root / "repo"))
     with pytest.MonkeyPatch.context() as environment:
-        for variable, value in _user_environment(root / "user").items():
-            environment.setenv(variable, value)
+        _apply_test_environment(root / "user", environment)
         fixture = write_fixture(repo / "github.json", issues={"2": issue(2)})
         seed_run(repo, fixture, "1")
         state = load_only_run_state(repo)

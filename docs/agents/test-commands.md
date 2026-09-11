@@ -32,15 +32,15 @@ pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命�
 CLI、安装器等未单列的模块直接选择其测试文件。公共接口、共享状态、生命周期、依赖和测试基础设施
 变化应扩大到直接调用方、同族场景及历史回归；无法界定影响范围时运行完整套件。
 
-本地最终验收使用 `make test-full`：先检查 pip 和 Linux `os.memfd_create`、`os.pidfd_open` 能力，再执行完整套件，默认固定六个 pytest worker；缺少关键能力时拒绝全量入口，不以跳过进程边界测试代替验收。`make typecheck` 执行完整类型检查。
+本地最终验收使用 `make test-full`：先检查 pip，并真实创建、关闭 Linux memfd/pidfd，再执行完整套件，默认固定六个 pytest worker；缺少接口或内核拒绝调用时拒绝全量入口，不以跳过进程边界测试代替验收。`make typecheck` 执行完整类型检查。
 
-提交前优先使用 CI 相同的 Python 3.11 与锁定开发依赖；通过环境报告比较 Git、系统能力及依赖版本。Git 测试只使用公开支持的命令构造状态，例如通过本地 fetch 生成 `FETCH_HEAD`，不直接将伪引用交给 `update-ref`。不同版本本地通过不代表 CI 已通过，不应固定旧版 Git 来规避兼容性缺陷。
+提交前优先使用 CI 相同的 CPython 3.11.16 与锁定开发依赖；通过环境报告比较 Git、系统能力及依赖版本。Python 版本号本身不能证明构建支持 memfd/pidfd，部分便携构建缺少这些接口。先激活所选 venv，并确认 `python` 与 `python3` 都来自该环境；仅指定 Make 的 `PYTHON` 不会改变所有外部工具的解释器选择。Git 测试只使用公开支持的命令构造状态，例如通过本地 fetch 生成 `FETCH_HEAD`，不直接将伪引用交给 `update-ref`。不同版本本地通过不代表 CI 已通过，不应固定旧版 Git 来规避兼容性缺陷。
 六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`；CI 显式使用这个双 worker 命令，runner 规格和 job 数量不变。
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
 调试顺序问题用 `make test-full TEST_WORKERS=0`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。
 
-普通 pytest 自动按用例隔离 HOME/XDG；共享准备与 CLI 子进程使用同一环境。
+普通 pytest 自动按用例隔离 HOME/XDG，并将当前测试解释器所在目录放在 PATH 首位；共享准备与 CLI 子进程使用同一环境。继承的 Git 仓库位置和 `GIT_CONFIG*` 覆盖会被清除，系统 Git 配置被禁用，避免本地宿主设置进入 CI 场景；用例仍可在隔离 HOME 中创建 `.gitconfig` 或显式构造配置覆盖。Git Trace2 等诊断变量保留。
 Git 初始模板每个 worker 只创建一次，每个用例复制独立文件，禁止修改共享模板或改为共享可写仓库。
 默认删除通过用例的临时目录，只保留最近一次失败现场；排障完成后清理本次保留路径。
 若使用 `--basetemp`，只能指定本次新建的专用目录，并在取证后自行清理。

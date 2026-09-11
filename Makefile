@@ -9,7 +9,7 @@ REPORT_MAKE = $(MAKE)
 
 # Groups are starting points; shared changes also need their callers' tests.
 TESTS_policy = tests/test_delivery_policy.py tests/test_review_budget.py
-TESTS_state = tests/test_state_store.py tests/test_scope_revision.py
+TESTS_state = tests/test_state_store.py tests/test_scope_revision.py tests/test_error_safety.py
 TESTS_prompts = tests/test_codex_prompt_contract.py tests/test_codex_prompt_refinement.py
 TESTS_locator = tests/test_cli.py tests/test_state_store.py tests/test_run_locator*.py tests/test_test_environment.py -k 'locator or selector or test_pytest_isolates'
 TESTS_github = tests/test_github*.py tests/test_required_checks_observation.py tests/test_external_supervision.py
@@ -39,7 +39,7 @@ test:
 
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:
-	$(PYTHON) -c 'import os, pip, sys; sys.exit(0 if all(hasattr(os, name) for name in ("memfd_create", "pidfd_open")) else "完整测试需要支持 os.memfd_create 和 os.pidfd_open 的 Linux Python；请切换解释器，不得以跳过关键进程测试代替完整验收")'
+	$(PYTHON) -c 'import os, pip, sys; all(hasattr(os, name) for name in ("memfd_create", "pidfd_open")) or sys.exit("完整测试需要支持 os.memfd_create 和 os.pidfd_open 的 Linux Python；请切换解释器，不得以跳过关键进程测试代替完整验收"); os.close(os.memfd_create("agent-run-tests", os.MFD_CLOEXEC)); os.close(os.pidfd_open(os.getpid()))'
 	AGENT_RUN_TEST_WHEELHOUSE="$(abspath $(TEST_WHEELHOUSE))" $(PYTHON) -m pytest -n $(TEST_WORKERS) --dist worksteal $(PYTEST_ARGS)
 
 # Preserve diagnostics on failure; pipefail retains the test command's failure.
