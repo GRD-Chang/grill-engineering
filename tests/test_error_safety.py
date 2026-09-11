@@ -15,8 +15,22 @@ from agent_run.error_safety import bounded_error, redact_credentials
         ("gh\x00p_1234567890abcdef", "[REDACTED]"),
         ("sk\x00-1234567890abcdef", "[REDACTED]"),
         ("token=credential", "token=[REDACTED]"),
+        ("to\x00ken=credential", "token=[REDACTED]"),
+        ("client_secret=credential", "client_secret=[REDACTED]"),
+        ("ſecret=credential", "ſecret=[REDACTED]"),
         ('api_Key="credential words"', 'api_Key="[REDACTED]"'),
         ("authorızation: Bearer credential", "authorızation: [REDACTED]"),
+        ("authorİzation: credential", "authorİzation: [REDACTED]"),
+        (
+            "proxy-authorization: Basic credential",
+            "proxy-authorization: [REDACTED]",
+        ),
+        (
+            "private_key=-----begin test key-----body-----end test key-----",
+            "private_key=[REDACTED]",
+        ),
+        ("prıvate_Key=first\nsecond", "private_key=[REDACTED]"),
+        ("private\x00_key=first\nsecond", "private_key=[REDACTED]"),
         (
             "https:\x00//user:credential@example.invalid",
             "https://[REDACTED]@example.invalid",
