@@ -32,6 +32,7 @@ from agent_run.state import StateStore
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.review_budget import new_budget
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_round_agents, passing_acceptance
 
@@ -1665,7 +1666,7 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert state["ticket_jobs"]["2"]["phase"] == "blocked"
     assert "3" not in state["ticket_jobs"]
     assert "4" not in state["ticket_jobs"]
-    status_view = run_cli(git_repo, fixture, "status", run_id)
+    status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
     assert status_view.returncode == 0
     assert "Repository: example/project" in status_view.stdout
     assert "Parent:     #1 Parent spec" in status_view.stdout
@@ -1691,14 +1692,14 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         "digest",
     ):
         assert internal_value not in status_view.stdout
-    history_view = run_cli(git_repo, fixture, "history", run_id)
+    history_view = invoke_cli_inprocess(git_repo, fixture, "history", run_id)
     assert history_view.returncode == 0
     assert "类型: Human Blocker" in history_view.stdout
     assert "对象: Ticket #2" in history_view.stdout
     assert _human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"] in history_view.stdout
     for command in ("status", "history"):
         json_view = stdout_json(
-            run_cli(git_repo, fixture, command, run_id, "--json")
+            invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
         )
         assert json_view["operator_action"]["type"] == "Human Blocker"
         assert json_view["operator_action"]["object"] == "Ticket #2"
@@ -1793,7 +1794,7 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert state["ticket_jobs"]["3"]["phase"] == "completed"
     assert state["ticket_jobs"]["4"]["phase"] == "completed"
     history_json = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
     assert any(
         event["kind"] == "resume" and event["details"] == [long_response]
@@ -1803,13 +1804,13 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     stale_timeline_history = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )
     assert any(
         event["kind"] == "resume" and event["details"] == [long_response]
         for event in stale_timeline_history["events"]
     )
-    history_text = run_cli(git_repo, fixture, "history", run_id).stdout
+    history_text = invoke_cli_inprocess(git_repo, fixture, "history", run_id).stdout
     assert "…（已截断；完整内容见 --json）" in history_text
     assert long_response not in history_text
 

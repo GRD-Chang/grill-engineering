@@ -118,9 +118,9 @@ def test_capacity_then_ordinary_continue_with_short_role_prompt(
     assert len(calls) == 4
     assert sum(waits) == 60
     assert all("resume" in call["arguments"] for call in calls[1:])
-    assert "Development Brief" in calls[0]["prompt"]
+    assert "开始前先读取" in calls[0]["prompt"]
     assert all(
-        "继续完成你负责的当前开发交付" in call["prompt"]
+        "继续完成你负责的开发任务" in call["prompt"]
         for call in calls[1:]
     )
     assert len({call["prompt"] for call in calls[1:]}) == 1
@@ -164,7 +164,7 @@ def test_interrupted_last_json_repair_preserves_step(
     assert len(calls) == 2
     assert all("summary missing" in call["prompt"] for call in calls)
     assert all(
-        "不重新执行开发、验证或工具调用" in call["prompt"]
+        "不重新开发、审查、验证、读取项目或调用工具" in call["prompt"]
         for call in calls
     )
     assert all(
@@ -365,7 +365,7 @@ def test_readonly_roles_continue_same_work(
     assert len(calls) == 2
     assert "resume" in calls[1]["arguments"]
     assert calls[0]["prompt"] != calls[1]["prompt"]
-    assert "继续完成你负责的当前" in calls[1]["prompt"]
+    assert "继续完成你负责的" in calls[1]["prompt"]
     for call in calls:
         arguments = call["arguments"]
         assert arguments[arguments.index(str(tmp_path)) - 1] == "--ro-bind"

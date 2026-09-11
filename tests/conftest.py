@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,31 @@ from agent_run.state import StateStore
 from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlStore, TaskKey
 
 
+_GIT_LOCATION_VARIABLES = {
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_TEMPLATE_DIR",
+}
+
+
+def _inherited_git_override(variable: str) -> bool:
+    return variable in _GIT_LOCATION_VARIABLES or variable.startswith("GIT_CONFIG")
+
+
 def _user_environment(root: Path) -> dict[str, str]:
-    environment = {}
+    python_directory = str(Path(sys.executable).parent)
+    inherited_path = os.environ.get("PATH", os.defpath)
+    environment = {
+        "PATH": os.pathsep.join(
+            [python_directory]
+            + [entry for entry in inherited_path.split(os.pathsep) if entry != python_directory]
+        ),
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
     for variable, directory in (
         ("HOME", "home"),
         ("XDG_STATE_HOME", "state"),
@@ -39,12 +63,19 @@ def _user_environment(root: Path) -> dict[str, str]:
     return environment
 
 
+def _apply_test_environment(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in tuple(os.environ):
+        if _inherited_git_override(variable):
+            monkeypatch.delenv(variable)
+    for variable, value in _user_environment(root).items():
+        monkeypatch.setenv(variable, value)
+
+
 @pytest.fixture(autouse=True)
 def isolated_user_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Helpers and CLI children share one private user environment per case."""
 
-    for variable, value in _user_environment(tmp_path / "user").items():
-        monkeypatch.setenv(variable, value)
+    _apply_test_environment(tmp_path / "user", monkeypatch)
 
 
 @pytest.fixture(scope="session")
@@ -52,7 +83,9 @@ def git_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build once per worker; tests only receive independent copies."""
 
     root = tmp_path_factory.mktemp("git-template")
-    environment = os.environ | _user_environment(root / "user")
+    environment = {
+        key: value for key, value in os.environ.items() if not _inherited_git_override(key)
+    } | _user_environment(root / "user")
     repo = root / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=repo, env=environment, check=True, capture_output=True)

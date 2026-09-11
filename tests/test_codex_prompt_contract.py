@@ -13,13 +13,13 @@ from agent_run.delivery_loop import TicketDeliveryAdapter
 
 
 PUBLICATION_BLOCKER_SHAPE = (
-    '`{"result_kind":"human_blocker","commit_message":null,'
+    '{"result_kind":"human_blocker","commit_message":null,'
     '"pr_title":null,"pr_body_markdown":null,'
-    '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
+    '"human_blockers":["发生了什么；已尝试什么；人必须做什么"]}'
 )
 DEVELOPMENT_BLOCKER_SHAPE = (
-    '`{"result_kind":"human_blocker","summary":null,'
-    '"human_blockers":["发生了什么；尝试了什么；人必须做什么"]}`'
+    '{"result_kind":"human_blocker","summary":null,'
+    '"human_blockers":["发生了什么；已尝试什么；人必须做什么"]}'
 )
 PASS_EVIDENCE = {
     "e2e": "操作或命令：运行候选公开流程；退出码：0；结果：候选通过端到端复验。",
@@ -163,7 +163,7 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
                 "TICKET_PREVIOUS_BASE",
                 "TICKET_PREVIOUS_CANDIDATE",
                 "TICKET_PREVIOUS_TREE",
-                "Previous reviewed Candidate",
+                "上一次验收对象",
             ),
         ),
         (
@@ -188,7 +188,7 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
                 "RUN_CURRENT_TREE",
                 "RUN_PREVIOUS_DEFAULT",
                 "RUN_PREVIOUS_HEAD",
-                "Previous Run head",
+                "上一次验收对象",
             ),
         ),
         (
@@ -215,7 +215,7 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
                 "REPAIR_CURRENT_TREE",
                 "REPAIR_PREVIOUS_BASE",
                 "REPAIR_PREVIOUS_CANDIDATE",
-                "Previous Repair Candidate",
+                "上一次验收对象",
             ),
         ),
     )
@@ -231,11 +231,13 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
         assert "Reviewer 2+" not in prompt
         assert "本窗口 Reviewer" not in prompt
         assert "因前次调用失败而继续的同 Thread Resume" not in prompt
-        assert "优先核销上一轮 Findings" in prompt
-        assert "repair delta" in prompt
+        assert "优先复核原有问题" in prompt
+        assert "这次修改" in prompt
         assert "直接回归" in prompt
-        assert "缺少具体风险依据时，避免对未变化代码重复完整扫描" in prompt
-        assert "当前证据或实际影响需要时，自主扩大检查范围" in prompt
+        assert "没有具体风险依据时，不重复完整扫描未变化代码" in prompt
+        assert "当前证据或影响需要时可以扩大检查" in prompt
+        assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
+        assert "旧结果不能证明当前代码已经通过" in prompt
 
     r2_prompt = _capture_public_prompt(
         tmp_path,
@@ -259,14 +261,15 @@ def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
         },
         name="run-repair-review-previous-run",
     )
-    assert "Previous Run Acceptance Context" in r2_prompt
+    assert "上一次验收对象" in r2_prompt
     assert "R1_DEFAULT_BASE" in r2_prompt
     assert "R1_RUN_HEAD" in r2_prompt
-    assert "Previous Repair Candidate" not in r2_prompt
+    assert "R1_EXPECTED_TREE" in r2_prompt
 
 
+@pytest.mark.parametrize("resume", [False, True])
 def test_fallback_publication_prompt_receives_only_minimal_projection(
-    tmp_path: Path, monkeypatch: Any
+    tmp_path: Path, monkeypatch: Any, resume: bool
 ) -> None:
     prompt = _capture_public_prompt(
         tmp_path,
@@ -274,6 +277,7 @@ def test_fallback_publication_prompt_receives_only_minimal_projection(
         "publication",
         {
             "acceptance_scope": "ticket",
+            **({"thread_id": "publication-thread", "_invocation_mode": "resume"} if resume else {}),
             "fallback_receipt": {
                 "window": "PRIVATE_WINDOW",
                 "reviewer_invocations": "PRIVATE_REVIEW_COUNT",
@@ -289,6 +293,7 @@ def test_fallback_publication_prompt_receives_only_minimal_projection(
                 },
                 "development_delta": True,
                 "current_candidate_has_additional_review": False,
+                "failure_evidence_source": "SAFE_FAILURE_EVIDENCE_SOURCE",
             },
         },
         name="fallback-minimal-projection",
@@ -296,14 +301,15 @@ def test_fallback_publication_prompt_receives_only_minimal_projection(
 
     assert "SAFE_PREVIOUS_CANDIDATE" in prompt
     assert "SAFE_CURRENT_CANDIDATE" in prompt
+    assert "SAFE_FAILURE_EVIDENCE_SOURCE" in prompt
     assert "PRIVATE_WINDOW" not in prompt
     assert "PRIVATE_REVIEW_COUNT" not in prompt
     assert "PRIVATE_ARTIFACT" not in prompt
     assert "PRIVATE_CI" not in prompt
-    assert "Fallback Publication Context" in prompt
-    assert "不证明三个验收 lane 通过" in prompt
-    assert "完整独立验收三条 lane 的实际证据" not in prompt
-    assert "Candidate delta" in prompt
+    assert "当前修改没有独立验收通过的结论" in prompt
+    assert "最近一次审查针对的是修改前的代码" in prompt
+    assert "不能声称当前代码通过验收" in prompt
+    assert "后续修改" in prompt
 
 
 def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
@@ -331,11 +337,12 @@ def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
         name="run-repair-role",
     )
 
-    assert "当前 Ticket Candidate 的独立集成验收工程师" in ticket
-    assert "当前 Parent-only Candidate 的独立验收工程师" in parent
-    assert "当前 Run Repair PR 的发布叙事工程师" in run_repair
-    assert "独立 Fresh Acceptance 验收工程师" not in ticket
-    assert "独立 Fresh Acceptance 验收工程师" not in parent
+    assert "独立验收工程师" in ticket
+    assert "具体任务的标题、正文和验收条件确定本次范围" in ticket
+    assert "独立验收工程师" in parent
+    assert "该需求的标题、正文和全部验收条件确定本次范围" in parent
+    assert "交付说明" in run_repair
+    assert "读取最终子任务及依赖" in run_repair
 
 
 def test_non_publication_prompt_keeps_exact_human_blocker_result(
@@ -368,12 +375,14 @@ def test_development_prompt_keeps_git_authority_local_to_the_role(
         name="development-authority",
     )
 
-    assert "当前 checkout 最终保留的交付修改" in prompt
-    assert "包括应交付的未跟踪文件" in prompt
-    assert "会整体成为本轮 Candidate Commit 的内容" in prompt
-    assert "可以用只读 Git 命令理解历史" in prompt
-    assert "只整理当前工作树，不暂存、commit、改写 Git 历史或写入远端" in prompt
-    assert "修正先前改动时直接形成当前正确文件树" in prompt
+    assert "程序会统一提交当前工作区的修改和未被忽略的新增文件" in prompt
+    assert "检查全部未提交内容" in prompt
+    assert "保留应交付的" in prompt
+    assert "可以使用只读 Git" in prompt
+    assert "只整理当前工作树，不暂存、commit、改写 Git 历史或执行 GitHub 写入" in prompt
+    assert "工作区外的本轮临时路径也要定位并清理" in prompt
+    assert "不进行宽泛删除" in prompt
+    assert "不用忽略规则隐藏交付文件" in prompt
     assert "Controller" not in prompt
     assert "Publisher" not in prompt
     assert "后续 Git/GitHub 交付" not in prompt
@@ -409,14 +418,13 @@ def test_repair_prompt_preserves_raw_evidence_without_controller_triage(
     )
 
     assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
-    assert "`findings` 是本轮必须处理的问题证据" in prompt
-    assert "Deferred to #N：…" in prompt
-    assert "Non-blocking observation：…" in prompt
+    assert "当前范围内全部有证据支持的 findings" in prompt
+    assert "延期说明和可选建议" in prompt
     assert "不是自动修改指令" in prompt
-    assert "不限定实现方案，也不表示问题只存在于列出的示例" in prompt
-    assert "结合当前代码理解根因" in prompt
-    assert "同一决策点直接影响的场景" in prompt
-    assert "本次修复可能造成的直接回归" in prompt
+    assert "问题示例不限制调查范围，实现方式由你判断" in prompt
+    assert "理解根因及其直接影响" in prompt
+    assert "直接影响的同类场景" in prompt
+    assert "本次修复可能造成的回归" in prompt
 
 
 def test_git_integrity_prompt_preserves_only_raw_integrity_evidence(
@@ -441,7 +449,7 @@ def test_git_integrity_prompt_preserves_only_raw_integrity_evidence(
         name="git-integrity-repair",
     )
 
-    assert "Git Integrity Repair" in prompt
+    assert "可在当前目录修复的完整性问题" in prompt
     assert "INTEGRITY_HEAD" in prompt
     assert "agent-owned commit" in prompt
     assert "reviewer_invocations" not in prompt
@@ -455,22 +463,22 @@ def test_git_integrity_prompt_preserves_only_raw_integrity_evidence(
         (
             "ticket",
             (
-                "Ticket Contract",
-                "Parent Context",
-                "sibling/follow-on Ticket",
-                "task_issue_url",
+                "具体任务的标题、正文和验收条件确定本次范围",
+                "背景用于理解整体目标",
+                "不自动增加其他子任务的工作",
+                "https://github.com/example/project/issues/125",
             ),
-            ("完整 Parent Issue；",),
+            ("该需求的标题、正文和全部验收条件确定本次范围",),
         ),
         (
             "parent_only",
-            ("完整 Parent Issue", "Acceptance Criteria"),
-            ("Ticket Contract", "task_issue_url"),
+            ("本次负责的完整需求", "该需求的标题、正文和全部验收条件确定本次范围"),
+            ("本次负责的具体任务", "https://github.com/example/project/issues/125"),
         ),
         (
             "run",
-            ("完整 Parent、最终 Ticket Set", "跨 Ticket 交互", "预期合并结果"),
-            ("Ticket Contract", "task_issue_url"),
+            ("本次负责的完整需求", "最终子任务及依赖", "任务之间的配合和最终用户路径"),
+            ("本次负责的具体任务", "https://github.com/example/project/issues/125"),
         ),
     ],
 )
@@ -518,29 +526,27 @@ def test_development_prompt_uses_risk_proportional_verification_and_stops_at_com
         name="risk-proportional-development",
     )
 
-    assert "最小且可维护的方案" in prompt
-    assert "验收示例不是完整问题空间" in prompt
-    assert "涉及共享决策点时" in prompt
-    assert "当前需求直接影响的同族场景" in prompt
-    assert "根据实际风险取得最低充分证据" in prompt
-    assert "完整测试套件不是每轮默认的固定门槛" in prompt
-    assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt
-    assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt
-    assert "稳定候选是已知实现修改、相关验证及需先处理的问题已经收口" in prompt
-    assert "完整套件失败后，先定向诊断、修复并验证受影响路径" in prompt
-    assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt
-    assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
-    assert "先自行检查当前完整工作树、已知风险与未处理问题" in prompt
-    assert "低风险局部改动可以直接收口" in prompt
-    assert "默认最多进行一个 Development Preflight Round" in prompt
-    assert "一轮可以包含多个不同风险方向的审查型 subagent" in prompt
+    assert "使用 skill:implement" in prompt
+    assert "按修改的实际风险验证受影响功能" in prompt
+    assert "无需每轮固定运行完整测试" in prompt
+    assert "影响范围不明或发现具体风险时仍应扩大验证" in prompt
+    assert "完整测试失败时先定向定位和修复，再对收口后的代码复验" in prompt
+    assert "后续审查和最终完整测试，由另一位验收工程师负责" in prompt
+    assert "不把未执行或旧代码的通过当作本次结果" in prompt
+    assert "实现、验证和自行检查后" in prompt
+    assert "建议安排审查子 Agent" in prompt
+    assert "本次开发最多组织一轮" in prompt
+    assert "按实际风险安排不同方向的审查子 Agent" in prompt
     assert 'fork_turns: "none"' in prompt
-    assert "完成审查所需的中立任务事实、当前范围和真实证据" in prompt
-    assert "当前未提交工作树及未跟踪的交付内容" in prompt
-    assert "不常规启动第二轮内部 Reviewer" in prompt
-    assert "内部预检不形成 Acceptance Artifact" in prompt
-    assert "根据实际改动和新发现的风险自主选择审查方式与复查强度" not in prompt
-    assert "取得有效复查" not in prompt
+    assert "中立的需求、范围和代码事实，不传递预设结论" in prompt
+    assert "包括未提交修改与未跟踪的交付文件" in prompt
+    assert "覆盖其默认只比较已提交 HEAD 的做法" in prompt
+    assert "处理本轮问题后自行检查和复测，不反复启动通用审查" in prompt
+    assert "探索或并行实现等其他协作按任务需要组织" in prompt
+    assert "实现本次全部验收条件" in prompt
+    assert "处理已知的当前范围问题" in prompt
+    assert "你只报告实际开发与自测结果" in prompt
+    assert "交付是否通过审查，由验收工程师另行判断" in prompt
 
 
 @pytest.mark.parametrize(
@@ -583,7 +589,7 @@ def test_development_prompt_uses_risk_proportional_verification_and_stops_at_com
         ),
     ],
 )
-def test_directed_repair_self_checks_without_internal_reviewer(
+def test_directed_repair_reviews_only_new_critical_design_risks(
     tmp_path: Path,
     monkeypatch: Any,
     request_extra: dict[str, Any],
@@ -610,14 +616,20 @@ def test_directed_repair_self_checks_without_internal_reviewer(
 
     for prompt in (full_prompt, compact_prompt):
         assert evidence_marker in prompt
-        assert "自行检查当前工作树并完成与风险相称的验证" in prompt
-        assert "本轮不需要启动开发侧 Reviewer" in prompt
+        assert "实际风险验证受影响功能" in prompt
+        assert "默认不再组织独立审查" in prompt
+        assert "既改变原方案、又引入此前未覆盖的关键风险" in prompt
+        assert "才允许一次针对该风险的审查" in prompt
+        assert 'fork_turns: "none"' in prompt
+        assert "中立" in prompt
+        assert "未跟踪" in prompt and "交付文件" in prompt
+        assert "处理结果后自行检查和复测，不反复启动通用审查" in prompt
         assert "Development Preflight Round" not in prompt
-        assert "审查型 subagent" not in prompt
-        assert "取得有效复查" not in prompt
-    assert "Development Brief" in full_prompt
-    assert "使用 skill:implement 完成当前定向修复" in compact_prompt
-    assert "Development Brief" not in compact_prompt
+        assert "建议安排审查子 Agent" not in prompt
+    assert "开始前先读取" in full_prompt
+    assert "使用 skill:implement" in compact_prompt
+    assert "已掌握的需求" in compact_prompt
+    assert "开始前先读取" not in compact_prompt
     assert "Thread" not in compact_prompt
     assert "Resume" not in compact_prompt
 
@@ -658,6 +670,7 @@ def test_directed_repair_keeps_issue_urls_without_mandatory_reread(
         "develop",
         {
             "acceptance_scope": acceptance_scope,
+            "thread_id": "existing-development-thread",
             **request_urls,
             "repair_source": "required_checks",
             "ci_evidence": {"check": "DIRECTED_REPAIR_CI_EVIDENCE"},
@@ -667,12 +680,10 @@ def test_directed_repair_keeps_issue_urls_without_mandatory_reread(
 
     for url in required_urls:
         assert url in prompt
-    assert "当前 Issue URL 用于确认本轮修复对象和需求边界" in prompt
-    assert "以本轮原始 Repair Evidence、当前 checkout" in prompt
-    assert "再通过只读 `gh issue view` 回查对应 Issue" in prompt
-    assert "不要仅因开始本轮修复而重复读取没有变化的需求" in prompt
-    assert "开始前必须通过只读 `gh issue view`" not in prompt
-    assert "开始前也必须通过只读 `gh issue view`" not in prompt
+    assert "以当前代码、原始证据及已掌握的需求为依据" in prompt
+    assert "通过只读 `gh issue view` 回查对应 Issue" in prompt
+    assert "不要仅因开始新一轮修复就重复读取未变化的需求" in prompt
+    assert "开始前先读取" not in prompt
 
 
 def test_initial_development_still_requires_reading_issue_contracts(
@@ -692,9 +703,10 @@ def test_initial_development_still_requires_reading_issue_contracts(
 
     assert "INITIAL_PARENT_URL" in prompt
     assert "INITIAL_TICKET_URL" in prompt
-    assert "开始前必须通过只读 `gh issue view`" in prompt
-    assert "开始前也必须通过只读 `gh issue view`" in prompt
-    assert "当前 Issue URL 用于确认本轮修复对象和需求边界" not in prompt
+    assert "开始前先读取具体任务，再读取背景" in prompt
+    assert "只读 `gh issue view`" in prompt
+    assert "读取标题、正文和验收条件" in prompt
+    assert "已掌握的需求" not in prompt
 
 
 def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
@@ -737,9 +749,9 @@ def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
         )
 
     assert prompts[0] == prompts[1]
-    assert "Required-Checks Repair" in prompts[0]
+    assert "下列检查失败对应当前提交" in prompts[0]
     assert "EXACT_HEAD_CI_EVIDENCE" in prompts[0]
-    assert "本轮不需要启动开发侧 Reviewer" in prompts[0]
+    assert "默认不再组织独立审查" in prompts[0]
 
 
 def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestration(
@@ -757,23 +769,28 @@ def test_fresh_acceptance_prompt_keeps_lane_independence_without_fixed_orchestra
         name="fresh-acceptance",
     )
 
-    assert "E2E、Standards 和 Spec 三种独立视角" in prompt
-    assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in prompt
-    assert "记录实际验证对象、命令、exit code、结果和相关环境" in prompt
-    assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt
-    assert "完整测试失败时提供具体失败证据和复验要求" in prompt
-    assert "没有 Previous Acceptance Context 时，对完整 Review Boundary 建立基线" in prompt
-    assert "Standards 与 Spec 默认使用静态证据" in prompt
-    assert "必须调用 `skill:code-review`" in prompt
-    assert "你对三个维度的最终判断负责" in prompt
-    assert "不要求每个维度对应一个独立 subagent" in prompt
+    assert "除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证" in prompt
+    assert "完整测试与必要检查" in prompt
+    assert "记录实际对象、验证入口、操作或命令、预期与实际结果、必要环境" in prompt
+    assert "退出码" in prompt
+    assert "代码、测试、依赖或环境变化后重新判断旧证据是否适用" in prompt
+    assert "失败时给出具体证据与复验要求" in prompt
+    assert "按当前需求和代码检查本次完整范围，独立建立验收结论" in prompt
+    assert "Standards 与 Spec 使用静态证据" in prompt
+    assert "不重复相同完整套件，除非具体风险确实需要" in prompt
+    assert "使用 skill:code-review" in prompt
+    assert "对三个维度的最终结果负责" in prompt
     assert 'fork_turns: "none"' in prompt
     assert "Deferred to #N：…" in prompt
     assert "Non-blocking observation：…" in prompt
-    assert "保持现状会使当前验收对象不可接受" in prompt
-    assert "同一根因的多个表现应合并报告" in prompt
-    assert "没有实际后续价值的轻微问题直接省略" in prompt
-    assert "问题、证据、所需修复和复验方式" in prompt
+    assert "使当前交付不可接受" in prompt
+    assert "同一根因合并为一条" in prompt
+    assert "无实际价值的轻微意见省略" in prompt
+    assert "问题、证据、所需修复及复验方式" in prompt
+    assert "findings 中的问题会交回开发修复" in prompt
+    assert "二者不进入 findings，不改变状态，不触发自动修复" in prompt
+    assert "覆盖 code-review 默认的 Markdown 报告步骤" in prompt
+    assert "不输出额外报告或问题处理对照表" in prompt
     assert "必须派发三个不同 subagent" not in prompt
     assert "不得用父 Reviewer 自己的判断替代缺失的独立审查视角" not in prompt
     assert "任一 fail 将回到 Development" not in prompt
@@ -811,14 +828,13 @@ def test_review_and_directed_repair_prompts_receive_bounded_budget_context(
         name="repair-budget-context",
     )
 
-    assert "这是当前对象的第 2 次独立验收" in review
-    assert "根据当前可用额度" in review
-    assert "本轮结束后最多还可自动启动 1 次独立验收" in review
-    assert "已经完成 2 次独立验收" in repair
-    assert "最多还可自动启动 1 次独立验收" in repair
+    assert "这是本任务的第 2 次独立验收" in review
+    assert "本轮结束后最多还可启动 1 次独立验收" in review
+    assert "本任务已完成 2 次独立验收" in repair
+    assert "最多还可启动 1 次独立验收" in repair
     for prompt in (review, repair):
         assert "不改变验收标准" in prompt
-        assert "不得隐瞒、降级或放行必须修复的问题" in prompt
+        assert "不要隐瞒、降级或放行必须修复的问题" in prompt
         assert "Review Budget Window" not in prompt
         assert "checkpoint" not in prompt
 
@@ -838,11 +854,12 @@ def test_run_repair_review_prompt_describes_the_merge_preview_boundary(
         name="run-repair-review",
     )
 
-    assert "独立 Run Repair 验收工程师" in prompt
-    assert "Run Repair 的完整 Parent、最终 Ticket Set" in prompt
-    assert "repair Candidate 后的无提交合并预览" in prompt
-    assert "HEAD 保持 Run Branch base 是正常现象" in prompt
-    assert "不得把局部 Repair Candidate 单独通过当作整体验收通过" in prompt
+    assert "独立验收工程师" in prompt
+    assert "最终子任务及依赖" in prompt
+    assert "本次修复与默认分支合并后的未提交预览" in prompt
+    assert "HEAD 留在默认分支基准是正常情况" in prompt
+    assert "不能用单个子任务或局部修复的通过代替整体完成" in prompt
+    assert "整体开发基准与实际合并基准可能不同" in prompt
 
 
 def test_publication_prompt_does_not_turn_nonblocking_evidence_into_delivery(
@@ -873,9 +890,9 @@ def test_publication_prompt_does_not_turn_nonblocking_evidence_into_delivery(
         name="publication-evidence",
     )
 
-    assert "Deferred to #N：…" in prompt
-    assert "Non-blocking observation：…" in prompt
-    assert "不得描述为当前交付范围的交付成果、已实现能力或 User Impact" in prompt
+    assert "Deferred to #117：default branch drift" in prompt
+    assert "Non-blocking observation：可选重构" in prompt
+    assert "延期范围和可选建议不是本次交付成果" in prompt
 
 
 def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
@@ -1245,7 +1262,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                     assert role_request[evidence_key] in prompt
             if with_human_context:
                 assert json.dumps(prior_blockers[0], ensure_ascii=False) in prompt
-                assert "不表示问题已经解决" in prompt
+                assert "回复不等于问题已经解决" in prompt
                 assert "Human Blocker 恢复" not in prompt
                 assert "LATEST_RESPONSE_SENTINEL" in prompt
                 assert "OLD_RESPONSE_SENTINEL" not in prompt
@@ -1254,49 +1271,48 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
-                assert "完整测试套件不是每轮默认的固定门槛" in prompt, active_case
-                assert "共享状态、生命周期、持久化、公共接口、测试基础设施或依赖变化" in prompt, active_case
-                assert "影响范围不明或具体 Finding 要求时，可以提前运行完整套件" in prompt, active_case
-                assert "稳定候选是已知实现修改、相关验证及需先处理的问题已经收口" in prompt, active_case
-                assert "完整套件失败后，先定向诊断、修复并验证受影响路径" in prompt, active_case
-                assert "独立 Acceptance 的 E2E 负责稳定候选的完整验证" in prompt, active_case
-                assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
-                assert "当前 checkout 最终保留的交付修改" in prompt
-                assert "会整体成为本轮 Candidate Commit 的内容" in prompt
+                assert "无需每轮固定运行完整测试" in prompt, active_case
+                assert "影响范围不明或发现具体风险时仍应扩大验证" in prompt, active_case
+                assert "完整测试失败时先定向定位和修复，再对收口后的代码复验" in prompt, active_case
+                assert "后续审查和最终完整测试，由另一位验收工程师负责" in prompt, active_case
+                assert "不把未执行或旧代码的通过当作本次结果" in prompt, active_case
+                assert "程序会统一提交当前工作区的修改和未被忽略的新增文件" in prompt
                 assert "只整理当前工作树" in prompt
                 if role_request.get("repair_scope") == "run_repair":
-                    assert "Run Repair 的完整 Parent、最终 Ticket Set" in prompt, active_case
+                    assert "多个子任务的整体结果" in prompt, active_case
             else:
                 assert "受管开发工作区" not in prompt, active_case
             assert "Controller" not in prompt, active_case
             assert "Publisher" not in prompt, active_case
-            assert "动态 Context 中的 URL 不是需求摘要" in prompt, active_case
-            assert "Acceptance Criteria" in prompt, active_case
+            assert "读取" in prompt, active_case
+            assert "验收条件" in prompt, active_case
+            for internal_term in ("Ticket Contract", "Review Boundary", "Delivery Run", "Initial Development"):
+                assert internal_term not in prompt, active_case
             if method == "develop":
-                assert "在当前 checkout 中检查全部未提交内容" in prompt, active_case
-                assert "仅长期、可再生且不应版本控制的项目产物" in prompt, active_case
-                assert "不暂存、commit、改写 Git 历史或写入远端" in prompt, active_case
+                assert "检查全部未提交内容" in prompt, active_case
+                assert "只有长期可再生且不应版本控制的" in prompt, active_case
+                assert "不暂存、commit、改写 Git 历史或执行 GitHub 写入" in prompt, active_case
             elif method == "review":
-                assert "E2E、Standards 和 Spec 三种独立视角" in prompt, active_case
-                assert "E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查" in prompt, active_case
-                assert "Standards 与 Spec 默认使用静态证据" in prompt, active_case
-                assert "记录实际验证对象、命令、exit code、结果和相关环境" in prompt, active_case
-                assert "代码、测试、依赖或相关环境变化后，重新判断旧结果的适用性" in prompt, active_case
-                assert "不得修复源码、测试、配置或 `.gitignore`" in prompt, active_case
-                assert "所需修复和复验方式" in prompt, active_case
-                assert "自由文本自然表达" in prompt, active_case
+                assert "除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证" in prompt, active_case
+                assert "完整测试与必要检查" in prompt, active_case
+                assert "Standards 与 Spec 使用静态证据" in prompt, active_case
+                assert "记录实际对象、验证入口、操作或命令、预期与实际结果、必要环境" in prompt, active_case
+                assert "代码、测试、依赖或环境变化后重新判断旧证据是否适用" in prompt, active_case
+                assert "整个工作区保持只读" in prompt, active_case
+                assert "所需修复及复验方式" in prompt, active_case
+                assert "e2e 的 evidence 说明实际操作及结果" in prompt, active_case
                 assert "必须严格使用" not in prompt, active_case
                 assert "严格采用" not in prompt, active_case
                 if name == "run_acceptance":
-                    assert "跨 Ticket 交互" in prompt
-                    assert "预期合并结果" in prompt
+                    assert "任务之间的配合" in prompt
+                    assert "最终用户路径" in prompt
             else:
                 assert "What Problem This Solves" in prompt, active_case
-                assert "实际操作或命令与可观察结果" in prompt, active_case
-                assert "按变更规模调整章节和措辞" in prompt, active_case
-                assert "任务关联、关闭和完成信息由 Runner 填写" in prompt, active_case
+                assert "实际测试或检查、结果及覆盖范围" in prompt, active_case
+                assert "按变更规模调整篇幅、合并章节" in prompt, active_case
+                assert "任务关联、关闭与完成信息由程序填写" in prompt, active_case
                 assert "必须有四个非空二级标题" not in prompt, active_case
-                assert "CI、Candidate、SHA、门禁和生命周期" in prompt, active_case
+                assert "内部提交身份和门禁信息不写入产品叙事" in prompt, active_case
 
 
 def test_run_prompts_describe_run_scope_without_controller_private_records(
@@ -1325,11 +1341,16 @@ def test_run_prompts_describe_run_scope_without_controller_private_records(
         name="run-acceptance",
     )
 
-    assert "Required-Checks Repair：当前 Delivery Run" in checks_repair
-    assert "Required-Checks Repair：当前 Ticket" not in checks_repair
+    assert "下列检查失败对应当前提交" in checks_repair
+    assert "多个子任务的整体结果" in checks_repair
+    assert "具体任务的标题、正文和验收条件确定本次范围" not in checks_repair
     assert "Completion Record" not in run_acceptance
     assert "Expected Merge Result" not in run_acceptance
-    assert "完整 Parent、最终 Ticket Set、依赖关系、累计变更、跨 Ticket 交互和预期合并结果" in run_acceptance
+    assert "最终子任务" in run_acceptance
+    assert "依赖" in run_acceptance
+    assert "累计改动" in run_acceptance
+    assert "任务之间的配合" in run_acceptance
+    assert "最终用户路径" in run_acceptance
 
 
 @pytest.mark.parametrize(
@@ -1420,7 +1441,7 @@ def test_ticket_116_keeps_follow_on_scope_out_of_development_and_findings(
     assert ticket_url in review
     assert follow_on_url not in development
     assert follow_on_url not in review
-    assert "sibling/follow-on Ticket 不会自动进入本轮范围" in review
+    assert "不自动增加其他子任务的工作" in review
     assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in repair
     assert f"Deferred to #{follow_on_number}：{follow_on_note}" in repair
     assert "不是自动修改指令" in repair
@@ -1438,24 +1459,26 @@ def test_ticket_116_keeps_follow_on_scope_out_of_development_and_findings(
     ],
 )
 def test_candidate_run_review_prompt_excludes_run_repair_evidence(
-    evidence_key: str, sentinel: object
+    tmp_path: Path, monkeypatch: Any, evidence_key: str, sentinel: object
 ) -> None:
-    prompt = CodexCliBackend._review_prompt(
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
         {
             "acceptance_scope": "run",
             "candidate_acceptance": True,
             "parent_issue_url": "https://github.com/example/project/issues/1",
             evidence_key: sentinel,
-        }
+        },
+        name=f"candidate-run-with-{evidence_key}",
     )
 
-    assert "你是独立 Candidate Run Acceptance 验收工程师。" in prompt
-    assert (
-        "当前 Validation Checkout 是将本轮 Repair Candidate 应用到当前 "
-        "default head 后的预期合并结果"
-    ) in prompt
-    assert "仍须按完整 Run Review Boundary 验收" in prompt
-    assert "不得把局部 Repair Candidate 的 diff 通过当作完整 Run 通过" in prompt
+    assert "独立验收工程师" in prompt
+    assert "合并" in prompt
+    assert "预览" in prompt
+    assert "整体结果" in prompt
+    assert "代替整体完成" in prompt
     assert "Run Repair Evidence (verbatim)" not in prompt
     assert json.dumps(sentinel, ensure_ascii=False, sort_keys=True) not in prompt
     for private_field in (
@@ -1512,8 +1535,8 @@ def test_human_blocker_resume_context_reaches_original_thread_stdin_verbatim(
     assert "resume" in captured["arguments"]
     assert "original-thread" in captured["arguments"]
     assert blockers[0] in captured["prompt"]
-    assert "你是当前 Ticket 的开发工程师" in captured["prompt"]
-    assert "继续完成你负责的当前开发交付" in captured["prompt"]
+    assert "开发工程师" in captured["prompt"]
+    assert "继续完成你负责的开发任务" in captured["prompt"]
     assert "Development Brief" not in captured["prompt"]
     assert "完整测试套件" not in captured["prompt"]
     assert "Thread" not in captured["prompt"]
@@ -1612,7 +1635,8 @@ def test_human_blocker_continuations_keep_each_roles_current_object_facts(
     assert "REVIEW_TREE_SENTINEL" in review
     assert "PUBLICATION_PARENT_SENTINEL" in publication
     assert "PUBLICATION_TICKET_SENTINEL" in publication
-    assert "完整独立验收证据" in publication
+    assert "当前" in publication
+    assert "独立验收" in publication
 
 
 def test_new_semantic_repair_on_development_thread_uses_compact_repair_prompt(
@@ -1633,19 +1657,20 @@ def test_new_semantic_repair_on_development_thread_uses_compact_repair_prompt(
         name="new-semantic-repair",
     )
 
-    assert "你是当前 Ticket 的开发工程师" in prompt
-    assert "使用 skill:implement 完成当前定向修复" in prompt
-    assert "Acceptance Repair" in prompt
+    assert "开发工程师" in prompt
+    assert "使用 skill:implement" in prompt
+    assert "这是上一次独立审查的完整结果" in prompt
     assert "REPAIR_SENTINEL" in prompt
     assert "PARENT_ISSUE_SENTINEL" in prompt
     assert "TICKET_ISSUE_SENTINEL" in prompt
-    assert "当前 Review Boundary 是 Ticket Contract" in prompt
-    assert "当前 checkout 最终保留的交付修改会整体成为新的 Candidate Commit" in prompt
-    assert "本轮不需要启动开发侧 Reviewer" in prompt
-    assert "Development Brief" not in prompt
+    assert "具体任务的标题、正文和验收条件确定本次范围" in prompt
+    assert "程序会统一提交" in prompt
+    assert "默认不再组织独立审查" in prompt
+    assert "不要仅因开始新一轮修复就重复读取未变化的需求" in prompt
+    assert "开始前先读取" not in prompt
     assert "Development Preflight Round" not in prompt
-    assert "完整测试套件不是每轮默认的固定门槛" not in prompt
-    assert "继续完成你负责的当前修复交付" not in prompt
+    assert "使用继承环境中的" not in prompt
+    assert "继续完成你负责的修复任务" not in prompt
 
 
 def test_new_thread_directed_repair_keeps_full_role_contract(
@@ -1664,10 +1689,13 @@ def test_new_thread_directed_repair_keeps_full_role_contract(
         name="new-thread-semantic-repair",
     )
 
-    assert "Acceptance Repair" in prompt
-    assert "Development Brief" in prompt
+    assert "这是上一次独立审查的完整结果" in prompt
+    assert "开始前先读取" in prompt
+    assert "保留继承的 PATH 与认证环境" in prompt
     assert "NEW_THREAD_REPAIR_SENTINEL" in prompt
-    assert "使用 skill:implement 完成当前定向修复" not in prompt
+    assert "已掌握的需求" not in prompt
+    assert "默认不再组织独立审查" in prompt
+    assert "建议安排审查子 Agent" not in prompt
 
 
 def test_resume_mode_without_a_valid_thread_uses_the_full_role_prompt(
@@ -1684,9 +1712,9 @@ def test_resume_mode_without_a_valid_thread_uses_the_full_role_prompt(
         name="development-resume-without-thread",
     )
 
-    assert "Development Brief" in prompt
-    assert "以当前 Ticket 和代码事实为依据" in prompt
-    assert "继续完成你负责的当前开发交付" not in prompt
+    assert "开始前先读取" in prompt
+    assert "实现本次全部验收条件" in prompt
+    assert "继续完成你负责的开发任务" not in prompt
 
 
 def test_role_continuations_use_short_role_specific_prompts(
@@ -1769,38 +1797,44 @@ def test_role_continuations_use_short_role_specific_prompts(
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "task_issue_url": "https://github.com/example/project/issues/2",
             "fallback_publication_context": {
-                "receipt": "UNCHANGED_FALLBACK_EVIDENCE_SENTINEL"
+                "current_candidate_identity": {
+                    "candidate_sha": "CURRENT_FALLBACK_CANDIDATE_SENTINEL"
+                },
+                "failure_evidence_source": "CURRENT_FAILURE_EVIDENCE_SOURCE",
             },
+            "fallback_receipt": {"private": "PRIVATE_COMPLETE_RECEIPT_SENTINEL"},
             "thread_id": "fallback-publication-thread",
             "_invocation_mode": "resume",
         },
         name="fallback-publication-execution-continuation",
     )
 
-    assert "你是当前 Ticket 的开发工程师" in development
-    assert "继续完成你负责的当前开发交付" in development
+    assert "开发工程师" in development
+    assert "继续完成你负责的开发任务" in development
     assert "https://github.com/example/project/issues/1" in development
     assert "https://github.com/example/project/issues/2" in development
     assert "Development Brief" not in development
-    assert "你是本次 Delivery Run 的修复工程师" in repair
-    assert "继续完成你负责的当前修复交付" in repair
+    assert "开发工程师" in repair
+    assert "继续完成你负责的修复任务" in repair
     assert "https://github.com/example/project/issues/1" in repair
     assert "CURRENT_CI_SENTINEL" in repair
     assert "Development Brief" not in repair
-    assert "你是独立 Run 整体验收工程师" in review
-    assert "继续完成你负责的当前独立验收" in review
+    assert "独立验收" in review
+    assert "继续完成你负责的独立验收" in review
     assert "CURRENT_BASE_SENTINEL" in review
     assert "CURRENT_HEAD_SENTINEL" in review
     assert "CURRENT_TREE_SENTINEL" in review
     assert "OLD_ARTIFACT_SENTINEL" not in review
-    assert "E2E、Standards 和 Spec 三种独立视角" not in review
-    assert "你是当前 Ticket PR 的发布叙事工程师" in publication
-    assert "继续完成你负责的当前发布叙事" in publication
+    assert "除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证" not in review
+    assert "交付说明" in publication
+    assert "继续完成你负责的交付说明" in publication
     assert "https://github.com/example/project/issues/1" in publication
     assert "https://github.com/example/project/issues/2" in publication
-    assert "完整独立验收证据" in publication
-    assert "最小 Fallback Publication Context" in fallback_publication
-    assert "UNCHANGED_FALLBACK_EVIDENCE_SENTINEL" not in fallback_publication
+    assert json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) in publication
+    assert "当前修改没有独立验收通过的结论" in fallback_publication
+    assert "CURRENT_FALLBACK_CANDIDATE_SENTINEL" in fallback_publication
+    assert "CURRENT_FAILURE_EVIDENCE_SOURCE" in fallback_publication
+    assert "PRIVATE_COMPLETE_RECEIPT_SENTINEL" not in fallback_publication
     assert "What Problem This Solves" not in publication
     for prompt in (
         development,

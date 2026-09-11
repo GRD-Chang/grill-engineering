@@ -21,6 +21,7 @@ from agent_run.state_contract import (
 )
 
 from run_acceptance_test_support import _passing_artifact
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_internal_stage, run_cli, stdout_json
 
 from run_publication_test_support import (
@@ -388,7 +389,7 @@ def test_final_publication_human_resume_clears_current_blocker(
         require_current_run_state(malformed)
     assert publisher.data["delivery"]["pull_requests"] == []
     for command in ("status", "history"):
-        view = run_cli(
+        view = invoke_cli_inprocess(
             git_repo,
             git_repo / "github.json",
             command,
@@ -413,7 +414,7 @@ def test_final_publication_human_resume_clears_current_blocker(
             in view.stdout
         )
     history = stdout_json(
-        run_cli(
+        invoke_cli_inprocess(
             git_repo,
             git_repo / "github.json",
             "history",

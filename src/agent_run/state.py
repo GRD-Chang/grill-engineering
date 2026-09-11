@@ -225,7 +225,7 @@ class StateStore:
             json.dumps(
                 durable_state,
                 ensure_ascii=False,
-                indent=2,
+                separators=(",", ":"),
                 sort_keys=True,
             )
             + "\n"

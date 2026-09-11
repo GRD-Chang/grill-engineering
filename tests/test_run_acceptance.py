@@ -28,6 +28,7 @@ from agent_run.state_contract import (
 )
 
 from conftest import seed_idle_control
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_internal_stage, run_cli, stdout_json
 from test_cli_delivery import final_run_publication
 
@@ -1385,12 +1386,12 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert delivery["pull_requests"] == []
     status = stdout_json(
-        run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
     )
     assert status["status"] == "ready_for_human"
     assert status["diagnostics"][0]["message"].startswith("GitHub denied access")
     history = stdout_json(
-        run_cli(git_repo, fixture, "history", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", str(state["run_id"]), "--json")
     )
     assert any(
         event.get("thread_id") == "run-repair-development-blocked"
@@ -1455,7 +1456,7 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
     assert not old_checkout.exists()
     history = stdout_json(
-        run_cli(git_repo, fixture, "history", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", str(state["run_id"]), "--json")
     )
     assert any(
         event.get("worker") == "独立验收工作代理"
@@ -1526,7 +1527,7 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
         "pull_requests"
     ] == []
     history = stdout_json(
-        run_cli(git_repo, fixture, "history", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", str(state["run_id"]), "--json")
     )
     assert any(
         event.get("worker") == "发布工作代理"

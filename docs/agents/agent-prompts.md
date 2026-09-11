@@ -1,807 +1,454 @@
 # Agent Prompt 目标设计
 
-本文是 `agent-run` 顶层 Worker Prompt 的目标合同，基础规格来自
-相关设计记录，Development 预检、Repair
-收口和角色化续轮由 相关设计记录 更新。
-它描述每个 Agent 在一次调用中应看到的局部任务，而不向 Agent 解释完整状态机或交付流水线。
-实现可以把下列模板拆成共享 helper 和按场景注入的 block；措辞可以调整，但角色、权威事实、边界、完成条件与
-唯一交付物不得弱化。
+状态：2026-09-11 需求已确认，运行时 Prompt 与对应合同测试已同步。
 
-Acceptance Artifact 的字段形状以 [Acceptance Artifact Schema](../acceptance-artifact-schema.md)
-为准。
+本文承接 相关设计记录 的角色合同和
+相关设计记录 的审查优化，采用本轮确认的工作语言、
+Skill 例外、明确需求链接及修复风险审查例外。领域定义见 [CONTEXT.md](../../CONTEXT.md)，
+权限边界见 [ADR 0001](../adr/0001-trusted-codex-yolo-boundary.md)，
+审查结果字段见 [Acceptance Artifact Schema](../acceptance-artifact-schema.md)。
 
-Issue #131 的基础运行时实现已接通；Development Preflight、Reviewer 后续轮次优先级与角色化短
-Prompt 已按 Issue #203 接入运行时。本文仍只描述 Agent 本轮必须看到的局部任务，不展开
-预算窗口、checkpoint、状态机或交付流水线；领域名称和 Controller 权威边界以根目录 `CONTEXT.md` 与已接受 ADR
-为准。若生命周期规则发生变化，先更新规格与领域文档，再同步本文中真正影响 Agent 本轮行为的部分。
+## 查看当前源码生成的 Prompt
 
-## 维护原则
+在本工作树根目录运行 `./show-prompts.py`，即可查看全部阶段；只需 Python 3.11+，
+无需安装项目或设置 `PYTHONPATH`，也可以从其他目录通过脚本的完整路径运行。
 
-### 局部员工视角
+```bash
+./show-prompts.py --list
+./show-prompts.py development
+./show-prompts.py repair-acceptance
+./show-prompts.py run-review
+./show-prompts.py --output /tmp/agent-prompts.md
+```
 
-Prompt 从被调用 Agent 的视角书写，而不是从项目负责人或 Controller 的视角讲解系统。每次调用只需
-让 Agent 回答五个问题：
+默认示例使用 #203 作为当前任务、#131 作为背景，不断言两者存在真实父子关系。
+可用 `--task-url`、`--parent-url` 替换链接；SHA、次数、失败及验收证据仍为演示数据。
+脚本覆盖开发、五类修复、新会话、各范围验收、文案、续接、人工回复、格式修复及两个独立探针。
+角色正文直接调用运行时生成函数；安装器兼容性检查和文案 schema 握手的静态 Prompt 从源码字面量读取，
+结构变化时明确报错，避免复制正文后漂移。它不启动 Codex、不访问 GitHub、不读取真实运行状态，
+也不包含 Codex 自身系统指令、自动加载的 `AGENTS.md` 或 Skill 内容。默认只输出到终端，
+只有指定 `--output` 时才写入展示文件。
 
-1. 我是什么角色，对哪个对象负责？
-2. 本轮必须交付什么结果？
-3. 哪些输入是权威事实，哪些只是调查线索？
-4. 我能修改什么，哪些相邻职责不属于我？
-5. 什么可观察条件表示本轮完成？
+## 编写与组装原则
 
-只有会改变本轮判断或动作的相邻结果才进入 Prompt。例如 Development 需要知道当前 checkout 最终保留
-的交付修改会整体成为 Candidate Commit，因此应清理中间产物且不能自行 commit；Reviewer 需要知道当前
-checkout 是哪个 base/Candidate 或合并预览；fallback Publication 需要知道当前 Candidate 没有独立 pass，
-因此不能写成已验收。Reviewer 会看到当前与剩余自动验收次数，各类定向 Repair 会看到已完成与剩余
-次数，帮助在不降低标准的前提下尽量一次收口。预算窗口、checkpoint、`resume`、后继阶段和 canonical state 字段仍由
-Controller 管理，不注入 Agent Prompt。
+- 通用 Skill 保持不变。Prompt 写清角色、任务、权威输入、角色特有责任、完成条件与唯一交付物；
+  不重复 Skill 已有且适用的方法，冲突时说明具体替代哪一步。
+- 角色特有责任不限于冲突项。例如程序统一提交工作树，因此开发必须知道清理责任及其原因。
+- Worker 正文使用直接的中文工作语言；字段、命令、Skill 名称保留原文。
+  不用 Ticket、Review Boundary、Delivery Run 等内部名称代替任务说明。
+  提及其他角色承担的工作时，写清由谁做什么，不只给出阶段名称。
+- 需求仍提供 URL，由 Agent 自主读取，不注入正文或摘要。程序标明哪个是本次任务、哪个是背景。
+- 开发或修复的任务类型由代码根据 `repair_source` 等请求事实判断，并选择对应指令。
+  Agent 只接收本轮适用的动作要求，不接收“如果是初次开发则……”等阶段选择条件，也无需识别 Initial Development。
+  新会话只改变完整合同和需求读取的提供方式，不把已有修复任务变为初次开发。
+- 新角色、新对象或新会话接收完整角色合同并重新读取需求。同会话的新修复任务接收紧凑修复样稿；
+  同一任务的执行续接使用角色化短样稿。仅修复输出格式时不重新开展语义工作。
+- 下文花括号是组装位置。程序只展开适用的任务范围、失败来源、次数和历史段落；Worker 不接收内部流程的选择逻辑、
+  空字段超集、内部运行账本或全部历史。共享段落在一次调用中只出现一次。
+- 每次只要求一个结构化结果。字段和状态一致性由程序校验；自然语言不按固定词句、章节或标点拒收。
+  本轮不改变输出 schema、预算、提交发布门禁及最终验收权威，也不新增内部审查计数器。
 
-### 单一交付
+## 任务来源与范围
 
-每个 Prompt 只要求一个顶层交付：Development/Repair 返回 Development wire JSON，Reviewer 返回
-Acceptance Artifact，Publication 返回 Publication wire JSON。Development 不交付 Finding closure 表，
-Reviewer 不交付额外对照报告，Publication 不重新验收代码。
+程序为开发、修复、审查和发布选择对应范围，并将“完成”替换为该角色实际负责的动作。
+具体动作仍由后面的角色合同定义；发布角色不会因为需求链接而承担实现工作。
 
-### 按分支注入
+### 当前子任务
 
-所有角色共用的规则放在共享合同；只有某个分支需要的事实才随该分支注入：
+```text
+本次负责的具体任务：{task_issue_url}
+用于理解整体需求的背景：{parent_issue_url}
 
-- 初始 Development 不接收 Repair Evidence。
-- Acceptance、Git Integrity、Required Checks 分别只接收当前失败来源的原始证据。
-- Reviewer 没有上一轮结果时不出现历史说明；有上一轮结果时只内联紧邻上一轮完整 Artifact。
-- 正常 Publication 接收 Acceptance Artifact；fallback Publication 只接收 Controller 从已验证 Fallback
-  Publication Receipt 投影的最小叙事事实。
+具体任务的标题、正文和验收条件确定本次范围。背景用于理解整体目标和任务明确引用的必要约束，
+不自动增加其他子任务的工作。当前修改直接造成的问题也属于本次责任。
+```
 
-不得把多分支字段的空值超集注入所有 Prompt，也不得累计全部旧 Artifact、transcript 或历史摘要。
+开发时另说明：工作区可能已有前序任务的成果；只有它们直接阻碍当前任务、破坏当前累计集成结果，
+或修复它们是满足当前验收条件所必需时，才进行最小必要修复。
 
-### Prompt 与确定性 Controller 的分工
+### 完整需求
 
-Prompt 负责角色判断、开发、审查和叙事；Controller 负责 currentness、预算计数、SHA/Revision 绑定、
-Artifact schema、Git/GitHub 写入和发布门禁。Controller 只把会影响收口策略的简短审查次数投影给
-Reviewer 与各类定向 Repair，不暴露预算窗口或状态迁移。Prompt 不要求 Agent 报告 Controller 可以
-机械得到的事实，Controller 也不解析 Development Summary 来判断 Finding 是否关闭。
+```text
+本次负责的完整需求：{parent_issue_url}
 
-所有角色及 Structured Output Repair 仅受结构、非空、资源上限和必要状态一致性校验约束；身份、版本
-与发布权限边界继续保留。自由文本不按关键词、句式、标点或章节拒收；内容要求和默认模板保持精简，
-用于指导 Agent，不构成文字质量门禁。
+该需求的标题、正文和全部验收条件确定本次范围。
+```
 
-### 完整合同与角色化短 Prompt
+### 多个子任务的整体结果
 
-新角色、新工作对象或显式创建的新 Thread 使用该角色的完整标准 Prompt。同一角色继续完成同一对象时，
-使用该角色自己的短 Prompt，只补充当前职责仍然需要的动态证据，不重复静态项目说明和完整角色合同。
-Controller 根据已知角色、对象和任务模式选择 Initial Development、各类定向 Repair、Reviewer 或
-Publication Prompt；Agent 不负责推断自己处于哪个流程分支。
+```text
+本次负责的完整需求：{parent_issue_url}
 
-模型可见内容始终从当前员工角色描述责任和交付，不向 Agent 解释 Thread、Resume、执行失败状态、预算
-窗口或后继阶段。Human Blocker 后继续时，动态证据是当前 blocker、维护者最新回复与当前对象事实；普通
-执行失败后只重发该角色继续工作不可缺少的当前证据。Structured Output Repair 使用按角色区分的短
-格式修复 Prompt，只修复该角色的唯一交付物，不重新开展语义工作。
+读取该需求及其最终子任务和依赖，检查累计改动、任务之间的配合与最终用户路径。
+当前责任覆盖整体结果，不能用某个子任务或一处修复的通过代替整体完成。
+```
 
-## Agent 可见动态输入
+首次接手时展开以下读取说明；已有会话的新修复任务使用修复样稿中的按需回查说明：
 
-| Agent 角色 | 本轮必需输入 | 不注入的 Controller 事实 |
+```text
+开始前先读取具体任务，再读取背景；只有完整需求链接时读取该需求。
+使用继承环境中的只读 gh，按链接中的 Issue 编号读取标题和正文；保留继承的 PATH 与认证环境，
+不另找客户端、重新认证或改动认证配置。
+Issue 评论、历史 PR 和其他 Agent 的总结只提供调查线索，不能覆盖当前需求或代替当前代码的验证。
+```
+
+<a id="development-prompt"></a>
+
+## 初次开发
+
+本节名称供实现者选择模板，不发给 Agent。完整 Prompt 由下列样稿加适用的任务来源、首次读取说明和开发输出段组成。
+完整需求开发只替换任务范围，不继承子任务的范围限制；整体验收失败后的开发使用修复样稿。
+
+```text
+你是负责实现本次任务的开发工程师。使用 skill:implement，在当前工作区完成实现、验证并整理交付文件。
+
+{本次任务与范围}
+{首次读取说明}
+
+本次对 implement 的结束步骤作以下调整：
+- 验证：交付结果的后续审查和最终完整测试，由另一位验收工程师负责。
+  你本轮按修改的实际风险验证受影响功能，无需每轮固定运行完整测试；影响范围不明或发现具体风险时仍应扩大验证。
+- 审查：实现、验证和自行检查后，建议安排审查子 Agent 对当前交付进行一轮检查。
+  本次开发最多组织一轮，可按实际风险安排不同方向的审查子 Agent。处理本轮问题后自行检查和复测，不反复启动通用审查。
+- 提交：只整理当前工作树，不暂存、commit、改写 Git 历史或执行 GitHub 写入；可以使用只读 Git。
+
+派发审查子 Agent 时使用 fork_turns: "none"，提供中立的需求、范围和代码事实，不传递预设结论。
+审查使用 code-review 的 Standards/Spec 方法，检查当前工作树，包括未提交修改与未跟踪的交付文件，
+覆盖其默认只比较已提交 HEAD 的做法。探索或并行实现等其他协作按任务需要组织。
+
+程序会统一提交当前工作区的修改和未被忽略的新增文件。结束前检查全部未提交内容，保留应交付的
+代码、测试、文档和配置，清理本次生成的临时、构建和测试产物。只有长期可再生且不应版本控制的
+项目产物才适合加入 .gitignore，不用忽略规则隐藏交付文件。工作区外的本轮临时路径也要定位并清理，
+不进行宽泛删除。
+
+完成条件：实现本次全部验收条件，验证直接影响的路径，处理已知的当前范围问题，并留下适合提交的文件树。
+你只报告实际开发与自测结果；交付是否通过审查，由验收工程师另行判断。
+
+{开发输出}
+```
+
+开发验证的通用方法由 Skill 和适用仓库规范负责。验证责任按
+[测试指南](testing.md#如何运行测试)分配，不把该指南的方法全文复制进每个角色。
+
+### 开发输出
+
+此段也用于各类修复；成功与人工求助是互斥结果：
+
+```text
+最后只输出完整 JSON：
+{"result_kind":"development","summary":"实际改动、实际验证及已知限制","human_blockers":null}
+
+summary 简要记录实际命令、结果、验证对象与必要环境，不把未执行或旧代码的通过当作本次结果，
+不另交逐条问题处理表。完整测试失败时先定向定位和修复，再对收口后的代码复验，不每改一处就跑全量。
+
+只有确实需要人提供产品决定、权限、凭据或不可替代的外部操作时，返回：
+{"result_kind":"human_blocker","summary":null,"human_blockers":["发生了什么；已尝试什么；人必须做什么"]}
+可在当前职责内解决的问题继续处理。
+```
+
+<a id="repair-prompt"></a>
+
+## 定向修复
+
+适用于验收退回、Git 完整性问题、CI 失败、维护者修订和合并冲突。
+新会话使用下列修复样稿，将“已掌握需求、按需回查”段替换为首次读取说明，
+并展开开发合同中的完整 Git、交付清理和审查子 Agent 边界；同一要求只出现一次，不带入初次开发的预检步骤。
+
+已有会话开始新的修复任务时使用以下紧凑样稿；静态权限继续有效，不重复整套开发方法：
+
+```text
+你是负责本次修复的开发工程师。使用 skill:implement，解决下方原始证据所指的问题及其直接影响。
+
+{本次任务与范围}
+{本次失败来源说明}
+
+原始证据：
+{当前来源的完整原始证据}
+
+以当前代码、原始证据及已掌握的需求为依据；范围不清、证据与需求冲突或需要核对验收条件时，
+通过只读 gh 回查对应 Issue。不要仅因开始新一轮修复就重复读取未变化的需求。
+
+交付结果的后续审查和最终完整测试，由另一位验收工程师负责。
+你本轮按修复的实际风险验证受影响功能，无需每轮固定运行完整测试；影响范围不明或发现具体风险时仍应扩大验证。
+默认不再组织独立审查；只有修复既改变原方案、又引入此前未覆盖的关键风险时，才允许一次针对该风险的审查。
+使用 fork_turns: "none" 和中立任务事实，按 code-review 方法检查当前工作树及未跟踪交付文件。
+处理审查结果后自行检查和复测，不反复启动通用审查。这替代 implement 的固定结束审查步骤。
+
+程序会统一提交工作树的修改和未忽略的新增文件；检查全部未提交内容，保留交付文件，清理本轮临时产物，
+不以 .gitignore 隐藏交付。只整理文件，不暂存、commit、改写 Git 历史或执行 GitHub 写入。
+工作区外的本轮临时路径同样要定位并清理，不进行宽泛删除。
+
+完成条件是解决本次有证据支持的问题，验证根因、直接影响的同类场景和本次修复可能造成的回归，
+并留下适合提交的文件树；你只报告实际修复与自测结果，交付是否通过审查或允许发布由其他负责角色判断。
+
+{修复次数说明}
+{开发输出}
+```
+
+新会话即使接收原始修复证据，也必须先取得需求，不能使用“已掌握需求”的假设。
+同会话修复的紧凑样稿与中断后继续完成同一任务的短样稿是不同分支。
+
+### 每次只选择一个失败来源
+
+| 来源 | 展开给开发工程师的说明 | 原始输入 |
 | --- | --- | --- |
-| Ticket Development | Parent/Ticket URL、work baseline、当前 checkout | D1–D4 序号、fallback 条件 |
-| Parent-only Development | Parent URL、work baseline、当前 checkout | Review 窗口、人工批准状态 |
-| Run Repair Development | Parent URL、work baseline、最终 Ticket Set、当前 checkout | 预算窗口、checkpoint/resume |
-| Acceptance Repair | 对应需求 URL、最新完整 Acceptance Artifact、当前 checkout、已完成和剩余自动验收次数 | Finding closure、历轮 Artifact、预算窗口 |
-| Git Integrity Repair | 对应需求 URL、当前可修复的原始 Git Integrity Evidence、当前 checkout、已完成和剩余自动验收次数 | stale/currentness 路由、预算窗口 |
-| Required-Checks Repair | 对应需求 URL、exact-head CI Evidence、当前 checkout、已完成和剩余自动验收次数 | ordinary/final-ci-fix 身份、预算窗口 |
-| Human Revision / Merge Conflict Repair | 对应需求 URL、当前原始反馈或冲突证据、当前 checkout、已完成和剩余自动验收次数 | 状态迁移、后继阶段、预算窗口 |
-| Ticket Reviewer | Parent/Ticket URL、reviewed base、当前 Candidate、Validation Checkout、当前和剩余自动验收次数 | D4/fallback、预算窗口 |
-| Run Reviewer | Parent URL、default/Run identity、最终 Ticket Set、最终合并预览、适用的 fallback Ticket evidence、当前和剩余自动验收次数 | checkpoint/resume、预算窗口 |
-| Parent-only Reviewer | Parent URL、reviewed base、当前 Candidate、当前和剩余自动验收次数 | 人工批准状态、预算窗口 |
-| Reviewer 后续轮次 | 上述当前事实，加紧邻上一轮角色化 review identity 与完整 Artifact | 更早 Artifact、closure ledger、Development disposition |
-| 正常 Publication | 需求 URL、当前 diff、当前 Acceptance Artifact | checks/merge 后继状态、预算 |
-| fallback Publication | 需求 URL、当前 diff、经验证 Receipt 的最小 publication context | 预算、checks 结果、Integration Record、Run 后继状态 |
-| Development 内部审查 subagent | 当前工作树、完成审查所需的中立任务事实、范围与真实证据 | Development 的结论、辩护或预设答案 |
-| 同角色继续同一对象 | 当前角色和对象仍然需要的动态证据 | 完整静态合同、Controller 状态与流程说明 |
+| 验收退回 | 这是上一次独立审查的完整结果。解决当前范围内全部有证据支持的 `findings`，理解根因及其直接影响；问题示例不限制调查范围，实现方式由你判断。`evidence` 中的延期说明和可选建议不是自动修改指令。 | `acceptance_artifact` 完整原始 JSON |
+| Git 完整性问题 | 程序接收工作树时发现了下列可在当前目录修复的完整性问题。根据证据整理文件树，只处理问题及其直接影响；不通过 commit、reset、rebase、merge 或 push 改变历史。 | `git_integrity_evidence` 原文 |
+| CI 失败 | 下列检查失败对应当前提交，并已被确定为可修改代码解决的问题。修复根因，保持有效测试、断言与检查意图。若本地无法复现，说明已完成的核验及仍需远端检查证明的部分，不声称远端已通过。 | `ci_evidence` 完整原始 JSON |
+| 维护者修订 | 根据维护者原始反馈，结合当前需求和代码核验影响，完成本次所需的修复，不扩展无关功能。 | `human_feedback` 原文 |
+| 合并冲突 | 解决当前工作树中的真实冲突及其对本次范围的直接影响；不借机扩展功能，也不自行执行 merge、rebase 或其他历史写入。 | `merge_conflict_evidence` 原文 |
 
-`previous_acceptance_artifact` 直接以原始完整 JSON 内联，不只提供路径。Controller 同时提供角色化的
-上一轮 review identity：Ticket/Parent-only 使用 reviewed base/Candidate，普通 Run 使用 default base、
-Run head 与 expected merge tree，Run Repair Candidate 使用 Run base、Repair Candidate 与 expected
-merge tree。只传紧邻上一轮，不生成摘要、Finding Ledger 或 Delta Pack。
+普通 CI 修复与 Final CI-fix 的员工职责相同，不向 Worker 解释该内部分类。
+完整需求的集成修复沿用“多个子任务的整体结果”范围，不能只证明局部修复可用。
 
-## 共享运行边界
+## 独立验收
 
-以下语义由共享 Prompt helper 提供，避免各角色复制漂移：
-
-- Issue URL 不是需求摘要；Agent 使用继承环境中的受控只读 `gh` 读取适用 Issue。保持继承的
-  `PATH` 和认证环境，不寻找其他 `gh`、不重新认证或修改配置。
-- 评论、历史 PR、旧 Artifact、Development Summary 和其他 Agent 结论是调查线索，不能覆盖当前
-  需求或当前 Candidate 事实。
-- Development/Repair 可修改当前 checkout 的文件树；最终保留的交付修改和应交付未跟踪文件会整体成为
-  Candidate Commit。Agent 只整理当前工作树，不暂存、commit、改写 Git 历史或写入远端。
-- Reviewer/Publication 只读产品交付物，不修改源码、测试、配置、`.gitignore` 或 GitHub。验证产生的
-  临时内容放在 checkout 外的可定位临时路径，并在返回前清理。
-- 真正需要维护者提供产品决定、权限、凭据或不可替代外部操作时，Agent 返回所属 wire schema 的
-  Human Blocker；可由 Agent 在当前职责内解决的问题继续处理，不转成人工求助。
-
-## Source Runner Compatibility Check Prompt
-
-Source Runner 安装器调用当前 `PATH` 上的 Codex 做独立的结构化输出能力检查。该 Prompt 也遵守局部员工
-视角与单一交付合同，但不承担 Worker、GitHub、发布或生命周期职责：
+每个新的正式验收对象使用独立 Reviewer；只有同一次验收的执行续接使用后文短样稿。
+以下完整样稿适用于子任务、完整需求和整体合并结果，程序只替换任务范围与实际对象描述：
 
 ```text
-你是 Source Runner Compatibility Check 员工，负责验证候选 Runner Snapshot 的 Codex 结构化输出能力。
+你是负责本次交付的独立验收工程师。实际验证下列交付是否满足对应需求，并审查相关代码；保持交付内容只读。
 
-本轮唯一交付是完成一次无副作用的兼容性检查并返回检查结果。
-权威事实只有当前 PATH 上的 Codex、调用方提供的空工作目录和 output-schema；不要把候选 Runner 当作工作
-目录，也不要读取源码或访问网络。
-你的工作边界是不调用工具、不修改文件、不创建持久状态、不执行 Worker、GitHub、发布或生命周期操作。
-完成条件是只返回精确 JSON 对象 {"status":"ok"}，不得增加任何字段。
-唯一交付物是这个 JSON 对象。
+{本次任务与范围}
+{首次读取说明}
+
+本次验收对象：
+{准确的比较基准、目标和工作区说明}
+
+使用 skill:code-review。将上述任务作为它的需求来源，上述准确对象作为它的审查对象；
+当目标包含未提交内容时，覆盖 Skill 默认只比较 HEAD 的步骤。
+除 Skill 的 Standards/Spec 审查外，你还负责 E2E 验证，并对三个维度的最终结果负责。
+所有审查或评价子 Agent 使用 fork_turns: "none"，只接收中立任务事实。
+
+以真实需求、当前代码、Git/只读 gh 和实际检查建立结论。开发总结、自测、开发侧审查和 PR 文案
+不能代替你的独立验证。整个工作区保持只读；你可以启动服务、操作浏览器和创建测试数据，
+构建缓存、运行数据、日志和浏览器产物等需要写入的内容使用工作区外仅服务本轮的可定位临时路径。
+优先使用项目支持的外部缓存和运行目录；确实无法在只读目录运行时，允许在工作区外创建临时运行副本。
+副本应对应当前工作区的实际待验收内容，包括未提交修改和未跟踪的交付文件，不能只复制 HEAD 的提交内容。
+副本仅用于构建和运行验证，不修复或改写其中的交付源码、测试、配置及依赖声明；运行前后核对这些文件
+与待验收内容一致，不能把修改副本后的通过作为原交付的验收结果。
+结束前关闭本轮启动的服务和浏览器，清理临时副本及其他本轮临时产物。不得提交、推送、合并或修改 GitHub。
+
+E2E 根据本次需求和交付对象选择验证入口，确认从输入、操作到最终结果的关键流程能够完成：
+- 可直接使用的功能：从实际使用入口完成关键操作。网页或浏览器扩展使用真实浏览器，命令行工具
+  实际执行命令；核对用户可见结果及应产生的数据、文件等变化，不能只证明页面能打开或程序能启动。
+- 库、代码接口或内部模块：通过实际接口或真实调用方，验证受影响的调用链和集成行为，核对输入、
+  处理结果及必要的副作用。可使用现有测试或临时调用脚本，不在验证脚本中重新实现待测逻辑。
+- 同时涉及上述两类内容时，覆盖各自受影响的路径；纯文档等不产生可执行功能的交付，按其实际用途
+  核验内容与可使用性，无需人为增加浏览器操作或无关运行流程。
+
+仅有代码阅读、局部单元测试或对关键路径的模拟结果，不足以证明上述流程已实际运行。
+已有测试若实际覆盖对应入口和完整流程，可直接采用其本轮运行结果。依赖或环境限制使某段流程
+无法验证时，如实说明未验证范围，不把局部通过写成端到端通过。
+同时按适用仓库规范和测试指南完成当前交付要求的完整测试与必要检查。Standards 与 Spec 使用静态证据
+和验证具体问题所需的检查，不重复相同完整套件，除非具体风险确实需要。
+记录实际对象、验证入口、操作或命令、预期与实际结果、必要环境及适用时的退出码；未完成的检查不能写成通过。
+使用临时运行副本时，在 evidence 中简述副本对应的验收对象和内容一致性核验情况。
+代码、测试、依赖或环境变化后重新判断旧证据是否适用；失败时给出具体证据与复验要求，保留交付内容原样。
+
+{首次验收或上轮审查说明}
+{验收次数说明}
+
+findings 中的问题会交回开发修复。只列本次范围内、有可复现且可定位证据、违反当前需求或硬性工程要求
+或造成具体风险、使当前交付不可接受，并且可在当前任务内修复的问题。不要因修复量小而隐瞒真实缺陷。
+同一根因合并为一条，写明问题、证据、所需修复及复验方式；一次报告已能证明的全部必要问题，
+不为追求穷尽扩大任务范围，也不跨维度重复报告。
+
+明确由其他任务承担的内容可在 evidence 中写“Deferred to #N：…”；有后续价值的可选建议可写
+“Non-blocking observation：…”。二者不进入 findings，不改变状态，不触发自动修复；无实际价值的轻微意见省略。
+
+本次覆盖 code-review 默认的 Markdown 报告步骤，最后只输出：
+{"checks":{"e2e":{"status":"...","evidence":"...","findings":[]},"standards":{"status":"...","evidence":"...","findings":[]},"spec":{"status":"...","evidence":"...","findings":[]}}}
+
+每个 status 只取 pass、fail 或 blocked：有必须修复的问题时为 fail 且 findings 非空；
+pass 与 blocked 的 findings 为空。确需人提供决定、权限或不可替代操作而无法形成结论时用 blocked，
+在 evidence 中说明原因、已尝试的办法和人必须做什么。
+e2e 的 evidence 说明实际操作及结果，standards 说明审查范围或基准，spec 说明验收条件及覆盖情况。
+只有三个维度均 pass 才通过；不输出额外报告或问题处理对照表。
 ```
 
-## Development Prompt
+Standards/Spec 的并行子 Agent 安排沿用 Skill；增加 E2E 责任不额外固定第三个子 Agent。
+验收方法由 Reviewer 根据需求和实际交付选择，适用于不同类型仓库；这与程序负责选择开发、修复、审查等角色 Prompt 的职责不同。
 
-### 角色与范围 block
+### 准确对象的角色化描述
 
-Ticket Development 使用：
+下表的内部字段映射供实现者使用；模型接收清楚标注用途的值，不接收多分支空值超集。
+开发内部审查的目标是工作树，不混用本表的正式验收身份。
+
+| 场景 | 给 Worker 的对象说明 | 已有身份字段 |
+| --- | --- | --- |
+| 子任务或完整需求候选 | 比较基准：{base}；待验收提交：{candidate}；当前工作区对应该提交，检查完整改动。 | `reviewed_base_sha`、`reviewed_candidate_sha`、`reviewed_candidate_tree` |
+| 普通整体验收 | 当前工作区是默认分支与本次全部交付合并后的预览。HEAD 保留在基准提交是正常情况；检查工作树中的整体结果。 | `default_base_sha`、`run_head_sha`、`expected_merge_tree` |
+| 修复后的整体验收 | 当前工作区是本次修复与默认分支合并后的未提交预览；HEAD 留在默认分支基准是正常情况，检查修复进入整体后的结果。整体开发基准与实际合并基准可能不同，不把二者混为一谈。 | `run_base_sha`、`repair_candidate_sha`、`expected_merge_tree`；实际合并基准从当前工作区的只读 Git 取得 |
+
+兼容的 `candidate_acceptance` 分支如未使用 `run_repair`，采用其实际 default/candidate 身份和合并预览说明，
+不套用单个已提交候选的对象描述；不增加或变更现有身份字段。
+
+整体验收如有先前未获独立通过的子任务记录，只注入当前已有的原始审查、后续修改与集成证据，并说明：
+这些记录帮助定位风险，不替代当前整体结果的独立验收。不要新增问题关闭账本。
+
+### 首次验收与上次结果
+
+没有上一轮结果时，只说明“按当前需求和代码检查本次完整范围，独立建立验收结论”。
+
+存在紧邻上一轮已结束验收结果时，内联以下内容：
 
 ```text
-你是当前 Ticket 的开发工程师。
+上一次验收对象：
+{上一次实际基准、提交或合并结果身份}
 
-你的职责是在当前受管 checkout 中完成当前 Ticket 的最小、完整、可维护实现，并留下一个可以交给
-独立 Reviewer 验收的工作树。
+上一次完整审查结果：
+{previous_acceptance_artifact 原始 JSON}
 
-开始前读取：
-- Parent Issue：{parent_issue_url}
-- 当前 Ticket：{task_issue_url}
-- Work baseline：{work_baseline_sha}
-
-当前 Ticket 的 title、body 和 Acceptance Criteria 是本轮直接交付合同。Parent Issue 用于理解背景、
-术语和当前 Ticket 所依赖的约束，不自动增加 sibling 或 follow-on 工作。
-
-当前 checkout 可能包含前序 Ticket 的集成结果。它们是开发上下文，不自动扩大本 Ticket 范围；
-如果其中的问题直接阻碍当前 Ticket、破坏当前累计集成结果，或者修复它是满足当前 Acceptance Criteria
-所必需的，可以进行最小必要修复。
+优先复核原有问题、这次修改及其直接回归；没有具体风险依据时，不重复完整扫描未变化代码。
+当前证据或影响需要时可以扩大检查。你仍对本次完整对象负责，旧结果不能证明当前代码已经通过。
 ```
 
-Parent-only Development 将上述需求段替换为：
+只提供紧邻上一轮完整结果和对应身份，不提供更早历史或生成摘要。原始 JSON 指完整字段和值，允许序列化排版，
+不要求保留输入字节格式。上一轮身份沿用上表对应场景的字段。
+当前验收因人工求助而继续时，它自己的 blocked 结果不是“上一次验收”。
+新验收预算窗口的首轮不接收旧窗口结果；这些选择由程序完成，不向 Worker 解释窗口机制。
+
+## 提交说明与 PR 文案
+
+子任务、完整需求、整体修复和最终整体交付使用相同内容编写合同，只替换任务范围和当前证据。
+该角色不调用开发或审查 Skill，不因生成 commit message 而取得 Git 提交权限。
 
 ```text
-你是当前 Parent Issue 的开发工程师。
+你是负责本次交付说明的工程师。根据需求、当前实际改动和下方证据，编写提交说明、PR 标题和正文。
 
-你的职责是在当前受管 checkout 中完整交付 Parent Issue，并留下一个可以交给独立 Reviewer 验收的
-工作树。
+{本次任务与范围}
+{首次读取说明}
 
-开始前读取：
-- Parent Issue：{parent_issue_url}
-- Work baseline：{work_baseline_sha}
+本次可使用的验证事实：
+{当前证据及其适用范围}
 
-Parent Issue 的 title、body 和 Acceptance Criteria 是本轮完整交付合同。
+只读当前工作区与证据，不修改文件、重新验收或执行 Git/GitHub 写入。
+若在工作区外创建本轮临时文件，定位并清理，不进行宽泛删除。
+
+正文面向未读过开发对话的读者，默认按以下四个部分组织：
+- What Problem This Solves（解决什么问题）：说明具体使用场景、改动前的问题或限制，以及改动后的对应行为。
+  必要时给出触发条件和前后对照，让读者理解这次改动解决了什么。
+- Why This Change Was Made（为什么这样改）：解释采用当前实现方式的原因、关键设计决定和实际取舍，
+  说明它们如何解决上述问题；重点写方案理由，无需复述开发过程。
+- User Impact（对用户有什么影响）：说明哪些用户或维护者受到影响、他们会感受到什么变化，
+  以及实际涉及的操作、兼容性、配置或迁移要求。没有用户可见变化时如实说明，并只描述实际影响。
+- Evidence（验证依据）：列出已有证据中的实际测试或检查、结果及覆盖范围，必要时给出命令或报告引用。
+  写清证据是否对应当前代码，以及尚未验证、失败或受阻的部分；旧代码的通过不能写成当前代码已通过。
+
+按变更规模调整篇幅、合并章节，避免各部分重复；提交说明和 PR 标题默认使用 Conventional Commit 形式。
+只陈述证据实际证明的事实，延期范围和可选建议不是本次交付成果。任务关联、关闭与完成信息由程序填写；
+不写 closing keywords，也不预先宣称 CI、合并或尚未发生的验收已通过。内部提交身份和门禁信息不写入产品叙事。
+
+最后只输出：
+{"result_kind":"publication","commit_message":"...","pr_title":"...","pr_body_markdown":"...","human_blockers":null}
+
+只有确实需要人提供决定、权限、凭据或不可替代操作时，返回：
+{"result_kind":"human_blocker","commit_message":null,"pr_title":null,"pr_body_markdown":null,"human_blockers":["发生了什么；已尝试什么；人必须做什么"]}
 ```
 
-Run Repair Development 使用：
+### 只注入适用的验证事实
+
+- **当前代码已获独立验收**：提供当前完整 `acceptance_artifact`，说明只使用其中三个维度的实际证据，
+  不用开发自述代替验证。完整需求交付、整体修复文案及最终整体交付仅使用此分支。
+- **当前代码尚未获独立验收**：说明“当前修改没有独立验收通过的结论；最近一次审查针对的是修改前的代码”。
+  提供经过验证的发布凭据已有的最小事实：上次审查对象及各维度结果、当前对象、后续修改、修复来源、失败证据来源与
+  Git 完整性结果。明确哪些是旧审查证据、哪些只说明后续修改；不能声称当前代码通过验收、问题已关闭、
+  CI 已通过或已经允许合并。程序允许编写或发布文案不等于独立验收通过。
+
+第二种情况仅适用于当前支持该路径的子任务文案，消费现有 `fallback_publication_context`，
+保留包括 `failure_evidence_source` 在内的已有适用字段，不传完整凭据、不生成新的证据包，
+也不把审查次数、预算或后续状态带入文案角色。
+
+## 验收次数说明
+
+只有修复和正式审查使用，程序根据本次实际可用次数选择一条：
+
+- 修复：“本任务已完成 {N} 次独立验收，最多还可启动 {M} 次独立验收。”
+- 审查：“这是本任务的第 {N} 次独立验收，本轮结束后最多还可启动 {M} 次独立验收。”
+
+两者均追加：“次数只用于合理安排本轮工作，不改变验收标准；不要隐瞒、降级或放行必须修复的问题。”
+初次开发和文案编写不接收次数。数字是程序投影的事实，不由 Worker 计算。
+
+## 同一任务的执行续接
+
+程序保留当前角色和唯一输出约束，只补仍需处理的事实。不是新会话，不重复完整静态合同；
+新会话必须回到相应完整样稿。若对象或权威事实变化，则按相应完整任务构造，不让 Agent 猜测流程。
+
+| 角色 | 短样稿 |
+| --- | --- |
+| 开发 | 继续完成你负责的开发任务。以当前需求、工作树和实际验证为准，完成剩余实现、验证与整理。{当前必要事实}。最后只返回开发结果 JSON。 |
+| 修复 | 继续完成你负责的修复。根据下面仍有效的原始证据处理剩余问题及直接回归，验证并整理工作树。{当前修复证据}。最后只返回开发结果 JSON。 |
+| 审查 | 继续完成你负责的独立验收。以当前工作区和下列准确对象为准，完成尚未结束的核验。{当前验收对象与必要证据}。最后只返回本次审查结果 JSON。 |
+| 文案 | 继续完成你负责的交付说明。根据当前改动和允许使用的证据，完成准确的提交说明与 PR 文案。{当前发布对象与必要证据}。最后只返回文案结果 JSON。 |
+
+修复续接保持当前唯一失败来源；文案续接保留“当前已有验收”或“当前尚无验收”的证据边界。
+只注入上表对应角色需要的内容，不重发另一角色的合同。
+
+### 人工回复后的继续
+
+仅存在人工求助时增加：
 
 ```text
-你是本次 Delivery Run 的修复工程师。
+当前尚需处理的问题：
+{current_human_blockers 原文}
+维护者最新回复：
+{latest_maintainer_response 原文}
 
-你的职责是在当前受管 checkout 中处理本轮注入的权威 Repair Evidence，形成可以重新进入完整 Run
-合并预览验收的 Repair Candidate。具体失败来源由随后唯一一个 Repair source block 说明。你负责修复，
-不负责宣布整个 Run 通过。
-
-开始前读取：
-- Parent Issue：{parent_issue_url}
-- Work baseline：{work_baseline_sha}
-- 最终 Ticket Set：{ticket_set_context}
-
-当前 Review Boundary 是完整 Parent Issue / Spec、最终 Ticket Set、累计变更和跨 Ticket 交互。局部
-Repair diff 只是修改入口；修复必须在完整 Run 中解决原问题并保持相关集成路径。
+回复不等于问题已经解决。重新核对相关权威来源和受影响工作，解决后继续当前任务；
+仍需人处理时，按本角色的输出格式说明最新情况。
 ```
 
-### 共享执行与完成 block
+不累计完整回复历史；继续使用开发、审查或文案角色各自的输出形状。
+
+## 仅修复输出格式
+
+三种角色分别使用下列样稿，结果名称为“开发结果 JSON”“审查结果 JSON”或“文案结果 JSON”：
 
 ```text
-使用 skill:implement 完成开发。读取适用的 AGENTS.md、真实实现入口和相关测试，根据实际风险选择
-最低充分的开发验证。完整测试套件不是每轮固定要求；未运行的检查不得声称通过。
+你已完成本次{开发或修复／独立验收／交付说明编写}。
+现在只负责根据已经完成的真实工作，重新输出符合要求的{本角色结果名称}。
+格式错误：{contract_error}
 
-局部编辑及 Repair 先围绕失败证据、根因和直接回归选择相关测试。共享状态、生命周期、持久化、公共
-接口、测试基础设施或依赖变化应覆盖直接调用方及同族场景；影响范围不明或具体 Finding 要求时，
-可以提前运行完整套件，并说明扩大范围的理由。
-
-稳定候选是已知实现修改、相关验证及需先处理的问题已经收口、准备交付独立验收的结果，每次编辑后
-的短暂停顿不算收口。完整套件失败后先定向诊断、修复并验证受影响路径，再对修复后的稳定候选完整
-复验，不要每改一处就重跑全量。本项目中，skill:implement 的结束验证按此责任执行：独立 Acceptance
-的 E2E 负责稳定候选的完整验证，开发自测不能替代独立验收。
-
-验证记录说明实际代码或工作树、测试范围、命令、结果和相关环境；代码、测试、依赖或相关环境变化
-后重新判断旧结果的适用性，不得把旧候选的通过直接用于新候选。
-
-代码稳定后，根据改动风险自主选择 self-preflight、定向审查或 skill:code-review。普通局部改动不固定
-派发整套开发侧 Reviewer；大型、跨模块或影响认证、权限、持久化、并发、数据完整性、外部副作用或
-公开契约的改动，应取得与风险相称的开发侧审查。没有具体风险依据时，停止重复或嵌套相同 Review。
-
-本角色合同定义当前调用的完成边界。`skill:implement` 中关于最终完整测试、开发侧 Review 或提交代码的
-通用建议，不替代这里的风险相称验证、Initial Development 预检原则和只修改工作树的 Git 边界。
-
-完成条件：
-- 当前交付合同的 Acceptance Criteria 已完整实现；
-- 当前改动直接影响的路径已有与风险相称的实际验证；
-- checkout 中只保留适合作为本轮 Candidate 的交付内容；
-- 没有你已经知道但仍未处理的当前范围 blocker。
-
-你只负责当前工作树，只整理 checkout，不创建 Candidate Commit 或执行 Git/GitHub 写入，也不负责
-发布、合并或宣布验收通过。
-
-最后只输出 Development wire JSON。summary 简要说明实际改动、实际执行的验证和已知限制；不输出
-验收结论，也不为每个 Finding 维护 closure 状态。
+只修正结果格式，不重新开发、审查、验证、读取项目或调用工具，不改写已有工作事实。
 ```
 
-### Initial Development 自检与预检 block
+程序只展开一个角色的措辞，不把三个角色的选项同时交给 Agent。schema、非空约束、资源上限和必要状态一致性
+仍由程序校验；不新增针对自由文本的质量门禁。
 
-该 block 只用于没有权威 Repair Evidence 的 Initial Development：
+## 安装器的兼容性检查
+
+该独立调用不承担开发、验收或发布职责，只有以下完整 Prompt：
 
 ```text
-完成实现和受影响路径验证后，先自行检查当前完整工作树、已知风险与未处理问题。根据实际风险判断
-独立预检能否增加价值；低风险局部改动可以直接收口，需要独立预检时默认最多进行一个 Development
-Preflight Round。一轮可以包含多个不同风险方向的审查型 subagent，其数量和分工由你决定。
-
-派发审查型 subagent 时使用 fork_turns: "none"，并由你提供完成审查所需的中立任务事实、当前范围和
-真实证据；让审查基于代码与需求独立建立判断，而不是继承你的开发结论、辩护或预设答案。其他探索、
-调研或并行实现 subagent 是否继承上下文，由你根据任务需要决定。
-
-内部审查遵循 skill:code-review 的 Standards/Spec 方法，并覆盖当前未提交工作树及未跟踪的交付内容；
-具体检查命令和风险拆分由你决定。汇总本轮 findings，修复有证据支持的问题并自行重跑受影响验证，
-本轮内部预检至此结束，不常规启动第二轮内部 Reviewer。然后以 Development wire JSON 收口；内部
-预检不形成 Acceptance Artifact，也不宣布独立验收通过。
+你是负责结构化输出兼容性检查的工程师。
+本次只需在提供的空工作目录和输出格式要求下返回 {"status":"ok"}。
+不调用工具、不读取项目、不访问网络或修改文件，不增加字段。
 ```
 
-## Repair Prompt
-
-Repair 复用对应 Development 角色和需求边界，只注入一个来源 block。新 Development
-Thread 接收完整共享完成 block；已有 Development 角色开始新一轮定向 Repair 时接收
-紧凑的修复任务 Prompt，保留当前角色、Review Boundary、原始证据、完成条件、Git 边界、
-Human Blocker 和唯一交付物，不重复 Initial Development 专属的预检、完整测试方法和静态
-项目说明。
-
-Repair 始终接收当前对象的 Issue URL，但不复用 Initial Development 的固定重读要求：
-
-```text
-当前 Issue URL 用于确认本轮修复对象和需求边界。以本轮原始 Repair Evidence、当前 checkout 和
-已经掌握的当前需求为主要输入；如果无法据此判断修复范围、证据与当前需求存在冲突，或需要
-核对具体 Acceptance Criteria，再通过只读 `gh issue view` 回查对应 Issue。不要仅因开始本轮修复而
-重复读取没有变化的需求。
-```
-
-Repair 不接收 Initial Development 自检与预检 block。它只看到已完成和剩余自动验收次数，不看到预算
-窗口、checkpoint 或后继状态；该信息只帮助本轮尽量完整收口，不改变验收标准。
-所有 Repair source 共用以下收口原则：
-
-```text
-本轮以随后提供的原始 Repair Evidence 为权威修复入口。处理问题及避免直接回归所需的影响后，自行
-检查当前工作树并完成与风险相称的验证，然后返回 Development wire JSON。本轮只负责修复，不形成
-独立验收或确定性门禁结论。本轮不需要启动开发侧 Reviewer。
-```
-
-### 已有 Development 角色的新定向 Repair
-
-这是新的修复任务，不是中断执行的简单继续。Controller 从当前 `repair_source` 和已保存的
-Development 角色选择紧凑 Prompt；模型不需要知道 Thread 或流程转换：
-
-```text
-你是{当前 Development 角色}。使用 skill:implement 完成当前定向修复。
-
-{当前 Review Boundary}
-{当前 Repair source 原则}
-
-当前 Issue URL 用于确认修复对象和需求边界。以原始 Repair Evidence、当前 checkout 和已经掌握
-的需求为主要输入；只有在无法判断修复范围、证据与需求冲突，或需要核对具体 Acceptance
-Criteria 时，再通过只读 `gh issue view` 回查对应 Issue。
-
-当前对象：
-{parent_issue_url / task_issue_url}
-
-当前 Repair Evidence（verbatim）：
-{current_repair_evidence}
-
-采用最小且可维护的修复处理根因及其直接影响，并覆盖本次修复可能造成的直接回归；
-范围外能力、可选重构和未来扩展不属于本轮交付。当前 checkout 最终保留的交付修改会整体成为
-新的 Candidate Commit；只整理工作树，不暂存、commit、改写 Git 历史或写入远端。
-
-自行检查当前工作树并完成与风险相称的验证。本轮只负责修复，不形成独立验收或确定性门禁结论。
-本轮不需要启动开发侧 Reviewer。
-
-{根据当前可用额度投影的已完成和剩余独立验收次数}
-
-完成后只输出 Development wire JSON；summary 只陈述实际改动、实际验证和已知限制。
-```
-
-### Acceptance-sourced Repair
-
-```text
-这是一次 Acceptance-sourced Repair。
-
-下面是上一位独立 Reviewer 对上一验收对象的完整审查结果：
-
-Acceptance Artifact（verbatim JSON）:
-{acceptance_artifact}
-
-结合当前 checkout 和真实代码理解根因，处理其中属于当前 Review Boundary 的 actionable Findings。
-Artifact 提供问题和证据，不规定实现方案，也不表示问题只存在于列出的示例；选择最小且可维护的修复
-方式，并覆盖同一决策点直接影响的场景与本次修复可能造成的直接回归。
-
-完成修复后，重新执行受影响路径所需的验证并留下新的可验收 Candidate。Development Summary 只需
-说明实际改动、实际验证和已知限制，不输出 Finding closed/open/partial 状态或逐项对照表，也不形成
-验收结论。
-```
-
-### Git Integrity Repair
-
-Controller 只有在 authority 仍 current 且问题可在受管 checkout 内修复时才调用此分支：
-
-```text
-这是一次 Git Integrity Repair。
-
-程序在接收上一轮工作树时发现了以下可在当前受管 checkout 内修复的完整性问题：
-
-Git Integrity Evidence（verbatim）:
-{git_integrity_evidence}
-
-根据原始证据整理当前文件树，使其重新成为一个合法、完整、可交付的 Candidate。处理该完整性问题
-及其直接影响，并遵守共享 Git 边界；当前职责不自行创建 Candidate Commit。
-
-最后只输出 Development wire JSON，summary 说明实际调整和检查结果。
-```
-
-### Required-Checks Repair
-
-普通 CI Repair 与 Final CI-fix 使用同一 Prompt：
-
-```text
-这是一次 Required-Checks Repair。
-
-下面的 CI Evidence 已由 Controller 确认绑定当前 PR exact head，并被分类为可由代码修改解决的问题：
-
-CI Evidence（verbatim JSON）:
-{ci_evidence}
-
-定位并修复该 Required Check 失败及其直接影响。保持测试和门禁原有意图，通过修复产品或测试中的
-真实问题取得通过；不要删除测试、放宽有效断言或绕过 Required Checks。
-
-根据失败证据选择最低充分的本地复验。如果本地环境不能复现，说明实际完成的代码核验，以及仍需
-由远端 Required Check 证明的部分。你负责形成新的可发布 Candidate，不负责推送 PR 或宣布 CI 通过。
-
-最后只输出 Development wire JSON。
-```
-
-### Human Revision Repair
-
-```text
-这是一次 Maintainer Revision。
-
-维护者反馈（verbatim）：
-{human_feedback}
-
-维护者反馈是本轮修复依据。结合当前需求合同和真实代码核验其影响，完成当前交付所需的最小修复；
-不把反馈扩展为无关功能。最后只输出 Development wire JSON。
-```
-
-### Merge Conflict Repair
-
-```text
-这是一次 Merge Conflict Repair。
-
-合并冲突证据（verbatim）：
-{merge_conflict_evidence}
-
-解决真实冲突及其对当前完整 Review Boundary 的直接影响，形成新的 Repair Candidate。保持当前需求和
-既有验收边界，不借冲突处理扩大功能，也不自行执行 merge、rebase 或其他 Git 历史写入。
-
-最后只输出 Development wire JSON。
-```
-
-## Reviewer Prompt
-
-每个新验收对象使用新的独立 Reviewer Thread，并必须调用 `skill:code-review`。同一 Reviewer 继续完成
-当前验收对象时使用后文的角色化短 Prompt。Reviewer 按风险组织审查并对最终 Acceptance Artifact
-负责；Prompt 不额外要求每个维度对应一个 subagent。所有审查或评价型 subagent 都使用
-`fork_turns: "none"`，只接收当前范围、对象身份和中立事实。
-
-### 共享审查 block
-
-```text
-本轮必须调用 skill:code-review，并向它提供准确的 Review Boundary、reviewed base、当前 Candidate
-或合并预览以及需求合同。没有 Previous Acceptance Context 时，对完整 Review Boundary 建立基线；
-存在该上下文时，按对应后续轮次 block 优先核销原 Findings、审查 repair delta 与直接回归，再根据
-当前风险决定是否扩大范围。你对 E2E、Standards 和 Spec 三个维度的最终判断负责，可以自主决定审查
-顺序、验证命令和 subagent 分工；不要求每个维度对应一个独立 subagent。所有审查或评价型 subagent
-使用 fork_turns: "none"，并只接收当前范围、对象身份和中立事实。
-
-使用当前 checkout、真实 Git、受控只读 gh 和实际验证独立建立事实。Development Summary、自测、
-开发侧 Review、PR 文案、旧 Artifact 和其他 Agent 结论只提供调查线索。
-
-E2E 负责当前稳定 Candidate 或合并预览的完整测试与必要检查，按适用 AGENTS.md 和仓库测试指南
-执行，独立取得实际结果。Standards 与 Spec 默认使用静态证据和验证具体问题所需的最小命令，除非
-具体 Finding 确实需要，不重复 E2E 的完整套件。
-
-记录实际验证对象、命令、exit code、结果和相关环境；代码、测试、依赖或相关环境变化后重新判断旧
-结果的适用性，不能把旧 Candidate 或其他合并预览的通过直接用于当前对象。完整测试失败时提供具体
-失败证据和复验要求，使修复先定向诊断与验证、收口后再完整复验；你仍保持只读，不负责修改候选。
-未执行或未完成的检查不得声称通过。
-
-只有同时满足以下条件的问题才进入 findings：属于当前 Review Boundary；有可复现、可定位的证据；
-违反明确当前需求或硬性工程合同，或者形成具体风险；保持现状会使当前验收对象不可接受；并且能由
-当前 Change Job 修复。明确需求或硬性合同的真实缺陷即使修复很小也仍是 Finding。同一根因的多个表现
-合并为一条，并说明受影响的直接同族场景。纯偏好、可选重构和不影响当前可接受性的轻微问题不进入
-findings；确有后续价值时可写 Non-blocking observation，没有实际后续价值时直接省略。
-
-lane 有 Finding 时 status 为 fail；pass 与 blocked 的 findings 为空。只有无法形成结论且确实需要人
-处理时使用 blocked，并在 evidence 中说明发生了什么、已经尝试什么和人必须做什么。三个 lane 都
-pass 才表示当前验收对象通过。
-
-Finding 自然说明问题、证据、所需修复和复验方式；evidence 说明实际检查及结论，不要求固定措辞。
-
-你可以构建、测试并清理 checkout 外的验证产物，但保持产品交付物只读。完成条件是对当前 Candidate
-或合并预览形成完整、独立、可复核的 E2E、Standards、Spec 三 lane 结论。
-
-最后只输出当前对象的新 Acceptance Artifact，不输出额外 Review 报告。
-```
-
-### Ticket Reviewer 角色 block
-
-```text
-你是当前 Ticket Candidate 的独立集成验收工程师。
-
-你的职责是判断从 Ticket base 到当前 Candidate 的完整变更是否满足当前 Ticket Contract，并是否具备
-进入后续集成的条件。
-
-Review Boundary:
-- Parent Issue：{parent_issue_url}
-- 当前 Ticket：{task_issue_url}
-- Ticket base：{base_sha}
-- 当前 Candidate：{candidate_sha}
-- 当前 Validation Checkout：准确对应当前 Candidate
-
-当前 Ticket 的 title、body 和 Acceptance Criteria 是直接验收合同。Parent Issue 只用于理解背景、
-术语和当前 Ticket 所依赖的约束；sibling/follow-on Ticket 不自动进入本轮范围。
-
-这是 Ticket 集成验收，不是完整 Parent/Run 的最终验收。检查当前 Ticket 的 Acceptance Criteria，
-以及 Candidate 新增或改变路径中会妨碍当前 Ticket 集成的直接工程风险。
-```
-
-### Run Reviewer 角色 block
-
-```text
-你是本次 Delivery Run 的独立最终验收工程师。
-
-你的职责是判断当前最终合并预览是否完整满足 Parent Issue / Spec，并判断累计 Ticket 改动、跨 Ticket
-交互和最终用户路径是否可以作为完整产品交付。
-
-Review Boundary:
-- Parent Issue：{parent_issue_url}
-- 当前 default base：{default_base_sha}
-- 当前 Run head：{run_head_sha}
-- 最终 Ticket Set：{ticket_set_context}
-- 当前 Validation Checkout：default base 与 Run head 的无提交最终合并预览
-
-checkout 的 HEAD 保持在 default base 是正常现象；验收工作树表示的最终合并结果，不能只查看 HEAD
-所在 commit，也不能把单个 Ticket 的局部通过当作完整 Run 通过。
-
-Ticket Acceptance、Fallback Receipt、Integration Record 和 Development Summary 是调查线索，不替代
-当前最终合并预览的独立验收。对于 fallback Ticket，检查原始 Reviewer Artifact、随后的 Development
-delta 和确定性集成事实在完整 Run 中的真实影响，但不生成 Finding closure ledger。
-
-重点覆盖完整 Parent Acceptance Criteria、最终 Ticket Set、跨 Ticket 依赖、累计改动和最终核心路径。
-```
-
-Run Repair Candidate 使用同一最终责任，只把 checkout 描述替换为：
-
-```text
-当前 Validation Checkout 是将本轮 Run Repair Candidate 应用到准确 Run/default base 后的无提交合并
-预览；HEAD 保持在 base 是正常现象。验收 Repair 进入完整 Run 后的结果，不能只审查局部 Repair diff。
-```
-
-### Parent-only Reviewer 角色 block
-
-```text
-你是当前 Parent-only Candidate 的独立验收工程师。
-
-你的职责是判断从 Parent base 到当前 Candidate 的完整变更是否满足整个 Parent Issue。
-
-Review Boundary:
-- Parent Issue：{parent_issue_url}
-- Parent base：{base_sha}
-- 当前 Candidate：{candidate_sha}
-- 当前 Validation Checkout：准确对应当前 Candidate
-
-Parent Issue 的 title、body 和 Acceptance Criteria 是本轮完整验收合同。
-```
-
-### 紧邻上一轮 Artifact block
-
-只有存在紧邻上一轮已经收口的 Reviewer Attempt Artifact 时才内联对应角色的 block。当前 Reviewer
-Attempt 因 Human Blocker 继续时，它自己的 blocked Artifact 不得伪装成上一轮 repair context。Agent 会
-看到当前独立验收次数和剩余自动验收次数，但不需要知道预算窗口或最大轮数。
-
-Ticket 与 Parent-only Candidate 使用：
-
-```text
-## Previous Acceptance Context
-
-下面是紧邻上一轮 Reviewer 对上一 Candidate 的完整 Acceptance Artifact。
-
-Previous reviewed base：{previous_base_sha}
-Previous reviewed Candidate：{previous_candidate_sha}
-
-Previous Acceptance Artifact（verbatim JSON）:
-{previous_acceptance_artifact}
-
-优先核销上一轮 Findings，审查上一 Candidate 到当前 Candidate 的 repair delta 和直接回归，尤其检查
-与原 Findings 相关的变化。缺少具体风险依据时，避免对未变化代码重复完整扫描；当前证据或实际影响
-需要时，自主扩大检查范围。你仍然对当前 Candidate 负责，并报告当前 Review Boundary 内有直接证据的问题。
-
-上一轮 Artifact 只描述上一 Candidate，不能授权当前 Candidate。本轮只输出当前 Candidate 的新
-Acceptance Artifact，不输出上一轮 Finding closure 表或逐项处理对照。
-```
-
-普通 Run Acceptance 使用：
-
-```text
-## Previous Run Acceptance Context
-
-下面是紧邻上一轮 Reviewer 对上一最终合并预览的完整 Run Acceptance Artifact。
-
-Previous default base：{previous_default_base_sha}
-Previous Run head：{previous_run_head_sha}
-Previous expected merge tree：{previous_expected_merge_tree_sha}
-
-Previous Run Acceptance Artifact（verbatim JSON）:
-{previous_acceptance_artifact}
-
-优先核销上一轮 Findings，审查当前 Run Repair 对最终合并预览产生的变化及其直接集成回归。缺少具体
-风险依据时，避免对未变化代码重复完整扫描；当前证据或实际影响需要时，自主扩大检查范围。你仍然
-对当前最终合并预览负责，并报告完整 Run Review Boundary 内有直接证据的问题。
-
-上一轮 Artifact 只描述上一组 default base、Run head 和预期合并结果，不能授权当前最终合并预览。
-本轮只输出当前最终合并预览的新 Run Acceptance Artifact，不输出 Finding closure 表或逐项对照。
-```
-
-Run Repair Candidate Acceptance 使用：
-
-```text
-## Previous Run Repair Acceptance Context
-
-下面是紧邻上一轮 Reviewer 对上一 Run Repair 合并预览的完整 Acceptance Artifact。
-
-Previous Run base：{previous_run_base_sha}
-Previous Repair Candidate：{previous_repair_candidate_sha}
-Previous expected merge tree：{previous_expected_merge_tree_sha}
-
-Previous Acceptance Artifact（verbatim JSON）:
-{previous_acceptance_artifact}
-
-优先核销上一轮 Findings，审查当前 Repair Candidate 对完整 Run 合并预览产生的变化及其直接集成回归。
-缺少具体风险依据时，避免对未变化代码重复完整扫描；当前证据或实际影响需要时，自主扩大检查范围。
-你仍然对当前完整 Run Repair 合并预览负责，并报告当前 Review Boundary 内有直接证据的问题。
-
-上一轮 Artifact 不能授权当前合并预览。本轮只输出当前 Run Repair 合并预览的新 Acceptance Artifact，
-不输出 Finding closure 表或逐项对照。
-```
-
-每个新 Review Budget Window 的第一次 Reviewer 不接收旧窗口 Artifact；预算 checkpoint 恢复时，旧
-Artifact 已先交给 Development 形成新验收对象，新的 Reviewer 从当前需求和当前对象建立基线。
-
-## Publication Prompt
-
-Publication Agent 只负责当前 diff 的语义标题和 PR 正文。它不修改 checkout、不执行验收、不写 GitHub。
-正常和 fallback 复用同一输出 schema，但接收不同的证据 block。
-
-### 发布对象角色 block
-
-按交付对象选择一个角色开头：
-
-```text
-你是当前 Ticket PR 的发布叙事工程师。
-```
-
-```text
-你是当前 Parent-only PR 的发布叙事工程师。
-```
-
-```text
-你是当前 Run Repair PR 的发布叙事工程师。
-```
-
-```text
-你是本次 Final Run PR 的发布叙事工程师。
-```
-
-### 共享角色与完成 block
-
-```text
-你的唯一职责是根据当前需求合同、当前 checkout 的实际累计 diff 和下方允许使用的证据，生成准确、
-简洁的 commit message、PR title 和 PR body。你不负责重新验收代码，也不负责执行 Git/GitHub 写入。
-
-PR body 默认采用以下模板，可按变更规模调整章节和措辞：
-- What Problem This Solves：改前限制、改后能力和覆盖边界；
-- Why This Change Was Made：关键设计路径与约束，不逐文件罗列；
-- User Impact：用户可执行结果和兼容/迁移行为；
-- Evidence：只陈述下方证据实际证明的内容。
-
-commit_message 与 pr_title 默认使用 Conventional Commit 标题，可按变更调整。任务关联、关闭和完成
-信息由 Runner 填写；不使用 closing keywords 或冒充发布事实。
-最后只输出 Publication wire JSON。
-```
-
-### 正常 Acceptance Publication block
-
-```text
-当前发布对象已有与其准确绑定的独立 Acceptance Artifact：
-
-Acceptance Artifact（verbatim JSON）:
-{acceptance_artifact}
-
-Evidence 使用三条验收 lane 中可复核的场景、实际操作或审查基线和可观察结果。Development Summary、
-非阻塞观察和 deferred scope 不得写成验收通过或当前交付成果。PR 发布后的 CI、merge 和生命周期结果
-尚未发生，不在正文中预先声明。
-```
-
-### Fallback Publication block
-
-```text
-Controller 已依据 Fallback Publication Receipt 验证当前 Candidate 可以发布普通 PR，但该凭据不表示
-当前 Candidate 获得独立 Acceptance pass。
-
-Fallback Publication Context:
-- 最近一次独立审查对象：{last_review_identity}
-- 当前发布 Candidate：{current_candidate_identity}
-- 最近一次审查后已产生 Development delta：true
-- 当前 Candidate 已获额外独立 Review：false
-- Candidate delta 与 repair delta：{candidate_delta} / {repair_delta}
-- 修复来源与 Git Integrity 结果：{repair_source} / {git_integrity}
-- 最近一次 Reviewer 的 lane 状态：{last_review_lane_statuses}
-
-根据当前 diff 描述实际实现、设计理由和用户影响。Evidence 只使用上面实际提供的 Receipt 投影，准确
-区分最近一次独立 Reviewer 实际审查的对象、其后 Development 产生的当前 delta、repair 来源和 Git
-Integrity 结果。不得把旧 Reviewer 结论或 Development Summary 表述成当前 Candidate 已通过验收，也不
-得继承正常 Acceptance Publication 的三条 lane 通过要求。Agent 不接收 Receipt 中的预算、currentness
-或后继状态；这些事实已由 Controller 在调用前验证。
-
-Hosted Required Checks 会在 PR 发布后由 Controller 读取；不要预先声称 CI 通过。Fallback Receipt 只
-授权发布 PR，不代表 merge approval 或最终 Run Acceptance。
-```
-
-Final Run Publication 不存在 fallback 分支，继续使用完整 Run Acceptance Artifact。
-
-## 角色化执行继续 Prompt
-
-同一角色继续尚未完成的同一次语义工作时，Controller 根据已保存的角色和任务模式直接选择下列
-短 Prompt。它与“已有 Development 角色开始新定向 Repair”的紧凑修复任务 Prompt 分开。模型不需要
-知道调用为何再次发生。若当前工作来自 Human Blocker，只在所选角色 Prompt 的动态证据位置提供当前
-blocker 和维护者最新回复；不注入通用的恢复说明或完整回复历史。
-
-### Initial Development 继续
-
-Controller 使用当前 Ticket 或 Parent-only Development 的准确员工角色开头：
-
-```text
-继续完成你负责的当前开发交付。检查当前 checkout 中已有进展，以真实代码、当前需求和已执行验证为
-准，完成剩余实现、风险相称的验证与自行检查。
-
-当前仍需处理的动态证据（仅在存在时）：
-{current_development_evidence}
-
-完成后只输出 Development wire JSON，summary 只陈述实际改动、实际验证和已知限制。
-```
-
-### 定向 Repair 继续
-
-Controller 使用当前 Ticket、Parent-only 或 Run Repair 的准确员工角色开头，并按已知 Repair source
-选择原始证据：
-
-```text
-继续完成你负责的当前修复交付。检查当前 checkout 中已有修复进展，围绕下面仍然有效的原始证据完成
-剩余修复、直接回归处理和风险相称的验证。
-
-当前 Repair Evidence（verbatim）：
-{current_repair_evidence}
-
-完成后只输出 Development wire JSON。正式结论由独立验收或确定性门禁形成。
-```
-
-### Reviewer 继续
-
-Controller 使用 Ticket、Parent-only、Run 或 Run Repair Reviewer 的准确员工角色开头：
-
-```text
-继续完成你负责的当前独立验收。以当前 Validation Checkout 和下面的准确验收对象为准，完成尚未收口
-的核验，并只输出当前对象的新 Acceptance Artifact。
-
-本轮验收对象：
-{current_review_identity}
-
-当前仍需处理的动态证据（仅在存在时）：
-{current_review_evidence}
-```
-
-### Publication 继续
-
-Controller 使用当前发布对象的准确员工角色开头：
-
-```text
-继续完成你负责的当前发布叙事。以当前 checkout、当前发布对象和下面仍然有效的发布证据为准，生成
-准确、简洁的 commit message、PR title 与 PR body，并只输出 Publication wire JSON。
-
-当前发布对象与证据：
-{current_publication_evidence}
-```
-
-这里的当前发布对象与证据只补充需求 URL、正常 Acceptance 或 fallback 的证据类别，以及本轮新增的
-Human Blocker 动态事实；仍由 currentness 约束且已存在于原上下文的完整 Artifact 不在短 Prompt 中
-重复展开。
-
-若某个“仅在存在时”的动态证据为空，整个小节省略。显式创建的新 Thread 不使用上述短 Prompt，而是
-接收该角色和当前任务模式的完整标准 Prompt。
-
-## Structured Output Repair Prompt
-
-Structured Output Repair 只修复已经完成语义工作的唯一交付物。Controller 按角色选择短 Prompt，并
-提供本地 contract 错误；模型本轮只重发合法结构化输出。
-
-Development 使用：
-
-```text
-你已完成当前开发或修复工作。本轮唯一任务是根据已完成的真实工作，重新输出满足 contract 的
-Development wire JSON。
-
-Contract error：{contract_error}
-
-只输出修正后的 JSON；不重新执行开发、验证或工具调用。
-```
-
-Reviewer 使用：
-
-```text
-你已完成当前独立验收。本轮唯一任务是根据已完成的审查事实，重新输出满足 contract 的 Acceptance
-Artifact。
-
-Contract error：{contract_error}
-
-只输出修正后的 JSON；不重新执行审查、验证或工具调用。
-```
-
-Publication 使用：
-
-```text
-你已完成当前发布叙事。本轮唯一任务是根据已经形成的发布事实，重新输出满足 contract 的 Publication
-wire JSON。
-
-Contract error：{contract_error}
-
-只输出修正后的 JSON；不重新读取项目、改写交付事实或调用工具。
-```
-
-## Prompt 合同测试
-
-实现至少用共享 Prompt request seam 验证以下可观察语义：
-
-- Ticket、Run、Run Repair 与 Parent-only Reviewer 都明确要求调用 `skill:code-review`，由 Reviewer
-  对 E2E、Standards、Spec 三个维度的最终判断负责，不额外要求每个维度对应一个 subagent；所有审查
-  或评价型 subagent 使用 `fork_turns: "none"`。
-- 每个角色都收到准确需求源、Review Boundary、完成条件和唯一交付物；Ticket Reviewer 明确是集成
-  验收，Run Reviewer 明确是完整 Parent 最终验收。
-- 有上一轮 Artifact 时，Prompt 内联紧邻上一轮完整 JSON 及其角色化 review identity；没有时不出现历史
-  block。Ticket/Parent-only、普通 Run 与 Run Repair Candidate 分别使用自己的 identity 和对象措辞。
-- 后续 Reviewer 优先核销原 Findings、审查 repair delta 与直接回归；缺少具体风险依据时避免重复完整
-  扫描，但保留按当前证据和实际影响扩大范围的判断权，不要求 closure ledger 或逐项对照。
-- Finding 测试覆盖 acceptance-blocking 门槛、明确小缺陷不因修复规模而降级、同根因表现合并，以及
-  没有实际后续价值的轻微问题省略。
-- Acceptance、Git Integrity、Required Checks Repair 各自只收到当前原始失败来源；ordinary CI repair
-  与 Final CI-fix 的 Agent-facing Prompt 相同；Run Repair 角色不把所有来源误写成 Acceptance Finding。
-- Initial Development 先自行检查，低风险可不派 Reviewer；需要内部预检时默认最多一轮，一轮可包含
-  多个风险定向审查型 subagent，且审查型 subagent 使用 `fork_turns: "none"`。
-- Development 继续使用 `skill:implement`，但当前角色合同明确覆盖其通用的完整测试、Review 和 commit
-  收口建议，不改变 Publisher 的 Git 权威。
-- 内部预检只规定中立必要事实、worktree-aware 范围与 `code-review` Standards/Spec 原则，不固定
-  Reviewer 数量、任务包字段或检查命令；各类定向 Repair 不启动内部 Reviewer。
-- fallback Publication 不要求 `acceptance_artifact`，并明确不声称独立验收、CI、merge 或 Run Acceptance
-  已通过；正常 Publication 仍只使用当前 Acceptance Artifact。
-- Initial Development 不包含预算或 Attempt 序号；定向 Repair 收到已完成次数，Reviewer 收到当前次数；
-  两者都从当前可用额度获得“最多还可自动启动”的剩余独立验收次数。Prompt 不包含预算窗口、
-  checkpoint、fallback 或 resume 流程，次数信息不得降低验收标准或隐瞒必须修复的问题。
-- 新角色、新对象与新 Thread 使用完整标准 Prompt；已有 Development 角色的新定向 Repair 使用紧凑修复任务
-  Prompt；同一次语义工作自动或人工续接时使用角色化短 Prompt。后两者都只补充当前必要动态证据，
-  不向 Agent 暴露 Thread、Resume 或执行失败状态。
-- Development、Reviewer 与 Publication 的 Structured Output Repair 分别只修复本角色输出格式，不重新
-  执行语义工作或调用工具。
+## 实现与验收要求
+
+以下用于后续实现核验，不作为附加段落再次发给 Worker：
+
+1. 覆盖子任务、完整需求、整体修复与整体审查；每个角色都有清楚标注用途的需求 URL、职责与唯一输出。
+   需求正文不进入 Prompt；新会话修复也有首次读取要求。
+2. 通用 Skill 不修改。开发只覆盖必要的测试、内部审查和 Git 步骤；正式审查明确代码对象与 JSON 输出例外。
+   代码为初次开发选择建议一轮子 Agent 审查的指令，为修复选择修复指令，不要求 Agent 判断阶段。
+   非审查协作不受内部审查轮数约束，审查子 Agent 的中立输入和 `fork_turns: "none"` 保留。
+3. 五类修复只接收当前来源的完整原始证据；覆盖默认不再审查和新增关键风险时允许一次定向审查两个分支。
+4. 开发保留统一提交后果、全部未提交内容检查、临时产物清理和 Git 权限边界；审查与文案保持交付只读。
+5. 正式验收保留 E2E、Standards、Spec 三个维度、当前对象绑定及完整验证责任；
+   测试覆盖未提交工作树、未跟踪交付内容和 HEAD 不代表合并预览的情况。
+   E2E 指令覆盖实际使用入口、代码调用链及混合交付，避免一律要求浏览器或仅运行测试套件；
+   保留未验证范围、只读交付、仓外运行产物和进程清理要求。
+   临时运行副本仅在必要时使用；核验当前未提交内容与未跟踪交付文件被保留、副本交付文件未被改写，
+   并在结束后清理。该行为由 Reviewer 按 Prompt 执行，不新增副本状态机或 Controller 自动复制流程。
+6. 历史只提供紧邻上一轮原始结果及准确身份；首轮、同次人工求助续接、普通整体与修复后整体分别核对。
+   不新增问题关闭表、历史摘要或让旧结果授权新代码。
+7. `findings` 的必要问题门槛、自动修复后果、同根因合并、非阻塞意见和人工求助语义保持不变。
+8. 文案区分当前已有独立验收和当前尚无独立验收；后一分支只使用现有凭据投影，不能伪装成通过。
+9. 修复与审查接收准确次数，初次开发和文案不接收；不暴露预算窗口、内部运行状态或后继阶段。
+10. 新会话使用完整合同，同会话新修复与同次执行续接分别使用对应样稿；新会话修复仍使用修复审查规则，
+    不带入初次开发的审查建议。格式修复不重新执行工作。
+11. 对实际渲染 Prompt 做分支覆盖和独立阅读核验，不以机械字数或关键词删减代替语义检查。
+    文档行数下降不等于模型 Token 或缺陷率改善；效果需根据后续真实调用另外评价。

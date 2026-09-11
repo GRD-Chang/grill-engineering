@@ -55,6 +55,15 @@ def memfd_capability() -> dict[str, object]:
     return {"available": True}
 
 
+def pidfd_capability() -> dict[str, object]:
+    try:
+        fd = os.pidfd_open(os.getpid())
+    except (AttributeError, OSError) as exc:
+        return {"available": False, "error": str(exc)}
+    os.close(fd)
+    return {"available": True}
+
+
 def main() -> None:
     report = {
         "python": {"version": sys.version, "executable": sys.executable},
@@ -62,6 +71,7 @@ def main() -> None:
         "os_release": platform.freedesktop_os_release(),
         "cpu_count": os.cpu_count(),
         "cpu_affinity_count": len(os.sched_getaffinity(0)),
+        "load_average": os.getloadavg(),
         "memory": {
             line.split(":", 1)[0]: line.split(":", 1)[1].strip()
             for line in Path("/proc/meminfo").read_text().splitlines()
@@ -74,7 +84,7 @@ def main() -> None:
         "packages": package_versions(),
         "bubblewrap": command("bwrap", "--version"),
         "memfd": memfd_capability(),
-        "pidfd": {"available": hasattr(os, "pidfd_open")},
+        "pidfd": pidfd_capability(),
         "user_namespace": {
             "unprivileged_userns_clone": read_limit(
                 "/proc/sys/kernel/unprivileged_userns_clone"

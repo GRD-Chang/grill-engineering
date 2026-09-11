@@ -38,6 +38,12 @@ _MULTILINE_PRIVATE_KEY = re.compile(
     r"(?:[\"']?-----BEGIN .*?-----END [^-]*-----|[^\r\n]*(?:\r?\n[^\r\n]*)+)"
 )
 _MAX_ERROR_BYTES = 8 * 1024
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f]")
+_JSON_CONTAINER_START = re.compile(r"[\[{]")
+# Every labelled pattern contains one of these words; matching remains below.
+_CREDENTIAL_LABEL = re.compile(
+    r"(?i)authorization|token|secret|key|password"
+)
 
 
 def bounded_error(value: str) -> str:
@@ -58,14 +64,22 @@ def redact_credentials(value: str) -> str:
 
 
 def _redact_text(value: str) -> str:
-    private_key_redacted = _MULTILINE_PRIVATE_KEY.sub("private_key=[REDACTED]", value)
-    clean = "".join(
-        character
-        for character in private_key_redacted
-        if character >= " " or character in "\n\t"
+    # Every labelled credential pattern requires one of these separators.
+    # Keep the regexes themselves authoritative, including Unicode IGNORECASE.
+    has_separator = ":" in value or "=" in value
+    # The private-key branches require a line break or a PEM-style marker.
+    private_key_redacted = (
+        _MULTILINE_PRIVATE_KEY.sub("private_key=[REDACTED]", value)
+        if has_separator and ("\n" in value or "-----" in value) else value
     )
-    redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", clean)
+    redacted = _CONTROL_CHARACTERS.sub("", private_key_redacted)
+    # Removing control characters can join a previously interrupted scheme.
+    if "://" in redacted:
+        redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", redacted)
     redacted = _KNOWN_BARE_TOKEN.sub("[REDACTED]", redacted)
+    # Match after control removal, which can also join a credential label.
+    if not has_separator or not _CREDENTIAL_LABEL.search(redacted):
+        return redacted
     redacted = _QUOTED_AUTHORIZATION.sub(
         r"\g<key>\g<key_close>\g<separator>\g<quote>[REDACTED]\g<quote>",
         redacted,
@@ -82,6 +96,11 @@ def _redact_text(value: str) -> str:
 
 
 def _redact_json_credentials(value: str) -> object | None:
+    # Avoid constructing JSONDecodeError for ordinary status/identity strings.
+    # Python's JSON decoder also accepts NaN and Infinity by default.
+    leading = value.lstrip(" \t\n\r")
+    if not leading or leading[0] not in '{["-0123456789tfnNI':
+        return None
     try:
         decoded: object = json.loads(value)
     except json.JSONDecodeError:
@@ -92,13 +111,13 @@ def _redact_json_credentials(value: str) -> object | None:
 def _redact_embedded_json_credentials(value: str) -> str:
     """Normalize every complete JSON object or array embedded in error text."""
 
-    decoder = json.JSONDecoder()
+    decoder: json.JSONDecoder | None = None
     fragments: list[str] = []
     cursor = 0
-    while cursor < len(value):
-        if value[cursor] not in "{[":
-            cursor += 1
-            continue
+    while match := _JSON_CONTAINER_START.search(value, cursor):
+        cursor = match.start()
+        if decoder is None:
+            decoder = json.JSONDecoder()
         try:
             decoded, end = decoder.raw_decode(value, cursor)
         except json.JSONDecodeError:

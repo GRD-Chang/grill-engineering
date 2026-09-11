@@ -21,6 +21,7 @@ from agent_run.run_repair_requests import RunRepairRequests
 from run_acceptance_test_support import _completed_run, _passing_artifact
 from conftest import seed_idle_control
 from test_cli import run_internal_stage, run_cli, stdout_json
+from test_codex_prompt_contract import _capture_public_prompt
 
 from run_publication_test_support import (
     InterruptedRunPublisher,
@@ -691,7 +692,7 @@ def test_final_run_publication_receives_only_role_required_facts(
 
 
 def test_publication_prompts_and_run_repair_requests_keep_integration_records_with_reviewers(
-    git_repo: Path,
+    git_repo: Path, tmp_path: Path, monkeypatch: Any,
 ) -> None:
     state, states, git, publisher = _accepted_run_with_integration(git_repo)
     fallback_ticket_records = [
@@ -785,16 +786,23 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         "integration_record"
     ]
 
-    final_publication_prompt = CodexCliBackend._run_publication_prompt(
+    final_publication_prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "run_publication",
         {
             "parent_issue_url": "https://github.com/example/project/issues/1",
             "acceptance_artifact": {},
             "fallback_ticket_records": fallback_ticket_records,
             "previous_review_identity": previous_review_identity,
             "ticket_integration_records": integration_records,
-        }
+        },
+        name="final-publication-role-facts",
     )
-    run_repair_publication_prompt = CodexCliBackend._publication_prompt(
+    run_repair_publication_prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
         {
             "acceptance_scope": "run",
             "parent_issue_url": "https://github.com/example/project/issues/1",
@@ -802,9 +810,13 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
             "fallback_ticket_records": fallback_ticket_records,
             "previous_review_identity": previous_review_identity,
             "ticket_integration_records": integration_records,
-        }
+        },
+        name="run-repair-publication-role-facts",
     )
-    reviewer_prompt = CodexCliBackend._review_prompt(
+    reviewer_prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "review",
         {
             "acceptance_scope": "run",
             "parent_issue_url": "https://github.com/example/project/issues/1",
@@ -819,7 +831,8 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
                 "run_head_sha": "run-head",
                 "expected_merge_tree": "expected-merge-tree",
             },
-        }
+        },
+        name="reviewer-integration-facts",
     )
 
     for prompt in (final_publication_prompt, run_repair_publication_prompt):

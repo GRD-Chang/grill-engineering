@@ -3234,9 +3234,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     assert "parent_approval_pending" not in requeued.stdout
     assert "<run-id>" not in requeued.stdout
     for command in ("status", "history"):
-        view = run_cli(
-            git_repo, fixture, command, run_id, machine_output=False
-        )
+        view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert "等待父项人工批准" in view.stdout
         assert "agent-run approve 1 --repo example/project" in view.stdout
         assert run_id not in view.stdout
@@ -3492,9 +3490,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     assert "<run-id>" not in interrupted.stdout
     assert run_id not in interrupted.stdout
     for command in ("status", "history"):
-        view = run_cli(
-            git_repo, fixture, command, run_id, machine_output=False
-        )
+        view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert "等待放弃恢复" in view.stdout
         assert "agent-run abandon 1 --repo example/project" in view.stdout
         assert "abandonment_pending" not in view.stdout

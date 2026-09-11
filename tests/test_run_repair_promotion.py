@@ -17,7 +17,8 @@ from agent_run.run_publication import RunPublicationEngine
 from agent_run.semantic_attempt import allocate_semantic_attempt, close_semantic_attempt
 from agent_run.state_contract import IncompatibleRunStateError
 
-from test_cli import run_cli, stdout_json
+from support.inprocess_cli import invoke_cli_inprocess
+from test_cli import stdout_json
 
 from run_acceptance_test_support import (
     ScriptedRunAgents,
@@ -610,7 +611,7 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     )
     assert any(record.get("publication") for record in archived_records)
 
-    history = run_cli(
+    history = invoke_cli_inprocess(
         git_repo, fixture, "history", str(state["run_id"]), "--plain", "--details"
     )
     assert history.returncode == 0, history.stderr
@@ -693,14 +694,14 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
 
     class StatusAssertingRepairAgents(ScriptedRunAgents):
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
-            json_status = run_cli(
+            json_status = invoke_cli_inprocess(
                 git_repo,
                 fixture,
                 "status",
                 str(state["run_id"]),
                 "--json",
             )
-            text_status = run_cli(
+            text_status = invoke_cli_inprocess(
                 git_repo,
                 fixture,
                 "status",
@@ -768,14 +769,14 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                     gated["terminal_kind"] = "ready_for_human"
                 states.save_run(str(state["run_id"]), gated)
 
-                gated_json_result = run_cli(
+                gated_json_result = invoke_cli_inprocess(
                     git_repo,
                     fixture,
                     "status",
                     str(state["run_id"]),
                     "--json",
                 )
-                gated_text = run_cli(
+                gated_text = invoke_cli_inprocess(
                     git_repo,
                     fixture,
                     "status",
@@ -844,9 +845,9 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     assert len(second["run_acceptance"]["completed_repair_jobs"]) == 1
 
     json_status = stdout_json(
-        run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
     )
-    text_status = run_cli(git_repo, fixture, "status", str(state["run_id"]))
+    text_status = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]))
     assert json_status["phase"] == "stale"
     assert json_status["progress"]["current_object"] == "Run Publication"
     assert "阶段:       已失效" in text_status.stdout

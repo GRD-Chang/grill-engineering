@@ -13,7 +13,8 @@ import pytest
 
 from agent_run.executor_host import _process_start_token
 from cli_fixtures import run_agents
-from test_cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
+from support.inprocess_cli import invoke_cli_inprocess
+from test_cli import PROJECT_ROOT, load_only_run_state, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, publication
 
 _WAIT_FIELDS = {
@@ -34,8 +35,8 @@ def _assert_public_wait_projection(
     repo: Path, fixture: Path, run_id: str, *, secret: str | None = None
 ) -> None:
     for command in ("status", "history"):
-        json_result = run_cli(repo, fixture, command, run_id, "--json")
-        text_result = run_cli(repo, fixture, command, run_id)
+        json_result = invoke_cli_inprocess(repo, fixture, command, run_id, "--json")
+        text_result = invoke_cli_inprocess(repo, fixture, command, run_id)
 
         assert json_result.returncode == text_result.returncode == 0
         wait = stdout_json(json_result)["supervision"]
@@ -64,8 +65,8 @@ def _assert_waiting_external_recovery_action(
 ) -> None:
     expected_action = "agent-run run 1"
     for command in ("status", "history"):
-        json_result = run_cli(repo, fixture, command, run_id, "--json")
-        text_result = run_cli(repo, fixture, command, run_id)
+        json_result = invoke_cli_inprocess(repo, fixture, command, run_id, "--json")
+        text_result = invoke_cli_inprocess(repo, fixture, command, run_id)
 
         assert json_result.returncode == text_result.returncode == 0
         assert stdout_json(json_result)["next_action"] == expected_action
@@ -75,7 +76,7 @@ def _assert_credential_wait_is_not_public(
     repo: Path, fixture: Path, run_id: str
 ) -> None:
     for command in ("status", "history"):
-        output = stdout_json(run_cli(repo, fixture, command, run_id, "--json"))
+        output = stdout_json(invoke_cli_inprocess(repo, fixture, command, run_id, "--json"))
         assert output.get("supervision") is None
 
 def _parent_only_agents(path: Path) -> Path:

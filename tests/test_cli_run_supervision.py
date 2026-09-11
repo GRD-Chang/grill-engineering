@@ -10,6 +10,7 @@ import pytest
 
 from cli_fixtures import run_agents
 from conftest import write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import (
     parent_publication,
@@ -259,9 +260,7 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     assert "requeue_required" not in halted.stdout
     assert "<run-id>" not in halted.stdout
     for command in ("status", "history"):
-        view = run_cli(
-            git_repo, fixture, command, run_id, machine_output=False
-        )
+        view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert "需要重新排队" in view.stdout
         assert "agent-run requeue 1 --repo example/project" in view.stdout
         assert run_id not in view.stdout
@@ -512,10 +511,10 @@ def test_public_run_supervises_non_repairable_final_check_failure(
     )
     assert state["run_publication"]["phase"] == "waiting_external"
     status = stdout_json(
-        run_cli(git_repo, fixture, "status", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
     )
     assert status["supervision"]["kind"] == "github_convergence"
-    status_view = run_cli(git_repo, fixture, "status", str(state["run_id"])).stdout
+    status_view = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"])).stdout
     assert "类型: Supervision Timeout Pause" in status_view
     assert "对象: Run Publication" in status_view
     assert "阶段: waiting_external" in status_view
