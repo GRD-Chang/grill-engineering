@@ -15,6 +15,7 @@ from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from cli_fixtures import run_agents
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, ticket
 
@@ -591,9 +592,13 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
             "Agent Execution Binding: role=review thread=new "
             "model=new-review reasoning_effort=low profile_revision=2"
         ) in stderr
-        idle = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
+        idle = stdout_json(
+            invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
+        )
         assert idle["agent_invocation"] is None
-        history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))
+        history = stdout_json(
+            invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
+        )
         development = next(
             item
             for item in history["agent_invocations"]
@@ -609,7 +614,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         )
         assert review["model"] == "new-review"
         assert review["profile_revision"] == 2
-        text_history = run_cli(git_repo, fixture, "history", run_id).stdout
+        text_history = invoke_cli_inprocess(git_repo, fixture, "history", run_id).stdout
         assert "模型=old-development；推理强度=xhigh" in text_history
         assert "profile_revision" not in text_history
         publication = next(
@@ -655,7 +660,7 @@ def test_public_resume_reuses_bound_thread_and_reports_its_id(git_repo: Path) ->
     assert blocked.returncode == 2, blocked.stderr
     run_id = str(stdout_json(blocked)["run_id"])
     failed_history = stdout_json(
-        run_cli(git_repo, fixture, "history", run_id, "--json")
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
     )["agent_invocations"]
     first_development = next(
         item for item in failed_history if item.get("invocation_role") == "development"
@@ -692,9 +697,9 @@ def test_public_resume_reuses_bound_thread_and_reports_its_id(git_repo: Path) ->
     )
     assert resumed.returncode == 0, resumed.stderr
     assert stdout_json(resumed)["status"] == "parent_approval_pending"
-    history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))[
-        "agent_invocations"
-    ]
+    history = stdout_json(
+        invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")
+    )["agent_invocations"]
     development_invocations = [
         item for item in history if item.get("invocation_role") == "development"
     ]

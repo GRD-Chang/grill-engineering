@@ -25,6 +25,7 @@ from agent_run.state_contract import (
 )
 
 from conftest import seed_idle_control
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_cli, stdout_json
 
 from run_acceptance_test_support import (
@@ -254,13 +255,13 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
 
     assert result.returncode == 2, result.stderr
     assert stdout_json(result)["status"] == "ready_for_human"
-    status_result = run_cli(
+    status_result = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
     )
-    text_status_result = run_cli(
+    text_status_result = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "status", str(state["run_id"])
     )
-    history_result = run_cli(
+    history_result = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "history", str(state["run_id"]), "--json"
     )
     assert status_result.returncode == text_status_result.returncode == 0
@@ -346,10 +347,10 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     assert job["acceptance_generation"] == 4
     assert job["repair_generation"] == 2
 
-    json_status = run_cli(
+    json_status = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
     )
-    text_status = run_cli(
+    text_status = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "status", str(state["run_id"])
     )
     assert json_status.returncode == text_status.returncode == 0
@@ -416,10 +417,10 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     }
     states.save_run(str(state["run_id"]), state)
 
-    json_status = run_cli(
+    json_status = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
     )
-    text_status = run_cli(
+    text_status = invoke_cli_inprocess(
         git_repo, git_repo / "github.json", "status", str(state["run_id"])
     )
 
@@ -460,10 +461,10 @@ def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
         def review(self, request: dict[str, Any]) -> ReviewResult:
             self.review_requests.append(request)
             if len(self.review_requests) == 3:
-                json_status = run_cli(
+                json_status = invoke_cli_inprocess(
                     git_repo, fixture, "status", str(state["run_id"]), "--json"
                 )
-                text_status = run_cli(
+                text_status = invoke_cli_inprocess(
                     git_repo, fixture, "status", str(state["run_id"])
                 )
                 assert json_status.returncode == text_status.returncode == 0
@@ -476,10 +477,10 @@ def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
             )
 
         def publication(self, request: dict[str, Any]) -> dict[str, str]:
-            json_status = run_cli(
+            json_status = invoke_cli_inprocess(
                 git_repo, fixture, "status", str(state["run_id"]), "--json"
             )
-            text_status = run_cli(
+            text_status = invoke_cli_inprocess(
                 git_repo, fixture, "status", str(state["run_id"])
             )
             assert json_status.returncode == text_status.returncode == 0

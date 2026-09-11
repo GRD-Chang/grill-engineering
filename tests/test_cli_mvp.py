@@ -25,7 +25,7 @@ def _assert_credential_wait_is_not_public(
     repo: Path, fixture: Path, run_id: str
 ) -> None:
     for command in ("status", "history"):
-        output = stdout_json(run_cli(repo, fixture, command, run_id, "--json"))
+        output = stdout_json(invoke_cli_inprocess(repo, fixture, command, run_id, "--json"))
         assert output.get("supervision") is None
 
 
@@ -598,14 +598,14 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
     run_file.write_text(json.dumps(paused_state), encoding="utf-8")
     expected_action = f"agent-run resume {run_id}"
     for command in ("status", "history"):
-        output = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+        output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
         wait = output["supervision"]
         assert wait["kind"] == "required_checks"
         assert wait["remaining_seconds"] == 0
         assert wait["timeout_resume_action"] == expected_action
 
     for command in ("status", "history"):
-        text = run_cli(git_repo, fixture, command, run_id).stdout
+        text = invoke_cli_inprocess(git_repo, fixture, command, run_id).stdout
         assert "超时恢复: agent-run resume <run-id>" in text
         assert run_id not in text
         if command == "status":
@@ -768,7 +768,7 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
     assert state["agent_invocation_history"] == []
     run_id = str(state["run_id"])
     for command in ("status", "history"):
-        output = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+        output = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
         assert output["next_action"] == (
             "agent-run resume 1 --repo example/project"
         )
@@ -776,7 +776,7 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         assert snapshot["credential_failure_class"] == "credential_unavailable"
         assert snapshot.get("credential_http_status") == http_status
         assert snapshot["next_action"] == f"agent-run resume {run_id}"
-        text = run_cli(git_repo, fixture, command, run_id)
+        text = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert text.returncode == 0, text.stderr
         assert "凭据失败类别: credential_unavailable" in text.stdout
         assert "重试次数: 13" in text.stdout

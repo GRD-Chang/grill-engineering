@@ -20,6 +20,7 @@ from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_idle_control, seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import issue, run_cli, stdout_json
 
 
@@ -977,7 +978,7 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
         "reason": "change_pr_base_changed_externally",
     }
     for command in ("status", "history"):
-        view = run_cli(git_repo, fixture, command, run_id)
+        view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert view.returncode == 0, view.stderr
         assert "类型: Deterministic Contradiction" in view.stdout
         assert "对象: Ticket #7" in view.stdout

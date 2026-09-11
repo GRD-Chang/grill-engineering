@@ -8,6 +8,7 @@ import pytest
 
 from agent_run.state import StateStore
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import passing_acceptance
 
@@ -583,7 +584,7 @@ def test_triage_remainder_is_not_a_gate_after_independent_work(
         }
     ]
     for command in ("status", "history"):
-        view = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+        view = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
         assert view["operator_action"] is None
 
 

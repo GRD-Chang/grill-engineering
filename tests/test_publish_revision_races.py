@@ -9,6 +9,7 @@ import pytest
 
 from agent_run.state import SimulatedProcessCrash, StateStore
 from conftest import seed_run, write_fixture
+from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import final_run_publication, passing_acceptance
 
@@ -480,7 +481,7 @@ def test_abandon_recovers_lost_change_pr_close_response(
     assert stdout_json(interrupted)["status"] == "abandonment_pending"
     for command in ("status", "history"):
         json_view = stdout_json(
-            run_cli(git_repo, fixture, command, run_id, "--json")
+            invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json")
         )
         action = json_view["operator_action"]
         assert action["type"] == "Abandonment Recovery"
@@ -491,7 +492,7 @@ def test_abandon_recovers_lost_change_pr_close_response(
         ]
         assert action["next_action"] == f"agent-run abandon {run_id}"
         assert json_view["next_action"] == action["next_action"]
-        text_view = run_cli(git_repo, fixture, command, run_id)
+        text_view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert "类型: Abandonment Recovery" in text_view.stdout
         assert "对象: Ticket #2" in text_view.stdout
         assert "阶段: waiting_checks" in text_view.stdout
