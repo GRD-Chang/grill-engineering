@@ -54,6 +54,25 @@ def ensure_change_branch_authority(
     ticket_number: int | None = None,
 ) -> None:
     """Persist exact ref intent before creating or recovering a Change ref."""
+    # A persisted merge may already have advanced the target and GitHub may
+    # have deleted its source ref. Let the shared delivery loop reconcile the
+    # PR and commit against this intent before attempting any branch setup.
+    intent = job.get("merge_intent")
+    publication = job.get("publication")
+    if (
+        job.get("phase") in {"merging", "merged"}
+        and type(job.get("pr_number")) is int
+        and isinstance(intent, dict)
+        and isinstance(publication, dict)
+        and intent.get("head_sha") == job.get("publication_sha")
+        and intent.get("base_branch") == base_branch
+        and intent.get("base_sha") == job.get("base_sha")
+        and intent.get("commit_message") == publication.get("commit_message")
+        and intent.get("effective_revision") == job.get("effective_revision")
+        and type(intent.get("attempts")) is int
+        and intent["attempts"] > 0
+    ):
+        return
     pending = job.get("ticket_write_intent")
     expected_remote_sha = str(job.get("published_sha", job["base_sha"]))
     recovery_remote_sha = expected_remote_sha

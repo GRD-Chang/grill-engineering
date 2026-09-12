@@ -449,6 +449,21 @@ class ParentDeliveryLoop:
             return False
         job["integrated_sha"] = integrated
         self._save(state)
+        if self.adapter.revision_changed(state, job):
+            # The approved merge is irreversible. Preserve its evidence and
+            # pause instead of closing a Parent whose requirements changed.
+            job.update({
+                "phase": "blocked", "blocked_reason": "effective_revision_mismatch",
+            })
+            state["status"] = "blocked"
+            state["diagnostics"] = [{
+                "code": "effective_revision_mismatch",
+                "message": (
+                    "Parent requirements changed after merge; merged facts are preserved"
+                ),
+            }]
+            self._save(state)
+            return False
         self.github.close_parent_issue(
             parent_number=int(_mapping(state, "parent")["number"]),
             run_id=str(state["run_id"]),

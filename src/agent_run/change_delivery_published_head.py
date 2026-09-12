@@ -154,6 +154,17 @@ def publish_and_merge(
             stage.save(state)
             return True
         if existing_live.get("state") == "MERGED":
+            if (
+                existing_live.get("head_branch") != stage.contract.branch
+                or existing_live.get("head_repository") != state.get("repository")
+                or existing_live.get("base_repository") != state.get("repository")
+                or existing_live.get("head_sha") != job.get("publication_sha")
+                or existing_live.get("base_branch") != stage.contract.base_branch
+            ):
+                return stage._block(
+                    state, job, "merged_result_mismatch",
+                    "Merged Change PR does not match the original publication identity",
+                )
             integrated = existing_live.get("integrated_sha")
             if (
                 job.get("phase") != "merging"

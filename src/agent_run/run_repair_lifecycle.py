@@ -160,7 +160,10 @@ class RunRepairLifecycle:
                 and self.owner.git.managed_checkout_dirty_reason(checkout) is not None
             ):
                 preserve_checkout = True
-            if not preserve_checkout:
+            # Promotion cleanup below binds the approved source head; generic
+            # worktree removal must not run first and bypass that protection.
+            completed = job is not None and job.get("phase") == "completed"
+            if not preserve_checkout and not completed:
                 self.owner.git.remove_worktree(checkout)
                 self.owner._remove_empty_directories(checkout)
         assert job is not None
