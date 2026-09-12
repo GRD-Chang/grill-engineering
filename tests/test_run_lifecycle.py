@@ -2028,6 +2028,9 @@ def test_repeated_run_reuses_the_completed_action_after_receipt_loss(
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "receipt")
+    defaults_path = Path(environment["XDG_CONFIG_HOME"]) / "agent-run" / "user-defaults.json"
+    defaults_path.parent.mkdir(parents=True, exist_ok=True)
+    defaults_path.write_text(json.dumps({"profile": {"development_model": "creation-model"}}))
 
     first = run_cli(
         git_repo,
@@ -2045,6 +2048,7 @@ def test_repeated_run_reuses_the_completed_action_after_receipt_loss(
     state_before = state_path.read_bytes()
     control_before = control_path.read_bytes()
 
+    defaults_path.write_text("invalid defaults after creation")
     second = run_cli(
         git_repo,
         fixture,

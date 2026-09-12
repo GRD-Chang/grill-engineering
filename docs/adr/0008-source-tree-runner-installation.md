@@ -4,6 +4,23 @@ status: accepted
 
 # v0.1 由源码安装器固化 Runner，不引入常驻 Manager
 
+## 后续有限修订：一次性宿主准备（#226 / #227）
+
+首次公开接入改为源码目录 `./setup.sh`：最外层不要求 Python 或 Git，集中展示检查、依赖
+来源/版本/架构、拟修改项和人工待办，统一确认后在 Ubuntu/Debian 准备必要缺项，再调用
+既有 `./install.sh`。其他 Linux 跳过未适配自动步骤，继续可行工作；缺关键构建或激活条件
+仍拒绝安装。确认不代替系统提权或账号认证，不升级整个系统。
+
+以下关于不调用包管理器、不执行 sudo 的限制继续约束底层 Source Runner Installer，
+不再禁止这个外层一次性 Setup。Setup 可以报告执行能力及认证缺项，明确区分本体未激活、
+已安装未就绪和安装及执行条件满足，不以命令存在代替生产能力检查。
+Skills、项目工具链、目标仓库忽略规则、标签、CI 与保护规则仍由维护者准备。
+不复制外部凭据，不关闭全机安全机制、替换 init、自动启用 linger 或增加常驻组件。
+候选构建、Compatibility Check、原子激活、幂等、current/previous、回滚及 ADR 0010
+管理租约继续由同一底层安装生命周期负责。平台支持只列实际完成宿主验收的组合。
+
+## 原始决策及保留边界
+
 v0.1 的公开安装入口是取得 Git 仓库源码，并在用户选择的 tag、branch 或本地修改目录中显式执行 `./install.sh`。该安装器从当前目录实际内容构建非 editable 的候选 Runner Snapshot；Snapshot identity 只覆盖安装后 `agent_run` runtime tree 的规范相对路径与内容，不包含环境生成文件、依赖、时间戳或 Git provenance。候选 identity 已经等于 Active current 时安装幂等成功，不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous；否则安装器执行一次只验证当前 Codex Structured Outputs schema 链路的小型真实调用，成功后先创建同时包含新 current 与可选旧 current-as-previous 的完整 Runner Generation，再原子切换本机 `agent-run` 命令，并固定只保留 Active Generation 引用的 current 与可选 previous Snapshot。构建、检查或切换失败时，旧 Generation 及其 current、previous 整体保持不变。安装器以可识别、幂等的受管配置把用户级命令目录加入 shell PATH，但不调用系统包管理器、不执行 `sudo`，也不自动安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件。源码来源、Git clean 状态和历史不限制构建或生命周期权限，既有 Delivery Run 不绑定旧 Runner，也不获得状态迁移或兼容层。
 
 安装器只存在于源码树并在用户显式调用时运行；安装完成后不驻留，不参与 Controller 生命周期，也不形成独立 Manager、Launcher、Python 包或版本。install、rollback 与 uninstall 在修改受管状态前必须取得同一个固定用户级非阻塞互斥锁；竞争者立即失败且不修改状态，uninstall 永不删除锁文件，避免替换持锁 inode 后出现第二把锁。官方更新由用户先通过 Git 选择或取得新源码再重新运行安装器，本地自开发使用同一入口。`./install.sh --rollback` 只通过新的完整 Generation 原子交换 current 与 previous，不重建、不调用 Codex、不判断状态兼容性，也不改变 Delivery Run。`./install.sh --uninstall` 删除全部受管 Snapshot、Generation、候选残留、内部 `active` 入口、公开命令 symlink 和安装器添加的 PATH 受管配置，但保留固定锁、GitHub App 配置、全局 Run 定位状态与仓库内 Delivery Run 数据；重复 uninstall 幂等成功，v0.1 不提供 purge 模式。v0.1 不要求 PyPI 或 pipx；以后增加 PyPI 只增加分发渠道，不改变 Snapshot 与显式安装语义。

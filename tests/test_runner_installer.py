@@ -255,6 +255,7 @@ def _isolated_quickstart_environment(
             + (
                 "if [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then exit 0; fi\n"
                 "if [ \"$#\" -eq 2 ] && [ \"$1\" = auth ] && [ \"$2\" = status ]; then exit 0; fi\n"
+                "if [ \"$#\" -eq 2 ] && [ \"$1\" = api ] && [ \"$2\" = --help ]; then echo '--paginate --slurp --method --header'; exit 0; fi\n"
                 "exit 97\n"
                 if name == "gh"
                 else f"printf '%s' {output!r}\n"
@@ -1508,6 +1509,14 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     isolated_environment, tool_directory, markers = (
         _isolated_quickstart_environment(tmp_path, fake_bin)
     )
+    # Exercise the new shell boundary with the same real offline build, rather
+    # than adding another heavyweight build. Runtime readiness remains negative
+    # in this deliberately isolated host (no real user systemd or credentials).
+    shutil.copy2(PROJECT_ROOT / "setup.sh", source / "setup.sh")
+    for name in ("uname", "sed", "tr", "awk", "timeout"):
+        executable = shutil.which(name, path=os.defpath)
+        assert executable is not None
+        (tool_directory / name).symlink_to(executable)
     isolated_environment.update(offline_install_environment)
     isolated_path = isolated_environment["PATH"]
     home = Path(isolated_environment["HOME"])
@@ -1528,14 +1537,17 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert pre_login.returncode == 1, pre_login.stderr
     assert pre_login.stdout.strip() == ""
 
-    installed = _run(
-        source,
-        home,
-        fake_bin,
-        path=isolated_path,
-        environment=isolated_environment,
+    installed = subprocess.run(
+        [str(tool_directory / "sh"), str(source / "setup.sh"), "--yes"],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=90,
     )
-    assert installed.returncode == 0, installed.stderr
+    assert installed.returncode == 2, installed.stdout + installed.stderr
+    assert "Runner 已安装但执行环境未就绪" in installed.stdout
+    assert (_data_root(home) / "active").exists()
     assert (tmp_path / "codex-path").read_text(encoding="utf-8") == isolated_path
     _assert_process_gone(tmp_path / "codex-descendant-pid")
     assert not [marker for marker in markers if marker.exists()]

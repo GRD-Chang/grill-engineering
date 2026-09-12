@@ -6,6 +6,12 @@ status: accepted
 
 后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 为 Executor 仍存活时的 Worker 普通异常增加一次同 Thread 自动恢复，并对准确容量错误允许持续恢复，并明确失联状态的耗时展示。Executor 自身消失后不自动重放、等待显式恢复的规则继续适用。
 
+后续有限修订（#226 / #227）：公开 `./setup.sh` 在统一确认后可一次性准备 Runner 宿主依赖，
+并汇总真实 user systemd、bubblewrap 与认证检查。以下“安装器不查询或提示 systemd”仍指
+底层 `./install.sh`，不限制外层 Setup 的执行就绪报告。Setup 不启用 linger、替换 init、
+关闭全机安全机制或建立常驻管理器，不改变 lifecycle 提交前检查与 Executor 真实握手权威。
+无前台降级、无 Executor 自动 restart、无开机 Run 重放及 Runner 管理租约保持不变。
+
 Issue #156 暴露的不是单个 `resume` 分支遗漏，而是公开生命周期命令拥有不同进程寿命：`run` 进入统一 `RunDriver`，普通 `resume`、`requeue`、`approve`、`revise` 与 `abandon` 则各自在调用进程中直接推进部分 Engine。命令可以成功形成 `waiting_checks` 后退出，后续外部状态却无人监督；同时，当前工作区级状态锁可能在 Agent、Git、GitHub 与等待期间一直被持有，使不同 Parent 也被无关地串行化。
 
 我们把 Delivery Run、Run Executor Session 与 CLI 命令分成三个寿命。Delivery Run 是从创建到 `completed` 或 `abandoned` 的持久交付对象；Run Executor Session 是其中一段无需新增人工授权的自动工作；CLI 只是提交 Lifecycle Action、取得 Action Receipt 或读取状态的短命客户端。一个 Local Delivery Workspace 中每个 Delivery Task 同时最多有一个未完成 Delivery Run、一个 Run Executor Session 和一个已接受但未完成的 Lifecycle Action，不同 Delivery Task 可以并行。两个独立本地仓库根目录由维护者自行协调，不建立跨 clone 唯一性。

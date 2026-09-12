@@ -23,11 +23,15 @@ def recovery_cli(
     outcomes: list[Any] = []
     waits: list[float] = []
     calls: list[dict[str, Any]] = []
+    current_thread = "original-thread"
 
     def worker(arguments: list[str], *, on_stdout_line: Any = None,
                **options: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal current_thread
+        if calls and 'resume' not in arguments:
+            current_thread = 'replacement-thread'
         calls.append({'arguments': arguments, **options})
-        line = json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'})
+        line = json.dumps({'type': 'thread.started', 'thread_id': current_thread})
         if on_stdout_line:
             on_stdout_line(line)
         outcome = outcomes.pop(0)
@@ -52,8 +56,9 @@ def recovery_cli(
         credential_provider=lambda: 'fixture-reader', **kwargs,
     ))
 
-    def command(name: str) -> tuple[int, dict[str, Any]]:
-        result = cli.main([name, '1', '--github-fixture', str(fixture), '--json'])
+    def command(name: str, *extra: str) -> tuple[int, dict[str, Any]]:
+        policy = ['--development-thread-policy', 'new-per-attempt'] if name == 'run' else []
+        result = cli.main([name, '1', '--github-fixture', str(fixture), '--json', *policy, *extra])
         capsys.readouterr()
         return result, load_only_run_state(git_repo)
 
@@ -81,6 +86,9 @@ def test_manual_resume_preserves_spent_recovery_and_interrupted_json_step(recove
     assert failed_again['active_agent_invocation']['ordinary_recovery_used'] is True
     assert calls[2]['prompt'] == calls[3]['prompt'] == calls[4]['prompt']
     assert '只修正结果格式' in calls[4]['prompt']
+    arguments = calls[4]['arguments']
+    checkout_index = arguments.index(str(calls[4]['cwd']))
+    assert arguments[checkout_index - 1] == '--ro-bind'
     assert '不重新开发、审查、验证、读取项目或调用工具' in calls[4]['prompt']
     assert all('resume' in call['arguments'] for call in calls[1:])
 
@@ -115,3 +123,45 @@ def test_capacity_continuation_keeps_bounded_history_and_one_business_attempt(
     assert state['parent_job']['review_budget']['window'] == 1
     assert len(json.dumps(active)) < 12000
     assert all('resume' in call['arguments'] for call in calls[1:])
+
+
+def test_human_reply_after_json_repair_preserves_allowance_and_writable_role(recovery_cli: Any) -> None:
+    command, outcomes, calls, _waits = recovery_cli
+    outcomes.extend(['invalid', 'invalid', 'blocker', 'invalid'])
+    code, blocked = command('run')
+    assert code == 2
+    attempt = blocked['active_agent_invocation']['semantic_attempt']['attempt_id']
+    code, failed = command('resume', '--message', '输入已补充，请继续当前任务。')
+    assert code == 2
+    assert len(calls) == 4
+    assert failed['active_agent_invocation']['semantic_attempt']['attempt_id'] == attempt
+    assert failed['active_agent_invocation']['output_attempt'] == 3
+    assert '只修正结果格式' not in calls[-1]['prompt']
+    arguments = calls[-1]['arguments']
+    checkout_index = arguments.index(str(calls[-1]['cwd']))
+    assert arguments[checkout_index - 1] == '--bind'
+    assert 'resume' in calls[-1]['arguments']
+    assert failed['parent_job']['development_thread_id'] == 'original-thread'
+    assert failed['parent_job']['review_budget'] == blocked['parent_job']['review_budget']
+
+
+def test_manual_thread_replacement_keeps_spent_counters_and_archives_identity(recovery_cli: Any) -> None:
+    command, outcomes, calls, _waits = recovery_cli
+    outcomes.extend(['invalid', 'invalid', 'failure', 'failure', 'blocker'])
+    code, failed = command('run')
+    assert code == 2
+    first = failed['active_agent_invocation']
+    code, blocked = command('resume', '--new-thread')
+    assert code == 2
+    active = blocked['active_agent_invocation']
+    assert active['semantic_attempt']['attempt_id'] == first['semantic_attempt']['attempt_id']
+    assert active['ordinary_recovery_used'] is True
+    assert active['output_attempt'] == 3
+    assert active['reported_thread_id'] == 'replacement-thread'
+    assert blocked['parent_job']['development_thread_history'] == ['original-thread']
+    assert blocked['parent_job']['review_budget'] == failed['parent_job']['review_budget']
+    assert 'resume' not in calls[-1]['arguments']
+    assert '只修正结果格式' not in calls[-1]['prompt']
+    arguments = calls[-1]['arguments']
+    checkout_index = arguments.index(str(calls[-1]['cwd']))
+    assert arguments[checkout_index - 1] == '--bind'

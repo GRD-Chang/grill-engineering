@@ -40,8 +40,10 @@ Parent、状态和开始时间并停止，不按最近时间猜测。
 ### Delivery Policy
 
 Delivery Policy 的取值优先级是内置默认值、用户级默认值、单次命令覆盖；仓库内容不能覆盖
-操作者的个人成本策略。用户级默认值保存在 `$XDG_CONFIG_HOME/agent-run/delivery-policy.json`
-（未设置时为 `~/.config/agent-run/delivery-policy.json`），可用公开命令查看或配置：
+操作者的个人成本策略。统一个人文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`
+（未设置时为 `~/.config/agent-run/user-defaults.json`）。完整字段、直接编辑、模型与推理强度、
+引用关系及兼容说明见[个人运行默认配置](user-defaults.md)。推荐 `settings show/configure`；
+旧 `policy` 命令指向同一文件：
 
 ```bash
 agent-run policy show
@@ -58,7 +60,7 @@ Reviewer；默认准确执行 `D10/R11`。第 `N+1` 次 Reviewer 仍有 Finding 
 Checkpoint，不使用 Final CI-fix 或未经 Reviewer 验收的 Publication Authority。
 正整数轮数和正 duration 在创建 Worker、PR 或部分状态之前校验。每个新 Run 以及显式开启的
 新 Budget Window 都把实际生效的完整策略保存为 Policy Snapshot；之后修改用户级默认值不会
-改变活动 Run 或活动预算窗口。缺少或不完整 Snapshot 的旧状态会 fail closed。
+改变已有 Run，包括之后获准开启的新预算窗口；只有检查点 Resume 的显式覆盖可修改新窗口策略。缺少或不完整 Snapshot 的旧状态会 fail closed。
 Invocation 默认 deadline 为 Development 5 小时、Review 2 小时、Publication 1 小时；同一
 Invocation 内的初始调用和 Output Repair 共用该 deadline。
 
@@ -451,7 +453,9 @@ Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗�
 
 ## Source Runner 安装
 
-v0.1 的公开入口是用户在所选源码目录执行一次 `./install.sh`。release tag 是稳定使用路径；
+首次公开接入在所选源码目录执行 `./setup.sh`，集中检查与确认后准备宿主并调用底层安装器。
+补齐人工待办后重跑同一入口；详细说明见 [README](../README.md#首次安装)。
+以下描述保留的 `./install.sh` 本体生命周期。release tag 是稳定使用路径；
 branch、fork、dirty source 和没有 Git metadata 的目录也按当前实际文件构建。安装器要求 CPython
 3.11+、`venv`、`pip` 和源码声明的 Python build backend；它不执行 `sudo`、系统包管理器、
 `pipx`、daemon、cron 或后台更新。
@@ -527,7 +531,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
 凭据隔离约束，Publisher 仍使用宿主写身份。
 
-v0.1 只支持 Linux/WSL、用户级 `~/.profile` 和单用户安装。用户必须自行提供 CPython 3.11+、`venv`、
+首版范围为 Linux、用户级 `~/.profile` 和单用户安装；已验证组合见[平台验收](runner-setup-validation.md)。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
 系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher、自动更新和跨平台支持不属于本版本。
 
