@@ -13,6 +13,7 @@ from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.published_run import prepare_published_run
 from test_cli import (
     load_only_run_state,
     run_internal_stage,
@@ -4174,14 +4175,11 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
 def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effects(
     git_repo: Path, identity_error: dict[str, str]
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, published = prepare_published_run(git_repo)
     agents = git_repo / "final-run-identity-agents.json"
     agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
 
-    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert completed.returncode == 0, completed.stderr
-    assert stdout_json(completed)["status"] == "run_approval_pending"
+    assert published["status"] == "run_approval_pending"
     before_state = load_only_run_state(git_repo)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     final = next(
@@ -4221,13 +4219,10 @@ def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effect
 
 
 def test_public_run_fails_closed_for_an_ambiguous_final_pr_read(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture, _ = prepare_published_run(git_repo)
     agents = git_repo / "ambiguous-final-run-agents.json"
     agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
 
-    completed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert completed.returncode == 0, completed.stderr
     before_state = load_only_run_state(git_repo)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["delivery"]["run_required_checks_read_failures"] = [
@@ -4265,14 +4260,9 @@ def test_public_run_fails_closed_for_an_ambiguous_final_pr_read(git_repo: Path) 
 def test_explicit_approval_rejects_foreign_final_run_pr_identity_without_external_writes(
     git_repo: Path, identity_error: dict[str, str]
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = git_repo / "final-run-approval-identity-agents.json"
-    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+    fixture, published = prepare_published_run(git_repo)
 
-    published = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert published.returncode == 0, published.stderr
-    assert stdout_json(published)["status"] == "run_approval_pending"
+    assert published["status"] == "run_approval_pending"
     before_state = load_only_run_state(git_repo)
     data = json.loads(fixture.read_text(encoding="utf-8"))
     final = next(
@@ -4310,18 +4300,11 @@ def test_explicit_approval_rejects_foreign_final_run_pr_identity_without_externa
 def test_post_merge_readback_rejects_foreign_identity_before_parent_closeout(
     git_repo: Path, identity_error: dict[str, str]
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"normal_merge_readback_identity_error": identity_error},
+    fixture, published = prepare_published_run(
+        git_repo, delivery={"normal_merge_readback_identity_error": identity_error},
     )
-    agents = git_repo / "post-merge-final-run-identity-agents.json"
-    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
 
-    published = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-
-    assert published.returncode == 0, published.stderr
-    run_id = stdout_json(published)["run_id"]
+    run_id = published["run_id"]
     failed = run_cli(git_repo, fixture, "approve", run_id)
 
     assert failed.returncode == 2

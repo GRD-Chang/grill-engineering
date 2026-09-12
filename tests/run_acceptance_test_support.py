@@ -204,14 +204,17 @@ class FreshCycleRunAgents(ScriptedRunAgents):
             artifact=result.artifact,
         )
 
-def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepository]:
+def _completed_run(
+    git_repo: Path, *, ticket_number: int = 2,
+) -> tuple[dict[str, Any], StateStore, GitRepository]:
+    ticket_key = str(ticket_number)
     fixture = write_fixture(
         git_repo / "github.json",
         issues={
-            "2": {
-                "number": 2,
-                "title": "Ticket 2",
-                "body": "Deliver ticket 2.",
+            ticket_key: {
+                "number": ticket_number,
+                "title": f"Ticket {ticket_number}",
+                "body": f"Deliver ticket {ticket_number}.",
                 "state": "CLOSED",
                 "labels": [],
                 "blocked_by": [],
@@ -227,14 +230,14 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
     state["status"] = "run_acceptance_pending"
     state["terminal_kind"] = "all_tickets_completed"
     state["ticket_jobs"] = {
-        "2": {
-            "ticket_number": 2,
+        ticket_key: {
+            "ticket_number": ticket_number,
             "phase": "completed",
             "development_thread_id": "ticket-developer",
             "development_thread_history": [],
             "reviewer_thread_ids": ["ticket-reviewer"],
             "modification_attempts": 1,
-            "effective_revision": state["ticket_graph"]["tickets"]["2"][
+            "effective_revision": state["ticket_graph"]["tickets"][ticket_key][
                 "content_revision"
             ],
             "acceptance_record": {"artifact": _passing_artifact()},
@@ -250,8 +253,8 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
             "review_budget_history": [],
         }
     }
-    integrated_sha = str(state["ticket_jobs"]["2"]["integrated_sha"])
-    effective_revision = state["ticket_graph"]["tickets"]["2"][
+    integrated_sha = str(state["ticket_jobs"][ticket_key]["integrated_sha"])
+    effective_revision = state["ticket_graph"]["tickets"][ticket_key][
         "content_revision"
     ]
     candidate_tree = git.resolve(f"{integrated_sha}^{{tree}}")
@@ -264,7 +267,7 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
         "reviewer_thread_id": "ticket-reviewer",
         "artifact": _passing_artifact(),
     }
-    state["ticket_jobs"]["2"]["acceptance_record"] = acceptance_record
+    state["ticket_jobs"][ticket_key]["acceptance_record"] = acceptance_record
     review_artifact = {
         "reviewer_thread_id": acceptance_record["reviewer_thread_id"],
         "candidate_sha": acceptance_record["reviewed_candidate_sha"],
@@ -276,7 +279,7 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
         },
         "artifact": acceptance_record["artifact"],
     }
-    state["ticket_jobs"]["2"]["review_budget"] = {
+    state["ticket_jobs"][ticket_key]["review_budget"] = {
         "window": 1,
         "development_attempts": 1,
         "reviewer_invocations": 1,
@@ -284,7 +287,7 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
         "review_artifacts": [review_artifact],
         "checkpoint_reason": None,
     }
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = {
+    state["ticket_jobs"][ticket_key]["deterministic_integration_record"] = {
         "source": "accepted",
         "base_sha": str(state["base"]["sha"]),
         "candidate_sha": integrated_sha,
@@ -299,7 +302,7 @@ def _completed_run(git_repo: Path) -> tuple[dict[str, Any], StateStore, GitRepos
         "pr_number": 1,
         "window": 1,
         "final_ci_fix_used": False,
-        "review_budget": deepcopy(state["ticket_jobs"]["2"]["review_budget"]),
+        "review_budget": deepcopy(state["ticket_jobs"][ticket_key]["review_budget"]),
         "required_checks_mode": "configured",
         "required_checks": "pass",
         "required_checks_evidence": {

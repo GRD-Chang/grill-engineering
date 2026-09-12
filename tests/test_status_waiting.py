@@ -11,13 +11,13 @@ from rich.text import Text
 
 from agent_run import cli, external_supervision
 from agent_run.executor_host import HostObservation
+from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
-from cli_fixtures import run_agents
+from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import write_fixture
-from test_cli import run_cli, stdout_json
-from test_cli_delivery import ticket
 from test_run_lifecycle import _file_snapshot, _isolated_environment
 from support.inprocess_cli import invoke_cli_inprocess
+from support.published_run import prepare_published_run
 
 
 class TerminalOutput(StringIO):
@@ -29,17 +29,14 @@ class TerminalOutput(StringIO):
 def waiting_run(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Path, dict[str, Any]]:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "waiting-status")
-    started = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(agents),
-        extra_env=environment,
-    )
-    assert started.returncode == 0, started.stderr
-    run_id = stdout_json(started)["run_id"]
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    # These cases inspect an existing publication. Ticket execution and process
+    # startup remain covered by the public run/lifecycle integration tests.
+    _, state = prepare_published_run(git_repo)
+    run_id = state["run_id"]
     path = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
-    state = json.loads(path.read_text())
     publication = state["run_publication"]
     publication["phase"] = "waiting_checks"
     publication["required_checks_evidence"] = {
@@ -51,18 +48,32 @@ def waiting_run(
     state.update(status="waiting_checks", terminal_kind="waiting_external", diagnostics=[])
     monkeypatch.setattr(external_supervision, "monotonic", lambda: 1_000_000.0)
     external_supervision.ensure_supervision_window(state, now=lambda: 999_760.0)
+    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(git_repo, state["repository"], state["parent"]["number"])
+    claim = control.claim_action(task, kind="run", payload={"parent": 1})
+    assert claim.action is not None and claim.action_id is not None
+    control.bind_run(task, claim.action_id, run_id)
+    prepare_action_application_receipt(state, claim.action)
     path.write_text(json.dumps(state))
-    control_path = next((git_repo / ".agent-run/task-control").glob("*.json"))
-    control = json.loads(control_path.read_text())
-    control["executor"].update(status="running", pid=123)
-    control_path.write_text(json.dumps(control))
+    control.record_application(
+        task, action_id=claim.action_id, run_id=run_id,
+        payload_digest=claim.action["payload_digest"],
+    )
+    reservation = control.begin_executor(task, action_id=claim.action_id, run_id=run_id)
+    control.mark_process_started(
+        task, action_id=claim.action_id, generation=reservation.generation,
+        pid=123, process_start_token=None,
+    )
+    control.mark_handshake(
+        task, action_id=claim.action_id, generation=reservation.generation,
+        pid=123, process_start_token=None,
+    )
+    control.complete_action(task, action_id=claim.action_id, result_status=state["status"])
     monkeypatch.setattr(
         cli, "observe_systemd_executor",
         lambda spec, *args, **kwargs: HostObservation("running", spec.generation, 123, True),
     )
     monkeypatch.chdir(git_repo)
-    for key, value in environment.items():
-        monkeypatch.setenv(key, value)
     monkeypatch.setenv("COLUMNS", "120")
     return git_repo, state
 
@@ -79,6 +90,7 @@ def test_waiting_status_shows_current_checks_without_restart_command(
 ) -> None:
     repo, state = waiting_run
     before = _file_snapshot(repo)
+    before_user_state = _file_snapshot(Path.home().parent)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
         assert f"等待 PR #{state['run_publication']['pr_number']} 的自动检查" in output
@@ -101,6 +113,7 @@ def test_waiting_status_shows_current_checks_without_restart_command(
     assert audit["progress"]["current_agent"]["is_active"] is False
     assert audit["executor_control"]["activity"] == "running"
     assert _file_snapshot(repo) == before
+    assert _file_snapshot(Path.home().parent) == before_user_state
 
 
 @pytest.mark.parametrize("host", ["not_running", "unknown"])
