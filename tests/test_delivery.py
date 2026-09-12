@@ -809,6 +809,7 @@ class CrashAfterMergePublisher(ScriptedPublisher):
         if self.merged_sha is not None:
             assert self.merged_head is not None
             return {
+                **super().live_pull_request(pr_number),
                 "head_sha": self.merged_head,
                 "base_branch": self.base_branch,
                 "base_sha": subprocess.run(

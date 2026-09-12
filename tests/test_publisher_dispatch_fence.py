@@ -178,7 +178,7 @@ def test_direct_git_mutations_revalidate_after_the_preceding_read(
     monkeypatch.setattr(GitRepository, "resolve", resolve)
     with pytest.raises(ActionReconciliationError):
         if operation == "delete":
-            publisher.delete_managed_branch(branch)
+            publisher.delete_managed_branch(branch, expected_head_sha=head)
         elif operation == "update_ref":
             publisher.sync_run_branch(run_branch=branch, integrated_sha=head)
         else:

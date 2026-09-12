@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -28,8 +29,17 @@ from test_ticket_194_stop_abandon import _bind_running_executor
     "command", ["run", "resume", "approve", "revise", "requeue", "stop", "abandon"]
 )
 @pytest.mark.parametrize("control_case", ["missing", "corrupt"])
-@pytest.mark.parametrize("receipt_case", ["absent", "invalid", "exact"])
-@pytest.mark.parametrize("host_status", ["exited", "running", "unknown", "conflict"])
+@pytest.mark.parametrize(
+    ("receipt_case", "host_status"),
+    [
+        ("absent", None),
+        ("invalid", None),
+        ("exact", "exited"),
+        ("exact", "running"),
+        ("exact", "unknown"),
+        ("exact", "conflict"),
+    ],
+)
 def test_cli_requires_exact_ownership_before_lifecycle_admission(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -37,8 +47,20 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
     command: str,
     control_case: str,
     receipt_case: str,
-    host_status: str,
+    host_status: str | None,
 ) -> None:
+    # An unknown launch is a synchronous FakeHost outcome here. Advance its
+    # existing startup deadline without waiting for a nonexistent successor.
+    now = 1000.25
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(
+        cli_module, "RunLifecycle",
+        partial(cli_module.RunLifecycle, clock=lambda: now, sleep=advance),
+    )
     for key, value in _isolated_environment(git_repo.parent / "user-env").items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo.parent / "runtime"))
@@ -102,7 +124,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
         state_before = state_path.read_bytes()
         fixture_before = fixture.read_bytes()
         agents_before = agents.read_bytes()
-        host = _install_host(git_repo, fixture, monkeypatch, host_status)
+        host = _install_host(git_repo, fixture, monkeypatch, host_status or "unknown")
         monkeypatch.setattr(
             cli_module,
             "GhGitHubReader",
@@ -113,6 +135,10 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
         monkeypatch.setattr(host, "prepare_environment", prepared.append)
 
         def observe(spec: ExecutorSpec, _store: TaskControlStore) -> HostObservation:
+            # No Host response can affect admission without an exact receipt;
+            # a failing sentinel covers all otherwise redundant response cases.
+            if host_status is None:
+                pytest.fail("Host must not be queried without an exact Run receipt")
             observed.append(spec)
             assert spec.action_id == receipt["action_id"]
             assert spec.generation == receipt["executor_generation"]

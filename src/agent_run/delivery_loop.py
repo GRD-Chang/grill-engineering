@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from agent_run.commit_messages import commit_messages_match
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
@@ -461,7 +462,9 @@ class TicketDeliveryLoop:
             or live.get("head_sha") != job.get("publication_sha")
             or live.get("base_branch") != state.get("run_branch")
             or live.get("head_tree") != live.get("integrated_tree")
-            or live.get("integrated_message") != publication.get("commit_message")
+            or not commit_messages_match(
+                live.get("integrated_message"), publication.get("commit_message")
+            )
             or live.get("integrated_parents") != [job.get("base_sha")]
         ):
             return self._block(

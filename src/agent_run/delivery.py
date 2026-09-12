@@ -46,6 +46,9 @@ class TicketDeliveryEngine:
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
         job = self._job(state)
+        # Restore the in-memory mirror before shared stages save a recovered
+        # Job; merge recovery intentionally performs no branch-intent write.
+        sync_active_ticket_job(state)
         if state.get("status") in {"blocked", "requeue_required"}:
             return state
         if job.get("phase") in {
@@ -129,7 +132,9 @@ class TicketDeliveryEngine:
             )
             raise
         finally:
-            if not preserve_checkout:
+            # Completed work is retired only by DeliveryCleanupEngine, whose
+            # exact source-head guard also owns failures and retries.
+            if not preserve_checkout and job.get("phase") != TicketPhase.COMPLETED.value:
                 self.git.remove_worktree(
                     checkout,
                     discard_worktree=not (

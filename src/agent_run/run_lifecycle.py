@@ -383,7 +383,7 @@ class RunLifecycle:
                     )
                 )
             )
-            and not _safe_supervision_recovery(current)
+            and not _safe_executor_recovery(current)
             and not (
                 session_interruption_is_persisted(current)
                 and executor.get("failure") == "session_interrupted"
@@ -480,7 +480,7 @@ class RunLifecycle:
                     break
                 if observation.status in {"absent", "exited"}:
                     state = self._load_action_run(run_id, state, record=claim_record)
-                    if _safe_supervision_recovery(state):
+                    if _safe_executor_recovery(state):
                         self.control.mark_executor_absent(
                             self.task,
                             action_id=action_id,
@@ -1179,7 +1179,7 @@ class RunLifecycle:
                 "Task Control Record 曾丢失；Executor ownership 无法确认，"
                 "不会启动第二个 Executor"
             )
-        recover = _safe_supervision_recovery(state)
+        recover = _safe_executor_recovery(state)
         applied_at_non_replayable_boundary = (
             expected_action is not None
             and _action_matches_run_receipt(state, expected_action)
@@ -1208,7 +1208,7 @@ class RunLifecycle:
                 self.sleep(self.poll_interval)
             if observation.status in {"absent", "exited"}:
                 state = self._load_action_run(run_id, state, record=record)
-                recover = _safe_supervision_recovery(state)
+                recover = _safe_executor_recovery(state)
                 if applied_at_non_replayable_boundary:
                     return self._complete_applied_action_after_executor_exit(
                         state,
@@ -1372,6 +1372,10 @@ class RunLifecycle:
         # Its latest durable boundary wins over the caller's progress snapshot.
         if (
             current.get("status") in {"completed", "abandoned"}
+            or (
+                current.get("status") == "ticket_completed"
+                and _safe_executor_recovery(current)
+            )
             or has_run_operator_gate(current)
         ) and not session_interruption_is_persisted(current):
             if latest_action.get("status") != "completed":
@@ -1941,10 +1945,14 @@ def _restartable_after_executor_exit(state: Mapping[str, Any]) -> bool:
     }
 
 
-def _safe_supervision_recovery(state: Mapping[str, Any]) -> bool:
-    """Allow a new host generation only from a persisted, non-agent wait."""
+def _safe_executor_recovery(state: Mapping[str, Any]) -> bool:
+    """Resume proven idle boundaries without interrupting finished Agent work."""
 
-    if state.get("status") not in {
+    if state.get("status") == "ticket_completed":
+        job = state.get("active_ticket_job")
+        if not isinstance(job, Mapping) or job.get("phase") != "completed":
+            return False
+    elif state.get("status") not in {
         "waiting_checks",
         "waiting_external",
         "waiting_merge",

@@ -239,12 +239,15 @@ class FixtureGitHubPublisher:
         published.setdefault(branch, self.git.resolve(base_branch))
         self._save()
 
-    def delete_managed_branch(self, branch: str) -> None:
+    def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None:
         if not is_managed_delivery_branch(branch):
             raise ValueError(f"refusing to delete unmanaged branch {branch!r}")
         delivery = self._delivery()
         published = _mutable_mapping(delivery, "published_branches")
-        head = published.pop(branch, None)
+        head = published.get(branch)
+        if not expected_head_sha or head not in {None, expected_head_sha}:
+            raise RuntimeError(f"preserved remote branch {branch!r}: source head changed")
+        published.pop(branch, None)
         if isinstance(head, str):
             for pull in _mutable_list(delivery, "pull_requests"):
                 if isinstance(pull, dict) and pull.get("branch") == branch:
@@ -1176,7 +1179,7 @@ class FixtureGitHubPublisher:
                     "integrated_tree": self.git.resolve(
                         f"{integrated}^{{tree}}"
                     ),
-                    "integrated_message": _commit_subject(
+                    "integrated_message": _commit_message(
                         self.git.root, integrated
                     ),
                     "integrated_parents": self.git.commit_parents(integrated),
@@ -1881,9 +1884,9 @@ def _mutable_list(data: dict[str, Any], key: str) -> list[Any]:
     return value
 
 
-def _commit_subject(repository: Path, sha: str) -> str:
+def _commit_message(repository: Path, sha: str) -> str:
     result = subprocess.run(
-        ["git", "log", "-1", "--format=%s", sha],
+        ["git", "cat-file", "commit", sha],
         cwd=repository,
         text=True,
         capture_output=True,
@@ -1891,4 +1894,4 @@ def _commit_subject(repository: Path, sha: str) -> str:
     )
     if result.returncode != 0:
         raise ValueError(result.stderr.strip() or "fixture commit is missing")
-    return result.stdout.strip()
+    return result.stdout.split("\n\n", 1)[1]

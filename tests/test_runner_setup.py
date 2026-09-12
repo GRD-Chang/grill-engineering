@@ -18,7 +18,7 @@ def _script(path: Path, body: str) -> None:
 
 
 @pytest.fixture
-def setup_host(tmp_path: Path):
+def setup_host(tmp_path: Path, request: pytest.FixtureRequest):
     source = tmp_path / 'source'
     source.mkdir()
     shutil.copy2(ROOT / 'setup.sh', source / 'setup.sh')
@@ -36,7 +36,16 @@ def setup_host(tmp_path: Path):
     _script(binaries / 'sudo', 'exit 1\n')
     _script(binaries / 'apt-cache', 'echo "Candidate: test-version; configured test source"\n')
     _script(binaries / 'apt-get', 'echo "apt $*" >> "$TEST_LOG"\nexit "${TEST_APT_EXIT:-0}"\n')
-    _script(binaries / 'python3', f'if [ "$1" = - ] || [ "${{1##*/}}" = runner_setup.py ]; then exec "{sys.executable}" "$@"; fi\nexit "${{TEST_PYTHON_EXIT:-0}}"\n')
+    # Policy cases execute the controlled, immediately returning fake tools
+    # directly. Representative probe/cleanup cases keep the real boundary;
+    # no-argument finalization always uses it, including doctor and unit cleanup.
+    probe_dispatch = '' if getattr(request, 'param', False) else '''
+if [ "${1##*/}" = runner_setup.py ] && [ "$#" -gt 1 ]; then
+    shift
+    exec "$@" 2>&1
+fi
+'''
+    _script(binaries / 'python3', probe_dispatch + f'if [ "$1" = - ] || [ "${{1##*/}}" = runner_setup.py ]; then exec "{sys.executable}" "$@"; fi\nexit "${{TEST_PYTHON_EXIT:-0}}"\n')
     _script(binaries / 'git', 'echo "git version ${TEST_GIT_VERSION:-2.43.0}"\n')
     for name in ('gh', 'bwrap', 'openssl', 'codex', 'systemctl', 'systemd-run'):
         _script(binaries / name, 'echo "compatible --paginate --slurp --method --header"\n')
@@ -59,6 +68,7 @@ chmod +x "$HOME/.local/bin/agent-run"
     return run, binaries, source, log, home
 
 
+@pytest.mark.parametrize('setup_host', [True], indirect=True, ids=['real-probes'])
 def test_compatible_tools_reused_and_rerun(setup_host):
     run, _, _, log, _ = setup_host
     for _ in range(2):
@@ -183,6 +193,7 @@ def test_old_github_cli_is_included_in_preparation(setup_host):
     assert 'apt install -y --no-install-recommends gh' in log.read_text()
 
 
+@pytest.mark.parametrize('setup_host', [True], indirect=True, ids=['real-probes'])
 def test_setup_probe_reaps_escaped_child_after_normal_exit(setup_host):
     run, binaries, source, _, _ = setup_host
     pid_path = source / 'probe-child.pid'

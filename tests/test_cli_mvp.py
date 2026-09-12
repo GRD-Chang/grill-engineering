@@ -606,11 +606,15 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
 
     for command in ("status", "history"):
         text = invoke_cli_inprocess(git_repo, fixture, command, run_id).stdout
-        assert "超时恢复: agent-run resume <run-id>" in text
+        assert "已超时" in text
+        assert "agent-run resume 1 --repo example/project" in text
+        assert "截止=" not in text
         assert run_id not in text
         if command == "status":
+            assert "最近 Agent:" not in text
+            assert "等待 PR #1 的自动检查" in text
+        else:
             latest_invocation = paused_state["agent_invocation_history"][-1]
-            assert "最近 Agent:" in text
             assert str(latest_invocation["model"]) in text
             assert str(latest_invocation["reasoning_effort"]) in text
 
@@ -778,14 +782,16 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         assert snapshot["next_action"] == f"agent-run resume {run_id}"
         text = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert text.returncode == 0, text.stderr
-        assert "凭据失败类别: credential_unavailable" in text.stdout
-        assert "重试次数: 13" in text.stdout
-        assert "截止=" in text.stdout
+        assert "等待工作凭据恢复可用" in text.stdout
+        assert "凭据失败类别：credential_unavailable" in text.stdout
+        assert "重试次数：13" in text.stdout
+        assert "已超时" in text.stdout
+        assert "截止=" not in text.stdout
         assert "authorization" not in text.stdout.lower()
         if http_status is None:
-            assert "凭据 HTTP 状态:" not in text.stdout
+            assert "凭据 HTTP 状态：" not in text.stdout
         else:
-            assert f"凭据 HTTP 状态: {http_status}" in text.stdout
+            assert f"凭据 HTTP 状态：{http_status}" in text.stdout
 
 
 @pytest.mark.parametrize(
@@ -1225,7 +1231,7 @@ def test_status_and_history_show_started_development_attempt(
     )
 
 
-def test_status_offers_run_for_automatic_recovery_states(git_repo: Path) -> None:
+def test_status_keeps_allowed_actions_without_inventing_host_activity(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
@@ -1236,7 +1242,14 @@ def test_status_offers_run_for_automatic_recovery_states(git_repo: Path) -> None
         state_path.write_text(json.dumps(state), encoding="utf-8")
         rendered = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
         assert rendered.returncode == 0, rendered.stderr
-        assert "下一步: agent-run run 1" in rendered.stdout
+        if status == "waiting_merge":
+            assert "无法确认 Runner 是否仍在自动等待" in rendered.stdout
+            assert "agent-run doctor" in rendered.stdout
+            assert "agent-run run" not in rendered.stdout
+        else:
+            assert "下一步: agent-run run 1" in rendered.stdout
+        audit = stdout_json(invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json"))
+        assert audit["next_action"].startswith("agent-run run 1")
 
 
 def test_premature_approve_does_not_mark_run_as_execution_failed(

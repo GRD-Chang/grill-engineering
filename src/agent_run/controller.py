@@ -1171,6 +1171,7 @@ class Controller:
                     branch=repair_branch,
                     checkout=checkout,
                     reason=dirty_reason,
+                    job=job,
                 )
                 return
             self.publisher.git.remove_worktree(checkout)

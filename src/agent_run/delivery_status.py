@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from rich.text import Text
 
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
 from agent_run.presentation_helpers import (
     current_work_subject,
     delivery_object_label,
@@ -283,6 +284,25 @@ def print_status_progress(
             f"{repair['code_modification_limit']}"
         )
 
+    wait_view = waiting_presentation(state, audit)
+    if wait_view is not None:
+        print("\n当前工作")
+        print(f"  {_terminal_safe(wait_view.work)}")
+        print(f"  {_terminal_safe(wait_view.activity)}")
+        for label, text in wait_view.details:
+            print(f"  {_terminal_safe(label)}：{_terminal_safe(text)}")
+        _print_cleanup(audit.get("delivery_cleanup"))
+        _print_scope_change(audit.get("scope_change"))
+        print("\n下一步")
+        print(f"  {_terminal_safe(wait_view.guidance)}")
+        action = audit.get("operator_action")
+        if isinstance(action, dict):
+            print_operator_action(action)
+        elif wait_view.show_command:
+            print(f"  {_terminal_safe(view['next_action'])}")
+        _print_findings(view["findings"])
+        return
+
     print("\n当前工作")
     executor_control = audit.get("executor_control")
     if (
@@ -325,17 +345,16 @@ def print_status_progress(
 
     operator_action = audit.get("operator_action")
     if not isinstance(operator_action, dict):
-        _print_wait(
-            audit.get("supervision"),
-            display_term=display_term,
-            run_id=state.get("run_id"),
-        )
         _print_cleanup(audit.get("delivery_cleanup"))
         _print_scope_change(audit.get("scope_change"))
         print("\n下一步")
         cleanup = audit.get("delivery_cleanup")
         if isinstance(cleanup, dict) and cleanup.get("status") == "cleanup_pending":
             print("  查看 --json 中的交付清理诊断，整理受管工作区后按恢复操作继续。")
+            print(
+                "  恢复命令: "
+                f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
+            )
         else:
             print(
                 "  下一步: "
@@ -352,11 +371,6 @@ def print_status_progress(
         _print_findings(view["findings"])
         return
 
-    _print_wait(
-        audit.get("supervision"),
-        display_term=display_term,
-        run_id=state.get("run_id"),
-    )
     _print_scope_change(audit.get("scope_change"))
     print()
     print_operator_action(operator_action)
@@ -451,8 +465,11 @@ def print_rich_status_progress(
     progress_text += f"；总运行时长 {_duration(view.get('elapsed_seconds'))}"
     add_identity("进度与预算", progress_text)
 
+    wait_view = waiting_presentation(state, audit)
     agent = view.get("current_agent")
-    if isinstance(agent, dict):
+    if wait_view is not None:
+        agent_text = f"{wait_view.work}\n{wait_view.activity}"
+    elif isinstance(agent, dict):
         label = "当前 Agent" if agent.get("is_active") else "最近 Agent"
         agent_text = (
             f"{label}：{_rich_role_label(agent.get('role'))} · "
@@ -488,7 +505,9 @@ def print_rich_status_progress(
     )
     action_lines: list[Text] = []
     activity = view.get("execution_activity")
-    if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
+    if wait_view is not None and not isinstance(action, dict):
+        action_lines.append(_rich_value(wait_view.guidance))
+    elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
         action_lines.append(
             _rich_value(
                 execution_guidance(
@@ -531,10 +550,17 @@ def print_rich_status_progress(
         action_lines.append(
             _rich_value(_operator_instruction(state, audit.get("agent_invocation")))
         )
-    action_lines.extend(_rich_wait_lines(audit.get("supervision"), run_id=state.get("run_id")))
+    if wait_view is not None:
+        action_lines.extend(_rich_labeled(label, text) for label, text in wait_view.details)
     cleanup = audit.get("delivery_cleanup")
     if isinstance(cleanup, dict):
-        action_lines.append(_rich_labeled("交付清理", cleanup.get("status")))
+        cleanup_status = {
+            "completed": "已完成", "cleanup_pending": "等待清理", "pending": "待处理",
+        }.get(str(cleanup.get("status")), cleanup.get("status"))
+        action_lines.append(_rich_labeled("交付清理", cleanup_status))
+        reason = _cleanup_reason(cleanup)
+        if reason:
+            action_lines.append(_rich_labeled("保留原因", reason))
     scope_change = audit.get("scope_change")
     if isinstance(scope_change, dict):
         summary = scope_change.get("graph_change_summary")
@@ -547,7 +573,8 @@ def print_rich_status_progress(
     # Put the executable next step before the detailed action panel so it is
     # visible in the first screen. Keep it outside Rich panels so wrapping
     # never inserts copy-breaking borders, padding, or hard newlines.
-    console.file.write(command_line.plain + "\n")
+    if wait_view is None or wait_view.show_command or isinstance(action, dict):
+        console.file.write(command_line.plain + "\n")
     console.print(
         Panel(
             Group(*action_lines),
@@ -636,41 +663,6 @@ def _terminal_safe(value: object) -> str:
     return terminal_safe(value)
 
 
-def _rich_wait_lines(wait: object, *, run_id: object) -> list[Text]:
-    if not isinstance(wait, dict):
-        return []
-    lines = [
-        _rich_labeled("当前等待", _status_term(wait.get("kind"))),
-        _rich_labeled("等待对象", wait.get("subject")),
-        _rich_labeled(
-            "等待窗口",
-            f"截止={wait.get('deadline')}；剩余={wait.get('remaining_seconds')} 秒",
-        ),
-        _rich_labeled("重试次数", wait.get("retry_count")),
-    ]
-    observation = wait.get("latest_observation")
-    lines.append(
-        _rich_labeled(
-            "最新观测",
-            observation.get("message")
-            if isinstance(observation, dict)
-            else "无",
-        )
-    )
-    if wait.get("timeout_resume_action"):
-        lines.append(
-            _rich_labeled(
-                "超时恢复",
-                human_next_action(wait["timeout_resume_action"], run_id=run_id),
-            )
-        )
-    if wait.get("credential_failure_class"):
-        lines.append(_rich_labeled("凭据失败类别", wait["credential_failure_class"]))
-    if wait.get("credential_http_status") is not None:
-        lines.append(_rich_labeled("凭据 HTTP 状态", wait["credential_http_status"]))
-    return lines
-
-
 def _rich_preserved_results(value: object) -> str:
     if not isinstance(value, str):
         return "当前状态与已有审计证据"
@@ -707,7 +699,7 @@ def _status_term(value: object) -> object:
         "execution_failed": "执行失败，可恢复",
         "operator_stopped": "操作者已停止，可恢复",
         "supervision_timeout": "监督超时暂停，可恢复",
-        "waiting_checks": "等待必需检查",
+        "waiting_checks": "等待自动检查",
         "run_acceptance_pending": "等待运行整体验收",
         "run_publication_pending": "等待运行发布",
         "run_approval_pending": "等待人工批准",
@@ -1415,6 +1407,9 @@ def _duration(seconds: object) -> str:
 def _operator_instruction(
     state: dict[str, Any], invocation: dict[str, Any] | None
 ) -> str:
+    cleanup = cleanup_instruction(state)
+    if cleanup:
+        return cleanup
     if invocation is not None and invocation.get("status") in {"running", "resuming"}:
         return "你暂时无需操作。"
     if state.get("status") in {"completed", "abandoned"}:
@@ -1422,54 +1417,31 @@ def _operator_instruction(
     return "按上述命令继续；不要重复启动另一个 Run。"
 
 
-def _print_wait(
-    wait: object,
-    *,
-    display_term: Callable[[object], object],
-    run_id: object,
-) -> None:
-    if not isinstance(wait, dict):
-        return
-    print("\n当前等待")
-    print(f"  等待种类: {_terminal_safe(display_term(wait.get('kind')))}")
-    print(f"  等待对象: {_terminal_safe(wait.get('subject'))}")
-    boundary_status = (
-        "已记录（完整值见 --json）"
-        if wait.get("head_sha") is not None or wait.get("base_sha") is not None
-        else "尚未取得"
-    )
-    print(f"  等待 head/base: {boundary_status}")
-    print(
-        "  等待窗口: "
-        f"截止={_terminal_safe(wait.get('deadline'))}；"
-        f"剩余={_terminal_safe(wait.get('remaining_seconds'))} 秒"
-    )
-    print(f"  重试次数: {_terminal_safe(wait.get('retry_count'))}")
-    observation = wait.get("latest_observation")
-    if isinstance(observation, dict):
-        print(f"  最新观测: {_terminal_safe(observation.get('message'))}")
-    else:
-        print("  最新观测: 无")
-    if wait.get("timeout_resume_action"):
-        print(
-            "  超时恢复: "
-            f"{_terminal_safe(human_next_action(wait['timeout_resume_action'], run_id=run_id))}"
-        )
-    if wait.get("credential_failure_class"):
-        print(f"  凭据失败类别: {_terminal_safe(wait['credential_failure_class'])}")
-    if wait.get("credential_http_status") is not None:
-        print(f"  凭据 HTTP 状态: {_terminal_safe(wait['credential_http_status'])}")
-
-
 def _print_cleanup(cleanup: object) -> None:
     if not isinstance(cleanup, dict):
         return
     print("\n交付清理")
     print(f"  状态: {_terminal_safe(cleanup.get('status'))}")
+    reason = _cleanup_reason(cleanup)
+    if reason:
+        print(f"  保留原因: {_terminal_safe(reason)}")
     items = cleanup.get("items")
     if isinstance(items, list):
         pending = sum(1 for item in items if isinstance(item, dict))
         print(f"  已保留 {pending} 个受管工作区；完整诊断与恢复操作见 --json")
+
+
+def _cleanup_reason(cleanup: dict[str, Any]) -> str | None:
+    error = cleanup.get("last_error")
+    if cleanup.get("status") == "completed" or not isinstance(error, str) or not error:
+        return None
+    if "source head changed" in error or "foreign head" in error:
+        return "源分支或工作区的提交已变化，已保留新增工作。"
+    if "branch identity changed" in error or "HEAD is not the managed branch" in error:
+        return "工作区已切换分支或处于游离 HEAD，已保留现场。"
+    if any(reason in error for reason in ("tracked modifications", "untracked", "dirty checkout")):
+        return "工作区存在尚未提交的文件，已保留现场。"
+    return error if len(error) <= 240 else error[:232] + "…（已截断）"
 
 
 def _print_scope_change(scope_change: object) -> None:

@@ -270,12 +270,14 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
         current_branch: str,
         next_branch: str,
         candidate_sha: str,
+        current_publication_sha: str,
     ) -> None:
         self.owner.git.rotate_run_repair_checkout(
             checkout=checkout,
             current_branch=current_branch,
             next_branch=next_branch,
             candidate_sha=candidate_sha,
+            current_publication_sha=current_publication_sha,
         )
 
     def prepare_validation(

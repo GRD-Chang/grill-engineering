@@ -48,7 +48,7 @@ class PartialCheckoutGit(GitRepository):
 
 
 class FailingBranchCleanupGit(GitRepository):
-    def delete_managed_delivery_branch(self, branch: str) -> None:
+    def delete_managed_delivery_branch(self, branch: str, *, expected_head_sha: str) -> None:
         raise OSError(f"cannot delete {branch}")
 
 
@@ -61,7 +61,7 @@ class RecordingBranchPublisher:
     def __init__(self) -> None:
         self.deleted_branches: list[str] = []
 
-    def delete_managed_branch(self, branch: str) -> None:
+    def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None:
         self.deleted_branches.append(branch)
 
 
@@ -85,6 +85,7 @@ def test_completed_ticket_cleanup_preserves_tracked_modifications(
         "ticket_branch": branch,
         "phase": "completed",
         "integrated_sha": git.resolve(branch),
+        "publication_sha": git.resolve(branch),
     }
     github = RecordingBranchPublisher()
 
@@ -124,6 +125,7 @@ def test_completed_ticket_cleanup_preserves_untracked_files(
         "ticket_branch": branch,
         "phase": "completed",
         "integrated_sha": git.resolve(branch),
+        "publication_sha": git.resolve(branch),
     }
 
     result = DeliveryCleanupEngine(git=git, states=states).complete_ticket(state, job)
@@ -152,6 +154,7 @@ def test_completed_ticket_cleanup_removes_clean_checkout(git_repo: Path) -> None
         "ticket_branch": branch,
         "phase": "completed",
         "integrated_sha": git.resolve(branch),
+        "publication_sha": git.resolve(branch),
     }
 
     result = DeliveryCleanupEngine(git=git, states=states).complete_ticket(state, job)
@@ -243,6 +246,7 @@ def test_completed_ticket_cleanup_retries_without_reopening_delivery(
         "ticket_branch": branch,
         "phase": "completed",
         "integrated_sha": git.resolve(branch),
+        "publication_sha": git.resolve(branch),
     }
     states.save_run(state["run_id"], state)
 
@@ -277,6 +281,7 @@ def test_cleanup_never_deletes_a_maintainer_branch(git_repo: Path) -> None:
         "ticket_branch": branch,
         "phase": "completed",
         "integrated_sha": git.resolve(branch),
+        "publication_sha": git.resolve(branch),
     }
 
     result = DeliveryCleanupEngine(git=git, states=states).complete_ticket(

@@ -15,7 +15,9 @@ from typing import Any, TypeVar, cast
 
 from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
+from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
+from agent_run.presentation_helpers import current_work_subject
 from agent_run.task_control import TaskControlBusyError
 
 
@@ -212,7 +214,7 @@ class StateStore:
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         destination = self.runs_directory / f"{run_id}.json"
         previous = self.load_run(run_id)
-        durable_state = _sanitize_durable_errors(deepcopy(state))
+        durable_state = _sanitize_durable_errors(state)
         if "run_id" in durable_state:
             _append_timeline_event(durable_state, previous)
             state["timeline"] = durable_state["timeline"]
@@ -323,11 +325,13 @@ def _append_timeline_event(
     state: dict[str, Any], previous: dict[str, Any] | None
 ) -> None:
     marker = _timeline_marker(state)
+    marker.update(checks_timeline_facts(state, marker))
     marker.update(_execution_timeline_projection(state))
     marker["result"] = _timeline_result(state)
     previous_marker: dict[str, object] | None = None
     if previous is not None:
         previous_marker = _timeline_marker(previous)
+        previous_marker.update(checks_timeline_facts(previous, previous_marker))
         previous_marker.update(_execution_timeline_projection(previous))
         previous_marker["result"] = _timeline_result(previous)
         if marker == previous_marker:
@@ -350,7 +354,7 @@ def _append_timeline_event(
         state["timeline_at_capacity"] = True
         _append_timeline_continuation(state, marker, previous_marker)
         return
-    event = _timeline_event(marker)
+    event = _timeline_event(marker, previous_marker)
     if _event_matches_marker(timeline[-1] if timeline else None, marker):
         return
     timeline.append(event)
@@ -370,7 +374,7 @@ def _append_timeline_continuation(
         continuation[-1] if continuation else None, continuation_marker
     ):
         return
-    continuation.append(_timeline_event(continuation_marker))
+    continuation.append(_timeline_event(continuation_marker, previous_marker))
     if len(continuation) > MAX_TIMELINE_CONTINUATION_EVENTS:
         del continuation[: len(continuation) - MAX_TIMELINE_CONTINUATION_EVENTS]
 
@@ -399,7 +403,9 @@ def _continuation_kind(
     return marker["kind"]
 
 
-def _timeline_event(marker: dict[str, object]) -> dict[str, object]:
+def _timeline_event(
+    marker: dict[str, object], previous_marker: dict[str, object] | None = None
+) -> dict[str, object]:
     event: dict[str, object] = {
         "at": datetime.now(UTC).isoformat(),
         "kind": marker["kind"],
@@ -416,6 +422,7 @@ def _timeline_event(marker: dict[str, object]) -> dict[str, object]:
         "approval_granted_at",
         "required_checks_result",
         "required_checks_observed_at",
+        *CHECKS_HISTORY_FIELDS,
         "human_blockers",
         "accepted_graph_revision",
         "observed_graph_revision",
@@ -439,6 +446,11 @@ def _timeline_event(marker: dict[str, object]) -> dict[str, object]:
         value = marker.get(key)
         if value is not None or (key == "budget_window" and key in marker):
             event[key] = deepcopy(value) if key == "graph_change_summary" else value
+    if marker.get("required_checks_evidence") is not None and (
+        previous_marker is None
+        or marker.get("required_checks_signature") != previous_marker.get("required_checks_signature")
+    ):
+        event["required_checks_evidence"] = deepcopy(marker["required_checks_evidence"])
     return event
 
 
@@ -525,6 +537,10 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             "next_action": "restore_graph_or_abandon",
         }
     publication = state.get("run_publication")
+    current_subject = current_work_subject(state)
+    publication_is_current = (
+        current_subject is not None and current_subject[1] is publication
+    )
     if (
         status in {
         "run_publication_pending",
@@ -535,11 +551,11 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
         "abandoned",
         }
         or (
-            status == "ready_for_human"
+            status in {"ready_for_human", "waiting_external", "supervision_timeout", "operator_stopped"}
             and isinstance(publication, dict)
-            and publication.get("phase") == "ready_for_human"
+            and publication.get("phase") in {"ready_for_human", "waiting_external", "waiting_checks", "ready_for_approval"}
         )
-    ) and isinstance(publication, dict):
+    ) and isinstance(publication, dict) and publication_is_current:
         phase = str(publication.get("phase", "pending"))
         role = _worker_role(publication, phase)
         approval_grant = publication.get("approval_grant")
@@ -568,8 +584,12 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             ),
         }, publication)
     run_acceptance = state.get("run_acceptance")
-    if status in {"run_acceptance_pending", "ready_for_human"} and isinstance(
-        run_acceptance, dict
+    if isinstance(run_acceptance, dict) and (
+        status in {"run_acceptance_pending", "ready_for_human"}
+        or (
+            status in {"waiting_checks", "waiting_external", "waiting_merge", "supervision_timeout", "operator_stopped"}
+            and isinstance(run_acceptance.get("repair_job"), dict)
+        )
     ):
         phase = str(run_acceptance.get("phase", "pending"))
         repair = run_acceptance.get("repair_job")
@@ -583,6 +603,8 @@ def _timeline_marker(state: dict[str, Any]) -> dict[str, object]:
             "attempt": _worker_attempt(subject, role),
             "thread_id": _thread_id_for_role(subject, role),
             "phase": subject_phase,
+            "pr_number": subject.get("pr_number"),
+            "commit_sha": subject.get("integrated_sha"),
         }, subject)
     active = state.get("active_ticket_job")
     if isinstance(active, dict):
@@ -597,6 +619,7 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
     phase = str(job.get("phase", "pending"))
     role = _worker_role(job, phase)
     ticket = job.get("ticket_number")
+    grant = job.get("approval_grant")
     return _with_human_blockers({
         "kind": "ticket_phase" if isinstance(ticket, int) else "parent_phase",
         "status": status,
@@ -610,6 +633,7 @@ def _job_timeline_marker(job: dict[str, Any], status: str) -> dict[str, object]:
         ),
         "phase": phase,
         "pr_number": job.get("pr_number"),
+        "approval_granted_at": grant.get("granted_at") if isinstance(grant, dict) else None,
         "commit_sha": job.get("integrated_sha")
         or job.get("publication_sha")
         or job.get("candidate_sha"),
@@ -733,7 +757,7 @@ def _timeline_result(state: dict[str, Any]) -> object:
 
 
 def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
-    """Bound diagnostics and exclude ephemeral or sensitive payloads from disk."""
+    """Build an isolated durable copy while bounding and redacting payloads."""
 
     sanitized = _sanitize_error_value(value)
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
@@ -759,7 +783,9 @@ def _sanitize_error_value(
     if isinstance(value, str):
         return bounded_error(value) if diagnostic else redact_credentials(value)
     if not isinstance(value, dict):
-        return value
+        # JSON scalars are immutable. Extensions such as tuples may contain
+        # mutable values, so retain their previous deepcopy isolation.
+        return value if value is None or type(value) in (bool, int, float) else deepcopy(value)
     sanitized: dict[object, object] = {}
     for key, item in value.items():
         if isinstance(key, str) and _is_ephemeral_payload_key(key):

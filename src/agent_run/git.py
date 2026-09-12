@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from agent_run.commit_messages import commit_messages_match
 from agent_run.git_errors import GitError as GitError
 from agent_run.git_errors import (
     GitIntegrityError as GitIntegrityError,
@@ -17,16 +18,13 @@ from agent_run.git_integration_commit import IntegrationRepairCommitGit
 from agent_run.git_integration_scene import IntegrationRepairSceneGit
 from agent_run.github_retry import run_read_command
 from agent_run.git_output import run_git
-
-
-MANAGED_DELIVERY_BRANCH_PREFIXES = (
-    "agent-run/",
-    "agent-run-repair/",
+from agent_run.git_retirement import (
+    MANAGED_DELIVERY_BRANCH_PREFIXES as MANAGED_DELIVERY_BRANCH_PREFIXES,
+    ManagedBranchRetirementGit,
+    is_managed_delivery_branch as is_managed_delivery_branch,
 )
 
 
-def is_managed_delivery_branch(branch: str) -> bool:
-    return branch.startswith(MANAGED_DELIVERY_BRANCH_PREFIXES)
 
 
 class DirtyManagedCheckoutError(GitError):
@@ -37,6 +35,7 @@ class GitRepository:
     def __init__(self, root: Path) -> None:
         self.root = root
         self._write_guard: Callable[[], None] | None = None
+        self._retirement = ManagedBranchRetirementGit(self)
         self._integration_scene = IntegrationRepairSceneGit(self)
         self._integration_commit = IntegrationRepairCommitGit(self)
 
@@ -238,32 +237,13 @@ class GitRepository:
             raise GitError("managed repair checkout seed did not match its Candidate")
 
     def rotate_run_repair_checkout(
-        self,
-        *,
-        checkout: Path,
-        current_branch: str,
-        next_branch: str,
-        candidate_sha: str,
+        self, *, checkout: Path, current_branch: str, next_branch: str,
+        candidate_sha: str, current_publication_sha: str,
     ) -> None:
-        """Move one persistent repair checkout onto a fresh managed Job branch."""
-
-        if self.ticket_checkout_matches(checkout, next_branch):
-            if self.checkout_head(checkout) != candidate_sha:
-                raise GitError("rotated Run Repair checkout has a foreign Candidate")
-            return
-        if not self.ticket_checkout_matches(checkout, current_branch):
-            raise GitError("existing Run Repair checkout does not match its Job branch")
-        if not is_managed_delivery_branch(next_branch):
-            raise GitError(f"refusing to create unmanaged branch {next_branch!r}")
-        if self._resolve(f"refs/heads/{next_branch}") is not None:
-            raise GitError(f"Run Repair Job branch {next_branch!r} already exists")
-        switched = self._run_in(
-            checkout, "switch", "-c", next_branch, candidate_sha
+        self._retirement.rotate_run_repair_checkout(
+            checkout=checkout, current_branch=current_branch, next_branch=next_branch,
+            candidate_sha=candidate_sha, current_publication_sha=current_publication_sha,
         )
-        if switched.returncode != 0:
-            raise GitError(
-                switched.stderr.strip() or "could not rotate Run Repair Job branch"
-            )
 
     def ticket_checkout_matches(self, checkout: Path, branch: str) -> bool:
         if not checkout.exists():
@@ -297,11 +277,11 @@ class GitRepository:
                 or f"could not delete branch {branch}"
             )
 
-    def delete_managed_delivery_branch(self, branch: str) -> None:
-        """Delete only a branch shape owned by the Delivery Run controller."""
-        if not is_managed_delivery_branch(branch):
-            raise GitError(f"refusing to delete unmanaged branch {branch!r}")
-        self.delete_branch(branch)
+    def managed_branch_head(self, branch: str) -> str | None:
+        return self._retirement.managed_branch_head(branch)
+
+    def delete_managed_delivery_branch(self, branch: str, *, expected_head_sha: str) -> None:
+        self._retirement.delete_managed_delivery_branch(branch, expected_head_sha=expected_head_sha)
 
     def prepare_validation_checkout(
         self, *, head_sha: str, checkout: Path
@@ -641,11 +621,13 @@ class GitRepository:
             and self.commit_parents(current) == [base_sha]
         ):
             current_message = self._run_in(
-                checkout, "show", "-s", "--format=%B", current
+                checkout, "cat-file", "commit", current
             )
             if (
                 current_message.returncode == 0
-                and current_message.stdout.strip() == message.strip()
+                and commit_messages_match(
+                    current_message.stdout.partition("\n\n")[2], message
+                )
             ):
                 return current
         created = self._run_in(
@@ -828,6 +810,13 @@ class GitRepository:
             f"{reason}; inspect and retain or commit the work, then run "
             f"agent-run resume {run_id}; to irreversibly discard it while abandoning "
             f"the Run, use agent-run abandon {run_id} --discard-worktree"
+        )
+
+    def remove_completed_worktree(
+        self, checkout: Path, *, branch: str, expected_head_sha: str
+    ) -> None:
+        self._retirement.remove_completed_worktree(
+            checkout, branch=branch, expected_head_sha=expected_head_sha
         )
 
     def remove_worktree(

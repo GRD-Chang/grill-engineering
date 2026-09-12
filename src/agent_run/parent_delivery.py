@@ -251,7 +251,11 @@ class ParentDeliveryEngine:
         existing = state.get("parent_job")
         parent = _mapping(state, "parent")
         if isinstance(existing, dict):
-            if existing.get("effective_revision") != parent.get("revision"):
+            if (
+                existing.get("effective_revision") != parent.get("revision")
+                and existing.get("phase") not in {"merging", "completed"}
+                and not isinstance(existing.get("integrated_sha"), str)
+            ):
                 self._reset_for_revision(state, existing, str(parent["revision"]))
                 self._save(state)
             return existing
