@@ -2371,6 +2371,8 @@ def test_squash_merge_uses_supported_pr_merge_and_live_result(
         "b" * 40,
         "--subject",
         "feat(test): supported merge",
+        "--body",
+        "",
     ]
 
 

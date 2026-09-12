@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agent_run.commit_messages import commit_messages_match
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.required_checks_observation import (
     bind_new_publication_head,
@@ -399,7 +400,9 @@ class RunRepairPromotion:
             or live.get("head_tree") != live.get("integrated_tree")
             or (
                 not published_as_merge_resolution
-                and live.get("integrated_message") != publication.get("commit_message")
+                and not commit_messages_match(
+                    live.get("integrated_message"), publication.get("commit_message")
+                )
             )
             or live.get("integrated_parents") != expected_parents
             or (

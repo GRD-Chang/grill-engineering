@@ -1176,7 +1176,7 @@ class FixtureGitHubPublisher:
                     "integrated_tree": self.git.resolve(
                         f"{integrated}^{{tree}}"
                     ),
-                    "integrated_message": _commit_subject(
+                    "integrated_message": _commit_message(
                         self.git.root, integrated
                     ),
                     "integrated_parents": self.git.commit_parents(integrated),
@@ -1881,9 +1881,9 @@ def _mutable_list(data: dict[str, Any], key: str) -> list[Any]:
     return value
 
 
-def _commit_subject(repository: Path, sha: str) -> str:
+def _commit_message(repository: Path, sha: str) -> str:
     result = subprocess.run(
-        ["git", "log", "-1", "--format=%s", sha],
+        ["git", "cat-file", "commit", sha],
         cwd=repository,
         text=True,
         capture_output=True,
@@ -1891,4 +1891,4 @@ def _commit_subject(repository: Path, sha: str) -> str:
     )
     if result.returncode != 0:
         raise ValueError(result.stderr.strip() or "fixture commit is missing")
-    return result.stdout.strip()
+    return result.stdout.split("\n\n", 1)[1]

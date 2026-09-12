@@ -1296,6 +1296,7 @@ class GhGitHubPublisher:
         commit_message: str,
     ) -> str:
         del run_branch
+        subject, separator, body = commit_message.partition("\n\n")
         merged = self._run(
             "pr",
             "merge",
@@ -1306,7 +1307,9 @@ class GhGitHubPublisher:
             "--match-head-commit",
             expected_head_sha,
             "--subject",
-            commit_message,
+            subject,
+            "--body",
+            body if separator else "",
         )
         try:
             live = self.live_pull_request(pr_number)
@@ -2062,7 +2065,7 @@ class GhGitHubPublisher:
             )
         return {
             "tree": tree_sha,
-            "message": message.splitlines()[0],
+            "message": message,
             "parents": parents,
         }
 

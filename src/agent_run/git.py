@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from agent_run.commit_messages import commit_messages_match
 from agent_run.git_errors import GitError as GitError
 from agent_run.git_errors import (
     GitIntegrityError as GitIntegrityError,
@@ -641,11 +642,13 @@ class GitRepository:
             and self.commit_parents(current) == [base_sha]
         ):
             current_message = self._run_in(
-                checkout, "show", "-s", "--format=%B", current
+                checkout, "cat-file", "commit", current
             )
             if (
                 current_message.returncode == 0
-                and current_message.stdout.strip() == message.strip()
+                and commit_messages_match(
+                    current_message.stdout.partition("\n\n")[2], message
+                )
             ):
                 return current
         created = self._run_in(
