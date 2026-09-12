@@ -8,6 +8,7 @@ import pytest
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.published_run import prepare_accepted_run, prepare_published_run
 from test_cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
 from test_cli_delivery import (
     HUMAN_BLOCKER,
@@ -448,17 +449,24 @@ def test_run_repair_resume_preserves_partial_worker_edits_and_thread(
     assert "当前有效通过" in status.stdout
     assert "尚无有效验收结论" not in status.stdout
 
+def _repair_agents_after_acceptance(path: Path, *, repair_generations: int) -> Path:
+    """Keep the repair script after its completed Ticket and accepted Run setup."""
+    agents = _repair_agents(path, repair_generations=repair_generations)
+    data = json.loads(agents.read_text(encoding="utf-8"))
+    for role in ("developments", "publications", "run_reviews"):
+        del data[role][0]
+    data["reviews"] = []
+    agents.write_text(json.dumps(data), encoding="utf-8")
+    return agents
+
+
 @pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
 def test_run_supervises_repair_trigger_live_pr_readback(
     git_repo: Path, error_type: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    initial_agents = run_agents(git_repo / "initial-agents.json")
-    awaiting = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(initial_agents)
-    )
-    run_id = str(stdout_json(awaiting)["run_id"])
-    assert stdout_json(awaiting)["status"] == "run_approval_pending"
+    fixture, awaiting = prepare_published_run(git_repo)
+    run_id = str(awaiting["run_id"])
+    assert awaiting["status"] == "run_approval_pending"
 
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["delivery"].update(
@@ -535,17 +543,18 @@ def test_run_supervises_repair_pr_failed_check_evidence_reads(
         {"scope": "run_repair", "type": error_type, "message": "evidence unavailable"},
         {"scope": "run_repair", "type": error_type, "message": "evidence unavailable"},
     ]
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
         delivery={
-            "required_checks": ["none", "fail", "fail"],
+            "required_checks": ["fail", "fail"],
             "required_check_evidence_failures": failures,
         },
-        # Preserve repeated read failures without relying on a post-deadline retry.
-        supervision_clock_multiplier=40,
     )
-    agents = _repair_agents(git_repo / "agents.json", repair_generations=2)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    # Preserve repeated read failures without relying on a post-deadline retry.
+    data["supervision_clock_multiplier"] = 40
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    agents = _repair_agents_after_acceptance(git_repo / "agents.json", repair_generations=2)
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -605,16 +614,17 @@ def test_run_supervises_required_check_trigger_fingerprint_reads(
         {"scope": "final_run", "type": error_type, "message": "fingerprint unavailable"},
         {"scope": "final_run", "type": error_type, "message": "fingerprint unavailable"},
     ]
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
         delivery={
-            "required_checks": ["none", "fail"],
+            "required_checks": ["fail"],
             "required_check_evidence_failures": failures,
         },
-        supervision_clock_multiplier=120,
     )
-    agents = _repair_agents(git_repo / "agents.json", repair_generations=1)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["supervision_clock_multiplier"] = 120
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    agents = _repair_agents_after_acceptance(git_repo / "agents.json", repair_generations=1)
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -651,11 +661,10 @@ def test_run_supervises_required_check_trigger_fingerprint_reads(
 def test_run_supervises_initial_final_check_evidence_reads(
     git_repo: Path, error_type: str
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
         delivery={
-            "required_checks": ["none", "fail"],
+            "required_checks": ["fail"],
             "required_check_evidence_failures": [
                 {
                     "scope": "final_run",
@@ -665,9 +674,11 @@ def test_run_supervises_initial_final_check_evidence_reads(
                 for _ in range(3)
             ],
         },
-        supervision_clock_multiplier=120,
     )
-    agents = _repair_agents(git_repo / "agents.json", repair_generations=1)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["supervision_clock_multiplier"] = 120
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    agents = _repair_agents_after_acceptance(git_repo / "agents.json", repair_generations=1)
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -709,10 +720,8 @@ def test_run_supervises_initial_final_check_evidence_reads(
 def test_run_supervises_post_approval_final_check_evidence_reads(
     git_repo: Path, error_type: str
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    agents = _repair_agents(git_repo / "agents.json", repair_generations=1)
-    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
-    run_id = str(stdout_json(awaiting)["run_id"])
+    fixture, awaiting = prepare_published_run(git_repo)
+    run_id = str(awaiting["run_id"])
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     fixture_data["supervision_clock_multiplier"] = 120
     fixture_data["delivery"].update(
