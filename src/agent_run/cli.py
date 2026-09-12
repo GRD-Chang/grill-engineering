@@ -175,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parent Issue 编号；也可传入完整 Run ID 走精确恢复路径",
     )
     _add_common_options(resume)
-    _add_policy_options(resume)
+    _add_policy_options(resume, allow_thread_policy=False)
     resume.add_argument("--json", action="store_true", dest="as_json")
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
@@ -4177,8 +4177,16 @@ def _add_profile_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_policy_options(
-    parser: argparse.ArgumentParser, *, dest_prefix: str = ""
+    parser: argparse.ArgumentParser, *, dest_prefix: str = "",
+    allow_thread_policy: bool = True,
 ) -> None:
+    if allow_thread_policy:
+        parser.add_argument(
+            "--development-thread-policy",
+            choices=("reuse", "new-per-attempt"),
+            dest=f"{dest_prefix}development_thread_policy",
+            help="开发 Thread 策略：跨轮复用或每新开发轮新建，仅新 Run 生效",
+        )
     parser.add_argument(
         "--parent-only-paired-rounds",
         "--parent-only-paired-round",
@@ -4221,6 +4229,7 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "development_thread_policy",
     ):
         value = getattr(parsed, f"policy_{key}", None)
         if value is None:

@@ -1,6 +1,6 @@
 # 个人运行默认配置
 
-`agent-run settings` 统一查看和编辑轮数、调用时限、模型及推理强度。无需自定义时无需创建文件，直接使用内置默认。
+`agent-run settings` 统一查看和编辑轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
 
 唯一文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
@@ -26,6 +26,17 @@ agent-run settings show --run <完整Run-ID> --json
 | `run_repair_rounds` / `--run-repair-rounds` | 10 | 正整数 N；先审核一次，最多 N 次修复开发，合计最多 N+1 次审核 |
 
 Ticket 最后一轮 Findings 经开发处理后可走确定性 Fallback；Final CI-fix 只处理适用 CI 失败。Parent-only 与 Run 窗口用尽后需要显式恢复，不自动续期。等待、内部子 Agent 和输出格式修复不增加这些业务轮数。
+
+## 开发会话策略
+
+`policy.development_thread_policy`（CLI `--development-thread-policy`）允许 `reuse`（默认，跨开发轮复用）与 `new-per-attempt`（每个新 Development Attempt 新建 Thread），一致作用于 Ticket、Parent-only 和 Run Repair。
+
+```bash
+agent-run settings configure --development-thread-policy new-per-attempt
+agent-run run 229 --development-thread-policy reuse
+```
+
+该字段在创建 Run 时固定；查询个人默认与指定 Run 可看到各自实际值，已有 Run 不开放策略切换，后续预算窗口也保留它。同一轮的执行异常、容量恢复、人工回应续接和 JSON 修复继续原 Thread；启动新一轮的需求修订才受轮换策略影响，显式人工替换 Thread 的例外保留。新 Thread 继续当前 checkout 和已有代码，不重置预算。它绑定该 Run 当前有效的 Profile Revision，不重读个人默认；显式 `configure <Run>` 的 Profile 修订仍只影响后续新 Thread。不承诺必然减少 Token、成本或提高质量。
 
 ## 单次调用时限
 
@@ -74,7 +85,7 @@ agent-run configure 228 --development-model gpt-6-astra --development-effort low
 agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 ```
 
-`configure <Run>` 仍仅创建该 Run 的新 Profile Revision，影响之后新建的 Thread；已有 Thread、Resume 和 Output Repair 保持绑定。`resume` 只有在预算检查点才接受显式策略覆盖，并以 Run 当前快照补齐未覆盖字段；普通恢复不会更换策略或新增预算。各旧窗口保存自己的策略与用量。按开发轮新 Thread 的个人选项尚未交付，本文件不接受该字段。
+`configure <Run>` 仍仅创建该 Run 的新 Profile Revision，影响之后新建的 Thread；已有 Thread、Resume 和 Output Repair 保持绑定。`resume` 只有在预算检查点才接受显式策略覆盖，并以 Run 当前快照补齐未覆盖字段；普通恢复不会更换策略或新增预算。各旧窗口保存自己的策略与用量。开发会话策略不能通过 `resume` 覆盖。
 
 ## 兼容与错误处理
 

@@ -1929,6 +1929,15 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     if role in {"development", "fresh_acceptance"}:
         job = _change_job_for_invocation(state, invocation)
         if role == "development":
+            previous_thread = invocation.get("reported_thread_id") or job.get(
+                "development_thread_id"
+            ) or invocation.get("requested_thread_id")
+            if isinstance(previous_thread, str) and previous_thread:
+                history = job.setdefault("development_thread_history", [])
+                if not isinstance(history, list):
+                    raise ValueError("development_thread_history must be an array")
+                if previous_thread not in history:
+                    history.append(previous_thread)
             job.pop("development_thread_id", None)
             job["development_new_thread"] = True
         else:

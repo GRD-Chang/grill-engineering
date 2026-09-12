@@ -33,13 +33,14 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     store = UserDefaultsStore()
     store.path.parent.mkdir(parents=True, exist_ok=True)
     store.path.write_text(json.dumps({
-        "policy": {"ticket_review_rounds": 2, "invocation_deadlines": {"development": "11m"}},
+        "policy": {"development_thread_policy": "new-per-attempt", "ticket_review_rounds": 2, "invocation_deadlines": {"development": "11m"}},
         "profile": {"development_model": "old-model", "development_effort": "high"},
     }))
     code, shown = settings("show")
     assert code == 0
     assert shown["policy"]["invocation_deadlines"]["development"] == 660
     assert shown["profile"]["profiles"]["publication"]["model"] == "old-model"
+    assert shown["policy"]["development_thread_policy"] == "new-per-attempt"
     fixture = write_fixture(git_repo / "github.json", issues={})
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps({"developments": [human_blocker_step("original-thread")]}))
@@ -52,15 +53,17 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     assert profile["bindings"][0]["model"] == "old-model"
     assert original["agent_invocation_history"][0]["deadline_seconds"] == 660
 
-    code, saved = settings("configure", "--development-model", "new-model", "--development-deadline", "13m")
+    code, saved = settings("configure", "--development-model", "new-model", "--development-deadline", "13m", "--development-thread-policy", "reuse")
     assert code == 0
     assert saved["notice"] == "仅影响之后创建的新 Run，已有 Run 保持原设置"
     document = json.loads(store.path.read_text())
     assert document["profile"]["development_effort"] == "high"
     assert document["policy"]["ticket_review_rounds"] == 2
+    assert document["policy"]["development_thread_policy"] == "reuse"
     code, actual = settings("show", "--run", run_id)
     assert code == 0
     assert actual["scope"] == "run"
+    assert actual["policy"]["development_thread_policy"] == "new-per-attempt"
     assert actual["policy"]["invocation_deadlines"]["development"] == 660
     assert actual["profile"]["profiles"]["development"]["model"] == "old-model"
     agents.write_text(json.dumps({"developments": [
@@ -87,6 +90,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     assert new_profile["bindings"][0]["reasoning_effort"] == "high"
     assert new_state["agent_invocation_history"][0]["deadline_seconds"] == 780
     assert new_state["policy_snapshot"]["ticket_review_rounds"] == 2
+    assert new_state["policy_snapshot"]["development_thread_policy"] == "reuse"
 
 
 def test_public_settings_validation_legacy_and_atomic_failure(
@@ -147,6 +151,7 @@ def test_settings_human_output_and_complete_example(tmp_path: Path, monkeypatch:
 
 @pytest.mark.parametrize("arguments,personal", [
     (["--ticket-review-rounds", "2"], {}),
+    (["--development-thread-policy", "new-per-attempt"], {}),
     (["--development-model", "explicit-model"], {"profile": {"review_model": "personal-review"}}),
 ])
 def test_creation_action_replay_preserves_frozen_configuration(
@@ -168,3 +173,22 @@ def test_creation_action_replay_preserves_frozen_configuration(
     assert cli._run_payload_for_existing_action(
         changed, first, None, cli._profile_configuration(changed)
     ) != first
+
+
+def test_thread_policy_cannot_be_changed_for_existing_run() -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([
+            "resume", "229", "--development-thread-policy", "new-per-attempt",
+        ])
+
+
+@pytest.mark.parametrize("value", [None, False, 1, "invalid", [], {}])
+def test_thread_policy_file_rejects_invalid_values(value: Any) -> None:
+    store = UserDefaultsStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps({"policy": {"development_thread_policy": value}})
+    store.path.write_text(content)
+    code, rejected = settings("show")
+    assert code == 2
+    assert "development_thread_policy" in json.dumps(rejected)
+    assert store.path.read_text() == content

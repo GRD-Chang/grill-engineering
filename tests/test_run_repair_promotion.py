@@ -434,11 +434,20 @@ def test_run_repair_default_drift_during_development_preserves_next_attempt(
     assert completed_run["development_thread_history"] == ["run-repair-developer"]
     assert not checkout.exists()
 
-@pytest.mark.parametrize("candidate_requires_more_repair", [False, True])
+@pytest.mark.parametrize(
+    ("candidate_requires_more_repair", "thread_policy"),
+    [(False, "reuse"), (True, "reuse"), (True, "new-per-attempt")],
+)
 def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
-    git_repo: Path, candidate_requires_more_repair: bool
+    git_repo: Path, candidate_requires_more_repair: bool, thread_policy: str
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    state.setdefault("policy_snapshot", {})["development_thread_policy"] = thread_policy
+    states.save_run(str(state["run_id"]), state)
+    successor_thread = (
+        "run-repair-successor" if thread_policy == "new-per-attempt"
+        else "run-repair-developer"
+    )
     fixture = git_repo / "github.json"
     initial_default = git.resolve("main")
 
@@ -486,13 +495,17 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
             if not self.development_requests:
                 return super().develop(request)
+            assert request["thread_id"] == (
+                None if thread_policy == "new-per-attempt" else "run-repair-developer"
+            )
             self.development_requests.append(request)
             checkout = Path(str(request["checkout"]))
+            assert (checkout / "run-repair.txt").read_text(encoding="utf-8") == "repaired\n"
             (checkout / "follow-up-repair.txt").write_text(
                 "repaired after revalidation\n", encoding="utf-8"
             )
             return DevelopmentResult(
-                thread_id="run-repair-developer",
+                thread_id=successor_thread,
                 summary="Repaired the latest default combination.",
             )
 
@@ -543,7 +556,10 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
         second["run_acceptance"]["repair_cycle"]["code_modification_attempts"]
         == expected_modifications
     )
-    assert second["run_acceptance"]["development_thread_history"] == [thread_id]
+    expected_threads = [thread_id]
+    if candidate_requires_more_repair and successor_thread != thread_id:
+        expected_threads.append(successor_thread)
+    assert second["run_acceptance"]["development_thread_history"] == expected_threads
     if candidate_requires_more_repair:
         assert second["run_acceptance"]["publication_sha"] != merged_publication_sha
     else:

@@ -57,3 +57,11 @@ Executor 仍存活且确认 Worker 异常结束时，普通执行异常沿用每
 恢复测试覆盖角色任务与 JSON 修复的不同中断位置、最后一次修复中断、普通自动恢复再次失败、人工续接，以及连续多次容量失败后在原 Thread 完成工作。验证准确 Thread、只读权限、校验错误传递、持久次数、独立时限、不改变业务预算，以及停止、取消、无 Thread、身份或 currentness 不成立时不启动 Worker。测试不调用真实 Codex、真实 systemd 或真实 GitHub 写入，不使用生产时长等待。
 
 另须验证已接受 Resume 的意图不会因后续状态变化转成新窗口授权，重复原 Action 不重复执行；自动续接遇到 Human Blocker 或预算检查点不能解除门禁。人工预算 Resume 的提示与回执明确表达新窗口授权，容量失败以受控时钟验证等待 30 秒后续接。
+
+### 新开发轮与同轮恢复的区别（Issue #229）
+
+Development Thread Policy 只在共享引擎分配新 Semantic Development Attempt 时选择会话；
+执行异常、容量恢复、Human Blocker 回应及 Output Repair 不触发策略轮换。
+同轮人工替换 Thread 也保留已用普通恢复和输出修复额度；新 Attempt 不继承旧轮计数。
+人工需求修订与回应阻塞问题不同：修订若分配新的开发轮，按 Run 固定策略选择 Thread。
+策略轮换先持久化 Attempt 和历史 Thread 身份，再开始调用，不重新授权预算或清空 checkout。

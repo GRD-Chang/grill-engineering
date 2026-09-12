@@ -35,6 +35,7 @@ def _capture_public_prompt(
     request: dict[str, Any],
     *,
     name: str,
+    worker_calls: list[tuple[list[str], dict[str, Any]]] | None = None,
 ) -> str:
     checkout = tmp_path / name
     checkout.mkdir()
@@ -74,6 +75,8 @@ def _capture_public_prompt(
         arguments: list[str], **options: Any
     ) -> subprocess.CompletedProcess[str]:
         captured.append(str(options["prompt"]))
+        if worker_calls is not None:
+            worker_calls.append((arguments, options))
         output_index = arguments.index("--output-last-message") + 1
         Path(arguments[output_index]).write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8"
@@ -748,7 +751,10 @@ def test_ordinary_and_final_ci_fix_sources_use_the_same_agent_prompt(
             )
         )
 
-    assert prompts[0] == prompts[1]
+    # Checkout paths are task facts; the repair instructions remain identical.
+    assert prompts[0].replace("required-checks-ordinary", "CHECKOUT") == prompts[1].replace(
+        "required-checks-final_ci_fix", "CHECKOUT"
+    )
     assert "下列检查失败对应当前提交" in prompts[0]
     assert "EXACT_HEAD_CI_EVIDENCE" in prompts[0]
     assert "默认不再组织独立审查" in prompts[0]
@@ -1208,7 +1214,6 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
         "PRIVATE_TICKET_BODY_SENTINEL",
         "PRIVATE_SUMMARY_SENTINEL",
         "PRIVATE_PR_SENTINEL",
-        "PRIVATE_CHECKOUT_SENTINEL",
         "PRIVATE_THREAD_SENTINEL",
         "PRIVATE_ATTEMPT_SENTINEL",
         "PRIVATE_VALIDATION_ATTEMPT_SENTINEL",
@@ -1268,6 +1273,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "OLD_RESPONSE_SENTINEL" not in prompt
             else:
                 assert "PRIOR_BLOCKER_SENTINEL" not in prompt
+            assert ("PRIVATE_CHECKOUT_SENTINEL" in prompt) is (method == "develop")
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":

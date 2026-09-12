@@ -1,5 +1,6 @@
 {
   "policy": {
+    "development_thread_policy": "reuse",
     "ticket_review_rounds": 3,
     "parent_only_paired_rounds": 10,
     "run_repair_rounds": 10,

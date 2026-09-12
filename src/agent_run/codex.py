@@ -375,7 +375,7 @@ class CodexCliBackend:
                 )
                 raise deadline_error
             attempt_prompt = role_prompt
-            if attempt > 1:
+            if validation_error:
                 attempt_prompt = structured_output_repair_prompt(
                     output_name, validation_error[:2000]
                 )
@@ -402,7 +402,7 @@ class CodexCliBackend:
                     thread_id=current_thread,
                     repository=repository,
                     schema=schema,
-                    writable_checkout=initial_writable_checkout and attempt == 1,
+                    writable_checkout=initial_writable_checkout and not validation_error,
                     model=model,
                     reasoning_effort=reasoning_effort,
                     timeout=remaining,
@@ -466,7 +466,7 @@ class CodexCliBackend:
                         )
                     notify("recovery_started", **facts)
                     deadline_at = time.monotonic() + deadline_seconds
-                    if attempt == 1 and continuation_prompt is not None:
+                    if not validation_error and continuation_prompt is not None:
                         role_prompt = continuation_prompt
                     continue
                 failure_facts: dict[str, object] = {
