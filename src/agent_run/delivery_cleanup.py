@@ -292,6 +292,7 @@ class DeliveryCleanupEngine:
                     )
                     if callable(remote_delete):
                         remote_delete(branch, expected_head_sha=expected_remote_head)
+                    self._remove_empty_directories(checkout)
                 except (OSError, RuntimeError) as error:
                     item.update(
                         {"status": "cleanup_pending", "last_error": str(error)}
@@ -313,6 +314,14 @@ class DeliveryCleanupEngine:
             cleanup.pop("last_error", None)
         self.states.save_run(str(state["run_id"]), state)
         return state
+
+    def _remove_empty_directories(self, checkout: Path) -> None:
+        for directory in (checkout.parent, checkout.parent.parent):
+            self.git._check_write_guard()
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
 
     def _cleanup(self, state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("delivery_cleanup")
