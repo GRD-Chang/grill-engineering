@@ -1954,7 +1954,7 @@ def test_history_human_output_groups_invocations_and_keeps_resume_as_a_turning_p
     assert finding in details
     assert "证据：candidate-a" in details
     assert "PR 编号：17" in details
-    assert "必需检查结果：pass" in details
+    assert "自动检查结果：pass" in details
     assert "preserved checkout" in details
     assert "恢复类型：stale_dirty_checkout" in details
 
@@ -6350,7 +6350,7 @@ def test_history_supporting_records_are_bound_to_attempt_version(
     details = capsys.readouterr().out
     assert "PR 编号：17" in details
     assert "门禁模式：configured" in details
-    assert "必需检查结果：pass" in details
+    assert "自动检查结果：pass" in details
     assert "检查项：名称=fixture；结果=pass" in details
     assert "集成提交：integrated-b" in details
     assert "发布提交：publication-b" in details

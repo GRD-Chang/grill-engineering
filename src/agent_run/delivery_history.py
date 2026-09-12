@@ -14,11 +14,14 @@ from agent_run.delivery_status import (
     invocation_execution_seconds,
     invocation_recovery_details,
 )
+from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS
+from agent_run.history_waits import collapse_check_waits
 from agent_run.presentation_helpers import (
     delivery_object_label,
     human_next_action,
     terminal_safe,
 )
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
 
 
 HISTORY_DETAIL_LIMIT = 240
@@ -54,12 +57,16 @@ def _history_turning_points(
                 if isinstance(blockers, list)
                 else []
             )
-            kind = _timeline_kind(raw, details)
+            kind = _human_timeline_kind(raw, details)
             details.extend(_scope_change_details(raw))
             event = {
                 "at": timestamp,
                 "kind": kind,
-                "object": _timeline_object(state, raw),
+                "object": (
+                    _subject_label(state, raw["history_work_subject"])
+                    if isinstance(raw.get("history_work_subject"), str)
+                    else _timeline_object(state, raw)
+                ),
                 "phase": raw.get("phase"),
                 "status": raw.get("status"),
                 "role": raw.get("worker"),
@@ -82,6 +89,7 @@ def _history_turning_points(
                 "explicit_resume_kind",
                 "explicit_resume_thread_id",
                 "explicit_resume_attempt_id",
+                *CHECKS_HISTORY_FIELDS,
             ):
                 if raw.get(key) is not None:
                     event[key] = raw[key]
@@ -148,7 +156,7 @@ def _history_turning_points(
     for point in points:
         point.pop("_order", None)
         point.pop("_human_blocker_occurrence", None)
-    return points
+    return collapse_check_waits(points)
 
 
 def _collapse_human_blocker_snapshots(
@@ -217,9 +225,6 @@ def _history_turning_point_identity(point: dict[str, Any]) -> str:
         )
     kind = point.get("kind")
     can_deduplicate_snapshot = (
-        kind == "required_checks"
-        and point.get("required_checks_observed_at") is not None
-    ) or (
         kind == "publication"
         and any(
             point.get(key) is not None
@@ -370,6 +375,10 @@ def print_history_progress(
         f"  {'总运行时长':<22}"
         f"{_duration(progress['summary']['elapsed_seconds'])}"
     )
+    waiting_lines = _current_wait_lines(state, audit)
+    if waiting_lines:
+        print("\n" + "\n".join(waiting_lines))
+        return
     if progress["execution_activity"] in {
         "interrupted",
         "unknown",
@@ -379,11 +388,6 @@ def print_history_progress(
         print(f"\n下一步: {execution_guidance(state, progress['execution_activity'])}")
         return
     operator_action = audit.get("operator_action")
-    _print_wait(
-        audit.get("supervision"),
-        display_term=display_term,
-        run_id=state.get("run_id"),
-    )
     if isinstance(operator_action, dict):
         print()
         bounded_action = dict(operator_action)
@@ -486,7 +490,10 @@ def print_rich_history_progress(
             ),
         ]
     )
-    if progress.get("execution_activity") in {
+    waiting_lines = _current_wait_lines(state, audit)
+    if waiting_lines:
+        body.extend([Text(""), *(Text(line) for line in waiting_lines)])
+    elif progress.get("execution_activity") in {
         "interrupted",
         "unknown",
         "capacity_wait",
@@ -588,7 +595,9 @@ def history_records(
         if not isinstance(raw, dict):
             continue
         attempt_id = raw.get("semantic_attempt_id")
-        if isinstance(attempt_id, str):
+        if isinstance(attempt_id, str) and raw.get("kind") not in {
+            "required_checks", "integration", "completion", "approval", "supervision", "abandonment",
+        }:
             event_by_attempt.setdefault(attempt_id, []).append(raw)
         elif _is_history_turning_point(raw):
             standalone.append(raw)
@@ -764,10 +773,15 @@ def _finalize_event_record(state: dict[str, Any], record: dict[str, Any]) -> Non
     record["object"] = _safe_text(record.get("work_subject") or "Delivery Run")
     record["role_label"] = "生命周期节点"
     record["role_zh"] = "节点"
-    record["started_at"] = event_at
-    record["ended_at"] = event_at
+    record["started_at"] = event.get("wait_started_at", event_at)
+    record["ended_at"] = event.get("wait_observed_until", event_at)
     record["activity"] = "not_running"
-    record["span_seconds"] = None
+    start = _parse_optional_timestamp(record["started_at"])
+    end = _parse_optional_timestamp(record["ended_at"])
+    record["span_seconds"] = (
+        max(0, int((end - start).total_seconds()))
+        if event.get("kind") in {"required_checks", "approval"} and start and end else None
+    )
     record["execution_seconds"] = None
     record["resumption_count"] = 0
     record["output_attempts"] = []
@@ -1584,6 +1598,7 @@ def _is_history_turning_point(event: dict[str, Any]) -> bool:
         "integration",
         "completion",
         "publication",
+        "approval",
         "resume",
         "unsupported_scope_change",
     } or status in {
@@ -1731,6 +1746,13 @@ def _event_record_lines(
         f"    时间：{_format_local_timestamp(point.get('at'), timezone)}",
         f"    事件：{_turning_point_kind(point)}；结果：{_safe_text(_turning_point_status(point))}",
     ]
+    if point.get("kind") in {"required_checks", "approval"}:
+        lines[1] = (
+            f"    时间区间：{_format_local_timestamp(record.get('started_at'), timezone)} → "
+            f"{_format_local_timestamp(record.get('ended_at'), timezone)}"
+        )
+        if record.get("span_seconds"):
+            lines.append(f"    Runner 观测到的等待：{_duration(record['span_seconds'])}")
     point_details = point.get("details")
     if isinstance(point_details, list):
         lines.extend(
@@ -1815,7 +1837,7 @@ def _append_check_observation_detail(
     observation: object,
     *,
     indent: str,
-    result_label: str = "必需检查结果",
+    result_label: str = "自动检查结果",
 ) -> None:
     if not isinstance(observation, dict):
         return
@@ -1932,7 +1954,7 @@ def _supporting_record_detail_lines(
         _append_detail_scalar(
             lines,
             indent="      ",
-            label="必需检查结果",
+            label="自动检查结果",
             value=_first_detail_value(value, ("required_checks", "required_checks_result")),
         )
         _append_detail_scalar(
@@ -1963,7 +1985,7 @@ def _supporting_record_detail_lines(
         )
         evidence = value.get("required_checks_evidence")
         if isinstance(evidence, dict):
-            lines.append("      必需检查证据")
+            lines.append("      自动检查证据")
             _append_check_observation_detail(lines, evidence, indent="        ")
         return lines
 
@@ -1991,7 +2013,7 @@ def _supporting_record_detail_lines(
         )
         evidence = value.get("required_checks_evidence")
         if isinstance(evidence, dict):
-            lines.append("      必需检查证据")
+            lines.append("      自动检查证据")
             _append_check_observation_detail(lines, evidence, indent="        ")
         source = value.get("failure_evidence_source")
         failure_evidence = (
@@ -2100,8 +2122,8 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
         for key, label in (
             ("pr_number", "PR 编号"),
             ("integrated_sha", "集成提交"),
-            ("required_checks_result", "必需检查结果"),
-            ("required_checks_observed_at", "必需检查观测时间"),
+            ("required_checks_result", "自动检查结果"),
+            ("required_checks_observed_at", "自动检查观测时间"),
         ):
             value = publication.get(key)
             if value is not None:
@@ -2225,16 +2247,17 @@ def _turning_point_evidence_lines(
     for key, label in (
         ("pr_number", "PR 编号"),
         ("commit_sha", "提交"),
-        ("approval_granted_at", "批准时间"),
-        ("required_checks_result", "必需检查结果"),
+        ("required_checks_result", "自动检查结果"),
     ):
         value = point.get(key)
         if value is not None:
             lines.append(f"        {label}：{_safe_text(value)}")
+    if point.get("approval_granted_at") is not None:
+        lines.append(f"        批准时间：{_format_local_timestamp(point['approval_granted_at'], timezone)}")
     observed_at = point.get("required_checks_observed_at")
     if observed_at is not None:
         lines.append(
-            "        必需检查观测时间："
+            "        自动检查观测时间："
             f"{_format_local_timestamp(observed_at, timezone)}"
         )
     next_action = point.get("next_action")
@@ -2244,9 +2267,14 @@ def _turning_point_evidence_lines(
             value = _truncate_history_detail(value)
         lines.append(f"        下一步：{value}")
     evidence = point.get("required_checks_evidence")
-    if details and evidence is not None:
-        lines.append("        必需检查证据：")
-        lines.extend(_json_detail_lines(evidence, indent="          "))
+    if details and isinstance(evidence, dict):
+        lines.append("        自动检查证据：")
+        _append_check_observation_detail(lines, evidence, indent="          ")
+        if evidence.get("omitted_checks"):
+            lines.append(f"          另有 {evidence['omitted_checks']} 项未保留明细")
+    reason = point.get("external_wait_reason")
+    if isinstance(reason, dict) and reason.get("message"):
+        lines.append(f"        外部情况：{_safe_text(reason['message'])}")
     result = point.get("result")
     if details and result is not None:
         lines.append(f"        结果：{_safe_text(result)}")
@@ -2309,9 +2337,11 @@ def _turning_point_kind(event: dict[str, Any]) -> str:
     return {
         "human_blocker": "人工阻塞",
         "supervision": "监督边界",
-        "required_checks": "必需检查",
+        "required_checks": "自动检查",
         "integration": "集成",
         "publication": "发布",
+        "approval": "人工批准",
+        "abandonment": "放弃处理",
         "completion": "整体完成",
         "resume": "恢复",
         "unsupported_scope_change": "范围变化",
@@ -2319,6 +2349,16 @@ def _turning_point_kind(event: dict[str, Any]) -> str:
 
 
 def _turning_point_status(event: dict[str, Any]) -> str:
+    if event.get("kind") == "approval":
+        return "已批准" if event.get("approval_granted_at") else "等待人工批准"
+    if event.get("kind") == "required_checks":
+        if event.get("required_checks_observation_status") in {"unavailable", "unknown"}:
+            return "自动检查结果无法读取"
+        return {
+            "pending": "等待自动检查", "pass": "自动检查通过",
+            "none": "未配置自动检查", "fail": "自动检查失败",
+            "unknown": "自动检查结果未知",
+        }.get(str(event.get("required_checks_result")), "自动检查结果未知")
     if event.get("kind") == "resume":
         return "人工恢复/继续"
     if event.get("activity") == "interrupted":
@@ -2334,7 +2374,7 @@ def _turning_point_status(event: dict[str, Any]) -> str:
         "abandoned": "已放弃",
         "abandonment_pending": "等待放弃处理",
         "deterministic_contradiction": "存在确定性矛盾",
-        "waiting_checks": "等待必需检查",
+        "waiting_checks": "等待自动检查",
         "waiting_external": "等待外部条件",
         "waiting_merge": "等待集成",
         "ready_for_human": "等待人工处理",
@@ -2632,6 +2672,27 @@ def _timeline_object(state: dict[str, Any], event: dict[str, Any]) -> str:
     return delivery_object_label(state, "run")
 
 
+def _human_timeline_kind(event: dict[str, Any], details: list[str]) -> str:
+    """Human lifecycle nodes are independent of the unchanged machine projection."""
+
+    if _is_human_blocker_event(event):
+        return "human_blocker"
+    status, phase = event.get("status"), event.get("phase")
+    if status == "abandonment_pending":
+        return "abandonment"
+    if status in {"operator_stopped", "execution_failed", "requeue_required"}:
+        return "supervision"
+    if status in {"completed", "abandoned"}:
+        return "completion"
+    if phase in {"merged", "completed"} and event.get("pr_number") is not None:
+        return "integration"
+    if status in {"run_approval_pending", "parent_approval_pending"} or (
+        phase == "ready_for_approval" and status not in {"waiting_external", "supervision_timeout"}
+    ):
+        return "approval"
+    return _timeline_kind(event, details)
+
+
 def _timeline_kind(event: dict[str, Any], details: list[str]) -> str:
     if _is_human_blocker_event(event):
         return "human_blocker"
@@ -2749,7 +2810,7 @@ def _artifact_outcome(artifact: dict[str, Any]) -> str:
 
 def _supporting_label(kind: str) -> str:
     return {
-        "required_checks_evidence": "必需检查证据",
+        "required_checks_evidence": "自动检查证据",
         "deterministic_integration_record": "确定性集成记录",
         "fallback_publication_receipt": "发布回执",
     }.get(kind, kind)
@@ -2924,6 +2985,9 @@ def _truncate_history_detail(value: str) -> str:
 def _operator_instruction(
     state: dict[str, Any], invocation: dict[str, Any] | None
 ) -> str:
+    cleanup = cleanup_instruction(state)
+    if cleanup:
+        return cleanup
     if invocation is not None and invocation.get("status") in {"running", "resuming"}:
         return "你暂时无需操作。"
     if state.get("status") in {"completed", "abandoned"}:
@@ -2931,39 +2995,13 @@ def _operator_instruction(
     return "按上述命令继续；不要重复启动另一个 Run。"
 
 
-def _print_wait(
-    wait: object,
-    *,
-    display_term: Callable[[object], object],
-    run_id: object,
-) -> None:
-    if not isinstance(wait, dict):
-        return
-    print("\n当前等待")
-    print(f"  等待种类: {display_term(wait.get('kind'))}")
-    print(f"  等待对象: {wait.get('subject')}")
-    boundary_status = (
-        "已记录（完整值见 --json）"
-        if wait.get("head_sha") is not None or wait.get("base_sha") is not None
-        else "尚未取得"
-    )
-    print(f"  等待 head/base: {boundary_status}")
-    print(
-        "  等待窗口: "
-        f"截止={wait.get('deadline')}；剩余={wait.get('remaining_seconds')} 秒"
-    )
-    print(f"  重试次数: {wait.get('retry_count')}")
-    observation = wait.get("latest_observation")
-    if isinstance(observation, dict):
-        print(f"  最新观测: {observation.get('message')}")
-    else:
-        print("  最新观测: 无")
-    if wait.get("timeout_resume_action"):
-        print(
-            "  超时恢复: "
-            f"{human_next_action(wait['timeout_resume_action'], run_id=run_id)}"
-        )
-    if wait.get("credential_failure_class"):
-        print(f"  凭据失败类别: {wait['credential_failure_class']}")
-    if wait.get("credential_http_status") is not None:
-        print(f"  凭据 HTTP 状态: {wait['credential_http_status']}")
+def _current_wait_lines(state: dict[str, Any], audit: dict[str, Any]) -> list[str]:
+    waiting = waiting_presentation(state, audit)
+    if waiting is None:
+        return []
+    lines = [f"当前工作：{_safe_text(waiting.work)}", f"执行情况：{_safe_text(waiting.activity)}"]
+    lines.extend(f"{label}：{_safe_text(value)}" for label, value in waiting.details)
+    lines.append(f"下一步：{_safe_text(waiting.guidance)}")
+    if waiting.show_command:
+        lines.append(f"命令：{human_next_action(audit.get('next_action'), run_id=state.get('run_id'))}")
+    return lines

@@ -16,6 +16,13 @@ class WaitingPresentation:
     details: tuple[tuple[str, str], ...]
 
 
+def cleanup_instruction(state: dict[str, Any]) -> str | None:
+    cleanup = state.get("delivery_cleanup")
+    if isinstance(cleanup, dict) and cleanup.get("status") == "cleanup_pending":
+        return "交付清理尚未完成；受管工作区已保留，请查看清理诊断。"
+    return None
+
+
 def waiting_presentation(
     state: dict[str, Any], audit: dict[str, Any],
 ) -> WaitingPresentation | None:
@@ -47,7 +54,8 @@ def waiting_presentation(
         guidance = "需要恢复本轮等待，执行以下命令。"
     elif activity == "running":
         description = "Runner 正在后台自动检查" if checks else "Runner 正在后台自动等待"
-        guidance = "无需操作。"
+        cleanup = cleanup_instruction(state)
+        guidance = f"后台等待会继续。{cleanup}" if cleanup else "无需操作。"
     elif activity == "not_running":
         description = "自动等待已停止"
         guidance = "需要继续时，执行以下命令。"

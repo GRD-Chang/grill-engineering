@@ -632,7 +632,7 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     )
     assert history.returncode == 0, history.stderr
     assert "Development Summary" in history.stdout
-    assert "必需检查结果" in history.stdout
+    assert "自动检查结果" in history.stdout
     assert "PR 编号" in history.stdout
     for internal_field in (
         "reviewer_thread_id",

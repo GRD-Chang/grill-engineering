@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from rich.text import Text
 
-from agent_run.waiting_presentation import waiting_presentation
+from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
 from agent_run.presentation_helpers import (
     current_work_subject,
     delivery_object_label,
@@ -351,6 +351,10 @@ def print_status_progress(
         cleanup = audit.get("delivery_cleanup")
         if isinstance(cleanup, dict) and cleanup.get("status") == "cleanup_pending":
             print("  查看 --json 中的交付清理诊断，整理受管工作区后按恢复操作继续。")
+            print(
+                "  恢复命令: "
+                f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
+            )
         else:
             print(
                 "  下一步: "
@@ -550,7 +554,13 @@ def print_rich_status_progress(
         action_lines.extend(_rich_labeled(label, text) for label, text in wait_view.details)
     cleanup = audit.get("delivery_cleanup")
     if isinstance(cleanup, dict):
-        action_lines.append(_rich_labeled("交付清理", cleanup.get("status")))
+        cleanup_status = {
+            "completed": "已完成", "cleanup_pending": "等待清理", "pending": "待处理",
+        }.get(str(cleanup.get("status")), cleanup.get("status"))
+        action_lines.append(_rich_labeled("交付清理", cleanup_status))
+        reason = _cleanup_reason(cleanup)
+        if reason:
+            action_lines.append(_rich_labeled("保留原因", reason))
     scope_change = audit.get("scope_change")
     if isinstance(scope_change, dict):
         summary = scope_change.get("graph_change_summary")
@@ -1397,6 +1407,9 @@ def _duration(seconds: object) -> str:
 def _operator_instruction(
     state: dict[str, Any], invocation: dict[str, Any] | None
 ) -> str:
+    cleanup = cleanup_instruction(state)
+    if cleanup:
+        return cleanup
     if invocation is not None and invocation.get("status") in {"running", "resuming"}:
         return "你暂时无需操作。"
     if state.get("status") in {"completed", "abandoned"}:
@@ -1409,10 +1422,26 @@ def _print_cleanup(cleanup: object) -> None:
         return
     print("\n交付清理")
     print(f"  状态: {_terminal_safe(cleanup.get('status'))}")
+    reason = _cleanup_reason(cleanup)
+    if reason:
+        print(f"  保留原因: {_terminal_safe(reason)}")
     items = cleanup.get("items")
     if isinstance(items, list):
         pending = sum(1 for item in items if isinstance(item, dict))
         print(f"  已保留 {pending} 个受管工作区；完整诊断与恢复操作见 --json")
+
+
+def _cleanup_reason(cleanup: dict[str, Any]) -> str | None:
+    error = cleanup.get("last_error")
+    if cleanup.get("status") == "completed" or not isinstance(error, str) or not error:
+        return None
+    if "source head changed" in error or "foreign head" in error:
+        return "源分支或工作区的提交已变化，已保留新增工作。"
+    if "branch identity changed" in error or "HEAD is not the managed branch" in error:
+        return "工作区已切换分支或处于游离 HEAD，已保留现场。"
+    if any(reason in error for reason in ("tracked modifications", "untracked", "dirty checkout")):
+        return "工作区存在尚未提交的文件，已保留现场。"
+    return error if len(error) <= 240 else error[:232] + "…（已截断）"
 
 
 def _print_scope_change(scope_change: object) -> None:

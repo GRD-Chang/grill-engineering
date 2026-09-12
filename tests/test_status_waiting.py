@@ -11,11 +11,13 @@ from rich.text import Text
 
 from agent_run import cli, external_supervision
 from agent_run.executor_host import HostObservation
+from agent_run.state import StateStore
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from test_cli import run_cli, stdout_json
 from test_cli_delivery import ticket
 from test_run_lifecycle import _file_snapshot, _isolated_environment
+from support.inprocess_cli import invoke_cli_inprocess
 
 
 class TerminalOutput(StringIO):
@@ -171,3 +173,36 @@ def test_waiting_status_does_not_invent_time_after_clock_discontinuity(
         output = status_text(state["run_id"], plain=plain)
         assert "已等待：未知" in output
         assert "本轮最多还可等待：未知" in output
+
+
+def test_completed_cleanup_pending_never_says_no_action_needed(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    StateStore(git_repo / ".agent-run").save_run("run-1", {
+        "schema_version": 1, "run_id": "run-1", "status": "completed",
+        "repository": "example/project", "parent": {"number": 1},
+        "diagnostics": [], "delivery_cleanup": {
+            "status": "cleanup_pending", "last_error": "source head changed",
+            "items": {"agent-run/ticket-3": {
+                "kind": "ticket", "branch": "agent-run/ticket-3",
+                "checkout": "/preserved/worktree", "status": "cleanup_pending",
+                "last_error": "source head changed",
+            }},
+        },
+    })
+    before = _file_snapshot(git_repo)
+    for command in ("status", "history"):
+        result = invoke_cli_inprocess(git_repo, fixture, command, "run-1", "--plain")
+        assert result.returncode == 0, result.stderr
+        assert "无需操作" not in result.stdout
+        assert "交付清理尚未完成" in result.stdout
+        assert "agent-run resume" in result.stdout
+        if command == "status":
+            assert "提交已变化" in result.stdout
+    monkeypatch.chdir(git_repo)
+    output = TerminalOutput()
+    with redirect_stdout(output):
+        assert cli.main(["status", "run-1", "--github-fixture", str(fixture)]) == 0
+    assert "提交已变化" in Text.from_ansi(output.getvalue()).plain
+    assert _file_snapshot(git_repo) == before
