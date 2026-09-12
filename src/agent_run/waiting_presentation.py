@@ -46,6 +46,9 @@ def waiting_presentation(
         else f"等待 {target} 的合并确认" if status == "waiting_merge"
         else f"等待 {target} 的操作结果"
     )
+    credential_failure = wait.get("credential_failure_class")
+    if isinstance(credential_failure, str):
+        work = "等待工作凭据恢复可用"
     control = audit.get("executor_control")
     activity = control.get("activity") if isinstance(control, dict) else "unknown"
     timed_out = status == "supervision_timeout"
@@ -63,6 +66,12 @@ def waiting_presentation(
         description = "无法确认 Runner 是否仍在自动等待"
         guidance = "运行状态无法确认；可运行 agent-run doctor 检查后台环境，再决定是否继续。"
     details = _wait_times(window, wait, timed_out=timed_out)
+    if isinstance(credential_failure, str):
+        details.append(("凭据失败类别", credential_failure))
+        if type(wait.get("credential_http_status")) is int:
+            details.append(("凭据 HTTP 状态", str(wait["credential_http_status"])))
+        if type(wait.get("retry_count")) is int:
+            details.append(("重试次数", str(wait["retry_count"])))
     details.extend(_check_results(subject, checks=checks))
     observation = wait.get("latest_observation")
     if isinstance(observation, dict) and isinstance(observation.get("message"), str):

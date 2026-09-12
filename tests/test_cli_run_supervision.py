@@ -180,11 +180,15 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
 
         for command in ("status", "history"):
             text = run_cli(git_repo, fixture, command, run_id).stdout
-            assert "等待对象: Parent PR #1 的 GitHub 对账 的 GitHub Required Checks" in text
-            assert "等待窗口:" in text
-            assert "重试次数:" in text
-            assert "最新观测: 无" in text
-            assert "超时恢复: agent-run run 1" in text
+            assert "等待 PR #1 的自动检查" in text
+            assert "已等待：" in text
+            assert "本轮最多还可等待：" in text
+            assert "fixture-required-check" in text
+            assert "等待完成" in text
+            assert "无法确认 Runner 是否仍在自动等待" in text
+            assert "agent-run doctor" in text
+            assert "截止=" not in text
+            assert "超时恢复:" not in text
     finally:
         _interrupt_run(process, git_repo)
 

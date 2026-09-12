@@ -47,15 +47,15 @@ def _assert_public_wait_projection(
         assert wait["deadline"] is not None
         assert wait["timeout_resume_action"] == "agent-run run 1"
         for label in (
-            "等待种类:",
-            "等待对象:",
-            "等待 head/base:",
-            "等待窗口:",
-            "重试次数:",
-            "最新观测:",
-            "超时恢复: agent-run run 1",
+            "等待 GitHub 的操作结果",
+            "已等待：",
+            "本轮最多还可等待：",
+            "无法确认 Runner 是否仍在自动等待",
+            "agent-run doctor",
         ):
             assert label in text_result.stdout
+        assert "截止=" not in text_result.stdout
+        assert "超时恢复:" not in text_result.stdout
         if secret is not None:
             assert secret not in json_result.stdout
             assert secret not in text_result.stdout
