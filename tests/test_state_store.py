@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +51,70 @@ def test_run_state_persistence_rejects_oversized_write_and_read(
     oversized.write_bytes(b" " * (MAX_RUN_STATE_BYTES + 1))
     with pytest.raises(ValueError, match="persistence limit"):
         store.load_run("run-external")
+
+
+def test_state_save_preserves_shared_input_while_redacting_its_durable_copy(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path)
+    shared = {
+        "values": [None, True, 3, 1.25, "中文状态"],
+        "detail": "token=private-value",
+        "environment": {"LOCAL_VALUE": "ephemeral-value"},
+    }
+    state = {"first": shared, "nested": [{"second": shared}]}
+    before = deepcopy(state)
+
+    store.save_run("run-1", state)
+
+    assert state == before
+    assert state["first"] is state["nested"][0]["second"]
+    expected = {
+        "values": [None, True, 3, 1.25, "中文状态"],
+        "detail": "token=[REDACTED]",
+    }
+    assert store.load_run("run-1") == {
+        "first": expected, "nested": [{"second": expected}],
+    }
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_saved_history_does_not_share_nested_values_with_the_callers_payload(
+    tmp_path: Path, container: type[list] | type[tuple],
+) -> None:
+    store = StateStore(tmp_path)
+    shared = [{"message": "original"}]
+    state = {
+        "run_id": "run-1", "status": "created", "payload": shared,
+        "timeline": [{
+            "at": "2026-09-12T00:00:00+00:00", "kind": "run_status",
+            "status": "created", "context": container([shared]),
+        }],
+    }
+
+    store.save_run("run-1", state)
+    state["timeline"][0]["context"][0][0]["message"] = "edited history"
+
+    assert shared == [{"message": "original"}]
+    persisted = store.load_run("run-1")
+    assert persisted is not None
+    assert persisted["payload"] == [{"message": "original"}]
+    assert persisted["timeline"][0]["context"] == [[{"message": "original"}]]
+
+
+def test_unserializable_extension_keeps_the_previous_durable_state(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path)
+    store.save_run("run-1", {"version": 1})
+    unsupported = {"version": 2, "extension": {"not-json"}}
+
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        store.save_run("run-1", unsupported)
+
+    assert unsupported == {"version": 2, "extension": {"not-json"}}
+    assert store.load_run("run-1") == {"version": 1}
+    assert not list(store.runs_directory.glob("*.tmp"))
 
 
 def test_run_state_persistence_bounds_diagnostics(tmp_path: Path) -> None:

@@ -214,7 +214,7 @@ class StateStore:
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         destination = self.runs_directory / f"{run_id}.json"
         previous = self.load_run(run_id)
-        durable_state = _sanitize_durable_errors(deepcopy(state))
+        durable_state = _sanitize_durable_errors(state)
         if "run_id" in durable_state:
             _append_timeline_event(durable_state, previous)
             state["timeline"] = durable_state["timeline"]
@@ -757,7 +757,7 @@ def _timeline_result(state: dict[str, Any]) -> object:
 
 
 def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
-    """Bound diagnostics and exclude ephemeral or sensitive payloads from disk."""
+    """Build an isolated durable copy while bounding and redacting payloads."""
 
     sanitized = _sanitize_error_value(value)
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
@@ -783,7 +783,9 @@ def _sanitize_error_value(
     if isinstance(value, str):
         return bounded_error(value) if diagnostic else redact_credentials(value)
     if not isinstance(value, dict):
-        return value
+        # JSON scalars are immutable. Extensions such as tuples may contain
+        # mutable values, so retain their previous deepcopy isolation.
+        return value if value is None or type(value) in (bool, int, float) else deepcopy(value)
     sanitized: dict[object, object] = {}
     for key, item in value.items():
         if isinstance(key, str) and _is_ephemeral_payload_key(key):
