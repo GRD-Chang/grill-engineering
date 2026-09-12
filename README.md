@@ -227,3 +227,5 @@ Issue 定位唯一 Run：零匹配、多匹配或仓库不匹配时拒绝猜测�
 Lifecycle mutation 默认输出不含 Action ID、Run ID、PID 或 digest 的人类回执；需要稳定机器审计事实时显式使用 `--json`。安装、更新、rollback 和
 uninstall 都不迁移、修改或绑定既有 Delivery Run；不兼容 state 仍返回
 `incompatible_run_state`。
+
+运行配置的统一入口为 `agent-run settings show/configure`，详见[个人运行默认配置](docs/user-defaults.md)；修改默认仅影响新 Run。

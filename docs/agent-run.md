@@ -40,8 +40,10 @@ Parent、状态和开始时间并停止，不按最近时间猜测。
 ### Delivery Policy
 
 Delivery Policy 的取值优先级是内置默认值、用户级默认值、单次命令覆盖；仓库内容不能覆盖
-操作者的个人成本策略。用户级默认值保存在 `$XDG_CONFIG_HOME/agent-run/delivery-policy.json`
-（未设置时为 `~/.config/agent-run/delivery-policy.json`），可用公开命令查看或配置：
+操作者的个人成本策略。统一个人文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`
+（未设置时为 `~/.config/agent-run/user-defaults.json`）。完整字段、直接编辑、模型与推理强度、
+引用关系及兼容说明见[个人运行默认配置](user-defaults.md)。推荐 `settings show/configure`；
+旧 `policy` 命令指向同一文件：
 
 ```bash
 agent-run policy show
@@ -58,7 +60,7 @@ Reviewer；默认准确执行 `D10/R11`。第 `N+1` 次 Reviewer 仍有 Finding 
 Checkpoint，不使用 Final CI-fix 或未经 Reviewer 验收的 Publication Authority。
 正整数轮数和正 duration 在创建 Worker、PR 或部分状态之前校验。每个新 Run 以及显式开启的
 新 Budget Window 都把实际生效的完整策略保存为 Policy Snapshot；之后修改用户级默认值不会
-改变活动 Run 或活动预算窗口。缺少或不完整 Snapshot 的旧状态会 fail closed。
+改变已有 Run，包括之后获准开启的新预算窗口；只有检查点 Resume 的显式覆盖可修改新窗口策略。缺少或不完整 Snapshot 的旧状态会 fail closed。
 Invocation 默认 deadline 为 Development 5 小时、Review 2 小时、Publication 1 小时；同一
 Invocation 内的初始调用和 Output Repair 共用该 deadline。
 

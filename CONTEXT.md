@@ -2,7 +2,7 @@
 
 本上下文描述以结构化 Agent 工作结果驱动、由确定性程序控制外部写入的自动交付流程。
 
-本轮新增的 Development Thread Policy 按轮新会话模式、Agent Run User Defaults 与 Runner Setup 为已确认、尚未实现的目标术语，见[需求讨论记录](docs/research/2026-09-11-onboarding-config-thread-policy.md)；默认复用、现有配置入口与安装器的运行行为尚未改变。
+Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务；相关背景见[需求讨论记录](docs/research/2026-09-11-onboarding-config-thread-policy.md)。
 
 ## Language
 
@@ -633,7 +633,7 @@ _Avoid_: 直接展示持久化 UTC、无时区时间、根据仓库推断时区
 _Avoid_: 独立配置出无法闭环的 Development/Review 组合、仓库级资源预算、动态读取的运行中策略、Agent 自选预算
 
 **Run Policy Snapshot（运行策略快照）**:
-Delivery Run 创建或维护者在预算耗尽检查点显式开启新预算窗口时解析并保存的准确 Delivery Policy；新窗口可以采用当时的用户级默认和本次命令明确覆盖。普通 Execution Failure、Human Blocker 或监督超时后的 Resume 只继续原 Semantic Agent Attempt 或原等待窗口，必须复用原 Policy Snapshot，不得改变预算或 Invocation Deadline。已开始及历史预算窗口不因外部默认配置或后继窗口变化而改变。本策略与 Invocation Deadline 采用一次明确的规范状态协议切换：缺少 Policy Snapshot 的旧 Run 不迁移、不兼容推进，也不根据旧 Attempt 或当前默认值反推策略；只有按新协议创建的 Run 可以继续生命周期命令。
+Delivery Run 创建或维护者在预算耗尽检查点显式开启新预算窗口时解析并保存的准确 Delivery Policy；新窗口沿用该 Run 已保存的策略，只有本次命令明确覆盖的字段可以改变，不读取最新个人默认。新 Run 同时保存初始创建配置供创建动作回执对账，恢复 Task Control 不依赖个人配置文件。普通 Execution Failure、Human Blocker 或监督超时后的 Resume 只继续原 Semantic Agent Attempt 或原等待窗口，必须复用原 Policy Snapshot，不得改变预算或 Invocation Deadline。已开始及历史预算窗口不因外部默认配置或后继窗口变化而改变。本策略与 Invocation Deadline 采用一次明确的规范状态协议切换：缺少 Policy Snapshot 的旧 Run 不迁移、不兼容推进，也不根据旧 Attempt 或当前默认值反推策略；只有按新协议创建的 Run 可以继续生命周期命令。
 _Avoid_: 每次命令重新读取默认值、普通恢复中途改预算、追溯改写已消耗预算、推断或迁移旧 Run、仓库隐式覆盖
 
 **Agent Invocation（Agent 调用）**:
@@ -663,7 +663,7 @@ Controller 或 Publisher 在一次 Publication Attempt 内对 GitHub 读取收�
 _Avoid_: Publication Attempt、Output Repair、无界 GitHub 重试
 
 **Agent Run User Defaults（个人运行默认配置）**:
-用户创建新 Delivery Run 时采用的统一运行偏好，包括开发与审查轮数、角色调用时限、模型与推理强度、Publication 配置引用以及 Development Thread Policy，修改这些默认值不改变已有 Run。它不同于显式调整某次 Run 的实际配置，也不拥有账号凭据、项目质量规则、运行状态或内部轮询与重试机制。
+用户创建新 Delivery Run 时采用的统一运行偏好，包括开发与审查轮数、角色调用时限、模型与推理强度、Publication 配置引用，统一保存在个人 `user-defaults.json`，由 `settings show/configure` 读写；Development Thread Policy 由后继任务扩展。修改这些默认值不改变已有 Run 或其未来预算窗口。它不同于显式调整某次 Run 的实际配置，也不拥有账号凭据、项目质量规则、运行状态或内部轮询与重试机制。
 _Avoid_: Codex 用户全局配置、活动 Run 快照、项目共享默认、认证配置合并文件
 
 **Agent Execution Profile（Agent 执行配置）**:
@@ -692,7 +692,7 @@ _Avoid_: Invocation Resume、智能重试、独立持久 journal
 **Invocation Resume（调用恢复）**:
 调用层的续接动作，其业务含义必须区分 Business Resume 与 Execution Recovery；复用同一 Thread 或生成 successor Invocation 本身不表示授权了新的预算窗口。公开 `resume` 保持单一入口，本次恢复意图绑定准入时的准确暂停原因、对象与授权，不能因后续状态变化被重解释；自动执行续接不具有解除业务阻塞或开启预算窗口的权限。以下保留公开 `resume` 的承载关系，不能据此把两种语义合并。
 维护者以 `agent-run resume <parent-issue>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
-successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。只有这两类开启新预算窗口的 Resume 才能为新窗口解析当前用户级默认或接受本次命令的 Delivery Policy 覆盖；旧窗口用量与策略保持不变。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
+successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，并将该新窗口的 `final_ci_fix_used` 初始化为 false；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。只有这两类开启新预算窗口的 Resume 才能在 Run 已存策略上接受本次命令的 Delivery Policy 覆盖，不重新读取个人默认；旧窗口用量与策略保持不变。它仍是同一 Job Generation、复用仍有效的 Thread、branch 与 PR，
 但不把新 Attempt 伪装成旧窗口的额外轮次。若检查点保留了尚需修改代码的准确失败证据，successor Invocation 必须先把该证据交回原 Development Thread，产生新 Candidate 后才启动新窗口的 Reviewer 1；尤其是 Final CI-fix 后准确 PR head 的 Required Checks 再失败时，不得先审查未变化且已知 CI 失败的 Candidate。复用仍有效 Thread 时由 Controller 根据 Development、Repair、Reviewer 或 Publication 角色选择短 Prompt，只重发完成本轮所需的当前动态证据；模型不接收 Resume、`execution_failed`、预算窗口或状态流转说明，Reviewer 与定向 Repair 只保留当前职责所需的简短审查次数。`--new-thread` 或无可恢复 Thread 时才以相应角色和任务模式的完整标准 Prompt 新开 Thread。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale 时不启动 Codex，只进入 `requeue_required`。JSON 格式修复步骤因执行异常中断后，默认同 Thread Resume 只续接该次只读修复并继承已用次数，不重新开放开发任务。人工 Resume 不重置同一 Semantic Agent Attempt 已用的普通异常自动恢复额度；本次进程异常恢复不改变格式修复额度耗尽后的既有授权规则。
 _Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
 

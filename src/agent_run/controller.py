@@ -21,6 +21,8 @@ from agent_run.delivery_policy import (
     DeliveryPolicy,
     default_delivery_policy,
     parent_only_budget_policy_for_job,
+    parse_policy_snapshot,
+    policy_snapshot_for_state,
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
@@ -297,7 +299,9 @@ class Controller:
 
         effective_budget_policy = self.delivery_policy
         if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
-            effective_budget_policy = budget_policy or self._policy_for_new_run()
+            effective_budget_policy = budget_policy or parse_policy_snapshot(
+                policy_snapshot_for_state(existing)
+            )
         try:
             existing = self._load_bound_run(run_id, state=existing)
             if explicit_resume or resume_human_blocker or resume_budget_checkpoint:

@@ -349,6 +349,7 @@ class DeliveryPolicyStore:
     _LOCK_FILE_NAME = ".delivery-policy.lock"
 
     def __init__(self, path: Path | None = None) -> None:
+        self._unified_defaults = path is None
         self.path = path or self.default_path()
 
     @classmethod
@@ -363,6 +364,10 @@ class DeliveryPolicyStore:
         return root / cls._DIRECTORY_NAME / cls._FILE_NAME
 
     def load(self) -> dict[str, Any] | None:
+        if self._unified_defaults:
+            from agent_run.user_defaults import UserDefaultsStore
+
+            return UserDefaultsStore().load().get("policy")
         if not self.path.exists():
             return None
         try:
@@ -374,6 +379,11 @@ class DeliveryPolicyStore:
         return normalize_policy_overrides(value)
 
     def configure(self, overrides: Mapping[str, Any]) -> DeliveryPolicy:
+        if self._unified_defaults:
+            from agent_run.user_defaults import UserDefaultsStore
+
+            result = UserDefaultsStore().configure(policy=overrides)
+            return parse_policy_snapshot(result["policy"])
         supplied = normalize_policy_overrides(overrides)
         if not supplied:
             raise DeliveryPolicyError("policy configure requires an explicit option")

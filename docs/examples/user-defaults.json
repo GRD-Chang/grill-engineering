@@ -1,0 +1,20 @@
+{
+  "policy": {
+    "ticket_review_rounds": 3,
+    "parent_only_paired_rounds": 10,
+    "run_repair_rounds": 10,
+    "invocation_deadlines": {
+      "development": "5h",
+      "review": "2h",
+      "publication": "1h"
+    }
+  },
+  "profile": {
+    "preset": "economy",
+    "development_model": "gpt-5.6-luna",
+    "development_effort": "xhigh",
+    "review_model": "gpt-6-astra",
+    "review_effort": "low",
+    "publication_from_development": true
+  }
+}
