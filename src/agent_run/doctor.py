@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import selectors
 import shutil
 import subprocess
@@ -54,10 +55,10 @@ def collect() -> dict[str, object]:
 def _collect() -> dict[str, object]:
     checks = {
         "python": _python_check(),
-        "git": _tool_check("git"),
-        "codex": _tool_check("codex"),
+        "git": _git_check(),
+        "codex": _codex_check(),
         "openssl": _tool_check("openssl", version_arguments=("version",)),
-        "bubblewrap": _tool_check("bwrap"),
+        "bubblewrap": _bubblewrap_check(),
         "github": _github_check(),
         "active_runner": _active_runner_check(),
         "path": _path_check(),
@@ -125,6 +126,60 @@ def _tool_check(
     }
 
 
+def _git_check() -> dict[str, object]:
+    executable = shutil.which("git")
+    if executable is None:
+        return {"status": "missing", "path": None}
+    tool: dict[str, object] = {"status": "ok", "path": executable}
+    code, timed_out, output = _run_bounded_output_probe(
+        [executable, "--version"], input_data=b""
+    )
+    if code != 0:
+        return {**tool, "status": "timeout" if timed_out else "unavailable"}
+    match = re.match(rb"git version (\d{1,4})\.(\d{1,4})(?:\.|\s|$)", output)
+    if code != 0 or match is None or tuple(map(int, match.groups())) < (2, 40):
+        return {**tool, "status": "unsupported", "reason": "需要 Git 2.40 或更新版本"}
+    return tool
+
+
+def _codex_check() -> dict[str, object]:
+    tool = _tool_check("codex")
+    executable = tool.get("path")
+    if tool["status"] != "ok" or not isinstance(executable, str):
+        return tool
+    required = (b"--json", b"--output-last-message", b"--output-schema",
+                b"--dangerously-bypass-approvals-and-sandbox", b"--model", b"--config")
+    for command in (["exec", "--help"], ["exec", "resume", "--help"]):
+        code, timed_out, output = _run_bounded_output_probe(
+            [executable, *command], input_data=b"", max_output_bytes=16 * 1024
+        )
+        flags = required + ((b"--cd", b"--color") if command == ["exec", "--help"] else ())
+        if code != 0 or any(flag not in output for flag in flags):
+            return {**tool, "status": "timeout" if timed_out else "unsupported",
+                    "reason": "Codex exec/resume 缺少生产调用选项；请更新 Codex"}
+    code, timed_out = _run_bounded_probe([executable, "login", "status"])
+    return {**tool, "status": "ok" if code == 0 else (
+        "timeout" if timed_out else "not_logged_in"), "logged_in": code == 0,
+        "reason": None if code == 0 else "请自行执行 codex login，然后重跑 doctor"}
+
+
+def _bubblewrap_check() -> dict[str, object]:
+    tool = _tool_check("bwrap")
+    executable = tool.get("path")
+    if tool["status"] != "ok" or not isinstance(executable, str):
+        return tool
+    # Exercise the mount, device and PID namespace operations used by Workers,
+    # without a model call or writes to the host filesystem.
+    code, timed_out = _run_bounded_probe([
+        executable, "--die-with-parent", "--ro-bind", "/", "/",
+        "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--",
+        "/bin/true",
+    ])
+    return {**tool, "status": "ok" if code == 0 else (
+        "timeout" if timed_out else "unavailable"), "reason": None if code == 0 else
+        "bubblewrap 无法创建 Worker 所需 mount/device/PID namespace；请检查宿主策略"}
+
+
 def _run_bounded_probe(
     arguments: list[str], *, input_data: bytes | None = None
 ) -> tuple[int | None, bool]:
@@ -167,6 +222,12 @@ def _github_check() -> dict[str, object]:
     executable = tool.get("path")
     if not isinstance(executable, str):
         return {"status": "unavailable", "logged_in": False}
+    code, timed_out, output = _run_bounded_output_probe(
+        [executable, "api", "--help"], input_data=b"", max_output_bytes=32 * 1024,
+    )
+    if code != 0 or any(flag not in output for flag in (b"--paginate", b"--slurp", b"--method", b"--header")):
+        return {**tool, "status": "timeout" if timed_out else "unsupported",
+                "logged_in": False, "reason": "gh api 缺少生产调用选项；请更新 GitHub CLI"}
     returncode, timed_out = _run_bounded_probe([executable, "auth", "status"])
     if returncode is None:
         return {
@@ -271,7 +332,10 @@ def _private_key_is_usable(path: Path) -> bool:
 
 
 def _run_bounded_output_probe(
-    arguments: list[str], *, input_data: bytes
+    arguments: list[str], *, input_data: bytes,
+    max_output_bytes: int = _MAX_SIGNATURE_OUTPUT_BYTES,
+    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
+    merge_stderr: bool = False,
 ) -> tuple[int | None, bool, bytes]:
     """Run a tiny probe while keeping captured output and descendants bounded."""
 
@@ -284,7 +348,7 @@ def _run_bounded_output_probe(
             arguments,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
             start_new_session=True,
         )
         stdout = process.stdout
@@ -292,7 +356,7 @@ def _run_bounded_output_probe(
             return None, False, b""
         process.stdin.write(input_data)
         process.stdin.close()
-        deadline = time.monotonic() + _COMMAND_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         with selectors.DefaultSelector() as selector:
             selector.register(stdout, selectors.EVENT_READ)
             while selector.get_map():
@@ -311,7 +375,7 @@ def _run_bounded_output_probe(
                         selector.unregister(stream)
                         continue
                     output.extend(chunk)
-                    if len(output) > _MAX_SIGNATURE_OUTPUT_BYTES:
+                    if len(output) > max_output_bytes:
                         _terminate_process_group(process, adopted_baseline=adopted_baseline)
                         return None, False, b""
         remaining = deadline - time.monotonic()
@@ -376,6 +440,8 @@ def _print_human(report: dict[str, object]) -> None:
                 "missing": "未找到 agent-run 入口",
             }.get(str(check.get("status")), "无法确认 agent-run 入口")
         print(f"{label}: {check.get('status')}" + (f" ({detail})" if detail else ""))
+        if check.get("reason"):
+            print(f"  {check['reason']}")
     installation = report.get("installation_readiness")
     execution = report.get("execution_readiness")
     if isinstance(installation, dict):
@@ -385,4 +451,6 @@ def _print_human(report: dict[str, object]) -> None:
             f"执行就绪度: {execution.get('status')} "
             f"({execution.get('host')})"
         )
+        if execution.get("reason"):
+            print(f"  {execution['reason']}")
     print(f"总体: {report.get('status')}")

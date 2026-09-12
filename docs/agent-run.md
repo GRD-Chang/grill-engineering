@@ -451,7 +451,9 @@ Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗�
 
 ## Source Runner 安装
 
-v0.1 的公开入口是用户在所选源码目录执行一次 `./install.sh`。release tag 是稳定使用路径；
+首次公开接入在所选源码目录执行 `./setup.sh`，集中检查与确认后准备宿主并调用底层安装器。
+补齐人工待办后重跑同一入口；详细说明见 [README](../README.md#首次安装)。
+以下描述保留的 `./install.sh` 本体生命周期。release tag 是稳定使用路径；
 branch、fork、dirty source 和没有 Git metadata 的目录也按当前实际文件构建。安装器要求 CPython
 3.11+、`venv`、`pip` 和源码声明的 Python build backend；它不执行 `sudo`、系统包管理器、
 `pipx`、daemon、cron 或后台更新。
@@ -527,7 +529,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
 凭据隔离约束，Publisher 仍使用宿主写身份。
 
-v0.1 只支持 Linux/WSL、用户级 `~/.profile` 和单用户安装。用户必须自行提供 CPython 3.11+、`venv`、
+首版范围为 Linux、用户级 `~/.profile` 和单用户安装；已验证组合见[平台验收](runner-setup-validation.md)。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
 系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher、自动更新和跨平台支持不属于本版本。
 

@@ -174,15 +174,15 @@ _Avoid_: 自动跟随源码、来源审批、状态迁移、自动触发构建
 _Avoid_: Promotion Audit、Codex 版本门禁、源码验收、状态兼容检查、长期信任证明
 
 **Runner Installation（Runner 安装）**:
-用户在所选源码目录显式执行 `./install.sh`，并在 Runner Management Quiescence 中依次构建候选 Runner Snapshot、执行 Runner Compatibility Check、创建以新 Snapshot 为 current 且以可选旧 current 为 previous 的完整 Runner Generation，并在成功后原子切换 Active Runner 的动作。若存在活跃 Run Executor Session，安装立即拒绝且不修改受管状态。若候选 content identity 已经等于 Active current，安装器直接幂等成功：不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous。首次安装、切换 Git tag、拉取官方修改或构建本地未提交修改都使用同一动作；成功后固定只保留 Active Generation 引用的 current 与可选 previous，更早的 Generation 和 Snapshot 自动清理，失败时清理候选并保持旧 Generation 整体不变。切换后的清理失败只产生有界 warning，并由下一次管理动作重试，不回滚已经成功的 Active Runner。安装器只在 `~/.local/bin/agent-run` 缺失或仍是解析到受管 XDG root 的自有 symlink 时创建或替换入口；同名非受管路径使安装失败，不备份、不覆盖。用户级命令目录通过唯一边界标记的幂等受管块加入 shell PATH；安装器不安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件，也不执行 `sudo`。安装器不检查或提示 Linux Executor Host Availability；公开生命周期动作在实际启动 Executor 前独立检查运行前置。安装不修改既有 Delivery Run 状态，也不创建兼容或迁移路径。
+用户在所选源码目录显式执行 `./install.sh`，并在 Runner Management Quiescence 中依次构建候选 Runner Snapshot、执行 Runner Compatibility Check、创建以新 Snapshot 为 current 且以可选旧 current 为 previous 的完整 Runner Generation，并在成功后原子切换 Active Runner 的动作。若存在活跃 Run Executor Session，安装立即拒绝且不修改受管状态。若候选 content identity 已经等于 Active current，安装器直接幂等成功：不重新执行 Compatibility Check、不创建 Snapshot 或 Generation，也不改变 previous。首次安装、切换 Git tag、拉取官方修改或构建本地未提交修改都使用同一动作；成功后固定只保留 Active Generation 引用的 current 与可选 previous，更早的 Generation 和 Snapshot 自动清理，失败时清理候选并保持旧 Generation 整体不变。切换后的清理失败只产生有界 warning，并由下一次管理动作重试，不回滚已经成功的 Active Runner。安装器只在 `~/.local/bin/agent-run` 缺失或仍是解析到受管 XDG root 的自有 symlink 时创建或替换入口；同名非受管路径使安装失败，不备份、不覆盖。用户级命令目录通过唯一边界标记的幂等受管块加入 shell PATH；安装器不安装或升级 Python、Git、`gh`、bubblewrap 等宿主软件，也不执行 `sudo`。底层安装器不检查 Linux Executor Host Availability；外层 Runner Setup 汇总该能力，公开生命周期动作在实际启动 Executor 前仍独立检查运行前置。安装不修改既有 Delivery Run 状态，也不创建兼容或迁移路径。
 _Avoid_: 自动更新、重复 PATH 配置、系统包管理、`sudo`、源码热加载、可配置保留策略、无限快照历史、状态迁移、每-Run Runner 绑定
 
 **Runner Setup（Runner 环境准备）**:
-用户开始使用 Runner 前，经统一确认后补齐宿主依赖并获取手动待办清单的一次性引导工作，区别于 Runner 本体安装、目标仓库准备和实际执行就绪判定。不在自动补装范围内的依赖转为手动待办，不因发行版缺少自动适配而中断所有可继续步骤，也不把尚缺关键条件的环境称为已就绪；CI、仓库忽略规则、任务标签与 Skills 由用户自行准备。
+源码树 `./setup.sh` 提供的、无需预先安装 Python 或 Git 的一次性公开入口；在用户开始使用 Runner 前，经集中检查和统一确认后补齐宿主依赖、委托 Source Runner Installer 完成本体安装并获取手动待办清单，区别于 Runner 本体安装、目标仓库准备和实际执行就绪判定。不在自动补装范围内的依赖转为手动待办，不因发行版缺少自动适配而中断所有可继续步骤，也不把尚缺关键条件的环境称为已就绪；CI、仓库忽略规则、任务标签与 Skills 由用户自行准备。
 _Avoid_: 安装成功即能运行、自动初始化目标仓库、自动配置 CI、自动管理 Skills、非适配发行版一律拒绝
 
 **Source Runner Installer（源码 Runner 安装器）**:
-随每份源码树提供、只在显式执行 `./install.sh` 时运行的一次性安装程序。它把当前源码目录安装为候选 Snapshot；identity 已经等于 Active current 时直接幂等成功，否则调用 Runner Compatibility Check、创建完整 Runner Generation、切换 Active Runner，并只保留 current 与可选 previous Snapshot。它只检查 Installation Readiness，不查询、提示或启用 systemd、linger 或其他 Executor Host 能力。安装完成后不驻留、不参与 Controller 调用，也不形成独立包、版本或更新生命周期。v0.1 的公开分发入口是 Git clone 或切换到用户选择的 Git revision 后运行该安装器，不要求 PyPI 或 pipx。
+随每份源码树提供、只在显式执行 `./install.sh` 时运行的一次性安装程序。它把当前源码目录安装为候选 Snapshot；identity 已经等于 Active current 时直接幂等成功，否则调用 Runner Compatibility Check、创建完整 Runner Generation、切换 Active Runner，并只保留 current 与可选 previous Snapshot。它只检查 Installation Readiness，不查询、提示或启用 systemd、linger 或其他 Executor Host 能力。安装完成后不驻留、不参与 Controller 调用，也不形成独立包、版本或更新生命周期。首次接入使用源码归档或 Git checkout 中的 Runner Setup；已有宿主可直接使用底层安装器。两者共享同一 Snapshot、Compatibility Check、原子激活与管理租约，不要求 PyPI 或 pipx。
 _Avoid_: Runner Manager、常驻 Launcher、editable install、独立发布物、PyPI 前置条件
 
 **Runner Installation Readiness（Runner 安装就绪度）**:
@@ -191,7 +191,7 @@ _Avoid_: Executor Host Availability、GitHub 执行资格、目标仓库、把 d
 
 **Runner Execution Readiness（Runner 执行就绪度）**:
 一次公开 lifecycle mutation 在提交 Action 前按本次动作实际需要检查、并由 Executor 在真实宿主环境中通过启动握手最终确认的运行条件，包括有效 Active Runner、准确 Local Delivery Workspace/Delivery Task、Linux Executor Host Availability 以及本次 Agent、Git、GitHub、Publisher 或 sandbox 所需工具和认证。缺失时不得持久化新 Action或启动前台 fallback；`doctor` 只读报告，不替代动作时检查。`status` 与 `history` 不要求该就绪度。
-_Avoid_: Runner Installation Readiness、一次全局永久判定、阻止只读查询、Installer systemd 检查
+_Avoid_: Runner Installation Readiness、一次全局永久判定、阻止只读查询、Setup 报告替代动作时检查
 
 **Runner Management Lock（Runner 管理锁）**:
 Source Runner Installer 与 Run Executor Session 共享的固定用户级非阻塞锁。Executor 从 Active Runner binding 确定前到 Session 退出或启动收口期间持共享 Runner Usage Lease；install、rollback 与 uninstall 必须取得独占 Runner Management Lease。多个 Executor 可以并行持有共享租约，任何共享或独占租约存在时竞争的独占管理动作立即失败且不修改状态；租约随持有进程退出由操作系统释放。uninstall 永不删除锁文件，避免替换持锁 inode 后出现第二把锁。
