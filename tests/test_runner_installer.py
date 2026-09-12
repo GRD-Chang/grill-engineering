@@ -73,6 +73,17 @@ def _source_tree(tmp_path: Path, *, real_install: bool = False) -> Path:
     return source
 
 
+def _assert_clean_installer_source(source: Path, environment: dict[str, str]) -> None:
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=source, env=environment,
+        check=True, capture_output=True, text=True,
+    )
+    assert status.stdout == ""
+    assert not (source / "build").exists()
+    assert not (source / "src" / "agent_run" / "__pycache__").exists()
+    assert not list(source.glob("*.egg-info"))
+
+
 @pytest.fixture
 def fast_in_process_build(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_installer, "_build_candidate", fast_build_candidate)
@@ -268,6 +279,7 @@ def _isolated_quickstart_environment(
         "sudo",
         "apt",
         "apt-get",
+        "apt-cache",
         "dnf",
         "yum",
         "pacman",
@@ -288,6 +300,7 @@ def _isolated_quickstart_environment(
     isolated_path = os.pathsep.join((str(sentinel_directory), str(tool_directory)))
     environment = {
         "HOME": str(tmp_path / "home"),
+        "GIT_CONFIG_NOSYSTEM": "1",
         "XDG_DATA_HOME": str(tmp_path / "home" / "data"),
         "XDG_CONFIG_HOME": str(tmp_path / "home" / "config"),
         "XDG_STATE_HOME": str(tmp_path / "home" / "state"),
@@ -858,105 +871,6 @@ def test_git_provenance_marks_an_untracked_source_dirty(tmp_path: Path) -> None:
     assert manifest["source_provenance"] == provenance
 
 
-def test_clean_git_source_is_not_polluted_by_public_install(
-    tmp_path: Path, offline_install_environment: dict[str, str],
-) -> None:
-    source = _source_tree(tmp_path, real_install=True)
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
-    subprocess.run(
-        ["git", "config", "user.name", "Agent Run Tests"], cwd=source, check=True
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "agent-run-tests@example.invalid"],
-        cwd=source,
-        check=True,
-    )
-    subprocess.run(["git", "add", "."], cwd=source, check=True)
-    subprocess.run(["git", "commit", "-qm", "initial source"], cwd=source, check=True)
-    before = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=source,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert before.stdout == ""
-
-    fake_bin, _count, _status_file = _fake_codex(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    sentinel_directory = tmp_path / "external-tool-sentinels"
-    sentinel_directory.mkdir()
-    markers: list[Path] = []
-    for command_name in (
-        "sudo",
-        "apt",
-        "apt-get",
-        "apt-cache",
-        "dnf",
-        "yum",
-        "pacman",
-        "apk",
-        "pipx",
-    ):
-        marker = sentinel_directory / f"{command_name}.called"
-        markers.append(marker)
-        command = sentinel_directory / command_name
-        command.write_text(
-            "#!/bin/sh\n"
-            f"printf called > {str(marker)!r}\n"
-            "exit 99\n",
-            encoding="utf-8",
-        )
-        command.chmod(0o755)
-    result = _run(
-        source,
-        home,
-        fake_bin,
-        path=os.pathsep.join(
-            [str(sentinel_directory), str(fake_bin), os.environ["PATH"]]
-        ),
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert not [marker for marker in markers if marker.exists()]
-    stable_entry = home / ".local" / "bin" / "agent-run"
-    assert stable_entry.is_symlink()
-    assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
-    command = subprocess.run(
-        [str(stable_entry), "--help"],
-        cwd=tmp_path,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert command.returncode == 0, command.stderr
-    assert "agent-run" in command.stdout
-    assert _manifest(_active_snapshot(home))["source_provenance"] == {
-        "kind": "git",
-        "commit": subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip(),
-        "ref": "main",
-        "dirty": False,
-    }
-    after = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=source,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert after.stdout == ""
-    assert not (source / "build").exists()
-    assert not (source / "src" / "agent_run" / "__pycache__").exists()
-    assert not list(source.glob("*.egg-info"))
-
-
 def test_install_rejects_managed_paths_inside_source_without_writing_source(
     tmp_path: Path,
 ) -> None:
@@ -1525,6 +1439,23 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     probe_tmp.mkdir()
     monkeypatch.setenv("TMPDIR", str(probe_tmp))
     shell = tool_directory / "bash"
+    git = str(tool_directory / "git")
+    # The two real builds also cover source cleanliness and exact provenance;
+    # a separate initial installation would repeat the same expensive boundary.
+    for arguments in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.name", "Agent Run Quickstart Tests"],
+        ["config", "user.email", "agent-run-quickstart@example.invalid"],
+        ["add", "."],
+        ["commit", "-qm", "initial source"],
+    ):
+        subprocess.run([git, *arguments], cwd=source, env=isolated_environment, check=True)
+    source_commit = subprocess.run(
+        [git, "rev-parse", "HEAD"], cwd=source, env=isolated_environment,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    provenance = {"kind": "git", "commit": source_commit, "ref": "main", "dirty": False}
+    _assert_clean_installer_source(source, isolated_environment)
 
     assert shutil.which("agent-run", path=isolated_path) is None
     pre_login = subprocess.run(
@@ -1551,10 +1482,14 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert (tmp_path / "codex-path").read_text(encoding="utf-8") == isolated_path
     _assert_process_gone(tmp_path / "codex-descendant-pid")
     assert not [marker for marker in markers if marker.exists()]
+    stable_entry = home / ".local" / "bin" / "agent-run"
+    assert stable_entry.is_symlink()
+    assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
+    assert _manifest(_active_snapshot(home))["source_provenance"] == provenance
+    _assert_clean_installer_source(source, isolated_environment)
 
     delivery = tmp_path / "delivery"
     delivery.mkdir()
-    git = str(tool_directory / "git")
     subprocess.run(
         [git, "init", "-q", "-b", "main"],
         cwd=delivery,
@@ -1641,6 +1576,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
         check=False,
     )
     assert first_run.returncode == 0, first_run.stderr
+    assert "agent-run" in first_run.stdout
     assert "start" not in first_run.stdout
     assert "--new-run" not in first_run.stdout
     seeded = seed_run(
@@ -1662,6 +1598,9 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert repeated.returncode == 0, repeated.stderr
     _assert_process_gone(tmp_path / "codex-descendant-pid")
     assert int(count.read_text(encoding="utf-8")) == count_before_repeat
+    assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
+    assert _manifest(_active_snapshot(home))["source_provenance"] == provenance
+    _assert_clean_installer_source(source, isolated_environment)
     profile = (home / ".profile").read_text(encoding="utf-8")
     assert profile.count("# >>> agent-run managed PATH >>>") == 1
     assert profile.count("# <<< agent-run managed PATH <<<") == 1
