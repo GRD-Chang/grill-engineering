@@ -180,6 +180,7 @@ def rotate_repair_job(
     completed = {
         "phase": "completed",
         "repair_branch": job["repair_branch"],
+        "publication_sha": job["publication_sha"],
         "pr_number": job["pr_number"],
         "integrated_sha": job["integrated_sha"],
         "candidate_sha": job["candidate_sha"],

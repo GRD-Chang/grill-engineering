@@ -42,6 +42,7 @@ class DeliveryCleanupEngine:
             state,
             kind="ticket",
             branch=self._string(job, "ticket_branch"),
+            expected_head_sha=self._completed_source_head(job),
             checkout=self._worktree(state, f"ticket-{self._integer(job, 'ticket_number')}")
         )
         return self._attempt(state)
@@ -57,6 +58,7 @@ class DeliveryCleanupEngine:
             state,
             kind="run_repair",
             branch=self._string(job, "repair_branch"),
+            expected_head_sha=self._completed_source_head(job),
             checkout=self._worktree(state, "run-repair"),
         )
         return self._attempt(state)
@@ -66,7 +68,8 @@ class DeliveryCleanupEngine:
     ) -> dict[str, Any]:
         """Retire every Job identity used by one completed Repair Cycle."""
 
-        for job in jobs:
+        # Rotated Jobs reuse one checkout; retire its final owner first.
+        for job in reversed(jobs):
             if job.get("phase") != "completed" or not isinstance(
                 job.get("integrated_sha"), str
             ):
@@ -75,6 +78,7 @@ class DeliveryCleanupEngine:
                 state,
                 kind="run_repair",
                 branch=self._string(job, "repair_branch"),
+                expected_head_sha=self._completed_source_head(job),
                 checkout=self._worktree(state, "run-repair"),
             )
         return self._attempt(state)
@@ -87,6 +91,7 @@ class DeliveryCleanupEngine:
             state,
             kind="parent",
             branch=self._string(job, "parent_branch"),
+            expected_head_sha=self._completed_source_head(job),
             checkout=self._worktree(state, "parent"),
         )
         return self._attempt(state)
@@ -103,6 +108,7 @@ class DeliveryCleanupEngine:
             state,
             kind="run",
             branch=self._string(state, "run_branch"),
+            expected_head_sha=self._mapping(publication, "record").get("pr_head_sha"),
             checkout=self._worktree(state, "run-publication"),
         )
         return self._attempt(state)
@@ -127,17 +133,29 @@ class DeliveryCleanupEngine:
         branch: str,
         checkout: Path,
         reason: str,
+        job: dict[str, Any],
     ) -> None:
         """Expose a stale dirty checkout without attempting to delete it."""
 
+        # Pending Development owns its recorded pre-invocation head. Outside
+        # that invocation, the latest committed publication/candidate (or the
+        # untouched initial base) is the local checkout authority. The remote
+        # can still be at an earlier published head, so bind it separately.
+        local_head = (
+            job.get("managed_checkout_head")
+            if job.get("pending_attempt") is not None
+            else job.get("publication_sha", job.get("candidate_sha", job.get("base_sha")))
+        )
         self._schedule(
             state,
             kind=kind,
             branch=branch,
+            expected_head_sha=local_head,
             checkout=checkout,
         )
         cleanup = self._cleanup(state)
         item = self._mapping(self._mapping(cleanup, "items"), branch)
+        item.setdefault("expected_remote_head_sha", job.get("published_sha", job.get("base_sha")))
         item.update(
             {
                 "status": "cleanup_pending",
@@ -160,6 +178,7 @@ class DeliveryCleanupEngine:
                         state,
                         kind="ticket",
                         branch=self._string(job, "ticket_branch"),
+                        expected_head_sha=self._completed_source_head(job),
                         checkout=self._worktree(
                             state,
                             f"ticket-{self._integer(job, 'ticket_number')}",
@@ -169,7 +188,7 @@ class DeliveryCleanupEngine:
         if isinstance(run, dict):
             repairs = run.get("completed_repair_jobs", [])
             if isinstance(repairs, list):
-                for job in repairs:
+                for job in reversed(repairs):
                     if (
                         isinstance(job, dict)
                         and job.get("phase") == "completed"
@@ -179,6 +198,7 @@ class DeliveryCleanupEngine:
                             state,
                             kind="run_repair",
                             branch=self._string(job, "repair_branch"),
+                            expected_head_sha=self._completed_source_head(job),
                             checkout=self._worktree(state, "run-repair"),
                         )
         if state.get("delivery_type") == "parent_only":
@@ -188,6 +208,7 @@ class DeliveryCleanupEngine:
                     state,
                     kind="parent",
                     branch=self._string(job, "parent_branch"),
+                    expected_head_sha=self._completed_source_head(job),
                     checkout=self._worktree(state, "parent"),
                 )
         elif state.get("delivery_type") == "ticket_run":
@@ -201,8 +222,16 @@ class DeliveryCleanupEngine:
                     state,
                     kind="run",
                     branch=self._string(state, "run_branch"),
+                    expected_head_sha=self._mapping(publication, "record").get("pr_head_sha"),
                     checkout=self._worktree(state, "run-publication"),
                 )
+
+    @staticmethod
+    def _completed_source_head(job: dict[str, Any]) -> object:
+        record = job.get("deterministic_integration_record")
+        if isinstance(record, dict):
+            return record.get("publication_sha")
+        return job.get("publication_sha")
 
     def _schedule(
         self,
@@ -210,6 +239,7 @@ class DeliveryCleanupEngine:
         *,
         kind: str,
         branch: str,
+        expected_head_sha: object,
         checkout: Path,
     ) -> None:
         cleanup = self._cleanup(state)
@@ -219,6 +249,7 @@ class DeliveryCleanupEngine:
             {
                 "kind": kind,
                 "branch": branch,
+                "expected_head_sha": expected_head_sha,
                 "checkout": str(checkout),
                 "attempts": 0,
                 "status": "pending",
@@ -228,6 +259,7 @@ class DeliveryCleanupEngine:
     def _attempt(self, state: dict[str, Any]) -> dict[str, Any]:
         cleanup = self._cleanup(state)
         items = self._mapping(cleanup, "items")
+        self.states.save_run(str(state["run_id"]), state)
         last_error: str | None = None
         for item in items.values():
             if not isinstance(item, dict) or item.get("status") == "completed":
@@ -243,15 +275,23 @@ class DeliveryCleanupEngine:
                 item["attempts"] = self._integer(item, "attempts") + 1
                 try:
                     self.git.require_clean_managed_checkout(checkout)
-                    self.git.remove_worktree(checkout)
-                    self.git.delete_managed_delivery_branch(branch)
+                    expected_head = item.get("expected_head_sha")
+                    if not isinstance(expected_head, str) or not expected_head:
+                        raise RuntimeError("cleanup is missing the completed source head")
+                    expected_remote_head = item.get("expected_remote_head_sha", expected_head)
+                    if not isinstance(expected_remote_head, str) or not expected_remote_head:
+                        raise RuntimeError("cleanup is missing the authorized remote source head")
+                    self.git.remove_completed_worktree(
+                        checkout, branch=branch, expected_head_sha=expected_head
+                    )
+                    self.git.delete_managed_delivery_branch(branch, expected_head_sha=expected_head)
                     remote_delete = (
                         getattr(self.github, "delete_managed_branch", None)
                         if self.github is not None
                         else None
                     )
                     if callable(remote_delete):
-                        remote_delete(branch)
+                        remote_delete(branch, expected_head_sha=expected_remote_head)
                 except (OSError, RuntimeError) as error:
                     item.update(
                         {"status": "cleanup_pending", "last_error": str(error)}

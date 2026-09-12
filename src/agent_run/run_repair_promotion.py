@@ -65,6 +65,7 @@ class RunRepairPromotion:
                 branch=str(job["repair_branch"]),
                 checkout=checkout,
                 reason=dirty_reason,
+                job=job,
             )
             return
         self.owner.git.remove_worktree(checkout)
@@ -504,6 +505,7 @@ class RunRepairPromotion:
         completed = {
             "phase": "completed",
             "repair_branch": job["repair_branch"],
+            "publication_sha": job["publication_sha"],
             "integrated_sha": integrated,
             "candidate_sha": job["candidate_sha"],
             "acceptance_state": "promoted",

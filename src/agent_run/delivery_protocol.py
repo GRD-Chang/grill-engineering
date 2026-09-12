@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 
 class GitHubPublisher(Protocol):
-    def delete_managed_branch(self, branch: str) -> None: ...
+    def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None: ...
 
     def ensure_change_branch(
         self,

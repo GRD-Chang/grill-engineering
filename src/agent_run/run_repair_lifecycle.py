@@ -490,9 +490,24 @@ class RunRepairLifecycle:
             or candidate_sha != job.get("candidate_sha")
         ):
             raise ValueError("repair_job_rotation does not match the active Job")
+        completed_jobs = self.owner._run_state(state).get("completed_repair_jobs")
+        if not isinstance(completed_jobs, list):
+            raise ValueError("repair rotation is missing completed source authority")
+        sources = [
+            completed for completed in completed_jobs
+            if isinstance(completed, dict)
+            and completed.get("repair_branch") == current_branch
+            and completed.get("phase") == "completed"
+        ]
+        if len(sources) != 1:
+            raise ValueError("repair rotation requires one completed source authority")
+        publication_sha = sources[0].get("publication_sha")
+        if not isinstance(publication_sha, str) or not publication_sha:
+            raise ValueError("repair rotation is missing the completed Publication head")
         RunRepairPublisher(self.owner).rotate_job_checkout(
             checkout=checkout,
             current_branch=current_branch,
+            current_publication_sha=publication_sha,
             next_branch=next_branch,
             candidate_sha=candidate_sha,
         )

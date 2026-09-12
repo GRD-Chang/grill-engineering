@@ -239,12 +239,15 @@ class FixtureGitHubPublisher:
         published.setdefault(branch, self.git.resolve(base_branch))
         self._save()
 
-    def delete_managed_branch(self, branch: str) -> None:
+    def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None:
         if not is_managed_delivery_branch(branch):
             raise ValueError(f"refusing to delete unmanaged branch {branch!r}")
         delivery = self._delivery()
         published = _mutable_mapping(delivery, "published_branches")
-        head = published.pop(branch, None)
+        head = published.get(branch)
+        if not expected_head_sha or head not in {None, expected_head_sha}:
+            raise RuntimeError(f"preserved remote branch {branch!r}: source head changed")
+        published.pop(branch, None)
         if isinstance(head, str):
             for pull in _mutable_list(delivery, "pull_requests"):
                 if isinstance(pull, dict) and pull.get("branch") == branch:

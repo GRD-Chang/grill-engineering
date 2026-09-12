@@ -239,6 +239,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         "repair_generation": 1,
         "repair_branch": repair_branch,
         "base_sha": "stale-run-base",
+        "published_sha": git.checkout_head(checkout),
         "parent_revision": state["parent"]["revision"],
         "ticket_graph_revision": state["ticket_graph"]["revision"],
         "ticket_completion_records": [],

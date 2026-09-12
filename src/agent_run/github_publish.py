@@ -75,22 +75,29 @@ class GhGitHubPublisher:
         if self._remote_branch_sha(branch) != expected_base_sha:
             raise GitError("Change ref creation readback did not match intent")
 
-    def delete_managed_branch(self, branch: str) -> None:
+    def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None:
+        """Delete only the recorded source head, including at remote dispatch."""
         if not is_managed_delivery_branch(branch):
             raise GitError(f"refusing to delete unmanaged branch {branch!r}")
-        remote = run_read_command(
-            ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
-            cwd=self.git.root,
-        )
-        if remote.returncode != 0:
-            raise GitError(remote.stderr.strip() or "could not inspect remote branch")
-        if not remote.stdout.strip():
+        if not expected_head_sha:
+            raise GitError("managed branch cleanup is missing its expected source head")
+        observed = self._remote_branch_sha(branch)
+        if observed is None:
             return
+        if observed != expected_head_sha:
+            raise GitError(f"preserved remote branch {branch!r}: source head changed")
+        ref = f"refs/heads/{branch}"
         deleted = self._write_command(
-            ["git", "push", "origin", "--delete", branch],
+            ["git", "push", "origin", f"--force-with-lease={ref}:{expected_head_sha}", f":{ref}"],
         )
-        if deleted.returncode != 0:
-            raise GitError(deleted.stderr.strip() or "could not delete remote branch")
+        # A response can be lost after deletion. Readback never authorizes a
+        # changed head and never turns an unavailable read into absence.
+        observed = self._remote_branch_sha(branch)
+        if observed is None:
+            return
+        if observed != expected_head_sha:
+            raise GitError(f"preserved remote branch {branch!r}: source head changed")
+        raise GitError(deleted.stderr.strip() or "remote branch deletion is not confirmed")
 
     def ensure_ticket_branch(
         self,
