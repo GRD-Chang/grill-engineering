@@ -451,8 +451,8 @@ _Avoid_: Parent Spec 静默改写、直接修改 Run Branch、无限自动重试
 _Avoid_: 暂停、单 Ticket 阻塞、默认分支回滚、将 `abandon` 默认解释为丢弃未提交成果
 
 **Ticket Squash Merge（Ticket 压缩合并）**:
-Publisher 在 Ticket PR 的 Published-Head Gate 通过后执行的固定合并方式。它使用 `--squash` 与 `--match-head-commit`，将 PR 公开分支上的 Publication 与 repair commits 作为一个新语义 commit 写入 Run Branch；首次推送前已压缩掉的本地 Candidate Commits 不会出现在 PR 页面。合并结果必须继续匹配 Ticket Integration Gate 绑定的 base、Publication tree 和语义标题。
-_Avoid_: Rebase merge、普通 merge commit、发布前 Candidate 压缩
+Publisher 在 Ticket PR 的 Published-Head Gate 通过后执行的固定合并方式。它使用 `--squash` 与 `--match-head-commit`，将 PR 公开分支上的 Publication 与 repair commits 作为一个新语义 commit 写入 Run Branch；首次推送前已压缩掉的本地 Candidate Commits 不会出现在 PR 页面。合并结果必须继续匹配 Ticket Integration Gate 绑定的 base、Publication tree，以及 Publication Artifact 的完整提交说明（标题与正文）。
+_Avoid_: Rebase merge、普通 merge commit、发布前 Candidate 压缩、仅比较提交标题
 
 **Run Merge Commit（运行合并提交）**:
 Run PR 通过最终人工整体验收后写入默认分支的普通 merge commit。其第二父历史保留 Run Branch 中各 Ticket squash commits，使系统既能按 Ticket 回滚，也能按整次 Delivery Run 回滚。
@@ -576,16 +576,16 @@ Fresh Acceptance 要求修改时，Controller 将原始 Acceptance Artifact 作�
 _Avoid_: Reviewer 直接修复、创建新 Ticket Job、复用旧验收结论
 
 **Published-Head Gate（已发布 Head 门禁）**:
-Publisher 推送 Publication Commit 后，Controller 确定性验证目标 PR 的 live head、base、有效 Revision、Required Checks、mergeability 与正常路径的 Acceptance Record 或兜底路径的 Deterministic Integration Record 完全一致。Fallback Publication Receipt 只能授权推送 PR，不能单独通过本门禁。它不进行第二次 Codex 语义审查；任何 head、base 或 Revision 漂移都会使旧门禁证据失效，最终合并使用 `--match-head-commit` 绑定准确 SHA，并在完成 Ticket 前验证 integrated commit 的 parent、tree 和标题。若远端已合并但本地同步中断，恢复必须先对齐本地 Run Branch，再完成 Ticket。
+Publisher 推送 Publication Commit 后，Controller 确定性验证目标 PR 的 live head、base、有效 Revision、Required Checks、mergeability 与正常路径的 Acceptance Record 或兜底路径的 Deterministic Integration Record 完全一致。Fallback Publication Receipt 只能授权推送 PR，不能单独通过本门禁。它不进行第二次 Codex 语义审查；任何 head、base 或 Revision 漂移都会使旧门禁证据失效，最终合并使用 `--match-head-commit` 绑定准确 SHA，并在完成 Ticket 前验证 integrated commit 的 parent、tree 和完整提交说明（标题与正文）。若远端已合并但本地同步中断，恢复必须先对齐本地 Run Branch，再完成 Ticket。
 _Avoid_: Fresh Acceptance、GitHub PR Exact-Head Review Loop、智能代码判断
 
 **Git Integrity Check（Git 完整性检查）**:
 Publisher 在创建、压缩、推送和合并候选时执行的确定性 Git 校验，包括 clean tree、预期 HEAD、base 绑定、压缩前后 tree equality、远端 lease 和 live head equality。它不运行仓库测试，也不判断实现是否正确。任何失败都不创建独立 Git-fix 阶段、专用 Agent 或独立预算，而是将原始失败证据以 `repair_source=git_integrity` 返回同一 Change Job 的现有 Development Thread，开始一次普通 Development Attempt；该 Agent 仍不得 commit、push、force-push、rebase 或 merge。Development 产出新 Candidate 后重新执行完整检查；普通 Development 预算耗尽则进入人工 Checkpoint，维护者可用 `resume` 开启新预算窗口后继续。失败检查本身不消耗 Development 或 Reviewer 预算，只有实际恢复的 Development Attempt 按普通规则计数；检查通过前不得继续 Publication、PR 更新、合并或 Ticket Completion。
 _Avoid_: Hosted CI Gate、Fresh Acceptance、本地代码 Validation、独立 Git-fix 状态机、Git-fix 专用预算、授予 Development 发布权限
 
-**Required Checks Observation（必需检查观察）**:
-Controller 对一张 Published PR 的准确 head 读取并持久化的一次完整 Required Checks snapshot，绑定 PR 身份、head SHA、`none|pass|pending|unknown|fail` 汇总结果与实际 Check 明细。Ticket、Parent-only、Run Repair 与 Run PR 使用同一观察语义；新 publication head 使旧观察失效，但各自的等待、Repair、Approval 与 Merge 规则保持独立。
-_Avoid_: 仅有汇总结果、旧 head 的观察、CI Failure Evidence、为满足字段形状合成空 Check
+**Required Checks Observation（自动检查观测）**:
+仓库规定合并前必须通过的自动检查（Required Checks）在一张 Published PR 准确 head 上的一次完整观测，绑定 PR 身份、head SHA、`none|pass|pending|unknown|fail` 汇总结果与实际 Check 明细。Ticket、Parent-only、Run Repair 与 Run PR 使用同一观察语义；新 publication head 使旧观察失效，但各自的等待、Repair、Approval 与 Merge 规则保持独立。
+_Avoid_: 面向用户单独使用“必需检查”、仅有汇总结果、旧 head 的观察、CI Failure Evidence、为满足字段形状合成空 Check
 
 **CI Failure Evidence（CI 失败证据）**:
 Required Checks Observation 为 `fail` 后，Controller 针对同一准确 PR head 取得的 completed Actions job 与 step 事实，用于判断失败是否可由代码修复并作为 Required-Checks Repair 输入。它不是所有结果通用的观察记录，`pending`、`unknown`、平台错误或缺少可归因 job/step 的失败都不构成 CI Failure Evidence。
