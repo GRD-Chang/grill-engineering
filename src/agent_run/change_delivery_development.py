@@ -14,6 +14,8 @@ from agent_run.change_delivery_fallback import (
 )
 from agent_run.change_delivery_threads import (
     record_development_thread as _record_development_thread,
+    select_development_thread,
+    require_development_thread,
 )
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
@@ -74,6 +76,7 @@ def develop(
     budget = job.get("review_budget")
     if not isinstance(budget, dict) or type(budget.get("window")) is not int:
         raise ValueError("Development is missing its Review Budget Window")
+    new_semantic_attempt = pending_semantic_attempt(job, role="development") is None
     semantic_attempt = allocate_semantic_attempt(
         job,
         role="development",
@@ -83,6 +86,7 @@ def develop(
         ordinal=attempt,
         budget_window=int(budget["window"]),
     )
+    select_development_thread(state, job, new_attempt=new_semantic_attempt)
     intent = job.get("candidate_commit_intent")
     if not (
         isinstance(intent, dict)
@@ -117,6 +121,9 @@ def develop(
     elif job.get("development_failure_resume") is True:
         request["_invocation_mode"] = "resume"
     result = stage.agents.develop(request)
+    require_development_thread(
+        job, result.thread_id, requested_thread=request.get("thread_id")
+    )
     clear_initial_credential_wait(state, work_subject=stage.contract.label)
     if isinstance(result, HumanBlockerResult):
         if not stage.adapter.development_thread_is_allowed(state, result.thread_id):

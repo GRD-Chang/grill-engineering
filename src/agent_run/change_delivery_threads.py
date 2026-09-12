@@ -5,6 +5,46 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.change_delivery_state import require_string_list
+from agent_run.delivery_policy import policy_snapshot_for_state
+
+
+def select_development_thread(
+    state: dict[str, Any], job: dict[str, Any], *, new_attempt: bool
+) -> None:
+    """Rotate only at allocation of semantic work, before the durable save."""
+
+    policy = policy_snapshot_for_state(state).get("development_thread_policy", "reuse")
+    if not new_attempt or policy != "new-per-attempt":
+        return
+    current = job.get("development_thread_id")
+    if isinstance(current, str) and current:
+        history = require_string_list(job, "development_thread_history")
+        if current not in history:
+            history.append(current)
+        job["development_thread_history"] = history
+    job["development_thread_id"] = None
+    # The new Attempt has no failed invocation to resume. Manual replacement
+    # remains a separate same-Attempt operation handled by the Controller.
+    job.pop("development_failure_resume", None)
+
+
+def require_development_thread(
+    job: dict[str, Any], thread_id: str, *, requested_thread: object
+) -> None:
+    """A fresh worker cannot return a historical developer or reviewer ID."""
+
+    if thread_id in require_string_list(job, "reviewer_thread_ids"):
+        raise ValueError(
+            "Change Job Development Thread is not independent: "
+            "Development cannot reuse a Reviewer Thread"
+        )
+    if requested_thread is None and thread_id in require_string_list(
+        job, "development_thread_history"
+    ):
+        raise ValueError(
+            "Change Job Development Thread is not independent: "
+            "Fresh Development cannot reuse a historical Thread"
+        )
 
 
 def record_development_thread(

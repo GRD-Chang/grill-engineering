@@ -1089,7 +1089,8 @@ def test_public_operator_docs_describe_the_v01_quickstart() -> None:
         assert "auth app configure" in document
         assert "--rollback" in document
         assert "--uninstall" in document
-        assert "Linux/WSL" in document
+        assert "Linux" in document
+        assert "./setup.sh" in document
         assert "目标交付仓库" in document
 
 
@@ -1099,8 +1100,8 @@ def test_doctor_reports_host_readiness_without_mutating_user_state(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     for name, output in {
-        "git": "git version 2.0\n",
-        "codex": "GH_TOKEN=doctor-secret\n",
+        "git": "git version 2.40.0\n",
+        "codex": "--json --output-last-message --output-schema --dangerously-bypass-approvals-and-sandbox --model --config --cd --color GH_TOKEN=doctor-secret\n",
         "openssl": "OpenSSL 3.0\n",
         "bwrap": "bubblewrap 0.8\n",
     }.items():
@@ -1116,6 +1117,7 @@ def test_doctor_reports_host_readiness_without_mutating_user_state(
         "#!/bin/sh\n"
         "[ \"$1\" = --version ] && exit 0\n"
         "[ \"$1\" = auth ] && exit 0\n"
+        "[ \"$1\" = api ] && { echo '--paginate --slurp --method --header'; exit 0; }\n"
         "exit 1\n",
         encoding="utf-8",
     )
@@ -1587,8 +1589,9 @@ def test_doctor_reaps_descendants_after_a_probe_exits_normally(
         f"#!{sys.executable}\n"
         "import subprocess\n"
         "from pathlib import Path\n"
-        f"child = subprocess.Popen([{sys.executable!r}, '-c', 'import time; time.sleep(30)'])\n"
-        f"Path({str(child_pid)!r}).write_text(str(child.pid))\n",
+        f"child = subprocess.Popen([{sys.executable!r}, '-c', 'import time; time.sleep(30)'], stdout=subprocess.DEVNULL)\n"
+        f"Path({str(child_pid)!r}).write_text(str(child.pid))\n"
+        "print('git version 2.40.0')\n",
         encoding="utf-8",
     )
     probe.chmod(0o700)

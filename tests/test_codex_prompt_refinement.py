@@ -210,3 +210,57 @@ def test_overall_work_rereads_subtasks_only_on_a_fresh_thread(
     assert ("读取最终子任务及依赖" in prompt) is should_read
     if not should_read:
         assert "开始前先读取" not in prompt
+
+
+@pytest.mark.parametrize("kind", ["development", "repair", "continuation"])
+def test_development_worker_command_matches_context_contract(
+    tmp_path: Path, monkeypatch: Any, kind: str
+) -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    request: dict[str, Any] = {
+        "acceptance_scope": "ticket",
+        "task_issue_url": "https://github.com/example/project/issues/2",
+        "parent_issue_url": "https://github.com/example/project/issues/1",
+        "_invocation_mode": "new-thread",
+    }
+    if kind != "development":
+        request.update(
+            repair_source="human_revision",
+            human_feedback="RAW_CURRENT_REVISION",
+            prior_human_blockers=["RAW_BLOCKER"],
+            human_response_history=[{"response": "RAW_RESPONSE"}],
+        )
+    if kind == "continuation":
+        request.update(thread_id="existing-thread", _invocation_mode="resume")
+    prompt = _capture_public_prompt(
+        tmp_path, monkeypatch, "develop", request,
+        name=kind, worker_calls=calls,
+    )
+    arguments, options = calls[0]
+    checkout = tmp_path / kind
+    assert options["cwd"] == checkout
+    assert "--dangerously-bypass-approvals-and-sandbox" in arguments
+    assert "--output-schema" in arguments
+    if kind == "continuation":
+        assert "resume" in arguments
+        assert "existing-thread" in arguments
+        assert "开始前先读取" not in prompt
+        assert "继续完成你负责的修复任务" in prompt
+    else:
+        assert "resume" not in arguments
+        assert arguments[arguments.index("--cd") + 1] == str(checkout)
+        assert f"当前 checkout：{checkout}" in prompt
+        assert "继续当前目录中已有及未提交的代码" in prompt
+        assert "自行读取当前权威需求并建立本轮需求基线" in prompt
+        assert "程序摘要、旧开发总结、历史对话和旧验收结论不能替代" in prompt
+        assert "只读 `gh issue view`" in prompt
+        assert "不暂存、commit、改写 Git 历史或执行 GitHub 写入" in prompt
+        assert '"result_kind":"development"' in prompt
+        assert "后续审查和最终完整测试，由另一位验收工程师负责" in prompt
+    if kind != "development":
+        for evidence in ("RAW_CURRENT_REVISION", "RAW_BLOCKER", "RAW_RESPONSE"):
+            assert evidence in prompt
+        assert "建议安排审查子 Agent" not in prompt
+    if kind == "repair":
+        assert "默认不再组织独立审查" in prompt
+        assert "已掌握的需求" not in prompt

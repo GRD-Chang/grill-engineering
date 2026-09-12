@@ -154,3 +154,27 @@ def test_policy_snapshot_is_complete_and_does_not_reapply_defaults() -> None:
 def test_direct_policy_constructor_rejects_invalid_values() -> None:
     with pytest.raises(DeliveryPolicyError):
         DeliveryPolicy(publication_deadline_seconds=0)
+
+
+def test_development_thread_policy_resolution_and_legacy_snapshot() -> None:
+    assert DeliveryPolicy().development_thread_policy == "reuse"
+    policy = resolve_delivery_policy(
+        user_defaults={"development_thread_policy": "new-per-attempt"},
+        command_overrides={"development_thread_policy": "reuse"},
+    )
+    assert policy.development_thread_policy == "reuse"
+    snapshot = policy.snapshot()
+    snapshot.pop("development_thread_policy")
+    assert parse_policy_snapshot(snapshot).development_thread_policy == "reuse"
+    snapshot["development_thread_policy"] = None
+    with pytest.raises(DeliveryPolicyError, match="development_thread_policy"):
+        parse_policy_snapshot(snapshot)
+
+
+def test_budget_window_override_preserves_frozen_thread_policy() -> None:
+    frozen = DeliveryPolicy(development_thread_policy="new-per-attempt")
+    renewed = resolve_delivery_policy(
+        user_defaults=frozen, command_overrides={"ticket_review_rounds": 5},
+    )
+    assert renewed.development_thread_policy == "new-per-attempt"
+    assert renewed.ticket_review_rounds == 5

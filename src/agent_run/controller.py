@@ -21,6 +21,8 @@ from agent_run.delivery_policy import (
     DeliveryPolicy,
     default_delivery_policy,
     parent_only_budget_policy_for_job,
+    parse_policy_snapshot,
+    policy_snapshot_for_state,
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
@@ -297,7 +299,9 @@ class Controller:
 
         effective_budget_policy = self.delivery_policy
         if resume_budget_checkpoint and budget_checkpoint_subjects(existing):
-            effective_budget_policy = budget_policy or self._policy_for_new_run()
+            effective_budget_policy = budget_policy or parse_policy_snapshot(
+                policy_snapshot_for_state(existing)
+            )
         try:
             existing = self._load_bound_run(run_id, state=existing)
             if explicit_resume or resume_human_blocker or resume_budget_checkpoint:
@@ -1925,6 +1929,15 @@ def _clear_current_invocation_thread(state: dict[str, Any]) -> None:
     if role in {"development", "fresh_acceptance"}:
         job = _change_job_for_invocation(state, invocation)
         if role == "development":
+            previous_thread = invocation.get("reported_thread_id") or job.get(
+                "development_thread_id"
+            ) or invocation.get("requested_thread_id")
+            if isinstance(previous_thread, str) and previous_thread:
+                history = job.setdefault("development_thread_history", [])
+                if not isinstance(history, list):
+                    raise ValueError("development_thread_history must be an array")
+                if previous_thread not in history:
+                    history.append(previous_thread)
             job.pop("development_thread_id", None)
             job["development_new_thread"] = True
         else:

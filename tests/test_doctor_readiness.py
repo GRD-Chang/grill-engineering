@@ -35,7 +35,14 @@ def test_doctor_cli_separates_installation_and_execution_readiness(
             continue
         executable = user_bin / name
         code = 1 if name == "systemctl" and not systemd_available else 0
-        executable.write_text(f"#!/bin/sh\nexit {code}\n")
+        output = ""
+        if name == "git":
+            output = "git version 2.40.0"
+        elif name == "gh":
+            output = "--paginate --slurp --method --header"
+        elif name == "codex":
+            output = "--json --output-last-message --output-schema --dangerously-bypass-approvals-and-sandbox --model --config --cd --color"
+        executable.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\nexit {code}\n")
         executable.chmod(0o700)
     if installed:
         root = Path(environment["XDG_DATA_HOME"]) / "agent-run"
@@ -83,3 +90,34 @@ def test_doctor_cli_separates_installation_and_execution_readiness(
         "ready" if installed and codex_available and systemd_available else "issues"
     )
     assert _file_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("dependency", "script", "status"),
+    [
+        ("git", "printf 'git version 2.39.5\\n'", "unsupported"),
+        ("git", "printf 'not a version\\n'", "unsupported"),
+        ("codex", "exit 0", "unsupported"),
+        ("gh", "echo '--paginate --method --header'", "unsupported"),
+        ("gh", "[ \"$1\" = auth ] && exit 1\necho '--paginate --slurp --method --header'", "not_logged_in"),
+        ("codex", "[ \"$1\" = login ] && exit 1\nprintf '%s\\n' '--json --output-last-message --output-schema --dangerously-bypass-approvals-and-sandbox --model --config --cd --color'", "not_logged_in"),
+        ("bwrap", "[ \"$1\" = --version ] && exit 0\nexit 1", "unavailable"),
+    ],
+)
+def test_doctor_rejects_version_only_or_incompatible_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], dependency: str, script: str, status: str,
+) -> None:
+    from agent_run.cli import main
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    executable = tools / dependency
+    executable.write_text("#!/bin/sh\n" + script + "\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tools))
+    assert main(["doctor", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    key = {"bwrap": "bubblewrap", "gh": "github"}.get(dependency, dependency)
+    assert report["checks"][key]["status"] == status
+    assert report["execution_readiness"]["status"] == "unavailable"

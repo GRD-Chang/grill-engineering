@@ -153,6 +153,16 @@ def development_prompt(
     blocks = [
         f"你是负责{work}本次任务的开发工程师。使用 skill:implement，在当前工作区完成{work}、验证并整理交付文件。",
         task_brief(request, read_issues=not compact, development=True),
+        (
+            f"当前 checkout：{request['checkout']}\n"
+            "继续当前目录中已有及未提交的代码，不清空工作区或重新从零开发。"
+            if request.get("checkout") and not compact else ""
+        ),
+        (
+            "自行读取当前权威需求并建立本轮需求基线，以当前代码和下方适用的原始证据核验。"
+            "程序摘要、旧开发总结、历史对话和旧验收结论不能替代权威需求与当前证据。"
+            if not compact else ""
+        ),
         source_instruction,
         evidence,
         (

@@ -12,6 +12,8 @@ from typing import Any, Sequence
 
 from agent_run import cli_presentation, cli_surface
 from agent_run import doctor
+from agent_run.user_defaults import UserDefaultsStore
+from agent_run import settings_cli
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_session_interruption
 from agent_run.agent_profiles import (
@@ -153,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar=(
             "{run,resume,requeue,approve,revise,stop,abandon,status,history,"
-            "runs,configure,policy,auth,doctor}"
+            "runs,configure,settings,policy,auth,doctor}"
         ),
     )
     run = subcommands.add_parser(
@@ -173,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parent Issue 编号；也可传入完整 Run ID 走精确恢复路径",
     )
     _add_common_options(resume)
-    _add_policy_options(resume)
+    _add_policy_options(resume, allow_thread_policy=False)
     resume.add_argument("--json", action="store_true", dest="as_json")
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
@@ -297,6 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_policy_options(policy_configure, dest_prefix="policy_")
     policy_configure.add_argument("--json", action="store_true", dest="as_json")
+    settings_cli.add_parser(
+        subcommands, _add_common_options, _add_policy_options, _add_profile_options
+    )
     auth = subcommands.add_parser("auth", help="配置 Worker 的 GitHub 只读身份")
     auth_commands = auth.add_subparsers(
         dest="auth_command", required=True, metavar="{status,app}"
@@ -368,6 +373,12 @@ def _main_with_parser_resources(
             return _auth_command(parsed)
         if parsed.command == "doctor":
             return doctor.run(as_json=parsed.as_json)
+        if parsed.command == "settings":
+            return settings_cli.execute(
+                parsed, policy_overrides=_policy_overrides,
+                profile_configuration=_profile_configuration,
+                load_run=_load_read_only_run, profile_root=_profile_state_root,
+            )
         if parsed.command == "policy":
             return _policy_command(parsed)
         if parsed.command == "runs":
@@ -1453,10 +1464,9 @@ def _resume_action_payload(
             "ordinary resume does not accept Delivery Policy overrides; "
             "policy can change only when opening a new Budget Window"
         )
-    policy = (
-        _resolve_delivery_policy(parsed)
-        if budget_checkpoint_resume
-        else parse_policy_snapshot(policy_snapshot_for_state(current))
+    policy = resolve_delivery_policy(
+        user_defaults=parse_policy_snapshot(policy_snapshot_for_state(current)),
+        command_overrides=explicit_policy,
     )
     return {
         "parent": parsed.parent,
@@ -2045,10 +2055,26 @@ def _run_lifecycle(
             payload = _resume_action_payload(parsed, current)
         elif action_kind == "run":
             if current is None:
-                policy = _resolve_delivery_policy(parsed)
+                defaults = UserDefaultsStore()
+                document = defaults.load()
+                policy = resolve_delivery_policy(
+                    user_defaults=document.get("policy"),
+                    command_overrides=_policy_overrides(parsed),
+                )
+                preset, overrides = creation_profile or (None, {})
+                resolved_creation: tuple[str | None, ProfileOverrides] | None = defaults.resolve_creation(
+                    preset=preset, overrides=overrides, document=document,
+                )
+                payload = _run_action_payload(parsed, policy, resolved_creation)
             else:
-                policy = parse_policy_snapshot(policy_snapshot_for_state(current))
-            payload = _run_action_payload(parsed, policy, creation_profile)
+                frozen_creation = current.get("creation_configuration")
+                if isinstance(frozen_creation, dict):
+                    payload = _run_payload_for_existing_action(
+                        parsed, frozen_creation, current, creation_profile,
+                    )
+                else:
+                    policy = parse_policy_snapshot(policy_snapshot_for_state(current))
+                    payload = _run_action_payload(parsed, policy, creation_profile)
         else:
             if current is None:  # pragma: no cover - guarded above
                 raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
@@ -2418,11 +2444,19 @@ def _run_lifecycle(
                         f"{action_kind} intent 在外部状态收敛前超时，尚未应用"
                     )
                 states.save_run(run_id, state)
+        run_payload = action.get("payload")
+        if not isinstance(run_payload, Mapping):
+            raise TaskControlError("run Action 缺少配置 payload")
+        frozen_policy = parse_policy_snapshot(run_payload.get("policy"))
+        controller.delivery_policy_provider = lambda: frozen_policy
+        def prepare_creation(state: dict[str, Any]) -> None:
+            # Keep the initial configuration beside the creation receipt so a
+            # lost Task Control can be reconciled without reading user defaults.
+            state.setdefault("creation_configuration", dict(run_payload))
+            prepare_action_application_receipt(state, action)
+
         return controller.start_or_resume_unfinished(
-            task.parent_number,
-            prepare_state=lambda state: prepare_action_application_receipt(
-                state, action
-            ),
+            task.parent_number, prepare_state=prepare_creation,
         )
 
     def initialize_lifecycle_profile(value: dict[str, Any], resumed: bool) -> None:
@@ -2449,8 +2483,18 @@ def _run_lifecycle(
                     and action.get("run_id") in {None, run_id}
                     and receipt_matches
                 )
+        configuration = creation_profile
+        if allow_create:
+            record = control.load(task)
+            action = record.get("action") if isinstance(record, Mapping) else None
+            action_payload = action.get("payload") if isinstance(action, Mapping) else None
+            frozen = action_payload.get("profile") if isinstance(action_payload, Mapping) else None
+            if isinstance(frozen, Mapping):
+                configuration = (frozen.get("preset"), frozen.get("overrides", {}))
+        elif not _profile_options_are_explicit(creation_profile):
+            configuration = None
         _initialize_profile(
-            profiles, value, creation_profile, allow_create=allow_create
+            profiles, value, configuration, allow_create=allow_create
         )
 
     lifecycle = RunLifecycle(
@@ -2549,14 +2593,24 @@ def _run_payload_for_existing_action(
             policy = resolve_delivery_policy(
                 user_defaults=policy, command_overrides=explicit_policy
             )
-        elif not _profile_options_are_explicit(creation_profile):
-            stored_profile = existing_payload.get("profile")
-            if isinstance(stored_profile, Mapping):
+        stored_profile = existing_payload.get("profile")
+        if isinstance(stored_profile, Mapping):
+            if not _profile_options_are_explicit(creation_profile):
                 return {
                     "parent": parsed.parent,
                     "policy": policy.snapshot(),
                     "profile": dict(stored_profile),
                 }
+            preset, overrides = creation_profile or (None, {})
+            frozen_defaults = {
+                "profile": {
+                    **({"preset": stored_profile["preset"]} if stored_profile.get("preset") else {}),
+                    **stored_profile.get("overrides", {}),
+                }
+            }
+            creation_profile = UserDefaultsStore().resolve_creation(
+                preset=preset, overrides=overrides, document=frozen_defaults,
+            )
         return _run_action_payload(parsed, policy, creation_profile)
     if not explicit_policy and not _profile_options_are_explicit(creation_profile):
         # A record reconstructed from a Run receipt has no semantic payload.
@@ -4123,8 +4177,16 @@ def _add_profile_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_policy_options(
-    parser: argparse.ArgumentParser, *, dest_prefix: str = ""
+    parser: argparse.ArgumentParser, *, dest_prefix: str = "",
+    allow_thread_policy: bool = True,
 ) -> None:
+    if allow_thread_policy:
+        parser.add_argument(
+            "--development-thread-policy",
+            choices=("reuse", "new-per-attempt"),
+            dest=f"{dest_prefix}development_thread_policy",
+            help="开发 Thread 策略：跨轮复用或每新开发轮新建，仅新 Run 生效",
+        )
     parser.add_argument(
         "--parent-only-paired-rounds",
         "--parent-only-paired-round",
@@ -4167,6 +4229,7 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "development_thread_policy",
     ):
         value = getattr(parsed, f"policy_{key}", None)
         if value is None:
@@ -4200,25 +4263,16 @@ def _validate_explicit_policy_options(parsed: argparse.Namespace) -> None:
 
 
 def _policy_command(parsed: argparse.Namespace) -> int:
-    store = DeliveryPolicyStore()
+    store = UserDefaultsStore()
     command = getattr(parsed, "policy_command", None)
     overrides = _policy_overrides(parsed)
     if command == "show" or (command is None and not overrides):
-        user_defaults = store.load()
-        policy = resolve_delivery_policy(user_defaults=user_defaults)
-        result = {
-            "result": "policy",
-            "policy": policy.snapshot(),
-            "user_defaults": user_defaults or {},
-        }
+        result = store.describe()
+        result["result"] = "policy"
     else:
-        policy = store.configure(overrides)
-        user_defaults = store.load()
-        result = {
-            "result": "configured",
-            "policy": policy.snapshot(),
-            "user_defaults": user_defaults or {},
-        }
+        result = store.configure(policy=overrides)
+        result["result"] = "configured"
+    result["user_defaults"] = result["defaults"].get("policy", {})
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

@@ -23,7 +23,7 @@ Thread 时，Controller 根据 Development、定向 Repair、Reviewer 或 Public
 不接收 Thread、Resume、`execution_failed`、预算窗口或后继状态说明；Reviewer 与定向 Repair 可继续
 接收从现有预算投影的简短审查次数。Resume 是同一 Job Generation 内的
 Invocation successor，不迁移或重置 Candidate、Acceptance、Human Response 或 branch/PR。只有到达
-适用的预算耗尽检查点后，维护者显式 Resume 才按当前 Delivery Policy 创建新的编号预算窗口；普通
+适用的预算耗尽检查点后，维护者显式 Resume 才按该 Run 已保存的 Delivery Policy（及本次显式覆盖）创建新的编号预算窗口；普通
 执行失败或 Human Blocker 继续原 Semantic Agent Attempt，不重置预算。
 
 当机械 Currentness Boundary 已经漂移，Controller 不让 Resume 猜测新事实或继续旧 checkout。Ticket 与

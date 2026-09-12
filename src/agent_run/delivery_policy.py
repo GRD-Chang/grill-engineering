@@ -27,6 +27,7 @@ _POLICY_KEYS = frozenset(
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "development_thread_policy",
         "invocation_deadlines",
     }
 )
@@ -51,8 +52,11 @@ class DeliveryPolicy:
     development_deadline_seconds: float = 5 * 60 * 60
     review_deadline_seconds: float = 2 * 60 * 60
     publication_deadline_seconds: float = 60 * 60
+    development_thread_policy: str = "reuse"
 
     def __post_init__(self) -> None:
+        if self.development_thread_policy not in ("reuse", "new-per-attempt"):
+            raise DeliveryPolicyError("development_thread_policy must be reuse or new-per-attempt")
         object.__setattr__(
             self,
             "ticket_review_rounds",
@@ -86,6 +90,7 @@ class DeliveryPolicy:
             "parent_only_paired_rounds": self.parent_only_paired_rounds,
             "run_repair_rounds": self.run_repair_rounds,
             "ticket_review_rounds": self.ticket_review_rounds,
+            "development_thread_policy": self.development_thread_policy,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
                 "review": _canonical_number(self.review_deadline_seconds),
@@ -175,6 +180,9 @@ def normalize_policy_overrides(
         for role in _DEADLINE_KEYS
     }
     for key, value in raw.items():
+        if key == "development_thread_policy":
+            put(key, value)
+            continue
         if key in round_aliases:
             put(round_aliases[key], value)
             continue
@@ -206,7 +214,9 @@ def normalize_policy_overrides(
 def parse_policy_snapshot(value: object) -> DeliveryPolicy:
     """Parse the complete canonical state snapshot without applying defaults."""
 
-    if not isinstance(value, Mapping) or set(value) != _POLICY_KEYS:
+    if not isinstance(value, Mapping) or set(value) not in (
+        _POLICY_KEYS, _POLICY_KEYS - {"development_thread_policy"}
+    ):
         raise DeliveryPolicyError("Policy Snapshot has an invalid field set")
     deadlines = value.get("invocation_deadlines")
     if not isinstance(deadlines, Mapping) or set(deadlines) != _DEADLINE_KEYS:
@@ -216,6 +226,7 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
             "parent_only_paired_rounds": value.get("parent_only_paired_rounds"),
             "run_repair_rounds": value.get("run_repair_rounds"),
             "ticket_review_rounds": value.get("ticket_review_rounds"),
+            "development_thread_policy": value.get("development_thread_policy", "reuse"),
             "invocation_deadlines": dict(deadlines),
         }
     )
@@ -349,6 +360,7 @@ class DeliveryPolicyStore:
     _LOCK_FILE_NAME = ".delivery-policy.lock"
 
     def __init__(self, path: Path | None = None) -> None:
+        self._unified_defaults = path is None
         self.path = path or self.default_path()
 
     @classmethod
@@ -363,6 +375,10 @@ class DeliveryPolicyStore:
         return root / cls._DIRECTORY_NAME / cls._FILE_NAME
 
     def load(self) -> dict[str, Any] | None:
+        if self._unified_defaults:
+            from agent_run.user_defaults import UserDefaultsStore
+
+            return UserDefaultsStore().load().get("policy")
         if not self.path.exists():
             return None
         try:
@@ -374,6 +390,11 @@ class DeliveryPolicyStore:
         return normalize_policy_overrides(value)
 
     def configure(self, overrides: Mapping[str, Any]) -> DeliveryPolicy:
+        if self._unified_defaults:
+            from agent_run.user_defaults import UserDefaultsStore
+
+            result = UserDefaultsStore().configure(policy=overrides)
+            return parse_policy_snapshot(result["policy"])
         supplied = normalize_policy_overrides(overrides)
         if not supplied:
             raise DeliveryPolicyError("policy configure requires an explicit option")
@@ -465,6 +486,7 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
             "invocation_deadlines is missing: " + ", ".join(sorted(required))
         )
     return DeliveryPolicy(
+        development_thread_policy=values.get("development_thread_policy", "reuse"),
         parent_only_paired_rounds=_positive_integer(
             values.get("parent_only_paired_rounds"), "parent_only_paired_rounds"
         ),

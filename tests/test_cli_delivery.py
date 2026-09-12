@@ -498,7 +498,12 @@ def test_user_policy_snapshot_is_frozen_across_human_blocker_resume(
     policy_store = DeliveryPolicyStore(
         config_home / "agent-run" / "delivery-policy.json"
     )
-    policy_store.configure({"ticket_review_rounds": 1})
+    policy_store.configure(
+        {
+            "ticket_review_rounds": 1,
+            "invocation_deadlines": {"development": "11m"},
+        }
+    )
     isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
 
     blocked_agents = git_repo / "blocked-user-policy-agents.json"
@@ -586,6 +591,11 @@ def test_user_policy_snapshot_is_frozen_across_human_blocker_resume(
     assert job["policy_snapshot"] == state["policy_snapshot"]
     assert job["review_budget"]["development_attempts"] == 1
     assert job["review_budget"]["reviewer_invocations"] == 1
+
+    development_invocations = [
+        item for item in state["agent_invocation_history"] if item["role"] == "development"
+    ]
+    assert [item["deadline_seconds"] for item in development_invocations] == [660, 660]
 
 
 def test_existing_run_ignores_invalid_user_policy_on_normal_run(
@@ -1106,35 +1116,6 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
         sort_keys=True,
     ) == delivery_before
 
-    policy_store.path.write_text(
-        json.dumps({"ticket_review_rounds": 0}), encoding="utf-8"
-    )
-    invalid_rounds = run_cli(
-        git_repo,
-        fixture,
-        "resume",
-        run_id,
-        extra_env=isolated_env,
-    )
-    assert_invalid_policy_cli_result(invalid_rounds)
-    assert load_only_run_state(git_repo) == before
-    assert fixture.read_text(encoding="utf-8") == fixture_before
-
-    policy_store.path.write_text(
-        json.dumps({"invocation_deadlines": {"development": "nope"}}),
-        encoding="utf-8",
-    )
-    invalid_user_duration = run_cli(
-        git_repo,
-        fixture,
-        "resume",
-        run_id,
-        extra_env=isolated_env,
-    )
-    assert_invalid_policy_cli_result(invalid_user_duration)
-    assert load_only_run_state(git_repo) == before
-    assert fixture.read_text(encoding="utf-8") == fixture_before
-    policy_store.path.write_text("{}", encoding="utf-8")
     empty_agents = git_repo / "no-implicit-budget-work.json"
     empty_agents.write_text(
         json.dumps(
@@ -1192,6 +1173,8 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
     ]
     recovery_agents = git_repo / "explicit-budget-resume.json"
     recovery_agents.write_text(json.dumps(recovery_data), encoding="utf-8")
+
+    policy_store.path.write_text("{\n", encoding="utf-8")
 
     resumed = run_cli(
         git_repo,
@@ -1895,9 +1878,17 @@ def test_parent_only_tenth_review_failure_checkpoints_without_an_extra_developme
     ] == []
 
 
+@pytest.mark.parametrize("explicit_rounds", [None, 2])
 def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
     git_repo: Path,
+    explicit_rounds: int | None,
 ) -> None:
+    config_home = git_repo / "checkpoint-user-config"
+    isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
+    policy_store = DeliveryPolicyStore(
+        config_home / "agent-run" / "delivery-policy.json"
+    )
+    policy_store.configure({"invocation_deadlines": {"development": "11m"}})
     fixture = write_fixture(git_repo / "github.json", issues={})
     initial_agents = git_repo / "parent-checkpoint-agents.json"
     initial_agents.write_text(
@@ -1913,12 +1904,23 @@ def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
         "1",
         "--agent-fixture",
         str(initial_agents),
+        extra_env=isolated_env,
     )
 
     assert blocked.returncode == 2, blocked.stdout
     blocked_state = load_only_run_state(git_repo)
     assert blocked_state["parent_job"]["review_budget"]["window"] == 1
 
+    policy_store.configure(
+        {
+            "parent_only_paired_rounds": 9,
+            "invocation_deadlines": {"development": "19m"},
+        }
+    )
+    overrides = [] if explicit_rounds is None else [
+        "--parent-only-paired-rounds", str(explicit_rounds),
+        "--development-deadline", "13m",
+    ]
     resumed_agents = git_repo / "parent-checkpoint-resume-agents.json"
     resumed_agents.write_text(
         json.dumps(
@@ -1948,16 +1950,26 @@ def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
         fixture,
         "resume",
         blocked_state["run_id"],
-        "--parent-only-paired-rounds",
-        "2",
+        *overrides,
         "--agent-fixture",
         str(resumed_agents),
+        extra_env=isolated_env,
     )
 
     assert resumed.returncode == 0, resumed.stderr
     state = load_only_run_state(git_repo)
     job = state["parent_job"]
-    assert state["policy_snapshot"]["parent_only_paired_rounds"] == 2
+    assert state["policy_snapshot"]["parent_only_paired_rounds"] == (explicit_rounds or 1)
+    expected_deadline = 780 if explicit_rounds is not None else 660
+    assert state["policy_snapshot"]["invocation_deadlines"][
+        "development"
+    ] == expected_deadline
+    development_invocations = [
+        item for item in state["agent_invocation_history"] if item["role"] == "development"
+    ]
+    assert [item["deadline_seconds"] for item in development_invocations] == [
+        660, expected_deadline,
+    ]
     assert job["policy_snapshot"] == state["policy_snapshot"]
     assert job["review_budget"]["window"] == 2
     assert job["review_budget"]["development_attempts"] == 1
@@ -1965,6 +1977,9 @@ def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
     assert job["review_budget_history"][0]["policy_snapshot"][
         "parent_only_paired_rounds"
     ] == 1
+    assert job["review_budget_history"][0]["policy_snapshot"][
+        "invocation_deadlines"
+    ]["development"] == 660
     assert job["phase"] == "ready_for_approval"
 
 

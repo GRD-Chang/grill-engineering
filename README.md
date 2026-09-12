@@ -4,21 +4,52 @@
 定义交付范围；Controller 依次驱动开发、独立验收、Required Checks、PR 发布和恢复，
 最终是否进入默认分支仍由维护者通过 `approve` 决定。
 
-## 从源码安装
+## 首次安装
 
-v0.1 的唯一规范安装入口是源码目录中的 `./install.sh`。安装器只使用当前目录实际内容，
-不会跟随后续源码变化，也不会调用 `sudo`、系统包管理器、`pipx`、daemon、cron 或后台更新组件。
-它要求宿主已经提供 CPython 3.11+、`venv`、`pip`、当前 Codex CLI；Git 只用于可选的来源说明，
-没有 Git metadata 也可以安装。安装失败会保留旧 Active Runner。
-
-稳定版本建议明确选择 release tag：
+Linux 用户在 GitHub release 页下载所选 release tag 的 **Source code** 归档，解压并进入源码目录，
+执行唯一首次准备入口。下载和解压可以使用浏览器及系统归档工具，无需预先安装 Python 或 Git：
 
 ```bash
-git clone https://github.com/GRD-Chang/grill-engineering.git
-cd grill-engineer
-git checkout <release-tag>
-./install.sh
+./setup.sh
 ```
+
+已有 Git 的开发者也可以 clone 并选择 tag、branch 或本地修改，然后执行同一入口。
+先审阅所选源码；安装器与构建后端拥有当前用户的代码执行权限。
+
+Setup 集中显示依赖检查、拟执行变更和人工待办，再统一确认一次。兼容工具直接复用；
+确认前执行可行的只读认证、bubblewrap namespace 和 user systemd 会话检查；构建前置
+不满足或安装失败时仍重新汇总这些检查。认证与会话环境的原始输出不展示。
+创建短命 systemd unit 及受管 Runner 的 doctor 检查明确后置到确认且安装成功之后。
+Ubuntu/Debian 自动准备仅补齐缺失或不兼容的 Runner 依赖，不升级整个系统。
+确认不代替管理员授权或账号认证；拒绝或缺少权限时不执行相应修改。其他 Linux 跳过
+未适配步骤，继续可行检查和安装，缺关键构建或激活条件时不绕过门禁。
+
+人工补齐后，在同一源码目录重跑 `./setup.sh`。报告区分“Runner 未安装或新版本未激活”、
+“Runner 已安装但执行环境未就绪”和“安装及执行条件均满足”。旧 Active 仍可用不代表新版
+已激活，宿主就绪也不代表目标仓库已配置完成。实际来源、版本、架构和缺项原因见本次检查计划。
+退出码 `0` 表示安装及执行条件满足，`1` 表示安装失败或未激活，`2` 表示已安装但未就绪。
+外层使用 POSIX shell 和系统 coreutils（含 `timeout`）；系统补装还需 util-linux 的 `flock`。
+Ubuntu/Debian 只使用已有 APT 软件源，以 `apt-cache policy` 展示候选，再通过
+在同一 Runner 管理租约下刷新已有源索引，再以 `apt-get install --no-install-recommends` 补齐缺项，不添加源。Codex 和不可用的 user systemd
+转为人工待办；仓库候选版本达不到基线也需人工处理。`./setup.sh --yes` 可预先确认计划，
+但不提供提权；没有可用管理员权限时跳过系统变更，操作者完成授权后重跑。
+Linux 以外平台不在本轮范围；Linux 仍须实际具备 user systemd 和 bubblewrap 能力。
+平台证据与显式 opt-in 方法见[一次性平台验收](docs/runner-setup-validation.md)。
+
+如果已有软件源仍提供不兼容版本，按缺项处理后重跑：
+
+| 缺项 | 人工处理与再次验证 |
+| --- | --- |
+| CPython / Git 太旧 | 由管理员选择提供 CPython 3.11+、Git 2.40+ 的系统版本或软件源；检查 `python3 --version`、`git --version`，重跑 Setup |
+| gh 缺少 `api --slurp` 等选项 | 由管理员按 [GitHub CLI 官方 Linux 安装说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)选择来源；检查 `gh api --help`、`gh auth status` |
+| Codex 缺失或调用选项不兼容 | 按 [Codex 官方安装说明](https://github.com/openai/codex)选择适合架构的发行物或 npm 安装；自行登录，再检查 `codex exec --help`、`codex exec resume --help` 和 `codex login status` |
+| user systemd / bubblewrap 不可用 | 在真实 Linux 用户登录会话检查 `systemctl --user show-environment`；由管理员定位 namespace/安全策略拒绝原因，重跑 Setup 的短命 unit 与 bubblewrap 探针，不用关闭全机防护来通过 |
+
+Setup 不替用户选择或添加第三方软件源，不修改已有 Codex 安装；因此这类缺项会保留为人工待办。
+
+底层 `./install.sh` 保留不可变 Runner 安装生命周期，不自动准备宿主，要求 CPython 3.11+、
+`venv`、`pip`、构建后端和能完成 Compatibility Check 的 Codex CLI。Git metadata 不是构建前置；
+构建或激活失败保留旧 Active Runner。
 
 branch、fork 和包含未提交修改的本地目录也使用同一个命令。没有 Git metadata 的源码目录只要
 包含有效的 Python build backend，同样可以安装；Git ref、commit 和 dirty 状态只写入有界
@@ -79,19 +110,61 @@ C 后只保留 C/B。相同源码重复执行是幂等的，候选构建或 Comp
 固定安装锁、Run locator、App profile、私钥文件和目标仓库 `.agent-run`。卸载后重新打开登录 shell
 以取得 PATH 变化，重复卸载安全成功。
 
-## 目标仓库前置条件
+## 目标仓库人工接入
 
-运行生命周期命令仍需要目标仓库具备：
+Setup 不管理 Skills、项目工具链，不修改目标仓库忽略规则、标签、Issue 状态、CI 或保护规则。
+首次任务前由维护者完成：
 
-- Python 3.11+、已登录的 `codex` 和 `gh` CLI、Git、OpenSSL 与 Linux `bubblewrap`；
-- Worker 使用的 GitHub 读取权限：`actions: read`、`checks: read`、`contents: read`、
-  `issues: read`、`metadata: read`、`pull_requests: read` 和 `statuses: read`；
-- Publisher 使用宿主 `gh` 登录的仓库写权限；
-- 与仓库 Ruleset 对应的 Required Check（通常为 `quality`）。
+1. **认证和权限**：自行 `codex login`、`gh auth login`，用 `codex login status`、
+   `gh auth status` 验证，已有有效登录直接复用；确认 Git 身份及远端读写可用。
+   Publisher 需要宿主 gh 的仓库写权限。Worker 只读请求需要 `actions: read`、`checks: read`、
+   `contents: read`、`issues: read`、`metadata: read`、`pull_requests: read`、`statuses: read`。
+   默认不要求 GitHub App，也不复制外部认证材料。
+2. **Skills**：自行在 Codex 可发现的位置准备 `implement`、`code-review` 及目标 `AGENTS.md`
+   引用的其他 Skills，确认当前用户能加载；安装 Runner 不会同步或覆盖它们。
+3. **项目工具链**：自行安装项目语言、编译器、包管理器、数据库及测试依赖，从配置好项目
+   PATH/虚拟环境的终端启动任务。Runner 的 Python 环境不代替项目环境。
+4. **忽略规则**：自行在目标仓库根 `.gitignore` 加入 `/.agent-run/`，用
+   `git check-ignore .agent-run/runs/probe` 核对；已跟踪内容由维护者妥善处理。
+   此目录包含 Run 状态和受管工作区，不应进入交付提交。
+5. **任务资格**：自行创建 [triage 标签](docs/agents/triage-labels.md)。可领取的 open 任务
+   要有 `ready-for-agent`，且不能同时有 `needs-triage`、`needs-info`、`ready-for-human`。
+   Ticket 集合来自 Parent 的 GitHub 原生 sub-issues，依赖来自原生 `blockedBy`；未解除的
+   blocker 阻止领取，正文列表和标签搜索不增加任务。标签变化不会自动启动 Run。
+6. **执行能力**：CPython 3.11+、Git 2.40+（或经过验证的等价功能）、Codex、gh、Linux
+   bubblewrap 和真实 user systemd 应满足生产调用；App 模式另需 OpenSSL。
+   `agent-run doctor` 只读报告能力，不代替实际任务检查。安装器不会关闭全机安全机制、
+   替换 init、自动启用 linger 或降级为前台执行。
 
-Runner 安装本身不访问 GitHub、目标仓库或 GitHub App；Compatibility Check 只验证当前 Codex
-结构化输出链路。完整生命周期、权限边界和恢复语义见
-[`docs/agent-run.md`](docs/agent-run.md)。
+### CI 接入
+
+中间 Ticket PR、Run Repair PR 的目标是受管 Run Branch（`agent-run/<run-id>/run`）；
+最终 Run PR 与 Parent-only PR 的目标是默认分支。维护者自行让 workflow 的
+`pull_request.branches` 覆盖相应 base，例如 `main` 和 `agent-run/**`，并核对针对两类
+目标的 Ruleset/branch protection；安装器不会创建这些配置。
+
+| GitHub 必需检查事实 | 行为 |
+| --- | --- |
+| 确认无必需检查 | 继续既有开发、独立审核和发布门禁，不宣称 CI 运行或通过 |
+| 存在必需检查 | 当前 PR head 的所有必需检查通过才继续，未触发仍需等待 |
+| 可选检查 | 不属于自动门禁，由维护者决定是否提升为必需 |
+| 必需检查失败或读取未知 | 保留失败或监督语义，不作为“无 CI” |
+
+可在目标 `pyproject.toml` 声明允许自动修复的稳定 `workflow::job显示名::step`，例如：
+
+```toml
+[tool.agent-run.required-checks]
+code-failure-steps = [
+  "CI::quality::Run tests",
+  "CI::quality::Run type checks",
+]
+```
+
+只有 GitHub 给出失败结论、completed Actions job 准确绑定当前 PR head，且全部失败步骤
+都在声明内，才进入既有有界代码修复。pending、cancelled、未配置步骤、缺失或矛盾证据、
+runner/网络/平台问题继续由 Controller 监督，不触发无依据的代码修复。
+声明不会创建必需检查、增加预算、绕过独立审核或授权任意 CI 改造。
+完整生命周期、权限边界和恢复语义见 [`docs/agent-run.md`](docs/agent-run.md)。
 
 Worker 默认复用宿主已经登录的 `gh` 进行固定只读请求。需要独立只读身份时，可从任意目录一次性配置
 GitHub App；配置只保存元数据和仓库外私钥路径，不复制私钥或 installation token：
@@ -110,9 +183,9 @@ agent-run auth app remove
 profile 并恢复 host `gh`，不会删除私钥文件。Worker 永远不会看到宿主 token、App 私钥或 Publisher
 凭据。
 
-v0.1 支持 Linux/WSL 的用户级 `~/.profile` PATH 管理，需要用户自行提供 CPython 3.11+、`venv`、
-`pip`、Codex CLI、Git、OpenSSL、已登录的 `gh` 和 Linux `bubblewrap`。不提供 Windows、macOS、
-系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher 或自动更新。
+自动准备路径面向 Ubuntu/Debian；未取得一次性完整宿主验收证据的发行版/版本/架构组合
+不列为已支持，普通容器或模拟测试不能证明真实执行能力。Windows、macOS、系统级/多用户安装、
+PyPI/pipx、常驻 Manager/Launcher 和自动更新不在本轮范围。
 
 ## 开发
 
@@ -154,3 +227,5 @@ Issue 定位唯一 Run：零匹配、多匹配或仓库不匹配时拒绝猜测�
 Lifecycle mutation 默认输出不含 Action ID、Run ID、PID 或 digest 的人类回执；需要稳定机器审计事实时显式使用 `--json`。安装、更新、rollback 和
 uninstall 都不迁移、修改或绑定既有 Delivery Run；不兼容 state 仍返回
 `incompatible_run_state`。
+
+运行配置的统一入口为 `agent-run settings show/configure`，详见[个人运行默认配置](docs/user-defaults.md)；修改默认仅影响新 Run。

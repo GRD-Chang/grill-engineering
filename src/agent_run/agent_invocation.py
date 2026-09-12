@@ -83,6 +83,7 @@ def invocation_event_recorder(
         for key in (
             "ordinary_recovery_used",
             "capacity_recovery_count",
+            "output_attempt",
         ):
             value = previous.get(key, recovery_state[key])
             recovery_state[key] = value
