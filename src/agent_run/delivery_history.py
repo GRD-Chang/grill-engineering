@@ -2267,7 +2267,9 @@ def _turning_point_evidence_lines(
             value = _truncate_history_detail(value)
         lines.append(f"        下一步：{value}")
     evidence = point.get("required_checks_evidence")
-    if details and isinstance(evidence, dict):
+    if details and isinstance(evidence, dict) and (
+        evidence.get("checks") or evidence.get("omitted_checks")
+    ):
         lines.append("        自动检查证据：")
         _append_check_observation_detail(lines, evidence, indent="          ")
         if evidence.get("omitted_checks"):
