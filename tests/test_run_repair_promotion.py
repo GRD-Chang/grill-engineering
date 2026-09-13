@@ -631,8 +631,8 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
         git_repo, fixture, "history", str(state["run_id"]), "--plain", "--details"
     )
     assert history.returncode == 0, history.stderr
-    assert "Development Summary" in history.stdout
-    assert "自动检查结果" in history.stdout
+    assert "开发说明" in history.stdout
+    assert "合并前检查结果" in history.stdout
     assert "PR 编号" in history.stdout
     for internal_field in (
         "reviewer_thread_id",

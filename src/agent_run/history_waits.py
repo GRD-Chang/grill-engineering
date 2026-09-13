@@ -28,6 +28,10 @@ def collapse_check_waits(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             elif signature in known_evidence:
                 event["required_checks_evidence"] = known_evidence[signature]
         prior = result[-1] if result else None
+        if prior is not None and _same_completed_observation(prior, event):
+            # A repeated read of an already completed check is not time spent
+            # waiting. Keep the first observation's point in time.
+            continue
         if prior is not None and (
             _same_check_wait(prior, event) or _same_approval_wait(prior, event)
         ):
@@ -49,6 +53,23 @@ def collapse_check_waits(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 event["wait_observed_until"] = event.get("at")
             result.append(event)
     return result
+
+
+def _same_completed_observation(prior: dict[str, Any], event: dict[str, Any]) -> bool:
+    return (
+        prior.get("kind") == event.get("kind") == "required_checks"
+        and prior.get("checks_wait_identity") is None
+        and event.get("checks_wait_identity") is None
+        and _same_check_identity(prior, event)
+        and prior.get("required_checks_result") in {"pass", "none"}
+        and prior.get("required_checks_result") == event.get("required_checks_result")
+        and prior.get("required_checks_signature") is not None
+        and prior.get("required_checks_signature") == event.get("required_checks_signature")
+        and all(
+            item.get("required_checks_observation_status") not in {"unavailable", "unknown"}
+            for item in (prior, event)
+        )
+    )
 
 
 def _same_check_wait(prior: dict[str, Any], event: dict[str, Any]) -> bool:

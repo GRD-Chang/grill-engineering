@@ -48,15 +48,15 @@ def test_run_reaches_explicit_approval_with_status_and_history(
 
     status = run_cli(git_repo, fixture, "status", run_id)
     assert status.returncode == 0, status.stderr
-    assert "Repository: example/project" in status.stdout
-    assert "Parent:     #1 Parent spec" in status.stdout
-    assert "Status:     等待人工批准" in status.stdout
-    assert "当前对象:   Run Publication" in status.stdout
-    assert "最近 Agent: Publication Agent" in status.stdout
+    assert "仓库:       example/project" in status.stdout
+    assert "整体需求:   #1 Parent spec" in status.stdout
+    assert "状态:       等待人工批准" in status.stdout
+    assert "当前对象:   整体交付" in status.stdout
+    assert "最近 Agent: 发布 Agent" in status.stdout
     latest_invocation = state["agent_invocation_history"][-1]
     assert str(latest_invocation["model"]) in status.stdout
     assert str(latest_invocation["reasoning_effort"]) in status.stdout
-    assert "唯一下一步: agent-run approve" in status.stdout
+    assert "下一步: agent-run approve" in status.stdout
     assert run_id not in status.stdout
     status_json = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
     assert status_json["active_ticket"] is None
@@ -393,9 +393,9 @@ def test_history_renders_device_timezone_and_keeps_json_events_in_utc(
     audit = stdout_json(history)
 
     assert local.returncode == fallback.returncode == 0
-    assert "Time zone: Asia/Shanghai (UTC+08:00)" in local.stdout
+    assert "时区:       Asia/Shanghai (UTC+08:00)" in local.stdout
     assert "08:00" in local.stdout
-    assert "Time zone: UTC (UTC+00:00)" in fallback.stdout
+    assert "时区:       UTC (UTC+00:00)" in fallback.stdout
     assert audit["time_zone"] == "UTC"
     assert audit["events"][0]["at"] == "2026-08-30T00:00:00+00:00"
 
@@ -452,7 +452,7 @@ def test_history_keeps_later_invocations_after_an_early_timeline_tail(
         for kind, obj, _ in later_facts
     )
     assert any(kind == "publication" for kind, _, _ in later_facts)
-    assert "Run Publication · 发布 Agent" in text
+    assert "整体交付 · 发布 Agent" in text
 
 
 def test_status_shows_the_current_review_findings(
