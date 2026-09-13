@@ -4,7 +4,7 @@ status: accepted
 
 # 最终批准执行期间不可取消，失败后显式恢复
 
-2026-09-13 的真实运行讨论确认：维护者执行 `approve`，是在批准当前版本的最终交付。若命令只保存批准便报告成功，或者随后允许 `stop` 将合并与收尾拆开，用户无法从这次操作判断交付是否完成。本决策已确认，现有实现是否完整满足仍需后续验证；证据和讨论见[需求记录](../research/2026-09-13-e2e-diagnostics-history-requirements.md)。
+2026-09-13 的真实运行讨论确认：维护者执行 `approve`，是在批准当前版本的最终交付。若命令只保存批准便报告成功，或者随后允许 `stop` 将合并与收尾拆开，用户无法从这次操作判断交付是否完成。本决策已实现并完成本地独立验证；证据和讨论见[需求记录](../research/2026-09-13-e2e-diagnostics-history-requirements.md)，验证范围和限制见[实现验证记录](../research/2026-09-13-approval-query-implementation-validation.md)。
 
 本 ADR 有限修订 [ADR 0010](0010-task-scoped-run-executor.md) 中 `approve` 的动作完成、准入释放与 CLI 返回边界，并适用于显式 `resume` 正在继续原最终批准操作的情形；其他生命周期动作沿用既有规则。
 
