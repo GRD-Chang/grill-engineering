@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 from typing import Any, Callable
 
+from agent_run.final_approval_operation import (
+    final_approval_cleanup_pending,
+    has_final_approval,
+)
 from agent_run.controller import Controller
 from agent_run.state import StateStore
 from agent_run.state_contract import (
@@ -73,6 +77,12 @@ def _resume_is_publication_recovery(state: dict[str, object]) -> bool:
     """Recognize a durable merge/closeout intent that only needs reconciliation."""
 
     status = state.get("status")
+    if has_final_approval(state) and (
+        status in {"waiting_checks", "waiting_external", "run_approval_pending",
+                   "parent_approval_pending", "execution_failed", "supervision_timeout"}
+        or (status == "completed" and final_approval_cleanup_pending(state))
+    ):
+        return True
     if status == "parent_closeout_pending":
         return True
     parent_job = state.get("parent_job")

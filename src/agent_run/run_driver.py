@@ -22,6 +22,9 @@ from agent_run.external_supervision import (
     public_supervision_snapshot,
     wait_for_github_convergence,
 )
+from agent_run.final_approval_operation import (
+    final_approval_cleanup_pending, has_final_approval,
+)
 from agent_run.executor_host import ExecutorHost
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
@@ -282,7 +285,13 @@ class DirectRunOperations:
 
     def deliver(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
-        if self._cannot_advance(refreshed):
+        if refreshed.get("status") == "completed" and has_final_approval(refreshed):
+            return self.classify(DeliveryCleanupEngine(
+                git=self.git, states=self.states, github=self.publisher
+            ).resume(run_id))
+        if self._cannot_advance(refreshed) and not (
+            refreshed.get("status") == "parent_approval_pending" and has_final_approval(refreshed)
+        ):
             return self.classify(refreshed)
         refreshed = DeliveryCleanupEngine(
             git=self.git, states=self.states, github=self.publisher
@@ -386,7 +395,9 @@ class DirectRunOperations:
 
     def publish(self, run_id: str) -> RunOutcome:
         refreshed, _ = self._refresh(run_id)
-        if self._cannot_advance(refreshed):
+        if self._cannot_advance(refreshed) and not (
+            refreshed.get("status") == "run_approval_pending" and has_final_approval(refreshed)
+        ):
             return self.classify(refreshed)
         publication = refreshed.get("run_publication")
         if (
@@ -420,7 +431,10 @@ class DirectRunOperations:
         )
         if (
             isinstance(publication, dict)
-            and publication.get("phase") in {"waiting_checks", "waiting_external"}
+            and (
+                publication.get("phase") in {"waiting_checks", "waiting_external"}
+                or isinstance(publication.get("merge_intent"), dict)
+            )
             and publication_engine.has_current_approval_grant(run_id)
         ):
             return self.classify(publication_engine.approve(run_id))
@@ -644,6 +658,7 @@ class RunDriver:
             raise ValueError("Delivery Run is missing its Run ID")
         if control_operation is not None:
             return self.operations.apply_control(run_id, control_operation).state
+        continuing_approval = has_final_approval(state)
         outcome = self.operations.classify(state)
         previous_marker: tuple[object, ...] | None = None
         try:
@@ -670,6 +685,8 @@ class RunDriver:
                     self.states.save_run(run_id, latest)
                     outcome = self.operations.classify(latest)
                 state = outcome.state
+                if continuing_approval and not has_final_approval(state):
+                    return state
                 if (
                     outcome.kind is RunOutcomeKind.PROGRESS
                     and _progress_marker(state) == progress_marker_before_dispatch
@@ -775,9 +792,16 @@ class RunDriver:
 def _next_step(state: dict[str, Any]) -> RunStep | None:
     """Select the following step while translating persistent state to a result."""
 
+    status = str(state.get("status"))
+    if has_final_approval(state):
+        if status == "run_approval_pending":
+            return RunStep.PUBLISH
+        if status == "parent_approval_pending":
+            return RunStep.DELIVER
+        if status == "completed" and final_approval_cleanup_pending(state):
+            return RunStep.DELIVER
     if _has_pending_stale_dirty_checkout(state):
         return RunStep.ACCEPT
-    status = str(state.get("status"))
     if status in {
         "active",
         "ticket_completed",

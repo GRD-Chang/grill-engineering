@@ -42,8 +42,7 @@ class RunPublicationApproval(RunPublicationShared):
         state = self._load(run_id)
         publication = self._publication_state(state)
         recovering_merge = (
-            publication["phase"] == "waiting_external"
-            and isinstance(publication.get("merge_intent"), dict)
+            isinstance(publication.get("merge_intent"), dict)
         )
         if publication["phase"] == "merged":
             return self._complete_parent_closeout(state)
@@ -60,8 +59,11 @@ class RunPublicationApproval(RunPublicationShared):
         authority = self._approval_grant_authority(
             state, run, pr_number, run_head
         )
-        if not grant_matches(publication.get("approval_grant"), authority):
+        if publication.get("approval_grant") is None:
             publication["approval_grant"] = create_grant(authority)
+        # A later read may observe the default branch after our merge. Keep
+        # the original human grant while reconciling that exact merge intent;
+        # an OPEN PR still has to pass the existing grant/currentness checks.
         if prepare_state is not None:
             prepare_state(state)
         self._save(state)
@@ -289,7 +291,7 @@ class RunPublicationApproval(RunPublicationShared):
         pr_number = publication.get("pr_number")
         if not isinstance(run, dict) or not isinstance(pr_number, int):
             return False
-        if publication.get("phase") == "waiting_external":
+        if publication.get("phase") == "waiting_external" or isinstance(publication.get("merge_intent"), dict):
             return isinstance(publication.get("approval_grant"), dict)
         try:
             authority = self._approval_grant_authority(

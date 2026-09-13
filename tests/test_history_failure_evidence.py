@@ -24,7 +24,7 @@ def test_history_fallback_failure_sources(
             "recovery_head": "recovered-head", "recovery_action": "reset-and-clean",
             "recovery_error": "recovery-error",
         }
-        expected = ["checkout changed", "expected-head", "observed-head", "False",
+        expected = ["checkout changed", "expected-head", "observed-head", "工作区清洁：否",
                     "recovered-head", "reset-and-clean", "recovery-error"]
     elif source == "acceptance":
         evidence = {"checks": {lane: {"status": "fail", "evidence": f"evidence-{lane}",
@@ -36,7 +36,7 @@ def test_history_fallback_failure_sources(
         evidence = {"result": "fail", "head_sha": "failed-check-head", "pr_number": 17,
                     "checks": [{"name": "failing-check", "bucket": "fail",
                                 "link": "https://example.test/check"}]}
-        expected = ["failed-check-head", "failing-check", "https://example.test/check"]
+        expected = ["failing-check", "https://example.test/check"]
     evidence["policy_snapshot"] = {"private-marker": True}
     attempt = {"attempt_id": "attempt", "role": "reviewer", "work_subject": "ticket:3",
                "generation": 1, "ordinal": 1, "budget_window": 1, "status": "completed"}
@@ -54,8 +54,10 @@ def test_history_fallback_failure_sources(
     monkeypatch.setattr(cli_presentation, "_use_rich_status", lambda plain: not plain)
     cli_presentation._print_history(state, as_json=False, plain=plain, details=True)
     output = capsys.readouterr().out
-    for value in ["publication-sha", *expected]:
+    for value in expected:
         assert value in output
+    assert "publication-sha" not in output
+    assert "failed-check-head" not in output
     assert "private-marker" not in output
     assert "policy_snapshot" not in output
     cli_presentation._print_history(state, as_json=True)

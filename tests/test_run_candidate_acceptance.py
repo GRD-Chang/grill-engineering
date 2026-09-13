@@ -272,9 +272,12 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     assert status["run_repair"]["candidate_validation_phase"] == "blocked"
     assert status["run_repair"]["cycle_status"] == "budget_exhausted"
     assert status["run_repair"]["code_modification_attempts"] == 10
-    assert "Run Acceptance Generation 4" in text_status_result.stdout
-    assert "Repair Cycle Generation 2" in text_status_result.stdout
-    assert "Candidate 验证状态 已阻塞" in text_status_result.stdout
+    assert "整体修复" in text_status_result.stdout
+    assert "当前版本验收 已受阻" in text_status_result.stdout
+    assert "代码修改 10 / 10" in text_status_result.stdout
+    assert "本次开发或验收额度已用尽" in text_status_result.stdout
+    assert "下一步: agent-run resume 1 --repo example/project" in text_status_result.stdout
+    assert "Generation" not in text_status_result.stdout
     assert stdout_json(history_result)["run_id"] == state["run_id"]
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
@@ -358,9 +361,11 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     assert repair_status["acceptance_generation"] == 4
     assert repair_status["repair_cycle_generation"] == 2
     assert repair_status["candidate_validation_phase"] == "blocked"
-    assert "Run Acceptance Generation 4" in text_status.stdout
-    assert "Repair Cycle Generation 2" in text_status.stdout
-    assert "Candidate 验证状态 已阻塞" in text_status.stdout
+    assert "整体修复" in text_status.stdout
+    assert "当前版本验收 已受阻" in text_status.stdout
+    assert _BLOCKED_EVIDENCE in text_status.stdout
+    assert "下一步: agent-run resume 1 --repo example/project" in text_status.stdout
+    assert "Generation" not in text_status.stdout
 
 @pytest.mark.parametrize(
     ("job_phase", "run_status"),
@@ -429,7 +434,12 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     assert repair_status["phase"] == job_phase
     assert repair_status["candidate_validation_status"] == "pass"
     assert repair_status["candidate_validation_phase"] == "pass"
-    assert "Candidate 验证状态 已通过" in text_status.stdout
+    assert "当前版本验收 已通过" in text_status.stdout
+    phase_label = {
+        "publishing": "发布中", "waiting_checks": "等待合并前检查",
+        "waiting_merge": "等待合并确认",
+    }[job_phase]
+    assert f"阶段:       {phase_label}" in text_status.stdout
 
 def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
     git_repo: Path,
@@ -470,7 +480,7 @@ def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
                 assert json_status.returncode == text_status.returncode == 0
                 repair_status = stdout_json(json_status)["run_repair"]
                 assert repair_status["candidate_validation_status"] == "reviewing"
-                assert "Candidate 验证状态 验收中" in text_status.stdout
+                assert "当前版本验收 验收中" in text_status.stdout
             return ReviewResult(
                 thread_id=f"run-reviewer-{len(self.review_requests)}",
                 artifact=self._reviews.pop(0),
@@ -486,7 +496,7 @@ def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
             assert json_status.returncode == text_status.returncode == 0
             repair_status = stdout_json(json_status)["run_repair"]
             assert repair_status["candidate_validation_status"] == "pass"
-            assert "Candidate 验证状态 已通过" in text_status.stdout
+            assert "当前版本验收 已通过" in text_status.stdout
             return super().publication(request)
 
     agents = ConsecutiveCandidateAgents()

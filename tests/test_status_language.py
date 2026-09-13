@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import json
+import time
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+
+import pytest
+from rich.text import Text
+
+from agent_run import cli
+from agent_run.state import StateStore
+from test_run_lifecycle import _file_snapshot
+
+
+class TerminalOutput(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize("plain", [True, False])
+def test_completed_status_requires_cleanup_when_closeout_crashed_before_scheduling(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
+) -> None:
+    state = {
+        "run_id": "run-cleanup-not-scheduled", "schema_version": 1,
+        "repository": "example/project", "parent": {"number": 1},
+        "status": "completed", "run_branch": "agent-run/final-delivery",
+        "run_publication": {
+            "phase": "merged", "approval_grant": {}, "parent_closed": True,
+        }, "diagnostics": [],
+    }
+    root = git_repo / ".agent-run"
+    StateStore(root).save_run(state["run_id"], state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("COLUMNS", "160")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    output = TerminalOutput()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], *(["--plain"] if plain else [])]) == 0
+    human = Text.from_ansi(output.getvalue()).plain
+    assert "已合并，待清理" in human
+    assert "agent-run resume 1 --repo example/project" in human
+    assert "无需操作" not in human
+    assert "工作区清理：已完成" not in human
+    audit_output = StringIO()
+    with redirect_stdout(audit_output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    audit = json.loads(audit_output.getvalue())
+    assert audit["status"] == "completed"
+    assert audit["delivery_cleanup"] is None
+    assert _file_snapshot(root) == before
+
+
+@pytest.mark.parametrize("plain", [True, False])
+def test_completed_status_keeps_work_facts_without_internal_labels(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
+) -> None:
+    state = {
+        "run_id": "run-language", "schema_version": 1, "repository": "example/project",
+        "parent": {"number": 1, "title": "整体需求"}, "status": "completed",
+        "run_acceptance": {
+            "phase": "accepted", "candidate_sha": "accepted-head",
+            "modification_attempts": 0, "validation_attempts": 1,
+            "review_budget": {"window": 1, "development_attempts": 0,
+                              "reviewer_invocations": 1, "final_ci_fix_used": False},
+            "acceptance_record": {
+                "reviewed_candidate_sha": "accepted-head",
+                "artifact": {"checks": {lane: {"status": "pass", "findings": []}
+                                        for lane in ("e2e", "standards", "spec")}},
+            },
+        },
+        "run_publication": {"phase": "merged", "head_sha": "accepted-head"},
+        "agent_invocation_history": [{
+            "role": "final_publication", "work_subject": "run-publication:run-language",
+            "status": "completed", "model": "gpt-5.6-luna", "reasoning_effort": "xhigh",
+            "started_at": "2026-09-12T15:20:14.737344+00:00",
+            "ended_at": "2026-09-12T15:22:14.737344+00:00",
+        }],
+        "delivery_cleanup": {"status": "completed", "items": {}}, "diagnostics": [],
+    }
+    root = git_repo / ".agent-run"
+    StateStore(root).save_run(state["run_id"], state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("COLUMNS", "160")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    try:
+        with monkeypatch.context() as timezone:
+            timezone.setenv("TZ", "Asia/Shanghai")
+            time.tzset()
+            output = TerminalOutput()
+            with redirect_stdout(output):
+                assert cli.main(["status", state["run_id"], *(["--plain"] if plain else [])]) == 0
+    finally:
+        time.tzset()
+    human = Text.from_ansi(output.getvalue()).plain
+    for expected in (
+        "整体交付", "发布 Agent", "gpt-5.6-luna", "xhigh", "2 分钟",
+        "2026-09-12 23:20:14", "UTC+08:00", "当前版本已通过验收",
+        "本次授权已用", "额外 CI 修复：不适用", "工作区清理", "已完成", "无需操作",
+    ):
+        assert expected in human
+    for internal in (
+        "Run Publication", "Publication Agent", "Attempt #", "预算窗口", "False /",
+        "Findings", "Candidate", "状态: completed", "已保留 0", "恢复操作见 --json",
+        "2026-09-12T15:20", "run-language", "命令：无",
+    ):
+        assert internal not in human
+    audit_output = StringIO()
+    with redirect_stdout(audit_output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    audit = json.loads(audit_output.getvalue())
+    assert audit["progress"]["current_object"] == "Run Publication"
+    assert audit["progress"]["conclusion"] == "当前有效通过"
+    assert audit["progress"]["current_agent"]["started_at"] == "2026-09-12T15:20:14.737344+00:00"
+    assert audit["review_budget"]["final_ci_fix_used"] is False
+    assert audit["review_budget"]["final_ci_fix_limit"] == 0
+    assert _file_snapshot(root) == before
+
+
+@pytest.mark.parametrize(("status", "command"), [
+    ("unsupported_scope_change", "abandon"), ("deterministic_contradiction", "run"),
+    ("publication_pending", "abandon"),
+])
+def test_status_qualifies_manual_abandon_guidance_without_changing_json(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, status: str, command: str,
+) -> None:
+    state = {
+        "run_id": "run-action-language", "schema_version": 1, "repository": "example/project",
+        "parent": {"number": 1}, "status": status, "diagnostics": [],
+    }
+    root = git_repo / ".agent-run"
+    StateStore(root).save_run(state["run_id"], state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], "--plain"]) == 0
+    assert f"agent-run {command} 1 --repo example/project" in output.getvalue()
+    assert "确定性外部矛盾" not in output.getvalue()
+    audit_output = StringIO()
+    with redirect_stdout(audit_output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    assert "agent-run abandon 1 --repo" not in json.loads(audit_output.getvalue())["next_action"]
+    assert _file_snapshot(root) == before
+
+
+@pytest.mark.parametrize("plain", [True, False])
+def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
+) -> None:
+    state = {
+        "run_id": "run-repair-language", "schema_version": 1, "repository": "example/project",
+        "parent": {"number": 1}, "status": "ready_for_human", "diagnostics": [],
+        "run_acceptance": {
+            "phase": "repairing", "acceptance_generation": 31,
+            "repair_cycle": {"generation": 72, "status": "active", "code_modification_attempts": 2},
+            "repair_job": {
+                "repair_generation": 99, "phase": "blocked", "candidate_sha": "private-candidate-sha",
+                "blocked_reason": "agent_requires_human", "human_blocker_phase": "reviewing",
+                "human_blockers": ["请批准读取 /config/resource 的权限。"],
+                "repair_checkout": "/preserved/development",
+                "review_budget": {"window": 4, "development_attempts": 2,
+                                  "reviewer_invocations": 1, "final_ci_fix_used": False},
+            },
+        },
+        "agent_invocation_history": [{
+            "role": "reviewer", "work_subject": "run-repair:run-repair-language",
+            "status": "completed", "model": "review-model", "reasoning_effort": "high",
+            "started_at": "2026-09-12T15:20:00+00:00", "ended_at": "2026-09-12T15:21:00+00:00",
+        }],
+    }
+    root = git_repo / ".agent-run"
+    StateStore(root).save_run(state["run_id"], state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLUMNS", "140")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    output = TerminalOutput()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], *(["--plain"] if plain else [])]) == 0
+    human = Text.from_ansi(output.getvalue()).plain
+    readable = " ".join(human.replace("│", " ").split())
+    for expected in (
+        "整体修复", "代码修改 2 / 10", "当前版本验收", "需要人工处理", "验收中",
+        "review-model", "high", "请批准读取 /config/resource 的权限。",
+        "当前代码版本已保存", "开发工作区已保留", "整项任务已暂停，其他子任务也不会继续",
+        "agent-run resume 1 --repo example/project",
+    ):
+        assert expected in readable
+    for internal in (
+        "Generation", "generation", "Human Blocker", "Candidate", "Managed Checkout",
+        "Delivery Run", "Ticket", "reviewer", "run-repair-language", "private-candidate-sha",
+    ):
+        assert internal not in human
+    assert _file_snapshot(root) == before

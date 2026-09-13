@@ -20,6 +20,12 @@ from agent_run.executor_host import (
     ExecutorStartUnknownError,
     HostObservation,
 )
+from agent_run.final_approval_operation import (
+    final_approval_busy_message,
+    final_approval_failure,
+    has_final_approval,
+    is_final_approval_action,
+)
 from agent_run.operator_gate import has_run_operator_gate
 from agent_run.state import StateStore
 from agent_run.resume_intent import action_resume_intent
@@ -270,6 +276,12 @@ class RunLifecycle:
             # Reconstructing the same explicit intent is receipt recovery, even
             # if the Run still advertises the original command's ready state.
             request = replace(request, allow_terminal_successor=False)
+        if (
+            request.kind == "approve" and isinstance(current, Mapping)
+            and has_final_approval(current) and isinstance(receipt, Mapping)
+            and receipt.get("kind") == "approve"
+        ):
+            request = replace(request, allow_terminal_successor=False)
         reconciliation_payload: Mapping[str, Any] | None = request.payload
         if (
             existing_control is None
@@ -352,6 +364,17 @@ class RunLifecycle:
                 "Task Control 不可用；仅凭 Delivery Run Receipt 无法证明原 "
                 "Executor 已退出。请恢复对应 Task Control 后重试。"
             )
+        if (
+            request.kind == "resume" and isinstance(current, Mapping)
+            and isinstance(action, Mapping) and isinstance(executor, Mapping)
+            and action.get("status") in {"accepted", "applying"}
+            and executor.get("status") in {"absent", "exited"}
+            and action_receipt_matches(current, action)
+            and is_final_approval_action(action, current)
+        ):
+            assert isinstance(record, Mapping)
+            record = self._close_receipt_predecessor(current, record)
+            action, executor = record.get("action"), record.get("executor")
         invocation = (
             current.get("active_agent_invocation") if current is not None else None
         )
@@ -419,7 +442,8 @@ class RunLifecycle:
                     action.get("status") == "failed"
                     and request.kind != "resume"
                     and isinstance(executor, Mapping)
-                    and executor.get("failure") == "session_interrupted"
+                    and (executor.get("failure") == "session_interrupted"
+                         or is_final_approval_action(action, current))
                 )
             )
             and action.get("kind") == request.kind
@@ -442,6 +466,18 @@ class RunLifecycle:
                 self.receipt_from_record(
                     record, action_id=action.get("action_id"), attached=True
                 ),
+            )
+        if (
+            request.kind == "resume" and isinstance(current, Mapping)
+            and current.get("status") == "completed" and final_approval_failure(current) is None
+            and isinstance(action, Mapping) and is_final_approval_action(action, current)
+            and action.get("status") == "completed" and isinstance(executor, Mapping)
+            and executor.get("status") in {"exited", "absent"}
+            and action_receipt_matches(current, action)
+        ):
+            assert isinstance(record, Mapping)
+            return dict(current), True, self.receipt_from_record(
+                record, action_id=str(action["action_id"]), attached=True
             )
         claim = self._claim(request)
         if claim.executor_active:
@@ -576,7 +612,7 @@ class RunLifecycle:
         )
         if active_action is not None and not attached:
             raise ActionBusyError(
-                "当前 Delivery Task 已有未完成 Lifecycle Action；不会等待或排队",
+                final_approval_busy_message(active_action, current),
                 action=active_action,
             )
         if (
@@ -776,6 +812,13 @@ class RunLifecycle:
             raise ActionReconciliationError("原 Action 缺少准确 Run receipt")
         if action.get("status") in {"completed", "failed"}:
             return dict(record)
+        if is_final_approval_action(action, current) and final_approval_failure(current):
+            return self.control.finish_executor(
+                self.task, action_id=_string_field(action, "action_id"),
+                generation=_positive_integer(action.get("executor_generation")),
+                failure=final_approval_failure(current),
+                result_status=str(current.get("status")),
+            )
         kind = action.get("kind")
         if kind in {"stop", "abandon"} and current.get("status") not in (
             {"operator_stopped", "completed", "abandoned"}
@@ -881,6 +924,8 @@ class RunLifecycle:
         if not isinstance(action_run_id, str) or not action_run_id:
             action_run_id = None
 
+        final_approval = is_final_approval_action(action, current or {})
+
         def apply(generation: int) -> Mapping[str, Any]:
             self._set_executor_state_fence(
                 self.states,
@@ -924,6 +969,7 @@ class RunLifecycle:
                 generation=generation,
                 resumed=resumed,
                 execution_context=execution_context,
+                final_approval=final_approval,
                 replace_receipt_action_id=receipt_predecessor,
             )
 
@@ -1064,6 +1110,7 @@ class RunLifecycle:
         generation: int,
         resumed: bool,
         execution_context: dict[str, Any],
+        final_approval: bool = False,
         replace_receipt_action_id: str | None = None,
         state_store: StateStore | None = None,
     ) -> Mapping[str, Any]:
@@ -1104,6 +1151,20 @@ class RunLifecycle:
                     "Control Action 缺少绑定业务执行入口"
                 )
             return self.execute_with_binding(run_id, action_id, generation)
+        if final_approval or is_final_approval_action(action, prepared):
+            if not has_final_approval(prepared) and prepared.get("status") != "completed":
+                result: Mapping[str, Any] = prepared
+            else:
+                result = (
+                    self.execute_with_binding(run_id, action_id, generation)
+                    if self.execute_with_binding is not None else self.execute(run_id)
+                )
+            self.control.complete_action(
+                self.task, action_id=action_id, generation=generation,
+                result_status=str(result.get("status")),
+                failure=final_approval_failure(result),
+            )
+            return result
         result_status = prepared.get("status")
         self.control.complete_action(
             self.task,
@@ -1184,8 +1245,10 @@ class RunLifecycle:
             expected_action is not None
             and _action_matches_run_receipt(state, expected_action)
             and isinstance(state.get("run_id"), str)
-            and expected_action.get("kind") in {"approve", "revise", "requeue"}
-            and not recover
+            and (
+                is_final_approval_action(expected_action, state)
+                or (expected_action.get("kind") in {"revise", "requeue"} and not recover)
+            )
         )
         observation: HostObservation | None = None
         if isinstance(executor, dict) and executor.get("status") in {
@@ -1438,6 +1501,18 @@ class RunLifecycle:
         if not isinstance(application_receipt, Mapping):  # pragma: no cover - gated
             raise ActionReconciliationError(
                 "Delivery Run 缺少可对账的 Action Application Receipt"
+            )
+        action = record.get("action") if isinstance(record, Mapping) else None
+        if (
+            isinstance(action, Mapping) and is_final_approval_action(action, state)
+            and final_approval_failure(state)
+        ):
+            record = self.control.finish_executor(
+                self.task, action_id=action_id, generation=generation,
+                result_status=str(state.get("status")), failure=final_approval_failure(state),
+            )
+            return state, resumed, self.receipt_from_record(
+                record, action_id=action_id, attached=attached
             )
         record = self.control.complete_action_from_application_receipt(
             self.task,

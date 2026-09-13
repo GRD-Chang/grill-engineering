@@ -55,11 +55,21 @@ def test_continuous_checks_form_one_independent_observed_wait() -> None:
     waits = [record for record in records if record["event_record"]]
     assert len(waits) == 2
     assert waits[1]["status_text"] == "等待人工批准"
-    assert waits[0]["status_text"] == "自动检查通过"
+    assert waits[0]["status_text"] == "合并前检查通过"
     assert waits[0]["started_at"] == "2026-09-12T04:00:00+00:00"
     assert waits[0]["ended_at"] == "2026-09-12T04:13:00+00:00"
     assert waits[0]["span_seconds"] == 780
     assert (state, audit) == before
+
+
+def test_repeated_completed_check_without_wait_window_is_one_observation_not_wait_time() -> None:
+    events = [check_event(minute, "pass", status="waiting_merge", phase="waiting_merge",
+                          checks_wait_identity=None) for minute in (0, 4, 8)]
+    records = history_records(*history(events))
+    checks = [record for record in records if record["event_record"]]
+    assert len(checks) == 1
+    assert checks[0]["span_seconds"] == 0
+    assert checks[0]["started_at"] == checks[0]["ended_at"] == events[0]["at"]
 
 
 def test_state_store_retains_future_check_identity_without_repeating_details(tmp_path: Path) -> None:
@@ -209,10 +219,10 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
         with redirect_stdout(output):
             assert main(["history", run_id, *arguments]) == 0
         text = Text.from_ansi(output.getvalue()).plain
-        assert text.count("事件：自动检查") == 1
-        assert "自动检查通过" in text
-        assert "Runner 观测到的等待：13 分钟" in text
-        assert "事件：人工批准" in text
+        assert text.count("合并前检查通过") == 1
+        assert "合并前检查通过" in text
+        assert "记录到的等待时间：13 分钟" in text
+        assert "等待人工批准" in text
         assert "04:04" not in text
         if "--details" in arguments:
             assert "quality" in text

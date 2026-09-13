@@ -10,7 +10,11 @@ from agent_run.operator_gate import (
 )
 from agent_run.presentation_helpers import (
     delivery_object_label,
+    human_agent_role,
+    human_delivery_object,
     human_next_action,
+    human_pause_reason,
+    human_status_term,
     terminal_safe,
 )
 
@@ -85,71 +89,64 @@ def operator_action_view(
 def print_operator_action(
     action: dict[str, Any], *, run_id: object = None
 ) -> None:
-    print("操作者动作:")
-    print(f"类型: {terminal_safe(_human_action_type(action['type']))}")
-    print(f"对象: {terminal_safe(action['object'])}")
-    print(f"阶段: {terminal_safe(action['phase'])}")
+    print("需要你处理:")
+    print(f"类型: {terminal_safe(human_action_type(action['type']))}")
+    print(f"对象: {terminal_safe(human_delivery_object(action['object']))}")
+    print(f"阶段: {terminal_safe(human_status_term(action['phase']))}")
     for reason in action["reasons"]:
-        print(f"原因: {terminal_safe(reason)}")
+        message = reason if action["type"] == "Human Blocker" else human_pause_reason(reason)
+        print(f"原因: {terminal_safe(message)}")
     invocation = action.get("trigger_invocation")
     if isinstance(invocation, dict):
         print(
             "触发阻塞的 Agent: "
             f"{terminal_safe(_human_agent_role(invocation['role']))}；"
-            f"model {terminal_safe(invocation['model'])}；"
-            f"reasoning effort {terminal_safe(invocation['reasoning_effort'])}；"
+            f"模型 {terminal_safe(invocation['model'])}；"
+            f"推理强度 {terminal_safe(invocation['reasoning_effort'])}；"
             f"本轮时长: {terminal_safe(invocation['duration_seconds'])} 秒"
         )
     print(
-        f"已保留成果: {terminal_safe(_human_preserved_results(action['preserved']))}"
+        f"已保留成果: {terminal_safe(human_preserved_results(action['preserved']))}"
     )
-    print("全局暂停: 整个 Delivery Run 已暂停；其他 Ticket 不会推进")
+    print("整项任务已暂停，其他子任务也不会继续。")
     if action["type"] == "Review Budget Checkpoint":
-        print("恢复授权: resume 将授权新的预算窗口，继续已有工作。")
+        print("继续执行后，将按配置补充本次开发与验收额度，继续已有工作。")
     print(
-        "唯一下一步: "
+        "下一步: "
         f"{terminal_safe(human_next_action(action['next_action'], run_id=run_id))}"
     )
 
 
-def _human_action_type(value: object) -> str:
+def human_action_type(value: object) -> str:
     raw = str(value)
     localized = {
         "Human Blocker": "需要人工处理",
-        "Review Budget Checkpoint": "验收预算窗口已用尽",
+        "Review Budget Checkpoint": "本次开发或验收额度已用尽",
         "Execution Failure": "执行失败",
-        "Deterministic Contradiction": "确定性矛盾",
-        "Supervision Timeout Pause": "监督超时暂停",
-        "Operator Stopped": "操作者已停止",
-        "Requeue Required": "需要重新排队",
+        "Deterministic Contradiction": "交付记录与实际结果不一致",
+        "Supervision Timeout Pause": "自动等待已超时",
+        "Operator Stopped": "已手动停止",
+        "Requeue Required": "需要按更新后的需求重新开始",
         "Final Approval": "等待最终批准",
         "Publication Retry Exhausted": "发布重试已耗尽",
-        "Abandonment Recovery": "放弃恢复处理中",
+        "Abandonment Recovery": "正在完成放弃操作",
     }.get(raw)
-    return f"{raw}（{localized}）" if localized else raw
+    return localized or "需要人工处理"
 
 
 def _human_agent_role(value: object) -> str:
-    raw = str(value)
-    localized = {
-        "development": "开发 Agent",
-        "reviewer": "验收 Agent",
-        "fresh_acceptance": "验收 Agent",
-        "publication": "发布 Agent",
-        "final_publication": "发布 Agent",
-    }.get(raw)
-    return f"{raw}（{localized}）" if localized else raw
+    return human_agent_role(value)
 
 
-def _human_preserved_results(value: object) -> str:
+def human_preserved_results(value: object) -> str:
     if not isinstance(value, str):
         return "当前状态与已有审计证据"
     parts: list[str] = []
     for item in value.split("；"):
         if item.startswith("Candidate "):
-            parts.append("Candidate 已保存")
+            parts.append("当前代码版本已保存")
         elif item.startswith("Managed Checkout "):
-            parts.append("Managed Checkout 已保存")
+            parts.append("开发工作区已保留")
         else:
             parts.append(item)
     return "；".join(parts)

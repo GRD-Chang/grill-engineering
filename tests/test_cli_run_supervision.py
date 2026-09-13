@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -150,8 +151,16 @@ def test_run_retries_initial_credential_before_starting_each_parent_only_worker(
     assert attempts[0]["status"] == "completed"
 
 def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
-    git_repo: Path,
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Lifecycle fixtures use real processes without systemd units. Querying the
+    # developer's user manager would make exit observability host-dependent.
+    host_bin = tmp_path / "host-bin"
+    host_bin.mkdir()
+    systemctl = host_bin / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 4\n", encoding="utf-8")
+    systemctl.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{host_bin}{os.pathsep}{os.environ['PATH']}")
     fixture = write_fixture(
         git_repo / "github.json",
         issues={},
@@ -178,17 +187,43 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
             assert wait["next_action"] == "agent-run run 1"
             assert wait["timeout_resume_action"] == "agent-run run 1"
 
-        for command in ("status", "history"):
-            text = run_cli(git_repo, fixture, command, run_id).stdout
-            assert "等待 PR #1 的自动检查" in text
-            assert "已等待：" in text
-            assert "本轮最多还可等待：" in text
-            assert "fixture-required-check" in text
-            assert "等待完成" in text
-            assert "无法确认 Runner 是否仍在自动等待" in text
-            assert "agent-run doctor" in text
-            assert "截止=" not in text
-            assert "超时恢复:" not in text
+        _interrupt_run(process, git_repo)
+        state_files = {
+            path: path.read_bytes() for path in (git_repo / ".agent-run").rglob("*.json")
+        }
+        for host_exit, activity in ((4, "not_running"), (1, "unknown")):
+            # systemctl exit 4 confirms an absent unit; exit 1 cannot establish
+            # whether it is running, even after our fixture process has exited.
+            systemctl.write_text(f"#!/bin/sh\nexit {host_exit}\n", encoding="utf-8")
+            for command in ("status", "history"):
+                audit = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+                assert audit["executor_control"]["activity"] == activity
+                if activity == "unknown":
+                    assert audit["executor_control"]["reason"] == "executor_host_unknown"
+                human = run_cli(git_repo, fixture, command, run_id)
+                assert human.returncode == 0, human.stderr
+                text = human.stdout
+                assert "等待 PR #1 的合并前检查" in text
+                assert "已等待：" in text
+                assert "本轮最多还可等待：" in text
+                assert "fixture-required-check" in text
+                assert "等待完成" in text
+                if activity == "not_running":
+                    assert "自动等待已停止" in text
+                    assert "agent-run run 1 --repo example/project" in text
+                else:
+                    assert "无法确认后台等待是否仍在继续" in text
+                    assert "先核验原执行的归属和退出状态" in text
+                    assert "agent-run status --repo example/project --parent 1 --json" in text
+                    assert "自动等待已停止" not in text
+                    assert "agent-run run" not in text
+                    assert "agent-run resume" not in text
+                assert "agent-run doctor" not in text
+                assert "截止=" not in text
+                assert "超时恢复:" not in text
+        assert {
+            path: path.read_bytes() for path in (git_repo / ".agent-run").rglob("*.json")
+        } == state_files
     finally:
         _interrupt_run(process, git_repo)
 
@@ -259,13 +294,13 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     assert halted.returncode == 2
     state = load_only_run_state(git_repo)
     assert state["status"] == "requeue_required"
-    assert "交付状态: 需要重新排队" in halted.stdout
+    assert "交付状态: 需要按更新后的需求重新开始" in halted.stdout
     assert "下一步: agent-run requeue 1 --repo example/project" in halted.stdout
     assert "requeue_required" not in halted.stdout
     assert "<run-id>" not in halted.stdout
     for command in ("status", "history"):
         view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
-        assert "需要重新排队" in view.stdout
+        assert "需要按更新后的需求重新开始" in view.stdout
         assert "agent-run requeue 1 --repo example/project" in view.stdout
         assert run_id not in view.stdout
         assert "<run-id>" not in view.stdout
@@ -519,9 +554,9 @@ def test_public_run_supervises_non_repairable_final_check_failure(
     )
     assert status["supervision"]["kind"] == "github_convergence"
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"])).stdout
-    assert "类型: Supervision Timeout Pause" in status_view
-    assert "对象: Run Publication" in status_view
-    assert "阶段: waiting_external" in status_view
+    assert "类型: 自动等待已超时" in status_view
+    assert "对象: 整体交付" in status_view
+    assert "阶段: 等待 GitHub 操作结果" in status_view
     assert status["supervision"]["timeout_resume_action"] == (
         f"agent-run resume {state['run_id']}"
     )

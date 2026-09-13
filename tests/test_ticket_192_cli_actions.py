@@ -126,7 +126,7 @@ def _assert_human_status_and_history(
     history = _human_cli(repo, fixture, "history", run_id)
 
     assert status.returncode == history.returncode == 0
-    assert f"Status:     {status_term}" in status.stdout
+    assert f"状态:       {status_term}" in status.stdout
     assert next_action in status.stdout
     assert next_action in history.stdout
     assert run_id not in status.stdout
@@ -144,7 +144,7 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
         git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
     )
     assert started.returncode == 0, started.stdout
-    assert "交付状态: 等待父项人工批准" in started.stdout
+    assert "交付状态: 等待人工批准" in started.stdout
     assert "下一步: agent-run approve 1 --repo example/project" in started.stdout
     assert "parent_approval_pending" not in started.stdout
     assert "<run-id>" not in started.stdout
@@ -153,7 +153,7 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
         git_repo,
         fixture,
         run_id,
-        status_term="等待父项人工批准",
+        status_term="等待人工批准",
         next_action="agent-run approve 1 --repo example/project",
     )
 
@@ -163,7 +163,7 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
 
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     assert "操作: approve" in first.stdout
-    assert "动作状态: 已应用" in first.stdout
+    assert "动作状态: 最终交付已完成" in first.stdout
     assert "交付状态: 整个交付已完成" in first.stdout
     assert "下一步: 无" in first.stdout
     assert run_id not in first.stdout
@@ -386,7 +386,7 @@ def test_run_failure_receipt_recovers_the_durable_parent_run(
     run_id = str(state["run_id"])
     assert "Repository: example/project" in crashed.stdout
     assert "Parent Issue: #1" in crashed.stdout
-    assert "交付状态: 正在启动" in crashed.stdout
+    assert "交付状态: 正在初始化" in crashed.stdout
     assert "下一步: agent-run run 1 --repo example/project" in crashed.stdout
     assert run_id not in crashed.stdout
     assert "starting" not in crashed.stdout
@@ -395,7 +395,7 @@ def test_run_failure_receipt_recovers_the_durable_parent_run(
         git_repo,
         fixture,
         run_id,
-        status_term="正在启动",
+        status_term="正在初始化",
         next_action="agent-run run 1 --repo example/project",
     )
 
@@ -571,7 +571,7 @@ def test_default_interruption_output_hides_machine_run_identity(capsys) -> None:
     rendered = capsys.readouterr().out
     assert "操作状态: 已中断" in rendered
     assert "Parent Issue: #1" in rendered
-    assert "交付状态: 等待外部系统收敛" in rendered
+    assert "交付状态: 等待 GitHub 操作结果" in rendered
     assert "下一步: agent-run run 1 --repo example/project" in rendered
     assert "waiting_external" not in rendered
     assert "<run-id>" not in rendered

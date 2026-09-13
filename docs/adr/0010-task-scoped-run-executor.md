@@ -6,6 +6,8 @@ status: accepted
 
 后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 为 Executor 仍存活时的 Worker 普通异常增加一次同 Thread 自动恢复，并对准确容量错误允许持续恢复，并明确失联状态的耗时展示。Executor 自身消失后不自动重放、等待显式恢复的规则继续适用。
 
+后续修订：[ADR 0012](0012-noncancellable-final-approval.md) 将最终批准定义为执行期间不可取消、失败后显式恢复的完整交付操作。下文 `approve` 在意图应用和握手后返回并释放准入的原规则，以及可在此后停止最终交付的含义，由该 ADR 取代；恢复原最终批准操作的 `resume` 同样适用。其他动作、终端独立性、短锁和执行者所有权合同保持不变。
+
 后续有限修订（#226 / #227）：公开 `./setup.sh` 在统一确认后可一次性准备 Runner 宿主依赖，
 并汇总真实 user systemd、bubblewrap 与认证检查。以下“安装器不查询或提示 systemd”仍指
 底层 `./install.sh`，不限制外层 Setup 的执行就绪报告。Setup 不启用 linger、替换 init、

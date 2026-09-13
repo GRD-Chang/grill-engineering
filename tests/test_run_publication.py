@@ -396,8 +396,8 @@ def test_final_publication_human_resume_clears_current_blocker(
             str(state["run_id"]),
         )
         assert view.returncode == 0, view.stderr
-        assert "类型: Human Blocker" in view.stdout
-        assert "对象: Run Publication" in view.stdout
+        assert "类型: 需要人工处理" in view.stdout
+        assert "对象: 整体交付" in view.stdout
         if command == "status":
             assert "阶段:       等待人工处理" in view.stdout
         assert (
@@ -405,12 +405,12 @@ def test_final_publication_human_resume_clears_current_blocker(
             in view.stdout
         )
         assert (
-            "触发阻塞的 Agent: publication（发布 Agent）；model publication-model；"
-            "reasoning effort high；本轮时长: 0 秒"
+            "触发阻塞的 Agent: 发布 Agent；模型 publication-model；"
+            "推理强度 high；本轮时长: 0 秒"
             in view.stdout
         )
         assert (
-            "唯一下一步: agent-run resume 1 --repo example/project"
+            "下一步: agent-run resume 1 --repo example/project"
             in view.stdout
         )
     history = stdout_json(
@@ -824,3 +824,37 @@ def test_abandon_recovers_lost_final_run_pr_close_response(
         for mutation in publisher.data["delivery"]["mutations"]
         if mutation["action"] == "close_final_run_pr"
     ] == close_mutations
+
+
+def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+
+    class LostMergeResponse(FixtureGitHubPublisher):
+        def normal_merge(self, **authority: Any) -> str:
+            super().normal_merge(**authority)
+            raise OSError("merge applied before response")
+
+    publisher = LostMergeResponse(git_repo / "github.json", git)
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(), github=publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    run_id = str(state["run_id"])
+    engine.publish(run_id)
+    waiting = engine.approve(run_id)
+    assert waiting["status"] == "waiting_external"
+    pending = states.load_current_run(run_id)
+    assert pending is not None
+    original_grant = pending["run_publication"]["approval_grant"]
+    assert original_grant["base_sha"] != git.resolve("main")
+
+    resumed = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        default_branch="main", default_head_sha=git.resolve("main"),
+    ).approve(run_id)
+    assert resumed["status"] == "completed"
+    assert resumed["run_publication"]["approval_grant"] == original_grant
+    assert resumed["run_publication"]["merge_intent"]["attempts"] == 1

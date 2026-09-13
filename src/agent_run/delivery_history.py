@@ -15,9 +15,14 @@ from agent_run.delivery_status import (
     invocation_recovery_details,
 )
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS
+from agent_run.history_publication import group_final_pr_creation
 from agent_run.history_waits import collapse_check_waits
+from agent_run.operator_action_presentation import human_action_type, human_preserved_results
 from agent_run.presentation_helpers import (
     delivery_object_label,
+    human_delivery_object,
+    human_pause_reason,
+    human_status_term,
     human_next_action,
     terminal_safe,
 )
@@ -58,7 +63,13 @@ def _history_turning_points(
                 else []
             )
             kind = _human_timeline_kind(raw, details)
-            details.extend(_scope_change_details(raw))
+            if (
+                kind == "publication" and raw.get("semantic_attempt_id")
+                and raw.get("status") == "run_publication_pending"
+                and raw.get("pr_number") is None
+            ):
+                continue
+            details.extend(_scope_change_details(raw, human=True))
             event = {
                 "at": timestamp,
                 "kind": kind,
@@ -156,7 +167,7 @@ def _history_turning_points(
     for point in points:
         point.pop("_order", None)
         point.pop("_human_blocker_occurrence", None)
-    return collapse_check_waits(points)
+    return group_final_pr_creation(collapse_check_waits(points))
 
 
 def _collapse_human_blocker_snapshots(
@@ -334,14 +345,14 @@ def print_history_progress(
     timezone, timezone_label = _local_timezone()
     parent = state.get("parent")
     parent_view = parent if isinstance(parent, dict) else {}
-    print(f"Repository: {_safe_text(state.get('repository') or 'unknown')}")
+    print(f"仓库:       {_safe_text(state.get('repository') or '未知')}")
     print(
-        "Parent:     "
+        "整体需求:   "
         f"#{_safe_text(parent_view.get('number', '?'))} "
-        f"{_safe_text(parent_view.get('title') or '未命名 Parent')}"
+        f"{_safe_text(parent_view.get('title') or '未命名整体需求')}"
     )
-    print(f"Time zone: {timezone_label}")
-    print(f"Elapsed:   {_duration(progress['summary']['elapsed_seconds'])}")
+    print(f"时区:       {timezone_label}")
+    print(f"任务历时:   {_duration(progress['summary']['elapsed_seconds'])}")
     executor_control = audit.get("executor_control")
     if (
         isinstance(executor_control, dict)
@@ -357,7 +368,7 @@ def print_history_progress(
             for line in _record_lines(record, timezone=timezone, details=details):
                 print(line)
     else:
-        print("  尚无可确认的 Semantic Agent Attempt 记录")
+        print("  尚无可确认的 Agent 工作记录")
     cleanup_lines = _cleanup_history_lines(state, details=details)
     if cleanup_lines:
         print("\n交付清理")
@@ -414,6 +425,7 @@ def print_rich_history_progress(
     """Render a bounded, static Rich timeline for an interactive terminal."""
 
     from rich.console import Console
+    from rich.padding import Padding
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -431,7 +443,7 @@ def print_rich_history_progress(
             "任务",
             f"{state.get('repository') or 'unknown'} · "
             f"#{parent_view.get('number', '?')} "
-            f"{parent_view.get('title') or '未命名 Parent'}",
+            f"{parent_view.get('title') or '未命名整体需求'}",
         ),
         _rich_line("时区", timezone_label),
         _rich_line("任务历时", _duration(progress["summary"]["elapsed_seconds"])),
@@ -456,28 +468,31 @@ def print_rich_history_progress(
         )
         body.append(Text(""))
     if not records:
-        body.append(Text("  尚无可确认的 Semantic Agent Attempt 记录"))
+        body.append(Text("  尚无可确认的 Agent 工作记录"))
     cleanup_lines = _cleanup_history_lines(state, details=details)
     if cleanup_lines:
         body.extend([Text(""), Text("交付清理", style="bold")])
         body.extend(Text(line) for line in cleanup_lines)
     action = audit.get("operator_action")
     if isinstance(action, dict):
-        body.extend([Text(""), Text("当前操作边界", style="bold yellow")])
-        body.append(Text(f"  类型：{_safe_text(action.get('type') or '未记录')}"))
+        body.extend([Text(""), Text("需要你处理", style="bold yellow")])
+        body.append(Text(f"  类型：{_safe_text(human_action_type(action.get('type')))}"))
         reasons = action.get("reasons")
         if isinstance(reasons, list):
             for reason in reasons:
-                value = _safe_text(reason)
+                value = _safe_text(
+                    reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
+                )
                 if not details:
                     value = _truncate_history_detail(value)
                 body.append(Text(f"  原因：{value}"))
         preserved = action.get("preserved")
         if preserved is not None:
-            body.append(Text(f"  已保留成果：{_safe_text(preserved)}"))
+            body.append(Text(f"  已保留成果：{_safe_text(human_preserved_results(preserved))}"))
         phase = action.get("phase")
         if phase is not None:
-            body.append(Text(f"  阻塞阶段：{_safe_text(phase)}"))
+            body.append(Text(f"  所在阶段：{_safe_text(human_status_term(phase))}"))
+        body.append(Text("整项任务已暂停，其他子任务也不会继续。"))
     body.extend(
         [
             Text(""),
@@ -532,7 +547,8 @@ def print_rich_history_progress(
     table = Table.grid(expand=True, padding=(0, 0))
     table.add_column(no_wrap=False, overflow="fold")
     for line in body:
-        table.add_row(line)
+        indent = len(line.plain) - len(line.plain.lstrip(" "))
+        table.add_row(Padding(line[indent:], (0, 0, 0, indent)) if indent else line)
     console.print(
         Panel(
             table,
@@ -596,7 +612,7 @@ def history_records(
             continue
         attempt_id = raw.get("semantic_attempt_id")
         if isinstance(attempt_id, str) and raw.get("kind") not in {
-            "required_checks", "integration", "completion", "approval", "supervision", "abandonment",
+            "required_checks", "integration", "completion", "approval", "supervision", "abandonment", "pr_creation",
         }:
             event_by_attempt.setdefault(attempt_id, []).append(raw)
         elif _is_history_turning_point(raw):
@@ -780,7 +796,7 @@ def _finalize_event_record(state: dict[str, Any], record: dict[str, Any]) -> Non
     end = _parse_optional_timestamp(record["ended_at"])
     record["span_seconds"] = (
         max(0, int((end - start).total_seconds()))
-        if event.get("kind") in {"required_checks", "approval"} and start and end else None
+        if event.get("kind") in {"required_checks", "approval", "pr_creation"} and start and end else None
     )
     record["execution_seconds"] = None
     record["resumption_count"] = 0
@@ -1598,6 +1614,7 @@ def _is_history_turning_point(event: dict[str, Any]) -> bool:
         "integration",
         "completion",
         "publication",
+        "pr_creation",
         "approval",
         "resume",
         "unsupported_scope_change",
@@ -1648,7 +1665,7 @@ def _record_lines(
     finding_values = record.get("findings")
     findings = finding_values if isinstance(finding_values, list) else []
     title = (
-        f"{_safe_text(record.get('object') or 'Delivery Run')} · "
+        f"{_safe_text(human_delivery_object(record.get('object') or 'Delivery Run'))} · "
         f"{_safe_text(record.get('role_label') or 'Agent')} {round_text} · "
         f"{_safe_text(record.get('status_text') or '未知')}"
     )
@@ -1710,11 +1727,10 @@ def _record_lines(
         for point in turning_points:
             if not isinstance(point, dict):
                 continue
-            point_status = _turning_point_status(point)
             point_details = point.get("details")
             lines.append(
                 f"      {_format_local_timestamp(point.get('at'), timezone)} · "
-                f"{_turning_point_kind(point)}：{_safe_text(point_status)}"
+                f"{_event_title(point)}"
             )
             if isinstance(point_details, list):
                 lines.extend(
@@ -1742,17 +1758,16 @@ def _event_record_lines(
         {},
     )
     lines = [
-        f"  {_safe_text(record.get('object') or 'Delivery Run')} · 关键节点",
+        f"  {_safe_text(human_delivery_object(record.get('object') or 'Delivery Run'))} · {_event_title(point)}",
         f"    时间：{_format_local_timestamp(point.get('at'), timezone)}",
-        f"    事件：{_turning_point_kind(point)}；结果：{_safe_text(_turning_point_status(point))}",
     ]
-    if point.get("kind") in {"required_checks", "approval"}:
+    if point.get("kind") in {"required_checks", "approval", "pr_creation"} and record.get("span_seconds"):
         lines[1] = (
             f"    时间区间：{_format_local_timestamp(record.get('started_at'), timezone)} → "
             f"{_format_local_timestamp(record.get('ended_at'), timezone)}"
         )
-        if record.get("span_seconds"):
-            lines.append(f"    Runner 观测到的等待：{_duration(record['span_seconds'])}")
+        if point.get("kind") != "pr_creation":
+            lines.append(f"    记录到的等待时间：{_duration(record['span_seconds'])}")
     point_details = point.get("details")
     if isinstance(point_details, list):
         lines.extend(
@@ -1760,15 +1775,48 @@ def _event_record_lines(
             for value in point_details
         )
     lines.extend(_turning_point_evidence_lines(point, timezone=timezone, details=details))
+    if details:
+        for step in point.get("creation_steps", []):
+            lines.append(f"      {_format_local_timestamp(step['at'], timezone)} · {step['action']}")
     return lines
+
+
+def _event_title(point: dict[str, Any]) -> str:
+    kind = point.get("kind")
+    if kind == "pr_creation":
+        return f"最终 PR #{point['pr_number']} 已创建"
+    if kind == "completion":
+        return "交付已放弃" if point.get("status") == "abandoned" else "整体交付完成"
+    if kind == "integration":
+        if point.get("status") == "parent_closeout_pending":
+            return "代码已合并，正在关闭整体需求 Issue"
+        return "代码已合并" if point.get("commit_sha") else "合并代码"
+    if kind == "approval":
+        return "已获人工批准" if point.get("approval_granted_at") else "等待人工批准"
+    if kind == "required_checks":
+        return _turning_point_status(point)
+    if kind == "publication":
+        return (
+            f"创建／更新 PR #{point['pr_number']}"
+            if point.get("pr_number") is not None else "准备提交代码与创建 PR"
+        )
+    action = point.get("github_write_action")
+    if action in {"ensure_final_run_ref", "create_final_pr", "refresh_final_pr_narrative"}:
+        label = {
+            "ensure_final_run_ref": "准备远端分支",
+            "create_final_pr": "创建最终 PR",
+            "refresh_final_pr_narrative": "更新最终 PR 说明",
+        }[action]
+        return f"{label} · {_turning_point_status(point)}"
+    return f"{_turning_point_kind(point)} · {_turning_point_status(point)}"
 
 
 def _budget_line(record: dict[str, Any]) -> str:
     if _role_family(str(record.get("role") or "")) == "publication":
-        return "业务预算：不适用（发布阶段）"
+        return "执行额度：不适用（编写发布说明）"
     facts = record.get("budget_facts")
     if not isinstance(facts, dict):
-        return "预算窗口：未记录；Development 用量=未记录 / 未记录；Review 用量=未记录 / 未记录"
+        return "本轮开始时已用：开发次数未记录；验收次数未记录"
     window = facts.get("window")
     window_text = window if isinstance(window, int) else "未记录"
     development = _budget_fraction(
@@ -1778,8 +1826,8 @@ def _budget_line(record: dict[str, Any]) -> str:
         facts.get("reviewer_invocations"), facts.get("reviewer_limit")
     )
     return (
-        f"预算窗口：{window_text}；Development 用量={development}；"
-        f"Review 用量={review}"
+        f"第 {window_text} 次授权额度；本轮开始时已用：开发 {development} 次；"
+        f"验收 {review} 次"
     )
 
 
@@ -1837,7 +1885,7 @@ def _append_check_observation_detail(
     observation: object,
     *,
     indent: str,
-    result_label: str = "自动检查结果",
+    result_label: str = "合并前检查结果",
 ) -> None:
     if not isinstance(observation, dict):
         return
@@ -1850,21 +1898,17 @@ def _append_check_observation_detail(
     _append_detail_scalar(
         lines,
         indent=indent,
-        label="检查提交",
-        value=observation.get("head_sha"),
-    )
-    _append_detail_scalar(
-        lines,
-        indent=indent,
         label=result_label,
-        value=_first_detail_value(observation, ("result", "status", "conclusion")),
+        value=human_status_term(_first_detail_value(observation, ("result", "status", "conclusion"))),
     )
     _append_detail_scalar(
         lines,
         indent=indent,
-        label="检查观测时间",
-        value=_first_detail_value(
-            observation, ("observed_at", "required_checks_observed_at")
+        label="检查结果获取时间",
+        value=(
+            _format_local_timestamp(observed_at, _local_timezone()[0])
+            if (observed_at := _first_detail_value(observation, ("observed_at", "required_checks_observed_at")))
+            else None
         ),
     )
     checks = observation.get("checks")
@@ -1883,9 +1927,8 @@ def _append_check_observation_detail(
         if isinstance(name, (str, int, float, bool)):
             details.append(f"名称={_safe_text(name)}")
         if isinstance(result, (str, int, float, bool)):
-            details.append(f"结果={_safe_text(result)}")
+            details.append(f"结果={_safe_text(human_status_term(result))}")
         for key, label in (
-            ("state", "状态"),
             ("workflow", "工作流"),
             ("link", "链接"),
             ("description", "说明"),
@@ -1908,13 +1951,20 @@ def _git_integrity_detail_lines(
         ("expected_head", "期望 HEAD"),
         ("observed_head", "实际 HEAD"),
         ("base_sha", "基础 HEAD"),
-        ("previous_candidate_sha", "上一个 Candidate"),
+        ("previous_candidate_sha", "上一个代码版本"),
         ("workspace_clean", "工作区清洁"),
         ("recovery_head", "恢复后 HEAD"),
-        ("recovery_action", "恢复动作"),
+        ("recovery_action", "恢复方式"),
         ("recovery_error", "恢复错误"),
     ):
-        _append_detail_scalar(lines, indent=indent, label=label, value=evidence.get(key))
+        value = evidence.get(key)
+        if key == "status":
+            value = human_status_term(value)
+        elif key == "workspace_clean" and isinstance(value, bool):
+            value = "是" if value else "否"
+        elif key == "recovery_action" and value == "controller_reset_and_clean":
+            value = "恢复已保存版本并清理工作区"
+        _append_detail_scalar(lines, indent=indent, label=label, value=value)
     return lines
 
 
@@ -1931,31 +1981,28 @@ def _supporting_record_detail_lines(
     """
 
     lines: list[str] = []
+    mode_text = {
+        "configured": "已配置合并前检查", "not_configured": "未配置合并前检查",
+    }.get(str(_required_checks_mode(value)))
     if kind == "required_checks_evidence":
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="门禁模式",
-            value=_required_checks_mode(value),
-        )
+        if mode_text:
+            lines.append(f"      {mode_text}")
         _append_check_observation_detail(lines, value, indent="      ")
         return lines
 
     if kind == "deterministic_integration_record":
-        _append_detail_scalar(
-            lines, indent="      ", label="来源", value=value.get("source")
-        )
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="门禁模式",
-            value=_required_checks_mode(value),
-        )
+        source = value.get("source")
+        if source == "accepted":
+            lines.append("      验收通过后合并")
+        elif source == "fallback":
+            lines.append("      通过兜底校验后合并，未经独立验收通过")
+        if mode_text:
+            lines.append(f"      {mode_text}")
         _append_detail_scalar(
             lines,
             indent="      ",
-            label="自动检查结果",
-            value=_first_detail_value(value, ("required_checks", "required_checks_result")),
+            label="合并前检查结果",
+            value=human_status_term(_first_detail_value(value, ("required_checks", "required_checks_result"))),
         )
         _append_detail_scalar(
             lines, indent="      ", label="PR 编号", value=value.get("pr_number")
@@ -1963,20 +2010,8 @@ def _supporting_record_detail_lines(
         pr = value.get("pr")
         if isinstance(pr, dict):
             _append_detail_scalar(
-                lines, indent="      ", label="PR 状态", value=pr.get("state")
+                lines, indent="      ", label="PR 状态", value=human_status_term(pr.get("state"))
             )
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="发布提交",
-            value=value.get("publication_sha"),
-        )
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="集成提交",
-            value=value.get("integrated_sha"),
-        )
         _append_detail_scalar(
             lines,
             indent="      ",
@@ -1985,35 +2020,20 @@ def _supporting_record_detail_lines(
         )
         evidence = value.get("required_checks_evidence")
         if isinstance(evidence, dict):
-            lines.append("      自动检查证据")
+            lines.append("      合并前检查证据")
             _append_check_observation_detail(lines, evidence, indent="        ")
         return lines
 
     if kind == "fallback_publication_receipt":
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="发布路径",
-            value=value.get("repair_source") or "兜底发布",
-        )
+        lines.append("      验收额度已用尽，按兜底校验发布；不代表独立验收通过")
         _append_detail_scalar(
             lines, indent="      ", label="PR 编号", value=value.get("pr_number")
         )
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="发布提交",
-            value=value.get("publication_sha"),
-        )
-        _append_detail_scalar(
-            lines,
-            indent="      ",
-            label="门禁模式",
-            value=_required_checks_mode(value),
-        )
+        if mode_text:
+            lines.append(f"      {mode_text}")
         evidence = value.get("required_checks_evidence")
         if isinstance(evidence, dict):
-            lines.append("      自动检查证据")
+            lines.append("      合并前检查证据")
             _append_check_observation_detail(lines, evidence, indent="        ")
         source = value.get("failure_evidence_source")
         failure_evidence = (
@@ -2045,7 +2065,7 @@ def _supporting_record_detail_lines(
                             continue
                         _append_detail_scalar(
                             failure_lines, indent="        ", label=lane_label,
-                            value=check.get("status"),
+                            value=human_status_term(check.get("status")),
                         )
                         _append_detail_scalar(
                             failure_lines, indent="          ", label="证据",
@@ -2075,9 +2095,9 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
     lines: list[str] = []
     summary = record.get("development_summary")
     if isinstance(summary, str) and summary.strip():
-        lines.extend(["    Development Summary", f"      {_safe_text(summary)}"])
+        lines.extend(["    开发说明", f"      {_safe_text(summary)}"])
     elif record.get("role") == "development":
-        lines.append("    Development Summary：未记录")
+        lines.append("    开发说明：未记录")
     artifact = record.get("acceptance_artifact")
     if isinstance(artifact, dict):
         checks = artifact.get("checks")
@@ -2098,7 +2118,7 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
                     lines.append(f"      {label}：未记录")
                     continue
                 lines.append(
-                    f"      {label}：{_safe_text(check.get('status') or '未知')}"
+                    f"      {label}：{_safe_text(human_status_term(check.get('status') or '未知'))}"
                 )
                 evidence = check.get("evidence")
                 if isinstance(evidence, str) and evidence.strip():
@@ -2121,16 +2141,13 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
                 lines.append(f"      {label}：{_safe_text(value)}")
         for key, label in (
             ("pr_number", "PR 编号"),
-            ("integrated_sha", "集成提交"),
-            ("required_checks_result", "自动检查结果"),
-            ("required_checks_observed_at", "自动检查观测时间"),
         ):
             value = publication.get(key)
             if value is not None:
                 lines.append(f"      {label}：{_safe_text(value)}")
     invocations = record.get("invocations")
     if isinstance(invocations, list) and invocations:
-        lines.append("    Invocation 明细")
+        lines.append("    本轮执行记录")
         for index, invocation in enumerate(invocations, start=1):
             if not isinstance(invocation, dict):
                 continue
@@ -2152,22 +2169,22 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
             )
             lines.append(
                 f"      {index}：{started} → {ended}；"
-                f"状态={_safe_text(invocation.get('status') or '未记录')}；"
+                f"状态={_safe_text(human_status_term(invocation.get('status') or '未记录'))}；"
                 f"时长={_duration(duration)}"
             )
             lines.append(
                 f"        模型={_safe_text(invocation.get('model') or '未记录')}；"
-                f"推理强度={_safe_text(invocation.get('reasoning_effort') or '未记录')}；"
-                f"输出续接={_output_continuation_text(invocation.get('attempt_count'))} 次"
+                f"推理强度={_safe_text(invocation.get('reasoning_effort') or '未记录')}"
             )
+            if isinstance(invocation.get("attempt_count"), int) and invocation["attempt_count"] > 1:
+                lines.append(f"        输出续接={_output_continuation_text(invocation['attempt_count'])} 次")
+            elif invocation.get("attempt_count") is None:
+                lines.append("        输出续接次数：未记录")
             for key, label in (
                 ("error", "错误"),
-                ("machine_error", "机器错误"),
                 ("validation_error", "验证错误"),
-                ("failure_reason", "失败原因"),
                 ("interruption_observed_at", "中断观测时间"),
                 ("last_failure_at", "最近失败时间"),
-                ("resume_id", "恢复 ID"),
                 ("signal", "信号"),
                 ("return_code", "返回码"),
             ):
@@ -2175,17 +2192,11 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
                 if value is not None and (
                     not isinstance(value, str) or value.strip()
                 ):
+                    if key in {"interruption_observed_at", "last_failure_at"}:
+                        value = _format_local_timestamp(value, timezone)
                     lines.append(f"        {label}：{_safe_text(value)}")
     supporting = record.get("supporting_records")
     if isinstance(supporting, list):
-        recorded_kinds = {
-            item.get("kind")
-            for item in supporting
-            if isinstance(item, dict)
-        }
-        for kind in _SUPPORTING_RECORD_KEYS:
-            if kind not in recorded_kinds:
-                lines.append(f"    {_supporting_label(kind)}：未记录")
         for item in supporting:
             if not isinstance(item, dict) or not isinstance(item.get("value"), dict):
                 continue
@@ -2224,8 +2235,8 @@ def _cleanup_history_lines(state: dict[str, Any], *, details: bool) -> list[str]
         )
         if details:
             recovery_kind = item.get("recovery_kind")
-            if recovery_kind is not None:
-                lines.append(f"    恢复类型：{_safe_text(recovery_kind)}")
+            if recovery_kind == "stale_dirty_checkout":
+                lines.append("    保留原因：工作区仍有未提交修改")
             item_error = item.get("last_error")
             if item_error is not None:
                 lines.append(f"    项错误：{_safe_text(item_error)}")
@@ -2244,20 +2255,21 @@ def _turning_point_evidence_lines(
     point: dict[str, Any], *, timezone: tzinfo, details: bool
 ) -> list[str]:
     lines: list[str] = []
-    for key, label in (
-        ("pr_number", "PR 编号"),
-        ("commit_sha", "提交"),
-        ("required_checks_result", "自动检查结果"),
+    if point.get("pr_number") is not None and point.get("kind") != "pr_creation":
+        lines.append(f"        PR 编号：{_safe_text(point['pr_number'])}")
+    if (
+        point.get("kind") not in {"required_checks", "pr_creation"}
+        and point.get("required_checks_signature") is None
+        and point.get("required_checks_result") is not None
     ):
-        value = point.get(key)
-        if value is not None:
-            lines.append(f"        {label}：{_safe_text(value)}")
-    if point.get("approval_granted_at") is not None:
-        lines.append(f"        批准时间：{_format_local_timestamp(point['approval_granted_at'], timezone)}")
+        # Older records may only retain this result on the completion event.
+        # Without an observation identity, do not assume a separate check
+        # record already carries it.
+        lines.append(f"        合并前检查结果：{_safe_text(human_status_term(point['required_checks_result']))}")
     observed_at = point.get("required_checks_observed_at")
-    if observed_at is not None:
+    if details and point.get("kind") == "required_checks" and observed_at is not None:
         lines.append(
-            "        自动检查观测时间："
+            "        检查结果获取时间："
             f"{_format_local_timestamp(observed_at, timezone)}"
         )
     next_action = point.get("next_action")
@@ -2267,19 +2279,33 @@ def _turning_point_evidence_lines(
             value = _truncate_history_detail(value)
         lines.append(f"        下一步：{value}")
     evidence = point.get("required_checks_evidence")
-    if details and isinstance(evidence, dict) and (
+    if point.get("kind") == "required_checks" and isinstance(evidence, dict) and (
         evidence.get("checks") or evidence.get("omitted_checks")
     ):
-        lines.append("        自动检查证据：")
-        _append_check_observation_detail(lines, evidence, indent="          ")
-        if evidence.get("omitted_checks"):
+        checks = evidence.get("checks")
+        if isinstance(checks, list):
+            names = dict.fromkeys(
+                str(check["name"]) for check in checks
+                if isinstance(check, dict) and check.get("name")
+            )
+            if names:
+                lines.append(f"        检查名称：{_safe_text('、'.join(names))}")
+        if details:
+            lines.append("        合并前检查证据：")
+            _append_check_observation_detail(lines, evidence, indent="          ")
+        if details and evidence.get("omitted_checks"):
             lines.append(f"          另有 {evidence['omitted_checks']} 项未保留明细")
     reason = point.get("external_wait_reason")
-    if isinstance(reason, dict) and reason.get("message"):
+    if (
+        isinstance(reason, dict) and reason.get("message")
+        and not (
+            reason.get("code") == "github_write_pending"
+            and point.get("github_write_action") in {
+                "ensure_final_run_ref", "create_final_pr", "refresh_final_pr_narrative",
+            }
+        )
+    ):
         lines.append(f"        外部情况：{_safe_text(reason['message'])}")
-    result = point.get("result")
-    if details and result is not None:
-        lines.append(f"        结果：{_safe_text(result)}")
     return lines
 
 
@@ -2307,11 +2333,10 @@ def _full_finding_lines(finding: str, *, indent: str) -> list[str]:
     match = _FINDING.fullmatch(finding)
     if match is None:
         return [f"{indent}问题原文：{_safe_text(finding)}"]
-    lines = [f"{indent}{_safe_text(finding)}"]
-    lines.extend(
+    lines = [
         f"{indent}{label}：{_safe_text(value)}"
         for label, value in zip(("问题", "证据", "必须修复", "复验"), match.groups())
-    )
+    ]
     return lines
 
 
@@ -2329,17 +2354,17 @@ def _finding_question(finding: object) -> str:
 def _record_action(record: dict[str, Any]) -> str:
     role = _role_family(str(record.get("role") or ""))
     return {
-        "development": "开发候选",
-        "review": "验收候选",
-        "publication": "发布候选",
+        "development": "实现任务",
+        "review": "验收代码",
+        "publication": "编写提交与 PR 说明",
     }.get(role or "", "交付状态变更")
 
 
 def _turning_point_kind(event: dict[str, Any]) -> str:
     return {
         "human_blocker": "人工阻塞",
-        "supervision": "监督边界",
-        "required_checks": "自动检查",
+        "supervision": "确认外部操作结果",
+        "required_checks": "合并前检查",
         "integration": "集成",
         "publication": "发布",
         "approval": "人工批准",
@@ -2355,12 +2380,12 @@ def _turning_point_status(event: dict[str, Any]) -> str:
         return "已批准" if event.get("approval_granted_at") else "等待人工批准"
     if event.get("kind") == "required_checks":
         if event.get("required_checks_observation_status") in {"unavailable", "unknown"}:
-            return "自动检查结果无法读取"
+            return "合并前检查结果无法读取"
         return {
-            "pending": "等待自动检查", "pass": "自动检查通过",
-            "none": "未配置自动检查", "fail": "自动检查失败",
-            "unknown": "自动检查结果未知",
-        }.get(str(event.get("required_checks_result")), "自动检查结果未知")
+            "pending": "等待合并前检查", "pass": "合并前检查通过",
+            "none": "未配置合并前检查", "fail": "合并前检查失败",
+            "unknown": "合并前检查结果未知",
+        }.get(str(event.get("required_checks_result")), "合并前检查结果未知")
     if event.get("kind") == "resume":
         return "人工恢复/继续"
     if event.get("activity") == "interrupted":
@@ -2371,33 +2396,7 @@ def _turning_point_status(event: dict[str, Any]) -> str:
         return "模型容量不足，等待自动续接"
     if event.get("activity") == "recovery_wait":
         return "执行异常，等待自动续接"
-    return {
-        "completed": "已完成",
-        "abandoned": "已放弃",
-        "abandonment_pending": "等待放弃处理",
-        "deterministic_contradiction": "存在确定性矛盾",
-        "waiting_checks": "等待自动检查",
-        "waiting_external": "等待外部条件",
-        "waiting_merge": "等待集成",
-        "ready_for_human": "等待人工处理",
-        "parent_approval_pending": "等待父项人工批准",
-        "parent_closeout_pending": "等待父项收口",
-        "run_approval_pending": "等待人工批准",
-        "run_acceptance_pending": "等待运行整体验收",
-        "run_publication_pending": "等待运行发布",
-        "abandonment_pending": "等待放弃恢复",
-        "operator_stopped": "操作者已停止，可恢复",
-        "supervision_timeout": "监督超时暂停，可恢复",
-        "execution_failed": "执行失败，可恢复",
-        "requeue_required": "需要重新排队",
-        "parent_delivery_pending": "等待 Parent 交付",
-        "ticket_completed": "Ticket 已完成",
-        "progress_exhausted": "推进次数已耗尽",
-        "unsupported_scope_change": "不支持的范围变化",
-    }.get(
-        str(event.get("status") or ""),
-        _safe_text(event.get("status") or event.get("kind") or "状态变化"),
-    )
+    return str(human_status_term(event.get("status") or "状态变化"))
 
 
 def _format_local_timestamp(value: object, timezone: tzinfo) -> str:
@@ -2722,7 +2721,7 @@ def _timeline_kind(event: dict[str, Any], details: list[str]) -> str:
     return kind
 
 
-def _scope_change_details(event: dict[str, Any]) -> list[str]:
+def _scope_change_details(event: dict[str, Any], *, human: bool = False) -> list[str]:
     if event.get("kind") != "unsupported_scope_change":
         return []
     summary = event.get("graph_change_summary")
@@ -2733,8 +2732,8 @@ def _scope_change_details(event: dict[str, Any]) -> list[str]:
     if isinstance(headline, str):
         details.append(headline)
     for key, label in (
-        ("added_tickets", "新增 Ticket"),
-        ("removed_tickets", "移除 Ticket"),
+        ("added_tickets", "新增子任务" if human else "新增 Ticket"),
+        ("removed_tickets", "移除子任务" if human else "移除 Ticket"),
     ):
         values = summary.get(key)
         if isinstance(values, list) and values:
@@ -2812,15 +2811,17 @@ def _artifact_outcome(artifact: dict[str, Any]) -> str:
 
 def _supporting_label(kind: str) -> str:
     return {
-        "required_checks_evidence": "自动检查证据",
-        "deterministic_integration_record": "确定性集成记录",
-        "fallback_publication_receipt": "发布回执",
+        "required_checks_evidence": "合并前检查证据",
+        "deterministic_integration_record": "PR 合并记录",
+        "fallback_publication_receipt": "兜底发布记录",
     }.get(kind, kind)
 
 
 def _round_label(key: str) -> str:
     scope, _, role = key.partition("_")
-    return f"{scope.title()} {'Review' if role == 'review' else role.title()}"
+    subject = {"ticket": "子任务", "parent": "整体任务", "run": "整体"}.get(scope, "任务")
+    action = {"development": "开发", "review": "验收", "publication": "发布说明"}.get(role, "执行")
+    return f"{subject}{action}"
 
 
 def _invocation_attempt_view(invocation: dict[str, Any]) -> dict[str, Any]:
@@ -2994,7 +2995,7 @@ def _operator_instruction(
         return "你暂时无需操作。"
     if state.get("status") in {"completed", "abandoned"}:
         return "无需操作。"
-    return "按上述命令继续；不要重复启动另一个 Run。"
+    return "按上述命令继续；不要重复启动同一项任务。"
 
 
 def _current_wait_lines(state: dict[str, Any], audit: dict[str, Any]) -> list[str]:

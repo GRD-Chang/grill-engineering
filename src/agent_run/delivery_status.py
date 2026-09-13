@@ -9,11 +9,24 @@ if TYPE_CHECKING:
     from rich.text import Text
 
 from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
+from agent_run.final_approval_operation import final_approval_cleanup_pending
+from agent_run.operator_action_presentation import (
+    human_action_type,
+    human_preserved_results,
+)
 from agent_run.presentation_helpers import (
     current_work_subject,
     delivery_object_label,
+    human_ci_fix_usage,
+    human_delivery_object,
+    human_agent_role,
     human_next_action,
+    human_pause_reason,
+    human_status_term,
+    local_timestamp,
     terminal_safe,
+    status_diagnostic_command,
+    unknown_execution_guidance,
 )
 
 
@@ -198,11 +211,17 @@ def execution_guidance(
     if activity == "interrupted":
         guidance = "执行已中断，等待恢复"
         if include_resume_command:
-            guidance += (
-                f"；使用 agent-run resume {state.get('run_id')} 继续原工作"
+            parent = state.get("parent")
+            number = parent.get("number") if isinstance(parent, dict) else None
+            repository = state.get("repository")
+            command = (
+                f"agent-run resume {number} --repo {repository}"
+                if type(number) is int and isinstance(repository, str)
+                else "agent-run resume <run-id>"
             )
+            guidance += f"；使用 {command} 继续原工作"
         return f"{guidance}。"
-    return "运行状态无法确认；请先检查 Executor Host 与 Task Control，再决定是否恢复。"
+    return unknown_execution_guidance(state, include_command=include_resume_command)
 
 
 def print_status_progress(
@@ -214,72 +233,43 @@ def print_status_progress(
     print_operator_action: Callable[[dict[str, Any]], None],
 ) -> None:
     parent = view["parent"]
-    print(f"Repository: {_terminal_safe(view['repository'] or 'unknown')}")
+    print(f"仓库:       {_terminal_safe(view['repository'] or '未知')}")
     print(
-        "Parent:     "
+        "整体需求:   "
         f"#{_terminal_safe(parent.get('number', '?'))} "
-        f"{_terminal_safe(parent.get('title') or '未命名 Parent')}"
+        f"{_terminal_safe(parent.get('title') or '未命名需求')}"
     )
-    print(f"Status:     {_terminal_safe(display_term(view['status']))}")
+    status_label = (
+        "已合并，待清理" if state.get("status") == "completed"
+        and final_approval_cleanup_pending(state) else display_term(view["status"])
+    )
+    print(f"状态:       {_terminal_safe(status_label)}")
     phase = _phase_term(view["phase"], view["current_object"], display_term)
     print(
         f"阶段:       {_terminal_safe(phase if phase is not None else '未进入具体阶段')}"
     )
-    print(f"结论:       {_terminal_safe(view['conclusion'])}")
-    print(f"当前对象:   {_terminal_safe(view['current_object'])}")
+    print(f"结论:       {_terminal_safe(_human_conclusion(view['conclusion']))}")
+    print(f"当前对象:   {_terminal_safe(human_delivery_object(view['current_object']))}")
 
     print("\n进度")
     tickets = view["ticket_progress"]
     if tickets["total"]:
-        print(f"  Tickets              {tickets['completed']} / {tickets['total']} 已完成")
+        print(f"  子任务               {tickets['completed']} / {tickets['total']} 已完成")
     rounds = view["round_progress"]
     if rounds is not None:
-        print(
-            f"  {rounds['development_label']:<20}"
-            f"{rounds['development_attempts']} / {rounds['development_limit']} 轮"
-        )
-        print(
-            f"  {rounds['review_label']:<20}"
-            f"{rounds['reviewer_invocations']} / {rounds['reviewer_limit']} 轮"
-        )
-        if rounds.get("cycle_development_attempts") is not None:
-            print(
-                f"  当前周期 {rounds['development_label']} "
-                f"{rounds['cycle_development_attempts']} 轮"
-                f"（Attempt #{rounds['development_attempt']}）"
-            )
-            print(
-                f"  当前周期 {rounds['review_label']} "
-                f"{rounds['cycle_review_attempts']} 轮"
-                f"（Attempt #{rounds['review_attempt']}）"
-            )
-        print(
-            f"  预算窗口 {rounds.get('window', '未知')}：Development "
-            f"{rounds.get('development_attempts')} / "
-            f"{rounds.get('development_limit')}，Review "
-            f"{rounds.get('reviewer_invocations')} / "
-            f"{rounds.get('reviewer_limit')}"
-        )
-        if rounds.get("checkpoint_reason"):
-            print(f"  预算暂停原因       {_terminal_safe(rounds['checkpoint_reason'])}")
-        print(
-            "  最终 CI 修复          "
-            f"{rounds.get('final_ci_fix_used')} / "
-            f"{rounds.get('final_ci_fix_limit')}"
-        )
+        for line in _round_details(rounds):
+            print(f"  {_terminal_safe(line)}")
     print(f"  总运行时长           {_duration(view['elapsed_seconds'])}")
 
     repair = view["run_repair"]
     if repair is not None:
-        print("\nRun Repair")
-        print(f"  Run Acceptance Generation {repair['acceptance_generation']}")
-        print(f"  Repair Cycle Generation {repair['repair_cycle_generation']}")
+        print("\n整体修复")
         print(
-            "  Candidate 验证状态 "
+            "  当前版本验收 "
             f"{_terminal_safe(display_term(repair['candidate_validation_status']))}"
         )
         print(
-            "  Code Modification Attempts "
+            "  代码修改 "
             f"{repair['code_modification_attempts']} / "
             f"{repair['code_modification_limit']}"
         )
@@ -319,14 +309,13 @@ def print_status_progress(
     else:
         agent_label = "当前 Agent" if agent["is_active"] else "最近 Agent"
         print(
-            f"  {agent_label}: {_terminal_safe(_human_role_label(agent['role']))} · "
-            f"{_terminal_safe(agent['object'])}（"
-            f"{_terminal_safe(_localized_role_label(agent['role']))}）"
+            f"  {agent_label}: {_terminal_safe(human_agent_role(agent['role']))} · "
+            f"{_terminal_safe(human_delivery_object(agent['object']))}"
         )
         print(f"  模型                  {_terminal_safe(agent['model'])}")
         print(f"  推理强度              {_terminal_safe(agent['reasoning_effort'])}")
         if agent.get("started_at"):
-            print(f"  开始时间              {_terminal_safe(agent['started_at'])}")
+            print(f"  开始时间              {local_timestamp(agent['started_at'])}")
         if agent["duration_seconds"] is None:
             print("  实际执行时长未知")
         if agent["duration_seconds"] is not None:
@@ -355,7 +344,7 @@ def print_status_progress(
                 "  恢复命令: "
                 f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
             )
-        else:
+        elif activity != "running":
             print(
                 "  下一步: "
                 f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
@@ -394,6 +383,10 @@ def print_rich_status_progress(
     console = Console(highlight=False, soft_wrap=False)
     raw_status = str(view.get("status") or "")
     status_style = _status_style(raw_status)
+    status_label = (
+        "已合并，待清理" if raw_status == "completed"
+        and final_approval_cleanup_pending(state) else _status_term(raw_status)
+    )
 
     parent = view.get("parent")
     parent_view = parent if isinstance(parent, dict) else {}
@@ -415,19 +408,19 @@ def print_rich_status_progress(
         "任务",
         f"{view.get('repository') or 'unknown'} · "
         f"#{parent_view.get('number', '?')} "
-        f"{parent_view.get('title') or '未命名 Parent'}",
+        f"{parent_view.get('title') or '未命名需求'}",
     )
     add_identity(
         "状态",
-        f"{_status_symbol(raw_status)} {view.get('conclusion')} · "
-        f"{_status_term(view.get('status'))}",
+        f"{_status_symbol(raw_status)} {_human_conclusion(view.get('conclusion'))} · "
+        f"{status_label}",
     )
     add_identity(
         "阶段",
         _phase_term(view.get("phase"), view.get("current_object"), _status_term)
         or "未进入具体阶段",
     )
-    add_identity("当前对象", view.get("current_object"))
+    add_identity("当前对象", human_delivery_object(view.get("current_object")))
 
     progress = view.get("ticket_progress")
     progress_text = "未知"
@@ -438,27 +431,12 @@ def print_rich_status_progress(
         )
     rounds = view.get("round_progress")
     if isinstance(rounds, dict):
-        progress_text += (
-            f"；当前周期 Development {rounds.get('cycle_development_attempts', '未知')} "
-            f"轮（Attempt #{rounds.get('development_attempt', '未知')}）；"
-            f"当前周期 Review {rounds.get('cycle_review_attempts', '未知')} "
-            f"轮（Attempt #{rounds.get('review_attempt', '未知')}）；"
-            f"预算窗口 {rounds.get('window', '未知')}：Development "
-            f"{rounds.get('development_attempts')} / "
-            f"{rounds.get('development_limit')}，Review "
-            f"{rounds.get('reviewer_invocations')} / {rounds.get('reviewer_limit')}"
-        )
-        if rounds.get("checkpoint_reason"):
-            progress_text += f"；预算暂停原因：{rounds['checkpoint_reason']}"
-        progress_text += (
-            f"；最终 CI 修复：{rounds.get('final_ci_fix_used')} / "
-            f"{rounds.get('final_ci_fix_limit')}"
-        )
+        progress_text += "；" + "；".join(_round_details(rounds))
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (
-            f"；Run Repair：第 {repair.get('repair_cycle_generation')} 轮，"
-            f"Candidate 验证 {_status_term(repair.get('candidate_validation_status'))}，"
+            "；整体修复："
+            f"当前版本验收 {_status_term(repair.get('candidate_validation_status'))}，"
             f"代码修改 {repair.get('code_modification_attempts')} / "
             f"{repair.get('code_modification_limit')}"
         )
@@ -472,12 +450,14 @@ def print_rich_status_progress(
     elif isinstance(agent, dict):
         label = "当前 Agent" if agent.get("is_active") else "最近 Agent"
         agent_text = (
-            f"{label}：{_rich_role_label(agent.get('role'))} · "
-            f"{agent.get('object') or 'Delivery Run'}\n"
+            f"{label}：{human_agent_role(agent.get('role'))} · "
+            f"{human_delivery_object(agent.get('object'))}\n"
             f"模型：{agent.get('model') or '未绑定'}；推理强度："
             f"{agent.get('reasoning_effort') or '未绑定'}\n"
             f"执行时长：{_duration(agent.get('duration_seconds'))}"
         )
+        if agent.get("started_at"):
+            agent_text += f"；开始时间：{local_timestamp(agent['started_at'])}"
         if agent.get("remaining_seconds") is not None:
             agent_text += f"；本轮剩余：{_duration(agent['remaining_seconds'])}"
         recovery_details = agent.get("recovery_details")
@@ -497,16 +477,25 @@ def print_rich_status_progress(
     )
 
     action = audit.get("operator_action")
-    command_line = _rich_labeled(
-        "命令",
-        view.get("next_action")
-        or (action.get("next_action") if isinstance(action, dict) else None)
-        or "无",
-    )
-    action_lines: list[Text] = []
     activity = view.get("execution_activity")
+    control = audit.get("executor_control")
+    unknown_wait = (
+        wait_view is not None and isinstance(control, dict)
+        and control.get("activity") == "unknown" and state.get("status") != "supervision_timeout"
+    )
+    needs_diagnostic = activity == "unknown" or unknown_wait
+    agent_running = wait_view is None and activity == "running" and not isinstance(action, dict)
+    command = (
+        status_diagnostic_command(state) if needs_diagnostic else view.get("next_action")
+        or (action.get("next_action") if isinstance(action, dict) else None)
+    )
+    command_line = _rich_labeled("命令", command)
+    action_lines: list[Text] = []
     if wait_view is not None and not isinstance(action, dict):
-        action_lines.append(_rich_value(wait_view.guidance))
+        action_lines.append(_rich_value(
+            unknown_execution_guidance(state, include_command=False)
+            if unknown_wait else wait_view.guidance
+        ))
     elif activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
         action_lines.append(
             _rich_value(
@@ -520,7 +509,8 @@ def print_rich_status_progress(
             _rich_labeled("类型", _human_action_type(action.get("type")))
         )
         for reason in action.get("reasons", []):
-            action_lines.append(_rich_labeled("原因", reason))
+            message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
+            action_lines.append(_rich_labeled("原因", message))
         action_lines.append(
             _rich_labeled("已保留成果", _rich_preserved_results(action.get("preserved")))
         )
@@ -543,9 +533,9 @@ def print_rich_status_progress(
                     ),
                 )
             )
-        action_lines.append(Text("全局暂停：整个 Delivery Run 已暂停；其他 Ticket 不会推进"))
+        action_lines.append(Text("整项任务已暂停，其他子任务也不会继续。"))
         if action.get("type") == "Review Budget Checkpoint":
-            action_lines.append(Text("恢复授权：resume 将授权新的预算窗口，继续已有工作。"))
+            action_lines.append(Text("继续执行后，将按配置补充本次开发与验收额度，继续已有工作。"))
     else:
         action_lines.append(
             _rich_value(_operator_instruction(state, audit.get("agent_invocation")))
@@ -557,23 +547,27 @@ def print_rich_status_progress(
         cleanup_status = {
             "completed": "已完成", "cleanup_pending": "等待清理", "pending": "待处理",
         }.get(str(cleanup.get("status")), cleanup.get("status"))
-        action_lines.append(_rich_labeled("交付清理", cleanup_status))
+        action_lines.append(_rich_labeled("工作区清理", cleanup_status))
         reason = _cleanup_reason(cleanup)
         if reason:
             action_lines.append(_rich_labeled("保留原因", reason))
+        for path in _cleanup_paths(cleanup):
+            action_lines.append(_rich_labeled("待处理工作区", path))
     scope_change = audit.get("scope_change")
     if isinstance(scope_change, dict):
         summary = scope_change.get("graph_change_summary")
         action_lines.append(
             _rich_labeled(
-                "Ticket Graph 变化",
+                "任务与依赖变化",
                 summary.get("summary") if isinstance(summary, dict) else "见 --json",
             )
         )
     # Put the executable next step before the detailed action panel so it is
     # visible in the first screen. Keep it outside Rich panels so wrapping
     # never inserts copy-breaking borders, padding, or hard newlines.
-    if wait_view is None or wait_view.show_command or isinstance(action, dict):
+    if not agent_running and command and command != "无" and (
+        needs_diagnostic or wait_view is None or wait_view.show_command or isinstance(action, dict)
+    ):
         console.file.write(command_line.plain + "\n")
     console.print(
         Panel(
@@ -588,7 +582,7 @@ def print_rich_status_progress(
     finding_values = findings if isinstance(findings, list) else []
     finding_renderables: list[Text] = []
     if not finding_values:
-        finding_renderables.append(Text("当前没有属于本对象和当前 Candidate 的 Finding"))
+        finding_renderables.append(Text("当前没有属于本工作和当前代码版本的问题"))
     else:
         for index, finding in enumerate(finding_values, start=1):
             finding_renderables.append(Text(f"{index}.", style="bold red"))
@@ -664,17 +658,7 @@ def _terminal_safe(value: object) -> str:
 
 
 def _rich_preserved_results(value: object) -> str:
-    if not isinstance(value, str):
-        return "当前状态与已有审计证据"
-    parts: list[str] = []
-    for item in value.split("；"):
-        if item.startswith("Candidate "):
-            parts.append("Candidate 已保存")
-        elif item.startswith("Managed Checkout "):
-            parts.append("Managed Checkout 已保存")
-        else:
-            parts.append(item)
-    return "；".join(parts)
+    return human_preserved_results(value)
 
 
 def _status_symbol(value: str) -> str:
@@ -688,36 +672,7 @@ def _status_symbol(value: str) -> str:
 
 
 def _status_term(value: object) -> object:
-    if not isinstance(value, str):
-        return value
-    return {
-        "active": "进行中",
-        "starting": "正在启动",
-        "completed": "已完成",
-        "blocked": "已阻塞",
-        "ready_for_human": "等待人工处理",
-        "execution_failed": "执行失败，可恢复",
-        "operator_stopped": "操作者已停止，可恢复",
-        "supervision_timeout": "监督超时暂停，可恢复",
-        "waiting_checks": "等待自动检查",
-        "run_acceptance_pending": "等待运行整体验收",
-        "run_publication_pending": "等待运行发布",
-        "run_approval_pending": "等待人工批准",
-        "publication_pending": "等待发布",
-        "pending": "待处理",
-        "developing": "开发中",
-        "repairing": "修复中",
-        "reviewing": "验收中",
-        "validating": "验证中",
-        "publishing": "发布中",
-        "candidate": "候选待处理",
-        "accepted": "验收通过",
-        "ready_for_approval": "等待批准",
-        "merged": "已合并",
-        "parent_phase": "父项阶段",
-        "run_acceptance": "运行验收",
-        "run_publication": "运行发布",
-    }.get(value, value)
+    return human_status_term(value)
 
 
 def _phase_term(
@@ -733,20 +688,12 @@ def _phase_term(
     return fallback(value)
 
 
+def _human_conclusion(value: object) -> object:
+    return "当前版本已通过验收" if value == "当前有效通过" else value
+
+
 def _human_action_type(value: object) -> str:
-    raw = str(value or "Operator Action")
-    return {
-        "Human Blocker": "需要人工处理（Human Blocker）",
-        "Review Budget Checkpoint": "验收预算窗口已用尽（Review Budget Checkpoint）",
-        "Execution Failure": "执行失败（Execution Failure）",
-        "Deterministic Contradiction": "确定性矛盾（Deterministic Contradiction）",
-        "Supervision Timeout Pause": "监督超时暂停（Supervision Timeout Pause）",
-        "Operator Stopped": "操作者已停止（Operator Stopped）",
-        "Requeue Required": "需要重新排队（Requeue Required）",
-        "Publication Retry Exhausted": "发布重试已耗尽（Publication Retry Exhausted）",
-        "Abandonment Recovery": "放弃恢复处理中（Abandonment Recovery）",
-        "Final Approval": "等待最终批准（Final Approval）",
-    }.get(raw, raw)
+    return human_action_type(value)
 
 
 def _agent_view(
@@ -870,6 +817,33 @@ def _round_progress(
         "development_attempt": development_attempt,
         "review_attempt": review_attempt,
     }
+
+
+def _round_details(rounds: dict[str, Any]) -> list[str]:
+    scope = {
+        "Ticket Development": "当前子任务",
+        "Parent Development": "当前整体需求",
+        "Run Development": "当前整体验收周期",
+    }.get(str(rounds.get("development_label")), "当前工作")
+    details = []
+    if rounds.get("cycle_development_attempts") is not None:
+        details.append(
+            f"{scope}累计：开发 {rounds['cycle_development_attempts']} 次，"
+            f"验收 {rounds.get('cycle_review_attempts', '未知')} 次"
+        )
+    details.append(
+        f"本次授权已用：开发 {rounds.get('development_attempts')} / "
+        f"{rounds.get('development_limit')} 次，验收 {rounds.get('reviewer_invocations')} / "
+        f"{rounds.get('reviewer_limit')} 次"
+    )
+    if rounds.get("checkpoint_reason"):
+        details.append(f"暂停原因：{human_pause_reason(rounds['checkpoint_reason'])}")
+    details.append(
+        "额外 CI 修复：" + human_ci_fix_usage(
+            rounds.get("final_ci_fix_used"), rounds.get("final_ci_fix_limit")
+        )
+    )
+    return details
 
 
 def _attempt_count(subject: dict[str, Any], *keys: str) -> int | None:
@@ -1288,58 +1262,25 @@ _FINDING_PARTS = re.compile(
 
 def _print_findings(findings: object) -> None:
     values = findings if isinstance(findings, list) else []
-    print(f"\n当前 Findings（{len(values)}） · 当前问题")
+    print(f"\n当前问题（{len(values)}）")
     if not values:
         print("  无")
         return
     for index, finding in enumerate(values, start=1):
         text = _terminal_safe(finding)
-        print(f"  {index}. {text}")
         match = _FINDING_PARTS.fullmatch(text)
         if match is None:
+            print(f"  {index}. {text}")
             continue
+        print(f"  {index}.")
         for label, value in zip(
             ("问题", "证据", "必须修复", "复验"), match.groups()
         ):
             print(f"     {_terminal_safe(label)}：{_terminal_safe(value)}")
 
 
-def _human_role_label(value: object) -> str:
-    role = str(value)
-    if "开发" in role or role in {"development", "Development Agent"}:
-        return "Development Agent"
-    if "验收" in role or role in {
-        "review",
-        "reviewer",
-        "fresh_acceptance",
-        "Review Agent",
-    }:
-        return "Review Agent"
-    if "发布" in role or role in {"publication", "final_publication", "Publication Agent"}:
-        return "Publication Agent"
-    return role
-
-
-def _localized_role_label(value: object) -> str:
-    role = str(value)
-    if "开发" in role or role in {"development", "Development Agent"}:
-        return "开发 Agent"
-    if "验收" in role or role in {
-        "review",
-        "reviewer",
-        "fresh_acceptance",
-        "Review Agent",
-    }:
-        return "验收 Agent"
-    if "发布" in role or role in {"publication", "final_publication", "Publication Agent"}:
-        return "发布 Agent"
-    return role
-
-
 def _rich_role_label(value: object) -> str:
-    role = _human_role_label(value)
-    localized = _localized_role_label(value)
-    return f"{localized}（{role}）" if localized != role else role
+    return human_agent_role(value)
 
 
 def _subject_label(state: dict[str, Any], subject: str) -> str:
@@ -1414,21 +1355,34 @@ def _operator_instruction(
         return "你暂时无需操作。"
     if state.get("status") in {"completed", "abandoned"}:
         return "无需操作。"
-    return "按上述命令继续；不要重复启动另一个 Run。"
+    return "按上述命令继续；不要重复启动同一项任务。"
 
 
 def _print_cleanup(cleanup: object) -> None:
     if not isinstance(cleanup, dict):
         return
-    print("\n交付清理")
-    print(f"  状态: {_terminal_safe(cleanup.get('status'))}")
+    print("\n工作区清理")
+    print(f"  状态: {_terminal_safe(human_status_term(cleanup.get('status')))}")
+    if cleanup.get("status") == "completed":
+        return
     reason = _cleanup_reason(cleanup)
     if reason:
         print(f"  保留原因: {_terminal_safe(reason)}")
     items = cleanup.get("items")
     if isinstance(items, list):
         pending = sum(1 for item in items if isinstance(item, dict))
-        print(f"  已保留 {pending} 个受管工作区；完整诊断与恢复操作见 --json")
+        if pending:
+            print(f"  已保留 {pending} 个开发工作区")
+        for path in _cleanup_paths(cleanup):
+            print(f"  待处理工作区: {_terminal_safe(path)}")
+
+
+def _cleanup_paths(cleanup: dict[str, Any]) -> list[str]:
+    items = cleanup.get("items")
+    if cleanup.get("status") == "completed" or not isinstance(items, list):
+        return []
+    return [item["checkout"] for item in items
+            if isinstance(item, dict) and isinstance(item.get("checkout"), str)]
 
 
 def _cleanup_reason(cleanup: dict[str, Any]) -> str | None:
@@ -1448,6 +1402,6 @@ def _print_scope_change(scope_change: object) -> None:
     if not isinstance(scope_change, dict):
         return
     summary = scope_change.get("graph_change_summary")
-    print("\nTicket Graph 变化")
+    print("\n任务与依赖变化")
     if isinstance(summary, dict):
         print(f"  {_terminal_safe(summary.get('summary'))}")

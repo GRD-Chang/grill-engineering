@@ -493,14 +493,14 @@ def test_abandon_recovers_lost_change_pr_close_response(
         assert action["next_action"] == f"agent-run abandon {run_id}"
         assert json_view["next_action"] == action["next_action"]
         text_view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
-        assert "类型: Abandonment Recovery" in text_view.stdout
-        assert "对象: Ticket #2" in text_view.stdout
-        assert "阶段: waiting_checks" in text_view.stdout
-        assert "原因: Run abandonment recovery is incomplete." in text_view.stdout
+        assert "类型: 正在完成放弃操作" in text_view.stdout
+        assert "对象: 子任务 #2" in text_view.stdout
+        assert "阶段: 等待合并前检查" in text_view.stdout
+        assert "原因: 放弃操作尚未完成" in text_view.stdout
         assert "已保留成果:" in text_view.stdout
-        assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in text_view.stdout
+        assert "整项任务已暂停，其他子任务也不会继续。" in text_view.stdout
         assert (
-            "唯一下一步: agent-run abandon 1 --repo example/project"
+            "下一步: agent-run abandon 1 --repo example/project"
             in text_view.stdout
         )
         assert "<run-id>" not in text_view.stdout

@@ -59,7 +59,7 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
     assert "立即停止活动 Executor 并保留可显式恢复的现场" in help_text
     assert "仅从 requeue_required 创建新的 Change Job Generation" in help_text
     assert "显示当前状态与下一条允许的操作" in help_text
-    assert "显示有界 Invocation 与状态时间线" in help_text
+    assert "查看各轮 Agent 工作、关键进展与结果" in help_text
     assert "promotion-handshake" not in help_text
     for internal_command in ("deliver", "accept-run", "publish-run"):
         assert internal_command not in help_text
@@ -353,7 +353,7 @@ def test_status_keeps_matching_acceptance_conclusion_after_completion(
 
     output = stdout_json(json_result)
     assert output["progress"]["conclusion"] == "当前有效通过"
-    assert "结论:       当前有效通过" in plain_result.stdout
+    assert "结论:       当前版本已通过验收" in plain_result.stdout
 
 
 @pytest.mark.parametrize(
@@ -707,11 +707,13 @@ def test_status_exposes_current_cycle_rounds_alongside_window_budget(
     assert rounds["cycle_review_attempts"] == 3
     assert rounds["development_attempt"] == 2
     assert rounds["review_attempt"] == 3
-    assert "预算窗口 3：Development 5 /" in plain_result.stdout
-    assert "Review 4 /" in plain_result.stdout
-    assert "最终 CI 修复          True / 1" in plain_result.stdout
-    assert "当前周期 Ticket Development 2 轮（Attempt #2）" in plain_result.stdout
-    assert "当前周期 Ticket Review 3 轮（Attempt #3）" in plain_result.stdout
+    assert "本次授权已用：开发 5 /" in plain_result.stdout
+    assert "验收 4 /" in plain_result.stdout
+    assert "额外 CI 修复：已用 1 / 1 次" in plain_result.stdout
+    assert "当前子任务累计：开发 2 次，验收 3 次" in plain_result.stdout
+    assert "Attempt #" not in plain_result.stdout
+    assert "True /" not in plain_result.stdout
+    assert rounds["final_ci_fix_used"] is True
 
 
 def test_status_fails_closed_when_current_candidate_identity_is_missing(
@@ -789,6 +791,8 @@ def test_plain_status_places_next_action_before_complete_finding_details(
     assert "证据：feature.txt 只有一行" in output
     assert "必须修复：补齐实现" in output
     assert "复验：运行 CLI" in output
+    for value in ("缺少修复", "feature.txt 只有一行", "补齐实现", "复验：运行 CLI"):
+        assert output.count(value) == 1
 
 
 @pytest.mark.parametrize("width", [60, 80, 120])
@@ -866,10 +870,12 @@ def test_rich_status_wraps_long_findings_and_next_action(
     assert f"命令：{command}" in visible
     assert f"命令：{command}\n" in visible
     assert visible.index(f"命令：{command}") < visible.index("下一步")
-    assert "触发阻塞的 Agent：验收 Agent（Review Agent）" in visible
+    assert "触发阻塞的 Agent：验收 Agent" in visible
+    assert "Review Agent" not in visible
     assert "模型" in visible and "status-model" in visible
     assert "推理强度" in visible and "high" in visible
-    assert "本轮时长" in visible and "42 秒" in visible
+    readable = " ".join(visible.replace("│", " ").split())
+    assert "本轮时长" in readable and "42 秒" in readable
     assert "\x1b[90m" not in rendered
 
 
@@ -919,8 +925,8 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     assert failed["active_agent_invocation"] is None
 
     status = run_cli(git_repo, fixture, "status", run_id)
-    assert "类型: Execution Failure" in status.stdout
-    assert "唯一下一步: agent-run resume 1 --repo example/project" in status.stdout
+    assert "类型: 执行失败" in status.stdout
+    assert "下一步: agent-run resume 1 --repo example/project" in status.stdout
     for command in ("status", "history"):
         json_view = stdout_json(
             run_cli(git_repo, fixture, command, run_id, "--json")
@@ -1695,8 +1701,8 @@ def test_status_distinguishes_semantic_invocation_output_budget_and_publication_
 
     cli.cli_presentation._print_status(state, as_json=False)
     human = capsys.readouterr().out
-    assert "Status:     执行失败，可恢复" in human
-    assert "Ticket #3" in human
+    assert "状态:       执行失败，可恢复" in human
+    assert "子任务 #3" in human
     assert "Semantic Agent Attempt" not in human
     assert "attempt-publication-2" not in human
     assert "sha256:boundary" not in human
@@ -1946,17 +1952,19 @@ def test_history_human_output_groups_invocations_and_keeps_resume_as_a_turning_p
     assert "恢复" in output
     assert "review-model-v1" in output
     assert "review-model-v2" in output
-    assert "动作：验收候选；结果：验收未通过" in output
+    assert "动作：验收代码；结果：验收未通过" in output
 
     cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
     details = capsys.readouterr().out
     assert details.count("第 1 轮") == 1
-    assert finding in details
+    assert "问题：候选缺少边界处理" in details
     assert "证据：candidate-a" in details
+    assert "必须修复：补齐边界" in details
+    assert "复验：重新运行 CLI。" in details
     assert "PR 编号：17" in details
-    assert "自动检查结果：pass" in details
+    assert "合并前检查结果：已通过" in details
     assert "preserved checkout" in details
-    assert "恢复类型：stale_dirty_checkout" in details
+    assert "保留原因：工作区仍有未提交修改" in details
 
     projection = history_records(
         state,
@@ -2286,15 +2294,15 @@ def test_history_merges_internal_publication_snapshots_and_same_integration(
     cli.cli_presentation._print_history(state, as_json=False, plain=True)
     output = capsys.readouterr().out
 
-    assert output.count("发布：等待运行发布") == 1
-    assert output.count("事件：集成") == 2
-    assert output.count("事件：监督边界") == 2
+    assert "发布：等待运行发布" not in output
+    assert output.count("代码已合并") == 2
+    assert output.count("确认外部操作结果") == 2
 
     cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
     detailed_output = capsys.readouterr().out
-    assert detailed_output.count("发布：等待运行发布") == 1
-    assert detailed_output.count("事件：集成") == 2
-    assert detailed_output.count("事件：监督边界") == 2
+    assert "发布：等待运行发布" not in detailed_output
+    assert detailed_output.count("代码已合并") == 2
+    assert detailed_output.count("确认外部操作结果") == 2
 
     cli.cli_presentation._print_history(state, as_json=True)
     machine_output = json.loads(capsys.readouterr().out)
@@ -2805,15 +2813,15 @@ def test_history_details_reuses_development_acceptance_and_publication_records(
     cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
     output = capsys.readouterr().out
 
-    assert "Development Summary" in output
+    assert "开发说明" in output
     assert "Implemented the boundary handling." in output
     assert "验收证据" in output
     assert "e2e log" in output
     assert "必须修复：增加断言" in output
     assert "feat: publish ticket" in output
     assert "PR 标题" in output
-    assert "预算窗口：1；Development 用量=1 / 4；Review 用量=1 / 3" in output
-    assert "业务预算：不适用（发布阶段）" in output
+    assert "第 1 次授权额度；本轮开始时已用：开发 1 / 4 次；验收 1 / 3 次" in output
+    assert "执行额度：不适用（编写发布说明）" in output
 
     cli.cli_presentation._print_history(state, as_json=True)
     assert "budget_snapshot" not in capsys.readouterr().out
@@ -3080,11 +3088,10 @@ def test_status_exposes_preserved_dirty_checkout_and_recovery_action(
 
     cli.cli_presentation._print_status(state, as_json=False)
     human = capsys.readouterr().out
-    assert "已保留 1 个受管工作区" in human
-    assert "完整诊断与恢复操作见 --json" in human
-    assert "/repo/.agent-run/worktrees/run-1/ticket-3" not in human
+    assert "已保留 1 个开发工作区" in human
+    assert "/repo/.agent-run/worktrees/run-1/ticket-3" in human
     assert "tracked modifications" not in human
-    assert "run-1" not in human
+    assert "run-1" not in human.replace("/repo/.agent-run/worktrees/run-1/ticket-3", "")
 
 
 def test_operator_action_keeps_repository_names_starting_with_run(
@@ -3339,9 +3346,9 @@ def test_status_labels_the_latest_agent_with_its_own_ticket(
     cli.cli_presentation._print_status(state, as_json=False)
     output = capsys.readouterr().out
 
-    assert "当前对象:   Ticket #3" in output
-    assert "最近 Agent: Publication Agent · Ticket #2" in output
-    assert "Publication Agent · Ticket #3" not in output
+    assert "当前对象:   子任务 #3" in output
+    assert "最近 Agent: 发布 Agent · 子任务 #2" in output
+    assert "发布 Agent · 子任务 #3" not in output
 
 
 def test_status_localizes_profiled_review_agent(
@@ -3382,7 +3389,7 @@ def test_status_localizes_profiled_review_agent(
     cli.cli_presentation._print_status(state, as_json=False)
     output = capsys.readouterr().out
 
-    assert "最近 Agent: Review Agent · Ticket #2（验收 Agent）" in output
+    assert "最近 Agent: 验收 Agent · 子任务 #2" in output
     assert "最近 Agent: review ·" not in output
 
     cli.cli_presentation._print_history(state, as_json=False)
@@ -3551,6 +3558,8 @@ def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(
     )
     assert "run-1" not in human
     assert "<run-id>" not in human
+    for internal in ("stale", "Managed Development Checkout", "fresh Run Acceptance", "clean"):
+        assert internal not in human
 
 
 @pytest.mark.parametrize(
@@ -6349,23 +6358,23 @@ def test_history_supporting_records_are_bound_to_attempt_version(
     )
     details = capsys.readouterr().out
     assert "PR 编号：17" in details
-    assert "门禁模式：configured" in details
-    assert "自动检查结果：pass" in details
-    assert "检查项：名称=fixture；结果=pass" in details
-    assert "集成提交：integrated-b" in details
-    assert "发布提交：publication-b" in details
-    deterministic_details = details.rsplit("确定性集成记录", 1)[1].split(
-        "发布回执", 1
+    assert "已配置合并前检查" in details
+    assert "合并前检查结果：已通过" in details
+    assert "检查项：名称=fixture；结果=已通过" in details
+    assert "PR 状态：已合并" in details
+    assert "Merge accepted candidate" in details
+    deterministic_details = details.rsplit("PR 合并记录", 1)[1].split(
+        "兜底发布记录", 1
     )[0]
-    fallback_details = details.rsplit("发布回执", 1)[1]
-    assert "门禁模式：configured" in deterministic_details
-    assert "门禁模式：configured" in fallback_details
+    fallback_details = details.rsplit("兜底发布记录", 1)[1]
+    assert "已配置合并前检查" in deterministic_details
+    assert "已配置合并前检查" in fallback_details
     assert "Git 完整性失败依据" in fallback_details
     assert "失败原因：managed checkout changed" in fallback_details
     assert "期望 HEAD：expected-head" in fallback_details
     assert "实际 HEAD：observed-head" in fallback_details
     assert "恢复后 HEAD：expected-head" in fallback_details
-    assert "恢复动作：controller_reset_and_clean" in fallback_details
+    assert "恢复方式：恢复已保存版本并清理工作区" in fallback_details
     for internal_value in (
         "hidden-reviewer-thread",
         "hidden-policy-marker",
@@ -6377,6 +6386,10 @@ def test_history_supporting_records_are_bound_to_attempt_version(
         "policy_snapshot",
         "review_budget",
         "acceptance_record",
+        "publication-b",
+        "integrated-b",
+        "configured",
+        "controller_reset_and_clean",
     ):
         assert internal_value not in details
 
@@ -6695,9 +6708,9 @@ def test_history_details_distinguish_output_continuations_and_missing_counts(
     cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
     output = capsys.readouterr().out
 
-    assert "输出续接=0 次" in output
+    assert "输出续接=0 次" not in output
     assert "输出续接=1 次" in output
-    assert "输出续接=未记录 次" in output
+    assert "输出续接次数：未记录" in output
 
 
 def test_history_details_omit_empty_validation_errors_but_keep_real_error(

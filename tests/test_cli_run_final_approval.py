@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 
 from cli_fixtures import run_agents
@@ -142,6 +145,11 @@ def test_final_approval_required_checks_read_timeout_preserves_its_grant_for_res
     paused = run_cli(git_repo, fixture, "approve", run_id)
     assert stdout_json(paused)["status"] == "supervision_timeout"
     grant = load_only_run_state(git_repo)["run_publication"]["approval_grant"]
+    assert stdout_json(paused)["action"]["status"] == "failed"
+    before_run = load_only_run_state(git_repo)
+    ordinary = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    assert ordinary.returncode == 2
+    assert load_only_run_state(git_repo) == before_run
 
     assert paused.returncode == 2
     paused_state = load_only_run_state(git_repo)
@@ -448,3 +456,185 @@ def test_final_run_pending_window_survives_process_restart(
     final_state = load_only_run_state(git_repo)
     assert final_state["agent_invocation_history"] == first_invocations
     assert len(json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]) == 2
+
+
+def test_resume_recovers_approval_after_executor_exits_with_saved_grant(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    run_id = str(stdout_json(awaiting)["run_id"])
+
+    interrupted = run_cli(git_repo, fixture, "approve", run_id, "--crash-after-save", "2")
+    assert interrupted.returncode == 2
+    stopped = load_only_run_state(git_repo)
+    grant = stopped["run_publication"]["approval_grant"]
+    original_events = stopped["active_agent_invocation"]
+
+    resumed = run_cli(git_repo, fixture, "resume", run_id)
+    assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
+    final = load_only_run_state(git_repo)
+    assert final["status"] == "completed"
+    assert final["run_publication"]["approval_grant"] == grant
+    assert final["active_agent_invocation"] == original_events
+
+
+def test_resume_finished_delivery_only_retries_unfinished_cleanup(git_repo: Path) -> None:
+    from agent_run.state import StateStore
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    run_id = str(stdout_json(awaiting)["run_id"])
+    approved = run_cli(git_repo, fixture, "approve", run_id)
+    assert approved.returncode == 0, approved.stderr
+    state = load_only_run_state(git_repo)
+    original_invocations = state["agent_invocation_history"]
+    original_merge = state["run_publication"]["integrated_sha"]
+    # Model a lost cleanup response: external deletion succeeded, while the
+    # persisted item still needs an idempotent confirmation.
+    cleanup = state["delivery_cleanup"]
+    cleanup["status"] = "cleanup_pending"
+    for item in cleanup["items"].values():
+        item["status"] = "cleanup_pending"
+    StateStore(git_repo / ".agent-run").save_run(run_id, state)
+
+    resumed = run_cli(git_repo, fixture, "resume", "1")
+    assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
+    final = load_only_run_state(git_repo)
+    assert final["status"] == "completed"
+    assert final["delivery_cleanup"]["status"] == "completed"
+    assert final["run_publication"]["integrated_sha"] == original_merge
+    assert final["agent_invocation_history"] == original_invocations
+    repeated = run_cli(git_repo, fixture, "resume", "1")
+    assert repeated.returncode == 2
+    assert load_only_run_state(git_repo) == final
+    delivery = json.loads(fixture.read_text())["delivery"]
+    assert delivery["closed_issues"].count(1) == 1
+
+
+@pytest.mark.parametrize("receipt_saved", [False, True], ids=["before-receipt", "after-receipt"])
+def test_resume_only_reconciles_success_when_executor_lost_the_final_receipt(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, receipt_saved: bool,
+) -> None:
+    from agent_run import cli
+    from agent_run.state import SimulatedProcessCrash
+    from agent_run.task_control import TaskControlStore
+    from support.inprocess_cli import invoke_cli_inprocess
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    run_id = str(stdout_json(awaiting)["run_id"])
+
+    class ReceiptCrashStore(TaskControlStore):
+        def complete_action(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            if receipt_saved:
+                super().complete_action(*args, **kwargs)
+            raise SimulatedProcessCrash("before executor exit was recorded")
+
+        def mark_executor_absent(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            # The fixture observer normally persists the child's abrupt exit.
+            # Model a lost observer too, leaving real process proof for resume.
+            raise SimulatedProcessCrash("before observer recorded executor exit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "TaskControlStore", ReceiptCrashStore)
+        interrupted = invoke_cli_inprocess(git_repo, fixture, "approve", run_id, "--json")
+    assert interrupted.returncode == 2
+    completed = load_only_run_state(git_repo)
+    assert completed["status"] == "completed"
+    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    original_control = json.loads(control_path.read_text())
+    assert original_control["action"]["status"] == (
+        "completed" if receipt_saved else "applying"
+    )
+    assert original_control["executor"]["status"] == "running"
+    fixture_before = fixture.read_bytes()
+
+    resumed = run_cli(git_repo, fixture, "resume", "1")
+    assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
+    current_control = json.loads(control_path.read_text())
+    assert current_control["action"]["action_id"] == original_control["action"]["action_id"]
+    assert current_control["action"]["status"] == "completed"
+    assert current_control["executor"]["generation"] == original_control["executor"]["generation"]
+    assert current_control["executor"]["status"] == "exited"
+    assert load_only_run_state(git_repo) == completed
+    assert fixture.read_bytes() == fixture_before
+    reconciled_control = control_path.read_bytes()
+    repeated = run_cli(git_repo, fixture, "resume", "1")
+    assert repeated.returncode == 2
+    assert control_path.read_bytes() == reconciled_control
+    assert load_only_run_state(git_repo) == completed
+    assert fixture.read_bytes() == fixture_before
+
+
+def test_resume_reads_an_applied_merge_after_process_exit_before_wait_was_saved(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run import cli
+    from agent_run.github_fixture import FixtureGitHubPublisher
+    from support.inprocess_cli import invoke_cli_inprocess
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    run_id = str(stdout_json(awaiting)["run_id"])
+
+    class MergeCrashPublisher(FixtureGitHubPublisher):
+        def normal_merge(self, **authority: Any) -> str:
+            super().normal_merge(**authority)
+            raise SystemExit("process exited after merge")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "FixtureGitHubPublisher", MergeCrashPublisher)
+        interrupted = invoke_cli_inprocess(git_repo, fixture, "approve", run_id, "--json")
+    assert interrupted.returncode == 2
+    pending = load_only_run_state(git_repo)
+    assert pending["run_publication"]["phase"] == "ready_for_approval"
+    grant = pending["run_publication"]["approval_grant"]
+    history = pending["agent_invocation_history"]
+    remote = json.loads(fixture.read_text())["delivery"]["pull_requests"][-1]
+    assert remote["state"] == "MERGED"
+
+    resumed = run_cli(git_repo, fixture, "resume", "1")
+    assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
+    final = load_only_run_state(git_repo)
+    assert final["status"] == "completed"
+    assert final["run_publication"]["approval_grant"] == grant
+    assert final["run_publication"]["integrated_sha"] == remote["integrated_sha"]
+    assert final["run_publication"]["merge_intent"]["attempts"] == 1
+    assert final["agent_invocation_history"] == history
+
+
+def test_resume_schedules_final_cleanup_after_closeout_committed_before_a_crash(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.delivery_cleanup import DeliveryCleanupEngine
+    from support.inprocess_cli import invoke_cli_inprocess
+
+    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    agents = run_agents(git_repo / "agents.json")
+    awaiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    run_id = str(stdout_json(awaiting)["run_id"])
+
+    def exit_before_cleanup(self: Any, state: dict[str, Any]) -> dict[str, Any]:
+        raise SystemExit("process exited before scheduling final cleanup")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(DeliveryCleanupEngine, "complete_final_run", exit_before_cleanup)
+        interrupted = invoke_cli_inprocess(git_repo, fixture, "approve", run_id, "--json")
+    assert interrupted.returncode == 2
+    pending = load_only_run_state(git_repo)
+    assert pending["status"] == "completed"
+    assert pending["run_publication"]["parent_closed"] is True
+    assert pending["run_branch"] not in pending["delivery_cleanup"]["items"]
+
+    resumed = run_cli(git_repo, fixture, "resume", "1")
+    assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
+    final = load_only_run_state(git_repo)
+    assert final["delivery_cleanup"]["items"][pending["run_branch"]]["status"] == "completed"
+    assert final["run_publication"] == pending["run_publication"]
+    assert final["agent_invocation_history"] == pending["agent_invocation_history"]
+    assert json.loads(fixture.read_text())["delivery"]["closed_issues"].count(1) == 1

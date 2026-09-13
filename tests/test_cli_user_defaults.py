@@ -25,6 +25,52 @@ def settings(*arguments: str) -> tuple[int, dict[str, Any]]:
     return code, json.loads(output.getvalue())
 
 
+@pytest.mark.parametrize("case", ["initializing", "missing", "starting_only", "applied", "corrupt"])
+def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profile(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from agent_run.state import StateStore
+    from test_run_lifecycle import _file_snapshot
+
+    monkeypatch.chdir(git_repo)
+    root = git_repo / ".agent-run"
+    state = {
+        "run_id": "run-settings", "repository": "example/project",
+        "parent": {"number": 1}, "status": "starting", "schema_version": 1,
+        "base_resolution_pending": True, "currentness_resolution_pending": True,
+        "agent_invocation_history": [], "active_agent_invocation": None,
+    }
+    if case == "missing":
+        state["status"] = "active"
+    elif case == "starting_only":
+        state.pop("base_resolution_pending")
+    elif case == "applied":
+        state["action_application_receipt"] = {"action_id": "already-applied"}
+    StateStore(root).save_run("run-settings", state)
+    if case == "corrupt":
+        (root / "profiles").mkdir()
+        (root / "profiles/run-settings.json").write_text("broken")
+    before = _file_snapshot(root)
+
+    code, output = settings("show", "--run", "run-settings")
+
+    if case == "initializing":
+        assert code == 0
+        assert output["source"] == "initializing"
+        assert output["profile"] is None
+        assert "初始化" in output["message"]
+        human = StringIO()
+        with redirect_stdout(human):
+            assert cli.main(["settings", "show", "--run", "run-settings"]) == 0
+        assert "初始化" in human.getvalue()
+        assert "缺少 Agent Execution Profile" not in human.getvalue()
+    else:
+        assert code == 2
+        assert output["result"] == "error"
+        assert output.get("source") != "initializing"
+    assert _file_snapshot(root) == before
+
+
 def test_public_settings_file_cli_and_new_old_run_execution(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

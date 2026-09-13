@@ -48,15 +48,15 @@ def test_run_reaches_explicit_approval_with_status_and_history(
 
     status = run_cli(git_repo, fixture, "status", run_id)
     assert status.returncode == 0, status.stderr
-    assert "Repository: example/project" in status.stdout
-    assert "Parent:     #1 Parent spec" in status.stdout
-    assert "Status:     等待人工批准" in status.stdout
-    assert "当前对象:   Run Publication" in status.stdout
-    assert "最近 Agent: Publication Agent" in status.stdout
+    assert "仓库:       example/project" in status.stdout
+    assert "整体需求:   #1 Parent spec" in status.stdout
+    assert "状态:       等待人工批准" in status.stdout
+    assert "当前对象:   整体交付" in status.stdout
+    assert "最近 Agent: 发布 Agent" in status.stdout
     latest_invocation = state["agent_invocation_history"][-1]
     assert str(latest_invocation["model"]) in status.stdout
     assert str(latest_invocation["reasoning_effort"]) in status.stdout
-    assert "唯一下一步: agent-run approve" in status.stdout
+    assert "下一步: agent-run approve" in status.stdout
     assert run_id not in status.stdout
     status_json = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
     assert status_json["active_ticket"] is None
@@ -136,9 +136,9 @@ def test_displayed_final_approval_selects_the_unique_active_run(
 
     status = run_cli(git_repo, fixture, "status", second_run_id)
     action_line = next(
-        line for line in status.stdout.splitlines() if line.startswith("唯一下一步: ")
+        line for line in status.stdout.splitlines() if line.startswith("下一步: ")
     )
-    displayed_command = action_line.removeprefix("唯一下一步: ")
+    displayed_command = action_line.removeprefix("下一步: ")
     command = shlex.split(displayed_command)
     assert command[0] == "agent-run"
 
@@ -393,9 +393,9 @@ def test_history_renders_device_timezone_and_keeps_json_events_in_utc(
     audit = stdout_json(history)
 
     assert local.returncode == fallback.returncode == 0
-    assert "Time zone: Asia/Shanghai (UTC+08:00)" in local.stdout
+    assert "时区:       Asia/Shanghai (UTC+08:00)" in local.stdout
     assert "08:00" in local.stdout
-    assert "Time zone: UTC (UTC+00:00)" in fallback.stdout
+    assert "时区:       UTC (UTC+00:00)" in fallback.stdout
     assert audit["time_zone"] == "UTC"
     assert audit["events"][0]["at"] == "2026-08-30T00:00:00+00:00"
 
@@ -452,7 +452,7 @@ def test_history_keeps_later_invocations_after_an_early_timeline_tail(
         for kind, obj, _ in later_facts
     )
     assert any(kind == "publication" for kind, _, _ in later_facts)
-    assert "Run Publication · 发布 Agent" in text
+    assert "整体交付 · 发布 Agent" in text
 
 
 def test_status_shows_the_current_review_findings(
@@ -487,8 +487,9 @@ def test_status_shows_the_current_review_findings(
     status = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
     finding = review["checks"]["e2e"]["findings"][0]
 
-    assert "当前 Findings（1）" in status.stdout
-    assert finding in status.stdout
+    assert "当前问题（1）" in status.stdout
+    for part in finding.split("；"):
+        assert status.stdout.count(part) == 1
 
 
 def test_run_drives_ticket_lifecycle_through_the_internal_driver(
@@ -612,7 +613,7 @@ def test_supervision_timeout_resume_opens_a_new_window_without_duplicate_deliver
         assert run_id not in text
         if command == "status":
             assert "最近 Agent:" not in text
-            assert "等待 PR #1 的自动检查" in text
+            assert "等待 PR #1 的合并前检查" in text
         else:
             latest_invocation = paused_state["agent_invocation_history"][-1]
             assert str(latest_invocation["model"]) in text
@@ -783,15 +784,13 @@ def test_run_pauses_after_the_initial_worker_credential_window_expires(
         text = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert text.returncode == 0, text.stderr
         assert "等待工作凭据恢复可用" in text.stdout
-        assert "凭据失败类别：credential_unavailable" in text.stdout
+        assert "暂时无法取得 GitHub 工作凭据" in text.stdout
+        assert "credential_unavailable" not in text.stdout
         assert "重试次数：13" in text.stdout
         assert "已超时" in text.stdout
         assert "截止=" not in text.stdout
         assert "authorization" not in text.stdout.lower()
-        if http_status is None:
-            assert "凭据 HTTP 状态：" not in text.stdout
-        else:
-            assert f"凭据 HTTP 状态：{http_status}" in text.stdout
+        assert "凭据 HTTP 状态：" not in text.stdout
 
 
 @pytest.mark.parametrize(
@@ -1243,8 +1242,10 @@ def test_status_keeps_allowed_actions_without_inventing_host_activity(git_repo: 
         rendered = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
         assert rendered.returncode == 0, rendered.stderr
         if status == "waiting_merge":
-            assert "无法确认 Runner 是否仍在自动等待" in rendered.stdout
-            assert "agent-run doctor" in rendered.stdout
+            assert "无法确认后台等待是否仍在继续" in rendered.stdout
+            assert "agent-run status --repo example/project --parent 1 --json" in rendered.stdout
+            assert "先核验原执行的归属和退出状态" in rendered.stdout
+            assert "agent-run doctor" not in rendered.stdout
             assert "agent-run run" not in rendered.stdout
         else:
             assert "下一步: agent-run run 1" in rendered.stdout
