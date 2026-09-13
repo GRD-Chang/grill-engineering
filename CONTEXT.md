@@ -249,15 +249,15 @@ Executor Host 在维护者最后一个登录会话结束后仍允许当前 Run E
 _Avoid_: 运行前置条件、Terminal Independence、重启恢复、自动 restart、Delivery Run 持久性
 
 **Action Completion Observation（动作完成观察）**:
-`stop` 与 `abandon` 在 Lifecycle Action 安全接受后，由当前命令对该 Action 直至准确目标状态的有界只读观察。观察只呈现少量结构化进展，可以随时离开；关闭终端或中断观察不会撤销 Action、停止 Executor、改变 Run 状态或转化为 Execution Failure。`status` 只返回一次当前 Delivery Progress View，其他公开生命周期命令也不进入持续观察。
+`stop`、`abandon`、`approve` 及恢复原最终批准操作的 `resume` 在 Lifecycle Action 安全接受后，由当前命令对该 Action 直至准确完成或无法继续边界的有界只读观察。观察只呈现少量结构化进展，可以随时离开；关闭终端或中断观察不会撤销 Action、停止 Executor、改变 Run 状态或转化为 Execution Failure。`status` 只返回一次当前 Delivery Progress View，其他公开生命周期命令也不进入持续观察。
 _Avoid_: 通用 watch 命令、终端所有权、Worker PTY 代理、以 Ctrl-C 隐式停止 Run、第二份运行状态、无界日志
 
 **Lifecycle Action（生命周期动作）**:
-维护者通过公开生命周期命令向准确 Delivery Run 提交的一次性、可验证意图。Action 在当前 Run 状态允许时被接受，并由唯一 Run Executor Session 至多消费一次；`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 共用这一入口和后续 Driver，不各自形成独立控制流程。活动 Executor 且没有未完成 Action 时再次收到普通 `run`，只返回现有执行状态而不创建新 Action；`resume`、`approve`、`revise` 与 `requeue` 只在准确对应边界接受，否则立即拒绝；`stop` 与 `abandon` 可在活动执行中请求收口。不被当前状态允许的 Action 不等待未来状态、不进入通用队列。完全匹配当前 unresolved Action 的 task、kind 与用户显式输入的重复原命令可以在新 Action 准入前附着并对账原 Action；它继续确认第一次接受时已解析并保存的语义 payload，即使其后用户级默认配置发生变化，也不重新解释第一次操作。原 Action 未收口时不产生第二个 Action 或历史，只有确认原 Action 已失败并持久收口后，同一次用户命令才可顺序提交 successor Action。其他相同或不同命令仍立即拒绝。
+维护者通过公开生命周期命令向准确 Delivery Run 提交的一次性、可验证意图。Action 在当前 Run 状态允许时被接受，并由唯一 Run Executor Session 至多消费一次；`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 共用这一入口和后续 Driver，不各自形成独立控制流程。活动 Executor 且没有未完成 Action 时再次收到普通 `run`，只返回现有执行状态而不创建新 Action；`resume`、`approve`、`revise` 与 `requeue` 只在准确对应边界接受，否则立即拒绝；`stop` 与 `abandon` 可在没有未完成 Action 的活动执行中请求收口；最终批准操作执行期间不可取消，恢复该操作时同样适用。不被当前状态允许的 Action 不等待未来状态、不进入通用队列。完全匹配当前 unresolved Action 的 task、kind 与用户显式输入的重复原命令可以在新 Action 准入前附着并对账原 Action；它继续确认第一次接受时已解析并保存的语义 payload，即使其后用户级默认配置发生变化，也不重新解释第一次操作。原 Action 未收口时不产生第二个 Action 或历史，只有确认原 Action 已失败并持久收口后，同一次用户命令才可顺序提交 successor Action。恢复原最终批准操作的 `resume` 是有限例外：可在新动作准入前对账原最终批准操作的未完成 Action（approve 或恢复该操作的 resume），但仍须确认旧执行已结束并形成原 Action 的确定结果，才能继续未完成部分。其他相同或不同命令仍立即拒绝。
 _Avoid_: 终端控制文件、重复消费、通用消息队列、过期授权、命令各自直接驱动 Engine、隐式授权、重复命令创建第二个 Action
 
 **Action Admission Gate（动作准入门）**:
-一个 Local Delivery Workspace 中每个 Delivery Task 对维护者 Lifecycle Action 的单槽位准入规则：同一时刻最多一个已接受但尚未完成的 Action，后来的新 Action 立即拒绝且不修改 Run、不等待、不排队。`run`、`resume`、`approve`、`revise` 与 `requeue` 在各自意图已按 Action identity 准确应用且 Run Executor Session 完成启动握手时释放准入；`stop` 与 `abandon` 在各自目标状态持久形成时释放准入。RunDriver 的自动工作不占用该门，只读查询与其他非 Delivery Run 生命周期管理也不经过该门。Action 中断或结果未知时，完全匹配的原命令可以附着并对账；只有先形成原 Action 的确定终态并释放单槽，才可顺序接受 successor，不能仅清除忙碌标记后接受下一项。
+一个 Local Delivery Workspace 中每个 Delivery Task 对维护者 Lifecycle Action 的单槽位准入规则：同一时刻最多一个已接受但尚未完成的 Action，后来的新 Action 立即拒绝且不修改 Run、不等待、不排队。`run`、普通 `resume`、`revise` 与 `requeue` 在各自意图已按 Action identity 准确应用且 Run Executor Session 完成启动握手时释放准入；`stop` 与 `abandon` 在各自目标状态持久形成时释放准入。`approve` 及恢复原最终批准操作的 `resume` 按 [ADR 0012](docs/adr/0012-noncancellable-final-approval.md) 占用准入，直至完整操作成功或形成准确的无法继续边界，不能只凭批准已保存便释放；失败后仍须对账原执行和实际结果才能恢复。其他 RunDriver 自动工作不占用该门，只读查询与其他非 Delivery Run 生命周期管理也不经过该门。Action 中断或结果未知时，完全匹配的原命令可以附着并对账；恢复原最终批准操作的 `resume` 也可在准入前对账该原操作。只有先形成原 Action 的确定终态并释放单槽，才可顺序接受 successor，恢复执行还须确认旧执行者已结束，不能仅清除忙碌标记后接受下一项。
 _Avoid_: 整个 Run Executor Session 锁、全仓库串行、Action 队列、优先级升级、过期授权、阻止 status/history、遗留 busy 标记
 
 **Configuration Mutation（配置变更）**:
@@ -277,15 +277,15 @@ Task Control Record 缺失、损坏或与 Host/Run receipt 不一致时，下一
 _Avoid_: 只读查询隐式修复、删除 busy 标记冒充恢复、裸 PID 猜测、无法确认时启动新 Executor、重放业务 Action
 
 **Action Application Receipt（动作应用凭据）**:
-Delivery Run state 为一个已接受 Lifecycle Action 保存的最小、不可歧义事实，证明该 Action identity 对应的命令特定业务意图已经幂等应用。它只用于在 Run state 已提交而 Task Control 尚未收口的崩溃窗口中补完原 Action，不能授权 Publisher、代替 Action Receipt View、参与 Action history 展示或复制完整 Action payload；Task Control Record 只引用它，不重新解释业务状态。
+Delivery Run state 为一个已接受 Lifecycle Action 保存的最小、不可歧义事实，证明该 Action identity 对应的命令特定业务意图已经幂等应用。它只用于在 Run state 已提交而 Task Control 尚未收口的崩溃窗口中补完原 Action，不能授权 Publisher、代替 Action Receipt View、参与 Action history 展示或复制完整 Action payload；Task Control Record 只引用它，不重新解释业务状态。对最终批准而言，它只证明批准意图已应用，不单独证明完整交付成功，也不能替代合并与收尾的结果确认。
 _Avoid_: 用户回执、Action history、第二份业务状态、重放业务意图、Publisher authority
 
 **Action Receipt（动作回执）**:
-公开生命周期命令在返回前对本次 Lifecycle Action 给出的有界、准确结果。`run`、`resume`、`approve`、`revise` 与 `requeue` 的成功回执说明命令特定意图已按 Action identity 幂等应用到 Delivery Run，且准确 Run Executor Session 已完成启动握手或已被确认存在；它不证明 Agent 工作、当前自动区间或整个 Delivery Run 已完成。`stop` 与 `abandon` 的成功回执只在各自准确目标状态已经持久形成后给出；Action 接受后的中间进展属于可离开的 Action Completion Observation。启动或收口结果未知时不得伪装成功或直接创建第二个 Executor，须先依据 Host、Task Control 与 Run application receipt 对账。
-_Avoid_: Delivery Run 完成声明、Agent 完成声明、仅凭进程启动请求、模糊 success、启动未知时盲目重试
+公开生命周期命令在返回前对本次 Lifecycle Action 给出的有界、准确结果。`run`、普通 `resume`、`revise` 与 `requeue` 的成功回执说明命令特定意图已按 Action identity 幂等应用到 Delivery Run，且准确 Run Executor Session 已完成启动握手或已被确认存在；它不证明 Agent 工作、当前自动区间或整个 Delivery Run 已完成。`stop` 与 `abandon` 的成功回执只在各自准确目标状态已经持久形成后给出；`approve` 及恢复原最终批准操作的 `resume` 只在最终交付与必要收尾完成后给出成功回执，失败、结果未知或批准失效须如实说明已完成部分及当前允许的下一步。Action 接受后的中间进展属于可离开的 Action Completion Observation。启动或收口结果未知时不得伪装成功或直接创建第二个 Executor，须先依据 Host、Task Control 与 Run application receipt 对账。
+_Avoid_: 以启动握手冒充 Delivery Run 或 Agent 完成、仅凭进程启动请求、模糊 success、启动未知时盲目重试
 
 **Action Receipt View（动作回执视图）**:
-公开生命周期命令默认提供的面向操作者简洁叙事，与 Delivery Progress View 使用相同语言和信息层级。它回答准确 Repository 与 Parent、这次操作实际发生了什么、Agent Run 是否已经开始或原本就在运行、当前可理解状态，以及操作者是否需要行动和可使用的下一条 `status` 命令；`stop` 与 `abandon` 等待期间只展示少量结构化阶段变化，不输出 Worker 或宿主原始日志。成功输出保持简短，失败或结果未知时说明原因、保留了什么和如何恢复。默认视图不展示 Run ID、Action ID、SHA、digest、execution nonce、generation、Host slot、systemd unit、PID 或其他机器绑定，精确内部事实只进入 Machine Audit View 或诊断。
+公开生命周期命令默认提供的面向操作者简洁叙事，与 Delivery Progress View 使用相同语言和信息层级。它回答准确 Repository 与 Parent、这次操作实际发生了什么、Agent Run 是否已经开始或原本就在运行、当前可理解状态，以及操作者是否需要行动和可使用的下一条 `status` 命令；`stop`、`abandon`、`approve` 及恢复原最终批准操作的 `resume` 等待期间只展示少量结构化阶段变化，不输出 Worker 或宿主原始日志。成功输出保持简短，失败或结果未知时说明原因、保留了什么和如何恢复。默认视图不展示 Run ID、Action ID、SHA、digest、execution nonce、generation、Host slot、systemd unit、PID 或其他机器绑定，精确内部事实只进入 Machine Audit View 或诊断。
 _Avoid_: 字段转储、内部状态码、SHA、哈希式身份、Executor Host 术语、把命令接受写成交付完成、无下一步的错误
 
 **执行失败（Execution Failure）**:
@@ -309,11 +309,11 @@ Codex Worker 保留项目开发所需的用户环境与 trusted-yolo 宿主能�
 _Avoid_: 只靠 Prompt 自律、Worker 自我批准、Publisher 凭证继承、禁止普通项目工具、宣称过滤任意第三方秘密
 
 **公开生命周期命令（Public Lifecycle Command）**:
-维护者用于创建或推进 Delivery Run 的稳定交互入口。`run` 是创建或恢复 Run 的唯一普通入口，也是不携带新增恢复或批准意图的自动入口：不存在未完成 Run 且 Parent 当前可执行时创建后继 Run；已有准确 Executor 正常运行且没有未完成 Action 时只返回现有状态，不提供单独的公开 `start` 或额外 `--new-run`。`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 都只提交一次对应 Lifecycle Action，确保该任务唯一的 Run Executor Session 存在，并在取得准确 Action Receipt 后返回；它们不各自在调用进程内形成不同推进路径。`run`、`resume`、`approve`、`revise` 与 `requeue` 在命令意图准确应用并完成启动握手后返回；`stop` 与 `abandon` 默认通过可离开的 Action Completion Observation 等待各自目标状态后返回。`stop` 是可恢复的中止意图，停止后必须显式 `resume`；`abandon` 是不可恢复的终止、对账与受限收口。Development、Acceptance、Publication 与内部等待只是 Controller 阶段，不要求也不允许维护者把它们作为独立流程手工串接；监督超时可由同一 Parent 的显式 `run` 或 `resume` 恢复。
+维护者用于创建或推进 Delivery Run 的稳定交互入口。`run` 是创建或恢复 Run 的唯一普通入口，也是不携带新增恢复或批准意图的自动入口：不存在未完成 Run 且 Parent 当前可执行时创建后继 Run；已有准确 Executor 正常运行且没有未完成 Action 时只返回现有状态，不提供单独的公开 `start` 或额外 `--new-run`。`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 都只提交一次对应 Lifecycle Action，确保该任务唯一的 Run Executor Session 存在，并在取得准确 Action Receipt 后返回；它们不各自在调用进程内形成不同推进路径。`run`、普通 `resume`、`revise` 与 `requeue` 在命令意图准确应用并完成启动握手后返回；`stop` 与 `abandon` 默认通过可离开的 Action Completion Observation 等待各自目标状态后返回。`approve` 及恢复原最终批准操作的 `resume` 通过同一观察方式等待完整操作的准确结果后返回，执行期间不可由其他生命周期动作取消。`stop` 是可恢复的中止意图，停止后必须显式 `resume`；`abandon` 是不可恢复的终止、对账与受限收口。Development、Acceptance、Publication 与内部等待只是 Controller 阶段，不要求也不允许维护者把它们作为独立流程手工串接；普通外部监督超时可由同一 Parent 的显式 `run` 或 `resume` 恢复；最终批准操作失败或超时后须显式 `resume`，沿用其不可取消与等待实际结果的合同。
 _Avoid_: 公开 `start`、额外 `--new-run`、把 `stop` 当作 `abandon`、手工反复执行内部阶段、把 `deliver` 当作公开工作流、以命令顺序替代 Controller 状态机
 
 **Operator Stop（人工停止）**:
-维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交；意图持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
+维护者直接结束当前 Run Executor Session 和准确 Agent 进程组、但保留 Delivery Run、Semantic Attempt、可恢复 Thread 与 Managed Development Checkout 以便后续恢复的明确 Lifecycle Action。Stop 可从任意终端提交，但不能取消执行中的最终批准操作，包括经 resume 恢复的该操作；意图获准并持久化后形成单调控制栅栏，不通知或等待 Agent 生成收尾输出，并禁止旧 Executor 开始新的 Agent、Git 或 Publisher 副作用。已经在途的单个 Publisher operation 只允许完成或进入对账，不能继续后续链式 mutation。成功 Stop 形成持久化 `operator_stopped` 边界并结束 Executor，不是执行故障或放弃 Run；后续必须显式 `resume`，Thread 已记录且仍可恢复时复用。准确 Executor 已退出但非终态 Delivery Run 记录未收口时，确认没有遗留 Worker 后，`stop` 仍持久化人工暂停；已有暂停的重复 Stop 与已完成、已放弃交付保持原状态。显式 `resume` 可对账准确旧 Executor 与 Worker 均已退出的记录；Worker 尚存时提示先 Stop，归属或退出证据不足时拒绝，不隐式终止 Worker。`status` 与 `history` 不执行这些修复。
 _Avoid_: Execution Failure、Abandonment、新建 Semantic Attempt、丢弃 Agent 已落盘成果、等待 Agent 配合、中断未对账的远端写入、普通 run 隐式恢复、无声退出、已有暂停或终态时重复制造 Stop 历史
 
 **No-progress Guard（无进展保护）**:
@@ -450,8 +450,8 @@ Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向
 _Avoid_: Ticket 级确认、自动 merge 默认分支、Agent 语义范围判断
 
 **Final Approval Command（最终批准命令）**:
-维护者对一个已通过全部自动门禁的 Delivery Run 授予默认分支合并权限的本地显式命令 `agent-run approve <parent-issue>`。该授权只对命令执行时重新验证的 Run PR head、base 和有效 Revision 生效；同一事实集合的收敛延迟继续自动处理，新 head 或 base 则令授权失效并重新请求验收。
-_Avoid_: GitHub Approve、标签触发、永久授权
+维护者通过本地显式命令 `agent-run approve <parent-issue>`，对已通过全部自动门禁的 Delivery Run 发起的不可取消的最终交付操作，涵盖最终条件复核、合并与收尾；接受后不允许操作者用 stop 撤销正在执行的操作，但可以因错误结束，并由显式 `resume` 在确认原执行已结束及实际结果后继续未完成部分。该授权只对重新验证的 Run PR head、base 和有效 Revision 生效，事实未变时恢复原操作无需重复批准，新 head 或 base 则令授权失效并重新请求验收；失败不使已合并代码自动回滚，结果未知时必须先确认是否已生效。命令等待完整操作完成或明确无法继续后返回；关闭终端只离开观察，不取消操作。准入、回执与恢复边界见 [ADR 0012](docs/adr/0012-noncancellable-final-approval.md)。
+_Avoid_: GitHub Approve、标签触发、永久授权、可取消操作、失败时全部回滚、恢复时重复合并、以未知结果当作未执行
 
 **Final Revision Command（最终修改命令）**:
 维护者通过 `agent-run revise <parent-issue> --message <feedback>` 提交的统一 Run 级人工恢复命令，既用于最终人工验收要求修改，也用于 Run Acceptance 返回 `human` 或累计修复预算耗尽。反馈原样形成新的 Run Feedback Revision、进入 Run Repair 输入，并显式开启按有效 Run Policy Snapshot 配置的 `N` 次 Run 修复预算窗口；修复后必须重新通过共享 Development–Acceptance Engine、全新 Run Acceptance、Run Publication 与 Run PR Required Checks。若反馈引起 Ticket Set 或依赖变化，Run 必须 fail closed 为 Unsupported Scope Change。
@@ -594,9 +594,9 @@ _Avoid_: Fresh Acceptance、GitHub PR Exact-Head Review Loop、智能代码判�
 Publisher 在创建、压缩、推送和合并候选时执行的确定性 Git 校验，包括 clean tree、预期 HEAD、base 绑定、压缩前后 tree equality、远端 lease 和 live head equality。它不运行仓库测试，也不判断实现是否正确。任何失败都不创建独立 Git-fix 阶段、专用 Agent 或独立预算，而是将原始失败证据以 `repair_source=git_integrity` 返回同一 Change Job 的现有 Development Thread，开始一次普通 Development Attempt；该 Agent 仍不得 commit、push、force-push、rebase 或 merge。Development 产出新 Candidate 后重新执行完整检查；普通 Development 预算耗尽则进入人工 Checkpoint，维护者可用 `resume` 开启新预算窗口后继续。失败检查本身不消耗 Development 或 Reviewer 预算，只有实际恢复的 Development Attempt 按普通规则计数；检查通过前不得继续 Publication、PR 更新、合并或 Ticket Completion。
 _Avoid_: Hosted CI Gate、Fresh Acceptance、本地代码 Validation、独立 Git-fix 状态机、Git-fix 专用预算、授予 Development 发布权限
 
-**Required Checks Observation（自动检查观测）**:
-仓库规定合并前必须通过的自动检查（Required Checks）在一张 Published PR 准确 head 上的一次完整观测，绑定 PR 身份、head SHA、`none|pass|pending|unknown|fail` 汇总结果与实际 Check 明细。Ticket、Parent-only、Run Repair 与 Run PR 使用同一观察语义；新 publication head 使旧观察失效，但各自的等待、Repair、Approval 与 Merge 规则保持独立。
-_Avoid_: 面向用户单独使用“必需检查”、仅有汇总结果、旧 head 的观察、CI Failure Evidence、为满足字段形状合成空 Check
+**Required Checks Observation（合并前检查观测）**:
+仓库规定合并前必须通过的自动检查（Required Checks）在一张 Published PR 准确 head 上的一次完整观测，绑定 PR 身份、head SHA、`none|pass|pending|unknown|fail` 汇总结果与实际 Check 明细。Ticket、Parent-only、Run Repair 与 Run PR 使用同一观察语义；新 publication head 使旧观察失效，但各自的等待、Repair、Approval 与 Merge 规则保持独立。人类视图统一称为“合并前检查”，有明细时带实际检查名称；范围仅为仓库规定必须通过的自动检查，不包含人工批准、Agent 本地验收或全部合并条件，也不代表所有 CI。未配置强制检查不等于仓库没有 CI。
+_Avoid_: 面向用户单独使用“必需检查”、将合并前检查等同全部 CI、把未配置强制检查称为没有 CI、仅有汇总结果、旧 head 的观察、CI Failure Evidence、为满足字段形状合成空 Check
 
 **CI Failure Evidence（CI 失败证据）**:
 Required Checks Observation 为 `fail` 后，Controller 针对同一准确 PR head 取得的 completed Actions job 与 step 事实，用于判断失败是否可由代码修复并作为 Required-Checks Repair 输入。它不是所有结果通用的观察记录，`pending`、`unknown`、平台错误或缺少可归因 job/step 的失败都不构成 CI Failure Evidence。
@@ -611,7 +611,7 @@ Development–Acceptance Engine 在独立验收后本地持久化的权威记录
 _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的结论
 
 **Delivery Progress View（交付进度视图）**:
-面向用户的当前工作摘要与关键工作历程；Agent 角色统一称为“开发 Agent／验收 Agent／发布 Agent”，工作动作使用“整体修复／整体验收／发布”等可理解名称。已确认的新版展示合同发布于 相关设计记录，本地副本见 [status/history 展示规格](docs/specs/status-history-human-readable.md)，其中的规则优先于下文旧版展示细节；该规格不代表实现已完成。
+面向用户的当前工作摘要与关键工作历程；Agent 角色统一称为“开发 Agent／验收 Agent／发布 Agent”，工作动作使用“整体修复／整体验收／发布”等可理解名称。已确认的新版展示合同发布于 相关设计记录，本地副本见 [status/history 展示规格](docs/specs/status-history-human-readable.md)，本地规格另记录 2026-09-13 已确认的用语与信息边界补充，尚未同步到该 Issue；其中的规则优先于下文旧版展示细节，该规格不代表实现已完成。
 `status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
 _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
 
