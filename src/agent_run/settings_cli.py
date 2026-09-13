@@ -51,15 +51,23 @@ def execute(
         state = load_run(parsed)
         parsed.run_id = state["run_id"]
         document = AgentProfileStore(profile_root(parsed)).load(parsed.run_id)
-        if document is None:
+        initializing = document is None and _profile_initialization_pending(state)
+        if document is None and not initializing:
             raise ValueError("Delivery Run 缺少 Agent Execution Profile")
         result = {
             "result": "settings", "scope": "run", "run_id": parsed.run_id,
             "policy": policy_snapshot_for_state(state),
-            "profile": {key: document[key] for key in ("preset", "profiles", "profile_revision")},
-            "source": "run_snapshot",
-            "bindings": document.get("bindings", []),
-            "message": "显示 Run 保存的策略及有效 Profile；已有 Thread 使用各自不可变 binding。",
+            "profile": (
+                {key: document[key] for key in ("preset", "profiles", "profile_revision")}
+                if document is not None else None
+            ),
+            "source": "initializing" if initializing else "run_snapshot",
+            "bindings": document.get("bindings", []) if document is not None else [],
+            "message": (
+                "任务正在初始化，Agent 运行配置尚未保存；请稍后重新查询。"
+                if initializing else
+                "显示 Run 保存的策略及有效 Profile；已有 Thread 使用各自不可变 binding。"
+            ),
         }
     else:
         if parsed.repo or parsed.state_dir:
@@ -71,3 +79,18 @@ def execute(
         print("Run 实际配置" if result.get("scope") == "run" else "个人运行默认配置")
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
+
+
+def _profile_initialization_pending(state: dict[str, Any]) -> bool:
+    """Recognize the persisted creation boundary before profile initialization."""
+    return (
+        state.get("status") == "starting"
+        and state.get("base_resolution_pending") is True
+        and state.get("currentness_resolution_pending") is True
+        and state.get("action_application_receipt") is None
+        and not state.get("active_agent_invocation")
+        and not state.get("agent_invocation_history")
+        and not any(state.get(key) for key in (
+            "active_ticket_job", "ticket_jobs", "parent_job", "run_acceptance", "run_publication",
+        ))
+    )
