@@ -632,6 +632,12 @@ def _main_with_parser_resources(
         elif executor_backed:
             if parsed.command == "resume":
                 current = cli_surface._load_local_run(states, parsed.run_id)
+                # Preserve this exact recovery need before exit reconciliation
+                # finishes it. An already fully completed Run cannot resume.
+                final_receipt_pending = (
+                    current.get("status") == "completed"
+                    and has_unfinished_final_receipt(current, git.root)
+                )
                 if parsed.message is not None:
                     try:
                         parsed.message = _validated_human_response(parsed.message)
@@ -644,7 +650,11 @@ def _main_with_parser_resources(
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
-                if not resume_attachable and not cli_surface._resume_is_ready(current):
+                if (
+                    not resume_attachable
+                    and not final_receipt_pending
+                    and not cli_surface._resume_is_ready(current)
+                ):
                     _reject_if_task_action_pending(parsed, states, git)
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
@@ -4002,7 +4012,11 @@ def _select_one_record(
             )
         if len(matches) == 1:
             public, state = matches[0]
-            if cli_surface._resume_is_ready(state):
+            if cli_surface._resume_is_ready(state) or (
+                state.get("status") == "completed"
+                and current_root is not None
+                and has_unfinished_final_receipt(state, current_root)
+            ):
                 return public, state
             raise _selector_error(
                 "run_selector_not_recoverable",

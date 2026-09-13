@@ -297,7 +297,7 @@ def test_public_run_repair_human_blocker_resume_reuses_semantic_attempt(
             *detail_args,
         )
         assert human_history.returncode == 0, human_history.stderr
-        assert human_history.stdout.count("人工阻塞：") == 1
+        assert human_history.stdout.count("人工阻塞 ·") == 1
 
 
 def test_public_run_repair_human_blocker_currentness_drift_retires_attempt(
@@ -446,7 +446,7 @@ def test_run_repair_resume_preserves_partial_worker_edits_and_thread(
     assert stdout_json(approved)["status"] == "completed"
     status = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--plain")
     assert status.returncode == 0, status.stderr
-    assert "当前有效通过" in status.stdout
+    assert "当前版本已通过验收" in status.stdout
     assert "尚无有效验收结论" not in status.stdout
 
 def _repair_agents_after_acceptance(path: Path, *, repair_generations: int) -> Path:
@@ -766,13 +766,35 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
     recovery_agents = _resume_repair_agents(
         git_repo / "recovery-agents.json", expected_thread_id=None
     )
+    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_before = control_path.read_bytes()
+    fixture_before = fixture.read_bytes()
+    refused = run_cli(git_repo, fixture, "run", "1")
+    assert refused.returncode == 2, refused.stdout
+    assert stdout_json(refused)["status"] == "supervision_timeout"
+    assert load_only_run_state(git_repo) == waiting_state
+    assert control_path.read_bytes() == control_before
+    assert fixture.read_bytes() == fixture_before
     recovered = run_cli(
-        git_repo, fixture, "run", "1", "--agent-fixture", str(recovery_agents)
+        git_repo, fixture, "resume", "1", "--agent-fixture", str(recovery_agents)
     )
 
-    assert recovered.returncode == 0, recovered.stderr
+    assert recovered.returncode == 2, recovered.stderr
+    invalidated = load_only_run_state(git_repo)
+    assert stdout_json(recovered)["status"] == "run_acceptance_pending"
+    assert "approval_grant" not in invalidated["run_publication"]
+    assert invalidated["agent_invocation_history"] == waiting_state["agent_invocation_history"]
+    assert not any(
+        pull.get("scope") == "final_run" and pull.get("state") == "MERGED"
+        for pull in json.loads(fixture.read_text())["delivery"]["pull_requests"]
+    )
+
+    repaired = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(recovery_agents)
+    )
+    assert repaired.returncode == 0, repaired.stderr
     completed = load_only_run_state(git_repo)
-    assert stdout_json(recovered)["status"] == "run_approval_pending"
+    assert stdout_json(repaired)["status"] == "run_approval_pending"
     assert completed["run_acceptance"]["repair_generation"] == 1
     assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
 

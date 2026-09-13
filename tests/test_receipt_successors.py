@@ -216,13 +216,15 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         return
 
     if intent.startswith("repeat"):
-        assert code == (
-            0 if intent == "repeat_ready" and command == "approve" else 2
-        ), output
+        assert code == 2, output
         assert output["action"]["submission"] == "attached"
         assert host.start_count == 0
         assert repaired["action"]["action_id"] == receipt["action_id"]
-        assert repaired["action"]["status"] == "completed"
+        # Saving approval is not completion: this receipt has no successful
+        # merge and closeout, so its stopped final operation must fail closed.
+        assert repaired["action"]["status"] == (
+            "failed" if command == "approve" else "completed"
+        )
     else:
         assert code == 2, output
         assert host.start_count == 1
@@ -237,9 +239,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
         assert len(predecessors) == 1
         assert predecessors[0]["status"] == "completed"
     before_retry = control_path.read_bytes()
-    assert cli_module.main(arguments) == (
-        0 if intent == "repeat_ready" and command == "approve" else 2
-    )
+    assert cli_module.main(arguments) == 2
     capsys.readouterr()
     assert host.start_count == (1 if intent == "successor" else 0)
     assert control_path.read_bytes() == before_retry

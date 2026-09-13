@@ -1541,9 +1541,9 @@ def test_ticket_fresh_acceptance_failure_resume_uses_requested_thread(
     failed_attempt = failed_job["pending_semantic_attempt"]
     assert failed_attempt["role"] == "reviewer"
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
-    assert "类型: Execution Failure" in status_view
-    assert "对象: Ticket #3" in status_view
-    assert "阶段: reviewing" in status_view
+    assert "类型: 执行失败" in status_view
+    assert "对象: 子任务 #3" in status_view
+    assert "阶段: 验收中" in status_view
 
     resumed_agents = git_repo / "resumed-ticket-review.json"
     resumed_data = final_run_agents()
@@ -2092,9 +2092,12 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
         capture_output=True,
         check=False,
     ).returncode != 0
+    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    completed_control = control_path.read_bytes()
     replayed = run_cli(git_repo, fixture, "resume", run_id)
     assert replayed.returncode == 2
     assert stdout_json(replayed)["status"] == "completed"
+    assert control_path.read_bytes() == completed_control
     abandoned = run_cli(git_repo, fixture, "abandon", run_id)
     assert abandoned.returncode == 0, abandoned.stderr
     assert stdout_json(abandoned)["status"] == "completed"
@@ -2778,6 +2781,7 @@ def test_parent_only_approve_queues_only_exact_repairable_failure(
         git_repo, fixture, "deliver", run_id, "--agent-fixture", str(agents)
     )
     assert delivered.returncode == 0, delivered.stderr
+    before_approval = load_only_run_state(git_repo)
     agents.write_text(
         json.dumps(
             {
@@ -2817,7 +2821,23 @@ def test_parent_only_approve_queues_only_exact_repairable_failure(
     )
 
     assert approval.returncode == 2, approval.stderr
-    assert stdout_json(approval)["status"] == "ready_for_human"
+    assert stdout_json(approval)["status"] == "parent_delivery_pending"
+    invalidated = load_only_run_state(git_repo)
+    assert invalidated["parent_job"]["phase"] == "repairing"
+    assert "approval_grant" not in invalidated["parent_job"]
+    assert invalidated["agent_invocation_history"] == before_approval["agent_invocation_history"]
+    assert not any(
+        pull.get("state") == "MERGED"
+        for pull in json.loads(fixture.read_text())["delivery"]["pull_requests"]
+    )
+
+    # A failed check ends the old approval. A subsequent run may repair the
+    # candidate, but that work cannot be covered by the invalidated grant.
+    repaired = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
+    assert repaired.returncode == 2, repaired.stderr
+    assert stdout_json(repaired)["status"] == "ready_for_human"
     job = load_only_run_state(git_repo)["parent_job"]
     assert job["phase"] == "blocked"
     assert job["human_blocker_phase"] == "repairing"
@@ -3100,11 +3120,22 @@ def test_parent_only_approve_waits_and_recovers_without_duplicate_delivery(
     data["delivery"].pop("required_check_evidence_failures", None)
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
+    if waiting_case in {"pending", "unknown"}:
+        control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+        control_before = control_path.read_bytes()
+        fixture_before = fixture.read_bytes()
+        refused = run_cli(git_repo, fixture, "run", "1")
+        assert refused.returncode == 2, refused.stdout
+        assert stdout_json(refused)["status"] == "supervision_timeout"
+        assert load_only_run_state(git_repo) == waiting
+        assert control_path.read_bytes() == control_before
+        assert fixture.read_bytes() == fixture_before
+
     recovered = (
         run_cli(
             git_repo,
             fixture,
-            "run",
+            "resume",
             "1",
             "--agent-fixture",
             str(agents),
@@ -3245,13 +3276,13 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
         machine_output=False,
     )
     assert requeued.returncode == 0, requeued.stderr
-    assert "交付状态: 等待父项人工批准" in requeued.stdout
+    assert "交付状态: 等待人工批准" in requeued.stdout
     assert "下一步: agent-run approve 1 --repo example/project" in requeued.stdout
     assert "parent_approval_pending" not in requeued.stdout
     assert "<run-id>" not in requeued.stdout
     for command in ("status", "history"):
         view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
-        expected = "等待人工批准" if command == "history" else "等待父项人工批准"
+        expected = "等待人工批准"
         assert expected in view.stdout
         assert "agent-run approve 1 --repo example/project" in view.stdout
         assert run_id not in view.stdout
@@ -3443,7 +3474,7 @@ def test_child_addition_cannot_continue_parent_only_delivery(
     history_text = invoke_cli_inprocess(git_repo, fixture, "history", run_id).stdout
     assert accepted not in history_text
     assert observed not in history_text
-    assert "新增 Ticket [3]" in history_text
+    assert "新增子任务 [3]" in history_text
     final = json.loads(fixture.read_text(encoding="utf-8"))
     assert final.get("delivery", {}).get("mutations", []) == []
 
@@ -3501,14 +3532,14 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
         git_repo, fixture, "abandon", run_id, machine_output=False
     )
     assert interrupted.returncode == 2
-    assert "交付状态: 等待放弃恢复" in interrupted.stdout
+    assert "交付状态: 正在完成放弃操作" in interrupted.stdout
     assert "下一步: agent-run abandon 1 --repo example/project" in interrupted.stdout
     assert "abandonment_pending" not in interrupted.stdout
     assert "<run-id>" not in interrupted.stdout
     assert run_id not in interrupted.stdout
     for command in ("status", "history"):
         view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
-        assert "等待放弃恢复" in view.stdout
+        assert "正在完成放弃操作" in view.stdout
         assert "agent-run abandon 1 --repo example/project" in view.stdout
         assert "abandonment_pending" not in view.stdout
         assert "<run-id>" not in view.stdout
@@ -5031,9 +5062,9 @@ def test_published_head_drift_blocks_merge_and_close(git_repo: Path) -> None:
         }
     ]
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id).stdout
-    assert "类型: Deterministic Contradiction" in status_view
-    assert "对象: Ticket #3" in status_view
-    assert "阶段: blocked" in status_view
+    assert "类型: 交付记录与实际结果不一致" in status_view
+    assert "对象: 子任务 #3" in status_view
+    assert "阶段: 已受阻" in status_view
     mutable_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert mutable_fixture["delivery"]["closed_issues"] == []
     assert mutable_fixture["delivery"]["pull_requests"][0]["state"] == "OPEN"
