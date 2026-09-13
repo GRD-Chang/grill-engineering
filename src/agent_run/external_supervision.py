@@ -8,6 +8,8 @@ import json
 from time import monotonic, sleep
 from typing import Any, Callable
 
+from agent_run.final_approval_operation import has_final_approval
+
 from agent_run.error_safety import bounded_error
 
 CHECKS_BUDGET_SECONDS = 45 * 60
@@ -510,7 +512,7 @@ def _waiting_ref_facts(state: dict[str, Any]) -> tuple[str | None, str | None]:
 
 def _run_recovery_action(state: dict[str, Any]) -> str | None:
     run_id = state.get("run_id")
-    if state.get("status") == "supervision_timeout" and isinstance(run_id, str):
+    if (state.get("status") == "supervision_timeout" or has_final_approval(state)) and isinstance(run_id, str):
         return f"agent-run resume {run_id}"
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, dict) else None

@@ -12,6 +12,9 @@ from agent_run.delivery_policy import (
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
+from agent_run.final_approval_operation import (
+    final_approval_cleanup_pending, has_final_approval,
+)
 from agent_run.delivery_progress import (
     history_progress_view,
     print_history_progress,
@@ -562,6 +565,8 @@ def _next_action(state: dict[str, Any]) -> str:
     parent = state.get("parent")
     parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
     cleanup = state.get("delivery_cleanup")
+    if status == "completed" and final_approval_cleanup_pending(state) and isinstance(run_id, str):
+        return f"agent-run resume {run_id}"
     if (
         isinstance(cleanup, dict)
         and cleanup.get("status") == "cleanup_pending"
@@ -580,6 +585,11 @@ def _next_action(state: dict[str, Any]) -> str:
                 f"随后用 agent-run run {parent_number} 退休旧 checkout 并继续 fresh Run Acceptance，"
                 f"或用 agent-run abandon {run_id} --discard-worktree 明确丢弃"
             )
+        return f"agent-run resume {run_id}"
+    if has_final_approval(state) and isinstance(run_id, str) and status in {
+        "run_approval_pending", "parent_approval_pending", "waiting_checks",
+        "waiting_external", "parent_closeout_pending", "execution_failed", "supervision_timeout",
+    }:
         return f"agent-run resume {run_id}"
     if status in {"run_approval_pending", "parent_approval_pending"} and isinstance(
         run_id, str

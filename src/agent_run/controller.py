@@ -1215,7 +1215,7 @@ class Controller:
         publication = state.get("run_publication")
         if (
             isinstance(publication, dict)
-            and publication.get("phase") == "waiting_external"
+            and publication.get("phase") not in {"merged", "abandoned", "stale"}
             and isinstance(publication.get("merge_intent"), dict)
         ):
             # A merge may have succeeded before GitHub's response or readback

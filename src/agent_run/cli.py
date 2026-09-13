@@ -83,11 +83,20 @@ from agent_run.run_driver import (
     RunDriver,
     RunOutcomeKind,
 )
+from agent_run.final_approval_operation import (
+    final_approval_busy_message,
+    final_approval_cleanup_pending,
+    final_approval_failure,
+    has_final_approval,
+    has_unfinished_final_receipt,
+    is_final_approval_action,
+)
 from agent_run.run_lifecycle import (
     ActionReceipt,
     LifecycleRequest,
     RunLifecycle,
     prepare_action_application_receipt,
+    _unbound_action_matches_run_receipt,
 )
 from agent_run.resume_intent import (
     ResumeIntentError,
@@ -252,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="使用可复制的朴素文本，关闭 Rich 装饰",
     )
-    history = subcommands.add_parser("history", help="显示有界 Invocation 与状态时间线")
+    history = subcommands.add_parser("history", help="查看各轮 Agent 工作、关键进展与结果")
     history.add_argument("run_id", nargs="?", help="完整 Run ID；省略时使用 Human Run Selector")
     _add_common_options(history)
     history.add_argument("--parent", type=_positive_integer, help="按 Parent Issue 选择 Run")
@@ -680,10 +689,15 @@ def _main_with_parser_resources(
             )
         else:  # pragma: no cover - lifecycle commands are Executor-backed
             raise ExecutionReadinessError("Lifecycle Action 缺少 Executor Host")
+        if lifecycle_receipt is not None and lifecycle_receipt.status == "failed":
+            control_failure = bounded_error(lifecycle_receipt.failure or "操作未完成")
         active_ticket_job = state.get("active_ticket_job")
         diagnostics = state.get("diagnostics")
         current_diagnostics = diagnostics if isinstance(diagnostics, list) else []
-        if control_failure is not None:
+        if control_failure is not None and not any(
+            isinstance(item, Mapping) and item.get("code") == control_failure
+            for item in current_diagnostics
+        ):
             current_diagnostics = [
                 *current_diagnostics,
                 {
@@ -1179,6 +1193,7 @@ def _print_lifecycle_result(
     if state.get("_control_no_active_executor") is True:
         print("Agent: 当前没有正在运行的 Agent；未创建 Action")
     if receipt is not None:
+        final_approval = is_final_approval_action({"kind": receipt.kind}, state)
         print(f"操作: {receipt.kind}")
         if (
             receipt.resume_intent is not None
@@ -1187,13 +1202,13 @@ def _print_lifecycle_result(
             print("恢复授权: 本次操作授权开启一个新的预算窗口；重复附着不会再次授权")
         print("提交结果: 已附着到原操作" if receipt.attached else "提交结果: 已接受新操作")
         if receipt.status == "failed":
-            print("动作状态: 应用失败")
+            print("动作状态: 最终批准未完成" if final_approval else "动作状态: 应用失败")
             if receipt.failure:
                 print(f"失败原因: {receipt.failure}")
         elif receipt.status in {"completed", "executor_active"}:
-            print("动作状态: 已应用")
+            print("动作状态: 最终交付已完成" if final_approval else "动作状态: 已应用")
         else:
-            print("动作状态: 正在应用")
+            print("动作状态: 最终批准正在执行" if final_approval else "动作状态: 正在应用")
         if receipt.executor_status in {"exited", "absent"}:
             print("Agent: 原操作已收口，无活动 Executor")
         elif receipt.attached:
@@ -1202,7 +1217,8 @@ def _print_lifecycle_result(
             print("Agent: Executor 已正确开始")
     status = state.get("status")
     if status == "completed":
-        print("交付状态: 整个交付已完成")
+        print("交付状态: 代码已合并，仍有清理待完成" if final_approval_cleanup_pending(state)
+              else "交付状态: 整个交付已完成")
     elif status == "abandoned":
         print("交付状态: 整个交付已放弃")
     else:
@@ -1231,6 +1247,8 @@ def _print_interruption_result(
     first = diagnostic[0] if isinstance(diagnostic, list) and diagnostic else None
     message = first.get("message") if isinstance(first, Mapping) else "操作观察已中断"
     print(f"操作状态: 已中断（{message}）")
+    if isinstance(state, Mapping) and has_final_approval(state):
+        print("本次仅停止观察，不取消已经接受的最终批准；请用 status 查看后台结果")
     print(
         "交付状态: "
         f"{cli_presentation.human_delivery_status(output.get('status'))}"
@@ -1337,7 +1355,7 @@ def _reject_conflicting_stop_action(
     ):
         return
     raise ActionBusyError(
-        "当前 Delivery Task 已有未完成 Lifecycle Action；不会等待或排队",
+        final_approval_busy_message(action, state),
         action=action,
     )
 
@@ -1752,6 +1770,8 @@ def _ordinary_run_requires_explicit_action(current: Mapping[str, Any]) -> bool:
     """Whether only a dedicated operator command may leave this boundary."""
 
     state = dict(current)
+    if has_final_approval(state) and state.get("status") not in {"completed", "abandoned"}:
+        return True
     if state.get("status") == "supervision_timeout":
         return has_local_operator_gate(state)
     return has_run_operator_gate(state)
@@ -2643,7 +2663,7 @@ def _reconcile_resume_exit(
     current: dict[str, Any],
 ) -> dict[str, Any]:
     """Explicit Resume may close an exactly identified externally stopped session."""
-    if host is None or current.get("status") in {"completed", "abandoned"}:
+    if host is None or current.get("status") == "abandoned":
         return current
     task = _task_for_parent(parsed, github, git)
     control = TaskControlStore(git.root / ".agent-run")
@@ -2667,19 +2687,23 @@ def _reconcile_resume_exit(
                 # the Run interruption save fails. Recheck its concrete process
                 # identity and finish that boundary on the next explicit Resume.
                 executor.get("status") in {"exited", "absent"}
-                and not has_run_operator_gate(current)
+                and (not has_run_operator_gate(current) or is_final_approval_action(action, current))
                 and type(executor.get("pid")) is int
                 and isinstance(executor.get("process_start_token"), str)
             )
         )
-        and action.get("status") in {"completed", "failed"}
-        and action_receipt_matches(current, action)
+        and (
+            action.get("status") in {"completed", "failed"}
+            or is_final_approval_action(action, current)
+        )
+        and (action_receipt_matches(current, action)
+             or _unbound_action_matches_run_receipt(current, action))
     ):
         return current
     spec = ExecutorSpec(
         task=task,
         action_id=str(action["action_id"]),
-        run_id=str(current["run_id"]),
+        run_id=executor.get("run_id"),
         generation=int(executor["generation"]),
         cwd=git.root,
         state_root=states.root,
@@ -2695,15 +2719,29 @@ def _reconcile_resume_exit(
         raise ExecutorStartUnknownError(observation.reason or "原 Executor 退出状态无法确认")
     validate_executor_exit(executor)
     latest = states.load_current_run(str(current["run_id"]))
-    if latest is None or not action_receipt_matches(latest, action):
+    if latest is None or not (
+        action_receipt_matches(latest, action) or _unbound_action_matches_run_receipt(latest, action)
+    ):
         raise ExecutorStartUnknownError("Run 与原 Executor 的关联已变化；请重新查询")
     current = latest
-    if current.get("status") in {"completed", "abandoned"}:
+    if current.get("status") in {"completed", "abandoned"} and not is_final_approval_action(action, current):
+        return current
+    if _unbound_action_matches_run_receipt(current, action) and is_final_approval_action(action, current):
+        control.mark_executor_absent(task, action_id=spec.action_id, generation=spec.generation)
+        control.complete_action_from_application_receipt(
+            task, action_id=spec.action_id, generation=spec.generation,
+            application_receipt=current["action_application_receipt"],
+            result_status=str(current.get("status")), failure=final_approval_failure(current),
+        )
         return current
     control.finish_executor(
         task, action_id=spec.action_id, generation=spec.generation,
         run_id=spec.run_id, runner_binding=spec.runner_binding,
+        failure=(final_approval_failure(current) if is_final_approval_action(action, current) else None),
+        result_status=str(current.get("status")),
     )
+    if is_final_approval_action(action, current):
+        return current
     if not has_run_operator_gate(current):
         control.fail_session_from_application_receipt(
             task, action_id=spec.action_id, generation=spec.generation,
@@ -3917,7 +3955,14 @@ def _select_one_record(
         if parent_number is not None and public.get("parent") != parent_number:
             continue
         if active_only and state.get("status") in {"completed", "abandoned"}:
-            continue
+            if not (
+                purpose == "resume" and state.get("status") == "completed"
+                and (
+                    final_approval_failure(state) is not None and has_final_approval(state)
+                    or (current_root is not None and has_unfinished_final_receipt(state, current_root))
+                )
+            ):
+                continue
         if ready_command is not None and not cli_surface._command_is_ready(
             state, ready_command
         ):

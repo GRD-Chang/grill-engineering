@@ -59,7 +59,7 @@ def test_lifecycle_help_describes_operator_boundaries() -> None:
     assert "立即停止活动 Executor 并保留可显式恢复的现场" in help_text
     assert "仅从 requeue_required 创建新的 Change Job Generation" in help_text
     assert "显示当前状态与下一条允许的操作" in help_text
-    assert "显示有界 Invocation 与状态时间线" in help_text
+    assert "查看各轮 Agent 工作、关键进展与结果" in help_text
     assert "promotion-handshake" not in help_text
     for internal_command in ("deliver", "accept-run", "publish-run"):
         assert internal_command not in help_text

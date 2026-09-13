@@ -1224,8 +1224,9 @@ class TaskControlStore:
         action_id: str,
         generation: int | None = None,
         result_status: str | None = None,
+        failure: str | None = None,
     ) -> dict[str, Any]:
-        """Release admission after handshake and durable intent application."""
+        """Release admission at the command-specific durable completion boundary."""
 
         with self._locked(task):
             record = self._require_unlocked(task)
@@ -1246,10 +1247,10 @@ class TaskControlStore:
                 raise ActionReconciliationError(
                     "Lifecycle Action 只能在业务意图持久应用后收口"
                 )
-            action["status"] = "completed"
+            action["status"] = "failed" if failure is not None else "completed"
             action["completed_at"] = _now()
             action["result_status"] = result_status
-            action["failure"] = None
+            action["failure"] = _bounded_text(failure) if failure is not None else None
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)
@@ -1262,6 +1263,7 @@ class TaskControlStore:
         generation: int,
         application_receipt: Mapping[str, Any],
         result_status: str | None = None,
+        failure: str | None = None,
     ) -> dict[str, Any]:
         """Close an applied Action after the exact Executor is proven gone."""
 
@@ -1288,11 +1290,22 @@ class TaskControlStore:
                 raise ActionReconciliationError(
                     "Lifecycle Action 崩溃对账前未证明 Executor 已退出"
                 )
+            receipt_run_id = application_receipt.get("run_id")
+            if action.get("run_id") is None:
+                payload = action.get("payload")
+                if not (
+                    action.get("kind") in {"approve", "resume"}
+                    and isinstance(receipt_run_id, str) and receipt_run_id
+                    and isinstance(payload, Mapping) and payload.get("run_id") == receipt_run_id
+                    and executor.get("run_id") in {None, receipt_run_id}
+                    and record.get("run_id") in {None, receipt_run_id}
+                ):
+                    raise ActionReconciliationError("未绑定的原操作缺少准确 Run 关联")
             expected = {
                 "action_id": action_id,
                 "kind": action.get("kind"),
                 "payload_digest": action.get("payload_digest"),
-                "run_id": action.get("run_id"),
+                "run_id": action.get("run_id") or receipt_run_id,
                 "executor_generation": generation,
             }
             if any(
@@ -1302,11 +1315,14 @@ class TaskControlStore:
                 raise ActionReconciliationError(
                     "Delivery Run Receipt 与崩溃 Action ownership 不一致"
                 )
+            action["run_id"] = receipt_run_id
+            executor["run_id"] = receipt_run_id
+            record["run_id"] = receipt_run_id
             action["application_observed"] = True
-            action["status"] = "completed"
+            action["status"] = "failed" if failure is not None else "completed"
             action["completed_at"] = _now()
             action["result_status"] = result_status
-            action["failure"] = None
+            action["failure"] = _bounded_text(failure) if failure is not None else None
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)

@@ -824,3 +824,37 @@ def test_abandon_recovers_lost_final_run_pr_close_response(
         for mutation in publisher.data["delivery"]["mutations"]
         if mutation["action"] == "close_final_run_pr"
     ] == close_mutations
+
+
+def test_merge_readback_keeps_the_original_approval_after_the_base_advances(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+
+    class LostMergeResponse(FixtureGitHubPublisher):
+        def normal_merge(self, **authority: Any) -> str:
+            super().normal_merge(**authority)
+            raise OSError("merge applied before response")
+
+    publisher = LostMergeResponse(git_repo / "github.json", git)
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(), github=publisher,
+        default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    run_id = str(state["run_id"])
+    engine.publish(run_id)
+    waiting = engine.approve(run_id)
+    assert waiting["status"] == "waiting_external"
+    pending = states.load_current_run(run_id)
+    assert pending is not None
+    original_grant = pending["run_publication"]["approval_grant"]
+    assert original_grant["base_sha"] != git.resolve("main")
+
+    resumed = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        default_branch="main", default_head_sha=git.resolve("main"),
+    ).approve(run_id)
+    assert resumed["status"] == "completed"
+    assert resumed["run_publication"]["approval_grant"] == original_grant
+    assert resumed["run_publication"]["merge_intent"]["attempts"] == 1
