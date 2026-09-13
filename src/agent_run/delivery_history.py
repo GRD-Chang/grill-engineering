@@ -425,6 +425,7 @@ def print_rich_history_progress(
     """Render a bounded, static Rich timeline for an interactive terminal."""
 
     from rich.console import Console
+    from rich.padding import Padding
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -546,7 +547,8 @@ def print_rich_history_progress(
     table = Table.grid(expand=True, padding=(0, 0))
     table.add_column(no_wrap=False, overflow="fold")
     for line in body:
-        table.add_row(line)
+        indent = len(line.plain) - len(line.plain.lstrip(" "))
+        table.add_row(Padding(line[indent:], (0, 0, 0, indent)) if indent else line)
     console.print(
         Panel(
             table,
@@ -2993,7 +2995,7 @@ def _operator_instruction(
         return "你暂时无需操作。"
     if state.get("status") in {"completed", "abandoned"}:
         return "无需操作。"
-    return "按上述命令继续；不要重复启动另一个 Run。"
+    return "按上述命令继续；不要重复启动同一项任务。"
 
 
 def _current_wait_lines(state: dict[str, Any], audit: dict[str, Any]) -> list[str]:

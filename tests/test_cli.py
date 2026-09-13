@@ -925,8 +925,8 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     assert failed["active_agent_invocation"] is None
 
     status = run_cli(git_repo, fixture, "status", run_id)
-    assert "类型: Execution Failure" in status.stdout
-    assert "唯一下一步: agent-run resume 1 --repo example/project" in status.stdout
+    assert "类型: 执行失败" in status.stdout
+    assert "下一步: agent-run resume 1 --repo example/project" in status.stdout
     for command in ("status", "history"):
         json_view = stdout_json(
             run_cli(git_repo, fixture, command, run_id, "--json")

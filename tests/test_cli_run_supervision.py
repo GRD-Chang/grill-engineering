@@ -178,15 +178,17 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
             assert wait["next_action"] == "agent-run run 1"
             assert wait["timeout_resume_action"] == "agent-run run 1"
 
+        _interrupt_run(process, git_repo)
         for command in ("status", "history"):
             text = run_cli(git_repo, fixture, command, run_id).stdout
-            assert "等待 PR #1 的自动检查" in text
+            assert "等待 PR #1 的合并前检查" in text
             assert "已等待：" in text
             assert "本轮最多还可等待：" in text
             assert "fixture-required-check" in text
             assert "等待完成" in text
-            assert "无法确认 Runner 是否仍在自动等待" in text
-            assert "agent-run doctor" in text
+            assert "自动等待已停止" in text
+            assert "agent-run run 1 --repo example/project" in text
+            assert "agent-run doctor" not in text
             assert "截止=" not in text
             assert "超时恢复:" not in text
     finally:
@@ -259,13 +261,13 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     assert halted.returncode == 2
     state = load_only_run_state(git_repo)
     assert state["status"] == "requeue_required"
-    assert "交付状态: 需要重新排队" in halted.stdout
+    assert "交付状态: 需要按更新后的需求重新开始" in halted.stdout
     assert "下一步: agent-run requeue 1 --repo example/project" in halted.stdout
     assert "requeue_required" not in halted.stdout
     assert "<run-id>" not in halted.stdout
     for command in ("status", "history"):
         view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
-        assert "需要重新排队" in view.stdout
+        assert "需要按更新后的需求重新开始" in view.stdout
         assert "agent-run requeue 1 --repo example/project" in view.stdout
         assert run_id not in view.stdout
         assert "<run-id>" not in view.stdout
@@ -519,9 +521,9 @@ def test_public_run_supervises_non_repairable_final_check_failure(
     )
     assert status["supervision"]["kind"] == "github_convergence"
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"])).stdout
-    assert "类型: Supervision Timeout Pause" in status_view
-    assert "对象: Run Publication" in status_view
-    assert "阶段: waiting_external" in status_view
+    assert "类型: 自动等待已超时" in status_view
+    assert "对象: 整体交付" in status_view
+    assert "阶段: 等待 GitHub 操作结果" in status_view
     assert status["supervision"]["timeout_resume_action"] == (
         f"agent-run resume {state['run_id']}"
     )

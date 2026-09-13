@@ -735,21 +735,21 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                 "Run Development"
             )
             assert "阶段:       开发中" in text_status.stdout
-            assert "当前对象:   Run Acceptance" in text_status.stdout
+            assert "当前对象:   整体验收" in text_status.stdout
             assert (
-                "最近 Agent: Development Agent · Run Acceptance（开发 Agent）"
+                "最近 Agent: 开发 Agent · 整体验收"
                 in text_status.stdout
             )
-            assert "Run Development     1 / 10 轮" in text_status.stdout
-            assert "Run Review          0 / 11 轮" in text_status.stdout
+            assert "本次授权已用：开发 1 / 10 次" in text_status.stdout
+            assert "验收 0 / 11 次" in text_status.stdout
             assert "等待人工批准" not in text_status.stdout
-            assert "当前对象:   Run Publication" not in text_status.stdout
+            assert "当前对象:   整体交付" not in text_status.stdout
 
             active_repair = states.load_current_run(str(state["run_id"]))
             publication_phase_labels = {
-                "blocked": "已阻塞",
+                "blocked": "已受阻",
                 "ready_for_human": "等待人工处理",
-                "publication_pending": "等待发布",
+                "publication_pending": "发布待继续",
             }
             for publication_phase, phase_label in publication_phase_labels.items():
                 gated = deepcopy(active_repair)
@@ -810,7 +810,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                 assert gated_json["worker"] is None
                 assert gated_json["progress"]["current_agent"] is None
                 assert f"阶段:       {phase_label}" in gated_text.stdout
-                assert "当前对象:   Run Publication" in gated_text.stdout
+                assert "当前对象:   整体交付" in gated_text.stdout
                 assert "运行修复开发工作代理" not in gated_text.stdout
 
             states.save_run(str(state["run_id"]), active_repair)
@@ -867,7 +867,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     assert json_status["phase"] == "stale"
     assert json_status["progress"]["current_object"] == "Run Publication"
     assert "阶段:       已失效" in text_status.stdout
-    assert "当前对象:   Run Publication" in text_status.stdout
+    assert "当前对象:   整体交付" in text_status.stdout
 
 
 def test_required_check_repair_promotion_clears_old_observation_and_archives_provenance(

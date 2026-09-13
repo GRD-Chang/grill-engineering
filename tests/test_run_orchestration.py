@@ -1668,20 +1668,20 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
     assert "4" not in state["ticket_jobs"]
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", run_id)
     assert status_view.returncode == 0
-    assert "Repository: example/project" in status_view.stdout
-    assert "Parent:     #1 Parent spec" in status_view.stdout
-    assert "操作者动作" in status_view.stdout
-    assert "类型: Human Blocker" in status_view.stdout
-    assert "对象: Ticket #2" in status_view.stdout
-    assert "阶段: candidate" in status_view.stdout
+    assert "仓库:       example/project" in status_view.stdout
+    assert "整体需求:   #1 Parent spec" in status_view.stdout
+    assert "需要你处理" in status_view.stdout
+    assert "类型: 需要人工处理" in status_view.stdout
+    assert "对象: 子任务 #2" in status_view.stdout
+    assert "阶段: 代码已准备，等待验收" in status_view.stdout
     assert _human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"] in status_view.stdout
-    assert "触发阻塞的 Agent: reviewer" in status_view.stdout
-    assert "model gpt-6-astra" in status_view.stdout
-    assert "reasoning effort low" in status_view.stdout
+    assert "触发阻塞的 Agent: 验收 Agent" in status_view.stdout
+    assert "模型 gpt-6-astra" in status_view.stdout
+    assert "推理强度 low" in status_view.stdout
     assert "本轮时长:" in status_view.stdout
-    assert "已保留成果: Candidate 已保存" in status_view.stdout
-    assert "整个 Delivery Run 已暂停；其他 Ticket 不会推进" in status_view.stdout
-    assert "唯一下一步: agent-run resume 1 --repo example/project" in status_view.stdout
+    assert "已保留成果: 当前代码版本已保存" in status_view.stdout
+    assert "整项任务已暂停，其他子任务也不会继续。" in status_view.stdout
+    assert "下一步: agent-run resume 1 --repo example/project" in status_view.stdout
     for internal_value in (
         run_id,
         str(state["ticket_jobs"]["2"]["candidate_sha"]),
@@ -1694,8 +1694,8 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         assert internal_value not in status_view.stdout
     history_view = invoke_cli_inprocess(git_repo, fixture, "history", run_id)
     assert history_view.returncode == 0
-    assert "类型: Human Blocker" in history_view.stdout
-    assert "对象: Ticket #2" in history_view.stdout
+    assert "类型: 需要人工处理" in history_view.stdout
+    assert "对象: 子任务 #2" in history_view.stdout
     assert _human_acceptance("reviewer-2")["checks"]["e2e"]["evidence"] in history_view.stdout
     for command in ("status", "history"):
         json_view = stdout_json(

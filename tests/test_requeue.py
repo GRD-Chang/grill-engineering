@@ -980,13 +980,13 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
     for command in ("status", "history"):
         view = invoke_cli_inprocess(git_repo, fixture, command, run_id)
         assert view.returncode == 0, view.stderr
-        assert "类型: Deterministic Contradiction" in view.stdout
-        assert "对象: Ticket #7" in view.stdout
-        assert "阶段: developing" in view.stdout
-        assert "原因: Change PR changed outside the current Generation" in view.stdout
+        assert "类型: 交付记录与实际结果不一致" in view.stdout
+        assert "对象: 子任务 #7" in view.stdout
+        assert "阶段: 开发中" in view.stdout
+        assert "原因: PR 已被外部修改，与当前交付记录不一致" in view.stdout
         assert f"已保留成果: PR #{pr_number}" in view.stdout
         assert (
-            "唯一下一步: 修复诊断中的确定性外部矛盾后执行 "
+            "下一步: 修复诊断中的交付记录与实际结果不一致的问题后执行 "
             "agent-run run 1 --repo example/project"
         ) in view.stdout
 

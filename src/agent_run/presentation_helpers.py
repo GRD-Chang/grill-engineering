@@ -145,6 +145,7 @@ def human_pause_reason(value: object) -> str:
         "unexpected_external_merge": "发现了未记录的外部合并",
         "Run abandonment recovery is incomplete.": "放弃操作尚未完成",
         "Parent Issue requires explicit human intervention": "整体需求需要你处理后才能继续",
+        "Change PR changed outside the current Generation": "PR 已被外部修改，与当前交付记录不一致",
         "外部状态在本次监督窗口内未收敛": "在本次等待时限内仍未确认 GitHub 操作结果",
         "initial Worker read credential is temporarily unavailable": "暂时无法取得 GitHub 工作凭据",
     }.get(raw, raw)
