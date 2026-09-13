@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -29,7 +30,7 @@ from agent_run.operator_action_presentation import (
     operator_action_view,
     print_operator_action as _print_operator_action,
 )
-from agent_run.presentation_helpers import current_work_subject, human_next_action
+from agent_run.presentation_helpers import current_work_subject, human_next_action, human_status_term
 from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.run_lifecycle import ActionReceipt
@@ -671,10 +672,26 @@ def human_next_action_for_state(state: Mapping[str, Any]) -> object:
             value = next_action
     if not isinstance(value, str):
         return value
+    for internal, human in (
+        ("stale Managed Development Checkout", "旧开发工作区"),
+        ("再使旧 checkout 恢复 clean", "再清理旧工作区中的未提交文件"),
+        ("退休旧 checkout 并继续 fresh Run Acceptance", "移除旧工作区并重新整体验收"),
+        ("检查已耗尽的 Publication Operation Retry", "检查发布重试失败的原因"),
+        ("原 Ticket Graph", "原任务与依赖关系"),
+        ("处理诊断中的确定性矛盾", "处理诊断中交付记录与实际结果不一致的问题"),
+        ("确定性外部矛盾", "交付记录与实际结果不一致的问题"),
+    ):
+        value = value.replace(internal, human)
     repository = state.get("repository")
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else None
     run_id = state.get("run_id")
+    if isinstance(repository, str) and type(parent_number) is int:
+        value = re.sub(
+            r"agent-run abandon(?=[，；。]|$)",
+            f"agent-run abandon {parent_number} --repo {repository}",
+            value,
+        )
     if (
         isinstance(repository, str)
         and isinstance(parent_number, int)
@@ -946,54 +963,4 @@ def _candidate_validation_status(job: dict[str, object]) -> str:
 
 
 def _display_term(value: object) -> object:
-    if not isinstance(value, str):
-        return value
-    return {
-        "active": "进行中",
-        "starting": "正在启动",
-        "ticket_completed": "任务已完成",
-        "waiting_checks": "等待自动检查",
-        "waiting_merge": "等待合并确认",
-        "waiting_external": "等待外部系统收敛",
-        "github_convergence": "GitHub 状态收敛",
-        "required_checks": "自动检查",
-        "publication_pending": "等待发布",
-        "parent_delivery_pending": "等待父项交付",
-        "parent_approval_pending": "等待父项人工批准",
-        "parent_closeout_pending": "等待父项收口",
-        "run_acceptance_pending": "等待运行整体验收",
-        "run_publication_pending": "等待运行发布",
-        "run_approval_pending": "等待人工批准",
-        "requeue_required": "需要重新排队",
-        "ready_for_human": "等待人工处理",
-        "unsupported_scope_change": "不支持的范围变化",
-        "deterministic_contradiction": "确定性矛盾，需人工处理",
-        "abandonment_pending": "等待放弃恢复",
-        "progress_exhausted": "无可推进任务",
-        "execution_failed": "执行失败，可恢复",
-        "operator_stopped": "操作者已停止，可恢复",
-        "supervision_timeout": "监督超时暂停，可恢复",
-        "pending": "待处理",
-        "blocked": "已阻塞",
-        "incompatible_run_state": "状态协议不兼容",
-        "unreviewed": "未验收",
-        "pass": "已通过",
-        "fail": "未通过",
-        "stale": "已失效",
-        "completed": "已完成",
-        "abandoned": "已放弃",
-        "developing": "开发中",
-        "repairing": "修复中",
-        "reviewing": "验收中",
-        "validating": "验证中",
-        "publishing": "发布中",
-        "publication_pending": "等待发布",
-        "ready_for_approval": "等待人工批准",
-        "merged": "已合并",
-        "ticket_phase": "任务阶段",
-        "parent_phase": "父项阶段",
-        "run_acceptance": "运行验收",
-        "run_publication": "运行发布",
-        "run_status": "运行状态",
-        "timeline_capacity": "时间线容量已达上限",
-    }.get(value, "未知内部状态")
+    return human_status_term(value)

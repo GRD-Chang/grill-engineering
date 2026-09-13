@@ -132,7 +132,7 @@ def test_budget_checkpoint_explains_new_window_authorization(git_repo: Path) -> 
     for command in ("status", "history"):
         result = run_cli(git_repo, fixture, command, state["run_id"])
         assert result.returncode == 0, result.stderr
-        assert "resume 将授权新的预算窗口" in result.stdout
+        assert "继续执行后，将按配置补充本次开发与验收额度" in result.stdout
     assert _file_snapshot(git_repo) == before
 
 

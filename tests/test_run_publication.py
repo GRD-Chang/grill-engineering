@@ -396,8 +396,8 @@ def test_final_publication_human_resume_clears_current_blocker(
             str(state["run_id"]),
         )
         assert view.returncode == 0, view.stderr
-        assert "类型: Human Blocker" in view.stdout
-        assert "对象: Run Publication" in view.stdout
+        assert "类型: 需要人工处理" in view.stdout
+        assert "对象: 整体交付" in view.stdout
         if command == "status":
             assert "阶段:       等待人工处理" in view.stdout
         assert (
@@ -405,12 +405,12 @@ def test_final_publication_human_resume_clears_current_blocker(
             in view.stdout
         )
         assert (
-            "触发阻塞的 Agent: publication（发布 Agent）；model publication-model；"
-            "reasoning effort high；本轮时长: 0 秒"
+            "触发阻塞的 Agent: 发布 Agent；模型 publication-model；"
+            "推理强度 high；本轮时长: 0 秒"
             in view.stdout
         )
         assert (
-            "唯一下一步: agent-run resume 1 --repo example/project"
+            "下一步: agent-run resume 1 --repo example/project"
             in view.stdout
         )
     history = stdout_json(

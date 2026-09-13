@@ -50,12 +50,14 @@ def _assert_public_wait_projection(
             "等待 GitHub 的操作结果",
             "已等待：",
             "本轮最多还可等待：",
-            "无法确认 Runner 是否仍在自动等待",
-            "agent-run doctor",
+            "无法确认后台等待是否仍在继续",
+            "agent-run status --repo example/project --parent 1 --json",
+            "先核验原执行的归属和退出状态",
         ):
             assert label in text_result.stdout
         assert "截止=" not in text_result.stdout
         assert "超时恢复:" not in text_result.stdout
+        assert "agent-run doctor" not in text_result.stdout
         if secret is not None:
             assert secret not in json_result.stdout
             assert secret not in text_result.stdout
