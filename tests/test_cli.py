@@ -1083,21 +1083,32 @@ def test_invalid_policy_is_rejected_before_run_state_creation(
 
 
 def test_public_operator_docs_describe_the_v01_quickstart() -> None:
-    documents = [
-        (PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
-        (PROJECT_ROOT / "docs" / "agent-run.md").read_text(encoding="utf-8"),
-    ]
+    reference = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(encoding="utf-8")
+    for required in (
+        "./install.sh", "release tag", "agent-run doctor", "auth app configure",
+        "--rollback", "--uninstall", "Linux", "./setup.sh", "目标交付仓库",
+    ):
+        assert required in reference
 
-    for document in documents:
-        assert "./install.sh" in document
-        assert "release tag" in document
-        assert "agent-run doctor" in document
-        assert "auth app configure" in document
-        assert "--rollback" in document
-        assert "--uninstall" in document
-        assert "Linux" in document
-        assert "./setup.sh" in document
-        assert "目标交付仓库" in document
+    # Public READMEs route agents to language-specific guides; installation
+    # details belong there rather than being duplicated in the landing page.
+    for readme, guide_name, install_name in (
+        ("README.md", "agent-guide.en.md", "install.en.md"),
+        ("README.zh-CN.md", "agent-guide.md", "install.md"),
+    ):
+        landing = (PROJECT_ROOT / readme).read_text(encoding="utf-8")
+        guide = (PROJECT_ROOT / "docs" / guide_name).read_text(encoding="utf-8")
+        install = (PROJECT_ROOT / "docs" / install_name).read_text(encoding="utf-8")
+        assert f"](docs/{guide_name})" in landing
+        assert f"]({install_name}#" in guide
+        for required in (
+            "./setup.sh", "./install.sh", "agent-run doctor --json",
+            "--rollback", "--uninstall", "Linux", "gh auth login",
+            "agent-run auth status", "codex login status",
+        ):
+            assert required in install
+        assert "](agent-run.md#github-只读身份)" in install
+        assert "](agent-run.md#权限边界)" in install
 
 
 def test_doctor_reports_host_readiness_without_mutating_user_state(
