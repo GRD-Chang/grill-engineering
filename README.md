@@ -2,6 +2,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
+![One command starts automated ticket development, verification, repair, and full acceptance before your approval.](docs/images/automation-overview.png)
+
 After [Matt Pocock Skills](https://github.com/mattpocock/skills) breaks your work into GitHub tickets,
 grill-engineering runs Codex to implement and verify them, with less manual coordination between tasks.
 

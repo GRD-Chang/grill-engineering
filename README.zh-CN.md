@@ -2,6 +2,8 @@
 
 [English](README.md) | 简体中文
 
+![一条命令启动任务自动开发、验收与循环修复，整体验收后由你批准。](docs/images/automation-overview.png)
+
 用 [Matt Pocock Skills](https://github.com/mattpocock/skills) 拆好 GitHub Tickets 后，
 agent-run 自动调用 Codex 完成开发和验收，减少逐个任务手动推进的工作。
 
