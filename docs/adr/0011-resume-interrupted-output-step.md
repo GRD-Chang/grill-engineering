@@ -34,7 +34,7 @@ Executor 仍存活且确认 Worker 异常结束时，普通执行异常沿用每
 
 准确的 `Selected model is at capacity` 失败表示本轮被容量错误中断。只要保持相同恢复资格，就持续等待并自动 Resume 原 Thread，不设次数上限、不消耗普通异常的一次恢复额度，也不增加任何业务尝试或格式修复额度。容量恢复保留原 model、reasoning effort、checkout、工作步骤与成果，不自动切换模型或新建 Thread。若错误转为普通异常，回到普通异常规则；用户明确停止或 Executor 自身消失时遵守对应停止和对账边界。“不限次数”不表示并发启动 Worker 或立即无间隔重试；每次容量失败后固定等待 30 秒再自动续接（Q10 已确认）。
 
-容量识别以准确失败事件为依据，不能只因桌面横幅、退出码 1、任意 HTTP 429 或账户 usage limit 而进入持续恢复。已核验本机 Codex 0.151.0 与 0.153.4 的该错误携带 `codex_error_info=server_overloaded`；应保留可取得的机器诊断，并在实际接口不暴露机器字段时针对已核验的准确容量文案处理。不能推断其他所有 `server_overloaded` 表现均获得无限恢复授权。证据见 [容量错误调研](../research/2026-09-08-codex-model-capacity.md)。
+容量识别以准确失败事件为依据，不能只因桌面横幅、退出码 1、任意 HTTP 429 或账户 usage limit 而进入持续恢复。已核验本机 Codex 0.151.0 与 0.153.4 的该错误携带 `codex_error_info=server_overloaded`；应保留可取得的机器诊断，并在实际接口不暴露机器字段时针对已核验的准确容量文案处理。不能推断其他所有 `server_overloaded` 表现均获得无限恢复授权。
 
 恢复必须保留中断步骤的任务与权限。角色任务中断时继续该角色任务；JSON 格式修复中断时，只续接同一 Thread 的 JSON 修复，携带原校验错误、保持 checkout 只读，不能重新进入开发或开放写权限。默认人工同 Thread Resume 也遵守此规则。
 
