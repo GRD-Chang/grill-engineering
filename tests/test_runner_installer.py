@@ -51,6 +51,7 @@ def _source_tree(tmp_path: Path, *, real_install: bool = False) -> Path:
     source.mkdir()
     shutil.copy2(PROJECT_ROOT / "install.sh", source / "install.sh")
     shutil.copy2(PROJECT_ROOT / "pyproject.toml", source / "pyproject.toml")
+    shutil.copy2(PROJECT_ROOT / "LICENSE", source / "LICENSE")
     shutil.copytree(
         PROJECT_ROOT / "src",
         source / "src",
@@ -1486,6 +1487,9 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert stable_entry.is_symlink()
     assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
     assert _manifest(_active_snapshot(home))["source_provenance"] == provenance
+    packaged_licenses = list(_active_snapshot(home).glob("lib/python*/site-packages/agent_run-*.dist-info/licenses/LICENSE"))
+    assert len(packaged_licenses) == 1
+    assert packaged_licenses[0].read_bytes() == (PROJECT_ROOT / "LICENSE").read_bytes()
     _assert_clean_installer_source(source, isolated_environment)
 
     delivery = tmp_path / "delivery"

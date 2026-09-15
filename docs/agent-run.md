@@ -376,7 +376,7 @@ GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数创建短
 权限使独立验收可以通过 `gh pr checks` 读取 GitHub Actions 产生的远端 Checks 与 commit
 statuses，确认 Hosted CI 结果。
 不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
-Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个最长三小时的 Worker 通过仅在本次 invocation 存活的
+Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个受 Run 保存的角色调用时限约束的 Worker 通过仅在本次 invocation 存活的
 普通 `gh` 命令入口按读取请求获取宿主身份或短期 token；Worker 不需要知道该入口背后的 adapter、socket、PATH 或挂载机制。Execution Guard
 只检查 Worker PATH 与 Codex command-tool 的有效前置目录（`CODEX_INSTALL_DIR`，未设置时为 `~/.local/bin`），将其中当前存在且可执行的 `gh` 解析为去重的 canonical target，并由 bubblewrap
 在 Worker mount namespace 内把同一个 invocation-local adapter 只读绑定到这些 target。新 adapter 不再 prepend 到 PATH，只清理继承环境中失效的旧 adapter 项；
@@ -454,7 +454,7 @@ Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗�
 ## Source Runner 安装
 
 首次公开接入在所选源码目录执行 `./setup.sh`，集中检查与确认后准备宿主并调用底层安装器。
-补齐人工待办后重跑同一入口；详细说明见 [README](../README.md#首次安装)。
+补齐人工待办后重跑同一入口；详细说明见 [安装参考](install.md#首次安装)。
 以下描述保留的 `./install.sh` 本体生命周期。release tag 是稳定使用路径；
 branch、fork、dirty source 和没有 Git metadata 的目录也按当前实际文件构建。安装器要求 CPython
 3.11+、`venv`、`pip` 和源码声明的 Python build backend；它不执行 `sudo`、系统包管理器、
@@ -501,7 +501,7 @@ branch、fork、dirty source 或非官方 provenance 被旧 gate 拒绝。目标
 
 ```bash
 git clone https://github.com/GRD-Chang/grill-engineering.git
-cd grill-engineer
+cd grill-engineering
 git checkout <release-tag>
 ./install.sh
 
@@ -531,7 +531,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
 凭据隔离约束，Publisher 仍使用宿主写身份。
 
-首版范围为 Linux、用户级 `~/.profile` 和单用户安装；已验证组合见[平台验收](runner-setup-validation.md)。底层安装器要求 CPython 3.11+、`venv`、
+首版范围为 Linux、用户级 `~/.profile` 和单用户安装；尚未完成发行版、版本与架构组合的完整真实宿主验证。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
 系统级/多用户安装、PyPI/pipx、常驻 Manager/Launcher、自动更新和跨平台支持不属于本版本。
 

@@ -7,3 +7,11 @@ __pycache__/
 /build/
 /.test-wheels/
 /.test-results/
+
+# 本机环境与凭据
+/.venv/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+/secrets/
