@@ -12,7 +12,7 @@ from typing import Any, Sequence
 
 from agent_run import cli_presentation, cli_surface
 from agent_run import doctor
-from agent_run.user_defaults import UserDefaultsStore
+from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
 from agent_run import settings_cli
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_session_interruption
@@ -175,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_profile_options(run)
     _add_policy_options(run)
     run.add_argument("--json", action="store_true", dest="as_json")
+    run.add_argument("--no-notifications", action="store_true", help="创建本次 Run 时关闭飞书通知")
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume = subcommands.add_parser(
         "resume", help="恢复 Stop、失败/Human Blocker Invocation 或监督超时窗口"
@@ -2096,6 +2097,9 @@ def _run_lifecycle(
                     preset=preset, overrides=overrides, document=document,
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
+                payload["notifications"] = notification_snapshot(
+                    document.get("notifications"), disabled=parsed.no_notifications,
+                )
             else:
                 frozen_creation = current.get("creation_configuration")
                 if isinstance(frozen_creation, dict):
@@ -2483,6 +2487,7 @@ def _run_lifecycle(
             # Keep the initial configuration beside the creation receipt so a
             # lost Task Control can be reconciled without reading user defaults.
             state.setdefault("creation_configuration", dict(run_payload))
+            state.setdefault("notifications", dict(run_payload.get("notifications", {"enabled": False})))
             prepare_action_application_receipt(state, action)
 
         return controller.start_or_resume_unfinished(
@@ -2615,6 +2620,10 @@ def _run_payload_for_existing_action(
 ) -> dict[str, Any]:
     """Resolve retries against the first payload without hiding new inputs."""
 
+    notifications = existing_payload.get("notifications")
+    if getattr(parsed, "no_notifications", False):
+        notifications = notification_snapshot(disabled=True)
+    notification_payload = {"notifications": dict(notifications)} if isinstance(notifications, Mapping) else {}
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")
     if isinstance(stored_policy, Mapping):
@@ -2630,6 +2639,7 @@ def _run_payload_for_existing_action(
                     "parent": parsed.parent,
                     "policy": policy.snapshot(),
                     "profile": dict(stored_profile),
+                    **notification_payload,
                 }
             preset, overrides = creation_profile or (None, {})
             frozen_defaults = {
@@ -2641,7 +2651,7 @@ def _run_payload_for_existing_action(
             creation_profile = UserDefaultsStore().resolve_creation(
                 preset=preset, overrides=overrides, document=frozen_defaults,
             )
-        return _run_action_payload(parsed, policy, creation_profile)
+        return {**_run_action_payload(parsed, policy, creation_profile), **notification_payload}
     if not explicit_policy and not _profile_options_are_explicit(creation_profile):
         # A record reconstructed from a Run receipt has no semantic payload.
         # Keeping that empty payload is the fail-closed reconciliation path.
@@ -2650,7 +2660,7 @@ def _run_payload_for_existing_action(
         policy = parse_policy_snapshot(policy_snapshot_for_state(current))
     else:
         policy = _resolve_delivery_policy(parsed)
-    return _run_action_payload(parsed, policy, creation_profile)
+    return {**_run_action_payload(parsed, policy, creation_profile), **notification_payload}
 
 
 def _profile_options_are_explicit(
@@ -3379,6 +3389,13 @@ def _with_executor_control(
     """Add an ephemeral, strictly read-only Executor ownership audit."""
 
     projected = dict(state)
+    if state_root is not None:
+        from agent_run.notifications import read_notifications
+
+        projected["_notifications"] = read_notifications(state_root, str(state["run_id"]))
+        config = state.get("notifications")
+        if not projected["_notifications"] and isinstance(config, dict):
+            projected["_notifications"] = dict(config)
     if repository_root is None:
         projected["_executor_control"] = {
             "activity": "unknown",

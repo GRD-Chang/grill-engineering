@@ -74,6 +74,26 @@ model 为非空字符串（去除首尾空格）；effort 允许 `minimal/low/me
 }
 ```
 
+## 飞书进度通知
+
+通知默认关闭；关闭时不调用 Feishu CLI，也不创建发送进程或待发消息。
+通过同一个个人设置文件保存 `notifications.enabled`、`open_id`、`profile` 和 `app_id`。
+先在 Feishu CLI 中准备机器人应用、凭据和 profile，并核对接收人的 open_id 属于该应用；
+`app_id` 是本次核对的应用标识，不是凭据。发送时会检查 profile 对应应用仍与绑定一致。
+
+```bash
+agent-run settings configure --notifications --notification-open-id ou_接收人 --notification-profile work --notification-app-id cli_应用标识
+agent-run run 241 --no-notifications
+agent-run settings configure --no-notifications
+```
+
+`--no-notifications` 在创建单次 Run 时生效，不修改个人默认，也不用于改变已有 Run 的快照。
+配置只供之后创建的 Run 使用；已有 Run 保留创建时的接收人、profile 和应用绑定。
+`settings show --run <完整Run-ID>` 可只读查看快照和本地通知原因。
+应用发生变化后，须重新核对 open_id 与 app_id，再为新 Run 更新个人设置；首版不支持运行中换接收人。
+配置不完整、通知字段非法、CLI 不可用、鉴权或发送失败均不改变开发结果，通知不可用及未送达原因保留在本地。
+飞书应用凭据仍由 Feishu CLI 管理，不放入个人设置、项目文件或 Worker 输入。
+
 ## 优先级与已有 Run
 
 新 Run 按内置默认、个人默认、本次显式覆盖解析。`run --preset` 明确重选整个预设基线，随后应用本次角色覆盖；不带 preset 时只覆盖对应的个人默认字段。`settings configure --preset` 是文件字段编辑，保留文件中其他显式设置，查询可看到这些覆盖。
@@ -91,6 +111,8 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 无新文件时，只读兼容旧 `delivery-policy.json`，查询的 `source` 为 `legacy-delivery-policy`。首次通过任一配置命令保存时，将全部旧有效策略保留到新文件。新文件存在后它是唯一权威，旧文件不再参与解析；查询 `legacy_ignored` 明示这一点，可以自行归档旧文件。旧 `policy show/configure` 命令保留，指向同一新文件，不维护另一套默认。
 
-未知字段、null、非法值及损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
+策略和模型中的未知字段、null、非法值及文件损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
 
 账号凭据由 `auth` 管理，项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录；这些内容均不合并到个人默认文件。
+
+发送、恢复与本地记录的边界见[飞书进度通知](notifications.md)。

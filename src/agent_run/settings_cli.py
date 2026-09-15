@@ -28,6 +28,17 @@ def add_parser(
     configure = actions.add_parser("configure", help="修改个人默认，仅影响新 Run")
     policy_options(configure)
     profile_options(configure)
+    notification_toggle = configure.add_mutually_exclusive_group()
+    notification_toggle.add_argument(
+        "--notifications", dest="notifications_enabled", action="store_true",
+        default=None, help="启用新 Run 的飞书通知",
+    )
+    notification_toggle.add_argument(
+        "--no-notifications", dest="notifications_enabled", action="store_false",
+        help="关闭新 Run 的飞书通知",
+    )
+    for name in ("open-id", "profile", "app-id"):
+        configure.add_argument(f"--notification-{name}", help="飞书通知绑定设置，仅影响新 Run")
     configure.add_argument("--json", action="store_true", dest="as_json")
 
 
@@ -46,6 +57,12 @@ def execute(
             profile["preset"] = preset
         result = UserDefaultsStore().configure(
             policy=policy_overrides(parsed), profile=profile,
+            notifications={key: value for key, value in {
+                "enabled": parsed.notifications_enabled,
+                "open_id": parsed.notification_open_id,
+                "profile": parsed.notification_profile,
+                "app_id": parsed.notification_app_id,
+            }.items() if value is not None} or None,
         )
     elif parsed.run_id is not None or parsed.parent is not None:
         state = load_run(parsed)
@@ -57,6 +74,7 @@ def execute(
         result = {
             "result": "settings", "scope": "run", "run_id": parsed.run_id,
             "policy": policy_snapshot_for_state(state),
+            "notifications": state.get("notifications", {"enabled": False}),
             "profile": (
                 {key: document[key] for key in ("preset", "profiles", "profile_revision")}
                 if document is not None else None

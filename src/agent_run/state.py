@@ -54,6 +54,7 @@ class StateStore:
         self._lock_depth = 0
         self._lock_owner: int | None = None
         self._write_guard: Callable[[], None] | None = None
+        self.run_saved_observer: Callable[[dict[str, Any]], None] | None = None
         self._write_transaction: Callable[[], Any] | None = None
 
     def _set_write_guard(
@@ -206,6 +207,8 @@ class StateStore:
     ) -> None:
         self._save_run_unlocked(run_id, state)
         self._after_run_saved()
+        if self.run_saved_observer is not None:
+            self.run_saved_observer(state)
 
     def _after_run_saved(self) -> None:
         """Hook for durable-write fault injection."""
