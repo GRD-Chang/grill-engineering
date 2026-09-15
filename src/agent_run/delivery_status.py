@@ -252,9 +252,7 @@ def print_status_progress(
     print(f"当前对象:   {_terminal_safe(human_delivery_object(view['current_object']))}")
 
     print("\n进度")
-    tickets = view["ticket_progress"]
-    if tickets["total"]:
-        print(f"  子任务               {tickets['completed']} / {tickets['total']} 已完成")
+    print(f"  {_ticket_progress_text(state, view)}")
     rounds = view["round_progress"]
     if rounds is not None:
         for line in _round_details(rounds):
@@ -422,13 +420,7 @@ def print_rich_status_progress(
     )
     add_identity("当前对象", human_delivery_object(view.get("current_object")))
 
-    progress = view.get("ticket_progress")
-    progress_text = "未知"
-    if isinstance(progress, dict) and progress.get("total"):
-        progress_text = (
-            f"子任务 {progress.get('completed')} / {progress.get('total')} 已完成；"
-            "整体验收与发布另行计算"
-        )
+    progress_text = _ticket_progress_text(state, view)
     rounds = view.get("round_progress")
     if isinstance(rounds, dict):
         progress_text += "；" + "；".join(_round_details(rounds))
@@ -759,6 +751,44 @@ def _run_repair_progress(value: object) -> dict[str, object] | None:
         "code_modification_attempts": value.get("code_modification_attempts"),
         "code_modification_limit": value.get("code_modification_limit"),
     }
+
+
+def _ticket_progress_text(state: dict[str, Any], view: dict[str, Any]) -> str:
+    if state.get("delivery_type") == "parent_only":
+        return "无子任务，直接推进需求"
+    progress = view.get("ticket_progress")
+    if state.get("delivery_type") != "ticket_run" or not isinstance(progress, dict):
+        return "无法确认进度"
+    completed, total = progress.get("completed"), progress.get("total")
+    if (
+        type(completed) is not int or type(total) is not int
+        or total <= 0 or not 0 <= completed <= total
+    ):
+        return "无法确认进度"
+    text = f"已完成 {completed} / {total} 个子任务"
+    if completed != total or state.get("status") == "completed":
+        return text
+    # Only active, normal workflow states may add a next-stage promise.
+    if state.get("status") not in {
+        "active", "run_acceptance_pending", "run_publication_pending",
+        "run_approval_pending",
+    }:
+        return text
+    publication = state.get("run_publication")
+    publication_phase = publication.get("phase") if isinstance(publication, dict) else None
+    acceptance = state.get("run_acceptance")
+    acceptance_phase = acceptance.get("phase") if isinstance(acceptance, dict) else None
+    if publication_phase == "ready_for_approval":
+        return text + "，等待你确认后发布"
+    if publication_phase == "publishing":
+        return text + "，正在发布"
+    if publication_phase not in {None, "pending"}:
+        return text
+    if acceptance_phase == "reviewing":
+        return text + "，正在验收"
+    if acceptance_phase in {None, "pending"}:
+        return text + "，还要验收并发布"
+    return text
 
 
 def _ticket_progress(state: dict[str, Any]) -> dict[str, int]:
