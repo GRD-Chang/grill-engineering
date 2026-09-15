@@ -1644,20 +1644,50 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert not list(probe_tmp.iterdir())
 
 
-def test_install_result_names_public_entry_and_login_shell_refresh(
+def test_install_result_reports_current_path_across_install_and_update(
     tmp_path: Path,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
+    environment, _tools, _markers = _isolated_quickstart_environment(tmp_path, fake_bin)
+    user_bin = home / ".local" / "bin"
+    ready_path = f"{user_bin}/../bin{os.pathsep}{environment['PATH']}"
 
-    result = _run(source, home, fake_bin)
+    result = _run(source, home, fake_bin, path=ready_path, environment=environment)
 
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
     assert output["entry"] == str(home / ".local" / "bin" / "agent-run")
-    assert "重新打开登录 shell" in output["path_notice"]
+    assert output["path_notice"] == "当前可直接使用 agent-run"
+    assert output["idempotent"] is False
+
+    repeated = _run(source, home, fake_bin, environment=environment)
+    assert repeated.returncode == 0, repeated.stderr
+    repeated_output = json.loads(repeated.stdout)
+    assert repeated_output["idempotent"] is True
+    assert repeated_output["active_snapshot"] == output["active_snapshot"]
+    assert repeated_output["path_notice"] == (
+        "当前还不能直接使用 agent-run；请重新打开登录 shell，"
+        "或在当前 shell 更新 PATH 后刷新命令缓存"
+    )
+
+    other_entry = fake_bin / "agent-run"
+    other_entry.symlink_to(user_bin / "agent-run")
+    (source / "src" / "agent_run" / "__init__.py").write_text(
+        "__version__ = 'path-notice-update'\n", encoding="utf-8"
+    )
+    shadowed_path = f"{fake_bin}{os.pathsep}{ready_path}"
+    updated = _run(source, home, fake_bin, path=shadowed_path, environment=environment)
+    assert updated.returncode == 0, updated.stderr
+    updated_output = json.loads(updated.stdout)
+    assert updated_output["idempotent"] is False
+    assert updated_output["active_snapshot"] != output["active_snapshot"]
+    assert updated_output["previous_snapshot"] == output["active_snapshot"]
+    assert updated_output["path_notice"] == (
+        f"当前 agent-run 指向其他位置：{other_entry}；请调整 PATH 后刷新命令缓存"
+    )
 
 
 @pytest.mark.parametrize("interrupt_stage", ["source", "paths", "install"])

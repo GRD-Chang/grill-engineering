@@ -19,6 +19,72 @@ class TerminalOutput(StringIO):
         return True
 
 
+@pytest.mark.parametrize("mode, completed, status, acceptance, publication, expected", [
+    ("parent_only", 0, "active", None, None, "无子任务，直接推进需求"),
+    (None, 0, "active", None, None, "无法确认进度"),
+    (None, 1, "active", None, None, "无法确认进度"),
+    ("ticket_run", 0, "active", None, None, "无法确认进度"),
+    ("ticket_run", 1, "active", None, None, "已完成 1 / 2 个子任务"),
+    ("ticket_run", 2, "active", "pending", None, "已完成 2 / 2 个子任务，还要验收并发布"),
+    ("ticket_run", 2, "run_acceptance_pending", "reviewing", None, "已完成 2 / 2 个子任务，正在验收"),
+    ("ticket_run", 2, "run_approval_pending", "accepted", "ready_for_approval", "已完成 2 / 2 个子任务，等待你确认后发布"),
+    ("ticket_run", 2, "run_publication_pending", "accepted", "publishing", "已完成 2 / 2 个子任务，正在发布"),
+    ("ticket_run", 2, "completed", "accepted", "merged", "已完成 2 / 2 个子任务"),
+    ("ticket_run", 2, "blocked", "reviewing", None, "已完成 2 / 2 个子任务"),
+    ("ticket_run", 2, "execution_failed", "accepted", "publishing", "已完成 2 / 2 个子任务"),
+    ("ticket_run", 2, "run_publication_pending", "accepted", "waiting_checks", "已完成 2 / 2 个子任务"),
+    ("ticket_run", 2, "ready_for_human", "ready_for_human", None, "已完成 2 / 2 个子任务"),
+])
+@pytest.mark.parametrize("plain", [True, False])
+def test_delivery_progress_preserves_audit(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
+    mode: str | None, completed: int, status: str, acceptance: str | None,
+    publication: str | None, expected: str,
+) -> None:
+    state = {
+        "run_id": "run-progress", "schema_version": 1,
+        "repository": "example/project", "parent": {"number": 1},
+        "delivery_type": mode, "status": status, "diagnostics": [],
+    }
+    if completed:
+        state["ticket_graph"] = {"tickets": {"2": {}, "3": {}}}
+        state["ticket_jobs"] = {
+            "2": {"phase": "completed"},
+            "3": {"phase": "completed" if completed == 2 else "developing"},
+        }
+    if acceptance:
+        state["run_acceptance"] = {"phase": acceptance}
+    if publication:
+        state["run_publication"] = {"phase": publication}
+    root = git_repo / ".agent-run"
+    StateStore(root).save_run(state["run_id"], state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("COLUMNS", "160")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    output = TerminalOutput()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], *(["--plain"] if plain else [])]) == 0
+    human = Text.from_ansi(output.getvalue()).plain
+    assert expected in human
+    if expected == "已完成 2 / 2 个子任务":
+        assert "已完成 2 / 2 个子任务，" not in human
+    audit_output = StringIO()
+    with redirect_stdout(audit_output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    progress = json.loads(audit_output.getvalue())["progress"]
+    assert set(progress) == {
+        "repository", "parent", "status", "phase", "current_object",
+        "ticket_progress", "round_progress", "run_repair", "elapsed_seconds",
+        "current_agent", "execution_activity", "findings", "conclusion", "next_action",
+    }
+    assert progress["ticket_progress"] == {
+        "completed": completed, "total": 2 if completed else 0,
+    }
+    assert _file_snapshot(root) == before
+
+
 @pytest.mark.parametrize("plain", [True, False])
 def test_completed_status_requires_cleanup_when_closeout_crashed_before_scheduling(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
