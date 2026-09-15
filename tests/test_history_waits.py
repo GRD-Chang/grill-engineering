@@ -221,7 +221,7 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
         text = Text.from_ansi(output.getvalue()).plain
         assert text.count("合并前检查通过") == 1
         assert "合并前检查通过" in text
-        assert "记录到的等待时间：13 分钟" in text
+        assert "记录到的等待时间：13 分 0 秒" in text
         assert "等待人工批准" in text
         assert "04:04" not in text
         if "--details" in arguments:

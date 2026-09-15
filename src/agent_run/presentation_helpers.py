@@ -273,3 +273,16 @@ def delivery_object_label(
     if include_parent_for_run:
         return f"Delivery Run（Parent Issue #{parent_number}）"
     return "Delivery Run"
+
+
+def execution_duration(seconds: object) -> str:
+    """Format trusted execution seconds without dropping minute remainders."""
+    if type(seconds) is not int or seconds < 0:
+        return "未知"
+    minutes, remainder = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分 {remainder} 秒"
+    if minutes:
+        return f"{minutes} 分 {remainder} 秒"
+    return f"{seconds} 秒"

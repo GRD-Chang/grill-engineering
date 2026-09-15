@@ -56,13 +56,16 @@ def _profile(raw: object) -> dict[str, Any]:
     return result
 
 
-def notification_snapshot(raw: object = None, *, disabled: bool = False) -> dict[str, Any]:
+def notification_snapshot(raw: object = None, *, disabled: bool = False, mode: str | None = None) -> dict[str, Any]:
     """Resolve optional notification settings without preventing Run creation."""
-    result: dict[str, Any] = {"enabled": False, "open_id": None, "profile": None, "app_id": None}
-    if disabled or raw is None:
+    result: dict[str, Any] = {"enabled": False, "open_id": None, "profile": None, "app_id": None, "mode": "concise"}
+    if disabled:
         return result
     try:
-        result.update(_notifications(raw))
+        result.update(_notifications(raw) if raw is not None else {})
+        if mode is not None:
+            result.update(_notifications({"mode": mode}))
+            result["enabled"] = True
     except UserDefaultsError as error:
         result["unavailable_reason"] = str(error)
     return result
@@ -76,6 +79,9 @@ def _notifications(raw: object) -> dict[str, Any]:
         if key == "enabled":
             if type(value) is not bool:
                 raise UserDefaultsError("notifications.enabled 必须是布尔值")
+        elif key == "mode":
+            if value not in ("concise", "detailed"):
+                raise UserDefaultsError("notifications.mode 必须是 concise 或 detailed")
         elif key in {"open_id", "profile", "app_id"}:
             if not isinstance(value, str) or not value.strip():
                 raise UserDefaultsError(f"notifications.{key} 必须是非空字符串")

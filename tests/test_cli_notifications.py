@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.notification_cards import card
-from agent_run.notification_events import events
+from agent_run.notification_events import events, recovery_event
 from agent_run.notifications import read_notifications
 from agent_run.presentation_helpers import human_status_term
 from agent_run.user_defaults import UserDefaultsStore
@@ -124,7 +124,7 @@ raise SystemExit(main(sys.argv[1:]))
                     for connection in connections.values():
                         connection.close()
 
-    result = invoke("run", "1", "--agent-fixture", str(agents))
+    result = invoke("run", "1", "--notification-mode", "detailed", "--agent-fixture", str(agents))
     assert result.returncode == 0, result.stderr
     output = stdout_json(result)
     assert output["status"] == "run_approval_pending"
@@ -135,18 +135,18 @@ raise SystemExit(main(sys.argv[1:]))
     # production close is allowed to leave later notifications unsent.
     delivered = [json.loads(line) for line in messages.read_text().splitlines()]
     assert delivered and all(item["schema"] == "2.0" for item in delivered)
-    assert delivered[0]["header"]["title"]["content"] == "任务已启动"
+    assert delivered[0]["header"]["title"]["content"] == "任务已开始"
     cards = [card(event) for event in events(current)]
     titles = [item["header"]["title"]["content"] for item in cards]
-    assert "任务已启动" in titles
-    assert any("开发 Agent" in value and "启动" in value for value in titles), titles
-    assert any("验收 Agent" in value and "启动" in value for value in titles), titles
-    assert any("发布说明已准备" in value for value in titles), titles
-    assert any("最终 PR" in value and "已创建" in value for value in titles), titles
-    assert "等待人工批准" in titles
-    approval_card = next(item for item in cards if item["header"]["title"]["content"] == "等待人工批准")
+    assert "任务已开始" in titles
+    assert any("正在开发" in value for value in titles), titles
+    assert any("正在验收" in value for value in titles), titles
+    assert any("说明已准备好" in value for value in titles), titles
+    assert not any("最终 PR" in value and "已创建" in value for value in titles), titles
+    assert any("请批准合并 PR" in value for value in titles)
+    approval_card = next(item for item in cards if item["header"]["title"]["content"]  .startswith("请批准合并 PR"))
     assert "未配置合并前检查" in json.dumps(approval_card, ensure_ascii=False)
-    assert "整体交付完成" not in titles
+    assert "任务已完成" not in titles
     assert all(item["schema"] == "2.0" for item in cards)
     journal = read_notifications(git_repo / ".agent-run", output["run_id"])
     assert journal["seen"]
@@ -179,7 +179,7 @@ raise SystemExit(main(sys.argv[1:]))
     completed = load_only_run_state(git_repo)
     assert completed["notifications"]["enabled"] is True
     cards = [card(event) for event in events(completed)]
-    assert sum(item["header"]["title"]["content"] == "整体交付完成" for item in cards) == 1
+    assert sum(item["header"]["title"]["content"] == "任务已完成" for item in cards) == 1
 
 
 @pytest.mark.parametrize("scope", ["ticket", "parent", "run"])
@@ -199,10 +199,26 @@ def test_cli_blocked_acceptance_resume_projects_same_round(
         status="blocked", evidence="External test account unavailable; restore access.", findings=[],
     )
     agents.write_text(json.dumps(data))
-    blocked = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    blocked = run_cli(git_repo, fixture, "run", "1", "--notification-mode", "detailed", "--agent-fixture", str(agents))
     assert blocked.returncode == 2, blocked.stdout + blocked.stderr
     state = load_only_run_state(git_repo)
     assert state["status"] == "ready_for_human"
+    expected_number = 3 if scope == "ticket" else 1
+    expected_title = state["ticket_graph"]["tickets"]["3"]["title"] if scope == "ticket" else state["parent"]["title"]
+    for mode in ("concise", "detailed"):
+        snapshot = deepcopy(state)
+        snapshot["notifications"]["mode"] = mode
+        pending = next(event for event in events(snapshot) if event.get("current"))
+        recovered = recovery_event(snapshot, [pending])
+        assert recovered is not None
+        for notification in (pending, recovered):
+            assert notification["task_number"] == expected_number
+            assert notification["task_title"] == expected_title
+            assert notification["url"] == f"https://github.com/example/project/issues/{expected_number}"
+            rendered = card(notification)
+            assert rendered["header"]["subtitle"]["content"] == f"example/project · #{expected_number}"
+            assert expected_title in str(rendered)
+            assert notification["url"] in str(rendered)
     before = events(state)
     blocked_events = [event for event in before if event["kind"] == "stage_end" and "验收受阻" in event["title"]]
     assert len(blocked_events) == 1, before

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from rich.text import Text
 
+from agent_run.status_actions import approval_lines, controller_work, delivery_result_lines, status_heading, status_timing
 from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
 from agent_run.final_approval_operation import final_approval_cleanup_pending
 from agent_run.operator_action_presentation import (
@@ -48,6 +49,11 @@ def status_progress_view(
         current_object=current_object,
     )
     activity = invocation_activity(invocation, audit)
+    control = audit.get("executor_control")
+    if (activity == "not_running" and current is not None
+        and current[1].get("phase") in {"committing_candidate", "creating_pr"}
+        and (not isinstance(control, dict) or control.get("activity") == "unknown")):
+        activity = "unknown"
     findings = _current_findings(state)
     if current_agent is not None:
         current_agent["activity"] = activity
@@ -60,6 +66,9 @@ def status_progress_view(
                 ),
                 remaining_seconds=None,
             )
+    timing = status_timing(state, invocation)
+    if current_agent is not None and "round_seconds" in timing:
+        current_agent["duration_seconds"] = timing["round_seconds"]
     return {
         "repository": state.get("repository"),
         "parent": {
@@ -243,7 +252,10 @@ def print_status_progress(
         "已合并，待清理" if state.get("status") == "completed"
         and final_approval_cleanup_pending(state) else display_term(view["status"])
     )
+    status_label = status_heading(state, view, status_label)
     print(f"状态:       {_terminal_safe(status_label)}")
+    for result in delivery_result_lines(state):
+        print(f"交付结果:   {result}")
     phase = _phase_term(view["phase"], view["current_object"], display_term)
     print(
         f"阶段:       {_terminal_safe(phase if phase is not None else '未进入具体阶段')}"
@@ -251,13 +263,20 @@ def print_status_progress(
     print(f"结论:       {_terminal_safe(_human_conclusion(view['conclusion']))}")
     print(f"当前对象:   {_terminal_safe(human_delivery_object(view['current_object']))}")
 
+    for detail in approval_lines(state):
+        print(f"  {detail}")
+    timing = status_timing(state)
+    if "total_seconds" in timing:
+        print(f"累计 Agent 执行耗时: {_duration(timing['total_seconds'])}")
     print("\n进度")
     print(f"  {_ticket_progress_text(state, view)}")
     rounds = view["round_progress"]
-    if rounds is not None:
+    if rounds is not None and state.get("status") != "completed":
+        print("\n执行额度")
         for line in _round_details(rounds):
             print(f"  {_terminal_safe(line)}")
-    print(f"  总运行时长           {_duration(view['elapsed_seconds'])}")
+    if view["elapsed_seconds"] is not None:
+        print(f"  任务历时             {_duration(view['elapsed_seconds'])}")
 
     repair = view["run_repair"]
     if repair is not None:
@@ -272,6 +291,7 @@ def print_status_progress(
             f"{repair['code_modification_limit']}"
         )
 
+    automatic_work = controller_work(state, audit)
     wait_view = waiting_presentation(state, audit)
     if wait_view is not None:
         print("\n当前工作")
@@ -296,12 +316,17 @@ def print_status_progress(
     if (
         isinstance(executor_control, dict)
         and executor_control.get("activity") == "unknown"
+        and state.get("status") != "completed"
     ):
         print("  Agent 活跃状态: 无法确认（运行状态无法确认）")
     activity = view["execution_activity"]
     if activity == "interrupted":
         print("  执行已中断，等待恢复")
+    if automatic_work:
+        print(f"  {automatic_work}")
     agent = view["current_agent"]
+    if state.get("status") == "completed":
+        agent = None
     if agent is None:
         print("  当前没有运行中的 Agent")
     else:
@@ -314,10 +339,8 @@ def print_status_progress(
         print(f"  推理强度              {_terminal_safe(agent['reasoning_effort'])}")
         if agent.get("started_at"):
             print(f"  开始时间              {local_timestamp(agent['started_at'])}")
-        if agent["duration_seconds"] is None:
-            print("  实际执行时长未知")
         if agent["duration_seconds"] is not None:
-            duration_label = "本轮已运行" if agent["is_active"] else "本轮耗时"
+            duration_label = "本轮执行耗时"
             print(f"  {duration_label:<20}{_duration(agent['duration_seconds'])}")
         if agent["remaining_seconds"] is not None:
             print(f"  本轮剩余              {_duration(agent['remaining_seconds'])}")
@@ -342,7 +365,7 @@ def print_status_progress(
                 "  恢复命令: "
                 f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
             )
-        elif activity != "running":
+        elif activity != "running" and not automatic_work:
             print(
                 "  下一步: "
                 f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
@@ -353,14 +376,17 @@ def print_status_progress(
         )
         print(
             "  "
-            f"{_operator_instruction(state, running_invocation)}"
+            f"{automatic_work or _operator_instruction(state, running_invocation)}"
         )
         _print_findings(view["findings"])
         return
 
     _print_scope_change(audit.get("scope_change"))
     print()
-    print_operator_action(operator_action)
+    if operator_action.get("type") == "Final Approval":
+        print(f"下一步: {_terminal_safe(view['next_action'])}")
+    else:
+        print_operator_action(operator_action)
     _print_findings(view["findings"])
 
 
@@ -386,6 +412,7 @@ def print_rich_status_progress(
         and final_approval_cleanup_pending(state) else _status_term(raw_status)
     )
 
+    status_label = status_heading(state, view, status_label)
     parent = view.get("parent")
     parent_view = parent if isinstance(parent, dict) else {}
     identity = Table.grid(expand=True, padding=(0, 1))
@@ -420,10 +447,17 @@ def print_rich_status_progress(
     )
     add_identity("当前对象", human_delivery_object(view.get("current_object")))
 
+    for result in delivery_result_lines(state):
+        add_identity("交付结果", result)
+    for detail in approval_lines(state):
+        add_identity("批准合并", detail)
+    timing = status_timing(state)
+    if "total_seconds" in timing:
+        add_identity("累计 Agent 执行耗时", _duration(timing["total_seconds"]))
     progress_text = _ticket_progress_text(state, view)
     rounds = view.get("round_progress")
-    if isinstance(rounds, dict):
-        progress_text += "；" + "；".join(_round_details(rounds))
+    if isinstance(rounds, dict) and state.get("status") != "completed":
+        add_identity("执行额度", "；".join(_round_details(rounds)))
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (
@@ -432,11 +466,13 @@ def print_rich_status_progress(
             f"代码修改 {repair.get('code_modification_attempts')} / "
             f"{repair.get('code_modification_limit')}"
         )
-    progress_text += f"；总运行时长 {_duration(view.get('elapsed_seconds'))}"
-    add_identity("进度与预算", progress_text)
+    if view.get("elapsed_seconds") is not None:
+        progress_text += f"；任务历时 {_duration(view['elapsed_seconds'])}"
+    add_identity("总体进度", progress_text)
 
+    automatic_work = controller_work(state, audit)
     wait_view = waiting_presentation(state, audit)
-    agent = view.get("current_agent")
+    agent = view.get("current_agent") if state.get("status") != "completed" else None
     if wait_view is not None:
         agent_text = f"{wait_view.work}\n{wait_view.activity}"
     elif isinstance(agent, dict):
@@ -446,8 +482,10 @@ def print_rich_status_progress(
             f"{human_delivery_object(agent.get('object'))}\n"
             f"模型：{agent.get('model') or '未绑定'}；推理强度："
             f"{agent.get('reasoning_effort') or '未绑定'}\n"
-            f"执行时长：{_duration(agent.get('duration_seconds'))}"
+
         )
+        if agent.get("duration_seconds") is not None:
+            agent_text += f"本轮执行耗时：{_duration(agent['duration_seconds'])}"
         if agent.get("started_at"):
             agent_text += f"；开始时间：{local_timestamp(agent['started_at'])}"
         if agent.get("remaining_seconds") is not None:
@@ -457,7 +495,7 @@ def print_rich_status_progress(
             agent_text += "\n" + "\n".join(str(item) for item in recovery_details)
     else:
         agent_text = "当前没有可确认的 Agent 工作记录"
-    add_identity("当前工作", agent_text)
+    add_identity("当前工作", automatic_work or agent_text)
 
     console.print(
         Panel(
@@ -476,7 +514,7 @@ def print_rich_status_progress(
         and control.get("activity") == "unknown" and state.get("status") != "supervision_timeout"
     )
     needs_diagnostic = activity == "unknown" or unknown_wait
-    agent_running = wait_view is None and activity == "running" and not isinstance(action, dict)
+    agent_running = (automatic_work is not None or (wait_view is None and activity == "running")) and not isinstance(action, dict)
     command = (
         status_diagnostic_command(state) if needs_diagnostic else view.get("next_action")
         or (action.get("next_action") if isinstance(action, dict) else None)
@@ -496,6 +534,8 @@ def print_rich_status_progress(
                 )
             )
         )
+    elif isinstance(action, dict) and action.get("type") == "Final Approval":
+        action_lines.append(Text("查看 PR、验收和合并前检查事实后，执行批准命令。"))
     elif isinstance(action, dict):
         action_lines.append(
             _rich_labeled("类型", _human_action_type(action.get("type")))
@@ -530,7 +570,7 @@ def print_rich_status_progress(
             action_lines.append(Text("继续执行后，将按配置补充本次开发与验收额度，继续已有工作。"))
     else:
         action_lines.append(
-            _rich_value(_operator_instruction(state, audit.get("agent_invocation")))
+            _rich_value(automatic_work or _operator_instruction(state, audit.get("agent_invocation")))
         )
     if wait_view is not None:
         action_lines.extend(_rich_labeled(label, text) for label, text in wait_view.details)
@@ -1025,6 +1065,14 @@ def _current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def current_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the verdict bound to the current work and candidate, without mutation."""
+    current = current_work_subject(state)
+    if current is None:
+        return _completed_acceptance_artifact(state)
+    return _current_artifact(_acceptance_subject(state, current))
+
+
 def _completed_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
     """Return a terminal acceptance artifact only when its candidate matches."""
 
@@ -1060,7 +1108,7 @@ def _acceptance_subject(
     location, subject = current
     if location == "run_publication":
         acceptance = state.get("run_acceptance")
-        publication_head = _publication_boundary_head(subject)
+        publication_head = _publication_boundary_head(subject) or _invocation_publication_head(state, subject)
         acceptance_head = (
             _acceptance_publication_boundary_head(acceptance)
             if isinstance(acceptance, dict)
@@ -1074,6 +1122,48 @@ def _acceptance_subject(
             return acceptance
         return {}
     return subject
+
+
+def _invocation_publication_head(state: dict[str, Any], subject: dict[str, Any]) -> object:
+    """Resolve the real invocation boundary, authenticated by its semantic attempt."""
+    from agent_run.agent_invocation import canonical_fingerprint
+
+    attempt = subject.get("pending_semantic_attempt")
+    invocation = state.get("active_agent_invocation")
+    if not isinstance(invocation, dict):
+        history = state.get("agent_invocation_history")
+        invocation = next((item for item in reversed(history) if isinstance(item, dict)
+                           and isinstance(item.get("semantic_attempt"), dict)
+                           and isinstance(attempt, dict)
+                           and item["semantic_attempt"].get("attempt_id") == attempt.get("attempt_id")), None) if isinstance(history, list) else None
+    if not isinstance(attempt, dict) or not isinstance(invocation, dict):
+        return None
+    identity = invocation.get("semantic_attempt")
+    boundary = invocation.get("currentness_boundary")
+    if (
+        not isinstance(identity, dict) or not isinstance(boundary, dict)
+        or not attempt.get("attempt_id")
+        or identity.get("attempt_id") != attempt.get("attempt_id")
+        or invocation.get("generation") != attempt.get("generation")
+        or identity.get("generation") != attempt.get("generation")
+        or invocation.get("work_subject") != f"run-publication:{state.get('run_id')}"
+        or canonical_fingerprint(boundary) != attempt.get("currentness_boundary_fingerprint")
+    ):
+        return None
+    for key, owner_key in (("parent_revision", "parent"), ("ticket_graph_revision", "ticket_graph")):
+        owner = state.get(owner_key)
+        if isinstance(owner, dict) and boundary.get(key) != owner.get("revision"):
+            return None
+    acceptance = state.get("run_acceptance")
+    if not isinstance(acceptance, dict) or attempt.get("generation") != acceptance.get("acceptance_generation"):
+        return None
+    record = acceptance.get("acceptance_record")
+    if not isinstance(record, dict):
+        return None
+    for key in ("reviewed_default_base_sha", "expected_merge_tree", "parent_revision", "ticket_graph_revision", "ticket_completion_records_fingerprint"):
+        if key in record and boundary.get(key) != record[key]:
+            return None
+    return boundary.get("reviewed_head_sha")
 
 
 def _acceptance_publication_boundary_head(
@@ -1364,15 +1454,9 @@ def _parse_optional_timestamp(value: object) -> datetime | None:
 
 
 def _duration(seconds: object) -> str:
-    if not isinstance(seconds, int):
-        return "未知"
-    minutes = seconds // 60
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours} 小时 {minutes} 分"
-    if minutes:
-        return f"{minutes} 分钟"
-    return f"{seconds} 秒"
+    from agent_run.presentation_helpers import execution_duration
+
+    return execution_duration(seconds)
 
 
 def _operator_instruction(

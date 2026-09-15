@@ -50,7 +50,7 @@ def test_run_reaches_explicit_approval_with_status_and_history(
     assert status.returncode == 0, status.stderr
     assert "仓库:       example/project" in status.stdout
     assert "整体需求:   #1 Parent spec" in status.stdout
-    assert "状态:       等待人工批准" in status.stdout
+    assert f"状态:       请批准合并 PR #{state['run_publication']['pr_number']}" in status.stdout
     assert "当前对象:   整体交付" in status.stdout
     assert "最近 Agent: 发布 Agent" in status.stdout
     latest_invocation = state["agent_invocation_history"][-1]

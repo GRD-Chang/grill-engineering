@@ -37,6 +37,10 @@ def add_parser(
         "--no-notifications", dest="notifications_enabled", action="store_false",
         help="关闭新 Run 的飞书通知",
     )
+    notification_toggle.add_argument(
+        "--notification-mode", choices=("concise", "detailed"),
+        help="启用新 Run 飞书通知：concise 精简，detailed 详细",
+    )
     for name in ("open-id", "profile", "app-id"):
         configure.add_argument(f"--notification-{name}", help="飞书通知绑定设置，仅影响新 Run")
     configure.add_argument("--json", action="store_true", dest="as_json")
@@ -58,7 +62,8 @@ def execute(
         result = UserDefaultsStore().configure(
             policy=policy_overrides(parsed), profile=profile,
             notifications={key: value for key, value in {
-                "enabled": parsed.notifications_enabled,
+                "enabled": True if parsed.notification_mode else parsed.notifications_enabled,
+                "mode": parsed.notification_mode,
                 "open_id": parsed.notification_open_id,
                 "profile": parsed.notification_profile,
                 "app_id": parsed.notification_app_id,
