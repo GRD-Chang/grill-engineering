@@ -81,6 +81,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     store.path.write_text(json.dumps({
         "policy": {"development_thread_policy": "new-per-attempt", "ticket_review_rounds": 2, "invocation_deadlines": {"development": "11m"}},
         "profile": {"development_model": "old-model", "development_effort": "high"},
+        "notifications": {"enabled": True, "open_id": "ou_old", "profile": "work", "app_id": "cli_old"},
     }))
     code, shown = settings("show")
     assert code == 0
@@ -90,16 +91,18 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     fixture = write_fixture(git_repo / "github.json", issues={})
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps({"developments": [human_blocker_step("original-thread")]}))
-    started = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
+    started = run_cli(git_repo, fixture, "run", "1", "--no-notifications", "--agent-fixture", str(agents))
     assert started.returncode == 2, started.stdout + started.stderr
     original = load_only_run_state(git_repo)
+    assert original["notifications"]["enabled"] is False
+    assert original["creation_configuration"]["notifications"] == original["notifications"]
     run_id = original["run_id"]
     profile = AgentProfileStore(git_repo / ".agent-run").load(run_id)
     assert profile is not None
     assert profile["bindings"][0]["model"] == "old-model"
     assert original["agent_invocation_history"][0]["deadline_seconds"] == 660
 
-    code, saved = settings("configure", "--development-model", "new-model", "--development-deadline", "13m", "--development-thread-policy", "reuse")
+    code, saved = settings("configure", "--development-model", "new-model", "--development-deadline", "13m", "--development-thread-policy", "reuse", "--no-notifications", "--notification-open-id", "ou_new")
     assert code == 0
     assert saved["notice"] == "仅影响之后创建的新 Run，已有 Run 保持原设置"
     document = json.loads(store.path.read_text())
@@ -109,6 +112,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     code, actual = settings("show", "--run", run_id)
     assert code == 0
     assert actual["scope"] == "run"
+    assert actual["notifications"] == original["notifications"]
     assert actual["policy"]["development_thread_policy"] == "new-per-attempt"
     assert actual["policy"]["invocation_deadlines"]["development"] == 660
     assert actual["profile"]["profiles"]["development"]["model"] == "old-model"
@@ -130,6 +134,8 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     created = run_cli(second_repo, second_fixture, "run", "1", "--agent-fixture", str(agents))
     assert created.returncode == 2, created.stdout + created.stderr
     new_state = load_only_run_state(second_repo)
+    assert new_state["notifications"]["enabled"] is False
+    assert new_state["notifications"]["open_id"] == "ou_new"
     new_profile = AgentProfileStore(second_repo / ".agent-run").load(new_state["run_id"])
     assert new_profile is not None
     assert new_profile["bindings"][0]["model"] == "new-model"
@@ -238,3 +244,47 @@ def test_thread_policy_file_rejects_invalid_values(value: Any) -> None:
     assert code == 2
     assert "development_thread_policy" in json.dumps(rejected)
     assert store.path.read_text() == content
+
+
+def test_notification_settings_are_optional_and_bound_to_an_app() -> None:
+    code, initial = settings("show")
+    assert code == 0
+    assert initial["notifications"]["enabled"] is False
+    code, configured = settings(
+        "configure", "--notifications", "--notification-open-id", "ou_recipient",
+        "--notification-profile", "work", "--notification-app-id", "cli_application",
+    )
+    assert code == 0
+    assert configured["notifications"] == {
+        "enabled": True, "open_id": "ou_recipient", "profile": "work", "app_id": "cli_application",
+    }
+    settings("configure", "--no-notifications")
+    assert UserDefaultsStore().load()["notifications"]["open_id"] == "ou_recipient"
+
+
+def test_bad_notification_settings_do_not_block_run_configuration() -> None:
+    from agent_run.user_defaults import notification_snapshot
+
+    store = UserDefaultsStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text('{"notifications":{"enabled":"yes"}}')
+    document = store.load()
+    snapshot = notification_snapshot(document["notifications"])
+    assert snapshot["enabled"] is False
+    assert "notifications.enabled" in snapshot["unavailable_reason"]
+    assert "unavailable_reason" not in notification_snapshot(document["notifications"], disabled=True)
+    assert store.resolve_creation(document=document)[0] == "economy"
+
+
+def test_notification_creation_replay_preserves_snapshot() -> None:
+    from agent_run.delivery_policy import resolve_delivery_policy
+
+    parsed = cli.build_parser().parse_args(["run", "228"])
+    payload = cli._run_action_payload(parsed, resolve_delivery_policy(), (None, {}))
+    payload["notifications"] = {"enabled": True, "open_id": "ou_old", "profile": "work", "app_id": "cli_app"}
+    UserDefaultsStore().path.parent.mkdir(parents=True, exist_ok=True)
+    UserDefaultsStore().path.write_text("broken")
+    assert cli._run_payload_for_existing_action(parsed, payload, None, (None, {})) == payload
+    changed = cli.build_parser().parse_args(["run", "228", "--review-model", "new-model"])
+    updated = cli._run_payload_for_existing_action(changed, payload, None, cli._profile_configuration(changed))
+    assert updated["notifications"] == payload["notifications"]

@@ -1846,7 +1846,7 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
         if time.monotonic() >= deadline:
             first.kill()
             raise AssertionError("first run did not reach the controlled Agent gate")
-        os.sched_yield()
+        time.sleep(0.01)
 
     second = subprocess.Popen(
         command,
@@ -1981,7 +1981,7 @@ def test_different_parent_runs_reach_agents_without_shared_state_lock(
                 raise AssertionError(f"first run failed early: {stdout}\n{stderr}")
             if time.monotonic() >= deadline:
                 raise AssertionError("first Parent did not reach the Agent barrier")
-            os.sched_yield()
+            time.sleep(0.01)
 
         processes.append(
             subprocess.Popen(
@@ -2002,7 +2002,7 @@ def test_different_parent_runs_reach_agents_without_shared_state_lock(
                 raise AssertionError(
                     "different Parent was blocked before reaching the Agent barrier"
                 )
-            os.sched_yield()
+            time.sleep(0.01)
 
         release_one.touch()
         release_two.touch()
@@ -3097,7 +3097,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
                 raise AssertionError(
                     "active run did not reach the controlled Agent gate"
                 )
-            os.sched_yield()
+            time.sleep(0.01)
 
         run_id = load_only_run_state(git_repo)["run_id"]
         persistent_roots = [git_repo, tmp_path / "read-only-active"]
@@ -3209,7 +3209,7 @@ def test_custom_state_dir_cannot_fork_a_canonical_unfinished_run(
                 raise AssertionError(
                     "canonical run did not reach the controlled Agent gate"
                 )
-            os.sched_yield()
+            time.sleep(0.01)
 
         canonical_run = next((git_repo / ".agent-run" / "runs").glob("*.json"))
         canonical_before = canonical_run.read_bytes()
@@ -3341,7 +3341,7 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
                 raise AssertionError(
                     "routed run did not reach the controlled Agent gate"
                 )
-            os.sched_yield()
+            time.sleep(0.01)
         custom_run_path = next((custom_state / "runs").glob("*.json"))
         state_before_interrupt = custom_run_path.read_bytes()
         owner.send_signal(signal.SIGINT)
@@ -3478,7 +3478,7 @@ def test_default_run_attaches_to_custom_state_during_executor_handshake(
                 raise AssertionError(
                     "custom run did not reach the controlled Agent gate"
                 )
-            os.sched_yield()
+            time.sleep(0.01)
         custom_run_path = next((custom_state / "runs").glob("*.json"))
         custom_run_id = json.loads(custom_run_path.read_text(encoding="utf-8"))[
             "run_id"

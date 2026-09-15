@@ -347,20 +347,31 @@ class RunAcceptanceEngine:
             self.git.remove_worktree(checkout)
         run.pop("reviewer_new_thread", None)
         budget = ensure_budget(run, budget_policy)
-        budget["review_artifacts"].append(
-            {
-                "reviewer_thread_id": review.thread_id,
-                "candidate_sha": run_head,
-                "reviewed_base_sha": default_head,
+        review_record = {
+            "reviewer_thread_id": review.thread_id,
+            "candidate_sha": run_head,
+            "reviewed_base_sha": default_head,
+            "expected_merge_tree": expected_merge_tree,
+            "review_identity": {
+                "default_base_sha": default_head,
+                "run_head_sha": run_head,
                 "expected_merge_tree": expected_merge_tree,
-                "review_identity": {
-                    "default_base_sha": default_head,
-                    "run_head_sha": run_head,
-                    "expected_merge_tree": expected_merge_tree,
-                },
-                "artifact": artifact.raw,
-            }
-        )
+            },
+            "artifact": artifact.raw,
+        }
+        # Human recovery finishes the same Reviewer round and candidate.
+        # Keep one authoritative artifact, as Ticket/Parent review does;
+        # the original blocker remains in human_blocker_history.
+        prior_index = next((
+            index for index in range(len(budget["review_artifacts"]) - 1, -1, -1)
+            if all(budget["review_artifacts"][index].get(key) == review_record[key]
+                   for key in ("reviewer_thread_id", "candidate_sha", "review_identity"))
+            and AcceptanceArtifact.parse(budget["review_artifacts"][index]["artifact"]).requires_human
+        ), None)
+        if prior_index is None:
+            budget["review_artifacts"].append(review_record)
+        else:
+            budget["review_artifacts"][prior_index] = review_record
         del budget["review_artifacts"][:-budget_policy.review_limit]
         record = self._acceptance_record(
             state,

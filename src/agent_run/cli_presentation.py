@@ -118,6 +118,7 @@ def _print_precondition_failure(
 def _print_status(
     state: dict[str, object], *, as_json: bool, plain: bool = False
 ) -> None:
+    _print_notification_warning(state, as_json=as_json)
     active = _active_ticket_job(state)
     active_ticket = active.get("ticket_number") if active else None
     worker = _current_worker(state)
@@ -136,6 +137,7 @@ def _print_status(
     latest_resume = latest_resume_audit(state)
     operator_action = _operator_action_view(state)
     output = {
+        "notifications": state.get("_notifications", {}),
         "run_id": state.get("run_id"),
         "repository": state.get("repository"),
         "parent": state.get("parent"),
@@ -211,6 +213,7 @@ def _print_history(
     plain: bool = False,
     details: bool = False,
 ) -> None:
+    _print_notification_warning(state, as_json=as_json)
     timeline = state.get("timeline", [])
     if not isinstance(timeline, list):
         raise ValueError("timeline must be an array")
@@ -232,6 +235,7 @@ def _print_history(
         raise ValueError("resume_audit.history must be an array")
     operator_action = _operator_action_view(state)
     output = {
+        "notifications": state.get("_notifications", {}),
         "run_id": state.get("run_id"),
         "timeline": timeline,
         "timeline_continuation": timeline_continuation,
@@ -964,3 +968,17 @@ def _candidate_validation_status(job: dict[str, object]) -> str:
 
 def _display_term(value: object) -> object:
     return human_status_term(value)
+
+
+def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> None:
+    if as_json:
+        return
+    notifications = state.get("_notifications")
+    if not isinstance(notifications, dict):
+        return
+    reason = notifications.get("unavailable_reason")
+    pending = notifications.get("pending", [])
+    if reason:
+        print(f"飞书通知不可用: {reason}")
+    if pending:
+        print(f"飞书通知未确认送达: {len(pending)} 条；原因见同命令 --json 的 notifications。")

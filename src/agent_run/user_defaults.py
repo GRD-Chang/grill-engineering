@@ -56,10 +56,40 @@ def _profile(raw: object) -> dict[str, Any]:
     return result
 
 
+def notification_snapshot(raw: object = None, *, disabled: bool = False) -> dict[str, Any]:
+    """Resolve optional notification settings without preventing Run creation."""
+    result: dict[str, Any] = {"enabled": False, "open_id": None, "profile": None, "app_id": None}
+    if disabled or raw is None:
+        return result
+    try:
+        result.update(_notifications(raw))
+    except UserDefaultsError as error:
+        result["unavailable_reason"] = str(error)
+    return result
+
+
+def _notifications(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise UserDefaultsError("notifications 必须是对象")
+    result: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == "enabled":
+            if type(value) is not bool:
+                raise UserDefaultsError("notifications.enabled 必须是布尔值")
+        elif key in {"open_id", "profile", "app_id"}:
+            if not isinstance(value, str) or not value.strip():
+                raise UserDefaultsError(f"notifications.{key} 必须是非空字符串")
+            value = value.strip()
+        else:
+            raise UserDefaultsError(f"未知 notifications 配置项: {key}")
+        result[key] = value
+    return result
+
+
 def _document(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise UserDefaultsError("用户默认配置必须是对象")
-    unknown = set(raw) - {"policy", "profile"}
+    unknown = set(raw) - {"policy", "profile", "notifications"}
     if unknown:
         raise UserDefaultsError(f"未知配置项: {sorted(unknown)}")
     result: dict[str, Any] = {}
@@ -71,6 +101,8 @@ def _document(raw: object) -> dict[str, Any]:
             raise UserDefaultsError(f"policy: {error}") from error
     if "profile" in raw:
         result["profile"] = _profile(raw["profile"])
+    if "notifications" in raw:
+        result["notifications"] = raw["notifications"]
     return result
 
 
@@ -143,6 +175,7 @@ class UserDefaultsStore:
             "defaults": document,
             "policy": policy, "policy_sources": policy_sources,
             "profile": resolved, "profile_sources": sources,
+            "notifications": notification_snapshot(document.get("notifications")),
             "scope": "future-runs", "notice": SCOPE_NOTICE,
         }
 
@@ -152,9 +185,12 @@ class UserDefaultsStore:
         return self._describe(*self._read())
 
     def configure(self, *, policy: Mapping[str, Any] | None = None,
-                  profile: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                  profile: Mapping[str, Any] | None = None,
+                  notifications: Mapping[str, Any] | None = None) -> dict[str, Any]:
         supplied = _document({**({"policy": policy} if policy is not None else {}),
                               **({"profile": profile} if profile is not None else {})})
+        if notifications is not None:
+            supplied["notifications"] = _notifications(notifications)
         if not any(supplied.values()):
             raise UserDefaultsError("configure requires an explicit option")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +209,11 @@ class UserDefaultsStore:
                             **prior.get("invocation_deadlines", {}), **update["invocation_deadlines"]}
                 if "profile" in supplied:
                     merged["profile"] = _merge_profile(current.get("profile", {}), supplied["profile"])
+                if "notifications" in supplied:
+                    prior_notifications = current.get("notifications", {})
+                    if not isinstance(prior_notifications, Mapping):
+                        prior_notifications = {}
+                    merged["notifications"] = _notifications({**prior_notifications, **supplied["notifications"]})
                 merged = _document(merged)
                 self._write(merged)
                 result = self._describe(merged, "user-defaults")

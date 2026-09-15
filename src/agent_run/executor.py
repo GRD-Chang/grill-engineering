@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
+from agent_run.notifications import Notifications
 from agent_run.runner_lease import runner_usage_lease
 from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError, TaskControlError, TaskKey
@@ -79,6 +80,8 @@ class DeliveryExecutor:
         state = states.load_current_run(run_id)
         if state is None:
             raise TaskControlError("Executor 找不到要推进的 Delivery Run")
+        notifications = Notifications(states.root, state)
+        states.run_saved_observer = notifications.observe
         try:
             driver = self.driver_factory(states, binding)
             if control_operation is None:
@@ -105,6 +108,9 @@ class DeliveryExecutor:
             if self.record_execution_failure is not None:
                 self.record_execution_failure(states, run_id, str(error), binding)
             raise
+        finally:
+            states.run_saved_observer = None
+            notifications.close()
 
 
 def main(arguments: list[str] | None = None) -> int:
