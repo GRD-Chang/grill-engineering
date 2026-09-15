@@ -84,6 +84,19 @@ For changes, read [user defaults](user-defaults.md). Model availability is estab
 Completion: each table item has a verification result, with a resolution for any missing requirement. For installation-only requests, report the result here.
 If the user requested a run, continue with [task checks](agent-guide.en.md#run-a-task).
 
+### Feishu notifications (optional)
+
+Follow the [official Feishu CLI guide](https://github.com/larksuite/cli#installation--quick-start)
+to install the CLI and configure a bot application. Reuse an existing setup when available;
+`setup.sh` does not install or configure the Feishu CLI.
+
+Make sure `lark-cli` is available to the same user who runs `agent-run`. Have the CLI profile,
+its application's `app_id`, and the recipient's `open_id` for that application ready.
+The Feishu CLI manages application credentials.
+
+Then follow [user defaults](user-defaults.md#飞书进度通知) to enable notifications, choose a mode,
+and check the saved settings. These settings apply to new tasks; check actual delivery after a task starts.
+
 ### Automatic CI repair
 
 To allow Runner to repair code failures in CI, declare the eligible steps in the target repository's `pyproject.toml`:
