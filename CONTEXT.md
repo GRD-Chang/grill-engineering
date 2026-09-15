@@ -615,6 +615,10 @@ _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的�
 `status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
 _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
 
+**精简通知**:
+面向任务发起人的重要进展通知，保留子任务完成、需要人工介入或批准及最终结果，省略每轮开发、验收和自动修复的常规启动与结束。Agent 角色在相关消息中保留，阶段使用可理解的工作动作。
+_Avoid_: 仅成功时通知、隐藏人工待办
+
 **Operator Action View（操作者动作视图）**:
 Delivery Progress View 在 Run 需要维护者介入时采用的统一区块，固定说明准确类型、所在 Ticket/Parent Issue 或 Run 对象与阶段、原因、已保留成果、整个 Run 已暂停，以及唯一允许的下一步；Human Blocker 额外显示触发阻塞的 Agent 角色、模型、推理强度与本轮时长。Human Blocker、Review Budget Checkpoint、Execution Failure、Supervision Timeout Pause、Requeue Required 与最终批准继续保留各自真实语义，不因共享版式而被统称为 Human Blocker。
 _Avoid_: 把所有暂停叫作 Human Blocker、只显示内部状态码、缺少恢复动作、声称其他 Ticket 仍在推进
