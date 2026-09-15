@@ -1010,13 +1010,27 @@ def _install_result(
     *,
     idempotent: bool,
 ) -> dict[str, object]:
+    executable = shutil.which("agent-run")
+    if executable is not None and os.path.normpath(executable) == os.path.normpath(
+        str(paths.stable_entry)
+    ):
+        path_notice = "当前可直接使用 agent-run"
+    elif executable is not None:
+        path_notice = (
+            f"当前 agent-run 指向其他位置：{executable}；请调整 PATH 后刷新命令缓存"
+        )
+    else:
+        path_notice = (
+            "当前还不能直接使用 agent-run；请重新打开登录 shell，"
+            "或在当前 shell 更新 PATH 后刷新命令缓存"
+        )
     return {
         "result": "installed",
         "content_identity": _manifest_identity(snapshot),
         "active_snapshot": _manifest_identity(snapshot),
         "previous_snapshot": _manifest_identity(previous) if previous is not None else None,
         "entry": str(paths.stable_entry),
-        "path_notice": "已更新用户级 PATH；请重新打开登录 shell 后使用 agent-run",
+        "path_notice": path_notice,
         "idempotent": idempotent,
         "warning": warnings or None,
     }
