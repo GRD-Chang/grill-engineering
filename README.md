@@ -7,7 +7,7 @@ English | [简体中文](README.zh-CN.md)
 After [Matt Pocock Skills](https://github.com/mattpocock/skills) breaks your work into GitHub tickets,
 grill-engineering runs Codex to implement and verify them, with less manual coordination between tasks.
 
-[Get started](#get-started) · [Screenshots](#screenshots) · [Agent guide](docs/agent-guide.en.md)
+[Get started](#get-started) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Agent guide](docs/agent-guide.en.md)
 
 ## Why I built this
 
@@ -71,6 +71,39 @@ execution and recovery details.
 
 The run keeps going after the terminal closes. Use `stop` to pause it and preserve the work,
 and `resume` to continue later.
+
+## Feishu notifications
+
+Follow progress without keeping a terminal open. Once enabled, Feishu sends you a message when a ticket
+finishes, your input or approval is needed, or the whole task is complete.
+
+Concise mode is the default, covering key progress and anything that needs your attention. Switch to
+detailed mode to follow each development, verification, and repair round. Cards include available work
+summaries and execution times, with links to the relevant issue or PR.
+
+<p align="center">
+  <img src="docs/images/feishu-delivery.en.jpg" width="460" alt="Feishu cards requesting PR approval and reporting completion, with Agent execution time and elapsed time">
+</p>
+
+<details>
+<summary>View development, verification, and repair notifications in detailed mode</summary>
+
+Detailed mode shows when each development round starts, what it delivers, and how long it takes.
+
+<p align="center">
+  <img src="docs/images/feishu-development.en.jpg" width="460" alt="Feishu cards showing a development round starting and finishing, with a work summary and execution time">
+</p>
+
+When verification finds problems, it also shows the findings and the automatic fixes that follow.
+
+<p align="center">
+  <img src="docs/images/feishu-verification.en.jpg" width="460" alt="Feishu cards showing a verification issue queued for automatic repair, followed by ticket completion">
+</p>
+
+</details>
+
+Feishu notifications are optional and off by default; see the
+[notification guide (Chinese)](docs/notifications.md) for setup.
 
 ## Get started
 
