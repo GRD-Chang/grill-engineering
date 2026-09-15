@@ -16,6 +16,7 @@ Read documentation matching the selected source version. Record the tool source 
 | Installed, adding a new repository | [Target repository setup](install.en.md#target-repository-setup) |
 | Start or follow a task | “Run a task” below; complete installation and repository checks before the first run |
 | Update, rollback, or uninstall | [Installation lifecycle](install.en.md#update-rollback-and-uninstall) |
+| Enable or adjust Feishu notifications | [Feishu setup](install.en.md#feishu-notifications-optional), then configure the recipient and notification mode in user defaults |
 | Change models, reasoning effort, or limits | [User defaults](user-defaults.md); check which changes apply to new versus existing tasks |
 
 Read only the relevant branch and its required references. Detailed operation references linked below are currently in Chinese.

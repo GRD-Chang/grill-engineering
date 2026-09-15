@@ -76,27 +76,55 @@ model 为非空字符串（去除首尾空格）；effort 允许 `minimal/low/me
 
 ## 飞书进度通知
 
-通知默认关闭；关闭时不调用 Feishu CLI，也不创建发送进程或待发消息。
-通过同一个个人设置文件保存 `notifications.enabled`、`mode`、`open_id`、`profile` 和 `app_id`。
-先在 Feishu CLI 中准备机器人应用、凭据和 profile，并核对接收人的 open_id 属于该应用；
-`app_id` 是本次核对的应用标识，不是凭据。发送时会检查 profile 对应应用仍与绑定一致。
+通知默认关闭。CLI 安装与机器人应用配置按[飞书 CLI 官方教程](https://github.com/larksuite/cli/blob/main/README.zh.md)
+完成；本节配置 `agent-run` 使用哪个应用、通知谁，以及发送哪些进展。
 
-```bash
-agent-run settings configure --notifications --notification-open-id ou_接收人 --notification-profile work --notification-app-id cli_应用标识
-agent-run settings configure --notification-mode detailed
-agent-run run 241 --notification-mode concise
-agent-run run 241 --no-notifications
-agent-run settings configure --no-notifications
-```
+### 启用通知
 
-通知仍默认关闭；`--notifications` 启用但未指定模式时，新任务默认精简（`concise`），旧个人配置同样适用。`--notification-mode concise|detailed` 选择并启用精简或详细通知；个人设置和单次 `run` 都支持。旧 Run 未保存模式时继续使用详细行为；已有 Run 不重新读取个人默认。
+1. 核对已有的 CLI profile 和机器人身份，用实际 profile 替换 `work`：
 
-`--no-notifications` 在创建单次 Run 时生效，不修改个人默认，也不用于改变已有 Run 的快照。
-配置只供之后创建的 Run 使用；已有 Run 保留创建时的接收人、profile 和应用绑定。
-`settings show --run <完整Run-ID>` 可只读查看快照和本地通知原因。
-应用发生变化后，须重新核对 open_id 与 app_id，再为新 Run 更新个人设置；首版不支持运行中换接收人。
-配置不完整、通知字段非法、CLI 不可用、鉴权或发送失败均不改变开发结果，通知不可用及未送达原因保留在本地。
-飞书应用凭据仍由 Feishu CLI 管理，不放入个人设置、项目文件或 Worker 输入。
+   ```bash
+   lark-cli --profile work whoami --as bot
+   ```
+
+   确认返回的 profile 正确、机器人身份可用，记录其 `appId`。
+   接收人的 `open_id` 必须属于同一个应用；获取方式见官方教程。`app_id` 是应用标识，不是凭据。
+
+2. 用实际值替换示例中的接收人、profile 和应用标识，保存个人配置：
+
+   ```bash
+   agent-run settings configure --notifications --notification-open-id ou_RECIPIENT --notification-profile work --notification-app-id cli_APP_ID
+   agent-run settings show
+   ```
+
+   核对 `notifications` 中的开关、接收人、profile、应用标识和模式。
+   首次启用未指定模式时使用精简模式（`concise`）。应用凭据由飞书 CLI 管理，不写入项目或个人运行配置。
+
+### 选择模式或关闭通知
+
+| 需要 | 命令 |
+| --- | --- |
+| 后续新任务使用精简模式 | `agent-run settings configure --notification-mode concise` |
+| 后续新任务使用详细模式 | `agent-run settings configure --notification-mode detailed` |
+| 仅本次新任务使用详细模式 | `agent-run run <parent-issue> --repo OWNER/REPO --notification-mode detailed` |
+| 仅本次新任务关闭通知 | `agent-run run <parent-issue> --repo OWNER/REPO --no-notifications` |
+| 后续新任务关闭通知 | `agent-run settings configure --no-notifications` |
+
+设置模式也会启用通知，需先完成接收人和应用配置。精简模式保留关键进展与人工待办；
+详细模式增加每轮开发、验收和自动修复的过程，具体内容见[飞书进度通知](notifications.md#收到什么)。
+
+### 生效范围与检查
+
+修改个人配置仅影响之后创建的任务。已有任务继续使用创建时的开关、模式、接收人、profile 和应用绑定；
+旧任务未保存模式时继续使用详细行为。`--no-notifications` 也不能改变已有任务的设置。
+使用 `agent-run settings show --run <完整Run-ID>` 查看已有任务的配置快照。
+
+任务启动后，通过 `agent-run status <完整Run-ID> --json` 或 `agent-run history <完整Run-ID> --json`
+查看 `notifications` 中的发送记录和未送达原因。保存配置、身份核对成功不代表消息已经送达。
+通知不可用或发送失败不改变开发结果。
+
+应用发生变化时，重新核对接收人的 `open_id` 与 `app_id`，再更新个人配置供新任务使用。
+已有任务不支持更换接收人或应用；恢复其通知需要恢复原 profile 对应的应用与凭据。
 
 ## 优先级与已有 Run
 

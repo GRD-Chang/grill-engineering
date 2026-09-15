@@ -7,7 +7,7 @@
 用 [Matt Pocock Skills](https://github.com/mattpocock/skills) 拆好 GitHub Tickets 后，
 agent-run 自动调用 Codex 完成开发和验收，减少逐个任务手动推进的工作。
 
-[安装和使用](#安装和使用) · [运行截图](#运行截图) · [Agent 操作指南](docs/agent-guide.md)
+[安装和使用](#安装和使用) · [运行截图](#运行截图) · [飞书通知](#飞书通知) · [Agent 操作指南](docs/agent-guide.md)
 
 ## 为什么做这个
 
@@ -69,6 +69,37 @@ flowchart TD
 
 运行期间可以关掉终端，之后再回来查状态。如果想让任务停下来，需要用 `stop`；
 程序会保存现场，之后可以用 `resume` 继续。
+
+## 飞书通知
+
+不用一直打开终端查看进度。启用飞书通知后，子任务完成、需要你补充信息或批准最终 PR 时，
+会收到消息；整个任务完成后也会通知你。
+
+默认使用精简模式，只发送关键进展和需要人工处理的消息。想了解每轮开发、验收和自动修复的过程，
+可以切换到详细模式。卡片会显示已有的工作摘要和执行耗时，并提供对应 Issue 或 PR 的链接。
+
+<p align="center">
+  <img src="docs/images/feishu-delivery.jpg" width="460" alt="飞书通知：请求批准合并 PR，以及任务完成后的执行耗时与任务历时">
+</p>
+
+<details>
+<summary>查看详细模式下的开发、验收与修复通知</summary>
+
+详细模式会显示每轮开发的开始时间、完成摘要和执行耗时。
+
+<p align="center">
+  <img src="docs/images/feishu-development.png" width="460" alt="飞书通知：开发 Agent 开始执行，以及开发完成后的工作摘要与本轮执行耗时">
+</p>
+
+验收发现问题时，还会显示问题和接下来的自动修复安排。
+
+<p align="center">
+  <img src="docs/images/feishu-verification.jpg" width="460" alt="飞书通知：验收发现问题后自动修复，以及子任务完成后的进度与执行耗时">
+</p>
+
+</details>
+
+飞书通知为可选功能，默认关闭，配置方法见[飞书通知说明](docs/notifications.md)。
 
 ## 安装和使用
 

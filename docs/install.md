@@ -85,6 +85,17 @@ App 所需只读权限和配置命令见[GitHub App 配置](agent-run.md#github-
 完成条件：表中各项有验证结果，缺项有处理方式。仅安装时到此报告结果；
 用户要求运行时，再按[运行任务](agent-guide.md#运行任务)核验 Issue 和任务关系。
 
+### 飞书通知（可选）
+
+需要飞书通知时，先按[飞书 CLI 官方教程](https://github.com/larksuite/cli/blob/main/README.zh.md)
+完成 CLI 安装与机器人应用配置。已有可用配置可以复用；`setup.sh` 不安装或配置飞书 CLI。
+
+在运行 `agent-run` 的同一用户环境中，确认 `lark-cli` 可用，并准备好 CLI profile、
+对应应用的 `app_id` 和该应用下接收人的 `open_id`。应用凭据由飞书 CLI 管理。
+
+然后按[个人运行配置](user-defaults.md#飞书进度通知)启用通知、选择模式并检查保存结果。
+配置完成只表示后续新任务会使用这些设置；实际送达情况需在任务启动后查看。
+
 ### CI 自动修复
 
 需要让 Runner 自动修复 CI 中的代码失败时，在目标 `pyproject.toml` 声明允许修复的步骤：
