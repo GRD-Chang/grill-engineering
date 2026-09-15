@@ -175,7 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_profile_options(run)
     _add_policy_options(run)
     run.add_argument("--json", action="store_true", dest="as_json")
-    run.add_argument("--no-notifications", action="store_true", help="创建本次 Run 时关闭飞书通知")
+    notification_options = run.add_mutually_exclusive_group()
+    notification_options.add_argument("--notification-mode", choices=("concise", "detailed"), help="创建本次 Run 时启用精简或详细飞书通知")
+    notification_options.add_argument("--no-notifications", action="store_true", help="创建本次 Run 时关闭飞书通知")
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume = subcommands.add_parser(
         "resume", help="恢复 Stop、失败/Human Blocker Invocation 或监督超时窗口"
@@ -2098,7 +2100,7 @@ def _run_lifecycle(
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
                 payload["notifications"] = notification_snapshot(
-                    document.get("notifications"), disabled=parsed.no_notifications,
+                    document.get("notifications"), disabled=parsed.no_notifications, mode=parsed.notification_mode,
                 )
             else:
                 frozen_creation = current.get("creation_configuration")
@@ -2621,8 +2623,11 @@ def _run_payload_for_existing_action(
     """Resolve retries against the first payload without hiding new inputs."""
 
     notifications = existing_payload.get("notifications")
-    if getattr(parsed, "no_notifications", False):
-        notifications = notification_snapshot(disabled=True)
+    if current is None:
+        if getattr(parsed, "no_notifications", False):
+            notifications = notification_snapshot(disabled=True)
+        elif getattr(parsed, "notification_mode", None):
+            notifications = notification_snapshot(notifications, mode=parsed.notification_mode)
     notification_payload = {"notifications": dict(notifications)} if isinstance(notifications, Mapping) else {}
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")

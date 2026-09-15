@@ -88,7 +88,7 @@ def test_failure_retry_is_bounded_and_recovery_uses_current_state(tmp_path: Path
     sender = Notifications(tmp_path, state("completed"))
     sender.close()
     assert "OLD BLOCKER" not in json.dumps(calls[-1])
-    assert "当前" in json.dumps(calls[-1], ensure_ascii=False)
+    assert calls[-1]["header"]["title"]["content"] == "任务已完成"
     assert not read_notifications(tmp_path, "run-test")["pending"]
 
 
@@ -174,3 +174,37 @@ def test_repeated_unchanged_observations_do_not_retry_failed_delivery(tmp_path: 
     after = read_notifications(tmp_path, "run-test")["pending"]
     assert after == before
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+def test_recovered_ticket_todo_sends_the_ticket_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    current = state("ready_for_human")
+    current["notifications"]["mode"] = mode
+    current["ticket_graph"] = {"tickets": {"3": {"title": "子任务标题"}}}
+    current["active_ticket_job"] = {
+        "ticket_number": 3, "phase": "blocked", "human_blockers": ["测试账号不可用"],
+    }
+    monkeypatch.setattr("agent_run.notifications.send", lambda *args: {
+        "outcome": "failed", "reason": "offline",
+    })
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    assert read_notifications(tmp_path, "run-test")["pending"]
+
+    delivered: list[dict[str, Any]] = []
+
+    def sent(config: Any, card: dict[str, Any], identity: Any, cancel: Any) -> dict[str, Any]:
+        delivered.append(card)
+        return {"outcome": "success", "reason": None}
+
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    recovered = Notifications(tmp_path, current)
+    recovered.close()
+    assert len(delivered) == 1
+    assert delivered[0]["header"]["subtitle"]["content"] == "example/project · #3"
+    assert "子任务标题" in str(delivered[0])
+    assert "https://github.com/example/project/issues/3" in str(delivered[0])
+    assert "https://github.com/example/project/issues/1" not in str(delivered[0])
+    assert not read_notifications(tmp_path, "run-test")["pending"]

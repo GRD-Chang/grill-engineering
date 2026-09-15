@@ -352,7 +352,8 @@ def print_history_progress(
         f"{_safe_text(parent_view.get('title') or '未命名整体需求')}"
     )
     print(f"时区:       {timezone_label}")
-    print(f"任务历时:   {_duration(progress['summary']['elapsed_seconds'])}")
+    if progress["summary"]["elapsed_seconds"] is not None:
+        print(f"任务历时:   {_duration(progress['summary']['elapsed_seconds'])}")
     executor_control = audit.get("executor_control")
     if (
         isinstance(executor_control, dict)
@@ -382,10 +383,8 @@ def print_history_progress(
             print(f"  {_round_label(key):<22}{count} 轮")
     else:
         print("  尚无 Agent 轮次")
-    print(
-        f"  {'总运行时长':<22}"
-        f"{_duration(progress['summary']['elapsed_seconds'])}"
-    )
+    if progress["summary"]["elapsed_seconds"] is not None:
+        print(f"  {'任务历时':<22}{_duration(progress['summary']['elapsed_seconds'])}")
     waiting_lines = _current_wait_lines(state, audit)
     if waiting_lines:
         print("\n" + "\n".join(waiting_lines))
@@ -446,8 +445,10 @@ def print_rich_history_progress(
             f"{parent_view.get('title') or '未命名整体需求'}",
         ),
         _rich_line("时区", timezone_label),
-        _rich_line("任务历时", _duration(progress["summary"]["elapsed_seconds"])),
+
     ]
+    if progress["summary"]["elapsed_seconds"] is not None:
+        header.append(_rich_line("任务历时", _duration(progress["summary"]["elapsed_seconds"])))
     if progress.get("execution_activity") in {
         "interrupted",
         "unknown",
@@ -500,9 +501,7 @@ def print_rich_history_progress(
             Text(
                 f"  Agent 轮次：{_round_summary_text(progress['summary']['rounds'])}"
             ),
-            Text(
-                f"  总运行时长：{_duration(progress['summary']['elapsed_seconds'])}"
-            ),
+
         ]
     )
     waiting_lines = _current_wait_lines(state, audit)
@@ -1659,7 +1658,9 @@ def _record_lines(
         if ended_value is not None
         else ("进行中" if record.get("activity") == "running" else "未知时间")
     )
-    interval = f"{started} → {ended}"
+    interval = f"{started} → {ended}" if ended_value is not None else started
+    if ended_value is None and record.get("activity") == "running":
+        interval += " → 进行中"
     ordinal = record.get("ordinal")
     round_text = f"第 {ordinal} 轮" if isinstance(ordinal, int) else "轮次未记录"
     finding_values = record.get("findings")
@@ -1671,23 +1672,20 @@ def _record_lines(
     )
     if findings:
         title += f"（问题 {len(findings)}）"
-    lines = [
-        f"  {title}",
-        f"    时间区间：{interval}",
-        f"    动作：{_record_action(record)}；结果：{_safe_text(record.get('status_text') or '未知')}",
-    ]
-    lines.append(
-        f"    时长：整轮 {_duration(record.get('span_seconds'))}；"
-        f"累计执行 {_duration(record.get('execution_seconds'))}"
-    )
-    if record.get("span_seconds") is None or record.get("execution_seconds") is None:
-        lines.append("    实际执行时长未知（缺少可信结束证据）")
-    lines.append(f"    {_budget_line(record)}")
+    lines = [f"  {title}"]
+    if _parse_optional_timestamp(record.get("started_at")) is not None:
+        lines.append(f"    时间区间：{interval}")
+    if record.get("execution_seconds") is not None:
+        lines.append(f"    本轮执行耗时：{_duration(record['execution_seconds'])}")
+    if record.get("span_seconds") is not None and record.get("span_seconds") != record.get("execution_seconds"):
+        lines.append(f"    本轮历时：{_duration(record['span_seconds'])}")
+    if details and _role_family(str(record.get("role") or "")) != "publication":
+        lines.append(f"    {_budget_line(record)}")
     configurations = record.get("configurations")
     if isinstance(configurations, list) and configurations:
         for index, configuration in enumerate(configurations, start=1):
             lines.append(
-                f"    配置 {index}：模型={_safe_text(configuration.get('model') or '未记录')}；"
+                f"    {'配置 ' + str(index) if len(configurations) > 1 else '配置'}：模型={_safe_text(configuration.get('model') or '未记录')}；"
                 f"推理强度={_safe_text(configuration.get('reasoning_effort') or '未记录')}"
             )
     else:
@@ -2871,47 +2869,19 @@ def run_elapsed_seconds(
         return None
     if state.get("status") not in {"completed", "abandoned"}:
         return max(0, int((datetime.now(UTC) - started).total_seconds()))
-    candidates: list[datetime] = []
-    if events is not None:
-        candidates.extend(
-            timestamp
-            for event in events
-            if (timestamp := _parse_optional_timestamp(event.get("at"))) is not None
-        )
-    else:
-        candidates.extend(_persisted_event_times(state))
-    end = max(candidates, default=started)
-    return max(0, int((end - started).total_seconds()))
-
-
-def _persisted_event_times(state: dict[str, Any]) -> list[datetime]:
-    values: list[object] = []
-    for key in ("timeline", "timeline_continuation"):
-        timeline = state.get(key)
-        if isinstance(timeline, list):
-            values.extend(
-                event.get("at") for event in timeline if isinstance(event, dict)
-            )
-    invocations = state.get("agent_invocation_history")
-    if isinstance(invocations, list):
-        for invocation in invocations:
-            if isinstance(invocation, dict):
-                values.append(
-                    invocation.get("ended_at") or invocation.get("started_at")
-                )
-    resume_audit = state.get("resume_audit")
-    resume_history = resume_audit.get("history") if isinstance(resume_audit, dict) else None
-    if isinstance(resume_history, list):
-        values.extend(
-            event.get("requested_at")
-            for event in resume_history
-            if isinstance(event, dict)
-        )
-    return [
-        timestamp
-        for value in values
-        if (timestamp := _parse_optional_timestamp(value)) is not None
+    terminal_events = events if events is not None else [
+        event for key in ("timeline", "timeline_continuation")
+        for event in state.get(key, []) if isinstance(event, dict)
     ]
+    candidates = [
+        timestamp for event in terminal_events
+        if event.get("status") == state.get("status")
+        and (timestamp := _parse_optional_timestamp(event.get("at"))) is not None
+    ]
+    if not candidates:
+        return None
+    end = max(candidates)
+    return int((end - started).total_seconds()) if end >= started else None
 
 
 def _utc_timestamp(value: str) -> str | None:
@@ -2961,15 +2931,9 @@ def _utc_offset(timezone: tzinfo) -> str:
 
 
 def _duration(seconds: object) -> str:
-    if not isinstance(seconds, int):
-        return "未知"
-    minutes = seconds // 60
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours} 小时 {minutes} 分"
-    if minutes:
-        return f"{minutes} 分钟"
-    return f"{seconds} 秒"
+    from agent_run.presentation_helpers import execution_duration
+
+    return execution_duration(seconds)
 
 
 def _output_continuation_text(value: object) -> str:

@@ -166,15 +166,15 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
         time.tzset()
     human = Text.from_ansi(output.getvalue()).plain
     for expected in (
-        "整体交付", "发布 Agent", "gpt-5.6-luna", "xhigh", "2 分钟",
-        "2026-09-12 23:20:14", "UTC+08:00", "当前版本已通过验收",
-        "本次授权已用", "额外 CI 修复：不适用", "工作区清理", "已完成", "无需操作",
+        "整体交付", "任务已完成", "当前版本已通过验收",
+        "工作区清理", "已完成", "无需操作",
     ):
         assert expected in human
     for internal in (
         "Run Publication", "Publication Agent", "Attempt #", "预算窗口", "False /",
         "Findings", "Candidate", "状态: completed", "已保留 0", "恢复操作见 --json",
         "2026-09-12T15:20", "run-language", "命令：无",
+        "发布 Agent", "gpt-5.6-luna", "本次授权已用",
     ):
         assert internal not in human
     audit_output = StringIO()

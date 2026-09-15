@@ -5,6 +5,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from agent_run.presentation_helpers import execution_duration
+
 
 def _text(value: object, limit: int = 260) -> str:
     text = " ".join(str(value).split())
@@ -19,17 +21,33 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
     """Build a narrow, single-column card with URL-only navigation."""
     number = event.get("task_number") or "?"
     repository = _text(event.get("repository", "未知仓库"), 100)
-    duration = event.get("duration_seconds")
-    elapsed = f"{duration} 秒" if type(duration) is int and duration >= 0 else "未知"
-    phase = _markdown(event.get("phase", "整体交付"))
-    if event.get("object"):
-        phase = f"{_markdown(event['object'], 80)} · {phase}"
-    ordinal = event.get("round")
-    lines = [f"**任务**：{_markdown(event.get('task_title', '未知'), 160)}",
-             f"**阶段**：{phase} · 第 {ordinal} 轮" if ordinal else f"**阶段**：{phase}",
-             f"**结果**：{_markdown(event.get('summary', '结果未知'))}"]
-    if event.get("kind") == "stage_end":
-        lines.append(f"**耗时**：{elapsed}")
+    lines = []
+    if event.get("task_title"):
+        lines.append(_markdown(event["task_title"], 160))
+    if event.get("kind") in {"stage_start", "stage_end"} or event.get("trigger_role"):
+        role = _markdown(event.get("trigger_role") or event.get("phase", ""))
+        ordinal = event.get("round")
+        lines.append(f"{role} · 第 {ordinal} 轮" if ordinal else role)
+    if event.get("summary"):
+        lines.append(_markdown(event["summary"]))
+    checks = event.get("checks") or {}
+    labels = {"e2e": "功能验证", "standards": "工程审查", "review": "工程审查", "spec": "需求核对"}
+    results = {"pass": "通过", "fail": "未通过", "blocked": "受阻"}
+    for name, result in checks.items():
+        lines.append(f"{labels.get(name, name)}：{results.get(result, '尚未确认')}")
+    if event.get("started_at"):
+        from datetime import datetime
+        try:
+            started = datetime.fromisoformat(event["started_at"]).astimezone()
+            lines.append(f"开始时间：{started:%Y-%m-%d %H:%M:%S %Z}")
+        except ValueError:
+            pass
+    for field, label in (("duration_seconds", "本轮执行耗时"), ("total_seconds", "累计 Agent 执行耗时"),
+                         ("elapsed_seconds", "任务历时")):
+        value = event.get(field)
+        if type(value) is int and value >= 0:
+            duration = execution_duration(value)
+            lines.append(f"**{label}**：{duration}")
     if event.get("next_step"):
         lines.append(f"**下一步**：{_markdown(event['next_step'])}")
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]

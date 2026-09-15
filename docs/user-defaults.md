@@ -77,15 +77,19 @@ model 为非空字符串（去除首尾空格）；effort 允许 `minimal/low/me
 ## 飞书进度通知
 
 通知默认关闭；关闭时不调用 Feishu CLI，也不创建发送进程或待发消息。
-通过同一个个人设置文件保存 `notifications.enabled`、`open_id`、`profile` 和 `app_id`。
+通过同一个个人设置文件保存 `notifications.enabled`、`mode`、`open_id`、`profile` 和 `app_id`。
 先在 Feishu CLI 中准备机器人应用、凭据和 profile，并核对接收人的 open_id 属于该应用；
 `app_id` 是本次核对的应用标识，不是凭据。发送时会检查 profile 对应应用仍与绑定一致。
 
 ```bash
 agent-run settings configure --notifications --notification-open-id ou_接收人 --notification-profile work --notification-app-id cli_应用标识
+agent-run settings configure --notification-mode detailed
+agent-run run 241 --notification-mode concise
 agent-run run 241 --no-notifications
 agent-run settings configure --no-notifications
 ```
+
+通知仍默认关闭；`--notifications` 启用但未指定模式时，新任务默认精简（`concise`），旧个人配置同样适用。`--notification-mode concise|detailed` 选择并启用精简或详细通知；个人设置和单次 `run` 都支持。旧 Run 未保存模式时继续使用详细行为；已有 Run 不重新读取个人默认。
 
 `--no-notifications` 在创建单次 Run 时生效，不修改个人默认，也不用于改变已有 Run 的快照。
 配置只供之后创建的 Run 使用；已有 Run 保留创建时的接收人、profile 和应用绑定。

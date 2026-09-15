@@ -256,7 +256,7 @@ def test_notification_settings_are_optional_and_bound_to_an_app() -> None:
     )
     assert code == 0
     assert configured["notifications"] == {
-        "enabled": True, "open_id": "ou_recipient", "profile": "work", "app_id": "cli_application",
+        "enabled": True, "open_id": "ou_recipient", "profile": "work", "app_id": "cli_application", "mode": "concise",
     }
     settings("configure", "--no-notifications")
     assert UserDefaultsStore().load()["notifications"]["open_id"] == "ou_recipient"
@@ -288,3 +288,50 @@ def test_notification_creation_replay_preserves_snapshot() -> None:
     changed = cli.build_parser().parse_args(["run", "228", "--review-model", "new-model"])
     updated = cli._run_payload_for_existing_action(changed, payload, None, cli._profile_configuration(changed))
     assert updated["notifications"] == payload["notifications"]
+
+
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+def test_notification_mode_configuration_and_override(mode: str) -> None:
+    from agent_run.user_defaults import notification_snapshot
+
+    code, configured = settings("configure", "--notification-mode", mode)
+    assert code == 0
+    assert configured["notifications"]["enabled"] is True
+    assert configured["notifications"]["mode"] == mode
+    legacy = {"enabled": True, "open_id": "ou_old"}
+    assert notification_snapshot(legacy)["mode"] == "concise"
+    assert "mode" not in legacy
+    assert notification_snapshot(legacy, mode=mode)["mode"] == mode
+    settings("configure", "--no-notifications")
+    assert settings("show")[1]["notifications"]["enabled"] is False
+    assert settings("show")[1]["notifications"]["mode"] == mode
+    assert notification_snapshot({"mode": "invalid"})["unavailable_reason"]
+
+
+@pytest.mark.parametrize("arguments, enabled, mode", [
+    ([], True, "concise"),
+    (["--notification-mode", "detailed"], True, "detailed"),
+    (["--notification-mode", "concise"], True, "concise"),
+    (["--no-notifications"], False, "concise"),
+])
+def test_new_run_freezes_notification_mode(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str], enabled: bool, mode: str,
+) -> None:
+    monkeypatch.chdir(git_repo)
+    # No app binding: exercise creation without calling an external account.
+    UserDefaultsStore().configure(notifications={"enabled": True})
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = tmp_path / "agents.json"
+    agents.write_text(json.dumps({"developments": [human_blocker_step("thread")]}))
+    started = run_cli(git_repo, fixture, "run", "1", *arguments, "--agent-fixture", str(agents))
+    assert started.returncode == 2, started.stdout + started.stderr
+    state = load_only_run_state(git_repo)
+    assert state["notifications"]["enabled"] is enabled
+    assert state["notifications"]["mode"] == mode
+    settings("configure", "--notification-mode", "detailed" if mode == "concise" else "concise")
+    assert settings("show", "--run", state["run_id"])[1]["notifications"] == state["notifications"]
+    # Attaching to an existing run cannot replace its immutable snapshot.
+    attached = run_cli(git_repo, fixture, "run", "1", "--notification-mode", "detailed")
+    assert attached.returncode == 2, attached.stdout + attached.stderr
+    assert load_only_run_state(git_repo)["notifications"] == state["notifications"]

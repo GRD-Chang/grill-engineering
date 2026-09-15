@@ -126,7 +126,11 @@ def _assert_human_status_and_history(
     history = _human_cli(repo, fixture, "history", run_id)
 
     assert status.returncode == history.returncode == 0
-    assert f"状态:       {status_term}" in status.stdout
+    if status_term == "请批准合并 PR":
+        state = load_only_run_state(repo)
+        publication = state["parent_job"] if state.get("delivery_type") == "parent_only" else state["run_publication"]
+        status_term = f"{status_term} #{publication['pr_number']}"
+    assert f"状态:       {status_term}\n" in status.stdout
     assert next_action in status.stdout
     assert next_action in history.stdout
     assert run_id not in status.stdout
@@ -153,7 +157,7 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
         git_repo,
         fixture,
         run_id,
-        status_term="等待人工批准",
+        status_term="请批准合并 PR",
         next_action="agent-run approve 1 --repo example/project",
     )
 
@@ -173,7 +177,7 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
         git_repo,
         fixture,
         run_id,
-        status_term="已完成",
+        status_term="任务已完成",
         next_action="下一步: 无",
     )
     control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
@@ -240,7 +244,7 @@ def test_revise_parent_intent_creates_a_successor_at_the_next_human_boundary(
         git_repo,
         fixture,
         run_id,
-        status_term="等待人工批准",
+        status_term="请批准合并 PR",
         next_action="agent-run approve 1 --repo example/project",
     )
     state_before = load_only_run_state(git_repo)
@@ -452,7 +456,7 @@ def test_exact_run_repository_mismatch_failure_is_human_safe(
         git_repo,
         fixture,
         run_id,
-        status_term="等待人工批准",
+        status_term="请批准合并 PR",
         next_action="agent-run approve 1 --repo example/project",
     )
 
@@ -538,7 +542,7 @@ def test_default_precondition_failure_hides_machine_run_identity(
         git_repo,
         fixture,
         run_id,
-        status_term="等待人工批准",
+        status_term="请批准合并 PR",
         next_action="agent-run approve 1 --repo example/project",
     )
 

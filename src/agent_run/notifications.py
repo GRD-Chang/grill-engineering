@@ -171,9 +171,11 @@ class Notifications:
                 if retryable and (stale or len(pending) > MAX_PENDING):
                     summary = recovery_event(state, [item["event"] for item in retryable])
                     digest = hashlib.sha256(json.dumps([item["event"]["id"] for item in retryable]).encode()).hexdigest()
-                    summary["id"] = f"{self.run_id}:recovery:{digest}"
+                    if summary is not None:
+                        summary["id"] = f"{self.run_id}:recovery:{digest}"
                     pending[:] = [item for item in pending if item not in retryable]
-                    pending.append({"event": summary, "outcome": "pending", "attempts": 0})
+                    if summary is not None:
+                        pending.append({"event": summary, "outcome": "pending", "attempts": 0})
                 # Unknown outcomes remain queryable, bounded, and never resubmitted.
                 while len(pending) > MAX_PENDING:
                     retired = next((item for item in pending if item["outcome"] == "unknown"), None)

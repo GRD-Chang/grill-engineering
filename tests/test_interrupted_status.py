@@ -98,7 +98,9 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
                     '执行已中断，等待恢复')
         assert expected in human
         if case != 'ended':
-            assert '实际执行时长未知' in human
+            assert '实际执行时长未知' not in human
+            if command == 'status':
+                assert '本轮执行耗时' not in human
         assert '2026-09-07' in human
         assert '你暂时无需操作' not in human
         assert '本轮剩余' not in human

@@ -1963,7 +1963,8 @@ def test_history_human_output_groups_invocations_and_keeps_resume_as_a_turning_p
     assert "恢复" in output
     assert "review-model-v1" in output
     assert "review-model-v2" in output
-    assert "动作：验收代码；结果：验收未通过" in output
+    assert "验收 Agent 第 1 轮 · 验收未通过" in output
+    assert "；结果：验收未通过" not in output
 
     cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
     details = capsys.readouterr().out
@@ -2664,9 +2665,9 @@ def test_history_does_not_accumulate_prior_unclosed_invocation(
     default_output = capsys.readouterr().out
     cli.cli_presentation._print_history(state, as_json=False, plain=True, details=True)
     details_output = capsys.readouterr().out
-    assert "累计执行 未知" in default_output
-    assert "累计执行 未知" in details_output
-    assert "→ 未知时间" in details_output
+    assert "本轮执行耗时" not in default_output
+    assert "本轮执行耗时" not in details_output
+    assert "→ 未知时间" not in details_output
 
 
 def test_history_running_attempt_reports_current_elapsed_time() -> None:
@@ -2832,7 +2833,7 @@ def test_history_details_reuses_development_acceptance_and_publication_records(
     assert "feat: publish ticket" in output
     assert "PR 标题" in output
     assert "第 1 次授权额度；本轮开始时已用：开发 1 / 4 次；验收 1 / 3 次" in output
-    assert "执行额度：不适用（编写发布说明）" in output
+    assert "执行额度：不适用" not in output
 
     cli.cli_presentation._print_history(state, as_json=True)
     assert "budget_snapshot" not in capsys.readouterr().out

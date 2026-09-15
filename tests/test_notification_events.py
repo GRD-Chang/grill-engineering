@@ -49,7 +49,7 @@ def test_review_findings_and_publication_meanings() -> None:
     state["status"] = "ready_for_human"
     assert [event for event in events(state) if event["kind"] == "stage_end"][0]["color"] == "yellow"
     publication = events(state_with_round("publication", "publication_artifact"))[-1]
-    assert "发布说明已准备" in publication["title"]
+    assert publication["title"] == "最终 PR 说明已准备好"
     assert "整体交付完成" not in publication["title"]
     assert not any(event["kind"] == "pr_created" for event in events(state_with_round("publication", "publication_artifact")))
 
@@ -77,7 +77,7 @@ def test_card_compact_unknown_duration_and_safe_navigation() -> None:
     assert value["schema"] == "2.0"
     assert value["config"]["width_mode"] == "compact"
     assert "o/repo #241" in value["config"]["summary"]["content"]
-    assert "耗时**：未知" in value["body"]["elements"][0]["content"]
+    assert "耗时" not in value["body"]["elements"][0]["content"]
     assert "agent-run history r --details" in value["body"]["elements"][1]["content"]
     button = value["body"]["elements"][-1]
     assert button["behaviors"] == [{"type": "open_url", "default_url": "https://github.com/o/repo/issues/241"}]
@@ -88,7 +88,7 @@ def test_card_compact_unknown_duration_and_safe_navigation() -> None:
 def test_start_waits_for_task_title_and_pr_uses_persisted_fact() -> None:
     state = state_with_round()
     state["parent"]["title"] = None
-    assert not any(event["kind"] == "run_start" for event in events(state))
+    assert next(event for event in events(state) if event["kind"] == "run_start")["task_title"] == ""
     state["parent"]["title"] = "真实标题"
     state["run_publication"] = {"pr_number": 99}
     projected = events(state)
@@ -111,7 +111,7 @@ def test_failure_is_red_with_actual_diagnostic_and_no_success_claim() -> None:
 def test_review_failed_check_without_findings_and_updated_result() -> None:
     state = state_with_round("review", "acceptance_artifact")
     attempt = state["semantic_agent_attempts"][0]
-    attempt["acceptance_artifact"] = {"checks": {"spec": {"status": "fail", "findings": []}}}
+    attempt["acceptance_artifact"] = {"checks": {lane: {"status": "fail" if lane == "spec" else "pass", "findings": []} for lane in ("e2e", "standards", "spec")}}
     failed = events(state)[-1]
     assert failed["color"] == "orange"
     attempt["acceptance_artifact"]["checks"]["spec"]["status"] = "pass"
@@ -136,7 +136,8 @@ def test_approval_card_uses_persisted_checks_and_final_pr(
     projected = events(state)
     approval = next(event for event in projected if event["current"])
     assert f"检查：{description}" in approval["summary"]
-    assert next(event for event in projected if event["kind"] == "pr_created")["url"].endswith("/pull/42")
+    assert approval["url"].endswith("/pull/42")
+    assert not any(event["kind"] == "pr_created" for event in projected)
 
 
 def test_manual_resume_uses_resume_identity_once() -> None:
@@ -174,9 +175,175 @@ def test_pending_review_reports_blocked_result_then_passes_in_same_round(with_fi
     state["status"] = "run_acceptance_pending"
     assert next(event["id"] for event in events(state) if event["kind"] == "stage_end") == blocked[0]["id"]
     attempt.update(status="completed", outcome="acceptance_artifact")
-    attempt["acceptance_artifact"]["checks"] = {"e2e": {"status": "pass", "findings": []}}
+    attempt["acceptance_artifact"]["checks"] = {lane: {"status": "pass", "findings": []} for lane in ("e2e", "standards", "spec")}
     passed = next(event for event in events(state) if event["kind"] == "stage_end")
     assert passed["id"] != blocked[0]["id"]
     assert passed["color"] == "green"
     assert passed["round"] == 1
     assert next(event["id"] for event in events(state) if event["kind"] == "stage_start") == start
+
+
+def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
+    state = state_with_round()
+    state['ticket_graph'] = {'tickets': {'2': {'title': '限制列表数量 2026-09-15'}}}
+    state['ticket_jobs'] = {'2': {'phase': 'completed', 'generation': 1}}
+    state['semantic_agent_attempts'] = []
+    state['agent_invocation_history'] = []
+    for index, role in enumerate(['development', 'review', 'publication', 'review', 'publication']):
+        attempt = {'attempt_id': f'a{index}', 'role': role, 'ordinal': 1, 'status': 'completed',
+                   'work_subject': 'ticket:2' if index < 3 else 'run:r',
+                   'outcome': {'development': 'candidate', 'review': 'acceptance_artifact', 'publication': 'publication_artifact'}[role]}
+        state['semantic_agent_attempts'].append(attempt)
+        state['agent_invocation_history'].append({'semantic_attempt': attempt.copy(), 'status': 'completed',
+            'started_at': f'2026-01-01T00:0{index}:00+00:00', 'ended_at': f'2026-01-01T00:0{index}:30+00:00'})
+    state.update(status='run_approval_pending', run_publication={'pr_number': 9})
+    detailed = events(state)
+    assert len(detailed) == 13  # start + ten round events + ticket + approval
+    ticket = next(event for event in detailed if event['kind'] == 'ticket_completed')
+    assert ticket['task_title'] == '限制列表数量 2026-09-15'
+    assert ticket['url'].endswith('/issues/2')
+    assert ticket['total_seconds'] == 90
+    assert next(event for event in detailed if event['kind'] == 'stage_start')['task_number'] == 2
+    state['notifications'] = {'mode': 'concise'}
+    concise = events(state)
+    assert [event['kind'] for event in concise] == ['run_start', 'ticket_completed', 'boundary']
+    state['status'] = 'completed'
+    assert events(state)[-1]['title'] == '任务已完成'
+    assert len({event['id'] for event in concise + events(state)}) == 4
+    state['notifications']['mode'] = 'detailed'
+    assert len({event['id'] for event in detailed + events(state)}) == 14
+
+
+def test_round_resume_timing_and_missing_data_are_not_fabricated() -> None:
+    state = state_with_round()
+    invocation = state['agent_invocation_history'][0]
+    state['agent_invocation_history'].append({**invocation, 'resume_id': 'r2',
+        'started_at': '2026-01-01T01:00:00+00:00', 'ended_at': '2026-01-01T01:07:55+00:00'})
+    ended = events(state)[-1]
+    assert ended['duration_seconds'] == 484
+    assert '8 分 4 秒' in str(card(ended))
+    state['agent_invocation_history'][0].pop('ended_at')
+    ended = events(state)[-1]
+    assert ended['duration_seconds'] is None
+    assert '耗时' not in str(card(ended))
+
+
+def test_latest_recovery_keeps_mode_and_omits_resolved_todo() -> None:
+    state = state_with_round()
+    state['notifications'] = {'mode': 'concise'}
+    state.update(status='ready_for_human', human_blockers=['旧待办'])
+    pending = [events(state)[-1]]
+    state.update(status='run_review_pending', human_blockers=[])
+    assert recovery_event(state, pending) is None
+    state['status'] = 'completed'
+    recovered = recovery_event(state, pending)
+    assert recovered and recovered['title'] == '任务已完成'
+    assert '恢复' not in str(card(recovered))
+    assert '旧待办' not in str(card(recovered))
+
+
+def test_boundary_times_use_business_event_and_omit_incomplete_totals() -> None:
+    state = state_with_round()
+    state.update(created_at='2026-01-01T00:00:00+00:00', status='completed',
+                 timeline=[{'at': '2026-01-01T00:10:00+00:00', 'status': 'completed'}])
+    result = events(state)[-1]
+    assert result['total_seconds'] == 9
+    assert result['elapsed_seconds'] == 600
+    state['agent_invocation_history'][0].pop('ended_at')
+    result = events(state)[-1]
+    assert 'total_seconds' not in result
+    assert result['elapsed_seconds'] == 600
+
+
+def test_ticket_total_omits_incomplete_unassociated_execution() -> None:
+    state = state_with_round()
+    state["ticket_jobs"] = {"2": {"phase": "completed", "generation": 1}}
+    attempt = state["semantic_agent_attempts"][0]
+    attempt["work_subject"] = "ticket:2"
+    state["agent_invocation_history"][0]["semantic_attempt"]["work_subject"] = "ticket:2"
+    state["agent_invocation_history"].append({
+        "work_subject": "ticket:2", "started_at": "2026-01-01T01:00:00+00:00",
+        "status": "completed",
+    })
+    completed = next(event for event in events(state) if event["kind"] == "ticket_completed")
+    assert "total_seconds" not in completed
+
+
+@pytest.mark.parametrize("status", ["blocked", "unsupported_scope_change", "deterministic_contradiction", "requeue_required", "publication_pending", "abandonment_pending"])
+def test_concise_preserves_other_human_boundaries(status: str) -> None:
+    state = state_with_round()
+    state.update(status=status, blocked_reason="需要核对外部分支", notifications={"mode": "concise"})
+    boundary = events(state)[-1]
+    assert boundary["kind"] == "boundary"
+    assert boundary["current"] is True
+    assert "需要核对外部分支" in boundary["summary"]
+    assert boundary["next_step"]
+
+
+def test_cleanup_failure_is_not_final_completion() -> None:
+    state = state_with_round()
+    state.update(status="completed", run_publication={"phase": "merged", "pr_number": 9, "parent_closed": True},
+                 delivery_cleanup={"status": "failed"}, notifications={"mode": "concise"})
+    pending = events(state)[-1]
+    assert pending["title"] == "已合并，待清理"
+    assert pending["color"] == "yellow"
+    assert pending["next_step"]
+    state["delivery_cleanup"]["status"] = "completed"
+    completed = events(state)[-1]
+    assert completed["title"] == "任务已完成"
+    assert completed["id"] != pending["id"]
+
+
+@pytest.mark.parametrize("role, outcome", [("development", "no_code_changes"), ("publication", "currentness_invalidated")])
+def test_incomplete_round_does_not_claim_work_prepared(role: str, outcome: str) -> None:
+    ended = events(state_with_round(role, outcome))[-1]
+    assert "等待验收" not in ended["title"]
+    assert "已准备好" not in ended["title"]
+
+
+def test_missing_review_lane_cannot_imply_acceptance() -> None:
+    state = state_with_round("review", "acceptance_artifact")
+    state["semantic_agent_attempts"][0]["acceptance_artifact"] = {
+        "checks": {"spec": {"status": "pass"}}}
+    ended = events(state)[-1]
+    assert ended["title"] == "验收结果尚未确认"
+    assert ended["color"] == "yellow"
+
+
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+@pytest.mark.parametrize("status", ["ready_for_human", "blocked", "execution_failed", "progress_exhausted", "supervision_timeout"])
+def test_ticket_todo_uses_current_object_even_with_older_pr(mode: str, status: str) -> None:
+    state = state_with_round()
+    state.update(status=status, notifications={"mode": mode},
+                 ticket_graph={"tickets": {"3": {"title": "子任务原始标题 2026-09-15"}}},
+                 active_ticket_job={"ticket_number": 3, "phase": "blocked", "human_blockers": ["当前子任务问题"]},
+                 ticket_jobs={"2": {"phase": "blocked", "human_blockers": ["旧任务问题"]}},
+                 run_publication={"pr_number": 9, "phase": "completed"})
+    pending = next(event for event in events(state) if event.get("current"))
+    recovered = recovery_event(state, [pending])
+    assert recovered is not None
+    for notification in (pending, recovered):
+        assert notification["task_number"] == 3
+        assert notification["task_title"] == "子任务原始标题 2026-09-15"
+        assert notification["url"] == "https://github.com/o/repo/issues/3"
+        assert "当前子任务问题" in notification["summary"]
+        assert "旧任务问题" not in notification["summary"]
+    state["active_ticket_job"]["ticket_number"] = 4
+    changed = next(event for event in events(state) if event.get("current"))
+    assert changed["id"] != pending["id"]
+    assert changed["task_number"] == 4
+    assert changed["task_title"] == ""
+
+
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+def test_overall_todo_does_not_borrow_completed_ticket_identity(mode: str) -> None:
+    state = state_with_round()
+    state.update(status="ready_for_human", notifications={"mode": mode},
+                 active_ticket_job={"ticket_number": 3, "phase": "completed"},
+                 run_acceptance={"phase": "blocked", "human_blockers": ["整体验收问题"]},
+                 run_publication={"pr_number": 9, "phase": "completed"})
+    notification = next(event for event in events(state) if event.get("current"))
+    assert notification["task_number"] == state["parent"]["number"]
+    assert notification["task_title"] == state["parent"]["title"]
+    assert notification["url"] == "https://github.com/o/repo/issues/241"
+    assert "整体验收问题" in notification["summary"]
