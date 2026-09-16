@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from agent_run.managed_workspace import ManagedWorkspace
-from conftest import write_fixture
+from agent_run.task_control import TaskControlStore, TaskKey
+from conftest import seed_idle_control, seed_run, write_fixture
 from test_cli import run_cli, issue, stdout_json
 
 
@@ -164,3 +165,30 @@ def test_state_override_cannot_write_into_user_repository(
     assert _files(git_repo) == before
     workspace = ManagedWorkspace.for_repository("example/project")
     assert not list((workspace.state_root / "runs").glob("*.json"))
+
+
+@pytest.mark.parametrize("command", ["stop", "abandon"])
+def test_control_rejects_a_record_bound_to_external_state(
+    git_repo: Path, tmp_path: Path, command: str,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
+    started = seed_run(git_repo, fixture)
+    assert started.returncode == 0, started.stderr
+    run_id = stdout_json(started)["run_id"]
+    workspace = ManagedWorkspace.for_repository("example/project")
+    external = tmp_path / "external-state"
+    external.mkdir()
+    (external / "untouched.txt").write_text("user-owned state\n")
+    seed_idle_control(
+        TaskControlStore(workspace.state_root),
+        TaskKey(workspace.repository_root, "example/project", 1),
+        run_id,
+        state_dir=external,
+    )
+    snapshots = {path: _files(path) for path in (git_repo, workspace.state_root, external)}
+
+    result = run_cli(git_repo, fixture, command, run_id)
+
+    assert result.returncode == 2, result.stderr
+    assert "统一状态目录" in result.stdout
+    assert all(_files(path) == before for path, before in snapshots.items())
