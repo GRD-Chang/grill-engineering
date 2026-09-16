@@ -18,6 +18,7 @@ from agent_run.delivery_policy import (
     DeliveryPolicyStore,
     resolve_delivery_policy,
 )
+from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
@@ -238,7 +239,7 @@ def _seed_run(
 
     reader = FixtureGitHubReader(fixture)
     workspace = prepare_workspace(repo, repository=reader.repository_hint())
-    managed_git = workspace.open()
+    managed_git = GitRepository(workspace.repository_root)
     state_root = (
         Path(state_dir_value).resolve()
         if state_dir_value is not None

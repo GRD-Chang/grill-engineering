@@ -48,7 +48,11 @@ def terminate_process_group(
 ) -> None:
     """Kill a process group and descendants that deliberately changed session."""
 
-    descendants = set(descendant_pids(process.pid))
+    # Once reaped, this child cannot retain descendants; any survivors were
+    # reparented. Its process group must still be killed below.
+    descendants = (
+        set(descendant_pids(process.pid)) if process.poll() is None else set()
+    )
     if adopted_baseline is not None:
         descendants.update(
             pid
@@ -77,12 +81,12 @@ def terminate_process_group(
         process.wait(timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         pass
+    if adopted_baseline is None:
+        _reap_children(descendants)
+        return
     for _ in range(100):
         adopted = set(descendant_pids(os.getpid()))
-        if adopted_baseline is not None:
-            adopted.difference_update(adopted_baseline)
-        else:
-            adopted.clear()
+        adopted.difference_update(adopted_baseline)
         if not adopted:
             _reap_children(descendants)
             return
