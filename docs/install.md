@@ -3,7 +3,7 @@
 [English](install.en.md) | 简体中文
 
 按本页完成安装和目标仓库检查；运行任务见 [Agent 操作指南](agent-guide.md#运行任务)。
-工具源码目录用于安装，目标仓库目录用于交付，两者可以不同。
+工具源码目录用于安装；交付使用 Runner 从目标远端建立的独立克隆，用户仓库保持不变。
 
 ## 首次安装
 
@@ -59,14 +59,13 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 
 ## 目标仓库接入
 
-进入目标仓库并读取其 `AGENTS.md`。Setup 不配置以下内容，按用户授权补齐并逐项验证：
+读取目标仓库的 `AGENTS.md`，确认交付所需内容已推送；可检查现有用户仓库或读取远端内容。Setup 不配置以下内容，按用户授权补齐并逐项验证：
 
 | 检查项 | 完成条件 |
 | --- | --- |
-| 认证与仓库身份 | `codex login status`、`gh auth status` 有效；Git 身份和 remote 正确，宿主 gh 有目标仓库发布所需的写权限 |
+| 认证与仓库身份 | `codex login status`、`gh auth status` 有效；Git 提交身份与目标 `OWNER/REPO` 正确，宿主 gh 有目标仓库发布所需的写权限 |
 | Skills | 实际运行 Codex 的用户可发现并读取 `implement`、`code-review`、它们引用的 Skills 及项目要求的其他 Skills。Runner 不附带它们；缺失时按 [Matt Skills](https://github.com/mattpocock/skills) 的当前说明准备，已有同名内容先检查并复用 |
 | 项目环境 | 编译、测试和运行依赖已就绪；从配置好项目 PATH/虚拟环境的终端启动，Runner 的 Python 环境不能替代它 |
-| 忽略规则 | 根 `.gitignore` 包含 `/.agent-run/`，`git check-ignore .agent-run/runs/probe` 成功；若已有跟踪文件，先妥善处理 |
 | CI | 已有 PR workflow 时，核对其 base 分支覆盖默认分支和 `agent-run/**`，并检查两类分支的必需检查规则；确认无必需检查也可运行，但不报告为 CI 通过 |
 
 ### GitHub 认证：默认无需配置 App
@@ -124,5 +123,5 @@ code-failure-steps = [
 
 安装只保留当前和上一个版本。重复安装仍构建候选；与当前版本内容相同时复用该版本，跳过兼容性调用。
 构建或激活失败保留原版本。
-安装、回滚和卸载均不修改已有交付任务。卸载保留安装锁、Run 定位记录、App 配置、私钥和各目标仓库的 `.agent-run`；
+安装、回滚和卸载均不修改已有交付任务。卸载保留安装锁、Run 定位记录、App 配置、私钥、Runner 独立仓库和运行数据；
 用户替换过的命令入口会保留并报告清理未完成。若任务状态不兼容，按错误处理，不手工迁移状态。

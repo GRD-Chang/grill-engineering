@@ -270,15 +270,16 @@ Required Check 失败时，Controller 读取失败 check 的名称、workflow、
 Actions job 的当前 head、状态与逐 step conclusion；只有仓库配置明确声明的 code/test step
 被该结构化事实证明失败时，才将原始 CI Evidence 交回同一 Development Thread，其他情况保持监督。
 
-新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、仓库根、state 目录及 Repository/Parent 路由身份，最多保留
+新版本创建 Run 时，本机 Run 定位索引记录其 Run ID、Runner 独立仓库根、state 目录及 Repository/Parent 路由身份，最多保留
 最近 32 条，不回填或迁移历史 Run。因此，`runs` 可以按当前仓库或显式 `--repo` 发现候选；
 `status`、`history` 可以按当前仓库的唯一进行中 Run、`--parent`，或任意目录的
 `--repo + --parent` 选择。可信身份能证明与目标无关的失效记录不会阻塞查询；旧记录若缺少 Parent 且 state 已丢失，
-则不能据此认定无关。若没有唯一候选、存在多个 clone、可能匹配的失效记录或身份冲突，命令会列出候选并
+则不能据此认定无关。同一用户的不同启动目录和用户 clone 共用同一 Repository/Parent 的未完成任务。若没有唯一候选、存在可能匹配的失效记录或身份冲突，命令会列出候选并
 停止，绝不按最近时间猜测或全盘搜索。查询成功和失败都不清理、补写或迁移索引与 Run state。
 普通 mutation 与 Run-scoped `configure` 同样使用 Parent
-位置参数并执行零匹配、多匹配和 repository mismatch 检查；完整 Run ID 与显式 state 目录仅是
-自动化和精确排障入口。改变 Run 的命令仍必须从目标仓库运行。
+位置参数并执行零匹配、多匹配和 repository mismatch 检查；完整 Run ID 用于自动化和精确排障。
+查询和变更命令都可从任意目录通过 `--repo OWNER/REPO` 定位目标；省略时只读识别当前用户仓库的远端。
+变更命令始终使用该仓库的统一 state 目录，`--state-dir` 指向其他位置时明确拒绝；`status`、`history` 可用该参数只读排障。数据主目录通过 `XDG_DATA_HOME` 选择。
 
 Lifecycle mutation 默认输出面向维护者的回执，只显示仓库、Parent、操作、是否附着原操作、动作是否
 已应用、当前交付状态与下一步；动作应用完成不代表整个交付已经完成。Action ID、Run ID、Executor
@@ -468,7 +469,7 @@ Snapshot。manifest 只用于识别和解释，不是 source trust、签名或�
 激活前由独立 `RunnerProbeBackend` 在空临时目录调用当前 PATH 中的 `codex exec --output-schema`。
 它只接受根对象、禁止额外字段且 `status` 为 `ok` 的固定结果，不复用 Worker、GitHub、bubblewrap
 或既有 publication handshake，不读取 Codex 版本，也不写长期 audit。Codex、构建或文件系统失败
-会清理候选并保留原 Active/previous、Run locator、用户配置和仓库 `.agent-run`。
+会清理候选并保留原 Active/previous、Run locator、用户配置和运行数据。
 
 Active Runner 由完整 generation symlink 原子选择，generation 内的 `current` 与可选 `previous`
 成对保存；系统只保留当前和紧邻上一个 Snapshot。相同 Active identity 的重复安装不会重新 probe
@@ -483,7 +484,7 @@ generation/Snapshot 的清理失败只写出有界 warning，并在后续安装�
 
 rollback 只交换 `current`/`previous`，不重建、不 probe、不检查或修改 Delivery Run；没有 previous
 时失败且 Active 不变。uninstall 删除受管 Snapshot、generation、入口和 `~/.profile` 中唯一的
-受管 PATH 块，保留固定锁、GitHub App profile、Run locator、私钥文件和目标仓库 `.agent-run`。
+受管 PATH 块，保留固定锁、GitHub App profile、Run locator、私钥文件、Runner 独立仓库和运行数据。
 同名非受管 `~/.local/bin/agent-run` 永不覆盖；用户替换入口时保留用户内容并报告清理未完成。
 
 安装完成后，稳定入口只是指向 Active Snapshot console entry 的 symlink；安装器不驻留、不启动
@@ -496,8 +497,7 @@ branch、fork、dirty source 或非官方 provenance 被旧 gate 拒绝。目标
 
 ## 开源用户 Quickstart 与 doctor
 
-源码仓库只负责构建 Runner，目标交付仓库负责保存 `.agent-run`、Delivery Run 和 Run Branch；两者
-应当是两个目录。稳定使用先选择 release tag，开发者才选择 branch、fork 或 dirty source：
+源码仓库用于构建 Runner；Runner 从目标远端独立克隆代码，并在自己的数据目录保存 Delivery Run、Run Branch 和 worktree。用户仓库仅供只读识别远端，未推送内容不参与交付，合并后由用户自行更新本地代码。稳定使用先选择 release tag，开发者才选择 branch、fork 或 dirty source：
 
 ```bash
 git clone https://github.com/GRD-Chang/grill-engineering.git
@@ -507,8 +507,6 @@ git checkout <release-tag>
 
 # 重新打开登录 shell 后，可在任意目录执行
 agent-run doctor --json
-cd /path/to/delivery-repository
-agent-run doctor
 agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
@@ -516,13 +514,13 @@ agent-run run <parent-issue> --repo OWNER/REPO
 宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker read provider；JSON
 输出只包含 Python 版本、路径、状态、provider 和布尔值等非敏感信息。缺少依赖只报告问题，不安装软件、不
 修复 PATH、不触发生命周期，也不修改 shell、auth profile、Run locator、Delivery Run、Thread、PR、
-branch 或目标仓库 `.agent-run`。
+branch 或运行数据。
 
 后续更新仍从源码目录显式执行 `./install.sh`。如果当前为 A，安装 B 后保留 B/A，再安装 C 后只保留
 C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失败会保留旧 Active。一次回退执行
 `./install.sh --rollback`，它不重建、不调用 Codex、不检查或修改 Delivery Run；卸载执行
 `./install.sh --uninstall`，它清理受管 Runner、入口和 PATH 块但保留固定 `install.lock`、App profile、
-私钥、Run locator 和目标仓库 `.agent-run`。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
+私钥、Run locator、Runner 独立仓库和运行数据。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
 的同名入口会被保留并报告清理未完成。
 
 没有 App profile 时 Worker read provider 默认是 host `gh`；`agent-run auth status`、
@@ -537,9 +535,19 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 
 ## 本地状态与清理
 
-耐久状态位于 `.agent-run/runs/`。本协议要求 `semantic_attempt_protocol: 1`；旧 Run 不迁移、
-不兼容读取，也不会在拒绝前执行 lifecycle mutation，必须重新创建或明确清理。稳定 Development Checkout 位于
-`.agent-run/worktrees/`：Required Checks pending 或 Worker/Publisher 普通失败、超时、
+长期数据默认位于 `~/.local/share/agent-run/`，设置 `XDG_DATA_HOME` 时使用其下的 `agent-run/`；该数据目录必须位于用户仓库之外。目录按需创建，失败时明确报错，不向用户仓库回退。
+
+| 位置（相对于数据主目录） | 内容 |
+| --- | --- |
+| `repositories/<owner>/<repo>/repository/` | 从远端独立克隆的 Git 仓库；owner/repo 统一小写 |
+| `repositories/<owner>/<repo>/state/` | Run、任务控制、profiles、通知记录；受管工作区位于其中的 `worktrees/` |
+| `run-locator.json` | 有界 Run 定位索引 |
+| `snapshots/`、`generations/` 等安装目录 | 安装快照和当前版本选择，与任务数据分别管理 |
+
+配置继续位于 `$XDG_CONFIG_HOME/agent-run/`（默认 `~/.config/agent-run/`），临时环境交接文件使用运行时目录。卸载仅清理安装内容，保留任务数据。用户仓库的文件、索引、引用和 Git 元数据均由用户自行管理。
+
+旧任务及旧位置的数据不在本次变更范围内，不迁移、恢复或清理，也无需用户先完成旧任务。
+本协议要求 `semantic_attempt_protocol: 1`。稳定 Development Checkout 在 Required Checks pending 或 Worker/Publisher 普通失败、超时、
 进程异常或 Ctrl-C 时保留，以恢复未提交成果；Development/Repair Codex 报告 Human Blocker 时也保留，供同一 Thread 在 `resume` 后重新核验并继续。普通 cleanup 只有在 Git 元数据证明 checkout 属于本 Run 且 `git status --porcelain` 为空时才删除。tracked/untracked 修改、元数据缺失或归属不一致都 fail closed，并在 `status`、`run`、`resume` JSON 中给出路径、原因和恢复命令。
 `abandon` 在任何 GitHub mutation 之前执行同样的全 Run preflight；若维护者确认不再需要本地成果，必须显式使用 `abandon --discard-worktree`。Ticket 完成和明确 abandonment 才进入清理。
 Checkout 尚未准备完成时产生的部分目录也会清理。每轮独立 Validation Checkout 在验收

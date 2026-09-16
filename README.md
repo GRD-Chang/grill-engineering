@@ -23,11 +23,13 @@ The `agent-run` command runs Codex to implement the tickets in dependency order.
 checks the results against the requirements and sends any problems back to the development agent.
 Implementation, verification, and fixes run in a loop, managed by the program.
 
-Once the requirements, tickets, and environment are ready, run this in the target repository:
+Once the requirements, tickets, and environment are ready, run this from any directory:
 
 ```bash
 agent-run run <parent-issue> --repo OWNER/REPO
 ```
+
+Runner develops in an independent clone of the remote and leaves your local checkout unchanged. You can continue the same repository and Parent task from different directories.
 
 The main workflow:
 
