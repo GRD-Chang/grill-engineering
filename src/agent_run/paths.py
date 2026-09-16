@@ -21,7 +21,7 @@ def _directory(
 def app_data_root(environment: Mapping[str, str] | None = None) -> Path:
     return _directory(
         "XDG_DATA_HOME", Path.home() / ".local" / "share", environment
-    ) / "agent-run"
+    ).resolve() / "agent-run"
 
 
 def app_config_root(environment: Mapping[str, str] | None = None) -> Path:

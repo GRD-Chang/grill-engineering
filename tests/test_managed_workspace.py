@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -113,14 +114,59 @@ def test_workspace_initialization_is_exclusive(tmp_path: Path) -> None:
     assert not workspace.root.exists()
 
 
+@pytest.mark.parametrize("relative", ["data", ".git/runner-data"])
 def test_workspace_rejects_data_root_inside_a_user_repository(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, relative: str,
 ) -> None:
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "data"))
+    data_home = git_repo / relative
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError, match="必须位于用户仓库之外"):
         workspace.ensure(remote_url=str(git_repo))
-    assert not (git_repo / "data").exists()
+    assert not data_home.exists()
+
+
+def test_workspace_accepts_a_symlink_to_the_data_disk(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disk = tmp_path / "data-disk"
+    disk.mkdir()
+    alias = tmp_path / "data-alias"
+    alias.symlink_to(disk, target_is_directory=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(alias))
+    workspace = ManagedWorkspace.for_repository("owner/project")
+
+    managed = workspace.ensure(remote_url=str(git_repo))
+
+    assert managed.root == disk / "agent-run/repositories/owner/project/repository"
+    assert workspace.open().root == managed.root
+    assert workspace.ensure().root == managed.root
+
+
+@pytest.mark.parametrize("relative", ["data", ".git/runner-data"])
+def test_existing_workspace_cannot_be_relocated_inside_a_user_repository(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, relative: str,
+) -> None:
+    workspace = ManagedWorkspace.for_repository("owner/project")
+    workspace.ensure(remote_url=str(git_repo))
+    data_home = git_repo / relative
+    data_home.mkdir(parents=True)
+    shutil.move(str(app_data_root()), str(data_home / "agent-run"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    moved = ManagedWorkspace.for_repository("owner/project")
+    before = {
+        path.relative_to(git_repo): path.read_bytes()
+        for path in git_repo.rglob("*") if path.is_file()
+    }
+
+    for action in (moved.open, moved.ensure):
+        with pytest.raises(ManagedWorkspaceError, match="必须位于用户仓库之外"):
+            action()
+
+    assert before == {
+        path.relative_to(git_repo): path.read_bytes()
+        for path in git_repo.rglob("*") if path.is_file()
+    }
 
 
 def test_clone_timeout_removes_partial_workspace_and_releases_initialization_lock(

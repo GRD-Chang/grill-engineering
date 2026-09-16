@@ -60,6 +60,7 @@ class ManagedWorkspace:
 
     def open(self) -> GitRepository:
         """Validate an existing workspace without creating or updating anything."""
+        validate_data_root()
         document = self._owned_document()
         git_directory = self.repository_root / ".git"
         roots = _command(
@@ -208,9 +209,8 @@ def validate_data_root() -> None:
     ancestor = app_data_root()
     while not ancestor.exists():
         ancestor = ancestor.parent
-    try:
-        GitRepository.discover(ancestor)
-    except GitError:
+    result = run_git(["git", "rev-parse", "--absolute-git-dir"], cwd=ancestor)
+    if result.returncode != 0:
         return
     raise ManagedWorkspaceError("Runner 数据目录必须位于用户仓库之外，请调整 XDG_DATA_HOME")
 
