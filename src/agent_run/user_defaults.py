@@ -21,6 +21,7 @@ from agent_run.delivery_policy import (
     normalize_policy_overrides,
     resolve_delivery_policy,
 )
+from agent_run.paths import app_config_root
 
 SCOPE_NOTICE = "仅影响之后创建的新 Run，已有 Run 保持原设置"
 _PROFILE_KEYS = frozenset(
@@ -129,11 +130,10 @@ class UserDefaultsStore:
 
     @staticmethod
     def default_path() -> Path:
-        config_home = os.environ.get("XDG_CONFIG_HOME")
-        root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-        if not root.is_absolute():
-            raise UserDefaultsError("XDG_CONFIG_HOME 必须是绝对路径")
-        return root / "agent-run" / "user-defaults.json"
+        try:
+            return app_config_root() / "user-defaults.json"
+        except ValueError as error:
+            raise UserDefaultsError(str(error)) from error
 
     def _read(self) -> tuple[dict[str, Any], str]:
         path = self.path if self.path.exists() else self.legacy_path

@@ -62,8 +62,8 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
     inherited = subprocess.run(["git", "config", "--get", "isolation.inherited"], cwd=git_repo)
     assert inherited.returncode == 1
     private_config = Path(os.environ["HOME"]) / ".gitconfig"
-    assert not private_config.exists()
-    private_config.write_text(f"[isolation]\\n    private = {case}\\n")
+    assert subprocess.check_output(["git", "config", "--global", "user.name"], text=True).strip() == "Agent Run Tests"
+    private_config.write_text(private_config.read_text() + f"[isolation]\\n    private = {case}\\n")
     assert subprocess.check_output(["git", "config", "isolation.private"], cwd=git_repo, text=True).strip() == case
     with monkeypatch.context() as explicit:
         explicit.setenv("GIT_CONFIG_COUNT", "1")
@@ -95,7 +95,7 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
         directory = host / key.lower()
         directory.mkdir(parents=True)
         environment[key] = str(directory)
-    locator = Path(environment["XDG_STATE_HOME"]) / "agent-run/run-locator.json"
+    locator = Path(environment["XDG_DATA_HOME"]) / "agent-run/run-locator.json"
     locator.parent.mkdir()
     locator.write_text("host locator must not be read or overwritten", encoding="utf-8")
     host_bin = host / "bin"

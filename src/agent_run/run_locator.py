@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
+from agent_run.paths import app_data_root
 
 MAX_LOCATOR_ENTRIES = 32
 
@@ -47,10 +48,7 @@ class RunLocatorIndex:
 
     @classmethod
     def default(cls) -> RunLocatorIndex:
-        state_home = Path(
-            os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
-        ).expanduser().resolve()
-        return cls(state_home / "agent-run" / "run-locator.json")
+        return cls(app_data_root() / "run-locator.json")
 
     def register(
         self,

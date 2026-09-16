@@ -2230,6 +2230,13 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     target = tmp_path / "target"
     (target / ".agent-run").mkdir(parents=True)
     (target / ".agent-run" / "run.json").write_text("keep", encoding="utf-8")
+    managed_workspace = _data_root(home) / "repositories" / "owner" / "project"
+    (managed_workspace / "repository").mkdir(parents=True)
+    (managed_workspace / "state").mkdir()
+    (managed_workspace / "repository" / "unfinished.txt").write_text("keep work")
+    (managed_workspace / "state" / "run.json").write_text("keep records")
+    managed_locator = _data_root(home) / "run-locator.json"
+    managed_locator.write_text("keep index")
     profile = home / ".profile"
     profile.write_text("before\n", encoding="utf-8")
 
@@ -2250,6 +2257,9 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (config / "github-app.json").read_bytes() == failed_config
     assert (locator / "run-locator.json").read_bytes() == failed_locator
     assert (target / ".agent-run" / "run.json").read_bytes() == failed_target
+    assert (managed_workspace / "repository" / "unfinished.txt").read_text() == "keep work"
+    assert (managed_workspace / "state" / "run.json").read_text() == "keep records"
+    assert managed_locator.read_text() == "keep index"
     assert profile.read_text(encoding="utf-8") == "before\n"
 
     uninstall = _run(source, home, fake_bin, "--uninstall")
@@ -2257,6 +2267,9 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (config / "github-app.json").read_text(encoding="utf-8") == "keep"
     assert (locator / "run-locator.json").read_text(encoding="utf-8") == "keep"
     assert (target / ".agent-run" / "run.json").read_text(encoding="utf-8") == "keep"
+    assert (managed_workspace / "repository" / "unfinished.txt").read_text() == "keep work"
+    assert (managed_workspace / "state" / "run.json").read_text() == "keep records"
+    assert managed_locator.read_text() == "keep index"
     assert (profile.read_text(encoding="utf-8") == "before\n")
     assert (_data_root(home) / "install.lock").exists()
     assert not (home / ".local" / "bin" / "agent-run").exists()
@@ -2435,7 +2448,7 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     cli_environment.update(
         {
             "HOME": str(home),
-            "XDG_STATE_HOME": str(home / "state"),
+            "XDG_DATA_HOME": str(home / "data"),
             "PATH": f"{home / '.local' / 'bin'}{os.pathsep}{cli_environment['PATH']}",
         }
     )
@@ -2443,12 +2456,13 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     started = seed_run(
         delivery,
         fixture,
-        extra_env={"XDG_STATE_HOME": str(home / "state")},
+        extra_env={"XDG_DATA_HOME": str(home / "data")},
     )
     assert started.returncode == 0, started.stderr
     started_output = json.loads(started.stdout)
     run_id = started_output["run_id"]
-    state_path = next((delivery / ".agent-run" / "runs").glob("*.json"))
+    state_root = _data_root(home) / "repositories" / "example" / "project" / "state"
+    state_path = state_root / "runs" / f"{run_id}.json"
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
         "__version__ = 'second'\n", encoding="utf-8"
@@ -2485,16 +2499,16 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     incompatible["schema_version"] = 1
     state_path.write_text(json.dumps(incompatible), encoding="utf-8")
     before = state_path.read_bytes()
-    locator_path = home / "state" / "agent-run" / "run-locator.json"
+    locator_path = _data_root(home) / "run-locator.json"
     locator_before = locator_path.read_bytes()
     target_files_before = {
-        path.relative_to(delivery / ".agent-run"): path.read_bytes()
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root): path.read_bytes()
+        for path in (state_root).rglob("*")
         if path.is_file()
     }
     target_paths_before = sorted(
-        path.relative_to(delivery / ".agent-run")
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root)
+        for path in (state_root).rglob("*")
     )
     rejected = subprocess.run(
         [
@@ -2516,13 +2530,13 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     assert state_path.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {
-        path.relative_to(delivery / ".agent-run"): path.read_bytes()
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root): path.read_bytes()
+        for path in (state_root).rglob("*")
         if path.is_file()
     } == target_files_before
     assert sorted(
-        path.relative_to(delivery / ".agent-run")
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root)
+        for path in (state_root).rglob("*")
     ) == target_paths_before
 
     (source / "src" / "agent_run" / "__init__.py").write_text(
@@ -2543,13 +2557,13 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     assert state_path.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {
-        path.relative_to(delivery / ".agent-run"): path.read_bytes()
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root): path.read_bytes()
+        for path in (state_root).rglob("*")
         if path.is_file()
     } == target_files_before
     assert sorted(
-        path.relative_to(delivery / ".agent-run")
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root)
+        for path in (state_root).rglob("*")
     ) == target_paths_before
 
     rolled_back_with_incompatible_state = _run(source, home, fake_bin, "--rollback")
@@ -2567,11 +2581,11 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     assert state_path.read_bytes() == before
     assert locator_path.read_bytes() == locator_before
     assert {
-        path.relative_to(delivery / ".agent-run"): path.read_bytes()
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root): path.read_bytes()
+        for path in (state_root).rglob("*")
         if path.is_file()
     } == target_files_before
     assert sorted(
-        path.relative_to(delivery / ".agent-run")
-        for path in (delivery / ".agent-run").rglob("*")
+        path.relative_to(state_root)
+        for path in (state_root).rglob("*")
     ) == target_paths_before

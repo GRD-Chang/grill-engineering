@@ -9,6 +9,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from agent_run.git_output import git_environment
+
 
 MAX_READ_ATTEMPTS = 3
 READ_TIMEOUT_SECONDS = 30
@@ -79,6 +81,7 @@ def _run_bounded_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        env=git_environment(),
     )
     stdout = bytearray()
     stderr = bytearray()

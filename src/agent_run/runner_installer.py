@@ -28,6 +28,7 @@ if __name__ == "__main__":
     sys.dont_write_bytecode = True
 
 try:
+    from agent_run.paths import app_data_root
     from agent_run.process_cleanup import (
         capture_process_scope,
         child_subreaper,
@@ -40,6 +41,7 @@ try:
         runner_management_lease,
     )
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
+    from paths import app_data_root  # type: ignore[import-not-found, no-redef]
     from process_cleanup import (  # type: ignore[import-not-found, no-redef]
         capture_process_scope,
         child_subreaper,
@@ -108,10 +110,7 @@ class InstallPaths:
 
     @classmethod
     def from_environment(cls) -> "InstallPaths":
-        data_home = os.environ.get("XDG_DATA_HOME")
-        if not data_home:
-            data_home = str(Path.home() / ".local" / "share")
-        data_root = (Path(data_home).expanduser() / "agent-run").resolve()
+        data_root = app_data_root()
         user_bin = (Path.home() / ".local" / "bin").resolve()
         return cls(
             data_root=data_root,

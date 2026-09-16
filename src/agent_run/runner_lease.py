@@ -12,6 +12,11 @@ from io import TextIOWrapper
 from pathlib import Path
 from typing import Iterator
 
+try:
+    from agent_run.paths import app_data_root
+except ModuleNotFoundError:  # pragma: no cover - source-tree installer
+    from paths import app_data_root  # type: ignore[import-not-found, no-redef]
+
 
 class RunnerLeaseError(RuntimeError):
     """A Runner lease could not be established safely."""
@@ -30,11 +35,7 @@ class RunnerLease:
 
 
 def default_runner_lock_path(environment: dict[str, str] | None = None) -> Path:
-    selected = os.environ if environment is None else environment
-    data_home = selected.get("XDG_DATA_HOME")
-    if not data_home:
-        data_home = str(Path.home() / ".local" / "share")
-    return Path(data_home).expanduser().resolve() / "agent-run" / "install.lock"
+    return app_data_root(environment) / "install.lock"
 
 
 @contextmanager
