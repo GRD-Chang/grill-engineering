@@ -2843,6 +2843,8 @@ def test_ticket_required_check_failure_uses_exact_head_repair_evidence(
         'code-failure-steps = ["ci::test::Run tests"]\n',
         encoding="utf-8",
     )
+    subprocess.run(["git", "add", "pyproject.toml"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "configure check policy"], cwd=git_repo, check=True)
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
     state, _ = Controller(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Fail-closed classification for Required Check failure evidence."""
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from agent_run.external_supervision import (
     ensure_supervision_window,
     wait_for_github_convergence,
 )
+from agent_run.git_output import run_git
 
 
 def annotate_configured_code_failures(
@@ -20,7 +22,7 @@ def annotate_configured_code_failures(
 ) -> list[dict[str, Any]]:
     """Bind GitHub job-step facts to repository-owned repairability policy."""
 
-    configured = _configured_code_steps(repository_root)
+    configured = _configured_code_steps(repository_root, expected_head_sha)
     annotated: list[dict[str, Any]] = []
     for raw in checks:
         check = dict(raw)
@@ -32,12 +34,21 @@ def annotate_configured_code_failures(
 
 
 def _configured_code_steps(
-    repository_root: Path,
+    repository_root: Path, expected_head_sha: str | None,
 ) -> frozenset[tuple[str, str, str]]:
-    path = repository_root / "pyproject.toml"
-    if not path.is_file():
+    # The persistent clone's checkout can lag behind fetched or merged heads,
+    # and concurrent tasks may use different versions of this policy.
+    if expected_head_sha is None or not re.fullmatch(
+        r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected_head_sha
+    ):
         return frozenset()
-    document = tomllib.loads(path.read_text(encoding="utf-8"))
+    result = run_git(
+        ["git", "show", "--no-ext-diff", "--no-textconv", f"{expected_head_sha}:pyproject.toml"],
+        cwd=repository_root,
+    )
+    if result.returncode != 0:
+        return frozenset()
+    document = tomllib.loads(result.stdout)
     tool = document.get("tool")
     agent_run = tool.get("agent-run") if isinstance(tool, dict) else None
     required = (
