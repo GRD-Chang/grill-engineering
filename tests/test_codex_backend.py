@@ -4784,10 +4784,7 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
     runner_root = data_home / "agent-run"
     runner_root.mkdir(parents=True)
     (runner_root / "management-secret").write_text("secret", encoding="utf-8")
-    state_home = tmp_path / "state"
-    locator_root = state_home / "agent-run"
-    locator_root.mkdir(parents=True)
-    (locator_root / "run-locator.json").write_text("secret", encoding="utf-8")
+    (runner_root / "run-locator.json").write_text("secret", encoding="utf-8")
     runtime_home = tmp_path / "runtime"
     systemd_private = runtime_home / "systemd" / "private"
     systemd_private.parent.mkdir(parents=True)
@@ -4801,7 +4798,6 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
     temporary = tmp_path / "worker-temp"
     temporary.mkdir()
     monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
-    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_home))
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={user_bus}")
     monkeypatch.setenv("AGENT_RUN_EXECUTOR_ACTION_ID", "secret-action")
@@ -4850,7 +4846,7 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
             "CUSTOM_PROFILE": str(custom_profile),
             "CUSTOM_LOCK": str(custom_lock),
             "RUNNER_SECRET": str(runner_root / "management-secret"),
-            "LOCATOR_SECRET": str(locator_root / "run-locator.json"),
+            "LOCATOR_SECRET": str(runner_root / "run-locator.json"),
             "CARRIER_SECRET": str(carrier),
             "USER_BUS": str(user_bus),
             "SYSTEMD_PRIVATE": str(systemd_private),

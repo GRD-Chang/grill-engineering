@@ -45,7 +45,7 @@ from agent_run.github_auth_profile import (
 from agent_run.error_safety import bounded_error
 from agent_run.execution_binding import emit_execution_binding
 from agent_run.executor_environment import ensure_executor_runtime_directory
-from agent_run.run_locator import RunLocatorIndex
+from agent_run.paths import app_data_root
 from agent_run.worker_sandbox import (
     WorkerDeadlineExceeded,
     WorkerSandboxError,
@@ -1102,11 +1102,7 @@ def _worker_hidden_paths(
     private_key_path = getattr(profile, "private_key_path", None)
     if isinstance(private_key_path, Path):
         paths.append(private_key_path)
-    data_home = Path(
-        os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")
-    ).expanduser()
-    paths.append(data_home / "agent-run")
-    paths.append(RunLocatorIndex.default().path.parent)
+    paths.append(app_data_root())
     paths.append(ensure_executor_runtime_directory())
     runtime_home = Path(
         os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")

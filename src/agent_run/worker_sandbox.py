@@ -14,6 +14,7 @@ from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
 from agent_run.worker_credentials import WORKER_GH_RESPONSE_TIMEOUT_SECONDS
+from agent_run.git_output import git_environment
 
 
 class WorkerSandboxError(RuntimeError):
@@ -148,7 +149,7 @@ def worker_environment(
     _validate_inherited_github_host()
     environment = {
         key: value
-        for key, value in os.environ.items()
+        for key, value in git_environment().items()
         if not key.startswith(("AGENT_RUN_EXECUTOR_", "AGENT_RUN_INTERNAL_"))
         and key
         not in {
@@ -369,7 +370,8 @@ def bubblewrap_command(
         arguments.extend(["--bind", str(checkout), str(checkout)])
     else:
         arguments.extend(["--ro-bind", str(checkout), str(checkout)])
-    for git_metadata in _git_metadata_paths(checkout):
+    git_metadata_paths = _git_metadata_paths(checkout)
+    for git_metadata in git_metadata_paths:
         arguments.extend(
             ["--ro-bind", str(git_metadata), str(git_metadata)]
         )
@@ -385,12 +387,31 @@ def bubblewrap_command(
     git_credentials = home / ".git-credentials"
     if git_credentials.exists():
         arguments.extend(["--ro-bind", "/dev/null", str(git_credentials)])
-    _mask_worker_paths(
+    hidden = _mask_worker_paths(
         arguments,
         hidden_paths,
         checkout=checkout,
         temporary=temporary,
     )
+    # Managed checkouts live below the hidden Runner data root. Reopen only
+    # this invocation's paths, then restore any narrower credential/state masks.
+    reopened: list[Path] = []
+    for path, binding in (
+        (temporary, "--bind"),
+        (checkout, "--bind" if writable_checkout else "--ro-bind"),
+        *((path, "--ro-bind") for path in git_metadata_paths),
+    ):
+        resolved = path.resolve()
+        if any(parent in hidden for parent in resolved.parents):
+            arguments.extend([binding, str(resolved), str(resolved)])
+            reopened.append(resolved)
+    if reopened:
+        _mask_worker_paths(
+            arguments,
+            [path for path in hidden if any(root in path.parents for root in reopened)],
+            checkout=checkout,
+            temporary=temporary,
+        )
     if gh_targets:
         if gh_adapter is None:
             raise WorkerSandboxError(
@@ -408,7 +429,7 @@ def _mask_worker_paths(
     *,
     checkout: Path,
     temporary: Path,
-) -> None:
+) -> set[Path]:
     checkout_root = checkout.resolve()
     temporary_root = temporary.resolve()
     paths: set[Path] = set()
@@ -436,6 +457,7 @@ def _mask_worker_paths(
         if any(directory in path.parents for directory in mounted_directories):
             continue
         arguments.extend(["--ro-bind", "/dev/null", str(path)])
+    return paths
 
 
 def _reject_credentialed_http_remotes(
