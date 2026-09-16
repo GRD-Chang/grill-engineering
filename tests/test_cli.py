@@ -33,6 +33,7 @@ from agent_run.state import FaultInjectingStateStore, StateStore
 from agent_run.worker_sandbox import WorkerSandboxError
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_repo, managed_state, managed_workspace, prepare_workspace
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -152,7 +153,8 @@ def test_status_does_not_fall_back_to_findings_from_another_work_subject(
     }
     state["schema_version"] = 1
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", state)
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
     output = stdout_json(result)
@@ -200,7 +202,8 @@ def test_status_binds_run_acceptance_verdict_to_publication_head(
     }
     state["schema_version"] = 1
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", state)
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
     output = stdout_json(result)
@@ -257,7 +260,8 @@ def test_status_binds_promoted_repair_acceptance_to_publication_boundary(
         "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run(
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run(
         "run-promoted-repair-status", state
     )
 
@@ -340,7 +344,8 @@ def test_status_keeps_matching_acceptance_conclusion_after_completion(
         "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run(
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run(
         "run-completed-conclusion", state
     )
 
@@ -391,7 +396,8 @@ def test_status_does_not_infer_completed_acceptance_without_matching_record(
     if acceptance_record is not None:
         parent_job["acceptance_record"] = acceptance_record
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run(
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run(
         "run-completed-without-proof", state
     )
 
@@ -513,7 +519,8 @@ def test_status_uses_saved_publication_boundary_before_publication_record(
         "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", state)
 
     output = stdout_json(
         invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
@@ -690,7 +697,8 @@ def test_status_exposes_current_cycle_rounds_alongside_window_budget(
         "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", state)
 
     json_result = invoke_cli_inprocess(
         git_repo, fixture, "status", "run-1", "--json"
@@ -745,7 +753,8 @@ def test_status_fails_closed_when_current_candidate_identity_is_missing(
         "schema_version": 1,
     }
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", state)
 
     result = invoke_cli_inprocess(git_repo, fixture, "status", "run-1", "--json")
     output = stdout_json(result)
@@ -779,7 +788,8 @@ def test_plain_status_places_next_action_before_complete_finding_details(
     }
     state["schema_version"] = 1
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", state)
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", state)
 
     result = invoke_cli_inprocess(
         git_repo, fixture, "status", "run-1", "--plain"
@@ -917,9 +927,9 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     }
     agents.write_text(json.dumps(agent_data), encoding="utf-8")
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     assert Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+        FixtureGitHubReader(fixture), GitRepository(managed_repo(git_repo)), states
     ).record_execution_failure(run_id, "controller failed before an Agent started")
     failed = load_only_run_state(git_repo)
     assert failed["active_agent_invocation"] is None
@@ -973,7 +983,7 @@ def test_public_run_preserves_non_invocation_execution_failure_until_resume(
     assert load_only_run_state(git_repo) == failed
 
     controller = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
+        FixtureGitHubReader(fixture), GitRepository(managed_repo(git_repo)), states
     )
     with pytest.raises(RequeueError, match="unresolved Execution Failure"):
         controller.requeue(run_id)
@@ -1086,7 +1096,7 @@ def test_public_operator_docs_describe_the_v01_quickstart() -> None:
     reference = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(encoding="utf-8")
     for required in (
         "./install.sh", "release tag", "agent-run doctor", "auth app configure",
-        "--rollback", "--uninstall", "Linux", "./setup.sh", "目标交付仓库",
+        "--rollback", "--uninstall", "Linux", "./setup.sh", "独立克隆",
     ):
         assert required in reference
 
@@ -3634,7 +3644,6 @@ def test_production_run_without_a_real_executor_host_fails_before_writes(
             raise cli.ExecutionReadinessError("user systemd unavailable")
 
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
     monkeypatch.setattr(cli, "_running_active_runner", lambda: True)
     monkeypatch.setattr(cli, "SystemdUserExecutorHost", UnavailableSystemdHost)
     monkeypatch.setattr(
@@ -3675,11 +3684,10 @@ def test_production_run_defers_environment_capture_to_action_admission(
         pytest.fail("environment rejection must stop lifecycle admission")
 
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
-    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / "runner-state"))
     monkeypatch.setattr(cli, "_running_active_runner", lambda: True)
     monkeypatch.setattr(cli, "SystemdUserExecutorHost", AvailableSystemdHost)
     monkeypatch.setattr(cli, "_run_lifecycle", enter_lifecycle)
+    prepare_workspace(git_repo)
 
     assert main(["run", "1", "--repo", "example/project", "--json"]) == 2
 
@@ -3712,7 +3720,7 @@ def issue(
 
 def run_cli(
     repo: Path,
-    fixture: Path,
+    fixture: Path | None,
     *arguments: str,
     extra_env: dict[str, str] | None = None,
     machine_output: bool = True,
@@ -3730,7 +3738,6 @@ def run_cli(
         if not environment.get("PYTHONPATH")
         else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
     )
-    environment.setdefault("XDG_STATE_HOME", str(repo / ".agent-run-test-state"))
     if extra_env:
         environment.update(extra_env)
     command_arguments = list(arguments)
@@ -3757,8 +3764,7 @@ def run_cli(
             "-m",
             "agent_run",
             *command_arguments,
-            "--github-fixture",
-            str(fixture),
+            *(["--github-fixture", str(fixture)] if fixture is not None else []),
         ],
         cwd=repo,
         env=environment,
@@ -3807,13 +3813,14 @@ def run_internal_stage(
         if "--crash-after-save" in arguments
         else None
     )
-    git = GitRepository.discover(repo)
+    workspace = prepare_workspace(repo)
+    git = workspace.open()
     states = (
         FaultInjectingStateStore(
-            repo / ".agent-run", crash_after_save=crash_after_save
+            workspace.state_root, crash_after_save=crash_after_save
         )
         if crash_after_save is not None
-        else StateStore(repo / ".agent-run")
+        else StateStore(workspace.state_root)
     )
     reader = FixtureGitHubReader(fixture)
     controller = Controller(reader, git, states)
@@ -3920,8 +3927,10 @@ def stdout_json(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     return loaded
 
 
-def load_only_run_state(repo: Path) -> dict[str, Any]:
-    run_files = list((repo / ".agent-run" / "runs").glob("*.json"))
+def load_only_run_state(
+    repo: Path, *, extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    run_files = list((managed_state(repo, extra_env=extra_env) / "runs").glob("*.json"))
     assert len(run_files) == 1
     loaded: object = json.loads(run_files[0].read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
@@ -4006,13 +4015,13 @@ def test_seed_run_creates_one_run_branch_and_is_idempotent(
     assert state["active_ticket_job"]["ticket_number"] == 2
     branches = subprocess.run(
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/agent-run/"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
     ).stdout.splitlines()
     assert branches == [state["run_branch"]]
-    assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 1
 
 
 def test_seed_run_preserves_the_managed_run_branch_side_effect(
@@ -4026,12 +4035,13 @@ def test_seed_run_preserves_the_managed_run_branch_side_effect(
     state = load_only_run_state(git_repo)
     branches = subprocess.run(
         ["git", "branch", "--format=%(refname:short)"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
     ).stdout.splitlines()
     assert state["run_branch"] in branches
+    assert not (git_repo / ".agent-run").exists()
 
 
 def test_run_repair_docs_describe_job_rotation_and_candidate_promotion() -> None:
@@ -4053,7 +4063,7 @@ def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     started = seed_run(git_repo, fixture, "1", extra_env=locator_env)
     run_id = stdout_json(started)["run_id"]
     elsewhere = tmp_path / "elsewhere"
@@ -4078,8 +4088,8 @@ def test_status_and_history_locate_a_new_run_from_an_unrelated_directory(
         "entries": [
             {
                 "run_id": run_id,
-                "repository_root": str(git_repo.resolve()),
-                "state_dir": str((git_repo / ".agent-run").resolve()),
+                "repository_root": str(managed_repo(git_repo, extra_env=locator_env).resolve()),
+                "state_dir": str((managed_state(git_repo, extra_env=locator_env)).resolve()),
                 "updated_at": locator["entries"][0]["updated_at"],
                 "repository": "example/project",
                 "parent_number": 1,
@@ -4096,7 +4106,7 @@ def test_status_and_history_do_not_initialize_online_dependencies(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
@@ -4105,7 +4115,7 @@ def test_status_and_history_do_not_initialize_online_dependencies(
         raise AssertionError("offline command initialized an online dependency")
 
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_STATE_HOME", str(locator_home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(locator_home))
     monkeypatch.setattr(cli, "SystemdUserExecutorHost", unavailable)
     monkeypatch.setattr(cli, "CodexCliBackend", unavailable)
     monkeypatch.setattr(cli, "GhGitHubReader", unavailable)
@@ -4117,11 +4127,11 @@ def test_status_and_history_do_not_initialize_online_dependencies(
     assert json.loads(output[-1])["run_id"] == run_id
 
 
-def test_new_runs_from_separate_clones_have_distinct_locator_ids(
+def test_new_runs_from_separate_clones_reuse_the_same_locator_id(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     first_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
@@ -4133,7 +4143,8 @@ def test_new_runs_from_separate_clones_have_distinct_locator_ids(
 
     assert second.returncode == 0, second.stderr
     second_id = stdout_json(second)["run_id"]
-    assert second_id != first_id
+    assert second_id == first_id
+    assert stdout_json(second)["result"] == "resumed"
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     assert run_cli(
@@ -4144,11 +4155,11 @@ def test_new_runs_from_separate_clones_have_distinct_locator_ids(
     ).returncode == 0
 
 
-def test_status_prefers_current_directory_state_and_explicit_state_dir(
+def test_status_ignores_user_directory_state_and_honors_explicit_state_dir(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
@@ -4157,7 +4168,7 @@ def test_status_prefers_current_directory_state_and_explicit_state_dir(
     subprocess.run(["git", "init", "-b", "main"], cwd=local_repo, check=True)
     local_state_dir = local_repo / ".agent-run" / "runs"
     local_state_dir.mkdir(parents=True)
-    local_state = load_only_run_state(git_repo)
+    local_state = load_only_run_state(git_repo, extra_env=locator_env)
     local_state["diagnostics"] = [{"code": "local_priority", "message": "local"}]
     (local_state_dir / f"{run_id}.json").write_text(
         json.dumps(local_state), encoding="utf-8"
@@ -4174,13 +4185,13 @@ def test_status_prefers_current_directory_state_and_explicit_state_dir(
         "status",
         run_id,
         "--state-dir",
-        str(git_repo / ".agent-run"),
+        str(local_state_dir.parent),
         "--json",
         extra_env=locator_env,
     )
 
-    assert stdout_json(local)["diagnostics"][0]["code"] == "local_priority"
-    assert stdout_json(explicit)["diagnostics"] == []
+    assert stdout_json(local)["diagnostics"] == []
+    assert stdout_json(explicit)["diagnostics"][0]["code"] == "local_priority"
 
 
 @pytest.mark.parametrize("command", ["status", "history"])
@@ -4189,11 +4200,11 @@ def test_read_only_locator_errors_are_actionable_and_do_not_mutate_run_history(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
     before = state_path.read_text(encoding="utf-8")
     locator_path = locator_home / "agent-run" / "run-locator.json"
     locator_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4203,7 +4214,7 @@ def test_read_only_locator_errors_are_actionable_and_do_not_mutate_run_history(
                 "entries": [
                     {
                         "run_id": run_id,
-                        "repository_root": str(git_repo.resolve()),
+                        "repository_root": str(managed_repo(git_repo, extra_env=locator_env).resolve()),
                         "state_dir": str(tmp_path / "missing-state"),
                         "updated_at": "2026-08-15T00:00:00+00:00",
                     }
@@ -4216,7 +4227,7 @@ def test_read_only_locator_errors_are_actionable_and_do_not_mutate_run_history(
     elsewhere.mkdir()
 
     result = run_cli(
-        elsewhere, fixture, command, run_id, "--json", extra_env=locator_env
+        elsewhere, None, command, run_id, "--json", extra_env=locator_env
     )
 
     assert result.returncode == 2
@@ -4232,7 +4243,7 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
@@ -4242,12 +4253,12 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
     locator_path.unlink()
 
     missing = run_cli(
-        elsewhere, fixture, "status", run_id, "--json", extra_env=locator_env
+        elsewhere, None, "status", run_id, "--json", extra_env=locator_env
     )
 
     assert stdout_json(missing)["diagnostics"][0]["code"] == "run_locator_missing"
     assert not locator_path.exists()
-    source_state = next((git_repo / ".agent-run" / "runs").glob("*.json")).read_text(
+    source_state = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json")).read_text(
         encoding="utf-8"
     )
     first_state_dir = tmp_path / "first-state"
@@ -4264,13 +4275,13 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
                 "entries": [
                     {
                         "run_id": run_id,
-                        "repository_root": str(git_repo.resolve()),
+                        "repository_root": str(managed_repo(git_repo, extra_env=locator_env).resolve()),
                         "state_dir": str(first_state_dir),
                         "updated_at": "2026-08-15T00:00:00+00:00",
                     },
                     {
                         "run_id": run_id,
-                        "repository_root": str(git_repo.resolve()),
+                        "repository_root": str(managed_repo(git_repo, extra_env=locator_env).resolve()),
                         "state_dir": str(second_state_dir),
                         "updated_at": "2026-08-15T00:00:01+00:00",
                     },
@@ -4281,7 +4292,7 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
     )
 
     conflict = run_cli(
-        elsewhere, fixture, "history", run_id, "--json", extra_env=locator_env
+        elsewhere, None, "history", run_id, "--json", extra_env=locator_env
     )
 
     assert conflict.returncode == 2
@@ -4299,29 +4310,32 @@ def test_missing_and_conflicting_locators_return_dedicated_read_only_errors(
         ("abandon", ("{run_id}",)),
     ],
 )
-def test_lifecycle_commands_do_not_use_cross_directory_locator(
+def test_lifecycle_commands_apply_the_same_preconditions_from_any_directory(
     git_repo: Path,
     tmp_path: Path,
     command: str,
     arguments: tuple[str, ...],
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
     before = state_path.read_text(encoding="utf-8")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     command_arguments = tuple(argument.format(run_id=run_id) for argument in arguments)
 
+    local = run_cli(
+        git_repo, fixture, command, *command_arguments, extra_env=locator_env
+    )
     result = run_cli(
         elsewhere, fixture, command, *command_arguments, extra_env=locator_env
     )
 
     assert result.returncode == 2
-    assert stdout_json(result)["diagnostics"][0]["code"] == "workspace_required"
+    assert stdout_json(result) == stdout_json(local)
     assert state_path.read_text(encoding="utf-8") == before
 
 
@@ -4354,7 +4368,7 @@ def test_parent_selector_works_in_a_repo_and_across_directories(
         cwd=git_repo,
         check=True,
     )
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
@@ -4381,11 +4395,11 @@ def test_parent_selector_works_in_a_repo_and_across_directories(
     assert stdout_json(cross_directory)["run_id"] == run_id
 
 
-def test_parent_selector_fails_closed_when_same_repository_has_multiple_clones(
+def test_parent_selector_reuses_one_task_across_user_clones(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     subprocess.run(
         ["git", "remote", "add", "origin", "git@github.com:example/project.git"],
         cwd=git_repo,
@@ -4417,13 +4431,9 @@ def test_parent_selector_fails_closed_when_same_repository_has_multiple_clones(
         extra_env=locator_env,
     )
 
-    assert result.returncode == 2
-    diagnostic = stdout_json(result)["diagnostics"][0]
-    assert diagnostic["code"] == "run_selector_ambiguous"
-    assert {candidate["run_id"] for candidate in diagnostic["candidates"]} == {
-        first_id,
-        second_id,
-    }
+    assert result.returncode == 0
+    assert stdout_json(result)["run_id"] == first_id == second_id
+    assert len(list((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))) == 1
 
 
 def test_repository_parent_selector_does_not_collide_on_same_issue_number(
@@ -4435,7 +4445,7 @@ def test_repository_parent_selector_does_not_collide_on_same_issue_number(
         cwd=git_repo,
         check=True,
     )
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     first_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
@@ -4495,11 +4505,11 @@ def test_repository_parent_selector_ignores_unrelated_stale_locator(
         cwd=git_repo,
         check=True,
     )
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     first_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    first_state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    first_state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
 
     other_repo = tmp_path / "other-repo"
     subprocess.run(["git", "clone", "--quiet", str(git_repo), str(other_repo)], check=True)
@@ -4514,7 +4524,7 @@ def test_repository_parent_selector_ignores_unrelated_stale_locator(
     second_id = stdout_json(
         seed_run(other_repo, other_fixture, "1", extra_env=locator_env)
     )["run_id"]
-    second_state_path = other_repo / ".agent-run" / "runs" / f"{second_id}.json"
+    second_state_path = managed_state(other_repo, extra_env=locator_env) / "runs" / f"{second_id}.json"
     second_state_path.unlink()
     locator_path = tmp_path / "locator-home" / "agent-run" / "run-locator.json"
     before_first_state = first_state_path.read_text(encoding="utf-8")
@@ -4579,11 +4589,11 @@ def test_runs_discovers_bounded_human_run_candidates(
         cwd=git_repo,
         check=True,
     )
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state = load_only_run_state(git_repo)
+    state = load_only_run_state(git_repo, extra_env=locator_env)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
 
@@ -4605,10 +4615,10 @@ def test_runs_discovers_bounded_human_run_candidates(
         {
             "parent": 1,
             "repository": "example/project",
-            "repository_root": str(git_repo.resolve()),
+            "repository_root": str(managed_repo(git_repo, extra_env=locator_env).resolve()),
             "run_id": run_id,
             "started_at": state["created_at"],
-            "state_dir": str((git_repo / ".agent-run").resolve()),
+            "state_dir": str((managed_state(git_repo, extra_env=locator_env)).resolve()),
             "status": state["status"],
         }
     ]
@@ -4630,15 +4640,15 @@ def test_runs_with_default_state_dir_reports_the_checkout_root(
         fixture,
         "runs",
         "--state-dir",
-        str(git_repo / ".agent-run"),
+        str(managed_state(git_repo)),
         "--json",
     )
 
     assert discovered.returncode == 0, discovered.stderr
     candidate = stdout_json(discovered)["runs"][0]
     assert candidate["run_id"] == run_id
-    assert candidate["repository_root"] == str(git_repo.resolve())
-    assert candidate["state_dir"] == str((git_repo / ".agent-run").resolve())
+    assert candidate["repository_root"] == str(managed_repo(git_repo).resolve())
+    assert candidate["state_dir"] == str((managed_state(git_repo)).resolve())
 
 
 def test_runs_with_registered_custom_state_dir_reports_the_checkout_root(
@@ -4651,7 +4661,7 @@ def test_runs_with_registered_custom_state_dir_reports_the_checkout_root(
         check=True,
     )
     custom_state_dir = tmp_path / "custom-state"
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     run_id = stdout_json(
         seed_run(
             git_repo,
@@ -4676,7 +4686,7 @@ def test_runs_with_registered_custom_state_dir_reports_the_checkout_root(
     assert discovered.returncode == 0, discovered.stderr
     candidate = stdout_json(discovered)["runs"][0]
     assert candidate["run_id"] == run_id
-    assert candidate["repository_root"] == str(git_repo.resolve())
+    assert candidate["repository_root"] == str(managed_repo(git_repo, extra_env=locator_env).resolve())
     assert candidate["state_dir"] == str(custom_state_dir.resolve())
 
 
@@ -4686,7 +4696,7 @@ def test_registered_state_dir_without_checkout_identity_is_unavailable(
     fixture = write_fixture(git_repo / "github.json", issues={})
     custom_state_dir = tmp_path / "custom-state"
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     run_id = stdout_json(
         seed_run(
             git_repo,
@@ -4744,7 +4754,7 @@ def test_explicit_repository_run_without_origin_remains_selectable(
     fixture = write_fixture(
         git_repo / "github.json", issues={}, repository="a/project"
     )
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
 
     started = seed_run(
         git_repo,
@@ -4757,7 +4767,7 @@ def test_explicit_repository_run_without_origin_remains_selectable(
 
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
     locator_path = tmp_path / "locator-home" / "agent-run" / "run-locator.json"
     before_state = state_path.read_text(encoding="utf-8")
     before_locator = locator_path.read_text(encoding="utf-8")
@@ -4787,7 +4797,7 @@ def test_runs_with_unknown_custom_state_dir_marks_worktree_unavailable(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    source = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    source = managed_state(git_repo) / "runs" / f"{run_id}.json"
     custom_state_dir = tmp_path / "custom-state"
     custom_runs = custom_state_dir / "runs"
     custom_runs.mkdir(parents=True)
@@ -4816,7 +4826,7 @@ def test_runs_with_nested_dot_agent_run_state_dir_marks_worktree_unavailable(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    source = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    source = managed_state(git_repo) / "runs" / f"{run_id}.json"
     custom_state_dir = git_repo / "nested" / ".agent-run"
     custom_runs = custom_state_dir / "runs"
     custom_runs.mkdir(parents=True)
@@ -4850,7 +4860,7 @@ def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inp
         check=True,
     )
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     custom_state_dir = tmp_path / "custom-state"
     run_id = stdout_json(
         seed_run(
@@ -4868,15 +4878,16 @@ def test_locator_root_reuse_by_another_repository_fails_closed_and_preserves_inp
     before_locator = locator_path.read_text(encoding="utf-8")
 
     original = tmp_path / "original"
-    git_repo.rename(original)
-    subprocess.run(["git", "clone", "--quiet", str(original), str(git_repo)], check=True)
+    root = managed_repo(git_repo, extra_env=locator_env)
+    root.rename(original)
+    subprocess.run(["git", "clone", "--quiet", str(original), str(root)], check=True)
     subprocess.run(
         ["git", "remote", "set-url", "origin", "git@github.com:other/project.git"],
-        cwd=git_repo,
+        cwd=root,
         check=True,
     )
     replacement_fixture = write_fixture(
-        git_repo / "github.json", issues={}, repository="other/project"
+        git_repo / "github.json", issues={}, repository="example/project"
     )
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -4925,8 +4936,8 @@ def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
         check=True,
     )
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
-    custom_state_dir = tmp_path / "custom-state"
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
+    custom_state_dir = managed_state(git_repo, extra_env=locator_env)
     run_id = stdout_json(
         seed_run(
             git_repo,
@@ -4952,8 +4963,10 @@ def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
     before_locator = locator_path.read_text(encoding="utf-8")
 
     original = tmp_path / "original"
-    git_repo.rename(original)
-    subprocess.run(["git", "clone", "--quiet", str(original), str(git_repo)], check=True)
+    root = managed_repo(git_repo, extra_env=locator_env)
+    root.rename(original)
+    subprocess.run(["git", "clone", "--quiet", str(original), str(root)], check=True)
+    subprocess.run(["git", "remote", "set-url", "origin", str(git_repo)], cwd=root, check=True)
     replacement_fixture = write_fixture(
         git_repo / "github.json", issues={}, repository="example/project"
     )
@@ -5026,7 +5039,7 @@ def test_same_repository_replacement_clone_fails_closed_for_all_selectors(
     assert not (git_repo / ".agent-run").exists()
 
 
-def test_selector_does_not_cross_select_a_run_from_another_clone(
+def test_selector_reuses_the_managed_run_from_another_user_clone(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -5036,7 +5049,7 @@ def test_selector_does_not_cross_select_a_run_from_another_clone(
         check=True,
     )
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     custom_state_dir = tmp_path / "custom-state"
     run_id = stdout_json(
         seed_run(
@@ -5072,15 +5085,14 @@ def test_selector_does_not_cross_select_a_run_from_another_clone(
             "--json",
             extra_env=locator_env,
         )
-        assert result.returncode == 2, result.stderr
-        diagnostic = stdout_json(result)["diagnostics"][0]
-        assert diagnostic["code"] == "run_selector_requires_checkout"
+        assert result.returncode == 0, result.stderr
+        assert stdout_json(result)["run_id"] == run_id
     assert state_path.read_text(encoding="utf-8") == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
     assert not (clone / ".agent-run").exists()
 
 
-def test_resume_with_explicit_state_dir_does_not_cross_select_another_clone(
+def test_resume_rejects_a_noncanonical_state_dir_from_another_clone(
     git_repo: Path, tmp_path: Path
 ) -> None:
     from cli_fixtures import run_agents
@@ -5092,7 +5104,7 @@ def test_resume_with_explicit_state_dir_does_not_cross_select_another_clone(
         check=True,
     )
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     custom_state_dir = tmp_path / "custom-state"
     run_id = stdout_json(
         seed_run(
@@ -5142,7 +5154,8 @@ def test_resume_with_explicit_state_dir_does_not_cross_select_another_clone(
 
     assert result.returncode == 2
     diagnostic = stdout_json(result)["diagnostics"][0]
-    assert diagnostic["code"] == "run_selector_requires_checkout"
+    assert diagnostic["code"] == "command_failed"
+    assert "统一状态目录" in diagnostic["message"]
     assert state_path.read_text(encoding="utf-8") == before_state
     assert locator_path.read_text(encoding="utf-8") == before_locator
     assert not (clone / ".agent-run").exists()
@@ -5157,14 +5170,14 @@ def test_parent_selector_fails_closed_with_all_ambiguous_candidates(
         cwd=git_repo,
         check=True,
     )
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator-home")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator-home")}
     first = seed_run(git_repo, fixture, "1", extra_env=locator_env)
     first_id = stdout_json(first)["run_id"]
     second = seed_run(
         git_repo, fixture, extra_env=locator_env, reuse_existing=False
     )
     second_id = stdout_json(second)["run_id"]
-    state_paths = sorted((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_paths = sorted((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
     before = [path.read_text(encoding="utf-8") for path in state_paths]
 
     result = run_cli(
@@ -5192,11 +5205,11 @@ def test_parent_selector_reports_stale_index_candidates_without_mutation(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     locator_home = tmp_path / "locator-home"
-    locator_env = {"XDG_STATE_HOME": str(locator_home)}
+    locator_env = {"XDG_DATA_HOME": str(locator_home)}
     run_id = stdout_json(
         seed_run(git_repo, fixture, "1", extra_env=locator_env)
     )["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=locator_env) / "runs").glob("*.json"))
     before = state_path.read_text(encoding="utf-8")
     locator_path = locator_home / "agent-run" / "run-locator.json"
     locator = json.loads(locator_path.read_text(encoding="utf-8"))
@@ -5251,7 +5264,7 @@ def test_resume_parent_selector_reuses_one_existing_recoverable_run(
     )
     agents = run_agents(git_repo / "agents.json")
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    run_file = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    run_file = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = load_only_run_state(git_repo)
     state.update(
         {
@@ -5278,7 +5291,7 @@ def test_resume_parent_selector_reuses_one_existing_recoverable_run(
     resumed_state = load_only_run_state(git_repo)
     assert resumed_state["run_id"] == run_id
     assert resumed_state["resume_audit"]["total"] == 1
-    assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 1
+    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 1
 
 
 def test_frontier_uses_native_dependencies_labels_state_and_parent_order(
@@ -5355,7 +5368,7 @@ def test_run_reports_an_incompatible_legacy_state_without_recording_a_failure(
     started = seed_run(git_repo, fixture, "1")
     state = load_only_run_state(git_repo)
     state["schema_version"] = 1
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5376,7 +5389,7 @@ def test_status_and_history_show_incompatible_legacy_evidence(
     run_id = stdout_json(started)["run_id"]
     state = load_only_run_state(git_repo)
     state["schema_version"] = 1
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5402,7 +5415,7 @@ def test_status_and_history_reject_an_invalid_timeline_without_mutation(
         state.pop("timeline")
     else:
         state["timeline"] = timeline
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5420,7 +5433,7 @@ def test_history_rejects_a_timeline_with_a_non_event_without_mutation(
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state["timeline"] = ["not an event"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5439,7 +5452,7 @@ def test_cli_rejects_a_malformed_canonical_nested_state(
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
     state = load_only_run_state(git_repo)
     state["parent"].pop("number")
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
     arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
@@ -5467,7 +5480,7 @@ def test_status_rejects_malformed_invocation_records(
     state = load_only_run_state(git_repo)
     state["status"] = "execution_failed"
     state[field] = value
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5488,7 +5501,7 @@ def test_resume_rejects_unknown_invocation_role_without_mutation(
     state["active_agent_invocation"] = failed_invocation(
         work_subject="ticket:2", role="unknown", phase="developing"
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5509,7 +5522,7 @@ def test_resume_rejects_active_invocation_for_missing_ticket(
     state["active_agent_invocation"] = failed_invocation(
         work_subject="ticket:999", role="development", phase="developing"
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5540,7 +5553,7 @@ def test_resume_rejects_final_publication_without_a_valid_owner(
             ),
         }
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5579,7 +5592,7 @@ def test_resume_rejects_an_incomplete_run_acceptance_owner(
             ),
         }
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5630,7 +5643,7 @@ def test_resume_rejects_an_owner_that_has_already_advanced(
         state["run_publication"] = owner
     else:
         state["run_acceptance"] = owner
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5671,7 +5684,7 @@ def test_change_resume_rejects_an_owner_that_has_already_advanced(
             ),
         }
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5714,7 +5727,7 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
             },
         }
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5731,7 +5744,7 @@ def test_incompatible_state_does_not_replay_its_diagnostics(git_repo: Path) -> N
     state["status"] = "blocked"
     state["diagnostics"] = [{"code": "attacker", "message": "not canonical"}]
     state["parent"].pop("number")
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5764,7 +5777,7 @@ def test_cli_rejects_malformed_human_blocker_without_mutation(git_repo: Path) ->
             },
         }
     )
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
 
@@ -5784,7 +5797,7 @@ def test_cli_rejects_resolved_run_with_missing_observed_revisions(
     state = load_only_run_state(git_repo)
     state["parent"]["revision"] = None
     state["ticket_graph"]["revision"] = None
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     before = deepcopy(state)
     arguments = (command, run_id, "--json") if command != "resume" else (command, run_id)
@@ -5801,7 +5814,7 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": issue(2)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     current = load_only_run_state(git_repo)
     cases = [
         (
@@ -5892,7 +5905,7 @@ def test_resume_does_not_refresh_a_run_without_an_agent_boundary(
     state = load_only_run_state(git_repo)
     tree = subprocess.run(
         ["git", "rev-parse", f"{state['run_branch']}^{{tree}}"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -5907,14 +5920,14 @@ def test_resume_does_not_refresh_a_run_without_an_agent_boundary(
             "-m",
             "integrate accepted ticket",
         ],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
     ).stdout.strip()
     subprocess.run(
         ["git", "update-ref", f"refs/heads/{state['run_branch']}", advanced],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         check=True,
     )
 
@@ -5927,7 +5940,7 @@ def test_resume_does_not_refresh_a_run_without_an_agent_boundary(
     assert (
         subprocess.run(
             ["git", "rev-parse", state["run_branch"]],
-            cwd=git_repo,
+            cwd=managed_repo(git_repo),
             text=True,
             capture_output=True,
             check=True,
@@ -5951,6 +5964,7 @@ def test_live_default_head_is_fetched_before_run_branch_creation(
         cwd=git_repo,
         check=True,
     )
+    managed_workspace(git_repo).ensure(remote_url=str(remote))
     updater = tmp_path / "updater"
     subprocess.run(
         ["git", "clone", str(remote), str(updater)],
@@ -5999,7 +6013,7 @@ def test_live_default_head_is_fetched_before_run_branch_creation(
     assert state["base"]["sha"] == live_head
     branch_head = subprocess.run(
         ["git", "rev-parse", state["run_branch"]],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,

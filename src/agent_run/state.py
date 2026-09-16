@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+from agent_run.models import same_repository
 from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
@@ -286,7 +287,7 @@ class StateStore:
                 continue
             parent = loaded.get("parent")
             if (
-                loaded.get("repository") == repository
+                same_repository(loaded.get("repository"), repository)
                 and isinstance(parent, dict)
                 and parent.get("number") == parent_number
             ):
@@ -307,7 +308,7 @@ class StateStore:
                 continue
             parent = loaded.get("parent")
             if (
-                loaded.get("repository") == repository
+                same_repository(loaded.get("repository"), repository)
                 and isinstance(parent, dict)
                 and parent.get("number") == parent_number
                 and loaded.get("status") not in {"completed", "abandoned"}

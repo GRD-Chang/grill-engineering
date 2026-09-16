@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -17,11 +18,11 @@ from agent_run.delivery_policy import (
     DeliveryPolicyStore,
     resolve_delivery_policy,
 )
-from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
 from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlStore, TaskKey
+from support.workspace import prepare_workspace
 
 
 _GIT_LOCATION_VARIABLES = {
@@ -60,6 +61,10 @@ def _user_environment(root: Path) -> dict[str, str]:
         path = root / directory
         path.mkdir(parents=True, mode=0o700)
         environment[variable] = str(path)
+    (Path(environment["HOME"]) / ".gitconfig").write_text(
+        "[user]\n\tname = Agent Run Tests\n\temail = agent-run-tests@example.invalid\n",
+        encoding="utf-8",
+    )
     return environment
 
 
@@ -158,6 +163,21 @@ def seed_run(
     reuse_existing: bool = True,
     idle_control: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    with patch.dict(os.environ, extra_env or {}):
+        return _seed_run(
+            repo, fixture, parent, *options,
+            reuse_existing=reuse_existing, idle_control=idle_control,
+        )
+
+
+def _seed_run(
+    repo: Path,
+    fixture: Path,
+    parent: str = "1",
+    *options: str,
+    reuse_existing: bool = True,
+    idle_control: bool = False,
+) -> subprocess.CompletedProcess[str]:
     """Create test state through Controller.start without a public CLI command.
 
     The process-shaped result keeps older state-oriented tests focused on their
@@ -216,23 +236,16 @@ def seed_run(
     if values:
         raise AssertionError(f"unsupported seed_run options: {values!r}")
 
+    reader = FixtureGitHubReader(fixture)
+    workspace = prepare_workspace(repo, repository=reader.repository_hint())
+    managed_git = workspace.open()
     state_root = (
         Path(state_dir_value).resolve()
         if state_dir_value is not None
-        else repo / ".agent-run"
+        else workspace.state_root
     )
-    environment = extra_env or {}
-    state_home = Path(
-        environment.get(
-            "XDG_STATE_HOME",
-            os.environ.get("XDG_STATE_HOME", repo / ".agent-run-test-state"),
-        )
-    ).expanduser().resolve()
     config_home = Path(
-        environment.get(
-            "XDG_CONFIG_HOME",
-            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"),
-        )
+        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
     ).expanduser().resolve()
     policy_store = DeliveryPolicyStore(
         config_home / "agent-run" / "delivery-policy.json"
@@ -243,10 +256,10 @@ def seed_run(
     )
     profiles = AgentProfileStore(state_root)
     controller = Controller(
-        FixtureGitHubReader(fixture),
-        GitRepository(repo),
+        reader,
+        managed_git,
         StateStore(state_root),
-        locator=RunLocatorIndex(state_home / "agent-run" / "run-locator.json"),
+        locator=RunLocatorIndex.default(),
         profiles=profiles,
         delivery_policy=policy,
     )
@@ -254,8 +267,8 @@ def seed_run(
     run_id = str(state["run_id"])
     if idle_control and not resumed:
         seed_idle_control(
-            TaskControlStore(repo / ".agent-run"),
-            TaskKey(repo, str(state["repository"]), int(parent)),
+            TaskControlStore(workspace.state_root),
+            TaskKey(managed_git.root, str(state["repository"]), int(parent)),
             run_id,
             state_dir=state_root,
         )

@@ -213,9 +213,11 @@ class HumanThenRunPublicationAgents:
         }
 
 def _accepted_run(
-    git_repo: Path, *, ticket_number: int = 2,
+    git_repo: Path, *, ticket_number: int = 2, state_root: Path | None = None,
 ) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
-    state, states, git = _completed_run(git_repo, ticket_number=ticket_number)
+    state, states, git = _completed_run(
+        git_repo, ticket_number=ticket_number, state_root=state_root,
+    )
     tree = git.resolve(f"{state['run_branch']}^{{tree}}")
     integrated = subprocess.run(
         [

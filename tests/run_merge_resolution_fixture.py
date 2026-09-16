@@ -218,10 +218,12 @@ class MergeResolutionAgents:
 
 
 class MergeResolutionFixture:
-    def __init__(self, git_repo: Path, scenario: str) -> None:
+    def __init__(
+        self, git_repo: Path, scenario: str, *, state_root: Path | None = None,
+    ) -> None:
         self.git_repo = git_repo
         self.scenario = scenario
-        self.state, self.states, self.git = _completed_run(git_repo)
+        self.state, self.states, self.git = _completed_run(git_repo, state_root=state_root)
         self.fixture = git_repo / "github.json"
         self.run_branch = str(self.state["run_branch"])
         self.candidate_requires_follow_up = scenario in {

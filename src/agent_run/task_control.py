@@ -72,7 +72,7 @@ class TaskKey:
         if type(self.parent_number) is not int or self.parent_number <= 0:
             raise TaskControlError("Delivery Task Parent Issue must be positive")
         object.__setattr__(self, "workspace", workspace)
-        object.__setattr__(self, "repository", self.repository.strip())
+        object.__setattr__(self, "repository", self.repository.strip().lower())
 
     @property
     def identity(self) -> dict[str, object]:

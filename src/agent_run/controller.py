@@ -41,7 +41,7 @@ from agent_run.external_supervision import (
     wait_for_github_convergence,
     wait_for_github_refresh,
 )
-from agent_run.models import DeliveryGraph, Repository
+from agent_run.models import DeliveryGraph, Repository, same_repository
 from agent_run.operator_gate import (
     has_mechanical_revision_restart,
     has_non_invocation_execution_failure,
@@ -762,7 +762,7 @@ class Controller:
         if (
             isinstance(repository_hint, str)
             and repository_hint
-            and state.get("repository") != repository_hint
+            and not same_repository(state.get("repository"), repository_hint)
         ):
             return False
         try:
@@ -771,7 +771,7 @@ class Controller:
             repository = None
         if (
             repository is not None
-            and state.get("repository") != repository.name_with_owner
+            and not same_repository(state.get("repository"), repository.name_with_owner)
         ):
             return False
         active = state.get("active_agent_invocation")
@@ -845,7 +845,7 @@ class Controller:
         if (
             isinstance(repository_hint, str)
             and repository_hint
-            and state.get("repository") != repository_hint
+            and not same_repository(state.get("repository"), repository_hint)
         ):
             return False
         state.pop("supervision_window", None)
@@ -877,7 +877,7 @@ class Controller:
         state = self._load_run(run_id) if state is None else state
         self._require_current_checkout(state)
         repository = self.github.repository()
-        if state.get("repository") != repository.name_with_owner:
+        if not same_repository(state.get("repository"), repository.name_with_owner):
             raise ValueError(
                 "configured GitHub repository does not match the Delivery Run"
             )

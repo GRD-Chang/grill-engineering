@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.models import same_repository
 from agent_run.agent_invocation import (
     record_session_interruption,
     session_interruption_is_persisted,
@@ -750,7 +751,7 @@ class RunLifecycle:
             )
         parent = current.get("parent")
         if (
-            current.get("repository") != self.task.repository
+            not same_repository(current.get("repository"), self.task.repository)
             or not isinstance(parent, Mapping)
             or parent.get("number") != self.task.parent_number
         ):
