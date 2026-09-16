@@ -33,6 +33,7 @@ from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.review_budget import new_budget
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_repo, managed_state, prepare_workspace
 from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_round_agents, passing_acceptance
 
@@ -376,10 +377,11 @@ def test_unbound_execution_failure_and_ticket_human_gate_fail_closed(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket(2)})
-    states = StateStore(git_repo / ".agent-run")
+    workspace = prepare_workspace(git_repo)
+    states = StateStore(workspace.state_root)
     controller = Controller(
         FixtureGitHubReader(fixture),
-        GitRepository(git_repo),
+        GitRepository(workspace.repository_root),
         states,
     )
     state, _ = controller.start(1)
@@ -1438,7 +1440,7 @@ def test_deliver_advances_the_complete_dag_and_enters_run_acceptance(
             "--count",
             f"{state['base']['sha']}..{state['run_branch']}",
         ],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -1801,7 +1803,7 @@ def test_human_blocked_ticket_gates_independent_work_until_resume(
         for event in history_json["events"]
     )
     state["timeline"] = [state["timeline"][0]]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     stale_timeline_history = stdout_json(
         invoke_cli_inprocess(git_repo, fixture, "history", run_id, "--json")

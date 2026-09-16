@@ -22,6 +22,7 @@ from agent_run.state_contract import (
 
 from run_acceptance_test_support import _passing_artifact
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import prepare_workspace
 from test_cli import run_internal_stage, run_cli, stdout_json
 
 from run_publication_test_support import (
@@ -369,7 +370,9 @@ def test_unknown_final_pr_narrative_write_does_not_replay(
 def test_final_publication_human_resume_clears_current_blocker(
     git_repo: Path,
 ) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git, publisher = _accepted_run(repo, state_root=workspace.state_root)
     agents = HumanThenRunPublicationAgents()
     engine = RunPublicationEngine(
         git=git,
@@ -390,8 +393,8 @@ def test_final_publication_human_resume_clears_current_blocker(
     assert publisher.data["delivery"]["pull_requests"] == []
     for command in ("status", "history"):
         view = invoke_cli_inprocess(
-            git_repo,
-            git_repo / "github.json",
+            repo,
+            repo / "github.json",
             command,
             str(state["run_id"]),
         )
@@ -415,8 +418,8 @@ def test_final_publication_human_resume_clears_current_blocker(
         )
     history = stdout_json(
         invoke_cli_inprocess(
-            git_repo,
-            git_repo / "github.json",
+            repo,
+            repo / "github.json",
             "history",
             str(state["run_id"]),
             "--json",
@@ -430,7 +433,7 @@ def test_final_publication_human_resume_clears_current_blocker(
     )
 
     resumed, _ = Controller(
-        FixtureGitHubReader(git_repo / "github.json"), git, states
+        FixtureGitHubReader(repo / "github.json"), git, states
     ).resume(
         str(state["run_id"]),
         resume_human_blocker=True,
@@ -732,7 +735,9 @@ def test_approve_rejects_default_branch_drift_without_merging(git_repo: Path) ->
 def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
     git_repo: Path,
 ) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git, publisher = _accepted_run(repo, state_root=workspace.state_root)
     engine = RunPublicationEngine(
         git=git,
         states=states,
@@ -765,20 +770,20 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
         == "CLOSED"
     )
     resumed = run_internal_stage(
-        git_repo, git_repo / "github.json", "accept-run", str(state["run_id"])
+        repo, repo / "github.json", "accept-run", str(state["run_id"])
     )
     assert resumed.returncode == 0, resumed.stderr
     assert stdout_json(resumed)["status"] == "abandoned"
     removed_command = run_cli(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "confirm-structure",
         str(state["run_id"]),
     )
     assert removed_command.returncode == 2
     assert "invalid choice" in removed_command.stderr
     assert not Controller(
-        FixtureGitHubReader(git_repo / "github.json"), git, states
+        FixtureGitHubReader(repo / "github.json"), git, states
     ).record_execution_failure(str(state["run_id"]), "must not overwrite abandonment")
     assert states.load_run(str(state["run_id"]))["status"] == "abandoned"
 

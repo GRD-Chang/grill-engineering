@@ -5,18 +5,34 @@ import time
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from rich.text import Text
 
 from agent_run import cli
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
+from support.workspace import prepare_workspace
 from test_run_lifecycle import _file_snapshot
 
 
 class TerminalOutput(StringIO):
     def isatty(self) -> bool:
         return True
+
+
+def _save_run(repo: Path, state: dict[str, Any]) -> Path:
+    workspace = prepare_workspace(repo)
+    StateStore(workspace.state_root).save_run(state["run_id"], state)
+    RunLocatorIndex.default().register(
+        run_id=state["run_id"],
+        repository_root=workspace.repository_root,
+        state_dir=workspace.state_root,
+        repository=state["repository"],
+        parent_number=state["parent"]["number"],
+    )
+    return workspace.state_root
 
 
 @pytest.mark.parametrize("mode, completed, status, acceptance, publication, expected", [
@@ -56,8 +72,7 @@ def test_delivery_progress_preserves_audit(
         state["run_acceptance"] = {"phase": acceptance}
     if publication:
         state["run_publication"] = {"phase": publication}
-    root = git_repo / ".agent-run"
-    StateStore(root).save_run(state["run_id"], state)
+    root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("COLUMNS", "160")
@@ -97,8 +112,7 @@ def test_completed_status_requires_cleanup_when_closeout_crashed_before_scheduli
             "phase": "merged", "approval_grant": {}, "parent_closed": True,
         }, "diagnostics": [],
     }
-    root = git_repo / ".agent-run"
-    StateStore(root).save_run(state["run_id"], state)
+    root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("COLUMNS", "160")
@@ -148,8 +162,7 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
         }],
         "delivery_cleanup": {"status": "completed", "items": {}}, "diagnostics": [],
     }
-    root = git_repo / ".agent-run"
-    StateStore(root).save_run(state["run_id"], state)
+    root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("COLUMNS", "160")
@@ -200,8 +213,7 @@ def test_status_qualifies_manual_abandon_guidance_without_changing_json(
         "run_id": "run-action-language", "schema_version": 1, "repository": "example/project",
         "parent": {"number": 1}, "status": status, "diagnostics": [],
     }
-    root = git_repo / ".agent-run"
-    StateStore(root).save_run(state["run_id"], state)
+    root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
     output = StringIO()
@@ -241,8 +253,7 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
             "started_at": "2026-09-12T15:20:00+00:00", "ended_at": "2026-09-12T15:21:00+00:00",
         }],
     }
-    root = git_repo / ".agent-run"
-    StateStore(root).save_run(state["run_id"], state)
+    root = _save_run(git_repo, state)
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("TERM", "xterm-256color")
