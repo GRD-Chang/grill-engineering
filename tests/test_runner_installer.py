@@ -1595,10 +1595,13 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     seeded = seed_run(
         delivery,
         fixture,
-        extra_env={"XDG_STATE_HOME": str(home / "state")},
+        extra_env={"XDG_DATA_HOME": str(home / "data")},
     )
     assert seeded.returncode == 0, seeded.stderr
-    target_state_before_uninstall = _file_tree(delivery / ".agent-run")
+    managed_root = _data_root(home) / "repositories" / "example" / "project"
+    target_state_before_uninstall = _file_tree(managed_root)
+    assert target_state_before_uninstall
+    assert list((managed_root / "state" / "runs").glob("*.json"))
 
     count_before_repeat = int(count.read_text(encoding="utf-8"))
     repeated = _run(
@@ -1639,7 +1642,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
         profile = profile_path.read_text(encoding="utf-8")
         assert "# >>> agent-run managed PATH >>>" not in profile
         assert "# <<< agent-run managed PATH <<<" not in profile
-    assert _file_tree(delivery / ".agent-run") == target_state_before_uninstall
+    assert _file_tree(managed_root) == target_state_before_uninstall
     assert not [marker for marker in markers if marker.exists()]
     assert not list(probe_tmp.iterdir())
 
