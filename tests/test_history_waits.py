@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run.delivery_history import history_records
 
 
@@ -203,7 +205,7 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
     started = seed_run(git_repo, fixture, idle_control=True)
     assert started.returncode == 0, started.stderr
     run_id = json.loads(started.stdout)["run_id"]
-    state_path = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    state_path = managed_state(git_repo) / "runs" / f"{run_id}.json"
     state = json.loads(state_path.read_text())
     events = [check_event(0), check_event(4), check_event(13, "pass")]
     events[-1]["required_checks_evidence"] = {"checks": [{
@@ -213,7 +215,7 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
     state_path.write_text(json.dumps(state))
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("COLUMNS", "120")
-    before = {path: path.read_bytes() for path in (git_repo / ".agent-run").rglob("*") if path.is_file()}
+    before = {path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*") if path.is_file()}
     for arguments in (["--plain"], ["--plain", "--details"], [], ["--details"]):
         output = Terminal()
         with redirect_stdout(output):

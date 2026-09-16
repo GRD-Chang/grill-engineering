@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run import cli
 from agent_run.executor_host import HostObservation
 
@@ -13,6 +15,12 @@ from conftest import write_fixture
 from test_cli import run_cli, stdout_json
 from test_cli_delivery import ticket
 from test_run_lifecycle import _file_snapshot, _isolated_environment
+
+
+def _workspace_snapshot(
+    repo: Path, *, extra_env: dict[str, str] | None = None,
+) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    return _file_snapshot(repo), _file_snapshot(managed_repo(repo, extra_env=extra_env).parent)
 
 
 @pytest.mark.parametrize("case", ["interrupted", "unknown", "ended", "capacity"])
@@ -32,7 +40,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     )
     assert first.returncode == 0, first.stderr
     run_id = stdout_json(first)['run_id']
-    state_path = next((git_repo / '.agent-run' / 'runs').glob('*.json'))
+    state_path = next((managed_state(git_repo, extra_env=environment) / 'runs').glob('*.json'))
     state = json.loads(state_path.read_text())
     invocation = dict(state['agent_invocation_history'][-1])
     invocation.update(
@@ -48,7 +56,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     if case == 'ended':
         invocation['ended_at'] = '2026-09-07T01:47:25+00:00'
         state['agent_invocation_history'][-1] = dict(invocation)
-    control_path = next((git_repo / '.agent-run' / 'task-control').glob('*.json'))
+    control_path = next((managed_state(git_repo, extra_env=environment) / 'task-control').glob('*.json'))
     if case == 'unknown':
         control_path.unlink()
     if case == 'capacity':
@@ -70,7 +78,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
     monkeypatch.chdir(git_repo)
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
-    before = _file_snapshot(git_repo)
+    before = _workspace_snapshot(git_repo, extra_env=environment)
     for command in ('status', 'history'):
         assert cli.main([command, run_id, '--json']) == 0
         output = json.loads(capsys.readouterr().out)
@@ -104,7 +112,7 @@ def test_interrupted_agent_has_unknown_duration_and_recovery_guidance(
         assert '2026-09-07' in human
         assert '你暂时无需操作' not in human
         assert '本轮剩余' not in human
-    assert _file_snapshot(git_repo) == before
+    assert _workspace_snapshot(git_repo, extra_env=environment) == before
 
 
 def test_normal_approval_gate_is_not_reported_as_interrupted(
@@ -130,12 +138,12 @@ def test_budget_checkpoint_explains_new_window_authorization(git_repo: Path) -> 
     from test_resume_intent import _checkpoint
 
     fixture, _, state = _checkpoint(git_repo)
-    before = _file_snapshot(git_repo)
+    before = _workspace_snapshot(git_repo)
     for command in ("status", "history"):
         result = run_cli(git_repo, fixture, command, state["run_id"])
         assert result.returncode == 0, result.stderr
         assert "继续执行后，将按配置补充本次开发与验收额度" in result.stdout
-    assert _file_snapshot(git_repo) == before
+    assert _workspace_snapshot(git_repo) == before
 
 
 def test_completed_invocation_keeps_bounded_recovery_summary(
@@ -150,13 +158,13 @@ def test_completed_invocation_keeps_bounded_recovery_summary(
     )
     assert first.returncode == 0, first.stderr
     run_id = stdout_json(first)["run_id"]
-    state_path = next((git_repo / ".agent-run/runs").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
     state = json.loads(state_path.read_text())
     invocation = state["agent_invocation_history"][-1]
     assert invocation["status"] == "completed"
     invocation.update(ordinary_recovery_used=True, capacity_recovery_count=3)
     state_path.write_text(json.dumps(state))
-    before = _file_snapshot(git_repo)
+    before = _workspace_snapshot(git_repo, extra_env=environment)
     for command in ("history", "status"):
         result = run_cli(
             git_repo, fixture, command, run_id, extra_env=environment,
@@ -165,4 +173,4 @@ def test_completed_invocation_keeps_bounded_recovery_summary(
         assert "普通异常自动续接已触发 1 次" in result.stdout
         assert "模型容量不足等待已触发 3 次" in result.stdout
         assert "ordinary_recovery_used" not in result.stdout
-    assert _file_snapshot(git_repo) == before
+    assert _workspace_snapshot(git_repo, extra_env=environment) == before

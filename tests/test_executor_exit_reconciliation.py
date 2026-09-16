@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.executor_host import _process_start_token
 from agent_run.cli import main
 from agent_run.run_lifecycle import prepare_action_application_receipt
@@ -19,11 +21,11 @@ from test_ticket_194_stop_abandon import _run_cli
 def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     original = states.find_unfinished_runs("example/project", 1)[0]
     run_id = original["run_id"]
     control = TaskControlStore(states.root)
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     seed_idle_control(control, task, run_id, state_dir=states.root)
 
     result = _run_cli(git_repo, fixture, "stop", run_id)
@@ -45,11 +47,11 @@ def test_resume_reconciles_externally_exited_executor(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = current["run_id"]
     control = TaskControlStore(states.root)
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id=run_id)
     child = subprocess.Popen([sys.executable, "-c", "pass"])

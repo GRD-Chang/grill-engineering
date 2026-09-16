@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from conftest import seed_idle_control, seed_run, write_fixture
 from test_ticket_194_stop_abandon import (
     _bind_running_executor,
@@ -49,7 +51,7 @@ def test_control_environment_rejected_before_ownership_changes(
         monkeypatch.setenv(key, value)
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     worker = None
@@ -64,7 +66,7 @@ def test_control_environment_rejected_before_ownership_changes(
         request.addfinalizer(cleanup_worker)
     else:
         control = TaskControlStore(states.root)
-        task = TaskKey(git_repo, "example/project", 1)
+        task = TaskKey(managed_repo(git_repo), "example/project", 1)
         seed_idle_control(control, task, run_id, state_dir=states.root)
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -192,7 +194,7 @@ def test_running_control_attaches_with_oversize_observer_environment(
         monkeypatch.setenv(key, value)
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)

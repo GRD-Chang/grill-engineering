@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run import cli as cli_module
 from agent_run.delivery_policy import policy_snapshot_for_state
 from agent_run.executor_host import ExecutorSpec, HostObservation
@@ -71,7 +73,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
     run_id = str(state["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
     try:
-        states = StateStore(git_repo / ".agent-run")
+        states = StateStore(managed_state(git_repo))
         state = states.load_run(run_id)
         assert state is not None
         receipt = dict(state["action_application_receipt"])
@@ -250,7 +252,7 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
     fixture = write_fixture(git_repo / "github.json", issues={})
     agents = run_agents(git_repo / "agents.json")
     state_root = (
-        git_repo / ".agent-run"
+        managed_state(git_repo)
         if state_case == "canonical"
         else git_repo.parent / "custom-state"
     )
@@ -260,8 +262,8 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
     states = StateStore(state_root)
     state = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(state["run_id"])
-    control = TaskControlStore(git_repo / ".agent-run")
-    task = TaskKey(git_repo, "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control.claim_action(task, kind="run", payload={"parent": 1})
     worker = subprocess.Popen(
         [sys.executable, "-c", "import signal; signal.pause()"],
@@ -307,7 +309,11 @@ def test_missing_receipt_does_not_make_stop_noop_or_refresh_approval(
             code = cli_module.main(arguments)
             output = json.loads(capsys.readouterr().out)
             assert code == 2, output
-            assert output["diagnostics"][0]["code"] == "task_control", output
+            if command == "stop" and state_case == "custom":
+                assert output["diagnostics"][0]["code"] == "command_failed", output
+                assert "统一状态目录" in output["diagnostics"][0]["message"]
+            else:
+                assert output["diagnostics"][0]["code"] == "task_control", output
             assert host.start_count == 0
             assert prepared == []
             assert published == []

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from cli_run_supervision_support import _parent_only_agents
@@ -83,7 +85,7 @@ elif sys.argv[1] == 'completed_during_inspect':
         assert select.select([executor_fd], [], [], 10)[0] == [executor_fd]
         Path(sys.argv[4]).write_text(json.dumps({
             'control': control.load(spec.task),
-            'state': StateStore(Path.cwd() / '.agent-run').load_run(spec.run_id),
+            'state': StateStore(spec.state_root).load_run(spec.run_id),
             'fixture': json.loads(Path(sys.argv[-1]).read_text()),
         }))
         return original_inspect(self, spec, control)
@@ -141,8 +143,8 @@ def test_run_observes_existing_executor_after_other_lifecycle_actions(
         ready, _, _ = select.select([ready_read], [], [], 5)
         assert ready == [ready_read]
         assert os.read(ready_read, 1) == b"1"
-        control = TaskControlStore(git_repo / ".agent-run")
-        task = TaskKey(git_repo, "example/project", 1)
+        control = TaskControlStore(managed_state(git_repo))
+        task = TaskKey(managed_repo(git_repo), "example/project", 1)
         record = control.load(task)
         assert record is not None
         assert record["action"]["kind"] == action
@@ -151,10 +153,10 @@ def test_run_observes_existing_executor_after_other_lifecycle_actions(
         )
         assert record["executor"]["status"] == "running"
         executor_fd = os.pidfd_open(record["executor"]["pid"])
-        state = StateStore(git_repo / ".agent-run").load_run(record["run_id"])
+        state = StateStore(managed_state(git_repo)).load_run(record["run_id"])
         assert state is not None
         roots = (
-            git_repo / ".agent-run", tmp_path / "environment", tmp_path / "runtime"
+            managed_state(git_repo), tmp_path / "environment", tmp_path / "runtime"
         )
         before = {str(root): _file_snapshot(root) for root in roots}
         fixture_before = fixture.read_bytes()
@@ -192,7 +194,7 @@ def test_run_observes_existing_executor_after_other_lifecycle_actions(
                 "parent_approval_pending" if action == "resume" else "completed"
             )
             assert control.load(task) == finished["control"]
-            final_state = StateStore(git_repo / ".agent-run").load_run(
+            final_state = StateStore(managed_state(git_repo)).load_run(
                 record["run_id"]
             )
             assert final_state == finished["state"]

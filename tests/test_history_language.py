@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 from rich.text import Text
 
+from support.workspace import managed_state
+
 from agent_run.cli import main
 from conftest import seed_run, write_fixture
 
@@ -50,7 +52,7 @@ def save_history(repo: Path, events: list[dict[str, Any]]) -> tuple[str, Path]:
     started = seed_run(repo, fixture, idle_control=True)
     assert started.returncode == 0, started.stderr
     run_id = json.loads(started.stdout)["run_id"]
-    path = repo / ".agent-run" / "runs" / f"{run_id}.json"
+    path = managed_state(repo) / "runs" / f"{run_id}.json"
     state = json.loads(path.read_text())
     state["timeline"] = events
     path.write_text(json.dumps(state))

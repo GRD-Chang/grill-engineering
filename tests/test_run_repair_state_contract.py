@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
@@ -72,13 +74,13 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "repair_job": repair_job,
     }
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
     head_before = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -93,7 +95,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
     assert fixture.read_text(encoding="utf-8") == fixture_before
     assert subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -444,11 +446,11 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
             "integrated_revalidation_merge": marker,
         },
     }
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_path.write_text(json.dumps(state), encoding="utf-8")
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
-    refs_before = _git_refs(git_repo)
+    refs_before = _git_refs(managed_repo(git_repo))
 
     result = run_cli(git_repo, fixture, "resume", run_id)
 
@@ -457,7 +459,7 @@ def test_resume_rejects_invalid_integrated_revalidation_merge_before_mutation(
     assert stdout_json(result)["diagnostics"][0]["code"] == "incompatible_run_state"
     assert json.loads(state_path.read_text(encoding="utf-8")) == state_before
     assert fixture.read_text(encoding="utf-8") == fixture_before
-    assert _git_refs(git_repo) == refs_before
+    assert _git_refs(managed_repo(git_repo)) == refs_before
 
 
 def test_canonical_integrated_revalidation_merge_passes_state_validation(

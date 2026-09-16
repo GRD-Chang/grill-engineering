@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -405,13 +407,14 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
-    git = GitRepository.discover(git_repo)
-    states = StateStore(git_repo / ".agent-run")
+    prepare_workspace(git_repo)
+    git = GitRepository(managed_repo(git_repo))
+    states = StateStore(managed_state(git_repo))
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     state, _ = controller.start(1)
     seed_idle_control(
-        TaskControlStore(git_repo / ".agent-run"),
-        TaskKey(git_repo, "example/project", 1),
+        TaskControlStore(managed_state(git_repo)),
+        TaskKey(managed_repo(git_repo), "example/project", 1),
         str(state["run_id"]),
     )
     active = state["active_ticket_job"]
@@ -525,8 +528,8 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
     started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -605,8 +608,8 @@ def test_requeue_blocks_an_external_close_during_retirement(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -673,8 +676,8 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -707,8 +710,8 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
     )
     started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -762,7 +765,7 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
 def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -775,7 +778,7 @@ def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) ->
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
             "effective_revision": "stale",
-            "base_sha": GitRepository(git_repo).resolve(str(state["run_branch"])),
+            "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }
     )
     state["ticket_jobs"] = {"7": job}
@@ -818,7 +821,7 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
     started = seed_run(git_repo, fixture, "1", idle_control=True)
     run_id = stdout_json(started)["run_id"]
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -831,7 +834,7 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
             "effective_revision": "old-revision",
-            "base_sha": GitRepository(git_repo).resolve(str(state["run_branch"])),
+            "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }
     )
     state["ticket_jobs"] = {"7": job}
@@ -914,8 +917,8 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    states = StateStore(git_repo / ".agent-run")
-    git = GitRepository(git_repo)
+    states = StateStore(managed_state(git_repo))
+    git = GitRepository(managed_repo(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]

@@ -12,6 +12,7 @@ import pytest
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_state
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import (
     parent_publication,
@@ -31,7 +32,7 @@ from agent_run.executor_host import _process_start_token
 
 
 def _write_executor_record(repo: Path, pid: int, start_token: str) -> None:
-    directory = repo / ".agent-run" / "task-control"
+    directory = managed_state(repo) / "task-control"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "fixture.json").write_text(
         json.dumps(
@@ -189,7 +190,7 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
 
         _interrupt_run(process, git_repo)
         state_files = {
-            path: path.read_bytes() for path in (git_repo / ".agent-run").rglob("*.json")
+            path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*.json")
         }
         for host_exit, activity in ((4, "not_running"), (1, "unknown")):
             # systemctl exit 4 confirms an absent unit; exit 1 cannot establish
@@ -222,7 +223,7 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
                 assert "截止=" not in text
                 assert "超时恢复:" not in text
         assert {
-            path: path.read_bytes() for path in (git_repo / ".agent-run").rglob("*.json")
+            path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*.json")
         } == state_files
     finally:
         _interrupt_run(process, git_repo)

@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run import cli
 from agent_run import executor_host as host_module
 from agent_run.executor_host import (
@@ -39,7 +41,7 @@ def test_failed_stop_missing_control_keeps_target_until_confirmed_exit(
     agents = _parent_only_agents(git_repo / "agents.json")
     seeded = seed_run(git_repo, fixture)
     assert seeded.returncode == 0, seeded.stderr
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)

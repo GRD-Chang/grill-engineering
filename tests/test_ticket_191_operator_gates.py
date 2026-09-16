@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 import agent_run.cli as cli_module
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -75,7 +77,7 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
     subject_location: str,
     blocked_reason: str,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
+    state, states, _git = _completed_run(prepare_workspace(git_repo).repository_root, state_root=managed_state(git_repo))
     budget = _canonical_run_budget()
     budget["checkpoint_reason"] = blocked_reason
     subject = {
@@ -126,9 +128,9 @@ def test_ordinary_run_preserves_every_non_parent_review_budget_subject(
         state["run_acceptance"] = acceptance
     state.update({"status": "blocked", "terminal_kind": "waiting_human"})
     states.save_run(str(state["run_id"]), state)
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_before = _tree_snapshot(state_root)
-    fixture = git_repo / "github.json"
+    fixture = managed_repo(git_repo) / "github.json"
     fixture_before = fixture.read_bytes()
 
     # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
@@ -161,7 +163,7 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
     capsys: pytest.CaptureFixture[str],
     subject_location: str,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
+    state, states, _git = _completed_run(prepare_workspace(git_repo).repository_root, state_root=managed_state(git_repo))
     subject = {
         "phase": "blocked",
         "blocked_reason": "review_budget_exhausted",
@@ -228,9 +230,9 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
         {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
     )
     states.save_run(str(state["run_id"]), state)
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_before = _tree_snapshot(state_root)
-    fixture = git_repo / "github.json"
+    fixture = managed_repo(git_repo) / "github.json"
     fixture_before = fixture.read_bytes()
 
     # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
@@ -267,22 +269,21 @@ def test_ordinary_run_preserves_local_gate_during_supervision_timeout(
             raise
 
 
-def test_production_run_locates_custom_state_gate_before_readiness(
+def test_production_run_locates_configured_data_root_gate_before_readiness(
     git_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    state_root = tmp_path / "custom-state"
-    state_home = tmp_path / "state-home"
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "custom-data"))
+    state_root = managed_state(git_repo)
     started = seed_run(
         git_repo,
         fixture,
         "1",
         "--state-dir",
         str(state_root),
-        extra_env={"XDG_STATE_HOME": str(state_home)},
     )
     state = StateStore(state_root).load_run(str(stdout_json(started)["run_id"]))
     assert state is not None
@@ -305,7 +306,6 @@ def test_production_run_locates_custom_state_gate_before_readiness(
         (),
         expected_status="supervision_timeout",
         state_root=state_root,
-        state_home=state_home,
     )
     assert not (git_repo / ".agent-run").exists()
 
@@ -377,7 +377,7 @@ def _assert_run_preserves_boundary(
     expected_status: str,
     run_arguments: tuple[str, ...],
 ) -> None:
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_path = next((state_root / "runs").glob("*.json"))
     control_path = next((state_root / "task-control").glob("*.json"))
     state_before = state_path.read_bytes()
@@ -448,7 +448,7 @@ def test_ordinary_run_preserves_parent_budget_checkpoint(
     if blocked_reason == "modification_budget_exhausted":
         state["parent_job"]["blocked_reason"] = blocked_reason
         state["parent_job"]["review_budget"]["checkpoint_reason"] = blocked_reason
-        StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
+        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
 
     # 每组参数都必须只读，复用边界前置流程并逐组核对同一快照。
     for run_arguments in (
@@ -483,7 +483,7 @@ def test_approval_refresh_exhaustion_does_not_create_a_successor_action(
         for attempt in range(MAX_READ_ATTEMPTS + 1)
     ]
     fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_path = next((state_root / "runs").glob("*.json"))
     control_path = next((state_root / "task-control").glob("*.json"))
     state_before = state_path.read_bytes()
@@ -554,7 +554,7 @@ def test_ordinary_run_advances_normal_run_publication_pending(
     assert advanced.returncode == 0, advanced.stderr
     assert stdout_json(advanced)["status"] == "run_approval_pending"
     control_path = next(
-        (git_repo / ".agent-run" / "task-control").glob("*.json")
+        (managed_state(git_repo) / "task-control").glob("*.json")
     )
     control = json.loads(control_path.read_bytes())
     assert control["action"]["kind"] == "run"
@@ -579,14 +579,14 @@ def test_progressing_run_reports_execution_readiness_when_unavailable(
     if current_status == "run_publication_pending":
         fixture, _agents = _establish_run_publication_pending(git_repo)
     else:
-        state, states, _git = _completed_run(git_repo)
+        state, states, _git = _completed_run(prepare_workspace(git_repo).repository_root, state_root=managed_state(git_repo))
         state.update(
             {"status": "supervision_timeout", "terminal_kind": "supervision_timeout"}
         )
         states.save_run(str(state["run_id"]), state)
-        fixture = git_repo / "github.json"
+        fixture = managed_repo(git_repo) / "github.json"
 
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_tree_before = _tree_snapshot(state_root)
     fixture_before = fixture.read_bytes()
     environment_carrier = git_repo / "runtime" / "environment-carrier.json"
@@ -615,7 +615,7 @@ def test_progressing_run_reports_execution_readiness_when_unavailable(
         return readiness_failure == "systemd-unavailable"
 
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo / "runtime"))
     monkeypatch.setattr(cli_module, "runner_usage_lease", observed_runner_lease)
     monkeypatch.setattr(cli_module, "_running_active_runner", active_runner_available)
@@ -627,6 +627,7 @@ def test_progressing_run_reports_execution_readiness_when_unavailable(
         "GhGitHubReader",
         lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
     )
+    monkeypatch.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture))
 
     return_code = cli_module.main(
         ["run", "1", "--repo", "example/project", "--json"]
@@ -655,7 +656,7 @@ def test_ordinary_run_preserves_requeue_required_boundary(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.load_run(run_id)
     assert state is not None
     job = state["active_ticket_job"]
@@ -675,7 +676,7 @@ def test_ordinary_run_preserves_requeue_required_boundary(
             },
             "review_budget_history": [],
             "effective_revision": "stale-revision",
-            "base_sha": GitRepository(git_repo).resolve(str(state["run_branch"])),
+            "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }
     )
     state["ticket_jobs"] = {"3": job}

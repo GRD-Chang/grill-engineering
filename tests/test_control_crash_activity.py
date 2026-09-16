@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run import cli
 from agent_run.executor_host import FakeExecutorHost, HostObservation
 from agent_run.state import StateStore
@@ -19,7 +21,7 @@ def test_control_receipt_crash_keeps_target_activity_unknown(
 ) -> None:
     fixture = write_fixture(git_repo / 'github.json', issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / '.agent-run')
+    states = StateStore(managed_state(git_repo))
     state = states.find_unfinished_runs('example/project', 1)[0]
     run_id = str(state['run_id'])
     control, task, worker = _bind_running_executor(git_repo, run_id)

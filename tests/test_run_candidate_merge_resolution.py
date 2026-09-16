@@ -14,6 +14,7 @@ from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
 
+from support.workspace import prepare_workspace
 from conftest import seed_idle_control
 from test_cli import run_cli
 
@@ -33,33 +34,35 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     latest_combination_has_finding: bool,
     external_base_drift: bool,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
     if not latest_combination_has_finding:
         seed_idle_control(
             TaskControlStore(states.root),
-            TaskKey(git_repo, str(state["repository"]), 1),
+            TaskKey(repo, str(state["repository"]), 1),
             str(state["run_id"]),
             state_dir=states.root,
         )
-    fixture = git_repo / "github.json"
+    fixture = repo / "github.json"
     run_branch = str(state["run_branch"])
 
-    subprocess.run(["git", "switch", run_branch], cwd=git_repo, check=True)
-    (git_repo / "shared.txt").write_text("run branch\n", encoding="utf-8")
-    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(["git", "switch", run_branch], cwd=repo, check=True)
+    (repo / "shared.txt").write_text("run branch\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=repo, check=True)
     subprocess.run(
         ["git", "commit", "-m", "change shared file on run branch"],
-        cwd=git_repo,
+        cwd=repo,
         check=True,
         capture_output=True,
     )
     run_head = git.resolve(run_branch)
-    subprocess.run(["git", "switch", "main"], cwd=git_repo, check=True)
-    (git_repo / "shared.txt").write_text("default branch\n", encoding="utf-8")
-    subprocess.run(["git", "add", "shared.txt"], cwd=git_repo, check=True)
+    subprocess.run(["git", "switch", "main"], cwd=repo, check=True)
+    (repo / "shared.txt").write_text("default branch\n", encoding="utf-8")
+    subprocess.run(["git", "add", "shared.txt"], cwd=repo, check=True)
     subprocess.run(
         ["git", "commit", "-m", "change shared file on default branch"],
-        cwd=git_repo,
+        cwd=repo,
         check=True,
         capture_output=True,
     )
@@ -125,15 +128,15 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     class DriftAfterMergePublisher(FixtureGitHubPublisher):
         def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
             super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
-            (git_repo / "default-after-merge.txt").write_text(
+            (repo / "default-after-merge.txt").write_text(
                 "advanced\n", encoding="utf-8"
             )
             subprocess.run(
-                ["git", "add", "default-after-merge.txt"], cwd=git_repo, check=True
+                ["git", "add", "default-after-merge.txt"], cwd=repo, check=True
             )
             subprocess.run(
                 ["git", "commit", "-m", "advance default after conflict merge"],
-                cwd=git_repo,
+                cwd=repo,
                 check=True,
                 capture_output=True,
             )
@@ -185,11 +188,11 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
         pull["base_branch"] = "main"
         mutations = deepcopy(data["delivery"].get("mutations", []))
         fixture.write_text(json.dumps(data), encoding="utf-8")
-        empty_agents = git_repo / "blocked-revalidation-agents.json"
+        empty_agents = repo / "blocked-revalidation-agents.json"
         empty_agents.write_text("{}", encoding="utf-8")
 
         blocked = run_cli(
-            git_repo,
+            repo,
             fixture,
             "run",
             "1",
@@ -231,7 +234,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
             currentness_reader=FixtureGitHubReader(fixture),
         ).accept(str(state["run_id"]))
     else:
-        revalidation_agents = git_repo / "revalidation-agents.json"
+        revalidation_agents = repo / "revalidation-agents.json"
         revalidation_agents.write_text(
             json.dumps(
                 {
@@ -262,7 +265,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
             encoding="utf-8",
         )
         resumed = run_cli(
-            git_repo,
+            repo,
             fixture,
             "run",
             "1",

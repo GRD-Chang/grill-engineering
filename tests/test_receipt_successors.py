@@ -10,7 +10,10 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 import agent_run.cli as cli_module
+import agent_run.workspace_cli as workspace_cli
 from agent_run.executor_host import (
     ExecutorSpec,
     ExecutorStartUnknownError,
@@ -84,8 +87,7 @@ def _install_host(
 
     host = ReceiptHost()
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo / "runtime"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo.parent / "runtime"))
     monkeypatch.setattr(
         cli_module, "runner_usage_lease", lambda _path: nullcontext(UsageLease())
     )
@@ -95,6 +97,10 @@ def _install_host(
         cli_module,
         "GhGitHubReader",
         lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
+    )
+    monkeypatch.setattr(
+        workspace_cli, "GhGitHubReader",
+        lambda **_options: FixtureGitHubReader(fixture),
     )
     monkeypatch.setattr(
         cli_module,
@@ -120,10 +126,10 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
     state = load_only_run_state(git_repo)
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     run_id = str(state["run_id"])
     control = TaskControlStore(state_root)
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     original = control.claim_action(task, kind="run", payload={"parent": 1})
     prepare_action_application_receipt(state, original.action)
     state.update({"status": "execution_failed", "terminal_kind": "execution_failed"})
@@ -280,8 +286,8 @@ def test_recovered_receipt_successor_executes_the_real_cli_action(
         agents = _revision_agents(git_repo / "revision-agents.json")
     state = load_only_run_state(git_repo)
     receipt = state["action_application_receipt"]
-    control = TaskControlStore(git_repo / ".agent-run")
-    task = TaskKey(git_repo, "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control.path_for(task).write_text("not json", encoding="utf-8")
     host = _install_host(git_repo, fixture, monkeypatch, "exited", launch_unknown=False)
     arguments = [
@@ -352,12 +358,12 @@ def test_original_retry_unknown_then_different_successor_reconciles_again(
     payload = {"parent": 1, "run_id": run_id}
     if original_command == "revise":
         payload["message"] = "original revision"
-    control = TaskControlStore(git_repo / ".agent-run")
-    task = TaskKey(git_repo, "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     original = control.claim_action(task, kind=original_command, payload=payload)
     prepare_action_application_receipt(state, original.action)
     state.update({"status": "run_approval_pending", "terminal_kind": None})
-    StateStore(git_repo / ".agent-run").save_run(run_id, state)
+    StateStore(managed_state(git_repo)).save_run(run_id, state)
     control.path_for(task).unlink()
     first_host = _install_host(git_repo, fixture, monkeypatch, "unknown")
     arguments = [original_command, run_id, "--repo", "example/project", "--json"]

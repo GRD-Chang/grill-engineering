@@ -8,6 +8,7 @@ import pytest
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_state
 from support.published_run import prepare_accepted_run, prepare_published_run
 from test_cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
 from test_cli_delivery import (
@@ -766,7 +767,7 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
     recovery_agents = _resume_repair_agents(
         git_repo / "recovery-agents.json", expected_thread_id=None
     )
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     control_before = control_path.read_bytes()
     fixture_before = fixture.read_bytes()
     refused = run_cli(git_repo, fixture, "run", "1")

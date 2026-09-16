@@ -24,6 +24,7 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 
+from support.workspace import prepare_workspace
 from conftest import seed_idle_control
 from support.inprocess_cli import invoke_cli_inprocess
 from test_cli import run_cli, stdout_json
@@ -179,10 +180,12 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
 def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
     seed_idle_control(
         TaskControlStore(states.root),
-        TaskKey(git_repo, str(state["repository"]), 1),
+        TaskKey(repo, str(state["repository"]), 1),
         str(state["run_id"]),
         state_dir=states.root,
     )
@@ -241,12 +244,12 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     state["run_acceptance"] = run
     state["status"] = "run_acceptance_pending"
     states.save_run(str(state["run_id"]), state)
-    agent_fixture = git_repo / "agents.json"
+    agent_fixture = repo / "agents.json"
     agent_fixture.write_text(json.dumps({}), encoding="utf-8")
 
     result = run_cli(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "run",
         "1",
         "--agent-fixture",
@@ -256,13 +259,13 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     assert result.returncode == 2, result.stderr
     assert stdout_json(result)["status"] == "ready_for_human"
     status_result = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
+        repo, repo / "github.json", "status", str(state["run_id"]), "--json"
     )
     text_status_result = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "status", str(state["run_id"])
+        repo, repo / "github.json", "status", str(state["run_id"])
     )
     history_result = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "history", str(state["run_id"]), "--json"
+        repo, repo / "github.json", "history", str(state["run_id"]), "--json"
     )
     assert status_result.returncode == text_status_result.returncode == 0
     assert history_result.returncode == 0
@@ -300,7 +303,9 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
 def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
     run = state["run_acceptance"] = {
         "phase": "pending",
         "policy_snapshot": dict(state["policy_snapshot"]),
@@ -342,7 +347,7 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
         git=git,
         states=states,
         agents=BlockedRepairAgents(),
-        github=FixtureGitHubPublisher(git_repo / "github.json", git),
+        github=FixtureGitHubPublisher(repo / "github.json", git),
     ).accept(str(state["run_id"]))
 
     job = blocked["run_acceptance"]["repair_job"]
@@ -351,10 +356,10 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
     assert job["repair_generation"] == 2
 
     json_status = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
+        repo, repo / "github.json", "status", str(state["run_id"]), "--json"
     )
     text_status = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "status", str(state["run_id"])
+        repo, repo / "github.json", "status", str(state["run_id"])
     )
     assert json_status.returncode == text_status.returncode == 0
     repair_status = stdout_json(json_status)["run_repair"]
@@ -378,7 +383,9 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
 def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     git_repo: Path, job_phase: str, run_status: str
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
     candidate_sha = git.resolve(str(state["run_branch"]))
     state["status"] = run_status
     repair_job = {
@@ -423,10 +430,10 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
     states.save_run(str(state["run_id"]), state)
 
     json_status = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "status", str(state["run_id"]), "--json"
+        repo, repo / "github.json", "status", str(state["run_id"]), "--json"
     )
     text_status = invoke_cli_inprocess(
-        git_repo, git_repo / "github.json", "status", str(state["run_id"])
+        repo, repo / "github.json", "status", str(state["run_id"])
     )
 
     assert json_status.returncode == text_status.returncode == 0
@@ -444,8 +451,10 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
 def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
 
     class ConsecutiveCandidateAgents(ScriptedRunAgents):
         def __init__(self) -> None:
@@ -472,10 +481,10 @@ def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
             self.review_requests.append(request)
             if len(self.review_requests) == 3:
                 json_status = invoke_cli_inprocess(
-                    git_repo, fixture, "status", str(state["run_id"]), "--json"
+                    repo, fixture, "status", str(state["run_id"]), "--json"
                 )
                 text_status = invoke_cli_inprocess(
-                    git_repo, fixture, "status", str(state["run_id"])
+                    repo, fixture, "status", str(state["run_id"])
                 )
                 assert json_status.returncode == text_status.returncode == 0
                 repair_status = stdout_json(json_status)["run_repair"]
@@ -488,10 +497,10 @@ def test_status_binds_candidate_verdict_to_the_candidate_being_reviewed(
 
         def publication(self, request: dict[str, Any]) -> dict[str, str]:
             json_status = invoke_cli_inprocess(
-                git_repo, fixture, "status", str(state["run_id"]), "--json"
+                repo, fixture, "status", str(state["run_id"]), "--json"
             )
             text_status = invoke_cli_inprocess(
-                git_repo, fixture, "status", str(state["run_id"])
+                repo, fixture, "status", str(state["run_id"])
             )
             assert json_status.returncode == text_status.returncode == 0
             repair_status = stdout_json(json_status)["run_repair"]

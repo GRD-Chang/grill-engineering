@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.state import SimulatedProcessCrash, StateStore
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
@@ -295,7 +297,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
         "ticket_completion_record": ticket_completion_record,
         "local_run_branch_sha": subprocess.run(
             ["git", "rev-parse", run_branch],
-            cwd=git_repo,
+            cwd=managed_repo(git_repo),
             text=True,
             capture_output=True,
             check=True,
@@ -330,7 +332,7 @@ def test_resume_freezes_completed_ticket_assets_after_graph_drift(
     } == frozen["ticket_completion_record"]
     assert subprocess.run(
         ["git", "rev-parse", run_branch],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -443,9 +445,9 @@ def test_abandon_closes_active_ticket_pr_after_graph_drift(
     assert {"action": "close_change_pr", "pr_number": 1} in after["delivery"][
         "mutations"
     ]
-    assert str(git_repo / ".agent-run" / "worktrees" / run_id) not in subprocess.run(
+    assert str(managed_state(git_repo) / "worktrees" / run_id) not in subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,

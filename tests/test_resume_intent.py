@@ -6,21 +6,14 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run import cli
 from agent_run.controller import Controller
 from agent_run.executor_host import FakeExecutorHost
 from conftest import write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_round_agents
-
-
-@pytest.fixture(autouse=True)
-def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for key, directory in (
-        ("HOME", "home"), ("XDG_CONFIG_HOME", "config"),
-        ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"),
-    ):
-        monkeypatch.setenv(key, str(tmp_path / directory))
 
 
 def _checkpoint(repo: Path) -> tuple[Path, Path, dict[str, Any]]:
@@ -44,7 +37,7 @@ def test_budget_resume_receipt_records_explicit_window_authority(git_repo: Path)
     output = stdout_json(result)
     assert output["action"]["resume_authorization"] == "new_budget_window"
     assert output["action_audit"]["resume_intent"]["pause_reason"] == "budget_checkpoint"
-    control_path = next((git_repo / ".agent-run/task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     action = json.loads(control_path.read_text())["action"]
     assert action["payload"]["resume_intent"] == output["action_audit"]["resume_intent"]
     assert load_only_run_state(git_repo)["parent_job"]["review_budget"]["window"] == 2
@@ -56,7 +49,7 @@ def test_resume_rejects_changed_pause_target_before_applying_authority(
     drift_at: str,
 ) -> None:
     fixture, agents, initial = _checkpoint(git_repo)
-    state_path = next((git_repo / ".agent-run/runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     original_refresh = Controller._refresh
 
     class DriftingHost(FakeExecutorHost):
@@ -108,9 +101,9 @@ def test_repeated_pending_resume_keeps_original_intent_and_generation(
     ]
     assert cli.main(arguments) == 2
     capsys.readouterr()
-    control_path = next((git_repo / ".agent-run/task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     first = json.loads(control_path.read_text())
-    state_path = next((git_repo / ".agent-run/runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = json.loads(state_path.read_text())
     state["parent_job"]["blocked_reason"] = "modification_budget_exhausted"
     state["parent_job"]["review_budget"]["checkpoint_reason"] = "modification_budget_exhausted"

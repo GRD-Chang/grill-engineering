@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_state, prepare_workspace
+
 from agent_run import cli
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.user_defaults import UserDefaultsStore
@@ -33,7 +35,9 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
     from test_run_lifecycle import _file_snapshot
 
     monkeypatch.chdir(git_repo)
-    root = git_repo / ".agent-run"
+    prepare_workspace(git_repo)
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"], cwd=git_repo, check=True)
+    root = managed_state(git_repo)
     state = {
         "run_id": "run-settings", "repository": "example/project",
         "parent": {"number": 1}, "status": "starting", "schema_version": 1,
@@ -97,7 +101,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     assert original["notifications"]["enabled"] is False
     assert original["creation_configuration"]["notifications"] == original["notifications"]
     run_id = original["run_id"]
-    profile = AgentProfileStore(git_repo / ".agent-run").load(run_id)
+    profile = AgentProfileStore(managed_state(git_repo)).load(run_id)
     assert profile is not None
     assert profile["bindings"][0]["model"] == "old-model"
     assert original["agent_invocation_history"][0]["deadline_seconds"] == 660
@@ -123,20 +127,20 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     assert resumed.returncode == 2, resumed.stdout + resumed.stderr
     original_after = load_only_run_state(git_repo)
     assert [i["deadline_seconds"] for i in original_after["agent_invocation_history"]] == [660, 660], resumed.stdout + resumed.stderr
-    frozen = AgentProfileStore(git_repo / ".agent-run").load(run_id)
+    frozen = AgentProfileStore(managed_state(git_repo)).load(run_id)
     assert frozen is not None
     assert frozen["bindings"] == profile["bindings"]
 
     second_repo = tmp_path / "second"
     subprocess.run(["git", "clone", "--local", str(git_repo), str(second_repo)], check=True, capture_output=True)
-    second_fixture = write_fixture(second_repo / "github.json", issues={})
+    second_fixture = write_fixture(second_repo / "github.json", issues={}, repository="example/second")
     agents.write_text(json.dumps({"developments": [human_blocker_step("new-thread")]}))
     created = run_cli(second_repo, second_fixture, "run", "1", "--agent-fixture", str(agents))
     assert created.returncode == 2, created.stdout + created.stderr
     new_state = load_only_run_state(second_repo)
     assert new_state["notifications"]["enabled"] is False
     assert new_state["notifications"]["open_id"] == "ou_new"
-    new_profile = AgentProfileStore(second_repo / ".agent-run").load(new_state["run_id"])
+    new_profile = AgentProfileStore(managed_state(second_repo)).load(new_state["run_id"])
     assert new_profile is not None
     assert new_profile["bindings"][0]["model"] == "new-model"
     assert new_profile["bindings"][0]["reasoning_effort"] == "high"

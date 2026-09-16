@@ -13,6 +13,7 @@ from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.published_run import prepare_published_run
 from test_cli import (
     load_only_run_state,
@@ -777,7 +778,7 @@ def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
         "executor_agent_interrupted"
     )
     control = json.loads(
-        next((git_repo / ".agent-run" / "task-control").glob("*.json")).read_text(
+        next((managed_state(git_repo) / "task-control").glob("*.json")).read_text(
             encoding="utf-8"
         )
     )
@@ -786,7 +787,7 @@ def test_ctrl_c_last_development_attempt_resumes_without_new_budget(
     assert control["executor"]["failure"] == "executor_agent_interrupted"
     state = load_only_run_state(git_repo)
     job = state["active_ticket_job"]
-    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
+    checkout = managed_state(git_repo) / "worktrees" / run_id / "ticket-3"
     assert (checkout / "feature.txt").read_text(encoding="utf-8") == (
         "attempt 4 partial\n"
     )
@@ -947,7 +948,7 @@ def test_public_resume_reuses_pending_final_ci_fix_attempt(
     assert job["ci_evidence"]["pr_number"] == job["pr_number"]
     assert job["ci_evidence"]["head_sha"] == job["publication_sha"]
     assert job["ci_evidence"]["result"] == "fail"
-    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
+    checkout = managed_state(git_repo) / "worktrees" / run_id / "ticket-3"
     assert (checkout / "final-ci-partial.txt").read_text(encoding="utf-8") == (
         "preserve me\n"
     )
@@ -2088,11 +2089,11 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     assert state["parent_branch"] not in mutable_fixture["delivery"]["published_branches"]
     assert subprocess.run(
         ["git", "show-ref", "--verify", f"refs/heads/{state['parent_branch']}"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         capture_output=True,
         check=False,
     ).returncode != 0
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     completed_control = control_path.read_bytes()
     replayed = run_cli(git_repo, fixture, "resume", run_id)
     assert replayed.returncode == 2
@@ -2104,7 +2105,7 @@ def test_parent_only_cli_delivers_to_default_branch_after_explicit_approval(
     assert load_only_run_state(git_repo)["status"] == "completed"
     assert subprocess.run(
         ["git", "show-ref", "--verify", f"refs/heads/{state['parent_branch']}"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         capture_output=True,
         check=False,
     ).returncode != 0
@@ -3121,7 +3122,7 @@ def test_parent_only_approve_waits_and_recovers_without_duplicate_delivery(
     fixture.write_text(json.dumps(data), encoding="utf-8")
 
     if waiting_case in {"pending", "unknown"}:
-        control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+        control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
         control_before = control_path.read_bytes()
         fixture_before = fixture.read_bytes()
         refused = run_cli(git_repo, fixture, "run", "1")
@@ -3233,7 +3234,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     canonical_stale = load_only_run_state(git_repo)
     wrong_subject = json.loads(json.dumps(canonical_stale))
     wrong_subject["requeue_required"]["work_subject"] = "parent-only:wrong-run"
-    StateStore(git_repo / ".agent-run").save_run(run_id, wrong_subject)
+    StateStore(managed_state(git_repo)).save_run(run_id, wrong_subject)
 
     incompatible = run_cli(git_repo, fixture, "requeue", run_id)
 
@@ -3242,13 +3243,13 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     wrong_generation_kind = json.loads(json.dumps(canonical_stale))
     wrong_generation_kind["parent_job"]["ticket_branch_generation"] = 999
     wrong_generation_kind["requeue_required"]["generation"] = 999
-    StateStore(git_repo / ".agent-run").save_run(run_id, wrong_generation_kind)
+    StateStore(managed_state(git_repo)).save_run(run_id, wrong_generation_kind)
 
     incompatible = run_cli(git_repo, fixture, "requeue", run_id)
 
     assert incompatible.returncode == 2
     assert stdout_json(incompatible)["status"] == "incompatible_run_state"
-    StateStore(git_repo / ".agent-run").save_run(run_id, canonical_stale)
+    StateStore(managed_state(git_repo)).save_run(run_id, canonical_stale)
 
     replacement_agents = git_repo / "parent-replacement.json"
     replacement_agents.write_text(
@@ -3296,7 +3297,7 @@ def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(
     ]
     pulls = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"]
     assert [pull["state"] for pull in pulls] == ["CLOSED", "OPEN"]
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     first_control = json.loads(control_path.read_text(encoding="utf-8"))
     first_requeue_action_id = first_control["action"]["action_id"]
 
@@ -3572,10 +3573,10 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     assert {"action": "close_parent_pr", "pr_number": 1} in after["delivery"][
         "mutations"
     ]
-    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
-    assert str(git_repo / ".agent-run" / "worktrees" / run_id) not in subprocess.run(
+    assert not (managed_state(git_repo) / "worktrees" / run_id).exists()
+    assert str(managed_state(git_repo) / "worktrees" / run_id) not in subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -3605,7 +3606,7 @@ def test_abandon_closes_parent_pr_after_graph_drift(git_repo: Path) -> None:
     assert stdout_json(replayed)["status"] == "abandoned"
     replayed_fixture = json.loads(fixture.read_text(encoding="utf-8"))
     assert replayed_fixture["delivery"]["mutations"] == frozen_mutations
-    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+    assert not (managed_state(git_repo) / "worktrees" / run_id).exists()
 
 
 def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
@@ -3645,9 +3646,9 @@ def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
         str(agents),
     )
     assert delivered.returncode == 0, delivered.stderr
-    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "parent"
+    checkout = managed_state(git_repo) / "worktrees" / run_id / "parent"
     current = load_only_run_state(git_repo)
-    GitRepository(git_repo).prepare_ticket_checkout(
+    GitRepository(managed_repo(git_repo)).prepare_ticket_checkout(
         branch=current["parent_job"]["parent_branch"],
         base_sha=current["parent_job"]["base_sha"],
         checkout=checkout,
@@ -3671,8 +3672,8 @@ def test_abandon_requires_explicit_authorization_to_discard_dirty_checkout(
         == mutations_before
     )
     assert checkout.exists()
-    task_control = TaskControlStore(git_repo / ".agent-run").load(
-        TaskKey(git_repo, "example/project", 1)
+    task_control = TaskControlStore(managed_state(git_repo)).load(
+        TaskKey(managed_repo(git_repo), "example/project", 1)
     )
     action = (
         task_control.get("action") if isinstance(task_control, dict) else None
@@ -3782,7 +3783,7 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
     assert job["ticket_branch"] not in delivery["published_branches"]
     assert subprocess.run(
         ["git", "show-ref", "--verify", f"refs/heads/{job['ticket_branch']}"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         capture_output=True,
         check=False,
     ).returncode != 0
@@ -3794,13 +3795,13 @@ def test_scripted_cli_delivers_active_ticket_end_to_end(
             "--count",
             f"{state['base']['sha']}..{state['run_branch']}",
         ],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
     ).stdout.strip()
     assert count == "1"
-    assert not (git_repo / ".agent-run" / "worktrees" / run_id).exists()
+    assert not (managed_state(git_repo) / "worktrees" / run_id).exists()
 
     replayed = run_internal_stage(
         git_repo,
@@ -3884,26 +3885,26 @@ def test_forward_candidate_repair_removes_prior_out_of_scope_file(
     assert "human_blockers" not in job
     assert subprocess.run(
         ["git", "cat-file", "-e", f"{candidate_sha}:feature.txt"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         capture_output=True,
         check=False,
     ).returncode == 0
     assert subprocess.run(
         ["git", "cat-file", "-e", f"{candidate_sha}:out-of-scope.txt"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         capture_output=True,
         check=False,
     ).returncode != 0
     assert subprocess.run(
         ["git", "diff", "--name-status", str(job["base_sha"]), candidate_sha],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
     ).stdout.splitlines() == ["A\tfeature.txt"]
     assert subprocess.run(
         ["git", "log", "--format=%s", "-2", candidate_sha],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -3935,9 +3936,10 @@ def test_run_cli_records_one_final_parent_linked_branch_display(
     )
     agents = git_repo / "final-run-agents.json"
     agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+    prepare_workspace(git_repo)
     before_config = subprocess.run(
         ["git", "config", "--local", "--list"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -3968,7 +3970,7 @@ def test_run_cli_records_one_final_parent_linked_branch_display(
     ]
     after_config = subprocess.run(
         ["git", "config", "--local", "--list"],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         text=True,
         capture_output=True,
         check=True,
@@ -4141,7 +4143,7 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
     data = json.loads(fixture.read_text(encoding="utf-8"))
     actual_head = state["run_acceptance"]["acceptance_record"]["reviewed_head_sha"]
     if base_branch != "main":
-        subprocess.run(["git", "branch", base_branch, "main"], cwd=git_repo, check=True)
+        subprocess.run(["git", "branch", base_branch, "main"], cwd=managed_repo(git_repo), check=True)
     data.setdefault("delivery", {}).setdefault("pull_requests", []).append(
         {
             "number": 99,
@@ -4224,7 +4226,7 @@ def test_persisted_final_run_pr_recovery_rejects_foreign_identity_without_effect
     resumed_publication["status"] = "waiting_external"
     resumed_publication["terminal_kind"] = "waiting_external"
     resumed_publication["run_publication"]["phase"] = "waiting_external"
-    StateStore(git_repo / ".agent-run").save_run(
+    StateStore(managed_state(git_repo)).save_run(
         str(before_state["run_id"]), resumed_publication
     )
 
@@ -4266,7 +4268,7 @@ def test_public_run_fails_closed_for_an_ambiguous_final_pr_read(git_repo: Path) 
     resumed_publication["status"] = "waiting_external"
     resumed_publication["terminal_kind"] = "waiting_external"
     resumed_publication["run_publication"]["phase"] = "waiting_external"
-    StateStore(git_repo / ".agent-run").save_run(
+    StateStore(managed_state(git_repo)).save_run(
         str(before_state["run_id"]), resumed_publication
     )
 
@@ -4435,7 +4437,7 @@ def test_one_ticket_run_reaches_final_parent_closeout(git_repo: Path) -> None:
             "--verify",
             f"refs/heads/{load_only_run_state(git_repo)['run_branch']}",
         ],
-        cwd=git_repo,
+        cwd=managed_repo(git_repo),
         capture_output=True,
         check=False,
     ).returncode != 0
@@ -4520,7 +4522,7 @@ def test_pending_required_checks_resume_without_duplicate_pr_or_attempt(
             "next_action": "wait for Required Checks",
         }
     ]
-    checkout = git_repo / ".agent-run" / "worktrees" / run_id / "ticket-3"
+    checkout = managed_state(git_repo) / "worktrees" / run_id / "ticket-3"
     assert checkout.is_dir()
     git_link = (checkout / ".git").read_text(encoding="utf-8")
 
@@ -4923,7 +4925,7 @@ def test_resume_targets_failed_run_repair_publication_not_completed_ticket(
     assert failed.returncode == 2, failed.stderr
     assert stdout_json(failed)["status"] == "execution_failed"
 
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     failed_state = load_only_run_state(git_repo)
     completed_ticket = failed_state["ticket_jobs"]["3"]
     completed_ticket["publication_thread_id"] = "completed-ticket-publication"

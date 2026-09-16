@@ -17,6 +17,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_thread_identity import prior_thread_identities
 
+from support.workspace import prepare_workspace
 from conftest import seed_idle_control, seed_run, write_fixture
 from agent_run.task_control import TaskControlStore, TaskKey
 from test_cli import failed_invocation, run_internal_stage, run_cli, stdout_json
@@ -188,14 +189,16 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
 def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
     seed_idle_control(
-        TaskControlStore(git_repo / ".agent-run"),
-        TaskKey(git_repo, "example/project", 1),
+        TaskControlStore(workspace.state_root),
+        TaskKey(repo, "example/project", 1),
         str(state["run_id"]),
         state_dir=states.root,
     )
-    fixture = git_repo / "github.json"
+    fixture = repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     run_id = str(state["run_id"])
     ticket_branch = f"agent-run/{run_id}/ticket-2"
@@ -286,7 +289,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     )
 
-    held = run_cli(git_repo, fixture, "run", "1")
+    held = run_cli(repo, fixture, "run", "1")
     assert held.returncode == 2
     assert stdout_json(held)["status"] == "execution_failed"
     assert states.load_run(run_id) == state
@@ -295,7 +298,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     )
 
     resumed = run_cli(
-        git_repo,
+        repo,
         fixture,
         "resume",
         run_id,
@@ -340,10 +343,10 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     )
     assert delivery_after_resume == expected_delivery
 
-    no_agents = git_repo / "no-agents.json"
+    no_agents = repo / "no-agents.json"
     no_agents.write_text("{}", encoding="utf-8")
     still_dirty = run_cli(
-        git_repo,
+        repo,
         fixture,
         "run",
         "1",
@@ -371,7 +374,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
         capture_output=True,
     )
     untracked.unlink()
-    fresh_agents = git_repo / "fresh-run-agents.json"
+    fresh_agents = repo / "fresh-run-agents.json"
     fresh_agents.write_text(
         json.dumps(
             {
@@ -387,7 +390,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     )
 
     recovered = run_cli(
-        git_repo,
+        repo,
         fixture,
         "run",
         "1",
@@ -405,7 +408,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
     assert not checkout.exists()
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{repair_branch}"],
-        cwd=git_repo,
+        cwd=repo,
         check=False,
     ).returncode == 1
     recovered_delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
@@ -698,16 +701,18 @@ def test_stale_run_repair_keeps_threads_out_of_fresh_review(
 def test_accept_run_does_not_review_after_a_github_refresh_failure(
     git_repo: Path,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["error"] = {"code": "github_read_failed", "message": "offline"}
     fixture.write_text(json.dumps(data), encoding="utf-8")
-    agents = git_repo / "run-agents.json"
+    agents = repo / "run-agents.json"
     agents.write_text(json.dumps({"reviews": []}), encoding="utf-8")
 
     result = run_internal_stage(
-        git_repo,
+        repo,
         fixture,
         "accept-run",
         str(state["run_id"]),

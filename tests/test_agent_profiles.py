@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 import json
 import os
 import subprocess
@@ -414,7 +416,7 @@ def test_seeded_run_profile_can_be_updated_by_public_cli(
     )
     assert started.returncode == 0, started.stderr
     run_id = str(stdout_json(started)["run_id"])
-    profile_path = git_repo / ".agent-run" / "profiles" / f"{run_id}.json"
+    profile_path = managed_state(git_repo) / "profiles" / f"{run_id}.json"
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     assert profile["profile_revision"] == 1
     assert profile["profiles"]["development"]["model"] == "gpt-5.6-luna"
@@ -543,7 +545,7 @@ def test_public_configuration_during_active_invocation_keeps_old_binding(
         while not started_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert started_file.exists()
-        run_files = list((git_repo / ".agent-run" / "runs").glob("*.json"))
+        run_files = list((managed_state(git_repo) / "runs").glob("*.json"))
         assert len(run_files) == 1
         run_id = run_files[0].stem
 
@@ -762,7 +764,7 @@ def test_public_cli_drives_run_review_output_repair(git_repo: Path) -> None:
             time.sleep(0.02)
         assert started_file.exists()
 
-        run_files = list((git_repo / ".agent-run" / "runs").glob("*.json"))
+        run_files = list((managed_state(git_repo) / "runs").glob("*.json"))
         assert len(run_files) == 1
         run_id = run_files[0].stem
 

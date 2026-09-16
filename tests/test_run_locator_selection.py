@@ -11,6 +11,7 @@ from agent_run.cli import main
 from agent_run.run_locator import RunLocatorIndex
 from conftest import seed_run, write_fixture
 from test_cli import run_cli, stdout_json
+from support.workspace import managed_repo, managed_state
 
 
 def test_empty_checkout_without_origin_does_not_list_another_repository(
@@ -21,12 +22,12 @@ def test_empty_checkout_without_origin_does_not_list_another_repository(
     assert seed_run(git_repo, fixture).returncode == 0
     empty = tmp_path / "empty-checkout"
     subprocess.run(["git", "init", "-b", "main", str(empty)], check=True, capture_output=True)
-    before = _snapshot(git_repo / ".agent-run", RunLocatorIndex.default().path.parent)
+    before = _snapshot(managed_state(git_repo), RunLocatorIndex.default().path.parent)
     monkeypatch.chdir(empty)
 
-    assert main(["runs", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["runs"] == []
-    assert _snapshot(git_repo / ".agent-run", RunLocatorIndex.default().path.parent) == before
+    assert main(["runs", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_selector_context"
+    assert _snapshot(managed_state(git_repo), RunLocatorIndex.default().path.parent) == before
 
 
 @pytest.mark.parametrize("explicit_directory", [False, True])
@@ -36,7 +37,7 @@ def test_readable_legacy_state_with_unknown_parent_requires_disambiguation(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     target = stdout_json(seed_run(git_repo, fixture))["run_id"]
-    state_dir = git_repo / ".agent-run"
+    state_dir = managed_state(git_repo)
     target_state = json.loads((state_dir / "runs" / f"{target}.json").read_text())
     legacy = {
         "run_id": "legacy-unknown-parent", "repository": "example/project",
@@ -48,7 +49,7 @@ def test_readable_legacy_state_with_unknown_parent_requires_disambiguation(
     directory = ["--state-dir", str(state_dir)] if explicit_directory else []
 
     for command in ("status", "history"):
-        assert main([command, "--parent", "1", *directory, "--json"]) == 2
+        assert main([command, "--repo", "example/project", "--parent", "1", *directory, "--json"]) == 2
         output = json.loads(capsys.readouterr().out)
         assert output["diagnostics"][0]["code"] == "run_locator_stale"
         assert main([command, target, *directory, "--json"]) == 0
@@ -60,7 +61,7 @@ def test_repository_parent_queries_ignore_a_deleted_unrelated_checkout(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    locator_env = {"XDG_STATE_HOME": str(tmp_path / "locator")}
+    locator_env = {"XDG_DATA_HOME": str(tmp_path / "locator")}
     target = stdout_json(seed_run(git_repo, fixture, extra_env=locator_env))["run_id"]
     other = tmp_path / "deleted-checkout"
     subprocess.run(["git", "clone", "--quiet", str(git_repo), str(other)], check=True)
@@ -71,10 +72,11 @@ def test_repository_parent_queries_ignore_a_deleted_unrelated_checkout(
     )
     other_fixture = write_fixture(other / "github.json", issues={}, repository="other/project")
     assert seed_run(other, other_fixture, extra_env=locator_env).returncode == 0
+    shutil.rmtree(managed_repo(other, extra_env=locator_env))
     shutil.rmtree(other)
     locator = tmp_path / "locator" / "agent-run" / "run-locator.json"
     before = locator.read_bytes()
-    state = git_repo / ".agent-run" / "runs" / f"{target}.json"
+    state = managed_state(git_repo, extra_env=locator_env) / "runs" / f"{target}.json"
     state_before = state.read_bytes()
 
     for command, cwd, selector in (
@@ -100,7 +102,7 @@ def test_parent_query_excludes_a_known_other_parent_with_missing_state(
         state_dir=git_repo / "missing", repository="example/project", parent_number=2,
     )
     monkeypatch.chdir(git_repo)
-    assert main(["status", "--parent", "1", "--json"]) == 0
+    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["run_id"] == target
 
 
@@ -116,14 +118,14 @@ def test_selector_rejects_conflicting_locator_and_state_identity(
     locator["entries"][0]["parent_number"] = 2
     locator_path.write_text(json.dumps(locator))
     before = locator_path.read_bytes()
-    state_path = git_repo / ".agent-run" / "runs" / f"{target}.json"
+    state_path = managed_state(git_repo) / "runs" / f"{target}.json"
     if malformed_state:
         state = json.loads(state_path.read_text())
         state.pop("timeline")
         state_path.write_text(json.dumps(state))
     state_before = state_path.read_bytes()
     monkeypatch.chdir(git_repo)
-    assert main(["status", "--parent", "1", "--json"]) == 2
+    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
     output = json.loads(capsys.readouterr().out)
     assert output["diagnostics"][0]["code"] == "run_locator_stale"
     assert "不一致" in output["diagnostics"][0]["message"]
@@ -138,7 +140,7 @@ def test_other_parent_legacy_state_in_the_same_directory_does_not_block_queries(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     target = stdout_json(seed_run(git_repo, fixture))["run_id"]
-    state_dir = git_repo / ".agent-run"
+    state_dir = managed_state(git_repo)
     legacy = state_dir / "runs" / "legacy-run.json"
     # Historical identity is sufficient for exclusion; it is not a current
     # lifecycle payload and has no checkout identity or registration to repair.
@@ -150,7 +152,7 @@ def test_other_parent_legacy_state_in_the_same_directory_does_not_block_queries(
     monkeypatch.chdir(git_repo)
     directory = ["--state-dir", str(state_dir)] if explicit_directory else []
     for command in ("status", "history", "runs"):
-        assert main([command, "--parent", "1", *directory, "--json"]) == 0
+        assert main([command, "--repo", "example/project", "--parent", "1", *directory, "--json"]) == 0
         output = json.loads(capsys.readouterr().out)
         if command == "runs":
             assert [candidate["run_id"] for candidate in output["runs"]] == [target]
@@ -175,22 +177,22 @@ def test_unknown_or_potentially_matching_records_fail_closed_but_exact_id_works(
     if unavailable == "old-deleted-checkout":
         entry["repository_root"] = str(git_repo / "deleted-checkout")
     if unavailable == "matching-corrupt":
-        (git_repo / ".agent-run" / "runs" / "unavailable-run.json").write_text("{")
+        (managed_state(git_repo) / "runs" / "unavailable-run.json").write_text("{")
     locator["entries"].append(entry)
     locator_path.write_text(json.dumps(locator))
-    before = _snapshot(git_repo / ".agent-run", locator_path.parent)
+    before = _snapshot(managed_state(git_repo), locator_path.parent)
     monkeypatch.chdir(git_repo)
     for command in ("status", "history"):
         assert main([command, "--repo", "example/project", "--parent", "1", "--json"]) == 2
         output = json.loads(capsys.readouterr().out)
         assert output["diagnostics"][0]["code"] == "run_locator_stale"
         assert "unavailable-run" in {item["run_id"] for item in output["diagnostics"][0]["candidates"]}
-        assert main([command, target, "--state-dir", str(git_repo / ".agent-run"), "--json"]) == 0
+        assert main([command, target, "--state-dir", str(managed_state(git_repo)), "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["run_id"] == target
-    assert main(["runs", "--parent", "1", "--json"]) == 0
+    assert main(["runs", "--repo", "example/project", "--parent", "1", "--json"]) == 0
     candidates = json.loads(capsys.readouterr().out)["runs"]
     assert any(item["run_id"] == "unavailable-run" and "error" in item for item in candidates)
-    assert _snapshot(git_repo / ".agent-run", locator_path.parent) == before
+    assert _snapshot(managed_state(git_repo), locator_path.parent) == before
 
 
 @pytest.mark.parametrize("contradiction", ["checkout-repository", "checkout-identity", "run-id", "invalid-parent", "invalid-repository"])
@@ -215,11 +217,11 @@ def test_unregistered_legacy_identity_cannot_hide_conflicts_as_an_unrelated_pare
         legacy["parent"] = {"number": False}
     else:
         legacy["repository"] = "invalid"
-    state_dir = git_repo / ".agent-run"
+    state_dir = managed_state(git_repo)
     (state_dir / "runs" / "legacy-run.json").write_text(json.dumps(legacy))
     before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
     monkeypatch.chdir(git_repo)
-    assert main(["status", "--parent", "1", "--json"]) == 2
+    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_stale"
     assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
 
@@ -231,7 +233,7 @@ def _snapshot(*roots: Path) -> dict[Path, tuple[bytes, int]]:
     }
 
 
-def test_unregistered_local_run_without_origin_still_detects_another_clone(
+def test_user_clones_reuse_the_same_unregistered_managed_run(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -245,13 +247,14 @@ def test_unregistered_local_run_without_origin_still_detects_another_clone(
     locator = json.loads(locator_path.read_text())
     locator["entries"] = [entry for entry in locator["entries"] if entry["run_id"] != target]
     locator_path.write_text(json.dumps(locator))
-    before = _snapshot(git_repo / ".agent-run", clone / ".agent-run", locator_path.parent)
-    monkeypatch.chdir(git_repo)
-    assert main(["status", "--parent", "1", "--json"]) == 2
-    diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
-    assert diagnostic["code"] == "run_selector_ambiguous"
-    assert {candidate["run_id"] for candidate in diagnostic["candidates"]} == {target, other}
-    assert _snapshot(git_repo / ".agent-run", clone / ".agent-run", locator_path.parent) == before
+    assert other == target
+    assert managed_repo(git_repo) == managed_repo(clone)
+    before = _snapshot(git_repo, clone, locator_path.parent)
+    for directory in (git_repo, clone, tmp_path):
+        monkeypatch.chdir(directory)
+        assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["run_id"] == target
+    assert _snapshot(git_repo, clone, locator_path.parent) == before
 
 
 def test_invalid_locator_query_failures_leave_all_state_unchanged(
@@ -263,12 +266,12 @@ def test_invalid_locator_query_failures_leave_all_state_unchanged(
     locator = json.loads(locator_path.read_text())
     locator["entries"][0].pop("parent_number")
     locator_path.write_text(json.dumps(locator))
-    before = _snapshot(git_repo / ".agent-run", locator_path.parent)
+    before = _snapshot(managed_state(git_repo), locator_path.parent)
     monkeypatch.chdir(git_repo)
     for command in ("status", "history", "runs"):
-        assert main([command, "--parent", "1", "--json"]) == 2
+        assert main([command, "--repo", "example/project", "--parent", "1", "--json"]) == 2
         assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_invalid"
-    assert _snapshot(git_repo / ".agent-run", locator_path.parent) == before
+    assert _snapshot(managed_state(git_repo), locator_path.parent) == before
 
 
 def test_explicit_state_directory_does_not_disambiguate_multiple_matching_runs(
@@ -277,11 +280,11 @@ def test_explicit_state_directory_does_not_disambiguate_multiple_matching_runs(
     fixture = write_fixture(git_repo / "github.json", issues={})
     first = stdout_json(seed_run(git_repo, fixture))["run_id"]
     second = stdout_json(seed_run(git_repo, fixture, reuse_existing=False))["run_id"]
-    state_dir = git_repo / ".agent-run"
+    state_dir = managed_state(git_repo)
     before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
     monkeypatch.chdir(git_repo)
     for command in ("status", "history"):
-        assert main([command, "--parent", "1", "--state-dir", str(state_dir), "--json"]) == 2
+        assert main([command, "--repo", "example/project", "--parent", "1", "--state-dir", str(state_dir), "--json"]) == 2
         diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
         assert diagnostic["code"] == "run_selector_ambiguous"
         assert {item["run_id"] for item in diagnostic["candidates"]} == {first, second}

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run.cli import main
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
@@ -15,7 +17,7 @@ from agent_run.state import StateStore
 from conftest import seed_run, write_fixture
 
 
-def test_resume_outside_repository_explains_directory_requirement(tmp_path: Path) -> None:
+def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path) -> None:
     environment = os.environ.copy()
     environment['PYTHONPATH'] = str(Path(__file__).parents[1] / 'src')
     result = subprocess.run(
@@ -25,9 +27,9 @@ def test_resume_outside_repository_explains_directory_requirement(tmp_path: Path
     )
     assert result.returncode == 2
     diagnostic = json.loads(result.stdout)['diagnostics'][0]
-    assert diagnostic['code'] == 'workspace_required'
-    assert 'Git 仓库' in diagnostic['message']
-    assert '目录' in diagnostic['message']
+    assert diagnostic['code'] == 'run_selector_not_found'
+    assert 'Runner 工作区' in diagnostic['message']
+    assert 'run' in diagnostic['message']
     assert not (tmp_path / '.agent-run').exists()
 
 
@@ -61,7 +63,7 @@ def test_new_command_error_does_not_replace_or_repeat_old_run_failure(
 ) -> None:
     fixture = write_fixture(git_repo / 'github.json', issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / '.agent-run')
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs('example/project', 1)[0]
     current['status'] = 'execution_failed'
     current['diagnostics'] = [{'code': 'old_failure', 'message': 'old usage limit'}]

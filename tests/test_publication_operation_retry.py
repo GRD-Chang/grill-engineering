@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run.cli_presentation import _publication_operation_retries
 from agent_run.change_delivery import ChangeDeliveryEngine
 from agent_run.publication_operation_retry import (
@@ -242,7 +244,7 @@ def test_public_command_rejects_corrupt_publication_retry_before_mutation(
     started = seed_run(git_repo, fixture, "1")
     assert started.returncode == 0, started.stderr
     run_id = stdout_json(started)["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["active_ticket_job"]["publication_operation_retry"] = {
         "attempts": 1,
