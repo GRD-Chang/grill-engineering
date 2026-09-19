@@ -213,3 +213,139 @@ def test_recovered_ticket_todo_sends_the_ticket_card(
     assert "https://github.com/example/project/issues/3" in str(delivered[0])
     assert "https://github.com/example/project/issues/1" not in str(delivered[0])
     assert not read_notifications(tmp_path, "run-test")["pending"]
+
+
+@pytest.mark.parametrize("outcome,status,title", [
+    ("failed", "execution_failed", "人工恢复失败"),
+    ("human_action", "ready_for_human", "人工恢复后需要你处理"),
+])
+def test_resume_result_replaces_fault_and_survives_observer_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    outcome: str, status: str, title: str,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+        calls.append(rendered)
+        return {"outcome": "success", "reason": None}
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state(status)
+    current["notifications"]["mode"] = "concise"
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    baseline = len(calls)
+    current["_manual_resume_result"] = {
+        "id": "manual-action-1", "outcome": outcome,
+        "evidence": "preflight", "reason": "original diagnostic",
+    }
+    sender = Notifications(tmp_path, current)
+    sender.observe(current)
+    sender.close()
+    assert len(calls) == baseline + 1
+    assert calls[-1]["header"]["title"]["content"] == title
+    assert "original diagnostic" in str(calls[-1])
+    current.pop("_manual_resume_result")
+    restarted = Notifications(tmp_path, current)
+    restarted.close()
+    assert len(calls) == baseline + 1
+
+
+def test_resume_request_and_unproven_success_never_send_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+        calls.append(rendered)
+        return {"outcome": "success", "reason": None}
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state("running")
+    current["notifications"]["mode"] = "concise"
+    sender = Notifications(tmp_path, current)
+    for evidence in ("request_received", "exit_zero", None):
+        current["_manual_resume_result"] = {
+            "id": "manual-action-1", "outcome": "started", "evidence": evidence,
+        }
+        sender.observe(current)
+    sender.close()
+    assert len(calls) == 1
+    assert calls[0]["header"]["title"]["content"] == "任务已开始"
+
+
+def test_first_ticket_start_is_not_replayed_after_history_rolls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_notification_events import state_with_round
+
+    calls: list[dict[str, Any]] = []
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+        calls.append(rendered)
+        return {"outcome": "success", "reason": None}
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state_with_round()
+    current["notifications"] = {**state()["notifications"], "mode": "concise"}
+    current["ticket_graph"] = {"tickets": {"3": {"title": "Feature"}}}
+    attempt = current["semantic_agent_attempts"][0]
+    attempt["work_subject"] = "ticket:3"
+    invocation = current["agent_invocation_history"][0]
+    invocation["semantic_attempt"] = attempt.copy()
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    first = len(calls)
+    current.update(semantic_agent_attempts=[], agent_invocation_history=[])
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    attempt = {**attempt, "attempt_id": "new-thread-repair", "ordinal": 2}
+    current.update(semantic_agent_attempts=[attempt],
+                   agent_invocation_history=[{**invocation, "semantic_attempt": attempt}])
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    assert len(calls) == first
+
+
+def test_resume_fault_does_not_reappear_as_detailed_round_result_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_notification_events import state_with_round
+
+    calls: list[dict[str, Any]] = []
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+        calls.append(rendered)
+        return {"outcome": "success", "reason": None}
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state_with_round()
+    current["status"] = "execution_failed"
+    current["notifications"] = {**state()["notifications"], "mode": "detailed"}
+    current["semantic_agent_attempts"][0].update(status="pending", outcome=None)
+    invocation = current["agent_invocation_history"][0]
+    invocation.update(status="execution_failed", error="failed to start")
+    invocation["semantic_attempt"] = current["semantic_agent_attempts"][0].copy()
+    current["_manual_resume_result"] = {"id": "manual-action-1", "outcome": "failed", "evidence": "execution"}
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    first = len(calls)
+    assert any(item["header"]["title"]["content"] == "人工恢复失败" for item in calls)
+    current.pop("_manual_resume_result")
+    restarted = Notifications(tmp_path, current)
+    restarted.close()
+    assert len(calls) == first
+
+
+def test_resume_result_identity_survives_absent_transient_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
+        calls.append(rendered)
+        return {"outcome": "success", "reason": None}
+    monkeypatch.setattr("agent_run.notifications.send", sent)
+    current = state("running")
+    result = {"id": "same-action", "outcome": "started", "evidence": "controller_check"}
+    current["_manual_resume_result"] = result
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    current.pop("_manual_resume_result")
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    current["_manual_resume_result"] = result
+    sender = Notifications(tmp_path, current)
+    sender.close()
+    assert len(calls) == 2  # Run start and the same actual Resume result once.

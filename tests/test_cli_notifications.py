@@ -23,13 +23,19 @@ from agent_run.user_defaults import UserDefaultsStore
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_publication, passing_acceptance, ticket
+from test_cli_delivery import parent_publication, passing_acceptance, repair_acceptance, ticket
 
 
-@pytest.mark.parametrize("language,drain", [("zh", True), ("en", True), ("zh", False)],
-                         ids=["zh-delivery", "en-delivery", "bounded-cancel"])
+@pytest.mark.parametrize("language,drain,scope,mode", [
+    ("zh", True, "ticket", "detailed"),
+    ("en", True, "ticket", "detailed"),
+    ("zh", False, "ticket", "detailed"),
+    ("zh", True, "ticket", "concise"),
+    ("en", True, "parent", "concise"),
+], ids=["zh-delivery", "en-delivery", "bounded-cancel", "concise-repairs", "parent-concise"])
 def test_cli_delivery_sends_cards_and_queries_never_send(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain: bool, language: str,
+    scope: str, mode: str,
 ) -> None:
     binary = tmp_path / "bin"
     binary.mkdir()
@@ -52,8 +58,34 @@ else:
     tool.chmod(0o700)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     UserDefaultsStore().configure(language=language, notifications={"enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test"})
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
+    fixture = write_fixture(git_repo / "github.json", issues={} if scope == "parent" else {"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
+    data = json.loads(agents.read_text())
+    if scope == "parent":
+        data["publications"] = [parent_publication()]
+        data["reviews"] = [repair_acceptance("parent-reviewer-1"),
+                           repair_acceptance("parent-reviewer-2"),
+                           passing_acceptance("parent-reviewer-3", "Complete requirement passed.")]
+        for ordinal in (1, 2):
+            data["developments"].append({
+                "expected_thread_id": "ticket-developer-3", "thread_id": "ticket-developer-3",
+                "summary": f"Parent repair {ordinal}",
+                "write_files": {"parent-repair.txt": f"round {ordinal}\n"},
+            })
+    elif mode == "concise":
+        # Two failed checks in the same overall acceptance produce two repair
+        # rounds, but only one concise transition into repair.
+        data["run_reviews"] = [repair_acceptance("run-reviewer-1"),
+                               repair_acceptance("repair-reviewer-1"),
+                               passing_acceptance("repair-reviewer-2", "Repaired candidate passed.")]
+        for ordinal in (1, 2):
+            data["developments"].append({
+                "expected_thread_id": None if ordinal == 1 else "repair-developer",
+                "thread_id": "repair-developer", "summary": f"Repair {ordinal}",
+                "write_files": {"repair.txt": f"round {ordinal}\n"},
+            })
+        data["publications"].append(deepcopy(data["publications"][0]))
+    agents.write_text(json.dumps(data))
 
     def invoke(*arguments: str) -> subprocess.CompletedProcess[str]:
         # This explicit entrypoint is imported only by the CLI/Executor, never
@@ -63,6 +95,20 @@ import agent_run.notifications as notifications
 from agent_run.cli import main
 original_close = notifications.Notifications.close
 original_send = notifications.send
+original_observe = notifications.Notifications.observe
+# Synchronize only the isolated fast transport. This makes selected business
+# events inspectable without assuming production exit drains every message.
+def observe(self, *args, **kwargs):
+    state = args[0]
+    for event in notifications.events(state):
+        if not kwargs.get('recovering') and event['kind'] == 'ticket_started' and event['id'] not in self.document.get('seen', []):
+            active = state.get('active_agent_invocation') or {}
+            assert active.get('reported_thread_id') and active.get('status') == 'running', active
+    original_observe(self, *args, **kwargs)
+    if not os.environ.get('NOTIFICATION_TEST_PORT') and self.enabled and self.thread is not None:
+        with self.condition:
+            assert self.condition.wait_for(lambda: not self.document['pending'], timeout=15), self.document
+notifications.Notifications.observe = observe
 release_sender = threading.Event()
 port = os.environ.get('NOTIFICATION_TEST_PORT')
 if port:
@@ -128,10 +174,10 @@ raise SystemExit(main(sys.argv[1:]))
                     for connection in connections.values():
                         connection.close()
 
-    result = invoke("run", "1", "--notification-mode", "detailed", "--agent-fixture", str(agents))
+    result = invoke("run", "1", "--notification-mode", mode, "--agent-fixture", str(agents))
     assert result.returncode == 0, result.stderr
     output = stdout_json(result)
-    assert output["status"] == "run_approval_pending"
+    assert output["status"] == ("parent_approval_pending" if scope == "parent" else "run_approval_pending")
     current = load_only_run_state(git_repo)
     assert current["notifications"]["profile"] == "test"
     # A representative real request proves Executor/transport integration.
@@ -149,9 +195,34 @@ raise SystemExit(main(sys.argv[1:]))
     cards = [card(event) for event in events(current)]
     titles = [item["header"]["title"]["content"] for item in cards]
     assert localized("任务已开始", "Task started") in titles
-    assert any(localized("正在开发", "Developing") in value for value in titles), titles
-    assert any(localized("正在验收", "Reviewing") in value for value in titles), titles
-    assert any(localized("说明已准备好", "description is ready") in value for value in titles), titles
+    if mode == "detailed":
+        assert sum(event["kind"] == "ticket_started" for event in events(current)) == 1
+        assert not any(event["kind"] == "stage_start" and event.get("role") == "development"
+                       for event in events(current))
+        assert any(localized("开始开发子任务", "Started developing ticket") in value for value in titles), titles
+        assert any(localized("正在验收", "Reviewing") in value for value in titles), titles
+        assert any(localized("说明已准备好", "description is ready") in value for value in titles), titles
+    else:
+        projected = events(current)
+        kinds = [event["kind"] for event in projected]
+        assert kinds.count("acceptance_passed") == 1
+        assert kinds.count("ticket_started") == (1 if scope == "ticket" else 0)
+        assert kinds.count("acceptance_started") == (1 if scope == "ticket" else 0)
+        assert kinds.count("acceptance_repair") == (1 if scope == "ticket" else 0)
+        assert "stage_start" not in kinds and "stage_end" not in kinds
+        # Inspect requests actually accepted by the isolated CLI, not merely
+        # render another copy of the projection or assert an old total count.
+        delivered_titles = [item["header"]["title"]["content"] for item in delivered]
+        for event in projected:
+            assert delivered_titles.count(event["title"]) == 1, delivered_titles
+        passed = next(event for event in projected if event["kind"] == "acceptance_passed")
+        approval = next(event for event in projected if event.get("current"))
+        assert passed["id"] != approval["id"]
+        assert delivered_titles.index(passed["title"]) < delivered_titles.index(approval["title"])
+        if scope == "ticket":
+            assert current["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 2
+        else:
+            assert len(delivered_titles) == 3  # Start, formal pass, approval; repairs stay quiet.
     assert not any("最终 PR" in value and "已创建" in value for value in titles), titles
     assert any(localized("请批准合并 PR", "Please approve merging PR") in value for value in titles)
     approval_card = next(item for item in cards if item["header"]["title"]["content"]  .startswith(localized("请批准合并 PR", "Please approve merging PR")))
@@ -171,7 +242,7 @@ raise SystemExit(main(sys.argv[1:]))
         ("unknown", localized("暂时无法确认", "Cannot currently confirm")),
     ):
         snapshot = deepcopy(current)
-        snapshot["run_publication"]["required_checks_evidence"]["result"] = result
+        snapshot["parent_job" if scope == "parent" else "run_publication"]["required_checks_evidence"]["result"] = result
         approval = next(event for event in events(snapshot) if event.get("current"))
         assert expected in approval["summary"]
     before = messages.read_bytes() if messages.exists() else b""
@@ -208,6 +279,9 @@ raise SystemExit(main(sys.argv[1:]))
     assert completed["language"] == language
     approval_deliveries = [json.loads(line) for line in messages.read_text().splitlines()[delivered_before_approval:]]
     assert approval_deliveries
+    if mode == "concise":
+        restarted_titles = [item["header"]["title"]["content"] for item in approval_deliveries]
+        assert restarted_titles == [localized("任务已完成", "Task completed")]
     for delivered_card in approval_deliveries:
         assert localized("打开 PR", "Open PR") in str(delivered_card)
     cards = [card(event) for event in events(completed)]
@@ -276,7 +350,7 @@ def test_cli_blocked_acceptance_resume_projects_same_round(
     after = events(load_only_run_state(git_repo))
     assert starts <= {event["id"] for event in after if event["kind"] == "stage_start"}
     assert not any("验收受阻" in event["title"] for event in after)
-    passed = [event for event in after if event["kind"] == "stage_end" and event["attempt_id"] == result["attempt_id"]]
+    passed = [event for event in after if event["kind"] in {"stage_end", "acceptance_passed"} and event.get("attempt_id") == result["attempt_id"]]
     assert len(passed) == 1, passed
     assert passed[0]["round"] == result["round"]
     assert passed[0]["id"] != result["id"]

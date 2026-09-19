@@ -14,7 +14,7 @@ def state_with_round(role: str = "development", outcome: str = "candidate") -> d
                "development_summary": "已实现输入校验"}
     return {"language": "zh", "run_id": "r", "repository": "o/repo", "parent": {"number": 241, "title": "飞书通知"},
             "status": "run_review_pending", "semantic_agent_attempts": [attempt],
-            "agent_invocation_history": [{"semantic_attempt": attempt.copy(), "status": "completed",
+            "agent_invocation_history": [{"semantic_attempt": attempt.copy(), "status": "completed", "reported_thread_id": "thread-1",
                                           "started_at": "2026-01-01T00:00:00+00:00",
                                           "ended_at": "2026-01-01T00:00:09+00:00"}]}
 
@@ -159,6 +159,8 @@ def test_manual_resume_uses_resume_identity_once() -> None:
         "resume_id": "resume-1", "requested_at": "2026-01-01T00:01:00+00:00",
         "work_subject": "run:r", "semantic_attempt_id": "a1", "source_status": "ready_for_human",
     }]}
+    assert not any(event["kind"] == "resume" for event in events(state))
+    state["_manual_resume_result"] = {"id": "resume-1", "outcome": "started", "evidence": "worker_started"}
     first = [event for event in events(state) if event["kind"] == "resume"]
     assert len(first) == 1
     state["resume_audit"]["history"][0]["requested_at"] = "2026-01-01T00:02:00+00:00"
@@ -207,7 +209,7 @@ def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
                    'work_subject': 'ticket:2' if index < 3 else 'run:r',
                    'outcome': {'development': 'candidate', 'review': 'acceptance_artifact', 'publication': 'publication_artifact'}[role]}
         state['semantic_agent_attempts'].append(attempt)
-        state['agent_invocation_history'].append({'semantic_attempt': attempt.copy(), 'status': 'completed',
+        state['agent_invocation_history'].append({'semantic_attempt': attempt.copy(), 'status': 'completed', 'reported_thread_id': 'thread-1',
             'started_at': f'2026-01-01T00:0{index}:00+00:00', 'ended_at': f'2026-01-01T00:0{index}:30+00:00'})
     state.update(status='run_approval_pending', run_publication={'pr_number': 9})
     detailed = events(state)
@@ -219,10 +221,10 @@ def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
     assert next(event for event in detailed if event['kind'] == 'stage_start')['task_number'] == 2
     state['notifications'] = {'mode': 'concise'}
     concise = events(state)
-    assert [event['kind'] for event in concise] == ['run_start', 'ticket_completed', 'boundary']
+    assert [event['kind'] for event in concise] == ['run_start', 'ticket_started', 'ticket_completed', 'boundary']
     state['status'] = 'completed'
     assert events(state)[-1]['title'] == '任务已完成'
-    assert len({event['id'] for event in concise + events(state)}) == 4
+    assert len({event['id'] for event in concise + events(state)}) == 5
     state['notifications']['mode'] = 'detailed'
     assert len({event['id'] for event in detailed + events(state)}) == 14
 
@@ -419,3 +421,142 @@ def test_card_localizes_labels_and_preserves_external_text(language: str) -> Non
                      ("Functional verification: Passed", "Requirements verification: Blocked",
                       "Engineering review: Failed", "8 min 4 s", "Next step")):
         assert fragment in content
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_concise_ticket_start_requires_invocation_and_survives_rework(language: str) -> None:
+    state = state_with_round()
+    state.update(language=language, notifications={"mode": "concise"})
+    attempt = state["semantic_agent_attempts"][0]
+    attempt.update(work_subject="ticket:2", started_at="2026-01-01T00:00:00+00:00")
+    state["ticket_graph"] = {"tickets": {"2": {"title": "Actual ticket"}}}
+    invocation = state["agent_invocation_history"].pop()
+    invocation["semantic_attempt"] = attempt.copy()
+    assert not any(event["kind"] == "ticket_started" for event in events(state))
+    state["agent_invocation_history"].append({key: value for key, value in invocation.items() if key != "reported_thread_id"})
+    assert not any(event["kind"] == "ticket_started" for event in events(state))
+    state["agent_invocation_history"][-1]["reported_thread_id"] = "actual-thread"
+    started = next(event for event in events(state) if event["kind"] == "ticket_started")
+    assert started["task_title"] == "Actual ticket"
+    assert started["language"] == language
+    later = {**invocation, "semantic_attempt": {**attempt, "attempt_id": "rework", "ordinal": 2}}
+    state["agent_invocation_history"].append(later)
+    assert [event["id"] for event in events(state) if event["kind"] == "ticket_started"] == [started["id"]]
+
+
+def _formal_review_state(parent_only: bool = False) -> dict[str, Any]:
+    state = state_with_round("reviewer", "acceptance_artifact")
+    artifact = {"checks": {lane: {"status": "pass", "findings": []} for lane in ("e2e", "standards", "spec")}}
+    subject = "parent:241" if parent_only else "run-acceptance:r"
+    state["semantic_agent_attempts"][0].update(work_subject=subject, acceptance_artifact=artifact)
+    state["agent_invocation_history"][0]["semantic_attempt"] = state["semantic_agent_attempts"][0].copy()
+    state.update(delivery_type="parent_only" if parent_only else "multi_ticket", ticket_jobs={}, ticket_graph={"tickets": {}}, notifications={"mode": "concise"})
+    state["parent_job" if parent_only else "run_acceptance"] = {
+        "phase": "accepted", "candidate_sha": "head", "generation": 1,
+        "acceptance_record": {"reviewed_candidate_sha": "head", "artifact": artifact}}
+    return state
+
+
+@pytest.mark.parametrize("parent_only", [False, True])
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_formal_pass_and_approval_are_independent(parent_only: bool, language: str) -> None:
+    state = _formal_review_state(parent_only)
+    state["language"] = language
+    before = events(state)
+    kinds = [event["kind"] for event in before]
+    assert kinds == (["run_start", "acceptance_passed"] if parent_only else
+                     ["run_start", "acceptance_started", "acceptance_passed"])
+    passed = next(event for event in before if event["kind"] == "acceptance_passed")
+    state["status"] = "parent_approval_pending" if parent_only else "run_approval_pending"
+    if parent_only:
+        state["parent_job"]["phase"] = "ready_for_approval"
+    after = events(state)
+    assert next(event["id"] for event in after if event["kind"] == "acceptance_passed") == passed["id"]
+    assert after[-1]["kind"] == "boundary"
+    state["notifications"]["mode"] = "detailed"
+    assert not any(event["kind"] == "stage_end" for event in events(state))
+
+
+@pytest.mark.parametrize("invalid", ["stale", "missing_lane", "no_checks", "failed_without_findings", "unpromoted", "local_only", "missing_findings", "parent_revision", "graph_revision"])
+def test_only_current_formal_full_acceptance_can_pass(invalid: str) -> None:
+    state = _formal_review_state()
+    run = state["run_acceptance"]
+    artifact = run["acceptance_record"]["artifact"]
+    if invalid == "stale":
+        run["candidate_sha"] = "new-head"
+    elif invalid == "missing_lane":
+        del artifact["checks"]["spec"]
+    elif invalid == "no_checks":
+        artifact["checks"] = {}
+    elif invalid == "failed_without_findings":
+        artifact["checks"]["spec"]["status"] = "fail"
+    elif invalid == "unpromoted":
+        run.update(phase="repairing", repair_job={"acceptance_record": run["acceptance_record"]})
+    elif invalid == "local_only":
+        run["candidate_acceptance"] = run.pop("acceptance_record")
+    elif invalid == "missing_findings":
+        del artifact["checks"]["spec"]["findings"]
+    elif invalid == "parent_revision":
+        state["parent"]["revision"] = "changed"
+    elif invalid == "graph_revision":
+        state["ticket_graph"] = {"revision": "changed"}
+    assert not any(event["kind"] == "acceptance_passed" for event in events(state))
+
+
+def test_first_run_repair_uses_execution_fact_and_stable_identity() -> None:
+    state = _formal_review_state()
+    run = state["run_acceptance"]
+    run["phase"] = "repairing"
+    run["acceptance_record"]["artifact"]["checks"]["spec"]["status"] = "fail"
+    planned = next(event for event in events(state) if event["kind"] == "acceptance_repair")
+    assert "将" in planned["title"] and not planned["live"]
+    state["active_agent_invocation"] = {"work_subject": "run-repair:r", "role": "development", "status": "running"}
+    assert next(event for event in events(state) if event["kind"] == "acceptance_repair")["title"] == planned["title"]
+    state["active_agent_invocation"]["started_at"] = "2026-01-01T00:00:01+00:00"
+    state["active_agent_invocation"]["reported_thread_id"] = "actual-thread"
+    active = next(event for event in events(state) if event["kind"] == "acceptance_repair")
+    assert active["live"] and "正在" in active["title"] and active["id"] == planned["id"]
+    run.update(repair_generation=2, repair_job={"repair_generation": 2})
+    assert next(event for event in events(state) if event["kind"] == "acceptance_repair")["id"] == planned["id"]
+    state["delivery_type"] = "parent_only"
+    assert not any(event["kind"] in {"acceptance_started", "acceptance_repair"} for event in events(state))
+
+
+def test_acceptance_merge_inspection_starts_before_reviewer() -> None:
+    state = state_with_round()
+    state.update(semantic_agent_attempts=[], agent_invocation_history=[], notifications={"mode": "concise"},
+                 run_acceptance={"acceptance_generation": 1, "phase": "repairing"})
+    assert [event["kind"] for event in events(state)] == ["run_start", "acceptance_started", "acceptance_repair"]
+
+
+def test_preparing_invocation_does_not_emit_detailed_start_then_duplicate() -> None:
+    state = state_with_round()
+    state["agent_invocation_history"][0].pop("reported_thread_id")
+    assert not any(event["kind"] == "stage_start" for event in events(state))
+
+
+def test_formal_pass_for_new_reviewed_base_has_distinct_identity() -> None:
+    state = _formal_review_state()
+    first = next(event for event in events(state) if event["kind"] == "acceptance_passed")
+    state["run_acceptance"]["acceptance_record"]["reviewed_default_base_sha"] = "new-base"
+    second = next(event for event in events(state) if event["kind"] == "acceptance_passed")
+    assert first["id"] != second["id"]
+
+
+def test_detailed_unpromoted_review_does_not_claim_formal_pass() -> None:
+    state = _formal_review_state()
+    state["notifications"]["mode"] = "detailed"
+    state["run_acceptance"]["phase"] = "repairing"
+    state["run_acceptance"]["repair_job"] = {"phase": "accepted"}
+    result = next(event for event in events(state) if event["kind"] == "stage_end")
+    assert result["title"] == "验收结果已返回，等待正式确认"
+    assert not any(event["kind"] == "acceptance_passed" for event in events(state))
+
+
+def test_approval_summary_does_not_infer_pass_from_missing_findings() -> None:
+    state = _formal_review_state()
+    state["status"] = "run_approval_pending"
+    del state["run_acceptance"]["acceptance_record"]["artifact"]["checks"]["spec"]["findings"]
+    approval = next(event for event in events(state) if event["kind"] == "boundary")
+    assert "尚无有效通过结论" in approval["summary"]
+    assert not any(event["kind"] == "acceptance_passed" for event in events(state))

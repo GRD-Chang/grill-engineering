@@ -43,7 +43,7 @@ def read_notifications(root: Path, run_id: str) -> dict[str, Any]:
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise ValueError("通知记录格式错误")
-        for field in ("seen", "pending", "records", "active"):
+        for field in ("seen", "pending", "records", "active", "milestones", "resume_results"):
             if field in value and not isinstance(value[field], list):
                 raise ValueError(f"通知记录 {field} 格式错误")
         if not isinstance(value.get("occurrences", {}), dict):
@@ -101,7 +101,7 @@ class Notifications:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 try:
                     self.document = read_notifications(self.root, self.run_id)
-                    for key in ("seen", "pending", "records", "active"):
+                    for key in ("seen", "pending", "records", "active", "milestones", "resume_results"):
                         self.document.setdefault(key, [])
                     self.document.setdefault("occurrences", {})
                     self.recovered = False
@@ -141,7 +141,8 @@ class Notifications:
         try:
             with self._transaction():
                 projected = events(state)
-                seen = set(self.document["seen"])
+                seen = set(self.document["seen"]) | set(self.document["milestones"])
+                resume_results = self.document["resume_results"]
                 active = set(self.document["active"])
                 current = {item["id"] for item in projected if item.get("current")}
                 pending = self.document["pending"]
@@ -149,18 +150,31 @@ class Notifications:
                 added = False
                 for item in projected:
                     identity = item["id"]
+                    resume_identity = (f"{item['resume_id']}:{item.get('resume_outcome')}"
+                                       if item.get("resume_id") else None)
                     if item.get("current"):
-                        if identity in active:
+                        if identity in active and (resume_identity is None or resume_identity in resume_results):
                             continue
                         counts = self.document["occurrences"]
                         counts[identity] = counts.get(identity, 0) + 1
                         item = {**item, "id": f"{identity}:{counts[identity]}"}
-                    elif identity in seen:
+                    elif identity in seen or (resume_identity is not None and resume_identity in resume_results):
                         continue
                     pending.append({"event": item, "outcome": "pending", "attempts": 0})
+                    if resume_identity is not None and resume_identity not in resume_results:
+                        resume_results.append(resume_identity)
+                    if item["kind"] in {"ticket_started", "acceptance_started", "acceptance_repair"}:
+                        self.document["milestones"].append(identity)
                     added = True
-                self.document["seen"] = [item["id"] for item in projected]
+                self.document["seen"] = list(dict.fromkeys(
+                    identity for item in projected
+                    for identity in [item["id"], *item.get("supersedes", [])]))
                 self.document["active"] = sorted(current)
+                self.document["resume_results"] = resume_results[-MAX_RECORDS:]
+                # First starts must survive history compaction. Their number is
+                # bounded by the fixed Ticket graph plus two overall nodes.
+                milestone_limit = len((state.get("ticket_graph") or {}).get("tickets") or {}) + 2
+                self.document["milestones"] = self.document["milestones"][-milestone_limit:]
                 # Only recurring boundary identities need counters.
                 self.document["occurrences"] = dict(list(self.document["occurrences"].items())[-MAX_RECORDS:])
                 retryable = [item for item in pending if item["outcome"] not in {"sending", "unknown"}]

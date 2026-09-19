@@ -104,6 +104,7 @@ from agent_run.run_lifecycle import (
     prepare_action_application_receipt,
     _unbound_action_matches_run_receipt,
 )
+from agent_run.resume_feedback import ResumeFeedback
 from agent_run.resume_intent import (
     ResumeIntentError,
     bind_resume_intent,
@@ -367,6 +368,7 @@ def _main_with_parser_resources(
 ) -> int:
     supplied_arguments = list(arguments) if arguments is not None else sys.argv[1:]
     parsed = parser.parse_args(supplied_arguments)
+    resume_feedback: ResumeFeedback | None = None
     controller: Controller | None = None
     states: StateStore | FaultInjectingStateStore | None = None
     git: GitRepository | None = None
@@ -489,6 +491,13 @@ def _main_with_parser_resources(
             _resolve_mutation_selection(parsed, git, states)
         if parsed.command == "resume":
             selected_resume = cli_surface._load_local_run(states, parsed.run_id)
+            resume_notifications = selected_resume.get("notifications")
+            if isinstance(resume_notifications, dict) and resume_notifications.get("enabled") is True:
+                resume_feedback = ResumeFeedback(
+                    states.root, selected_resume,
+                    lambda: states.load_current_run(parsed.run_id),
+                )
+                resources.callback(resume_feedback.close)
             selected_parent = selected_resume.get("parent")
             selected_parent_number = (
                 selected_parent.get("number")
@@ -501,6 +510,8 @@ def _main_with_parser_resources(
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
         executor_binding = _executor_binding_from_environment()
+        if resume_feedback is not None and executor_binding is not None:
+            resume_feedback.identity = executor_binding[0]
         executor_backed = parsed.command in {
             "run",
             "resume",
@@ -690,6 +701,9 @@ def _main_with_parser_resources(
                     current = _reconcile_resume_exit(
                         parsed, states, git, github, executor_host, current
                     )
+                    if (resume_feedback is not None and final_receipt_pending
+                            and not has_unfinished_final_receipt(current, git.root)):
+                        resume_feedback.progressed(current, "terminal_completion")
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
@@ -699,6 +713,8 @@ def _main_with_parser_resources(
                     and not cli_surface._resume_is_ready(current)
                 ):
                     _reject_if_task_action_pending(parsed, states, git)
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -708,6 +724,8 @@ def _main_with_parser_resources(
                     and parsed.message is not None
                     and human_blocker_subject_count(current) != 1
                 ):
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -715,6 +733,8 @@ def _main_with_parser_resources(
                 if current.get("status") == "supervision_timeout" and (
                     parsed.new_thread or parsed.message is not None
                 ):
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -722,6 +742,8 @@ def _main_with_parser_resources(
                 if has_non_invocation_execution_failure(current) and (
                     parsed.new_thread or parsed.message is not None
                 ):
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -739,11 +761,18 @@ def _main_with_parser_resources(
                 lifecycle_arguments=tuple(supplied_arguments),
                 executor_binding=executor_binding,
                 prepare_executor_session=prepare_executor_session,
+                resume_feedback=resume_feedback,
             )
         else:  # pragma: no cover - lifecycle commands are Executor-backed
             raise ExecutionReadinessError(error_message('cli.error.missing_executor'))
         if lifecycle_receipt is not None and lifecycle_receipt.status == "failed":
             control_failure = bounded_error(lifecycle_receipt.failure or "操作未完成")
+        if resume_feedback is not None and lifecycle_receipt is not None:
+            if lifecycle_receipt.attached and resume_feedback.result is None:
+                resume_feedback.suppressed = True
+            elif lifecycle_receipt.status == "failed":
+                resume_feedback.identity = lifecycle_receipt.action_id or resume_feedback.identity
+                resume_feedback.failure(lifecycle_receipt.failure or "execution_failed")
         active_ticket_job = state.get("active_ticket_job")
         diagnostics = state.get("diagnostics")
         current_diagnostics = diagnostics if isinstance(diagnostics, list) else []
@@ -942,6 +971,8 @@ def _main_with_parser_resources(
         ValueError,
         WorkerSandboxError,
     ) as error:
+        if resume_feedback is not None:
+            resume_feedback.failure(bounded_error(error_detail(error, selected_language(resume_feedback.state))))
         selected_run_id = getattr(parsed, "run_id", None)
         run_id = selected_run_id
         if (
@@ -1851,6 +1882,7 @@ def _run_lifecycle(
     lifecycle_arguments: tuple[str, ...] = (),
     executor_binding: tuple[str, int] | None = None,
     prepare_executor_session: Callable[[], None] | None = None,
+    resume_feedback: ResumeFeedback | None = None,
 ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
     if host is None:
         raise ExecutionReadinessError(
@@ -2236,7 +2268,7 @@ def _run_lifecycle(
                     # Executor.  The old Worker must not overwrite that fence.
                     return
 
-        return _run_driver(
+        driver = _run_driver(
             parsed,
             run_states,
             run_controller,
@@ -2249,6 +2281,9 @@ def _run_lifecycle(
             on_worker_started=worker_started,
             on_worker_finished=worker_finished,
         )
+        if resume_feedback is not None:
+            driver.on_outcome = resume_feedback.progressed
+        return driver
 
     def record_lifecycle_failure(
         run_states: StateStore,
@@ -2260,6 +2295,7 @@ def _run_lifecycle(
         return run_controller.record_execution_failure(run_id, message)
 
     delivery_executor = DeliveryExecutor(
+        resume_feedback=resume_feedback,
         states=states,
         state_store_factory=lifecycle_state_store,
         driver_factory=lifecycle_driver_factory,

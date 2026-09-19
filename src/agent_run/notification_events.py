@@ -14,7 +14,7 @@ from typing import Any
 
 from agent_run.cli_presentation import _semantic_attempt_history
 from agent_run.delivery_history import history_records, _role_family
-from agent_run.delivery_status import _ticket_progress, current_acceptance_artifact
+from agent_run.delivery_status import _ticket_progress
 from agent_run.presentation_helpers import current_work_subject
 from agent_run.messages import selected_language, text
 from agent_run.notification_presentation import status_term, pause_reason, next_action
@@ -67,7 +67,8 @@ def _round_events(state: dict[str, Any], record: dict[str, Any]) -> list[dict[st
     title = facts.get("task_title") or (f"#{facts['task_number']}" if ticket else _copy(state, "parent"))
     start_title = {"development": _copy(state, "development_start", title=title), "review": _copy(state, "review_ticket_start", title=title) if ticket else _copy(state, "review_start"),
                    "publication": _copy(state, "publication_ticket_start") if ticket else _copy(state, "publication_start")}[role]
-    if record.get("started_at") or record.get("invocations"):
+    if any(invocation.get("reported_thread_id") for invocation in record.get("invocations", [])
+           if isinstance(invocation, dict)):
         result.append(_base(state, "stage_start", record["attempt_id"],
                             start_title, started_at=record.get("started_at"), live=record.get("activity") == "running", **facts))
     artifact = record.get("acceptance_artifact") or {}
@@ -112,7 +113,7 @@ def _round_events(state: dict[str, Any], record: dict[str, Any]) -> list[dict[st
         status_code = "publication_artifact"
     check_results = {key: value.get("status") for key, value in (artifact.get("checks") or {}).items()
                      if isinstance(value, dict)}
-    title = {"development": _copy(state, "development_end"), "review": _copy(state, "review_ticket_end") if ticket else _copy(state, "review_end"),
+    title = {"development": _copy(state, "development_end"), "review": _copy(state, "review_ticket_end") if ticket else _copy(state, "review_result_pending"),
              "publication": _copy(state, "publication_ticket_end") if ticket else _copy(state, "publication_end")}[role]
     if status_code in {"execution_failed", "review_blocked"}:
         title = _copy(state, "role_result", role=facts["phase"], result=status_term(status_code, selected_language(state)))
@@ -126,7 +127,7 @@ def _round_events(state: dict[str, Any], record: dict[str, Any]) -> list[dict[st
         title = _copy(state, "review_unknown")
         color = "yellow"
     result.append(_base(state, "stage_end", [record["attempt_id"], outcome, stopped, check_results],
-                        title, color, checks=check_results,
+                        title, color, checks=check_results, status_code=status_code,
                         summary=summary, next_step=next_step, findings_count=len(findings),
                         duration_seconds=record.get("execution_seconds") if record.get("ended_at") else None, **facts))
     return result
@@ -154,13 +155,45 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
             result.extend(_round_events(state, record))
         for point in record.get("turning_points", []):
             kind = point.get("kind")
-            if kind == "resume" and point.get("resume_id"):
-                result.append(_base(state, "resume", point["resume_id"], _copy(state, "resume"), summary=_copy(state, "resume_summary")))
             if kind == "pr_creation" and point.get("pr_number"):
                 number = point["pr_number"]
                 result.append(_base(state, "pr_created", number, _copy(state, "pr_created", number=number),
                                     "green", summary=_copy(state, "pr_summary"),
                                     url=f"https://github.com/{state.get('repository')}/pull/{number}"))
+    from agent_run.notification_milestones import milestones
+    key_events = milestones(state, records)
+    # Detailed mode retains later rounds, but a milestone replaces its own
+    # process-level start instead of describing the same fact twice.
+    milestone_starts = {event.get("attempt_id") for event in key_events
+                        if event["kind"] in {"ticket_started", "acceptance_started"}}
+    result = [event for event in result if not (
+        event["kind"] == "stage_start" and event.get("attempt_id") in milestone_starts)]
+    replaced_results: set[object] = set()
+    # The first failed overall review is represented by its subsequent repair
+    # transition (or human boundary), even if those are separate saves.
+    failed = next((record for record in records
+                   if str(record.get("work_subject")) == f"run-acceptance:{state.get('run_id')}"
+                   and any(check.get("status") == "fail" for check in
+                           ((record.get("acceptance_artifact") or {}).get("checks") or {}).values()
+                           if isinstance(check, dict))), None)
+    if failed:
+        replaced_results.add(failed.get("attempt_id"))
+    if any(event["kind"] == "acceptance_passed" for event in key_events):
+        owner = state.get("parent_job" if state.get("delivery_type") == "parent_only" else "run_acceptance") or {}
+        formal_artifact = (owner.get("acceptance_record") or {}).get("artifact")
+        matching = next((record for record in reversed(records)
+                         if record.get("acceptance_artifact") == formal_artifact
+                         and not str(record.get("work_subject")).startswith("ticket:")), None)
+        if matching:
+            replaced_results.add(matching.get("attempt_id"))
+            for event in key_events:
+                if event["kind"] == "acceptance_passed":
+                    event.update(attempt_id=matching.get("attempt_id"), round=matching.get("ordinal"),
+                                 phase=_copy(state, "role_review"),
+                                 duration_seconds=matching.get("execution_seconds") if matching.get("ended_at") else None)
+    result = [event for event in result if not (
+        event["kind"] == "stage_end" and event.get("attempt_id") in replaced_results)]
+    result.extend(key_events)
     progress = _ticket_progress(state)
     for number, job in (state.get("ticket_jobs") or {}).items():
         if isinstance(job, dict) and job.get("phase") in {"completed", "merged"}:
@@ -220,10 +253,9 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
         summary = _copy(state, "separator").join(str(value) for value in blockers) or str(status_term(status, selected_language(state)))
         if "approval_pending" in status:
             title = _copy(state, "approve_number", number=pr_number) if pr_number else _copy(state, "approval_wait")
-            artifact = current_acceptance_artifact(state) or {}
-            verdicts = [check.get("status") for check in (artifact.get("checks") or {}).values() if isinstance(check, dict)]
-            complete_checks = set(artifact.get("checks") or {}) == {"e2e", "standards", "spec"}
-            latest_review = _copy(state, "review_pass") if complete_checks and verdicts and all(value == "pass" for value in verdicts) else _copy(state, "review_no_pass")
+            latest_review = _copy(state, "review_pass") if any(
+                event["kind"] == "acceptance_passed" for event in key_events
+            ) else _copy(state, "review_no_pass")
             checks_result = (publication.get("required_checks_evidence") or {}).get("result")
             checks_text = status_term(checks_result or "unknown", selected_language(state))
             summary += _copy(state, "approval_summary", review=latest_review, checks=checks_text)
@@ -242,14 +274,16 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
         if task_facts.get("task_number") is not None:
             boundary_identity = [status, task_facts["task_number"]]
         result.append(_base(state, "boundary", boundary_identity, title, color, summary=summary,
-                            current=True, **execution_totals(state, records, at),
+                            current=True, status_code=status, **execution_totals(state, records, at),
                             trigger_role=next((_copy(state, "role_" + str(_role_family(str(r.get("role"))))) for r in reversed(records) if not r.get("event_record")), None) if status in {"ready_for_human", "execution_failed", "progress_exhausted"} else None,
                             **task_facts,
                             next_step="" if status == "abandoned" or (status == "completed" and not cleanup_pending) else str(next_action(state) or "")))
     if "approval_pending" in status or status == "completed" or publication.get("approval_grant"):
         result = [event for event in result if event["kind"] != "pr_created"]
+    from agent_run.notification_resume import apply_resume_result
+    result = apply_resume_result(state, result)
     if (state.get("notifications") or {}).get("mode", "detailed") == "concise":
-        result = [event for event in result if event["kind"] in {"run_start", "ticket_completed", "boundary"}]
+        result = [event for event in result if event["kind"] in {"run_start", "ticket_started", "ticket_completed", "acceptance_started", "acceptance_repair", "acceptance_passed", "resume", "boundary"}]
     return list({event["id"]: event for event in result}.values())
 
 
@@ -267,5 +301,9 @@ def recovery_event(state: dict[str, Any], pending: list[dict[str, Any]]) -> dict
                  for event in projected if event["kind"] == "stage_end"}
     eligible = [event for event in projected if event["id"] in pending_ids and (
         (event["kind"] == "run_start" and state.get("status") == "starting") or
-        (event["kind"] == "stage_start" and event.get("live") and event.get("attempt_id") not in completed))]
+        (event["kind"] in {"stage_start", "ticket_started", "acceptance_started", "acceptance_repair", "resume"}
+         and event.get("live") and event.get("attempt_id") not in completed)
+        or event["kind"] == "acceptance_passed"
+        or (event["kind"] == "acceptance_repair"
+            and (state.get("run_acceptance") or {}).get("phase") == "repairing"))]
     return eligible[-1].copy() if eligible else None

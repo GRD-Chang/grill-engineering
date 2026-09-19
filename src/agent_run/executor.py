@@ -11,12 +11,14 @@ from typing import TYPE_CHECKING, Any, Protocol
 from agent_run.executor_environment import consume_environment_carrier
 from agent_run.executor_host import ExecutorSpec
 from agent_run.notifications import Notifications
+from agent_run.messages import error_detail, selected_language
 from agent_run.runner_lease import runner_usage_lease
 from agent_run.state import SimulatedProcessCrash, StateStore
 from agent_run.task_control import TaskControlBusyError, TaskControlError, TaskKey
 from agent_run.ticket_eligibility import TicketEligibilityError
 
 if TYPE_CHECKING:
+    from agent_run.resume_feedback import ResumeFeedback
     from agent_run.run_driver import ControlRunOperation
 
 
@@ -47,11 +49,13 @@ class DeliveryExecutor:
         driver_factory: Callable[[StateStore, _ExecutorBinding | None], _RunDriver],
         state_store_factory: Callable[[_ExecutorBinding | None], StateStore]
         | None = None,
+        resume_feedback: ResumeFeedback | None = None,
         record_execution_failure: Callable[
             [StateStore, str, str, _ExecutorBinding | None], bool
         ]
         | None = None,
     ) -> None:
+        self.resume_feedback = resume_feedback
         self.states = states
         self.driver_factory = driver_factory
         self.state_store_factory = state_store_factory
@@ -80,12 +84,22 @@ class DeliveryExecutor:
         state = states.load_current_run(run_id)
         if state is None:
             raise TaskControlError("Executor 找不到要推进的 Delivery Run")
-        notifications = Notifications(states.root, state)
-        states.run_saved_observer = notifications.observe
+        feedback = self.resume_feedback
+        if feedback is not None:
+            if action_id is not None:
+                feedback.identity = action_id
+            feedback.observe(state)
+        notifications = Notifications(states.root, feedback.project(state) if feedback else state)
+        if feedback is not None:
+            feedback.attach(notifications, action_id)
+        states.run_saved_observer = feedback.observe if feedback else notifications.observe
         try:
             driver = self.driver_factory(states, binding)
             if control_operation is None:
-                return driver.advance(state)
+                result = driver.advance(state)
+                if feedback is not None:
+                    feedback.observe(dict(result))
+                return result
             return driver.advance(state, control_operation=control_operation)
         except KeyboardInterrupt:
             if self.record_execution_failure is not None:
@@ -105,8 +119,12 @@ class DeliveryExecutor:
             # must not be rewritten as an applied business-operation failure.
             raise
         except Exception as error:
+            if feedback is not None:
+                feedback.failure(error_detail(error, selected_language(state)), evidence="execution")
             if self.record_execution_failure is not None:
                 self.record_execution_failure(states, run_id, str(error), binding)
+            if feedback is not None:
+                feedback.observe(states.load_current_run(run_id) or state)
             raise
         finally:
             states.run_saved_observer = None
