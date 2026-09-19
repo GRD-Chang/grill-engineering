@@ -13,7 +13,9 @@
 - 普通人工开发在最终交付或合并前也需要完整验证，可采用同一候选的有效 CI 证据，无需固定在本地再跑一遍。需在本地完整验证时运行 `make test-full` 和 `make typecheck`；其余步骤以 [CI workflow](../../.github/workflows/ci.yml) 为准。
 - 纯文档、注释等不改变运行行为的修改，检查内容、链接和 diff 即可；可执行示例或行为合同按影响补充验证。
 
-CI 对仅修改根目录 Markdown、`docs/` 下 Markdown 或图片的 PR/push，保留必需的 `quality` 检查并跳过依赖安装、测试和类型检查。`docs/` 下脚本、配置、其他目录的 Skill/Prompt，以及任何混合代码修改仍运行完整 CI。手动触发始终运行完整 CI；无法确定变更范围时也运行完整 CI。图片限 PNG、JPG、JPEG、SVG、GIF、WebP。
+CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown 或图片的 PR/push，保留必需的 `quality` 检查、记录跳过原因，并跳过依赖安装、测试和类型检查。PR 按相对目标分支的累计差异判断，不只看最后一次提交。`docs/` 下脚本、配置、其他目录的 Skill/Prompt，以及任何混合代码修改仍运行完整 CI。手动触发始终运行完整 CI；无法确定变更范围时也运行完整 CI。图片限 PNG、JPG、JPEG、SVG、GIF、WebP。
+
+同一 PR 更新提交时取消尚未结束的旧 CI；不同 PR、`main` 的 push 和手动运行互不取消。合并到 `main` 后继续检查，并适用相同的轻量或完整验证规则。
 
 ## 如何编写和改造测试
 
