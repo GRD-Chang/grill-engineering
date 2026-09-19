@@ -184,8 +184,13 @@ def test_clone_timeout_removes_partial_workspace_and_releases_initialization_loc
     monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
     monkeypatch.setattr(module, "_CLONE_TIMEOUT_SECONDS", 0.05)
     workspace = ManagedWorkspace.for_repository("owner/project")
-    with pytest.raises(ManagedWorkspaceError, match="超时"):
+    with pytest.raises(ManagedWorkspaceError, match="超时") as caught:
         workspace.ensure()
+    from agent_run.messages import error_detail
+
+    assert error_detail(caught.value, "en") == (
+        "The Runner independent repository operation timed out; rerun the command"
+    )
     assert not workspace.root.exists()
     assert not list(workspace.root.parent.iterdir())
     with pytest.raises(ManagedWorkspaceError, match="远端仓库不存在"):
@@ -254,3 +259,41 @@ def test_workspace_copies_only_local_commit_identity_and_can_commit(
         path.relative_to(git_repo): (path.read_bytes(), path.stat().st_mtime_ns)
         for path in git_repo.rglob("*") if path.is_file()
     }
+
+
+@pytest.mark.parametrize("diagnostic,zh,en", [
+    ("unknown failure", "请检查远端访问权限及 git/gh 认证", "Check remote access permissions and git/gh authentication"),
+    ("repository not found", "仓库不存在或当前身份无权访问", "The repository does not exist or the current identity cannot access it"),
+    ("does not exist", "远端仓库不存在", "The remote repository does not exist"),
+    ("permission denied", "远端拒绝访问，请检查认证", "The remote denied access; check authentication"),
+    ("authentication failed", "远端认证失败", "Remote authentication failed"),
+    ("could not resolve host", "无法解析远端主机", "Cannot resolve the remote host"),
+    ("failed to connect", "无法连接远端主机", "Cannot connect to the remote host"),
+    ("no space left", "数据目录磁盘空间不足", "The data directory has insufficient disk space"),
+])
+def test_clone_failure_localizes_classified_reason_and_preserves_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, diagnostic: str, zh: str, en: str,
+) -> None:
+    import os
+    import sys
+    from agent_run.messages import error_detail
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.stderr.write({diagnostic!r})\nsys.exit(7)\n",
+    )
+    fake_gh.chmod(0o700)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
+    workspace = ManagedWorkspace.for_repository("owner/project")
+    with pytest.raises(ManagedWorkspaceError) as caught:
+        workspace.ensure()
+    audit = f"Runner 独立仓库操作失败（退出码 7）：{zh}"
+    assert str(caught.value) == audit
+    assert error_detail(caught.value, "zh") == audit
+    assert error_detail(caught.value, "en") == (
+        f"Runner independent repository operation failed (exit code 7): {en}"
+    )
+    assert not workspace.root.exists()
+    assert not list(workspace.root.parent.iterdir())
