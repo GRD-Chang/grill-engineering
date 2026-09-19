@@ -9,9 +9,12 @@ from typing import Any
 import pytest
 from rich.text import Text
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 from agent_run import cli, external_supervision
 from agent_run.executor_host import HostObservation
 from agent_run.run_lifecycle import prepare_action_application_receipt
+from agent_run.run_locator import RunLocatorIndex
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
@@ -19,6 +22,10 @@ from conftest import write_fixture
 from test_run_lifecycle import _file_snapshot, _isolated_environment
 from support.inprocess_cli import invoke_cli_inprocess
 from support.published_run import prepare_published_run
+
+
+def _workspace_snapshot(repo: Path) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    return _file_snapshot(repo), _file_snapshot(managed_repo(repo).parent)
 
 
 class TerminalOutput(StringIO):
@@ -37,7 +44,14 @@ def waiting_run(
     # startup remain covered by the public run/lifecycle integration tests.
     _, state = prepare_published_run(git_repo)
     run_id = state["run_id"]
-    path = git_repo / ".agent-run" / "runs" / f"{run_id}.json"
+    RunLocatorIndex.default().register(
+        run_id=run_id,
+        repository_root=managed_repo(git_repo),
+        state_dir=managed_state(git_repo),
+        repository=state["repository"],
+        parent_number=state["parent"]["number"],
+    )
+    path = managed_state(git_repo) / "runs" / f"{run_id}.json"
     publication = state["run_publication"]
     publication["phase"] = "waiting_checks"
     publication["required_checks_evidence"] = {
@@ -49,8 +63,8 @@ def waiting_run(
     state.update(status="waiting_checks", terminal_kind="waiting_external", diagnostics=[])
     monkeypatch.setattr(external_supervision, "monotonic", lambda: 1_000_000.0)
     external_supervision.ensure_supervision_window(state, now=lambda: 999_760.0)
-    control = TaskControlStore(git_repo / ".agent-run")
-    task = TaskKey(git_repo, state["repository"], state["parent"]["number"])
+    control = TaskControlStore(managed_state(git_repo))
+    task = TaskKey(managed_repo(git_repo), state["repository"], state["parent"]["number"])
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     assert claim.action is not None and claim.action_id is not None
     control.bind_run(task, claim.action_id, run_id)
@@ -84,7 +98,8 @@ def waiting_run(
 def status_text(run_id: str, *, plain: bool) -> str:
     output = TerminalOutput()
     with redirect_stdout(output):
-        assert cli.main(["status", run_id, *(["--plain"] if plain else [])]) == 0
+        result = cli.main(["status", run_id, *(["--plain"] if plain else [])])
+    assert result == 0, output.getvalue()
     return Text.from_ansi(output.getvalue()).plain
 
 
@@ -111,9 +126,9 @@ def test_running_agent_status_does_not_offer_a_duplicate_run_command(
         "status": "running", "started_at": state["created_at"],
         "model": "gpt-5.6-luna", "reasoning_effort": "xhigh",
     }
-    path = repo / ".agent-run" / "runs" / f"{state['run_id']}.json"
+    path = managed_state(repo) / "runs" / f"{state['run_id']}.json"
     path.write_text(json.dumps(state))
-    before = _file_snapshot(repo)
+    before = _workspace_snapshot(repo)
     human = status_text(state["run_id"], plain=plain)
     assert "你暂时无需操作" in human
     assert "gpt-5.6-luna" in human and "xhigh" in human
@@ -125,14 +140,14 @@ def test_running_agent_status_does_not_offer_a_duplicate_run_command(
     assert audit["progress"]["execution_activity"] == "running"
     assert audit["operator_action"] is None
     assert audit["next_action"] == "agent-run run 1"
-    assert _file_snapshot(repo) == before
+    assert _workspace_snapshot(repo) == before
 
 
 def test_waiting_status_shows_current_checks_without_restart_command(
     waiting_run: tuple[Path, dict[str, Any]],
 ) -> None:
     repo, state = waiting_run
-    before = _file_snapshot(repo)
+    before = _workspace_snapshot(repo)
     before_user_state = _file_snapshot(Path.home().parent)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
@@ -155,7 +170,7 @@ def test_waiting_status_shows_current_checks_without_restart_command(
     assert audit["supervision"]["remaining_seconds"] == 2460
     assert audit["progress"]["current_agent"]["is_active"] is False
     assert audit["executor_control"]["activity"] == "running"
-    assert _file_snapshot(repo) == before
+    assert _workspace_snapshot(repo) == before
     assert _file_snapshot(Path.home().parent) == before_user_state
 
 
@@ -164,14 +179,14 @@ def test_waiting_status_does_not_promise_an_exited_or_unknown_runner_will_contin
     waiting_run: tuple[Path, dict[str, Any]], host: str,
 ) -> None:
     repo, state = waiting_run
-    control_path = next((repo / ".agent-run/task-control").glob("*.json"))
+    control_path = next((managed_state(repo) / "task-control").glob("*.json"))
     if host == "unknown":
         control_path.unlink()
     else:
         control = json.loads(control_path.read_text())
         control["executor"].update(status="exited", pid=None)
         control_path.write_text(json.dumps(control))
-    before = _file_snapshot(repo)
+    before = _workspace_snapshot(repo)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
         assert "无需操作" not in output
@@ -191,7 +206,7 @@ def test_waiting_status_does_not_promise_an_exited_or_unknown_runner_will_contin
             assert "agent-run run" not in output
             assert "agent-run resume" not in output
         assert "最近 Agent" not in output
-    assert _file_snapshot(repo) == before
+    assert _workspace_snapshot(repo) == before
 
 
 def test_timed_out_wait_shows_human_time_and_current_recovery_action(
@@ -202,15 +217,15 @@ def test_timed_out_wait_shows_human_time_and_current_recovery_action(
         now=lambda: 1_010_000.0, sleeper=lambda _: pytest.fail("expired wait must not sleep"),
     )
     assert supervisor.before_retry(state) is False
-    (repo / ".agent-run/runs" / f"{state['run_id']}.json").write_text(json.dumps(state))
-    before = _file_snapshot(repo)
+    (managed_state(repo) / "runs" / f"{state['run_id']}.json").write_text(json.dumps(state))
+    before = _workspace_snapshot(repo)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
         assert "已超时" in output
         assert "agent-run resume 1 --repo example/project" in output
         assert "截止=" not in output
         assert "最近 Agent" not in output
-    assert _file_snapshot(repo) == before
+    assert _workspace_snapshot(repo) == before
 
 
 def test_unconfigured_checks_are_not_shown_as_a_successful_ci_run(
@@ -218,7 +233,7 @@ def test_unconfigured_checks_are_not_shown_as_a_successful_ci_run(
 ) -> None:
     repo, state = waiting_run
     state["run_publication"]["required_checks_evidence"].update(result="none", checks=[])
-    (repo / ".agent-run/runs" / f"{state['run_id']}.json").write_text(json.dumps(state))
+    (managed_state(repo) / "runs" / f"{state['run_id']}.json").write_text(json.dumps(state))
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
         assert "未配置合并前检查" in output
@@ -238,9 +253,9 @@ def test_credential_wait_explains_failure_without_raw_failure_class(
         now=lambda: 1_010_000.0, sleeper=lambda _: pytest.fail("expired wait must not sleep"),
     )
     assert supervisor.before_retry(state) is False
-    path = repo / ".agent-run/runs" / f"{state['run_id']}.json"
+    path = managed_state(repo) / "runs" / f"{state['run_id']}.json"
     path.write_text(json.dumps(state))
-    before = _file_snapshot(repo)
+    before = _workspace_snapshot(repo)
     for plain in (True, False):
         output = status_text(state["run_id"], plain=plain)
         assert "暂时无法取得 GitHub 工作凭据" in output
@@ -248,7 +263,7 @@ def test_credential_wait_explains_failure_without_raw_failure_class(
         assert "credential_unavailable" not in output
         assert "凭据 HTTP 状态" not in output
         assert "agent-run resume 1 --repo example/project" in output
-    assert _file_snapshot(repo) == before
+    assert _workspace_snapshot(repo) == before
 
 
 def test_waiting_status_does_not_invent_time_after_clock_discontinuity(
@@ -266,7 +281,8 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
-    StateStore(git_repo / ".agent-run").save_run("run-1", {
+    prepare_workspace(git_repo)
+    StateStore(managed_state(git_repo)).save_run("run-1", {
         "schema_version": 1, "run_id": "run-1", "status": "completed",
         "repository": "example/project", "parent": {"number": 1},
         "diagnostics": [], "delivery_cleanup": {
@@ -278,7 +294,7 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
             }},
         },
     })
-    before = _file_snapshot(git_repo)
+    before = _workspace_snapshot(git_repo)
     for command in ("status", "history"):
         result = invoke_cli_inprocess(git_repo, fixture, command, "run-1", "--plain")
         assert result.returncode == 0, result.stderr
@@ -294,4 +310,4 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
         assert cli.main(["status", "run-1", "--github-fixture", str(fixture)]) == 0
     assert "提交已变化" in Text.from_ansi(output.getvalue()).plain
     assert "/preserved/worktree" in Text.from_ansi(output.getvalue()).plain
-    assert _file_snapshot(git_repo) == before
+    assert _workspace_snapshot(git_repo) == before

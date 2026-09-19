@@ -14,6 +14,7 @@ import pytest
 from agent_run.executor_host import _process_start_token
 from cli_fixtures import run_agents
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import managed_state
 from test_cli import PROJECT_ROOT, load_only_run_state, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, publication
 
@@ -119,7 +120,6 @@ def _run_until_pending_window(
         if not environment.get("PYTHONPATH")
         else f"{source_path}{os.pathsep}{environment['PYTHONPATH']}"
     )
-    environment.setdefault("XDG_STATE_HOME", str(repo / ".agent-run-test-state"))
     process = subprocess.Popen(
         [
             sys.executable,
@@ -184,7 +184,7 @@ def _interrupt_run(process: subprocess.Popen[str], repo: Path) -> None:
         process.communicate(timeout=3)
     assert process.returncode is not None
     executors: list[tuple[int, str]] = []
-    for path in (repo / ".agent-run" / "task-control").glob("*.json"):
+    for path in (managed_state(repo) / "task-control").glob("*.json"):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

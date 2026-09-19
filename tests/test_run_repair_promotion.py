@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import prepare_workspace
+
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.delivery_history import history_records
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -441,30 +443,32 @@ def test_run_repair_default_drift_during_development_preserves_next_attempt(
 def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     git_repo: Path, candidate_requires_more_repair: bool, thread_policy: str
 ) -> None:
-    state, states, git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
     state.setdefault("policy_snapshot", {})["development_thread_policy"] = thread_policy
     states.save_run(str(state["run_id"]), state)
     successor_thread = (
         "run-repair-successor" if thread_policy == "new-per-attempt"
         else "run-repair-developer"
     )
-    fixture = git_repo / "github.json"
+    fixture = repo / "github.json"
     initial_default = git.resolve("main")
 
     class DefaultDriftingAfterMergePublisher(FixtureGitHubPublisher):
         def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
             super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
-            (git_repo / "default-drift-after-merge.txt").write_text(
+            (repo / "default-drift-after-merge.txt").write_text(
                 "advanced\n", encoding="utf-8"
             )
             subprocess.run(
                 ["git", "add", "default-drift-after-merge.txt"],
-                cwd=git_repo,
+                cwd=repo,
                 check=True,
             )
             subprocess.run(
                 ["git", "commit", "-m", "advance default after repair merge"],
-                cwd=git_repo,
+                cwd=repo,
                 check=True,
                 capture_output=True,
             )
@@ -628,7 +632,7 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     assert any(record.get("publication") for record in archived_records)
 
     history = invoke_cli_inprocess(
-        git_repo, fixture, "history", str(state["run_id"]), "--plain", "--details"
+        repo, fixture, "history", str(state["run_id"]), "--plain", "--details"
     )
     assert history.returncode == 0, history.stderr
     assert "开发说明" in history.stdout
@@ -645,8 +649,10 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
 def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
     publisher.ensure_final_run_ref(
         branch=str(state["run_branch"]),
@@ -690,17 +696,17 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     class DefaultDriftingAfterMergePublisher(FixtureGitHubPublisher):
         def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
             super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
-            (git_repo / "default-drift-after-required-check-repair.txt").write_text(
+            (repo / "default-drift-after-required-check-repair.txt").write_text(
                 "advanced\n", encoding="utf-8"
             )
             subprocess.run(
                 ["git", "add", "default-drift-after-required-check-repair.txt"],
-                cwd=git_repo,
+                cwd=repo,
                 check=True,
             )
             subprocess.run(
                 ["git", "commit", "-m", "advance default after required-check repair"],
-                cwd=git_repo,
+                cwd=repo,
                 check=True,
                 capture_output=True,
             )
@@ -711,14 +717,14 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     class StatusAssertingRepairAgents(ScriptedRunAgents):
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
             json_status = invoke_cli_inprocess(
-                git_repo,
+                repo,
                 fixture,
                 "status",
                 str(state["run_id"]),
                 "--json",
             )
             text_status = invoke_cli_inprocess(
-                git_repo,
+                repo,
                 fixture,
                 "status",
                 str(state["run_id"]),
@@ -786,14 +792,14 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                 states.save_run(str(state["run_id"]), gated)
 
                 gated_json_result = invoke_cli_inprocess(
-                    git_repo,
+                    repo,
                     fixture,
                     "status",
                     str(state["run_id"]),
                     "--json",
                 )
                 gated_text = invoke_cli_inprocess(
-                    git_repo,
+                    repo,
                     fixture,
                     "status",
                     str(state["run_id"]),
@@ -861,9 +867,9 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     assert len(second["run_acceptance"]["completed_repair_jobs"]) == 1
 
     json_status = stdout_json(
-        invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(repo, fixture, "status", str(state["run_id"]), "--json")
     )
-    text_status = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]))
+    text_status = invoke_cli_inprocess(repo, fixture, "status", str(state["run_id"]))
     assert json_status["phase"] == "stale"
     assert json_status["progress"]["current_object"] == "Run Publication"
     assert "阶段:       已失效" in text_status.stdout

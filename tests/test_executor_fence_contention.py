@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from conftest import seed_run, write_fixture
 from test_run_lifecycle import _isolated_environment
 from test_receipt_successors import _install_host
@@ -38,7 +40,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         monkeypatch.setenv(key, value)
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.find_unfinished_runs("example/project", 1)[0]
     run_id = state["run_id"]
     # Only a terminal Run now takes the read-only Stop preflight. Keep the
@@ -65,14 +67,14 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         operations = DirectRunOperations(
             controller=SimpleNamespace(states=states),
             states=states,
-            git=GitRepository(git_repo),
+            git=GitRepository(managed_repo(git_repo)),
             github_reader=object(),
             publisher_factory=object,
             agents=object(),
             before_external_step=fence,
         )
-        head = GitRepository(git_repo).checkout_head(git_repo)
-        (git_repo / "README.md").write_text("candidate\n")
+        head = GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo))
+        (managed_repo(git_repo) / "README.md").write_text("candidate\n")
         before_state = (states.runs_directory / f"{run_id}.json").read_bytes()
         before_control = control.path_for(task).read_bytes()
         host = _install_host(git_repo, fixture, monkeypatch, "running")
@@ -129,7 +131,7 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
         ):
             future = executor.submit(
                 operations.git.commit_candidate,
-                git_repo,
+                managed_repo(git_repo),
                 ticket_number=194,
                 attempt=1,
                 expected_head=head,
@@ -178,10 +180,10 @@ def test_cli_stop_preflight_contention_revalidates_before_commit(
                     future.result(timeout=5)
         assert dispatched == (["commit"] if revocation == "none" else [])
         if revocation == "none":
-            assert GitRepository(git_repo).checkout_head(git_repo) != head
+            assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) != head
             states.save_run(run_id, {**state, "status": "completed"})
         else:
-            assert GitRepository(git_repo).checkout_head(git_repo) == head
+            assert GitRepository(managed_repo(git_repo)).checkout_head(managed_repo(git_repo)) == head
             with pytest.raises(ActionReconciliationError):
                 states.save_run(run_id, {**state, "status": "completed"})
             assert (

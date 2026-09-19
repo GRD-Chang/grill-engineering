@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run.notification_cards import card
 from agent_run.notification_events import events, recovery_event
 from agent_run.notifications import read_notifications
@@ -148,7 +150,7 @@ raise SystemExit(main(sys.argv[1:]))
     assert "未配置合并前检查" in json.dumps(approval_card, ensure_ascii=False)
     assert "任务已完成" not in titles
     assert all(item["schema"] == "2.0" for item in cards)
-    journal = read_notifications(git_repo / ".agent-run", output["run_id"])
+    journal = read_notifications(managed_state(git_repo), output["run_id"])
     assert journal["seen"]
     if drain:
         assert any(record["outcome"] == "success" for record in journal["records"])
@@ -170,7 +172,7 @@ raise SystemExit(main(sys.argv[1:]))
         assert queried.returncode == 0, queried.stderr
         assert "notifications" in stdout_json(queried)
     assert (messages.read_bytes() if messages.exists() else b"") == before
-    assert read_notifications(git_repo / ".agent-run", output["run_id"]) == journal
+    assert read_notifications(managed_state(git_repo), output["run_id"]) == journal
     # Approval reuses the immutable Run configuration even after defaults change.
     UserDefaultsStore().configure(notifications={"enabled": False})
     approved = invoke("approve", output["run_id"])

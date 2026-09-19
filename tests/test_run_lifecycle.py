@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 from agent_run import cli
 from agent_run.agent_invocation import session_interruption_is_persisted
 from agent_run.executor_host import (
@@ -43,7 +45,7 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from conftest import seed_idle_control, seed_run, write_fixture
+from conftest import _user_environment, seed_idle_control, seed_run, write_fixture
 from cli_fixtures import run_agents
 from cli_run_supervision_support import _parent_only_agents
 from test_cli import load_only_run_state, run_cli, stdout_json
@@ -55,13 +57,7 @@ def _task(tmp_path: Path) -> TaskKey:
 
 
 def _isolated_environment(root: Path) -> dict[str, str]:
-    return {
-        "HOME": str(root / "home"),
-        "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_DATA_HOME": str(root / "data"),
-        "XDG_STATE_HOME": str(root / "state"),
-        "PATH": os.pathsep.join((str(Path(sys.executable).parent), "/usr/bin", "/bin")),
-    }
+    return _user_environment(root)
 
 
 def _file_snapshot(root: Path) -> dict[str, bytes]:
@@ -324,8 +320,9 @@ def test_task_control_lock_contention_fails_without_persistent_mutation(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    prepare_workspace(git_repo)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     lock_path = control.directory / f".{task.fingerprint}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     ready = tmp_path / "lock-ready"
@@ -354,7 +351,7 @@ def test_task_control_lock_contention_fails_without_persistent_mutation(
             if time.monotonic() >= deadline:
                 raise AssertionError("Task Control lock holder did not become ready")
             time.sleep(0.01)
-        before = _file_snapshot(git_repo / ".agent-run")
+        before = _file_snapshot(managed_state(git_repo))
         blocked = run_cli(
             git_repo,
             fixture,
@@ -362,12 +359,11 @@ def test_task_control_lock_contention_fails_without_persistent_mutation(
             "1",
             "--agent-fixture",
             str(agents),
-            extra_env=_isolated_environment(tmp_path / "busy"),
         )
 
         assert blocked.returncode == 2, f"{blocked.stdout}\n{blocked.stderr}"
         assert stdout_json(blocked)["diagnostics"][0]["code"] == "task_control"
-        assert _file_snapshot(git_repo / ".agent-run") == before
+        assert _file_snapshot(managed_state(git_repo)) == before
     finally:
         if holder.stdin is not None:
             holder.stdin.close()
@@ -1573,11 +1569,11 @@ def test_receipt_only_control_closes_once_after_exact_host_exit_proof(
     )
     assert interrupted.returncode == 2
 
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo, extra_env=environment)
     states = StateStore(state_root)
-    state = load_only_run_state(git_repo)
+    state = load_only_run_state(git_repo, extra_env=environment)
     run_id = str(state["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1)
     control = TaskControlStore(state_root)
     control_path = control.path_for(task)
     original_control = json.loads(control_path.read_text(encoding="utf-8"))
@@ -1804,13 +1800,8 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
     environment = os.environ.copy()
     environment.update(_isolated_environment(tmp_path / "concurrent"))
     source = str(Path(__file__).resolve().parents[1] / "src")
-    isolated_home = tmp_path / "home"
     environment.update(
         {
-            "HOME": str(isolated_home),
-            "XDG_CONFIG_HOME": str(isolated_home / "config"),
-            "XDG_DATA_HOME": str(isolated_home / "data"),
-            "XDG_STATE_HOME": str(isolated_home / "state"),
             "PATH": os.pathsep.join(
                 (str(Path(sys.executable).parent), "/usr/bin", "/bin")
             ),
@@ -1857,8 +1848,8 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
         stderr=subprocess.PIPE,
     )
 
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     state_before_conflict = state_path.read_bytes()
     control_before_conflict = control_path.read_bytes()
     conflict = subprocess.run(
@@ -1890,7 +1881,7 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
     assert sorted(submissions) == ["attached", "started"]
     _assert_public_action_receipt(first_output, submission=submissions[0])
     _assert_public_action_receipt(second_output, submission=submissions[1])
-    state = load_only_run_state(git_repo)
+    state = load_only_run_state(git_repo, extra_env=environment)
     assert state["status"] == "run_approval_pending"
     development_invocations = [
         invocation
@@ -1898,7 +1889,7 @@ def test_concurrent_public_runs_share_one_task_action_and_executor(
         if invocation.get("role") == "development"
     ]
     assert len(development_invocations) == 1
-    controls = list((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    controls = list((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     assert len(controls) == 1
     control_record = json.loads(controls[0].read_text(encoding="utf-8"))
     assert control_record["action"]["status"] == "completed"
@@ -2011,7 +2002,7 @@ def test_different_parent_runs_reach_agents_without_shared_state_lock(
             assert process.returncode == 0, f"{stdout}\n{stderr}"
         states = [
             json.loads(path.read_text(encoding="utf-8"))
-            for path in sorted((git_repo / ".agent-run" / "runs").glob("*.json"))
+            for path in sorted((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
         ]
         assert len(states) == 2
         assert {state["parent"]["number"] for state in states} == {1, 2}
@@ -2042,8 +2033,8 @@ def test_repeated_run_reuses_the_completed_action_after_receipt_loss(
         extra_env=environment,
     )
     first_output = stdout_json(first)
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     fixture_before = json.loads(fixture.read_text(encoding="utf-8"))
     state_before = state_path.read_bytes()
     control_before = control_path.read_bytes()
@@ -2067,7 +2058,7 @@ def test_repeated_run_reuses_the_completed_action_after_receipt_loss(
     assert json.loads(fixture.read_text(encoding="utf-8")) == fixture_before
     assert state_path.read_bytes() == state_before
     assert control_path.read_bytes() == control_before
-    state = load_only_run_state(git_repo)
+    state = load_only_run_state(git_repo, extra_env=environment)
     assert (
         sum(
             invocation.get("role") == "development"
@@ -2279,12 +2270,12 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
         extra_env=environment,
     )
     assert interrupted.returncode == 2
-    interrupted_state = load_only_run_state(git_repo)
+    interrupted_state = load_only_run_state(git_repo, extra_env=environment)
     receipt = interrupted_state.get("action_application_receipt")
     assert isinstance(receipt, dict)
     assert isinstance(receipt.get("action_id"), str)
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     interrupted_control = json.loads(control_path.read_text(encoding="utf-8"))
     interrupted_action = interrupted_control["action"]
     interrupted_fixture_bytes = fixture.read_bytes()
@@ -2337,7 +2328,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     assert operator_gate["work_subject"] == "ticket:3"
     assert operator_gate["action_kind"] == "execution_failure"
     assert operator_gate["reason"] == "session_interrupted"
-    recovered_state = load_only_run_state(git_repo)
+    recovered_state = load_only_run_state(git_repo, extra_env=environment)
     require_current_run_state(recovered_state)
     assert recovered_state["status"] == "execution_failed"
     assert recovered_state["terminal_kind"] == "execution_failed"
@@ -2417,11 +2408,11 @@ def test_session_closeout_retries_only_the_control_commit(
     )
     assert interrupted.returncode == 2
 
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo, extra_env=environment)
     states = StateStore(state_root)
-    initial = load_only_run_state(git_repo)
+    initial = load_only_run_state(git_repo, extra_env=environment)
     run_id = str(initial["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1)
 
     class CrashAfterRunSaveStore(TaskControlStore):
         injected = False
@@ -2572,11 +2563,11 @@ def test_repeated_run_fails_closed_after_action_acceptance_before_run_receipt(
         extra_env=environment,
     )
     assert interrupted.returncode == 2
-    interrupted_state = load_only_run_state(git_repo)
+    interrupted_state = load_only_run_state(git_repo, extra_env=environment)
     assert "action_application_receipt" not in interrupted_state
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
     interrupted_state_bytes = state_path.read_bytes()
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     interrupted_control = json.loads(control_path.read_text(encoding="utf-8"))
     interrupted_action = interrupted_control["action"]
 
@@ -2621,8 +2612,8 @@ def test_terminal_run_receipt_still_requires_host_exit_proof(
         extra_env=environment,
     )
     first_output = stdout_json(first)
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    state_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     state_before = state_path.read_bytes()
     fixture_before = fixture.read_bytes()
     if control_case == "missing":
@@ -2646,7 +2637,7 @@ def test_terminal_run_receipt_still_requires_host_exit_proof(
     _assert_public_action_receipt(first_output, submission="started")
     assert state_path.read_bytes() == state_before
     assert fixture.read_bytes() == fixture_before
-    repaired_controls = list((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    repaired_controls = list((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     assert len(repaired_controls) == 1
     repaired_control = json.loads(repaired_controls[0].read_text(encoding="utf-8"))
     repaired_action = repaired_control["action"]
@@ -2718,7 +2709,7 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
     )
     assert first.returncode == 2, f"{first.stdout}\n{first.stderr}"
 
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo, extra_env=environment)
     state_path = next((state_root / "runs").glob("*.json"))
     control_path = next((state_root / "task-control").glob("*.json"))
     original_control = json.loads(control_path.read_text(encoding="utf-8"))
@@ -2783,6 +2774,7 @@ def test_public_run_reconciles_receipt_only_control_before_replay(
         "GhGitHubReader",
         lambda _repo, *, working_directory: cli.FixtureGitHubReader(fixture),
     )
+    monkeypatch.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: cli.FixtureGitHubReader(fixture))
 
     control_after_first: bytes | None = None
     state_after_first: bytes | None = None
@@ -2845,8 +2837,8 @@ def test_status_and_history_do_not_touch_run_or_task_control(
     )
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     run_id = stdout_json(first)["run_id"]
-    run_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    run_path = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     run_before = run_path.read_bytes()
     control_before = control_path.read_bytes()
 
@@ -2893,7 +2885,7 @@ def test_status_and_history_mark_unavailable_task_control_unknown_without_writes
     )
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     run_id = stdout_json(first)["run_id"]
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     if control_case == "missing":
         control_path.unlink()
     elif control_case == "corrupt":
@@ -2982,7 +2974,7 @@ def test_status_and_history_project_only_read_only_host_proof(
     )
     assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
     run_id = stdout_json(first)["run_id"]
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
     control = json.loads(control_path.read_text(encoding="utf-8"))
     control["executor"]["status"] = (
         "absent"
@@ -3099,7 +3091,7 @@ def test_status_and_history_bypass_an_active_action_without_persistent_writes(
                 )
             time.sleep(0.01)
 
-        run_id = load_only_run_state(git_repo)["run_id"]
+        run_id = load_only_run_state(git_repo, extra_env=environment)["run_id"]
         persistent_roots = [git_repo, tmp_path / "read-only-active"]
         before = {str(root): _file_snapshot(root) for root in persistent_roots}
         for command_name in ("status", "history"):
@@ -3138,7 +3130,7 @@ def test_old_run_without_lifecycle_protocol_is_read_only_but_not_mutable(
     fixture = write_fixture(git_repo / "github.json", issues={"2": ticket()})
     started = seed_run(git_repo, fixture, "1")
     run_id = stdout_json(started)["run_id"]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state.pop("lifecycle_action_protocol")
     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -3211,7 +3203,7 @@ def test_custom_state_dir_cannot_fork_a_canonical_unfinished_run(
                 )
             time.sleep(0.01)
 
-        canonical_run = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+        canonical_run = next((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
         canonical_before = canonical_run.read_bytes()
         alternate_state = tmp_path / "alternate-state"
         blocked = run_cli(
@@ -3226,7 +3218,8 @@ def test_custom_state_dir_cannot_fork_a_canonical_unfinished_run(
             extra_env=environment,
         )
         assert blocked.returncode == 2
-        assert stdout_json(blocked)["diagnostics"][0]["code"] == "task_control"
+        assert stdout_json(blocked)["diagnostics"][0]["code"] == "command_failed"
+        assert "统一状态目录" in stdout_json(blocked)["diagnostics"][0]["message"]
         assert not list((alternate_state / "runs").glob("*.json"))
         assert canonical_run.read_bytes() == canonical_before
     finally:
@@ -3235,13 +3228,13 @@ def test_custom_state_dir_cannot_fork_a_canonical_unfinished_run(
     assert first.returncode == 0, f"{stdout}\n{stderr}"
 
 
-def test_default_run_routes_to_an_unfinished_custom_state_dir(
+def test_default_run_reuses_an_explicit_canonical_state_dir(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "custom-first")
-    custom_state = tmp_path / "custom-state"
+    custom_state = managed_state(git_repo, extra_env=environment)
 
     first = run_cli(
         git_repo,
@@ -3273,7 +3266,7 @@ def test_default_run_routes_to_an_unfinished_custom_state_dir(
     _assert_public_action_receipt(first_output, submission="started")
     _assert_public_action_receipt(repeated_output, submission="attached")
     assert len(list((custom_state / "runs").glob("*.json"))) == 1
-    assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+    assert not (git_repo / ".agent-run").exists()
 
 
 def test_default_run_interrupt_does_not_make_cli_a_run_writer(
@@ -3282,7 +3275,7 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
     environment = _isolated_environment(tmp_path / "custom-interrupt")
-    custom_state = tmp_path / "custom-interrupt-state"
+    custom_state = managed_state(git_repo, extra_env=environment)
     started = tmp_path / "custom-interrupt-started"
     release = tmp_path / "custom-interrupt-release"
 
@@ -3296,8 +3289,8 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
     )
     assert initial.returncode == 0, f"{initial.stdout}\n{initial.stderr}"
     seed_idle_control(
-        TaskControlStore(git_repo / ".agent-run"),
-        TaskKey(git_repo, "example/project", 1),
+        TaskControlStore(managed_state(git_repo, extra_env=environment)),
+        TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1),
         str(stdout_json(initial)["run_id"]),
         state_dir=custom_state,
     )
@@ -3354,7 +3347,7 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
         assert "<run-id>" not in stdout
         custom_run_id = str(json.loads(custom_run_path.read_text())["run_id"])
         assert custom_run_id not in stdout
-        control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+        control_path = next((managed_state(git_repo, extra_env=environment) / "task-control").glob("*.json"))
         control_during_observation_exit = json.loads(
             control_path.read_text(encoding="utf-8")
         )
@@ -3382,10 +3375,10 @@ def test_default_run_interrupt_does_not_make_cli_a_run_writer(
     assert final_control["action"]["status"] == "completed"
     assert final_control["executor"]["status"] == "exited"
     assert final_control["executor"]["failure"] is None
-    assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+    assert not (git_repo / ".agent-run").exists()
 
 
-def test_default_run_routes_to_a_custom_seeded_run(
+def test_default_run_rejects_noncanonical_state_in_task_control(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
@@ -3404,12 +3397,15 @@ def test_default_run_routes_to_a_custom_seeded_run(
     started_output = stdout_json(started)
     assert started.returncode == 0, f"{started.stdout}\n{started.stderr}"
     seed_idle_control(
-        TaskControlStore(git_repo / ".agent-run"),
-        TaskKey(git_repo, "example/project", 1),
+        TaskControlStore(managed_state(git_repo, extra_env=environment)),
+        TaskKey(managed_repo(git_repo, extra_env=environment), "example/project", 1),
         str(stdout_json(started)["run_id"]),
         state_dir=custom_state,
     )
 
+    before_state = _file_snapshot(custom_state)
+    before_control = _file_snapshot(managed_state(git_repo, extra_env=environment))
+    before_fixture = fixture.read_bytes()
     continued = run_cli(
         git_repo,
         fixture,
@@ -3421,14 +3417,16 @@ def test_default_run_routes_to_a_custom_seeded_run(
     )
     continued_output = stdout_json(continued)
 
-    assert continued.returncode == 0, f"{continued.stdout}\n{continued.stderr}"
-    assert continued_output["result"] == "resumed"
-    assert continued_output["run_id"] == started_output["run_id"]
+    assert continued.returncode == 2, f"{continued.stdout}\n{continued.stderr}"
+    assert continued_output["result"] == "error"
+    assert _file_snapshot(custom_state) == before_state
+    assert _file_snapshot(managed_state(git_repo, extra_env=environment)) == before_control
+    assert fixture.read_bytes() == before_fixture
     assert len(list((custom_state / "runs").glob("*.json"))) == 1
-    assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+    assert not list((managed_state(git_repo, extra_env=environment) / "runs").glob("*.json"))
 
 
-def test_default_run_attaches_to_custom_state_during_executor_handshake(
+def test_default_run_attaches_to_canonical_state_during_executor_handshake(
     git_repo: Path, tmp_path: Path
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
@@ -3446,7 +3444,7 @@ def test_default_run_attaches_to_custom_state_during_executor_handshake(
     environment = _isolated_environment(tmp_path / "custom-handshake")
     source = str(Path(__file__).resolve().parents[1] / "src")
     environment["PYTHONPATH"] = source
-    custom_state = tmp_path / "custom-handshake-state"
+    custom_state = managed_state(git_repo, extra_env=environment)
     command = [
         sys.executable,
         "-m",
@@ -3510,4 +3508,4 @@ def test_default_run_attaches_to_custom_state_during_executor_handshake(
         if first.poll() is None:
             first.communicate(timeout=30)
     assert len(list((custom_state / "runs").glob("*.json"))) == 1
-    assert not list((git_repo / ".agent-run" / "runs").glob("*.json"))
+    assert not (git_repo / ".agent-run").exists()

@@ -4,6 +4,8 @@ status: accepted
 
 # 每个 Delivery Task 由操作系统托管一个短生命周期 Executor
 
+后续修订：[ADR 0013](0013-runner-owned-delivery-workspace.md) 将 Local Delivery Workspace 改为 Runner 独立克隆，并将同一 Repository/Parent 的唯一性收敛到本机当前用户。下文以用户仓库根区分任务、要求维护者自行协调不同 clone 的规则由该 ADR 取代；Executor、Action 与任务级短锁合同继续适用。
+
 后续修订：[ADR 0011](0011-resume-interrupted-output-step.md) 为 Executor 仍存活时的 Worker 普通异常增加一次同 Thread 自动恢复，并对准确容量错误允许持续恢复，并明确失联状态的耗时展示。Executor 自身消失后不自动重放、等待显式恢复的规则继续适用。
 
 后续修订：[ADR 0012](0012-noncancellable-final-approval.md) 将最终批准定义为执行期间不可取消、失败后显式恢复的完整交付操作。下文 `approve` 在意图应用和握手后返回并释放准入的原规则，以及可在此后停止最终交付的含义，由该 ADR 取代；恢复原最终批准操作的 `resume` 同样适用。其他动作、终端独立性、短锁和执行者所有权合同保持不变。

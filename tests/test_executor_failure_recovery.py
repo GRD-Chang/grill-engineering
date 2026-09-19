@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
 from cli_fixtures import run_agents
 from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
+from test_cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import ticket
 
 
@@ -72,7 +73,8 @@ raise SystemExit(main(sys.argv[1:]))
     failed = subprocess.run(
         [sys.executable, "-c", script, "run", "1", "--json",
          "--github-fixture", str(fixture), "--agent-fixture", str(agents)],
-        cwd=git_repo, capture_output=True, text=True, check=False, timeout=30,
+        cwd=git_repo, env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")},
+        capture_output=True, text=True, check=False, timeout=30,
     )
 
     assert failed.returncode == 2, failed.stderr

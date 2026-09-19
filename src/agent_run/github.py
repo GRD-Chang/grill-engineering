@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent_run.github_retry import run_read_command
+from agent_run.git_output import git_environment
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
 
 
@@ -59,9 +60,10 @@ class GhGitHubReader:
         self._repository: Repository | None = None
 
     def repository_hint(self) -> str | None:
-        return self.repository_override or _repository_hint_from_origin(
+        identity = self.repository_override or _repository_hint_from_origin(
             self.working_directory
         )
+        return identity.lower() if identity else None
 
     def repository(self) -> Repository:
         arguments = ["repo", "view"]
@@ -301,6 +303,7 @@ def _repository_hint_from_origin(working_directory: Path | None) -> str | None:
         text=True,
         capture_output=True,
         check=False,
+        env=git_environment(),
     )
     if result.returncode != 0:
         return None

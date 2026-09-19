@@ -20,6 +20,7 @@ from agent_run.task_control import (
 )
 from cli_run_supervision_support import _parent_only_agents
 from conftest import write_fixture
+from support.workspace import managed_workspace
 from test_cli_delivery import ticket
 
 
@@ -52,6 +53,7 @@ import os
 from pathlib import Path
 import time
 
+from agent_run.managed_workspace import ManagedWorkspace
 from agent_run.task_control import (
     TaskControlBusyError,
     TaskControlStore,
@@ -123,8 +125,9 @@ elif role == "second":
     TaskControlStore._locked = held_lock
 
     def hold_same_parent_transaction():
-        store = TaskControlStore(Path.cwd() / ".agent-run")
-        task = TaskKey(Path.cwd(), "example/project", 1)
+        workspace = ManagedWorkspace.for_repository("example/project")
+        store = TaskControlStore(workspace.state_root)
+        task = TaskKey(workspace.repository_root, "example/project", 1)
         deadline = time.monotonic() + 10
         while True:
             record = store.load(task)
@@ -168,6 +171,7 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     agents.write_text(json.dumps(data), encoding="utf-8")
     environment = _isolated_environment(tmp_path / "generation")
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    workspace = managed_workspace(git_repo, extra_env=environment)
     command = [
         sys.executable,
         "-m",
@@ -189,23 +193,26 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
     )
     try:
         _wait_for_marker(process, started)
-        state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
-        control = TaskControlStore(git_repo / ".agent-run")
-        task = TaskKey(git_repo, "example/project", 1)
-        control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+        state_path = next((workspace.state_root / "runs").glob("*.json"))
+        control = TaskControlStore(workspace.state_root)
+        task = TaskKey(workspace.repository_root, "example/project", 1)
+        control_path = next((workspace.state_root / "task-control").glob("*.json"))
         record = json.loads(control_path.read_text(encoding="utf-8"))
         action_id = record["action"]["action_id"]
         generation = record["executor"]["generation"]
         state_before_release = state_path.read_bytes()
         fixture_before_release = fixture.read_bytes()
         agents_before_release = agents.read_bytes()
-        git_status_before_release = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=git_repo,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
+        git_status_before_release = {
+            repo: subprocess.run(
+                ["git", "status", "--short"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout
+            for repo in (git_repo, workspace.repository_root)
+        }
 
         control.mark_executor_absent(
             task, action_id=action_id, generation=generation
@@ -230,16 +237,16 @@ def test_fixture_executor_keeps_reserved_generation_after_replacement(
         assert state_path.read_bytes() == state_before_release
         assert fixture.read_bytes() == fixture_before_release
         assert agents.read_bytes() == agents_before_release
-        assert (
-            subprocess.run(
+        assert {
+            repo: subprocess.run(
                 ["git", "status", "--short"],
-                cwd=git_repo,
+                cwd=repo,
                 text=True,
                 capture_output=True,
                 check=True,
             ).stdout
-            == git_status_before_release
-        )
+            for repo in git_status_before_release
+        } == git_status_before_release
         current = control.load(task)
         assert current is not None
         assert current["executor"]["generation"] == successor.generation
@@ -291,6 +298,7 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
     base_environment["PYTHONPATH"] = (
         f"{sitecustomize}{os.pathsep}{source_path}"
     )
+    workspace = managed_workspace(git_repo, extra_env=base_environment)
     command = [
         sys.executable,
         "-m",
@@ -351,7 +359,7 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
         )
         _wait_for_marker(second, holder)
         control_path = next(
-            (git_repo / ".agent-run" / "task-control").glob("*.json")
+            (workspace.state_root / "task-control").glob("*.json")
         )
         record_before = json.loads(control_path.read_text(encoding="utf-8"))
         executor_before = record_before["executor"]
@@ -365,9 +373,9 @@ def test_real_cli_retries_state_commit_during_same_parent_contention(
         assert second.returncode == 0, f"{second_stdout}\n{second_stderr}"
         assert not holder_error.exists()
 
-        run_files = list((git_repo / ".agent-run" / "runs").glob("*.json"))
+        run_files = list((workspace.state_root / "runs").glob("*.json"))
         control_files = list(
-            (git_repo / ".agent-run" / "task-control").glob("*.json")
+            (workspace.state_root / "task-control").glob("*.json")
         )
         assert len(run_files) == 1
         assert len(control_files) == 1

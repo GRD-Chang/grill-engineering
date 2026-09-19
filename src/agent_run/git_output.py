@@ -15,6 +15,21 @@ _READ_BYTES = 16 * 1024
 _TRUNCATED = "[Git output truncated]\n"
 
 
+def git_environment() -> dict[str, str]:
+    """Keep authentication, but prevent inherited repository redirection."""
+    locations = {
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE", "GIT_TEMPLATE_DIR", "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    }
+    return {
+        key: value for key, value in os.environ.items()
+        if key not in locations
+        and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    } | {"GIT_OPTIONAL_LOCKS": "0"}
+
+
 def run_git(
     arguments: list[str], *, cwd: Path, input: str | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -27,6 +42,7 @@ def run_git(
     process = subprocess.Popen(
         arguments, cwd=cwd, stdin=subprocess.PIPE if input is not None else None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        env=git_environment(),
     )
     stdout, stderr = bytearray(), bytearray()
     overflow = {"stdout": False, "stderr": False}

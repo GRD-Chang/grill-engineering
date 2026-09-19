@@ -6,7 +6,7 @@ You are the engineer responsible for installing and running `agent-run` for the 
 Deliver actual results, verification evidence, unmet requirements, and next steps. For installation-only requests, stop after setup. For run requests, follow the task to completion or a boundary requiring human action.
 
 Follow the user's instructions and the target repository's `AGENTS.md`. Use current Issue/PR data, the installed version's `--help`, and query results as evidence.
-Read documentation matching the selected source version. Record the tool source directory, target repository directory, and `OWNER/REPO`.
+Read documentation matching the selected source version. Record the tool source directory, target `OWNER/REPO`, and user checkout directory if used.
 
 ## Choose an entry point
 
@@ -27,7 +27,7 @@ Read only the relevant branch and its required references. Detailed operation re
    When subtasks exist, verify native GitHub sub-issues and `blockedBy` relationships; body lists do not define the task graph.
    With no subtasks, use Parent-only delivery. Eligible tasks must be open, have `ready-for-agent`, and have none of `needs-triage`, `needs-info`, or `ready-for-human`. Unresolved blockers prevent selection.
 
-2. Locate and start the task from the target repository with its project environment configured. Replace placeholders with actual values:
+2. Locate and start the task from a shell with the project environment configured. With `--repo`, commands work from any directory; inside a user checkout, omit it to discover the remote without modifying that checkout. Replace placeholders with actual values:
 
    ```bash
    agent-run runs --repo OWNER/REPO
@@ -35,7 +35,9 @@ Read only the relevant branch and its required references. Detailed operation re
    agent-run status --parent <parent-issue> --repo OWNER/REPO --json
    ```
 
-   `run` creates or attaches to the unfinished task for the same Parent. Follow query instructions when human action is pending.
+   Runner clones the remote independently and leaves the user checkout unchanged. Only pushed content reaches the Agent; users update their own files, index, and branches.
+   On first creation, the managed clone inherits only the effective Git `user.name` and `user.email` from the launch environment, without copying other repository-local Git settings.
+   For the same local user, `run` creates or attaches to one unfinished task for the same Repository/Parent, regardless of the launch directory. Follow query instructions when human action is pending.
    If multiple candidates exist, resolve repository and Parent identity rather than choosing the most recent. A command returning does not mean delivery is complete.
 
 3. Use `status` for the current work and next action. For process evidence, read
@@ -48,7 +50,7 @@ Report status, PR links if any, actual acceptance/required-check results, and ou
 ## Human action and recovery
 
 Before changing run state, read the [command boundary table](agent-run.md#命令边界与状态轮转) and select the action for the current state.
-Run mutation commands from the target repository with the actual Parent and `--repo OWNER/REPO`.
+Run mutation commands from any directory with the actual Parent and `--repo OWNER/REPO`.
 
 | Situation | Action |
 | --- | --- |
@@ -61,4 +63,4 @@ Run mutation commands from the target repository with the actual Parent and `--r
 | Pause | Use `stop`; Ctrl-C or closing the terminal only ends observation, while the background task continues |
 | Abandon | Follow `abandon` boundaries; preserve uncommitted work by default and require explicit authorization for forced discard |
 
-For exhausted limits, changed scope, or incompatible state, report the decision needed. Recover through the public CLI; never edit `.agent-run` state to bypass gates.
+For exhausted limits, changed scope, or incompatible state, report the decision needed. Recover through the public CLI; never edit persistent run state to bypass gates. See [local state and cleanup](agent-run.md#本地状态与清理) for directory ownership and retention.

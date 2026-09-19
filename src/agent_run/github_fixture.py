@@ -89,7 +89,7 @@ class FixtureGitHubReader:
     def repository_hint(self) -> str | None:
         self.data = self._load()
         repository = self.data.get("repository")
-        return repository if isinstance(repository, str) else None
+        return repository.lower() if isinstance(repository, str) else None
 
     def delivery_graph(self, parent_number: int) -> DeliveryGraph:
         return self._delivery_graph_once(parent_number)
@@ -1093,7 +1093,7 @@ class FixtureGitHubPublisher:
             ]
             evidence["checks"] = annotate_configured_code_failures(
                 normalized_checks,
-                self.path.parent,
+                self.git.root,
                 expected_head_sha=expected_head_sha,
             )
         return evidence

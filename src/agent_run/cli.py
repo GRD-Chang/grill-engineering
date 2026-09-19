@@ -12,6 +12,7 @@ from typing import Any, Sequence
 
 from agent_run import cli_presentation, cli_surface
 from agent_run import doctor
+from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
 from agent_run import settings_cli
 from agent_run.agent_fixture import FixtureAgentBackend
@@ -34,6 +35,8 @@ from agent_run.delivery_policy import (
     policy_snapshot_for_state,
     resolve_delivery_policy,
 )
+from agent_run.managed_workspace import workspace_for_root, workspace_state_root, validate_data_root
+from agent_run.workspace_cli import open_workspace, selected_repository_root
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
 from agent_run.github_auth_profile import (
@@ -369,7 +372,11 @@ def _main_with_parser_resources(
     control_failure: str | None = None
     command_dispatched = False
     executor_binding: tuple[str, int] | None = None
+    bootstrap_host: SystemdUserExecutorHost | None = None
+    runner_lease_fd: int | None = None
     try:
+        if getattr(parsed, "repo", None):
+            parsed.repo = parsed.repo.lower()
         _validate_explicit_policy_options(parsed)
         delivery_policy_provider = (
             (lambda: _resolve_delivery_policy(parsed))
@@ -409,12 +416,38 @@ def _main_with_parser_resources(
                     details=parsed.details,
                 )
             return 0
-        git = GitRepository.discover(Path.cwd())
-        state_root = (
-            Path(parsed.state_dir).resolve()
-            if parsed.state_dir
-            else git.root / ".agent-run"
+        target_root = selected_repository_root(parsed.repo, parsed.github_fixture)
+        if (
+            parsed.command == "run" and parsed.github_fixture is None
+            and target_root is not None and not target_root.exists()
+        ):
+            validate_data_root()
+            if not _running_active_runner():
+                raise ExecutionReadinessError(
+                    "self-hosting lifecycle commands require an installed Active Runner"
+                )
+            usage_lease = resources.enter_context(
+                runner_usage_lease(default_runner_lock_path())
+            )
+            runner_lease_fd = usage_lease.fileno()
+            bootstrap_host = SystemdUserExecutorHost(
+                runtime_directory=_executor_runtime_directory(),
+                environment=dict(os.environ),
+                executor_python=Path(sys.executable),
+                runner_lease_fd=runner_lease_fd,
+            )
+            try:
+                bootstrap_host.check_readiness()
+            except SystemdExecutionReadinessError as error:
+                raise ExecutionReadinessError(str(error)) from error
+        git = open_workspace(
+            parsed.repo, parsed.github_fixture, create=parsed.command == "run"
         )
+        state_root = workspace_state_root(git.root)
+        if parsed.state_dir and Path(parsed.state_dir).resolve() != state_root.resolve():
+            raise ValueError(
+                "变更命令不能覆盖 Runner 的统一状态目录；请通过 XDG_DATA_HOME 设置数据根目录。"
+            )
         fixture_path = Path(parsed.github_fixture) if parsed.github_fixture else None
         github = (
             FixtureGitHubReader(fixture_path)
@@ -475,7 +508,7 @@ def _main_with_parser_resources(
         control_record: dict[str, Any] | None = None
         if parsed.command == "run" and executor_binding is None:
             task = _task_for_parent(parsed, github, git)
-            control = TaskControlStore(git.root / ".agent-run")
+            control = TaskControlStore(workspace_state_root(git.root))
             try:
                 control_record = control.load(task)
             except TaskControlError:
@@ -518,11 +551,11 @@ def _main_with_parser_resources(
         ):
             _reject_conflicting_stop_action(parsed, states, git)
         execution_required = executor_backed and read_only_stop_state is None
-        runner_lease_fd: int | None = None
         if (
             execution_required
             and fixture_path is None
             and executor_binding is None
+            and runner_lease_fd is None
         ):
             usage_lease = resources.enter_context(
                 runner_usage_lease(default_runner_lock_path())
@@ -541,14 +574,15 @@ def _main_with_parser_resources(
                 action_id=executor_binding[0], generation=executor_binding[1]
             )
         elif execution_required:
-            systemd_host = SystemdUserExecutorHost(
+            systemd_host = bootstrap_host or SystemdUserExecutorHost(
                 runtime_directory=_executor_runtime_directory(),
                 environment=dict(os.environ),
                 executor_python=Path(sys.executable),
                 runner_lease_fd=runner_lease_fd,
             )
             try:
-                systemd_host.check_readiness()
+                if bootstrap_host is None:
+                    systemd_host.check_readiness()
             except SystemdExecutionReadinessError as error:
                 raise ExecutionReadinessError(str(error)) from error
             executor_host = systemd_host
@@ -813,22 +847,8 @@ def _main_with_parser_resources(
         ):
             try:
                 task = _task_for_parent(parsed, github, git)
-                control_record = TaskControlStore(git.root / ".agent-run").load(task)
-                bound_root = _control_state_root(control_record)
-                if bound_root is not None and bound_root != states.root.resolve():
-                    interrupt_states = StateStore(bound_root)
-                    interrupt_controller = Controller(
-                        github,
-                        git,
-                        interrupt_states,
-                        locator=RunLocatorIndex.default(),
-                        profiles=AgentProfileStore(bound_root),
-                        delivery_policy_provider=(
-                            controller.delivery_policy_provider
-                            if controller is not None
-                            else None
-                        ),
-                    )
+                control_record = TaskControlStore(workspace_state_root(git.root)).load(task)
+                _require_managed_state(states, git, control_record)
                 if isinstance(control_record, Mapping):
                     control_run_id = control_record.get("run_id")
                     if not isinstance(control_run_id, str):
@@ -1320,7 +1340,7 @@ def _read_only_stop_result(
     if not isinstance(repository, str) or type(parent_number) is not int:
         raise TaskControlError("Delivery Run 缺少准确 Delivery Task identity")
     task = TaskKey(git.root, repository, parent_number)
-    control = TaskControlStore(git.root / ".agent-run")
+    control = TaskControlStore(workspace_state_root(git.root))
     try:
         if not control.proves_read_only_stop(task, state):
             return None
@@ -1347,7 +1367,7 @@ def _reject_conflicting_stop_action(
         raise TaskControlError("Delivery Run 缺少准确 Delivery Task identity")
     task = TaskKey(git.root, repository, parent_number)
     try:
-        record = TaskControlStore(git.root / ".agent-run").load(task)
+        record = TaskControlStore(workspace_state_root(git.root)).load(task)
     except TaskControlError:
         return
     action = record.get("action") if isinstance(record, Mapping) else None
@@ -1398,33 +1418,9 @@ def _read_only_run_preflight(
 ) -> dict[str, Any] | None:
     """Locate one existing Run without readiness probes or reconciliation writes."""
 
-    requested_root = states.root.resolve()
-    canonical_root = (git.root / ".agent-run").resolve()
-    requested_current = _preflight_run(task, states)
-    bound_root = _control_state_root(control_record)
-    located_root = _located_unfinished_state_root(task, requested_root)
-    if bound_root is not None and located_root is not None:
-        if bound_root != located_root:
-            raise ValueError(
-                "Task Control 与 Run 定位索引指向多个未完成 state directory"
-            )
-    elif bound_root is None and located_root is not None:
-        if requested_root != canonical_root:
-            raise TaskControlError(
-                "同一 Delivery Task 已在另一个 state directory 拥有未完成 Run；"
-                "不会创建第二个 Run"
-            )
-        bound_root = located_root
-    if bound_root is None or bound_root == requested_root:
-        return requested_current
-
-    current = _preflight_run(task, _state_store_for_run(parsed, bound_root))
-    if requested_current is not None and (
-        current is None
-        or requested_current.get("run_id") != current.get("run_id")
-    ):
-        raise ValueError("同一 Delivery Task 在多个 state directory 存在未完成 Run")
-    return current
+    _require_managed_state(states, git, control_record)
+    _require_managed_locator(task, states.root.resolve())
+    return _preflight_run(task, states)
 
 
 def _lifecycle_result_succeeded(
@@ -1439,26 +1435,16 @@ def _lifecycle_result_succeeded(
     )
 
 
-def _located_unfinished_state_root(task: TaskKey, requested_root: Path) -> Path | None:
-    """Find an unfinished Run registered for this checkout in another root."""
+def _require_managed_locator(task: TaskKey, requested_root: Path) -> None:
+    """Reject historical bindings that would escape the managed state directory."""
 
-    candidate_roots: set[Path] = set()
     for entry in RunLocatorIndex.default().entries():
         if Path(entry["repository_root"]).resolve() != task.workspace:
             continue
-        candidate_root = Path(entry["state_dir"]).resolve()
-        if candidate_root != requested_root:
-            candidate_roots.add(candidate_root)
-    roots: set[Path] = set()
-    for candidate_root in candidate_roots:
-        if _preflight_run(task, StateStore(candidate_root)) is not None:
-            roots.add(candidate_root)
-    if len(roots) > 1:
-        rendered = ", ".join(str(root) for root in sorted(roots))
-        raise ValueError(
-            "同一 Delivery Task 在多个 state directory 存在未完成 Run: " f"{rendered}"
-        )
-    return next(iter(roots), None)
+        if entry.get("parent_number") not in (None, task.parent_number):
+            continue
+        if Path(entry["state_dir"]).resolve() != requested_root:
+            raise TaskControlError("任务索引指向非统一状态目录；不会恢复或写入旧任务目录")
 
 
 def _run_action_payload(
@@ -1610,14 +1596,15 @@ def _run_control_action(
     if not isinstance(run_id, str) or run_id != parsed.run_id:
         raise TaskControlError(f"{kind} selector 与当前 Delivery Run 不匹配")
     task = _task_for_parent(parsed, github, git)
-    control = TaskControlStore(git.root / ".agent-run")
+    control = TaskControlStore(workspace_state_root(git.root))
+    try:
+        existing = control.load(task)
+    except TaskControlError:
+        existing = None
+    _require_managed_state(states, git, existing)
     payload: dict[str, Any] = {"parent": parsed.parent, "run_id": run_id}
     if kind == "abandon":
         payload["discard_worktree"] = bool(parsed.discard_worktree)
-        try:
-            existing = control.load(task)
-        except TaskControlError:
-            existing = None
         existing_action = (
             existing.get("action") if isinstance(existing, Mapping) else None
         )
@@ -1656,10 +1643,8 @@ def _run_control_action(
             and isinstance(action.get("target_executor"), Mapping)
             else None
         )
+        _require_managed_state(states, git, record)
         bound_states = states
-        bound_root = _control_state_root(record)
-        if bound_root is not None and bound_root != states.root.resolve():
-            bound_states = _state_store_for_run(parsed, bound_root)
 
         def assert_current() -> None:
             control.assert_executor_current(
@@ -1678,11 +1663,7 @@ def _run_control_action(
                 run_id=bound_run_id,
             ),
         )
-        bound_profiles = (
-            profiles
-            if bound_states.root.resolve() == states.root.resolve()
-            else AgentProfileStore(bound_states.root)
-        )
+        bound_profiles = profiles
         bound_controller = Controller(
             github,
             git,
@@ -1852,10 +1833,8 @@ def _run_lifecycle(
     if action_kind not in {"run", "resume", "approve", "revise", "requeue"}:
         raise ValueError("unsupported Executor-backed lifecycle action")
     task = _task_for_parent(parsed, github, git)
-    # Task Control belongs to the canonical Local Delivery Workspace, not to
-    # an optional state-dir selected for a particular Run record.  This keeps
-    # two clients in the same checkout inside one admission domain.
-    control = TaskControlStore(git.root / ".agent-run")
+    # Every user checkout for this remote shares one managed admission domain.
+    control = TaskControlStore(workspace_state_root(git.root))
     current = (
         _preflight_run(task, states)
         if action_kind == "run"
@@ -1871,57 +1850,13 @@ def _run_lifecycle(
         # Reconciliation below may replace a corrupt record from an exact Run
         # receipt.  Do not let this read-only inspection mask that path.
         existing_control = None
+    _require_managed_state(states, git, existing_control)
+    if action_kind == "run":
+        _require_managed_locator(task, states.root.resolve())
     if existing_control is not None:
         existing_control = _reconcile_existing_control(
             control, task, current, state_dir=states.root
         )
-    requested_state_root = states.root.resolve()
-    canonical_state_root = (git.root / ".agent-run").resolve()
-    bound_state_root = _control_state_root(existing_control)
-    located_state_root = (
-        _located_unfinished_state_root(task, requested_state_root)
-        if action_kind == "run"
-        else None
-    )
-    if bound_state_root is not None and located_state_root is not None:
-        if bound_state_root != located_state_root:
-            raise ValueError(
-                "Task Control 与 Run 定位索引指向多个未完成 state directory"
-            )
-    elif bound_state_root is None and located_state_root is not None:
-        if requested_state_root == canonical_state_root:
-            bound_state_root = located_state_root
-        else:
-            raise TaskControlError(
-                "同一 Delivery Task 已在另一个 state directory 拥有未完成 Run；"
-                "不会创建第二个 Run"
-            )
-    if bound_state_root is not None and bound_state_root != requested_state_root:
-        requested_current = current
-        states = _state_store_for_run(parsed, bound_state_root)
-        profiles = AgentProfileStore(bound_state_root)
-        controller = Controller(
-            github,
-            git,
-            states,
-            locator=RunLocatorIndex.default(),
-            profiles=profiles,
-            delivery_policy_provider=controller.delivery_policy_provider,
-        )
-        current = (
-            _preflight_run(task, states)
-            if action_kind == "run"
-            else states.load_current_run(parsed.run_id)
-        )
-        if requested_current is not None:
-            if current is None or requested_current.get("run_id") != current.get(
-                "run_id"
-            ):
-                raise ValueError(
-                    "同一 Delivery Task 在多个 state directory 存在未完成 Run"
-                )
-        if current is not None:
-            controller._require_current_checkout(current)
     if current is not None and current.get("action_application_receipt") is None:
         existing_control = _reconcile_existing_control(
             control, task, current, state_dir=states.root
@@ -1934,29 +1869,6 @@ def _run_lifecycle(
         if isinstance(existing_control, dict)
         else None
     )
-    if action_kind == "run" and (
-        requested_state_root != canonical_state_root
-        and bound_state_root != requested_state_root
-    ):
-        # An explicitly selected alternate directory must not fork a Run that
-        # the canonical checkout already owns.  The reverse direction is
-        # handled above by routing the canonical command to the recorded Run.
-        canonical_current = _preflight_run(task, StateStore(canonical_state_root))
-        if canonical_current is not None:
-            raise TaskControlError(
-                "当前 Local Delivery Workspace 已有未完成 Run；"
-                "不会在另一个 state directory 创建第二个 Run"
-            )
-        if (
-            bound_state_root is None
-            and isinstance(existing_action, dict)
-            and existing_action.get("status") in {"accepted", "applying"}
-            and existing_action.get("run_id") is None
-            and current is None
-        ):
-            raise TaskControlError(
-                "当前 Lifecycle Action 尚未绑定 Run；不会在另一个 state directory 创建 Run"
-            )
     preflight_override = current
     if (
         action_kind == "run"
@@ -2043,7 +1955,7 @@ def _run_lifecycle(
             # admitting a successor Action or preparing a new Executor session,
             # even when run carries explicit Profile options.
             repository = github.repository()
-            if repository.name_with_owner != task.repository:
+            if not same_repository(repository.name_with_owner, task.repository):
                 raise TaskControlError(
                     "configured GitHub repository does not match the Delivery Run"
                 )
@@ -2116,7 +2028,6 @@ def _run_lifecycle(
                 raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
             payload = _mutation_action_payload(parsed, current)
 
-    base_state_root = states.root.resolve()
 
     def current_executor_binding() -> tuple[str, int, str | None]:
         record = control.load(task)
@@ -2205,10 +2116,8 @@ def _run_lifecycle(
             if binding is not None
             else control.load(task)
         )
-        bound_root = _control_state_root(current_control)
-        if bound_root is None or bound_root == base_state_root:
-            return states
-        return _state_store_for_run(parsed, bound_root)
+        _require_managed_state(states, git, current_control)
+        return states
 
     def lifecycle_components(
         run_states: StateStore,
@@ -2218,18 +2127,7 @@ def _run_lifecycle(
         run_states._set_write_guard(
             fence, transaction=transaction
         )
-        run_root = run_states.root.resolve()
-        if run_root == base_state_root:
-            return profiles, controller
-        run_profiles = AgentProfileStore(run_root)
-        return run_profiles, Controller(
-            github,
-            git,
-            run_states,
-            locator=RunLocatorIndex.default(),
-            profiles=run_profiles,
-            delivery_policy_provider=controller.delivery_policy_provider,
-        )
+        return profiles, controller
 
     def lifecycle_driver_factory(
         run_states: StateStore,
@@ -2595,13 +2493,17 @@ def _reconcile_existing_control(
     return control.reconcile_from_run(task, current, state_dir=state_dir)
 
 
-def _state_store_for_run(
-    parsed: argparse.Namespace, state_root: Path
-) -> StateStore | FaultInjectingStateStore:
-    crash_after_save = getattr(parsed, "crash_after_save", None)
-    if isinstance(crash_after_save, int):
-        return FaultInjectingStateStore(state_root, crash_after_save=crash_after_save)
-    return StateStore(state_root)
+def _require_managed_state(
+    states: StateStore,
+    git: GitRepository,
+    control_record: Mapping[str, Any] | None,
+) -> None:
+    canonical_root = workspace_state_root(git.root).resolve()
+    bound_root = _control_state_root(control_record)
+    if states.root.resolve() != canonical_root or (
+        bound_root is not None and bound_root != canonical_root
+    ):
+        raise TaskControlError("任务指向非统一状态目录；不会恢复或写入旧任务目录")
 
 
 def _control_state_root(control_record: Mapping[str, Any] | None) -> Path | None:
@@ -2691,7 +2593,7 @@ def _reconcile_resume_exit(
     if host is None or current.get("status") == "abandoned":
         return current
     task = _task_for_parent(parsed, github, git)
-    control = TaskControlStore(git.root / ".agent-run")
+    control = TaskControlStore(workspace_state_root(git.root))
     try:
         record = control.inspect_run(task, current)
     except TaskControlError:
@@ -2787,7 +2689,7 @@ def _resume_action_is_attachable(
 
     task = _task_for_parent(parsed, github, git)
     try:
-        record = TaskControlStore(git.root / ".agent-run").load(task)
+        record = TaskControlStore(workspace_state_root(git.root)).load(task)
     except TaskControlError:
         return False
     action = record.get("action") if isinstance(record, Mapping) else None
@@ -2828,7 +2730,7 @@ def _lifecycle_action_is_attachable(
 
     task = _task_for_parent(parsed, github, git)
     try:
-        record = TaskControlStore(git.root / ".agent-run").load(task)
+        record = TaskControlStore(workspace_state_root(git.root)).load(task)
     except TaskControlError:
         record = None
     if record is None:
@@ -2907,7 +2809,7 @@ def _reject_if_task_action_pending(
     if not isinstance(expected, str) or git.checkout_identity() != expected:
         return None
     task = TaskKey(git.root, repository, number)
-    control = TaskControlStore(git.root / ".agent-run")
+    control = TaskControlStore(workspace_state_root(git.root))
     receipt = (
         run_state.get("action_application_receipt")
         if run_state is not None
@@ -3010,12 +2912,7 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
             "否则请从目标仓库运行无参数命令。",
             [],
         )
-    selector_root: Path | None = None
-    if parsed.repo is None:
-        try:
-            selector_root = GitRepository.discover(Path.cwd()).root
-        except GitError:
-            pass
+    selector_root = selected_repository_root(parsed.repo, parsed.github_fixture)
     records = _selector_records(parsed, read_only=True)
     public, state = _select_one_record(
         records,
@@ -3134,13 +3031,13 @@ def _reject_local_repository_mismatch(
     if repository is None:
         return
     _validate_repository_name(repository)
-    local_records = _read_state_directory(git.root / ".agent-run", git.root)
+    local_records = _read_state_directory(workspace_state_root(git.root), git.root)
     mismatches = [
         public
         for public, state in local_records
         if state is not None
         and public.get("parent") == parent_number
-        and public.get("repository") != repository
+        and not same_repository(public.get("repository"), repository)
     ]
     if mismatches:
         raise _selector_error(
@@ -3178,7 +3075,7 @@ def _select_attached_action_run(
     if len(repositories) != 1:
         raise selection_error
     repository = next(iter(repositories))
-    record = TaskControlStore(git.root / ".agent-run").load(
+    record = TaskControlStore(workspace_state_root(git.root)).load(
         TaskKey(git.root, repository, parent_number)
     )
     action = record.get("action") if isinstance(record, Mapping) else None
@@ -3271,7 +3168,7 @@ def _resolve_resume_selection(
         if not isinstance(repository, str) or parent_value != parent_number:
             raise selection_error
         task = TaskKey(git.root, repository, parent_number)
-        record = TaskControlStore(git.root / ".agent-run").load(task)
+        record = TaskControlStore(workspace_state_root(git.root)).load(task)
         action = record.get("action") if isinstance(record, Mapping) else None
         executor = record.get("executor") if isinstance(record, Mapping) else None
         executor_active = (
@@ -3309,15 +3206,15 @@ def _selected_local_run_id(
     ):
         raise _selector_error(
             "run_selector_requires_checkout",
-            f"{command} 选择到的 Run 不属于当前 checkout；请切换到候选工作目录，"
-            "或使用完整 Run ID 与 --state-dir 走精确操作路径。",
+            f"{command} 选择到的 Run 不属于此仓库的 Runner 工作区；"
+            "请使用 --repo 指定正确的仓库。",
             [selected],
         )
     selected_state_dir = selected.get("state_dir")
     expected_state_dir = (
         Path(parsed.state_dir).resolve()
         if parsed.state_dir
-        else (git.root / ".agent-run").resolve()
+        else (workspace_state_root(git.root)).resolve()
     )
     if (
         not isinstance(selected_state_dir, str)
@@ -3325,8 +3222,8 @@ def _selected_local_run_id(
     ):
         raise _selector_error(
             "run_selector_requires_state_dir",
-            f"{command} 选择到的 Run 不在当前使用的 state directory；"
-            "请显式提供候选的 --state-dir 与当前 checkout。",
+            f"{command} 选择到的 Run 不在 Runner 的统一状态目录中；"
+            "不支持继续执行旧目录中的任务。",
             [selected],
         )
     return selected_run_id
@@ -3347,17 +3244,17 @@ def _load_exact_read_only_run(
             state = None
     else:
         try:
-            git = GitRepository.discover(Path.cwd())
-        except GitError:
+            git = open_workspace(parsed.repo, parsed.github_fixture, create=False)
+        except (GitError, RunLocatorError):
             git = None
         state = None
         if git is not None:
-            state = _load_read_only_state(StateStore(git.root / ".agent-run"), run_id)
+            state = _load_read_only_state(StateStore(workspace_state_root(git.root)), run_id)
             if state is not None and state.get("run_id") != run_id:
                 state = None
             elif state is not None:
                 repository_root = git.root
-                state_root = git.root / ".agent-run"
+                state_root = workspace_state_root(git.root)
         if state is None:
             locator = RunLocatorIndex.default()
             state_dir = locator.resolve_state_dir(run_id)
@@ -3418,10 +3315,10 @@ def _with_executor_control(
         return projected
     task = TaskKey(repository_root, repository, parent_number)
     try:
-        record = TaskControlStore(repository_root / ".agent-run").inspect_run(
+        record = TaskControlStore(workspace_state_root(repository_root)).inspect_run(
             task, state
         )
-    except (OSError, TaskControlError):
+    except (GitError, OSError, TaskControlError):
         projected["_executor_control"] = {
             "activity": "unknown",
             "reason": "task_control_invalid",
@@ -3490,7 +3387,7 @@ def _with_executor_control(
             try:
                 observation = observe_systemd_executor(
                     spec,
-                    TaskControlStore(repository_root / ".agent-run"),
+                    TaskControlStore(workspace_state_root(repository_root)),
                     runtime_directory=_executor_runtime_directory(),
                     executor_python=Path(sys.executable),
                 )
@@ -3602,21 +3499,19 @@ def _selector_records(
             records = [
                 record
                 for record in records
-                if record[0].get("repository") == repository
+                if same_repository(record[0].get("repository"), repository)
                 or record[0].get("repository") is None
             ]
         return records
 
-    if current_root is None and repository is None:
-        try:
-            current_root = GitRepository.discover(Path.cwd()).root
-        except GitError as error:
+    if current_root is None:
+        current_root = selected_repository_root(repository, parsed.github_fixture)
+        if current_root is None and repository is None:
             raise _selector_error(
                 "run_selector_context",
-                "无法从当前目录确定仓库；请使用 --repo <owner/name> --parent <issue>，"
-                "或显式提供 --state-dir。",
+                "无法从当前目录确定仓库；请使用 --repo <owner/name> --parent <issue>。",
                 [],
-            ) from error
+            )
 
     locator = RunLocatorIndex.default()
     entries = locator.entries()
@@ -3632,8 +3527,8 @@ def _selector_records(
     # A current checkout is an already-known, bounded location.  It remains a
     # useful fallback when an older/newly interrupted Run has not completed its
     # locator registration, but it never replaces an indexed entry.
-    if current_root is not None:
-        local_root = current_root.resolve() / ".agent-run"
+    if current_root is not None and current_root.is_dir():
+        local_root = workspace_state_root(current_root.resolve())
         indexed_runs = {
             (entry["run_id"], Path(entry["state_dir"]).resolve())
             for entry in entries
@@ -3653,12 +3548,12 @@ def _selector_records(
         # Resolve local identity only after the bounded fallback is included.
         # Otherwise an unregistered local Run can silently lose other clones.
         if repository is None:
-            repository = _current_repository_name(records, str(current_root.resolve()))
+            repository = workspace_for_root(current_root.resolve()).repository
     if repository is not None:
         records = [
             record
             for record in records
-            if record[0].get("repository") in (None, repository)
+            if (record[0].get("repository") is None or same_repository(record[0].get("repository"), repository))
         ]
     elif current_root is not None:
         # With no Repository identity, only this checkout is a known target.
@@ -3674,13 +3569,13 @@ def _selector_records(
 def _repository_root_for_state_dir(state_dir: Path) -> Path | None:
     """Resolve a state directory to a verified checkout when possible."""
 
-    if state_dir.name == ".agent-run":
+    if state_dir.name == "state":
+        root = state_dir.parent / "repository"
         try:
-            root = GitRepository.discover(state_dir.parent).root
+            if workspace_state_root(root) == state_dir:
+                return root
         except (GitError, OSError):
-            root = None
-        if root is not None and state_dir == root / ".agent-run":
-            return root
+            pass
 
     try:
         entries = RunLocatorIndex.default().entries()
@@ -3701,40 +3596,11 @@ def _repository_root_for_state_dir(state_dir: Path) -> Path | None:
     return root if root == recorded_root else None
 
 
-def _current_repository_name(
-    records: list[tuple[dict[str, object], dict[str, Any] | None]],
-    repository_root: str,
-) -> str | None:
-    repository_hint = GhGitHubReader(
-        working_directory=Path(repository_root)
-    ).repository_hint()
-    if repository_hint is not None:
-        return repository_hint
-    repositories = {
-        public["repository"]
-        for public, state in records
-        if public.get("repository_root") == repository_root
-        and state is not None
-        and isinstance(public.get("repository"), str)
-    }
-    if len(repositories) == 1:
-        repository = next(iter(repositories))
-        assert isinstance(repository, str)
-        return repository
-    return None
-
-
 def _verified_locator_checkout(
     entry: LocatorEntry,
 ) -> tuple[GitRepository, str | None]:
-    recorded_root = Path(entry["repository_root"]).resolve()
-    checkout = GitRepository.discover(recorded_root)
-    if checkout.root != recorded_root:
-        raise GitError("定位索引记录的 checkout 根目录不一致")
-    repository = GhGitHubReader(
-        working_directory=checkout.root
-    ).repository_hint()
-    return checkout, repository
+    workspace = workspace_for_root(Path(entry["repository_root"]).resolve())
+    return workspace.open(), workspace.repository
 
 
 def _read_state_directory(
@@ -3833,7 +3699,7 @@ def _read_locator_entry(
         if state is not None and "repository" in entry:
             parent = state.get("parent")
             if (
-                state.get("repository") != entry["repository"]
+                not same_repository(state.get("repository"), entry["repository"])
                 or not isinstance(parent, dict)
                 or parent.get("number") != entry["parent_number"]
             ):
@@ -3865,7 +3731,7 @@ def _read_locator_entry(
             )
         candidate = _candidate(entry, error=state_error)
         if checkout_repository is not None:
-            if "repository" in entry and entry["repository"] != checkout_repository:
+            if "repository" in entry and not same_repository(entry["repository"], checkout_repository):
                 return _candidate(
                     entry,
                     error="checkout repository 与定位索引不一致",
@@ -3890,7 +3756,7 @@ def _read_locator_entry(
                 None,
             )
         state_repository = state.get("repository")
-        if checkout_repository is not None and state_repository != checkout_repository:
+        if checkout_repository is not None and not same_repository(state_repository, checkout_repository):
             return _candidate(
                 entry,
                 state=state,
@@ -4091,7 +3957,7 @@ def _validate_repository_selector(
     repository = parsed.repo
     if repository is not None:
         _validate_repository_name(repository)
-        if state.get("repository") != repository:
+        if not same_repository(state.get("repository"), repository):
             parent = state.get("parent")
             candidate = {
                 "parent": (
@@ -4103,7 +3969,7 @@ def _validate_repository_selector(
                 "repository_root": "当前 checkout",
                 "run_id": run_id,
                 "started_at": state.get("created_at"),
-                "state_dir": parsed.state_dir or "当前 checkout/.agent-run",
+                "state_dir": parsed.state_dir or "Runner 统一状态目录",
                 "status": state.get("status"),
             }
             raise _selector_error(
@@ -4187,7 +4053,7 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--state-dir",
-        help="运行状态目录；默认是仓库根目录下的 .agent-run",
+        help="显式读取状态目录；变更命令仅允许使用 Runner 的统一状态目录",
     )
     parser.add_argument(
         "--github-fixture",
@@ -4495,11 +4361,11 @@ def _profile_state_root(parsed: argparse.Namespace) -> Path:
     if parsed.state_dir:
         return Path(parsed.state_dir).resolve()
     try:
-        git = GitRepository.discover(Path.cwd())
-    except GitError:
+        git = open_workspace(parsed.repo, parsed.github_fixture, create=False)
+    except (GitError, RunLocatorError):
         git = None
     if git is not None:
-        local_root = git.root / ".agent-run"
+        local_root = workspace_state_root(git.root)
         if StateStore(local_root).load_run(parsed.run_id) is not None:
             return local_root
     return RunLocatorIndex.default().resolve_state_dir(parsed.run_id)

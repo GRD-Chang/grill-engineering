@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 import json
 from pathlib import Path
 
@@ -15,10 +17,14 @@ from run_publication_test_support import RunPublicationAgents, _accepted_run
 def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
     git_repo: Path,
 ) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    state, states, _git, _publisher = _accepted_run(
+        workspace.repository_root, state_root=workspace.state_root
+    )
+    fixture = workspace.repository_root / "github.json"
     seed_idle_control(
         TaskControlStore(states.root),
-        TaskKey(git_repo, str(state["repository"]), 1),
+        TaskKey(managed_repo(git_repo), str(state["repository"]), 1),
         str(state["run_id"]),
         state_dir=states.root,
     )
@@ -28,7 +34,7 @@ def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
 
     published = run_internal_stage(
         git_repo,
-        git_repo / "github.json",
+        fixture,
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -38,12 +44,12 @@ def test_public_cli_publish_then_approve_is_an_end_to_end_user_flow(
     assert published.returncode == 0, published.stderr
     assert stdout_json(published)["status"] == "run_approval_pending"
     approved = run_cli(
-        git_repo, git_repo / "github.json", "approve", str(state["run_id"])
+        git_repo, fixture, "approve", str(state["run_id"])
     )
     assert approved.returncode == 0, approved.stderr
     assert stdout_json(approved)["status"] == "completed"
     assert (
-        FixtureGitHubPublisher(git_repo / "github.json", _git).live_pull_request(1)[
+        FixtureGitHubPublisher(fixture, _git).live_pull_request(1)[
             "state"
         ]
         == "MERGED"

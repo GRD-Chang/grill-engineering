@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.executor_host import ExecutorSpec, ExecutorStartUnknownError
 from agent_run.cli_presentation import human_next_action_for_state
 from agent_run.git import GitRepository
@@ -38,7 +40,7 @@ def completed_action(
         monkeypatch.setenv(name, value)
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.find_unfinished_runs("example/project", 1)[0]
     assert state["status"] == "parent_delivery_pending"
     run_id = state["run_id"]
@@ -62,11 +64,11 @@ def completed_action(
         "review_budget_history": [],
     }
     checkout = states.root / "worktrees" / run_id / "parent"
-    GitRepository(git_repo).prepare_ticket_checkout(
+    GitRepository(managed_repo(git_repo)).prepare_ticket_checkout(
         branch=state["parent_branch"], base_sha=state["base"]["sha"], checkout=checkout,
     )
     (checkout / "partial-work.txt").write_text("preserve the unfinished work\n")
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control = TaskControlStore(states.root)
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     assert claim.action_id is not None
@@ -76,7 +78,7 @@ def completed_action(
     spec = ExecutorSpec(
         task=task, run_id=run_id, action_id=claim.action_id,
         generation=record["action"]["executor_generation"], state_root=states.root,
-        command=("run", "1"), cwd=git_repo,
+        command=("run", "1"), cwd=managed_repo(git_repo),
     )
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(
@@ -132,14 +134,14 @@ def _lifecycle(
 
 @pytest.mark.parametrize("native_status", ["exited", "absent"])
 def test_systemd_completed_action_exit_closes_only_its_executor(
-    completed_action: tuple, native_status: str,
+    completed_action: tuple, native_status: str, git_repo: Path,
 ) -> None:
     states, control, spec, host, transport = completed_action
     initial = control.load(spec.task)
     before = states.load_current_run(spec.run_id)
     assert initial is not None and before is not None
-    worktrees = _file_snapshot(spec.task.workspace / ".agent-run" / "worktrees")
-    fixture = spec.task.workspace / "github.json"
+    worktrees = _file_snapshot(states.root / "worktrees")
+    fixture = git_repo / "github.json"
     fixture_before = fixture.read_bytes()
     transport.unit = replace(
         transport.unit, status=native_status, pid=None,
@@ -167,7 +169,7 @@ def test_systemd_completed_action_exit_closes_only_its_executor(
     assert again == result
     assert control.path_for(spec.task).read_bytes() == control_before
     assert _file_snapshot(states.root / "runs") == states_before
-    assert _file_snapshot(spec.task.workspace / ".agent-run" / "worktrees") == worktrees
+    assert _file_snapshot(states.root / "worktrees") == worktrees
     assert fixture.read_bytes() == fixture_before
     assert transport.start_count == 1
     assert not list(host.runtime_directory.glob("*.json"))

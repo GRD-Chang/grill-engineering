@@ -10,6 +10,7 @@ from agent_run.run_publication import RunPublicationEngine
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_idle_control, seed_run
+from support.workspace import managed_repo, managed_state, prepare_workspace
 from run_publication_test_support import InvocationRunPublicationAgents, _accepted_run
 
 
@@ -21,8 +22,12 @@ def prepare_accepted_run(
     The completed Ticket is historical setup. Git commits, Run Acceptance,
     durable state and CLI ownership registration remain real.
     """
-    state, _, _, _ = _accepted_run(repo, ticket_number=ticket_number)
-    fixture = repo / "github.json"
+    workspace = prepare_workspace(repo)
+    state, _, _, _ = _accepted_run(
+        workspace.repository_root, ticket_number=ticket_number,
+        state_root=workspace.state_root,
+    )
+    fixture = workspace.repository_root / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data.setdefault("delivery", {}).update(delivery or {})
     data["delivery"]["closed_issues"] = [ticket_number]
@@ -46,10 +51,10 @@ def prepare_accepted_run(
     registered = seed_run(repo, fixture)
     assert registered.returncode == 0, registered.stderr
     seed_idle_control(
-        TaskControlStore(repo / ".agent-run"),
-        TaskKey(repo, str(state["repository"]), 1),
+        TaskControlStore(managed_state(repo)),
+        TaskKey(managed_repo(repo), str(state["repository"]), 1),
         str(state["run_id"]),
-        state_dir=repo / ".agent-run",
+        state_dir=managed_state(repo),
     )
     return fixture, state
 
@@ -61,10 +66,10 @@ def prepare_published_run(
     fixture, state = prepare_accepted_run(
         repo, ticket_number=ticket_number, delivery=delivery,
     )
-    git = GitRepository(repo)
+    git = GitRepository(managed_repo(repo))
     published = RunPublicationEngine(
         git=git,
-        states=StateStore(repo / ".agent-run"),
+        states=StateStore(managed_state(repo)),
         agents=InvocationRunPublicationAgents(),
         github=FixtureGitHubPublisher(fixture, git),
         default_branch="main",

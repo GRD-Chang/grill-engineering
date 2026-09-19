@@ -25,7 +25,6 @@ def invoke_cli_inprocess(
     """
 
     environment = os.environ.copy()
-    environment.setdefault("XDG_STATE_HOME", str(repo / ".agent-run-test-state"))
     environment.update(extra_env or {})
     command_arguments = [*arguments, "--github-fixture", str(fixture)]
     stdout, stderr = StringIO(), StringIO()

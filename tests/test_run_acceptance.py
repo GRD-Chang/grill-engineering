@@ -29,6 +29,7 @@ from agent_run.state_contract import (
 
 from conftest import seed_idle_control
 from support.inprocess_cli import invoke_cli_inprocess
+from support.workspace import prepare_workspace
 from test_cli import run_internal_stage, run_cli, stdout_json
 from test_cli_delivery import final_run_publication
 
@@ -385,14 +386,16 @@ def test_run_acceptance_rejects_completed_ticket_without_integration_record(
 def test_run_acceptance_cli_reports_incompatible_missing_integration_record(
     git_repo: Path,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git = _completed_run(repo, state_root=workspace.state_root)
     state["ticket_jobs"]["2"].pop("deterministic_integration_record")
     states.save_run(str(state["run_id"]), state)
     state_before = deepcopy(states.load_run(str(state["run_id"])))
 
     result = run_cli(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "resume",
         str(state["run_id"]),
     )
@@ -1349,8 +1352,10 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
 def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
 
     class BlockedRunRepairDevelopment(ScriptedRunAgents):
         def develop(
@@ -1386,12 +1391,12 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert delivery["pull_requests"] == []
     status = stdout_json(
-        invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(repo, fixture, "status", str(state["run_id"]), "--json")
     )
     assert status["status"] == "ready_for_human"
     assert status["diagnostics"][0]["message"].startswith("GitHub denied access")
     history = stdout_json(
-        invoke_cli_inprocess(git_repo, fixture, "history", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(repo, fixture, "history", str(state["run_id"]), "--json")
     )
     assert any(
         event.get("thread_id") == "run-repair-development-blocked"
@@ -1428,8 +1433,10 @@ def test_run_repair_development_human_blocker_stops_before_candidate_or_pr(
 def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
 
     class BlockedRunRepairReviewer(ScriptedRunAgents):
         def __init__(self) -> None:
@@ -1456,7 +1463,7 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
     assert blocked["run_acceptance"]["repair_cycle"]["status"] == "human_blocked"
     assert not old_checkout.exists()
     history = stdout_json(
-        invoke_cli_inprocess(git_repo, fixture, "history", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(repo, fixture, "history", str(state["run_id"]), "--json")
     )
     assert any(
         event.get("worker") == "独立验收工作代理"
@@ -1487,8 +1494,10 @@ def test_run_repair_reviewer_human_blocker_history_uses_reviewer_thread(
 def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
     git_repo: Path,
 ) -> None:
-    state, states, git = _completed_run(git_repo)
-    fixture = git_repo / "github.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
 
     class BlockedRunRepairPublication(ScriptedRunAgents):
         def publication(
@@ -1527,7 +1536,7 @@ def test_run_repair_publication_human_blocker_stops_before_pr_mutation(
         "pull_requests"
     ] == []
     history = stdout_json(
-        invoke_cli_inprocess(git_repo, fixture, "history", str(state["run_id"]), "--json")
+        invoke_cli_inprocess(repo, fixture, "history", str(state["run_id"]), "--json")
     )
     assert any(
         event.get("worker") == "发布工作代理"
@@ -1894,8 +1903,10 @@ def test_run_acceptance_refreshes_currentness_before_reusing_an_accepted_run(
 def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
     git_repo: Path,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
-    agents = git_repo / "repair-run-review.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git = _completed_run(repo, state_root=workspace.state_root)
+    agents = repo / "repair-run-review.json"
     agents.write_text(
         json.dumps(
             {
@@ -1917,8 +1928,8 @@ def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
     )
 
     accepted = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "accept-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -1939,8 +1950,10 @@ def test_run_acceptance_fixture_repairs_malformed_output_in_same_thread(
 def test_run_acceptance_fixture_missing_thread_marks_invocation_failed(
     git_repo: Path,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
-    agents = git_repo / "missing-run-review-thread.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git = _completed_run(repo, state_root=workspace.state_root)
+    agents = repo / "missing-run-review-thread.json"
     agents.write_text(
         json.dumps(
             {"run_reviews": [{"no_thread": True, "artifact": _passing_artifact()}]}
@@ -1949,8 +1962,8 @@ def test_run_acceptance_fixture_missing_thread_marks_invocation_failed(
     )
 
     failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "accept-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -1965,8 +1978,10 @@ def test_run_acceptance_fixture_missing_thread_marks_invocation_failed(
 def test_run_acceptance_fixture_records_a_fresh_thread_without_expectation(
     git_repo: Path,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
-    agents = git_repo / "fresh-run-review.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git = _completed_run(repo, state_root=workspace.state_root)
+    agents = repo / "fresh-run-review.json"
     agents.write_text(
         json.dumps(
             {"run_reviews": [{"thread_id": "fresh-run-reviewer", "artifact": _passing_artifact()}]}
@@ -1975,8 +1990,8 @@ def test_run_acceptance_fixture_records_a_fresh_thread_without_expectation(
     )
 
     accepted = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "accept-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -1994,14 +2009,16 @@ def test_run_acceptance_fixture_records_a_fresh_thread_without_expectation(
 def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
     git_repo: Path,
 ) -> None:
-    state, states, _git = _completed_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git = _completed_run(repo, state_root=workspace.state_root)
     seed_idle_control(
         TaskControlStore(states.root),
-        TaskKey(git_repo, str(state["repository"]), 1),
+        TaskKey(repo, str(state["repository"]), 1),
         str(state["run_id"]),
         state_dir=states.root,
     )
-    failed_agents = git_repo / "failed-run-review.json"
+    failed_agents = repo / "failed-run-review.json"
     failed_agents.write_text(
         json.dumps(
             {
@@ -2027,8 +2044,8 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
         encoding="utf-8",
     )
     failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "accept-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -2036,7 +2053,7 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
     )
     assert failed.returncode == 2
 
-    resumed_agents = git_repo / "resumed-run-review.json"
+    resumed_agents = repo / "resumed-run-review.json"
     resumed_agents.write_text(
         json.dumps(
             {
@@ -2053,8 +2070,8 @@ def test_run_acceptance_fixture_resume_gets_a_fresh_repair_budget(
         encoding="utf-8",
     )
     resumed = run_cli(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "resume",
         str(state["run_id"]),
         "--agent-fixture",

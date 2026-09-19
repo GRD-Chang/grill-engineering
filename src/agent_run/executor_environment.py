@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from agent_run.executor_host import ExecutorSpec
+from agent_run.paths import app_runtime_root
 
 DEFAULT_MAX_ENVIRONMENT_BYTES = 1024 * 1024
 DEFAULT_CARRIER_TTL_SECONDS = 30.0
@@ -31,11 +32,7 @@ class CapturedExecutorEnvironment:
 def default_executor_runtime_directory(
     environment: Mapping[str, str] | None = None,
 ) -> Path:
-    selected = os.environ if environment is None else environment
-    runtime = selected.get("XDG_RUNTIME_DIR")
-    if runtime:
-        return Path(runtime).expanduser() / "agent-run" / "executor"
-    return Path("/tmp") / f"agent-run-{os.geteuid()}" / "executor"
+    return app_runtime_root(environment) / "executor"
 
 
 def ensure_executor_runtime_directory(

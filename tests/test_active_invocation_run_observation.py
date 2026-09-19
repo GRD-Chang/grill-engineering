@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.executor_host import ExecutorSpec
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
@@ -98,9 +100,9 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
         monkeypatch.setenv(key, value)
     fixture = write_fixture(git_repo / "github.json", issues={})
     _fail_parent_run(git_repo, fixture)
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.find_unfinished_runs("example/project", 1)[0]
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control = TaskControlStore(states.root)
     initial_control = control.load(task)
     assert initial_control is not None
@@ -117,7 +119,7 @@ def test_repeated_public_run_checks_host_while_invocation_is_active(
     spec = ExecutorSpec(
         task=task, run_id=state["run_id"], action_id=claim.action_id,
         generation=record["action"]["executor_generation"],
-        state_root=states.root, command=("run", "1"), cwd=git_repo,
+        state_root=states.root, command=("run", "1"), cwd=managed_repo(git_repo),
     )
     transport = FakeSystemdTransport()
     host = SystemdUserExecutorHost(

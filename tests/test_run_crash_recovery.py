@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run.state import StateStore
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
@@ -321,7 +323,7 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     for invocation in after_first["agent_invocation_history"]:
         if invocation.get("started_at") == started_at:
             invocation["status"] = "resuming"
-    StateStore(git_repo / ".agent-run").save_run(run_id, after_first)
+    StateStore(managed_state(git_repo)).save_run(run_id, after_first)
 
     interrupted_again = run_cli(
         git_repo,
@@ -357,7 +359,7 @@ def test_repeated_resume_after_executor_crash_does_not_replay_the_attempt(
     assert final_state["ticket_jobs"]["2"]["review_budget"][
         "development_attempts"
     ] == 1
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     final_control = json.loads(control_path.read_text(encoding="utf-8"))
     assert final_control["action"]["kind"] == "resume"
     assert final_control["action"]["status"] == "completed"
@@ -645,8 +647,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         }
     ]
     checkout = (
-        git_repo
-        / ".agent-run"
+        managed_state(git_repo)
         / "worktrees"
         / run_id
         / "ticket-2"

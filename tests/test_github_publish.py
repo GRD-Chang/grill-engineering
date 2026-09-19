@@ -51,6 +51,10 @@ def test_real_publisher_applies_repository_owned_check_repairability(
         'code-failure-steps = ["tests::unit::Run tests"]\n',
         encoding="utf-8",
     )
+    subprocess.run(["git", "add", "pyproject.toml"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "configure check policy"], cwd=git_repo, check=True)
+    head = GitRepository(git_repo).resolve("HEAD")
+    (git_repo / "pyproject.toml").write_text("[project]\nname = 'uncommitted-policy'\n")
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     monkeypatch.setattr(
         publisher,
@@ -71,14 +75,14 @@ def test_real_publisher_applies_repository_owned_check_repairability(
     monkeypatch.setattr(
         publisher,
         "live_pull_request",
-        lambda _pr: {"head_sha": "a" * 40},
+        lambda _pr: {"head_sha": head},
     )
     monkeypatch.setattr(
         publisher,
         "_json",
         lambda *_args, **_kwargs: {
             "id": 33,
-            "head_sha": "a" * 40,
+            "head_sha": head,
             "name": "unit",
             "workflow_name": "tests",
             "status": "completed",
@@ -95,7 +99,7 @@ def test_real_publisher_applies_repository_owned_check_repairability(
         },
     )
 
-    evidence = publisher.required_check_evidence(12, expected_head_sha="a" * 40)
+    evidence = publisher.required_check_evidence(12, expected_head_sha=head)
 
     assert evidence["checks"][0]["repairability"] == "code_failure"
     assert is_explicitly_repairable_code_failure(evidence) is True
@@ -109,6 +113,9 @@ def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable
         'code-failure-steps = ["CI::quality::Run tests"]\n',
         encoding="utf-8",
     )
+    subprocess.run(["git", "add", "pyproject.toml"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "configure check policy"], cwd=git_repo, check=True)
+    head = GitRepository(git_repo).resolve("HEAD")
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     monkeypatch.setattr(
         publisher,
@@ -127,14 +134,14 @@ def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable
     monkeypatch.setattr(
         publisher,
         "live_pull_request",
-        lambda _pr: {"head_sha": "a" * 40},
+        lambda _pr: {"head_sha": head},
     )
     monkeypatch.setattr(
         publisher,
         "_json",
         lambda *_args, **_kwargs: {
             "id": 33,
-            "head_sha": "a" * 40,
+            "head_sha": head,
             "name": "quality",
             "workflow_name": "CI",
             "status": "completed",
@@ -157,7 +164,7 @@ def test_real_publisher_does_not_mark_configured_job_platform_failure_repairable
         },
     )
 
-    evidence = publisher.required_check_evidence(12, expected_head_sha="a" * 40)
+    evidence = publisher.required_check_evidence(12, expected_head_sha=head)
 
     assert "repairability" not in evidence["checks"][0]
     assert is_explicitly_repairable_code_failure(evidence) is False

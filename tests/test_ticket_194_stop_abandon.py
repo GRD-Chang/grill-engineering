@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_repo, managed_state, prepare_workspace
+
 from conftest import seed_idle_control, seed_run, write_fixture
 from cli_run_supervision_support import _parent_only_agents
 from test_run_publication import RunPublicationAgents, _accepted_run
@@ -139,9 +141,9 @@ class _ControlReceiptHost(FakeExecutorHost):
 def _bind_running_executor(
     repo: Path, run_id: str
 ) -> tuple[TaskControlStore, TaskKey, subprocess.Popen[bytes]]:
-    states = StateStore(repo / ".agent-run")
-    task = TaskKey(repo, "example/project", 1)
-    control = TaskControlStore(repo / ".agent-run")
+    states = StateStore(managed_state(repo))
+    task = TaskKey(managed_repo(repo), "example/project", 1)
+    control = TaskControlStore(managed_state(repo))
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     reservation = control.begin_executor(
         task, action_id=claim.action_id, run_id=None, runner_binding="b" * 16
@@ -392,7 +394,7 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     if pending_kind == "resume":
@@ -400,8 +402,8 @@ def test_stop_rejects_pending_action_at_pre_executor_barrier(
             {"status": "operator_stopped", "terminal_kind": "operator_stopped"}
         )
         states.save_run(run_id, current)
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     pending = control.claim_action(
         task,
         kind=pending_kind,
@@ -512,7 +514,7 @@ def test_public_stop_is_immediate_and_repeat_is_read_only(git_repo: Path) -> Non
     fixture = write_fixture(git_repo / "github.json", issues={})
     seeded = seed_run(git_repo, fixture)
     assert seeded.returncode == 0, seeded.stderr
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     run = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(run["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -590,15 +592,15 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     dirty_checkout: Path | None = None
     mutations_before_failure: list[object] | None = None
     if kind == "abandon":
         seed_idle_control(
-            TaskControlStore(git_repo / ".agent-run"),
-            TaskKey(git_repo, "example/project", 1),
+            TaskControlStore(managed_state(git_repo)),
+            TaskKey(managed_repo(git_repo), "example/project", 1),
             run_id,
         )
         prepared = _run_cli(
@@ -614,8 +616,8 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
         assert current is not None
         parent_job = current["parent_job"]
         assert isinstance(parent_job, dict)
-        dirty_checkout = git_repo / ".agent-run" / "worktrees" / run_id / "parent"
-        GitRepository(git_repo).prepare_ticket_checkout(
+        dirty_checkout = managed_state(git_repo) / "worktrees" / run_id / "parent"
+        GitRepository(managed_repo(git_repo)).prepare_ticket_checkout(
             branch=str(parent_job["parent_branch"]),
             base_sha=str(parent_job["base_sha"]),
             checkout=dirty_checkout,
@@ -632,7 +634,7 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
     monkeypatch.chdir(git_repo)
 
     def record_status_before_receipt() -> None:
-        durable = StateStore(git_repo / ".agent-run").load_run(run_id)
+        durable = StateStore(managed_state(git_repo)).load_run(run_id)
         assert durable is not None
         status_before_failed_receipt.append(str(durable["status"]))
 
@@ -739,9 +741,7 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
                 capsys.readouterr()
                 with monkeypatch.context() as readiness:
                     readiness.chdir(git_repo)
-                    readiness.setenv(
-                        "XDG_DATA_HOME", str(git_repo / "runner-data")
-                    )
+
                     readiness.setenv(
                         "XDG_RUNTIME_DIR", str(git_repo / "runtime")
                     )
@@ -763,6 +763,9 @@ def test_detached_control_failure_is_reported_and_blocks_ordinary_run(
                             fixture
                         ),
                     )
+                    readiness.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: FixtureGitHubReader(
+                            fixture
+                        ))
                     production_return_code = cli_module.main(
                         [
                             "run",
@@ -849,13 +852,13 @@ def test_failed_control_retries_the_unresolved_target_before_success(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     if kind == "abandon":
         seed_idle_control(
-            TaskControlStore(git_repo / ".agent-run"),
-            TaskKey(git_repo, "example/project", 1),
+            TaskControlStore(managed_state(git_repo)),
+            TaskKey(managed_repo(git_repo), "example/project", 1),
             run_id,
         )
         prepared = _run_cli(
@@ -1063,7 +1066,7 @@ def test_unresolved_target_blocks_successors_and_run_id_drift(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -1122,12 +1125,12 @@ def test_public_abandon_can_permanently_close_an_operator_stopped_run(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     run = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(run["run_id"])
     seed_idle_control(
-        TaskControlStore(git_repo / ".agent-run"),
-        TaskKey(git_repo, "example/project", 1),
+        TaskControlStore(managed_state(git_repo)),
+        TaskKey(managed_repo(git_repo), "example/project", 1),
         run_id,
     )
     prepared = _run_cli(
@@ -1196,7 +1199,7 @@ def test_operator_stop_binds_the_invocation_subject_after_ticket_completion(
         },
     )
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(state["run_id"])
     state["active_ticket_job"]["phase"] = "completed"
@@ -1292,15 +1295,15 @@ def test_abandon_executor_survives_observer_exit_with_canonical_receipt(
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     seed_idle_control(control, task, run_id)
     ready_read, ready_write = os.pipe()
     release_read, release_write = os.pipe()
-    effect = git_repo / ".agent-run" / "abandon-effect"
+    effect = managed_state(git_repo) / "abandon-effect"
     observer_pid = os.fork()
     if observer_pid == 0:  # pragma: no branch - explicit observer process
         os.close(ready_read)
@@ -1422,11 +1425,11 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     run_id = str(states.find_unfinished_runs("example/project", 1)[0]["run_id"])
     seed_idle_control(
-        TaskControlStore(git_repo / ".agent-run"),
-        TaskKey(git_repo, "example/project", 1),
+        TaskControlStore(managed_state(git_repo)),
+        TaskKey(managed_repo(git_repo), "example/project", 1),
         run_id,
     )
     prepared = _run_cli(
@@ -1438,8 +1441,8 @@ def test_public_abandon_observer_exit_does_not_cancel_the_executor(
         str(_parent_only_agents(git_repo / "observer-agents.json")),
     )
     assert prepared.returncode == 0, prepared.stderr
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     ready_read, ready_write = os.pipe()
     release_read, release_write = os.pipe()
     attached_read, attached_write = os.pipe()
@@ -1610,7 +1613,7 @@ def test_abandon_executor_recovers_api_response_loss_without_duplicate_effect(
 ) -> None:
     """The control Action preserves Publisher dispatch/readback idempotence."""
 
-    state, states, git, publisher = _accepted_run(git_repo)
+    state, states, git, publisher = _accepted_run(prepare_workspace(git_repo).repository_root, state_root=managed_state(git_repo))
     run_id = str(state["run_id"])
     published = RunPublicationEngine(
         git=git,
@@ -1621,12 +1624,12 @@ def test_abandon_executor_recovers_api_response_loss_without_duplicate_effect(
         default_head_sha=git.resolve("main"),
     ).publish(run_id)
     pr_number = int(published["run_publication"]["pr_number"])
-    fixture_path = git_repo / "github.json"
+    fixture_path = managed_repo(git_repo) / "github.json"
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     fixture["delivery"]["crash_after_abandon_run_pr_once"] = True
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
-    task = TaskKey(git_repo, str(state["repository"]), int(state["parent"]["number"]))
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), str(state["repository"]), int(state["parent"]["number"]))
+    control = TaskControlStore(managed_state(git_repo))
     seed_idle_control(control, task, run_id)
 
     def execute_abandon(
@@ -1721,11 +1724,11 @@ def test_stop_fences_executor_across_external_and_api_barriers(
     }
     fixture_path = write_fixture(git_repo / "github.json", issues={"3": ticket})
     assert seed_run(git_repo, fixture_path).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     barrier_read, barrier_write = os.pipe()
 
     class BarrierPublisher(FixtureGitHubPublisher):
@@ -1765,7 +1768,7 @@ def test_stop_fences_executor_across_external_and_api_barriers(
                     signal.pause()
 
                 BarrierPublisher(
-                    fixture_path, GitRepository(git_repo)
+                    fixture_path, GitRepository(managed_repo(git_repo))
                 ).close_primary_ticket(
                     ticket_number=3,
                     run_id=run_id,
@@ -1880,7 +1883,7 @@ def test_stop_fences_executor_across_external_and_api_barriers(
         assert len(close_mutations) == expected_effects
         assert len(delivery.get("closed_issues", [])) == expected_effects
         if expected_effects:
-            FixtureGitHubPublisher(fixture_path, GitRepository(git_repo)).close_primary_ticket(
+            FixtureGitHubPublisher(fixture_path, GitRepository(managed_repo(git_repo))).close_primary_ticket(
                 ticket_number=3,
                 run_id=run_id,
                 pr_number=7,
@@ -1914,7 +1917,7 @@ def test_public_stop_rejects_unknown_ownership_without_mutating_run(
     fixture = write_fixture(git_repo / "github.json", issues={})
     seeded = seed_run(git_repo, fixture)
     assert seeded.returncode == 0, seeded.stderr
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     run = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(run["run_id"])
     state_path = states.runs_directory / f"{run_id}.json"
@@ -1944,11 +1947,11 @@ def test_stop_proven_no_active_observations_admit_pause_action(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     assert claim.action_id is not None
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id=None)
@@ -2055,11 +2058,11 @@ def test_stop_unknown_host_observation_rejects_without_partial_mutation(
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     assert claim.action_id is not None
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id=None)
@@ -2140,7 +2143,7 @@ def test_stop_admission_rechecks_executor_exit_after_running_observation(
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -2263,10 +2266,10 @@ def test_public_stop_reloads_state_after_executor_exit(
             )
 
     monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / "runner-state"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -2360,7 +2363,7 @@ def test_stop_noop_reload_fails_closed_after_successor_admission(
 
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -2445,7 +2448,7 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     current.update({"status": "completed", "terminal_kind": "completed"})
@@ -2482,7 +2485,7 @@ def test_read_only_stop_rechecks_action_admission_in_one_transaction(
             cli_module._read_only_stop_result(
                 SimpleNamespace(run_id=run_id),
                 states,
-                GitRepository(git_repo),
+                GitRepository(managed_repo(git_repo)),
             )
         )
     )
@@ -2553,10 +2556,10 @@ def test_production_read_only_stop_skips_execution_dependencies(
             pass
 
     monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / "runner-state"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -2587,7 +2590,7 @@ def test_production_read_only_stop_skips_execution_dependencies(
         terminal.update({"status": "completed", "terminal_kind": "completed"})
         states.save_run(run_id, terminal)
 
-    profile_path = git_repo / ".agent-run" / "profiles" / f"{run_id}.json"
+    profile_path = managed_state(git_repo) / "profiles" / f"{run_id}.json"
     if unavailable_dependency == "profile":
         profile_path.unlink()
     monkeypatch.chdir(git_repo)
@@ -2645,10 +2648,10 @@ def test_production_stop_with_active_executor_still_requires_readiness(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / "runner-state"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
     control, task, worker = _bind_running_executor(git_repo, run_id)
@@ -2681,14 +2684,14 @@ def test_production_stop_rejects_pending_action_before_execution_readiness(
     pending_kind: str,
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(git_repo / "runner-state"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     control.claim_action(task, kind=pending_kind, payload={"parent": 1})
     state_path = states.runs_directory / f"{run_id}.json"
     control_path = control.path_for(task)
@@ -2720,11 +2723,11 @@ def test_terminal_abandon_replay_completes_its_applying_control_action(
     fixture = write_fixture(git_repo / "github.json", issues={})
     seeded = seed_run(git_repo, fixture)
     assert seeded.returncode == 0, seeded.stderr
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     run = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(run["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     claim = control.claim_control_action(
         task,
         kind="abandon",
@@ -2756,11 +2759,11 @@ def test_control_action_reconciles_durable_outcome_after_executor_exit(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     current = states.find_unfinished_runs("example/project", 1)[0]
     run_id = str(current["run_id"])
-    task = TaskKey(git_repo, "example/project", 1)
-    control = TaskControlStore(git_repo / ".agent-run")
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
+    control = TaskControlStore(managed_state(git_repo))
     payload = {"parent": 1, "run_id": run_id}
     if kind == "abandon":
         payload["discard_worktree"] = True

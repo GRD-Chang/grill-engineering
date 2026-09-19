@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 import agent_run.cli as cli_module
 from agent_run.agent_invocation import record_operator_stop
 from agent_run.delivery_policy import DeliveryPolicyStore
@@ -166,8 +168,8 @@ def _wait_for_run_status(git_repo: Path, expected: str) -> dict[str, object]:
 
 
 def _assert_single_resume_action(git_repo: Path) -> None:
-    record = TaskControlStore(git_repo / ".agent-run").load(
-        TaskKey(git_repo, "example/project", 1)
+    record = TaskControlStore(managed_state(git_repo)).load(
+        TaskKey(managed_repo(git_repo), "example/project", 1)
     )
     assert record is not None
     actions = [record.get("action"), *record.get("action_history", [])]
@@ -503,7 +505,7 @@ def _establish_ordinary_run_boundary(
         _block_parent_for_human(git_repo, fixture)
         state = load_only_run_state(git_repo)
         state.update({"status": "blocked", "terminal_kind": "waiting_human"})
-        StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
+        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
     elif boundary == "permanent_blocked":
         blocked = run_cli(git_repo, fixture, "run", "1")
         assert blocked.returncode == 2, blocked.stderr
@@ -528,7 +530,7 @@ def _establish_ordinary_run_boundary(
         state.update(
             {"status": "publication_pending", "terminal_kind": "publication_pending"}
         )
-        StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
+        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
     elif boundary == "unsupported_scope_change":
         started = run_cli(
             git_repo,
@@ -573,7 +575,7 @@ def _establish_ordinary_run_boundary(
             {"status": "waiting_external", "terminal_kind": "waiting_external"}
         )
         state["run_publication"]["phase"] = "waiting_external"
-        StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
+        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
         blocked = run_cli(
             git_repo,
             fixture,
@@ -597,13 +599,13 @@ def _establish_ordinary_run_boundary(
         state.update(
             {"status": "abandonment_pending", "terminal_kind": "abandonment_pending"}
         )
-        StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
+        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
     elif boundary == "progress_exhausted":
         blocked = run_cli(git_repo, fixture, "run", "1")
         assert blocked.returncode == 2, blocked.stderr
         state = load_only_run_state(git_repo)
         state["terminal_kind"] = "waiting_human"
-        StateStore(git_repo / ".agent-run").save_run(str(state["run_id"]), state)
+        StateStore(managed_state(git_repo)).save_run(str(state["run_id"]), state)
     else:
         agents = (
             run_agents(git_repo / "initial-agents.json")
@@ -654,7 +656,7 @@ def _establish_ordinary_run_boundary(
             state = load_only_run_state(git_repo)
             record_operator_stop(
                 state,
-                save=lambda stopped: StateStore(git_repo / ".agent-run").save_run(
+                save=lambda stopped: StateStore(managed_state(git_repo)).save_run(
                     str(stopped["run_id"]), stopped
                 ),
             )
@@ -681,7 +683,7 @@ def _assert_production_run_does_not_prepare_executor(
     *,
     expected_return_code: int,
 ) -> None:
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_tree_before = _tree_snapshot(state_root)
     fixture_before = fixture.read_bytes()
     environment_carrier = git_repo / "runtime" / "environment-carrier.json"
@@ -705,7 +707,7 @@ def _assert_production_run_does_not_prepare_executor(
             environment_carrier.write_text("unexpected\n", encoding="utf-8")
 
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo / "runtime"))
     monkeypatch.setattr(cli_module, "_running_active_runner", lambda: True)
     monkeypatch.setattr(
@@ -719,6 +721,7 @@ def _assert_production_run_does_not_prepare_executor(
         "GhGitHubReader",
         lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
     )
+    monkeypatch.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture))
 
     return_code = cli_module.main(
         ["run", "1", "--repo", "example/project", *run_arguments, "--json"]
@@ -741,9 +744,8 @@ def _assert_production_run_rejects_before_readiness(
     *,
     expected_status: str,
     state_root: Path | None = None,
-    state_home: Path | None = None,
 ) -> None:
-    state_root = state_root or git_repo / ".agent-run"
+    state_root = state_root or managed_state(git_repo)
     state_tree_before = _tree_snapshot(state_root)
     fixture_before = fixture.read_bytes()
     environment_carrier = git_repo / "runtime" / "environment-carrier.json"
@@ -776,10 +778,8 @@ def _assert_production_run_rejects_before_readiness(
 
         with monkeypatch.context() as readiness:
             readiness.chdir(git_repo)
-            readiness.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
             readiness.setenv("XDG_RUNTIME_DIR", str(git_repo / "runtime"))
-            if state_home is not None:
-                readiness.setenv("XDG_STATE_HOME", str(state_home))
             readiness.setattr(cli_module, "runner_usage_lease", observed_runner_lease)
             readiness.setattr(
                 cli_module, "_running_active_runner", active_runner_available
@@ -792,6 +792,7 @@ def _assert_production_run_rejects_before_readiness(
                 "GhGitHubReader",
                 lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
             )
+            readiness.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture))
 
             return_code = cli_module.main(
                 ["run", "1", "--repo", "example/project", *run_arguments, "--json"]
@@ -826,8 +827,8 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
     state_before = load_only_run_state(git_repo)
     receipt_before = state_before["action_application_receipt"]
     assert isinstance(receipt_before, dict)
-    control_store = TaskControlStore(git_repo / ".agent-run")
-    task = TaskKey(git_repo, "example/project", 1)
+    control_store = TaskControlStore(managed_state(git_repo))
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control_before = control_store.load(task)
     assert control_before is not None
     old_action = control_before["action"]
@@ -877,7 +878,7 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
 
     host = ReconciliationHost()
     monkeypatch.chdir(git_repo)
-    monkeypatch.setenv("XDG_DATA_HOME", str(git_repo / "runner-data"))
+
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(git_repo / "runtime"))
     monkeypatch.setattr(
         cli_module, "runner_usage_lease", lambda _path: nullcontext(UsageLease())
@@ -891,6 +892,7 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         "GhGitHubReader",
         lambda _repo, *, working_directory: FixtureGitHubReader(fixture),
     )
+    monkeypatch.setattr("agent_run.workspace_cli.GhGitHubReader", lambda _repo=None, *, working_directory: FixtureGitHubReader(fixture))
     monkeypatch.setattr(
         cli_module,
         "GhGitHubPublisher",
@@ -906,7 +908,7 @@ def test_resume_reconciles_a_terminal_receipt_before_admitting_its_successor(
         str(_resumed_parent_agents(git_repo)),
         "--json",
     ]
-    state_path = next((git_repo / ".agent-run" / "runs").glob("*.json"))
+    state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
     state_bytes = state_path.read_bytes()
     fixture_bytes = fixture.read_bytes()
     return_code = cli_module.main(command)
@@ -1022,7 +1024,7 @@ def test_ordinary_run_preserves_explicit_authorization_boundaries(
             }
         ]
         fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_path = next((state_root / "runs").glob("*.json"))
     control_path = next((state_root / "task-control").glob("*.json"))
     current_state = load_only_run_state(git_repo)

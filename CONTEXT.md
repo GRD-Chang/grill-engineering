@@ -189,7 +189,7 @@ _Avoid_: Promotion Audit、Codex 版本门禁、源码验收、状态兼容检�
 _Avoid_: 自动更新、重复 PATH 配置、系统包管理、`sudo`、源码热加载、可配置保留策略、无限快照历史、状态迁移、每-Run Runner 绑定
 
 **Runner Setup（Runner 环境准备）**:
-源码树 `./setup.sh` 提供的、无需预先安装 Python 或 Git 的一次性公开入口；在用户开始使用 Runner 前，经集中检查和统一确认后补齐宿主依赖、委托 Source Runner Installer 完成本体安装并获取手动待办清单，区别于 Runner 本体安装、目标仓库准备和实际执行就绪判定。不在自动补装范围内的依赖转为手动待办，不因发行版缺少自动适配而中断所有可继续步骤，也不把尚缺关键条件的环境称为已就绪；CI、仓库忽略规则、任务标签与 Skills 由用户自行准备。
+源码树 `./setup.sh` 提供的、无需预先安装 Python 或 Git 的一次性公开入口；在用户开始使用 Runner 前，经集中检查和统一确认后补齐宿主依赖、委托 Source Runner Installer 完成本体安装并获取手动待办清单，区别于 Runner 本体安装、目标仓库准备和实际执行就绪判定。不在自动补装范围内的依赖转为手动待办，不因发行版缺少自动适配而中断所有可继续步骤，也不把尚缺关键条件的环境称为已就绪；CI、任务标签与 Skills 由用户自行准备。
 _Avoid_: 安装成功即能运行、自动初始化目标仓库、自动配置 CI、自动管理 Skills、非适配发行版一律拒绝
 
 **Source Runner Installer（源码 Runner 安装器）**:
@@ -221,7 +221,7 @@ _Avoid_: 等待 Executor、自动 stop、运行中热更新、每-Run Snapshot �
 _Avoid_: 状态迁移、兼容性检查、自动回退、下载历史版本、任意历史选择
 
 **Runner Uninstall（Runner 卸载）**:
-用户在任一包含源码安装器的目录显式执行 `./install.sh --uninstall`，并在 Runner Management Quiescence 中删除全部受管 Runner Snapshot、Runner Generation、候选残留、内部 `active` 入口、本机受管 `agent-run` symlink 以及安装器添加的 PATH 受管配置。若存在活跃 Run Executor Session，卸载立即拒绝且不修改受管状态。若用户已把公开入口替换为非受管路径，卸载保留该内容并以有界 operational error 报告清理未完成。它保留固定 Runner Management Lock、GitHub App 持久配置、全局 Run 定位状态和各目标仓库中的 `.agent-run` Delivery Run 数据；v0.1 不提供连带删除用户配置或运行数据的 purge 模式。
+用户在任一包含源码安装器的目录显式执行 `./install.sh --uninstall`，并在 Runner Management Quiescence 中删除全部受管 Runner Snapshot、Runner Generation、候选残留、内部 `active` 入口、本机受管 `agent-run` symlink 以及安装器添加的 PATH 受管配置。若存在活跃 Run Executor Session，卸载立即拒绝且不修改受管状态。若用户已把公开入口替换为非受管路径，卸载保留该内容并以有界 operational error 报告清理未完成。它保留固定 Runner Management Lock、GitHub App 持久配置、Run 定位状态、Runner 独立仓库及 Delivery Run 数据；v0.1 不提供连带删除用户配置或运行数据的 purge 模式。
 _Avoid_: 删除 Delivery Run、删除 GitHub App 配置、删除非受管 shell 配置、`--purge`
 
 **Run 内部监督（In-Run Supervision）**:
@@ -340,25 +340,29 @@ _Avoid_: Codex Worker、内容作者、智能审查者
 改变权威 Git 历史、metadata 或 GitHub 外部持久状态的排他权限；临时 checkout 的源码编辑和一次性 Git 数据不属于该权限。该权限只属于 Publisher，不因 Codex Worker 的建议、代码修改或完成声明而转移。
 _Avoid_: Agent 自治、结构化输出、候选就绪
 
+**User Repository（用户仓库）**:
+维护者自行管理的本地 Git checkout。Runner 仅用它只读识别目标远端，不修改其文件、索引、引用或 Git 元数据，也不借用其 Git object store 创建 worktree。未推送的本地内容不进入交付；获取交付后的远端代码由维护者自行完成。
+_Avoid_: Runner 工作区、共享 Git 元数据、合并后自动更新用户分支
+
 **Local Delivery Workspace（本地交付工作区）**:
-维护者发起并恢复 Delivery Run 的准确本地 Git 仓库根目录，也是任务唯一性和 Run Executor Session 排他权的本地范围。两个独立本地仓库根目录由维护者自行协调，Controller 不扫描、不关联、不阻止它们对同一远端 Parent 各自启动 Run。Controller 为 Run 创建的 Managed Development Checkout 仍隶属原工作区，不是可重复启动该任务的新工作区。
-_Avoid_: 主机级仓库注册表、跨 clone 锁、磁盘扫描、把 Managed Development Checkout 当作新的操作根
+Runner 在用户数据目录中为准确远端 Repository 管理的独立克隆，以及与其关联的运行状态和受管 worktree。相同本机用户从不同目录或不同用户 clone 启动同一 Repository 时定位到同一工作区；生命周期写入仅发生在 Runner 工作区和获准的远端。Managed Development Checkout 隶属该工作区，不产生新的任务身份。
+_Avoid_: 用户仓库、启动目录、借用用户仓库的 worktree、跨用户或跨主机协调、磁盘扫描
 
 **Delivery Task（交付任务）**:
-由准确 Repository 与 Parent Issue 共同标识的稳定远端交付对象。同一 Local Delivery Workspace 内，一个 Delivery Task 同时最多拥有一个未完成 Delivery Run；已完成或已放弃的 Run 保留为不可变历史，维护者可以显式创建一个后继 Run。不同 Repository 或同一 Repository 的不同 Parent Issue 是不同 Delivery Task，必须能够并行推进。
-_Avoid_: 裸 `run_id`、单张 Child Ticket、整个 Repository、主机全局任务、跨独立本地仓库的唯一性承诺
+由准确 Repository 与 Parent Issue 共同标识的稳定远端交付对象。同一用户在本机对一个 Delivery Task 同时最多拥有一个未完成 Delivery Run，不因启动目录或用户 clone 不同而重复创建；已完成或已放弃的 Run 保留为不可变历史，维护者可以显式创建一个后继 Run。不同 Repository 或同一 Repository 的不同 Parent Issue 是不同 Delivery Task，必须能够并行推进。
+_Avoid_: 裸 `run_id`、单张 Child Ticket、整个 Repository、以启动目录区分任务、跨用户或跨主机唯一性承诺
 
 **Delivery Run（交付运行）**:
 由一次人工授权在一个 Local Delivery Workspace 中启动、覆盖一个 Delivery Task 的 Parent Issue 及其相关 Ticket、并以最终整体验收结束的交付范围。一个 Run 拥有独立身份和集成边界；同一工作区内同一 Delivery Task 的多个 Run 只能按时间先后存在，不能并行。普通 `run` 本身就是创建或恢复授权：没有未完成 Run 且 Parent 当前可执行时创建后继 Run，旧终态 Run 只保留为历史，不复活、不覆盖。
 _Avoid_: 单张 Ticket、单次 Codex 执行、长期后台服务、同一 Parent 的并行 Run、复活或覆盖终态 Run、额外 `--new-run`
 
 **Run 定位索引（Run Locator Index）**:
-本机维护的最小 Run ID 到仓库根和 state 目录的定位记录。新登记同时保存 Repository 与 Parent number，作为 state 或 checkout 丢失时仍可核验的路由身份，不复制生命周期状态。查询兼容缺少这对字段的旧记录；可读取的 state、checkout 与路由身份必须一致，只有身份足以证明无关的记录才可排除。可能匹配但身份不足、状态失效或身份冲突时要求维护者显式消歧；查询成功和失败均不回填、删除或迁移索引与历史 Run，不扫描磁盘。索引最多保留最近 32 条，且不参与 Agent 编排、GitHub 状态、权限或生命周期 mutation。
+本机维护的最小 Run ID 到 Runner 独立仓库根和 state 目录的定位记录，存放于 Runner 数据目录。新登记同时保存 Repository 与 Parent number，作为 state 或 checkout 丢失时仍可核验的路由身份，不复制生命周期状态。查询兼容缺少这对字段的旧记录；可读取的 state、checkout 与路由身份必须一致，只有身份足以证明无关的记录才可排除。可能匹配但身份不足、状态失效或身份冲突时要求维护者显式消歧；查询成功和失败均不回填、删除或迁移索引与历史 Run，不扫描磁盘。索引最多保留最近 32 条，且不参与 Agent 编排、GitHub 状态、权限或生命周期 mutation。
 _Avoid_: 全盘搜索、历史 state 迁移、跨仓库自动 mutation、Agent 执行日志、第二套 Run state
 
 **Local Delivery Task Index（本地交付任务索引）**:
-一个 Local Delivery Workspace 内维护的最小活动 Delivery Task 到唯一未完成 Run 及其 state 目录的指针。它只保存任务身份、Run 身份和位置，不复制生命周期状态、不参与 Agent 编排，也不跨独立本地仓库目录发现或阻止 Run。Run Executor Session 结束不删除指针中的未完成 Run；下次显式 `run` 继续它。指针若仍指向已完成或已放弃的 Run，新授权可将它替换为后继 Run；指向缺失、损坏或身份不一致的 Run 则 fail closed，不扫描其他目录、不猜测、不创建第二个 Run。
-_Avoid_: 主机级索引、第二套 Run state、完整 Run 历史、磁盘扫描、远端任务注册表、静默覆盖冲突、复活终态 Run
+一个 Local Delivery Workspace 内维护的最小活动 Delivery Task 到唯一未完成 Run 及其 state 目录的指针。它只保存任务身份、Run 身份和位置，不复制生命周期状态、不参与 Agent 编排；来自不同用户 clone 的同一任务共用该指针。Run Executor Session 结束不删除指针中的未完成 Run；下次显式 `run` 继续它。指针若仍指向已完成或已放弃的 Run，新授权可将它替换为后继 Run；指向缺失、损坏或身份不一致的 Run 则 fail closed，不扫描其他目录、不猜测、不创建第二个 Run。
+_Avoid_: 第二套 Run state、完整 Run 历史、磁盘扫描、远端任务注册表、静默覆盖冲突、复活终态 Run
 
 **Merge 结果对账（Merge Outcome Reconciliation）**:
 Publisher 发出带精确 head 绑定的 merge intent 后，如网络或 GitHub 响应使结果未知，先在 GitHub 只读事实中对账：已 MERGED 即恢复成功；仍 OPEN 且 head、base、Required Checks 与 mergeability 仍全部匹配时，最多重试同一 intent 三次；任一矛盾状态才停止为人工处理。结果读取使用 GitHub 事件与只读状态的监督预算。

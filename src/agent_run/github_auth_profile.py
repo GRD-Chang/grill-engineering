@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_run.paths import app_config_root
+
 
 class GitHubAuthProfileError(ValueError):
     """The local GitHub App profile is missing, invalid, or unsafe to use."""
@@ -48,14 +50,10 @@ class GitHubAppProfileStore:
 
     @classmethod
     def default_path(cls) -> Path:
-        config_home = os.environ.get("XDG_CONFIG_HOME")
-        if config_home:
-            root = Path(config_home).expanduser()
-            if not root.is_absolute():
-                raise GitHubAuthProfileError("XDG_CONFIG_HOME 必须是绝对路径")
-        else:
-            root = Path.home() / ".config"
-        return root / cls._DIRECTORY_NAME / cls._FILE_NAME
+        try:
+            return app_config_root() / cls._FILE_NAME
+        except ValueError as error:
+            raise GitHubAuthProfileError(str(error)) from error
 
     def load(self) -> GitHubAppProfile | None:
         if self._profile_directory_metadata() is None:

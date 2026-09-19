@@ -205,7 +205,7 @@ class FreshCycleRunAgents(ScriptedRunAgents):
         )
 
 def _completed_run(
-    git_repo: Path, *, ticket_number: int = 2,
+    git_repo: Path, *, ticket_number: int = 2, state_root: Path | None = None,
 ) -> tuple[dict[str, Any], StateStore, GitRepository]:
     ticket_key = str(ticket_number)
     fixture = write_fixture(
@@ -221,7 +221,7 @@ def _completed_run(
             }
         },
     )
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(state_root if state_root is not None else git_repo / ".agent-run")
     git = GitRepository(git_repo)
     controller = Controller(FixtureGitHubReader(fixture), git, states)
     state, _ = controller.start(1)

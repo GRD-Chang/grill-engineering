@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import prepare_workspace
+
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
@@ -348,16 +350,18 @@ def test_final_publication_discards_an_artifact_when_default_base_advances(
 def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
     git_repo: Path,
 ) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "malformed-run-publication.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git, _publisher = _accepted_run(repo, state_root=workspace.state_root)
+    agents = repo / "malformed-run-publication.json"
     agents.write_text(
         json.dumps({"run_publications": [{"invalid": "publication"}]}),
         encoding="utf-8",
     )
 
     failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -379,16 +383,18 @@ def test_malformed_final_run_publication_is_reported_as_execution_failed_by_cli(
 def test_final_publication_fixture_missing_thread_marks_invocation_failed(
     git_repo: Path,
 ) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "missing-run-publication-thread.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git, _publisher = _accepted_run(repo, state_root=workspace.state_root)
+    agents = repo / "missing-run-publication-thread.json"
     agents.write_text(
         json.dumps({"run_publications": [{"no_thread": True}]}),
         encoding="utf-8",
     )
 
     failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -403,8 +409,10 @@ def test_final_publication_fixture_missing_thread_marks_invocation_failed(
 def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
     git_repo: Path,
 ) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "repair-run-publication.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git, _publisher = _accepted_run(repo, state_root=workspace.state_root)
+    agents = repo / "repair-run-publication.json"
     artifact = RunPublicationAgents().run_publication({})
     agents.write_text(
         json.dumps(
@@ -427,8 +435,8 @@ def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
     )
 
     published = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -446,16 +454,18 @@ def test_final_publication_fixture_repairs_malformed_output_in_same_thread(
 def test_final_publication_fixture_records_a_fresh_thread_without_expectation(
     git_repo: Path,
 ) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
-    agents = git_repo / "fresh-run-publication.json"
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git, _publisher = _accepted_run(repo, state_root=workspace.state_root)
+    agents = repo / "fresh-run-publication.json"
     agents.write_text(
         json.dumps({"run_publications": [RunPublicationAgents().run_publication({})]}),
         encoding="utf-8",
     )
 
     published = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -473,14 +483,16 @@ def test_final_publication_fixture_records_a_fresh_thread_without_expectation(
 def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
     git_repo: Path,
 ) -> None:
-    state, states, _git, _publisher = _accepted_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, _git, _publisher = _accepted_run(repo, state_root=workspace.state_root)
     seed_idle_control(
         TaskControlStore(states.root),
-        TaskKey(git_repo, str(state["repository"]), 1),
+        TaskKey(repo, str(state["repository"]), 1),
         str(state["run_id"]),
         state_dir=states.root,
     )
-    failed_agents = git_repo / "failed-run-publication.json"
+    failed_agents = repo / "failed-run-publication.json"
     failed_agents.write_text(
         json.dumps(
             {
@@ -506,8 +518,8 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
         encoding="utf-8",
     )
     failed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",
@@ -515,7 +527,7 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
     )
     assert failed.returncode == 2
 
-    resumed_agents = git_repo / "resumed-run-publication.json"
+    resumed_agents = repo / "resumed-run-publication.json"
     resumed_agents.write_text(
         json.dumps(
             {
@@ -531,8 +543,8 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
         encoding="utf-8",
     )
     resumed = run_cli(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "resume",
         str(state["run_id"]),
         "--agent-fixture",
@@ -552,26 +564,28 @@ def test_final_publication_fixture_resume_gets_a_fresh_repair_budget(
 def test_publish_run_cannot_bypass_exhausted_final_run_operation_retry(
     git_repo: Path,
 ) -> None:
-    state, states, git, publisher = _accepted_run(git_repo)
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git, publisher = _accepted_run(repo, state_root=workspace.state_root)
 
     pending = RunPublicationEngine(
         git=git,
         states=states,
         agents=RunPublicationAgents(),
-        github=InterruptedRunPublisher(git_repo / "github.json", git),
+        github=InterruptedRunPublisher(repo / "github.json", git),
         default_branch="main",
         default_head_sha=git.resolve("main"),
     ).publish(str(state["run_id"]))
     acceptance = pending["run_acceptance"]["acceptance_record"]
-    agents = git_repo / "resume-publication-agents.json"
+    agents = repo / "resume-publication-agents.json"
     agents.write_text(
         json.dumps({"run_publications": [RunPublicationAgents().run_publication({})]}),
         encoding="utf-8",
     )
 
     resumed = run_internal_stage(
-        git_repo,
-        git_repo / "github.json",
+        repo,
+        repo / "github.json",
         "publish-run",
         str(state["run_id"]),
         "--agent-fixture",

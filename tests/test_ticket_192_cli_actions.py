@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_state
+
 from agent_run.cli import (
     _print_interruption_result,
     build_parser,
@@ -180,7 +182,7 @@ def test_approve_parent_receipt_is_human_safe_and_repeat_is_idempotent(
         status_term="任务已完成",
         next_action="下一步: 无",
     )
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     first_control = json.loads(control_path.read_text(encoding="utf-8"))
     first_action_id = first_control["action"]["action_id"]
     delivery_before = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
@@ -271,13 +273,13 @@ def test_revise_parent_intent_creates_a_successor_at_the_next_human_boundary(
     repeated_output = stdout_json(repeated)
     assert repeated_output["action"]["submission"] == "started"
     assert repeated_output["action_audit"]["action_id"] != receipt["action_id"]
-    current = StateStore(git_repo / ".agent-run").load_run(run_id)
+    current = StateStore(managed_state(git_repo)).load_run(run_id)
     assert current is not None
     assert current["status"] == "run_approval_pending"
     assert current["run_acceptance"]["repair_generation"] == 2
     assert current["run_acceptance"]["modification_attempts"] == attempts_before == 1
     assert len(current["agent_invocation_history"]) == invocation_count_before + 4
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     control = json.loads(control_path.read_text(encoding="utf-8"))
     assert control["action"]["action_id"] == repeated_output["action_audit"]["action_id"]
     assert any(
@@ -324,7 +326,7 @@ def test_revise_durable_save_crash_is_not_replayed(
     )
     invocation_count_before = len(crashed_state["agent_invocation_history"])
     fixture_before = fixture.read_bytes()
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     control_before = json.loads(control_path.read_text(encoding="utf-8"))
 
     repeated = run_cli(
@@ -344,7 +346,7 @@ def test_revise_durable_save_crash_is_not_replayed(
     assert repeated_output["action"]["status"] == "applied"
     assert repeated_output["action_audit"]["action_id"] == receipt["action_id"]
     assert repeated_output["action_audit"]["payload_digest"] == receipt["payload_digest"]
-    current = StateStore(git_repo / ".agent-run").load_run(str(crashed_state["run_id"]))
+    current = StateStore(managed_state(git_repo)).load_run(str(crashed_state["run_id"]))
     assert current is not None
     assert current["run_acceptance"]["repair_request"] == repair_request
     assert (
@@ -414,7 +416,7 @@ def test_run_failure_receipt_recovers_the_durable_parent_run(
         ("configure", ["--development-model", "custom"]),
     ],
 )
-def test_exact_run_repository_mismatch_failure_is_human_safe(
+def test_unknown_repository_failure_does_not_use_the_launch_checkout(
     git_repo: Path,
     command: str,
     extra_arguments: list[str],
@@ -442,10 +444,9 @@ def test_exact_run_repository_mismatch_failure_is_human_safe(
 
     assert failed.returncode == 2
     assert "命令状态: 未执行" in failed.stdout
-    assert "Repository: example/project" in failed.stdout
-    assert "Parent Issue: #1" in failed.stdout
-    assert "交付状态: 等待人工批准" in failed.stdout
-    assert "下一步: agent-run approve 1 --repo example/project" in failed.stdout
+    assert "没有找到唯一匹配的交付" in failed.stdout
+    assert "不会猜测目标" in failed.stdout
+    assert load_only_run_state(git_repo) == state
     assert run_id not in failed.stdout
     assert internal_status not in failed.stdout
     assert "<run-id>" not in failed.stdout
@@ -466,7 +467,7 @@ def test_configure_parent_changes_only_the_profile_control_plane(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     run_id = str(stdout_json(seed_run(git_repo, fixture))["run_id"])
-    state_root = git_repo / ".agent-run"
+    state_root = managed_state(git_repo)
     state_path = state_root / "runs" / f"{run_id}.json"
     profile_path = state_root / "profiles" / f"{run_id}.json"
     profile_before = json.loads(profile_path.read_bytes())
@@ -597,10 +598,10 @@ def test_parent_mutation_selector_never_guesses_a_missing_run(
 
     assert result.returncode == 2
     assert stdout_json(result)["diagnostics"][0]["code"] == "run_selector_not_found"
-    assert not (git_repo / ".agent-run" / "runs").exists()
+    assert not (managed_state(git_repo) / "runs").exists()
 
 
-def test_parent_mutation_selector_reports_repository_mismatch_and_ambiguity(
+def test_parent_mutation_selector_reports_missing_repository_and_ambiguity(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
@@ -622,7 +623,7 @@ def test_parent_mutation_selector_reports_repository_mismatch_and_ambiguity(
     )
     assert mismatch.returncode == 2
     assert stdout_json(mismatch)["diagnostics"][0]["code"] == (
-        "run_selector_repository_mismatch"
+        "run_selector_not_found"
     )
 
     ambiguous = run_cli(
@@ -644,4 +645,4 @@ def test_parent_mutation_selector_reports_repository_mismatch_and_ambiguity(
     assert str(git_repo) not in human_ambiguous.stdout
     assert "state_dir" not in human_ambiguous.stdout
     assert "repository_root" not in human_ambiguous.stdout
-    assert len(list((git_repo / ".agent-run" / "runs").glob("*.json"))) == 2
+    assert len(list((managed_state(git_repo) / "runs").glob("*.json"))) == 2

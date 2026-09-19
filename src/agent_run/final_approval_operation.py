@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.task_control import TaskControlStore, TaskKey, action_receipt_matches
+from agent_run.managed_workspace import workspace_state_root
 
 
 def has_final_approval(state: Mapping[str, Any]) -> bool:
@@ -81,7 +82,7 @@ def has_unfinished_final_receipt(state: Mapping[str, Any], workspace: Path) -> b
     repository = state.get("repository")
     if type(number) is not int or not isinstance(repository, str):
         return False
-    control = TaskControlStore(workspace / ".agent-run")
+    control = TaskControlStore(workspace_state_root(workspace))
     task = TaskKey(workspace, repository, number)
     record = control.load(task)
     action = record.get("action") if isinstance(record, Mapping) else None

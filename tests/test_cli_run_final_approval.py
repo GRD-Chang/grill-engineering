@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from support.workspace import managed_state
+
 
 from cli_fixtures import run_agents
 from conftest import seed_run, write_fixture
@@ -498,7 +500,7 @@ def test_resume_finished_delivery_only_retries_unfinished_cleanup(git_repo: Path
     cleanup["status"] = "cleanup_pending"
     for item in cleanup["items"].values():
         item["status"] = "cleanup_pending"
-    StateStore(git_repo / ".agent-run").save_run(run_id, state)
+    StateStore(managed_state(git_repo)).save_run(run_id, state)
 
     resumed = run_cli(git_repo, fixture, "resume", "1")
     assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
@@ -545,7 +547,7 @@ def test_resume_only_reconciles_success_when_executor_lost_the_final_receipt(
     assert interrupted.returncode == 2
     completed = load_only_run_state(git_repo)
     assert completed["status"] == "completed"
-    control_path = next((git_repo / ".agent-run" / "task-control").glob("*.json"))
+    control_path = next((managed_state(git_repo) / "task-control").glob("*.json"))
     original_control = json.loads(control_path.read_text())
     assert original_control["action"]["status"] == (
         "completed" if receipt_saved else "applying"

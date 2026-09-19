@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from support.workspace import managed_repo, managed_state
+
 from agent_run.executor_host import ExecutorSpec, FakeExecutorHost, HostObservation
 from agent_run.run_lifecycle import (
     LifecycleRequest,
@@ -38,10 +40,10 @@ def test_attach_preserves_executor_completion_at_host_inspection(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     fixture = write_fixture(git_repo / "github.json", issues={})
     assert seed_run(git_repo, fixture).returncode == 0
-    states = StateStore(git_repo / ".agent-run")
+    states = StateStore(managed_state(git_repo))
     state = states.find_unfinished_runs("example/project", 1)[0]
     run_id = state["run_id"]
-    task = TaskKey(git_repo, "example/project", 1)
+    task = TaskKey(managed_repo(git_repo), "example/project", 1)
     control = TaskControlStore(states.root)
     claim = control.claim_action(task, kind="run", payload={"parent": 1})
     assert claim.action is not None and claim.action_id is not None

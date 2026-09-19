@@ -3,7 +3,7 @@
 English | [简体中文](install.md)
 
 Complete installation and the target repository checks on this page. To run a task, follow the [agent guide](agent-guide.en.md#run-a-task).
-The tool's source directory is used for installation; the target repository is where delivery runs. They may be different directories.
+The tool's source directory is used for installation. Delivery uses Runner's independent clone of the target remote; the user checkout stays unchanged.
 
 ## First installation
 
@@ -58,14 +58,13 @@ Setup's short-lived systemd probe checks actual execution capability. Preserve h
 
 ## Target repository setup
 
-Enter the target repository and read its `AGENTS.md`. Setup does not configure the items below. Resolve them within the user's authorization and verify each one:
+Read the target repository's `AGENTS.md` and confirm that the required content has been pushed. Inspect an existing user checkout or read the remote contents. Setup does not configure the items below. Resolve them within the user's authorization and verify each one:
 
 | Check | Completion criterion |
 | --- | --- |
-| Authentication and repository identity | `codex login status` and `gh auth status` succeed; Git identity and remotes are correct; host gh has the write permissions needed for publication |
+| Authentication and repository identity | `codex login status` and `gh auth status` succeed; Git commit identity and target `OWNER/REPO` are correct; host gh has the write permissions needed for publication |
 | Skills | The user running Codex can discover and read `implement`, `code-review`, their referenced Skills, and any other Skills required by the project. Runner does not bundle them. Follow the current [Matt Skills instructions](https://github.com/mattpocock/skills) when missing; inspect and reuse existing Skills with the same name |
 | Project environment | Build, test, and runtime dependencies are ready. Start from a shell with the project's PATH/virtual environment configured; Runner's Python environment does not replace it |
-| Ignore rules | Root `.gitignore` includes `/.agent-run/`, and `git check-ignore .agent-run/runs/probe` succeeds. Handle any already-tracked runtime files first |
 | CI | If PR workflows exist, verify that their base-branch filters cover the default branch and `agent-run/**`; check required-check rules for both. Runs may proceed with no required checks, but do not describe that as CI passing |
 
 ### GitHub authentication: no App required by default
@@ -126,5 +125,5 @@ Run these commands from the selected tool source root. Rerun `./setup.sh` first 
 Installation retains only the current and previous versions. Reinstalling still builds a candidate; if its content matches the current version, that version is reused and the compatibility call is skipped.
 Build or activation failure preserves the previous active version.
 
-Installation, rollback, and uninstall do not alter existing delivery tasks. Uninstall preserves the installation lock, Run locator records, App configuration, private keys, and each target repository's `.agent-run` directory.
+Installation, rollback, and uninstall do not alter existing delivery tasks. Uninstall preserves the installation lock, Run locator records, App configuration, private keys, Runner-owned clones, and run data.
 A user-replaced command entry point is preserved and reported as incomplete cleanup. If task state is incompatible, follow the reported error rather than manually migrating it.
