@@ -6791,3 +6791,47 @@ def test_rich_status_colors_follow_business_conclusion() -> None:
     assert _status_style("run_publication_pending") == "green"
     assert _status_style("run_approval_pending") == "yellow"
     assert _status_style("active") == "cyan"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("operator_stopped", "resume"),
+        ("abandonment_pending", "abandon"),
+        ("requeue_required", "requeue"),
+        ("run_approval_pending", "approve"),
+        ("active", "run"),
+    ],
+)
+def test_human_next_action_keeps_commands_identical_across_languages(
+    status: str, expected: str,
+) -> None:
+    from agent_run.cli_presentation import human_next_action_for_state
+
+    state = {
+        "status": status, "run_id": "run-private", "repository": "example/project",
+        "parent": {"number": 42},
+    }
+    for language in ("zh", "en"):
+        assert human_next_action_for_state(state, language=language) == (
+            f"agent-run {expected} 42 --repo example/project"
+        )
+
+
+def test_human_recovery_guidance_translates_copy_without_parsing_it() -> None:
+    from agent_run.cli_presentation import human_next_action_for_state
+    from agent_run.notification_presentation import next_action, pause_reason
+
+    state = {
+        "status": "publication_pending", "run_id": "run-private",
+        "repository": "example/project", "parent": {"number": 42}, "language": "en",
+    }
+    english = next_action(state)
+    assert "Inspect why publication retries failed" in english
+    assert "agent-run abandon 42 --repo example/project" in english
+    assert "检查发布重试失败的原因" in str(human_next_action_for_state(state))
+    raw_evidence = "外部工具原始证据: user supplied details"
+    assert pause_reason(raw_evidence, "en") == raw_evidence
+    assert pause_reason("review_budget_exhausted", "en") == (
+        "The authorized review attempts are exhausted"
+    )

@@ -12,7 +12,7 @@ def state_with_round(role: str = "development", outcome: str = "candidate") -> d
     attempt = {"attempt_id": "a1", "role": role, "work_subject": "run:r",
                "ordinal": 1, "generation": 1, "status": "completed", "outcome": outcome,
                "development_summary": "已实现输入校验"}
-    return {"run_id": "r", "repository": "o/repo", "parent": {"number": 241, "title": "飞书通知"},
+    return {"language": "zh", "run_id": "r", "repository": "o/repo", "parent": {"number": 241, "title": "飞书通知"},
             "status": "run_review_pending", "semantic_agent_attempts": [attempt],
             "agent_invocation_history": [{"semantic_attempt": attempt.copy(), "status": "completed",
                                           "started_at": "2026-01-01T00:00:00+00:00",
@@ -96,15 +96,28 @@ def test_start_waits_for_task_title_and_pr_uses_persisted_fact() -> None:
     assert [event["url"] for event in projected if event["kind"] == "pr_created"] == ["https://github.com/o/repo/pull/99"]
 
 
-def test_failure_is_red_with_actual_diagnostic_and_no_success_claim() -> None:
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_failure_is_red_with_actual_diagnostic_and_no_success_claim(
+    language: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     state = state_with_round()
     state["semantic_agent_attempts"][0].update(status="pending", outcome=None)
     state["agent_invocation_history"][0]["status"] = "failed"
-    state.update(status="execution_failed", diagnostics=[{"message": "输出管道断开"}])
+    state.update(language=language, status="execution_failed", diagnostics=[{"message": "输出管道断开"}])
+    from agent_run import notification_events
+    original = notification_events.history_records
+
+    def changed_copy(*args: Any, **kwargs: Any) -> Any:
+        records = original(*args, **kwargs)
+        for record in records:
+            record["status_text"] = "Unrelated display text"
+        return records
+
+    monkeypatch.setattr(notification_events, "history_records", changed_copy)
     projected = events(state)
     ended = [event for event in projected if event["kind"] == "stage_end"]
     assert len(ended) == 1 and ended[0]["color"] == "red"
-    assert "执行失败" in ended[0]["title"]
+    assert ("执行失败" if language == "zh" else "Execution failed") in ended[0]["title"]
     assert "输出管道断开" in projected[-1]["summary"]
 
 
@@ -347,3 +360,62 @@ def test_overall_todo_does_not_borrow_completed_ticket_identity(mode: str) -> No
     assert notification["task_title"] == state["parent"]["title"]
     assert notification["url"] == "https://github.com/o/repo/issues/241"
     assert "整体验收问题" in notification["summary"]
+
+
+@pytest.mark.parametrize("mode", ["concise", "detailed"])
+@pytest.mark.parametrize("status", [
+    "run_review_pending", "ready_for_human", "operator_stopped", "abandoned",
+    "execution_failed", "run_approval_pending", "completed",
+])
+def test_language_and_history_copy_do_not_change_business_facts(
+    mode: str, status: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from copy import deepcopy
+    from agent_run import notification_events
+
+    state = state_with_round("review", "acceptance_artifact")
+    state.update(status=status, notifications={"mode": mode},
+                 human_blockers=["原始 blocker 原样"],
+                 run_publication={"pr_number": 42, "required_checks_evidence": {"result": "pass"}})
+    state["semantic_agent_attempts"][0]["acceptance_artifact"] = {
+        "checks": {"spec": {"status": "fail", "findings": ["原始 finding 原样"]}}}
+    chinese = events(state)
+    original = notification_events.history_records
+
+    def changed_copy(*args: Any, **kwargs: Any) -> Any:
+        records = deepcopy(original(*args, **kwargs))
+        for record in records:
+            record.update(status_text="Arbitrary display text", role_label="任意角色文字")
+        return records
+
+    monkeypatch.setattr(notification_events, "history_records", changed_copy)
+    assert events(state) == chinese
+    state["language"] = "en"
+    english = events(state)
+    facts = ("id", "kind", "color", "current", "task_number", "task_title", "url", "query", "checks")
+    assert [{key: event.get(key) for key in facts} for event in chinese] == [
+        {key: event.get(key) for key in facts} for event in english]
+    assert [event["title"] for event in chinese] != [event["title"] for event in english]
+    assert all(event["language"] == "en" for event in english)
+    ended = [event for event in english if event["kind"] == "stage_end"]
+    if ended:
+        assert "原始 finding 原样" in ended[0]["summary"]
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_card_localizes_labels_and_preserves_external_text(language: str) -> None:
+    state = state_with_round()
+    state["language"] = language
+    event = events(state)[-1]
+    event.update(summary="原始 Agent 摘要", next_step="agent-run resume r", duration_seconds=484,
+                 checks={"e2e": "pass", "spec": "blocked", "review": "fail"})
+    rendered = card(event)
+    content = rendered["body"]["elements"][0]["content"]
+    assert "原始 Agent 摘要" in content
+    assert "agent-run resume r" in content
+    assert state["parent"]["title"] in content
+    for fragment in (("功能验证：通过", "需求核对：受阻", "工程审查：未通过", "8 分 4 秒", "下一步")
+                     if language == "zh" else
+                     ("Functional verification: Passed", "Requirements verification: Blocked",
+                      "Engineering review: Failed", "8 min 4 s", "Next step")):
+        assert fragment in content

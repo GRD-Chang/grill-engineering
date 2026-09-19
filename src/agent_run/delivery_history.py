@@ -770,6 +770,7 @@ def _finalize_history_record(state: dict[str, Any], record: dict[str, Any]) -> N
     record["configurations"] = _record_configurations(invocations)
     details = _history_record_details(state, record)
     record.update(details)
+    record["status_code"] = history_record_status_code(record)
     record["status_text"] = _history_record_status(record)
 
 
@@ -907,7 +908,12 @@ def _record_configurations(invocations: list[dict[str, Any]]) -> list[dict[str, 
     return configurations
 
 
-def _history_record_status(record: dict[str, Any]) -> str:
+def history_record_status_code(record: dict[str, Any]) -> str:
+    """Stable semantic result shared by History and notifications.
+
+    This read-only projection uses the already associated attempt evidence;
+    display wording is never an input to result classification.
+    """
     invocations = record.get("invocations")
     if isinstance(invocations, list) and invocations:
         latest = invocations[-1]
@@ -915,34 +921,47 @@ def _history_record_status(record: dict[str, Any]) -> str:
             "failed",
             "execution_failed",
         }:
-            return "执行失败"
+            return "execution_failed"
     attempt = record.get("attempt")
     if isinstance(record.get("findings"), list) and record["findings"]:
-        return "验收未通过"
+        return "review_failed"
     artifact = record.get("acceptance_artifact")
     if isinstance(artifact, dict):
         outcome = _artifact_outcome(artifact)
         if outcome == "pass":
-            return "验收通过"
+            return "review_passed"
         if outcome == "blocked":
-            return "验收受阻"
+            return "review_blocked"
     if isinstance(attempt, dict) and attempt.get("status") == "pending":
         if record.get("activity") == "running":
-            return "进行中"
+            return "running"
         if record.get("activity") in {"interrupted", "unknown"}:
-            return _execution_activity_text(str(record["activity"]))
-        return "待执行"
+            return str(record["activity"])
+        return "pending"
     attempt_outcome: object = (
         attempt.get("outcome") if isinstance(attempt, dict) else None
     )
+    outcome = str(attempt_outcome)
+    return outcome if outcome in {
+        "candidate", "publication_artifact", "acceptance_artifact",
+        "currentness_invalidated", "no_code_changes", "git_integrity_repair",
+    } else "completed"
+
+
+def _history_record_status(record: dict[str, Any]) -> str:
     return {
+        "execution_failed": "执行失败", "review_failed": "验收未通过",
+        "review_passed": "验收通过", "review_blocked": "验收受阻",
+        "running": "进行中", "interrupted": "执行已中断，等待恢复",
+        "unknown": "运行状态无法确认", "pending": "待执行",
         "candidate": "开发完成，待验收",
         "publication_artifact": "发布说明已完成",
         "acceptance_artifact": "验收结果已记录",
         "currentness_invalidated": "因版本变化失效",
         "no_code_changes": "开发未产生代码变更",
         "git_integrity_repair": "已记录 Git 修复边界",
-    }.get(str(attempt_outcome), "已完成")
+        "completed": "已完成",
+    }[history_record_status_code(record)]
 
 
 def _history_record_details(

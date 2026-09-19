@@ -25,9 +25,10 @@ from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import parent_publication, passing_acceptance, ticket
 
 
-@pytest.mark.parametrize("drain", [True, False], ids=["representative-delivery", "bounded-cancel"])
+@pytest.mark.parametrize("language,drain", [("zh", True), ("en", True), ("zh", False)],
+                         ids=["zh-delivery", "en-delivery", "bounded-cancel"])
 def test_cli_delivery_sends_cards_and_queries_never_send(
-    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain: bool,
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain: bool, language: str,
 ) -> None:
     binary = tmp_path / "bin"
     binary.mkdir()
@@ -49,7 +50,7 @@ else:
 ''')
     tool.chmod(0o700)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
-    UserDefaultsStore().configure(notifications={"enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test"})
+    UserDefaultsStore().configure(language=language, notifications={"enabled": True, "profile": "test", "open_id": "ou_test", "app_id": "cli_test"})
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     agents = run_agents(git_repo / "agents.json")
 
@@ -137,18 +138,24 @@ raise SystemExit(main(sys.argv[1:]))
     # production close is allowed to leave later notifications unsent.
     delivered = [json.loads(line) for line in messages.read_text().splitlines()]
     assert delivered and all(item["schema"] == "2.0" for item in delivered)
-    assert delivered[0]["header"]["title"]["content"] == "任务已开始"
+    assert current["language"] == language
+    def localized(zh: str, en: str) -> str:
+        return zh if language == "zh" else en
+
+    assert delivered[0]["header"]["title"]["content"] == localized("任务已开始", "Task started")
+    assert localized("开始时间", "Started at") in str(delivered[0])
+    assert localized("打开 Issue", "Open Issue") in str(delivered[0])
     cards = [card(event) for event in events(current)]
     titles = [item["header"]["title"]["content"] for item in cards]
-    assert "任务已开始" in titles
-    assert any("正在开发" in value for value in titles), titles
-    assert any("正在验收" in value for value in titles), titles
-    assert any("说明已准备好" in value for value in titles), titles
+    assert localized("任务已开始", "Task started") in titles
+    assert any(localized("正在开发", "Developing") in value for value in titles), titles
+    assert any(localized("正在验收", "Reviewing") in value for value in titles), titles
+    assert any(localized("说明已准备好", "description is ready") in value for value in titles), titles
     assert not any("最终 PR" in value and "已创建" in value for value in titles), titles
-    assert any("请批准合并 PR" in value for value in titles)
-    approval_card = next(item for item in cards if item["header"]["title"]["content"]  .startswith("请批准合并 PR"))
-    assert "未配置合并前检查" in json.dumps(approval_card, ensure_ascii=False)
-    assert "任务已完成" not in titles
+    assert any(localized("请批准合并 PR", "Please approve merging PR") in value for value in titles)
+    approval_card = next(item for item in cards if item["header"]["title"]["content"]  .startswith(localized("请批准合并 PR", "Please approve merging PR")))
+    assert localized("未配置合并前检查", "No pre-merge checks configured") in json.dumps(approval_card, ensure_ascii=False)
+    assert localized("任务已完成", "Task completed") not in titles
     assert all(item["schema"] == "2.0" for item in cards)
     journal = read_notifications(managed_state(git_repo), output["run_id"])
     assert journal["seen"]
@@ -158,14 +165,14 @@ raise SystemExit(main(sys.argv[1:]))
         assert any(item["outcome"] == "unknown" for item in journal["pending"])
         assert any(item["outcome"] == "pending" for item in journal["pending"])
     for result, expected in (
-        ("none", "未配置合并前检查"), ("pass", human_status_term("pass")),
-        ("pending", human_status_term("pending")), ("fail", human_status_term("fail")),
-        ("unknown", "暂时无法确认"),
+        ("none", localized("未配置合并前检查", "No pre-merge checks configured")), ("pass", localized(human_status_term("pass"), "Passed")),
+        ("pending", localized(human_status_term("pending"), "Pending")), ("fail", localized(human_status_term("fail"), "Failed")),
+        ("unknown", localized("暂时无法确认", "Cannot currently confirm")),
     ):
         snapshot = deepcopy(current)
         snapshot["run_publication"]["required_checks_evidence"]["result"] = result
         approval = next(event for event in events(snapshot) if event.get("current"))
-        assert f"检查：{expected}" in approval["summary"]
+        assert expected in approval["summary"]
     before = messages.read_bytes() if messages.exists() else b""
     for command in ("status", "history"):
         queried = run_cli(git_repo, fixture, command, output["run_id"], "--json")
@@ -174,14 +181,20 @@ raise SystemExit(main(sys.argv[1:]))
     assert (messages.read_bytes() if messages.exists() else b"") == before
     assert read_notifications(managed_state(git_repo), output["run_id"]) == journal
     # Approval reuses the immutable Run configuration even after defaults change.
-    UserDefaultsStore().configure(notifications={"enabled": False})
+    UserDefaultsStore().configure(language="en" if language == "zh" else "zh", notifications={"enabled": False})
+    delivered_before_approval = len(messages.read_text().splitlines())
     approved = invoke("approve", output["run_id"])
     assert approved.returncode == 0, approved.stderr
     assert stdout_json(approved)["status"] == "completed"
     completed = load_only_run_state(git_repo)
     assert completed["notifications"]["enabled"] is True
+    assert completed["language"] == language
+    approval_deliveries = [json.loads(line) for line in messages.read_text().splitlines()[delivered_before_approval:]]
+    assert approval_deliveries
+    for delivered_card in approval_deliveries:
+        assert localized("打开 PR", "Open PR") in str(delivered_card)
     cards = [card(event) for event in events(completed)]
-    assert sum(item["header"]["title"]["content"] == "任务已完成" for item in cards) == 1
+    assert sum(item["header"]["title"]["content"] == localized("任务已完成", "Task completed") for item in cards) == 1
 
 
 @pytest.mark.parametrize("scope", ["ticket", "parent", "run"])
@@ -246,8 +259,7 @@ def test_cli_blocked_acceptance_resume_projects_same_round(
     after = events(load_only_run_state(git_repo))
     assert starts <= {event["id"] for event in after if event["kind"] == "stage_start"}
     assert not any("验收受阻" in event["title"] for event in after)
-    passed = [event for event in after if event["kind"] == "stage_end" and event["phase"] == result["phase"]
-              and event.get("object") == result.get("object")]
+    passed = [event for event in after if event["kind"] == "stage_end" and event["attempt_id"] == result["attempt_id"]]
     assert len(passed) == 1, passed
     assert passed[0]["round"] == result["round"]
     assert passed[0]["id"] != result["id"]

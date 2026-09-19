@@ -101,6 +101,9 @@ def test_repair_history_does_not_use_shared_budget_position_as_round(
     before = deepcopy((state, audit))
 
     records = history_records(state, audit)
+    assert [record["status_code"] for record in records] == [
+        "review_failed", "review_passed"
+    ]
     assert [record["status_text"] for record in records] == [
         "验收未通过", "验收通过"
     ]

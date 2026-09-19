@@ -4,6 +4,8 @@ from datetime import datetime
 from itertools import chain
 from typing import Any
 
+from agent_run.guidance_actions import action_command
+from agent_run.messages import text
 from agent_run.operator_gate import (
     operator_gate_evidence,
     operator_gate_subjects,
@@ -24,6 +26,8 @@ def operator_action_view(
     *,
     current_identity: dict[str, object],
     fallback_next_action: str,
+    language: str = "zh",
+    human: bool = False,
 ) -> dict[str, Any] | None:
     """Project one canonical Run-wide gate for public CLI consumers."""
 
@@ -82,6 +86,7 @@ def operator_action_view(
             action_kind,
             reason,
             fallback_next_action=fallback_next_action,
+            language=language, human=human,
         ),
     }
 
@@ -303,6 +308,8 @@ def _operator_next_action(
     reason: object,
     *,
     fallback_next_action: str,
+    language: str = "zh",
+    human: bool = False,
 ) -> str:
     repository = state.get("repository")
     parent = state.get("parent")
@@ -332,10 +339,13 @@ def _operator_next_action(
             if isinstance(repository, str) and isinstance(parent_number, int):
                 return f"agent-run abandon {parent_number} --repo {repository}"
             if isinstance(run_id, str):
-                return f"agent-run abandon {run_id}"
+                return action_command(state, "abandon", run_id, human=human)
         if isinstance(repository, str) and isinstance(parent_number, int):
-            return (
-                "修复诊断中的确定性外部矛盾后执行 "
-                f"agent-run run {parent_number} --repo {repository}"
+            key = "guidance.action.external_contradiction"
+            if human:
+                key += ".human"
+            return text(
+                key, language=language,
+                run=f"agent-run run {parent_number} --repo {repository}",
             )
     return fallback_next_action

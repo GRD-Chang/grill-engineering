@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -13,9 +12,7 @@ from agent_run.delivery_policy import (
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
-from agent_run.final_approval_operation import (
-    final_approval_cleanup_pending, has_final_approval,
-)
+from agent_run.guidance_actions import next_action_fact, render_next_action
 from agent_run.delivery_progress import (
     history_progress_view,
     print_history_progress,
@@ -31,11 +28,9 @@ from agent_run.operator_action_presentation import (
     print_operator_action as _print_operator_action,
 )
 from agent_run.presentation_helpers import current_work_subject, human_next_action, human_status_term
-from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.run_lifecycle import ActionReceipt
 from agent_run.semantic_attempt import semantic_attempt_subjects
-from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 
 
 def public_action_receipt(
@@ -565,89 +560,7 @@ def _public_delivery_cleanup(
 
 
 def _next_action(state: dict[str, Any]) -> str:
-    status = str(state.get("status"))
-    run_id = state.get("run_id")
-    parent = state.get("parent")
-    parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
-    cleanup = state.get("delivery_cleanup")
-    if status == "completed" and final_approval_cleanup_pending(state) and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if (
-        isinstance(cleanup, dict)
-        and cleanup.get("status") == "cleanup_pending"
-        and isinstance(run_id, str)
-    ):
-        items = cleanup.get("items")
-        if isinstance(items, dict) and any(
-            isinstance(item, dict)
-            and item.get("status") != "completed"
-            and item.get("recovery_kind") == "stale_dirty_checkout"
-            for item in items.values()
-        ):
-                return (
-                "先检查并把 stale Managed Development Checkout 的成果转存到安全位置，"
-                "再使旧 checkout 恢复 clean；"
-                f"随后用 agent-run run {parent_number} 退休旧 checkout 并继续 fresh Run Acceptance，"
-                f"或用 agent-run abandon {run_id} --discard-worktree 明确丢弃"
-            )
-        return f"agent-run resume {run_id}"
-    if has_final_approval(state) and isinstance(run_id, str) and status in {
-        "run_approval_pending", "parent_approval_pending", "waiting_checks",
-        "waiting_external", "parent_closeout_pending", "execution_failed", "supervision_timeout",
-    }:
-        return f"agent-run resume {run_id}"
-    if status in {"run_approval_pending", "parent_approval_pending"} and isinstance(
-        run_id, str
-    ):
-        return f"agent-run approve {run_id}"
-    if status == "unsupported_scope_change":
-        return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
-    if status == "deterministic_contradiction":
-        return "处理诊断中的确定性矛盾；如需终止执行 agent-run abandon"
-    if status == "abandonment_pending" and isinstance(run_id, str):
-        return f"agent-run abandon {run_id}"
-    if status == "operator_stopped" and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if status == "requeue_required" and isinstance(run_id, str):
-        return f"agent-run requeue {run_id}"
-    if invocation_is_explicitly_resumable(state) and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if (
-        status == "waiting_external"
-        and isinstance(state.get("requeue_transition"), dict)
-    ):
-        return f"agent-run run {parent_number}"
-    if status == "waiting_external":
-        return f"agent-run run {parent_number}"
-    if status == "supervision_timeout" and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if (
-        status in {"ready_for_human", "progress_exhausted"}
-        and human_blocker_subject_count(state) == 1
-        and isinstance(run_id, str)
-    ):
-        return f"agent-run resume {run_id}"
-    if status in {"ready_for_human", "progress_exhausted", "blocked"}:
-        return "处理诊断中的人工事项"
-    if status == "publication_pending":
-        return (
-            "检查已耗尽的 Publication Operation Retry；无法恢复时执行 agent-run abandon"
-        )
-    if status in {
-        "active",
-        "starting",
-        "ticket_completed",
-        "parent_delivery_pending",
-        "run_acceptance_pending",
-        "run_publication_pending",
-        "waiting_checks",
-        "waiting_merge",
-        "parent_closeout_pending",
-        "execution_failed",
-        "supervision_timeout",
-    }:
-        return f"agent-run run {parent_number}"
-    return "无"
+    return render_next_action(next_action_fact(state), state)
 
 
 def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -664,61 +577,17 @@ def human_delivery_status(value: object) -> object:
     return _display_term(value)
 
 
-def human_next_action_for_state(state: Mapping[str, Any]) -> object:
-    """Project an ordinary recovery command through the Parent selector."""
-
+def human_next_action_for_state(state: Mapping[str, Any], *, language: str = "zh") -> object:
+    """Render the shared recovery decision using the public Parent selector."""
     public_state = state if isinstance(state, dict) else dict(state)
-    operator_action = _operator_action_view(public_state)
-    value: object = _next_action(public_state)
-    if isinstance(operator_action, Mapping):
-        next_action = operator_action.get("next_action")
-        if isinstance(next_action, str):
-            value = next_action
-    if not isinstance(value, str):
-        return value
-    for internal, human in (
-        ("stale Managed Development Checkout", "旧开发工作区"),
-        ("再使旧 checkout 恢复 clean", "再清理旧工作区中的未提交文件"),
-        ("退休旧 checkout 并继续 fresh Run Acceptance", "移除旧工作区并重新整体验收"),
-        ("检查已耗尽的 Publication Operation Retry", "检查发布重试失败的原因"),
-        ("原 Ticket Graph", "原任务与依赖关系"),
-        ("处理诊断中的确定性矛盾", "处理诊断中交付记录与实际结果不一致的问题"),
-        ("确定性外部矛盾", "交付记录与实际结果不一致的问题"),
-    ):
-        value = value.replace(internal, human)
-    repository = state.get("repository")
-    parent = state.get("parent")
-    parent_number = parent.get("number") if isinstance(parent, Mapping) else None
-    run_id = state.get("run_id")
-    if isinstance(repository, str) and type(parent_number) is int:
-        value = re.sub(
-            r"agent-run abandon(?=[，；。]|$)",
-            f"agent-run abandon {parent_number} --repo {repository}",
-            value,
-        )
-    if (
-        isinstance(repository, str)
-        and isinstance(parent_number, int)
-        and isinstance(run_id, str)
-        and f"agent-run abandon {run_id} --discard-worktree" in value
-    ):
-        return value.replace(
-            f"agent-run run {parent_number}",
-            f"agent-run run {parent_number} --repo {repository}",
-        ).replace(
-            f"agent-run abandon {run_id} --discard-worktree",
-            f"agent-run abandon {parent_number} --repo {repository} --discard-worktree",
-        )
-    parts = value.split()
-    if (
-        len(parts) == 3
-        and parts[0] == "agent-run"
-        and parts[1] in {"run", "resume", "approve", "requeue", "abandon"}
-        and isinstance(repository, str)
-        and isinstance(parent_number, int)
-    ):
-        return f"agent-run {parts[1]} {parent_number} --repo {repository}"
-    return human_next_action(value, run_id=run_id)
+    fallback = render_next_action(
+        next_action_fact(public_state), public_state, language=language, human=True,
+    )
+    operator_action = operator_action_view(
+        public_state, current_identity=_current_delivery_identity(public_state),
+        fallback_next_action=fallback, language=language, human=True,
+    )
+    return operator_action["next_action"] if operator_action is not None else fallback
 
 
 def _print_human_operator_action(
