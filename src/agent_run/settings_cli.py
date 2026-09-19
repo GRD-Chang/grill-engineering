@@ -81,6 +81,7 @@ def execute(
     elif parsed.run_id is not None or parsed.parent is not None:
         state = load_run(parsed)
         language = state.get("language", DEFAULT_LANGUAGE)
+        parsed.display_language = language
         parsed.run_id = state["run_id"]
         document = AgentProfileStore(profile_root(parsed)).load(parsed.run_id)
         initializing = document is None and _profile_initialization_pending(state)
@@ -112,7 +113,7 @@ def execute(
     else:
         print(text("settings.run_title" if result.get("scope") == "run" else "settings.personal_title",
                    language=result["language"]))
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        print_fields(result, language=result["language"])
     return 0
 
 
@@ -129,3 +130,31 @@ def _profile_initialization_pending(state: dict[str, Any]) -> bool:
             "active_ticket_job", "ticket_jobs", "parent_job", "run_acceptance", "run_publication",
         ))
     )
+
+
+def print_fields(values: dict[str, Any], *, language: str, indent: int = 0) -> None:
+    """Present known configuration labels; preserve values and unknown machine keys."""
+    for key, value in values.items():
+        try:
+            label = text(f"cli.settings.field.{key}", language=language)
+        except KeyError:
+            label = key
+        prefix = " " * indent + label + ":"
+        if isinstance(value, dict) and value:
+            print(prefix)
+            print_fields(value, language=language, indent=indent + 2)
+        elif isinstance(value, list) and value:
+            print(prefix)
+            for item in value:
+                if isinstance(item, dict):
+                    print_fields(item, language=language, indent=indent + 2)
+                else:
+                    print(" " * (indent + 2) + str(item))
+        else:
+            if value is None or value == [] or value == {}:
+                rendered = text("cli.settings.unset", language=language)
+            elif isinstance(value, bool):
+                rendered = text("cli.settings.yes" if value else "cli.settings.no", language=language)
+            else:
+                rendered = str(value)
+            print(f"{prefix} {rendered}")

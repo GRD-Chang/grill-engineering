@@ -66,7 +66,11 @@ def execute(parsed: argparse.Namespace) -> int:
                     created.append(path.name)
             result = {"result": "prompts_initialized", "directory": str(directory),
                       "created": created, "preserved": preserved}
-            plain = json.dumps(result, ensure_ascii=False, indent=2)
+            plain = "\n".join((
+                text("cli.prompts.directory", language=language, directory=directory),
+                text("cli.prompts.created", language=language, files=", ".join(created) or "—"),
+                text("cli.prompts.preserved", language=language, files=", ".join(preserved) or "—"),
+            ))
         else:
             effective = prompt_resources.resolve_resources(language)
             differences = {}

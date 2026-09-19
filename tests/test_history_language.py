@@ -41,6 +41,7 @@ def publication_events() -> list[dict[str, Any]]:
             "history_generation": 1, "history_budget_window": 1,
             "required_checks_evidence": {"checks": [{
                 "name": "test", "bucket": "pass", "state": "SUCCESS", "workflow": "tests",
+                "description": "开发 Agent：原始中文检查证据 remains unchanged",
                 "link": "https://github.com/o/r/actions/runs/1/job/2",
             }]},
         },
@@ -66,26 +67,44 @@ def render(run_id: str, *arguments: str) -> str:
     return Text.from_ansi(output.getvalue()).plain
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
 def test_history_groups_final_pr_preparation_without_hiding_checks_or_raw_events(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, language: str,
 ) -> None:
+    assert main(["settings", "configure", "--language", language, "--json"]) == 0
     events = publication_events()
     run_id, path = save_history(git_repo, events)
+    # Personal changes affect future Runs, not this frozen Run.
+    assert main(["settings", "configure", "--language", "en" if language == "zh" else "zh", "--json"]) == 0
     before = path.read_bytes()
     monkeypatch.chdir(git_repo)
+    # Exercise Rich even when the developer's shell requests plain output.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLUMNS", "120")
     for options in (("--plain",), ("--plain", "--details"), (), ("--details",)):
         output = render(run_id, *options)
-        assert output.count("最终 PR #4 已创建") == 1
-        assert "合并前检查通过" in output
-        assert "等待人工批准" in output
+        if "--plain" not in options:
+            assert "╭" in output and "│" in output
+        assert output.count("最终 PR #4 已创建" if language == "zh" else "Final PR #4 created") == 1
+        assert ("合并前检查通过" if language == "zh" else "Pre-merge checks passed") in output
+        assert ("等待人工批准" if language == "zh" else "Awaiting human approval") in output
         assert "test" in output
         for internal in ("关键节点", "监督边界", "Run Publication", "github_write_pending", "a" * 40):
             assert internal not in output
         if "--details" in options:
-            assert "准备远端分支" in output
-            assert "创建 PR" in output
+            assert ("准备远端分支" if language == "zh" else "Prepare remote branch") in output
+            assert ("创建 PR" if language == "zh" else "Create PR") in output
             assert "https://github.com/o/r/actions/runs/1/job/2" in output
+            description = events[-1]["required_checks_evidence"]["checks"][0]["description"]
+            if "--plain" in options:
+                assert description in output
+            else:
+                # Rich folds the evidence inside the panel. Check every content
+                # character in order, ignoring only layout whitespace/borders;
+                # plain output and the audit below retain exact-text checks.
+                visible_content = "".join(output.replace("│", "").split())
+                assert "".join(description.split()) in visible_content
     audit = json.loads(render(run_id, "--json"))
     assert audit["timeline"] == events
     assert path.read_bytes() == before

@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 from typing import Any
 
-from agent_run.messages import validate_language
+from agent_run.messages import ErrorMessage, error_message, validate_language
 
 from agent_run.paths import app_config_root
 
@@ -113,7 +113,9 @@ def personal_method_directory(language: str | None = None) -> Path:
 
 def read_builtin_resource(key: str, package_root: Path | None = None, *, language: str | None = None) -> str:
     if key not in RESOURCE_KEYS:
-        raise ValueError(f"Unknown prompt resource: {key}")
+        raise ValueError(error_message(
+            "prompts.error.unknown", audit=f"Unknown prompt resource: {key}", resource=key
+        ))
     language = selected_language(language)
     if package_root is None:
         root = RESOURCE_ROOT if language == "zh" else RESOURCE_ROOT.parent / language
@@ -125,15 +127,21 @@ def read_builtin_resource(key: str, package_root: Path | None = None, *, languag
 def _read(path: Path) -> str:
     try:
         if not stat.S_ISREG(path.stat().st_mode):
-            raise ValueError("resource must be a regular Markdown file")
+            raise ValueError(error_message(
+                "prompts.error.regular", audit="resource must be a regular Markdown file"
+            ))
         # Bound reads before decoding; explicit unreadability must never fall back.
         with path.open("rb") as stream:
             data = stream.read(MAX_RESOURCE_BYTES + 1)
         if len(data) > MAX_RESOURCE_BYTES:
-            raise ValueError("resource exceeds 512 KiB")
+            raise ValueError(error_message("prompts.error.size", audit="resource exceeds 512 KiB"))
         return data.decode("utf-8")
     except (OSError, UnicodeError, ValueError) as error:
-        raise ValueError(f"Cannot read prompt resource {path}: {error}") from error
+        reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+        raise ValueError(error_message(
+            "prompts.error.read", audit=f"Cannot read prompt resource {path}: {error}",
+            path=path, reason=reason,
+        )) from error
 
 
 def builtin_resources(language: str | None = None) -> dict[str, str]:
@@ -157,25 +165,38 @@ def resolve_resources(language: str | None = None) -> dict[str, str]:
             except FileNotFoundError:
                 continue
             except OSError as error:
-                raise ValueError(f"Cannot inspect prompt resource {path}: {error}") from error
+                raise ValueError(error_message(
+                    "prompts.error.inspect", audit=f"Cannot inspect prompt resource {path}: {error}",
+                    path=path, reason=str(error),
+                )) from error
     validate_resources(resources)
     return resources
 
 
 def validate_resources(snapshot: object) -> None:
     if not isinstance(snapshot, dict) or set(snapshot) != set(RESOURCE_KEYS):
-        raise ValueError("Incompatible prompt resource snapshot: required resource identities differ")
+        raise ValueError(error_message(
+            "prompts.error.identities",
+            audit="Incompatible prompt resource snapshot: required resource identities differ",
+        ))
     if any(not isinstance(value, str) for value in snapshot.values()):
-        raise ValueError("Invalid prompt resource snapshot: content must be text")
+        raise ValueError(error_message(
+            "prompts.error.content", audit="Invalid prompt resource snapshot: content must be text"
+        ))
     if sum(len(value.encode("utf-8")) for value in snapshot.values()) > MAX_RESOURCE_BYTES:
-        raise ValueError("Prompt resource snapshot exceeds 512 KiB")
+        raise ValueError(error_message(
+            "prompts.error.snapshot_size", audit="Prompt resource snapshot exceeds 512 KiB"
+        ))
 
 
 def resource(request: dict[str, Any] | None, key: str) -> str:
     if request is not None and "_prompt_resources" in request:
         snapshot = request["_prompt_resources"]
         if not isinstance(snapshot, dict) or key not in snapshot or not isinstance(snapshot[key], str):
-            raise ValueError(f"Incompatible prompt resource snapshot: missing {key}")
+            raise ValueError(error_message(
+                "prompts.error.missing", audit=f"Incompatible prompt resource snapshot: missing {key}",
+                resource=key,
+            ))
         value = str(snapshot[key])
         return value.removesuffix("\n") if key.startswith("internal/") else value
     value = resolve_resources(request.get("language") if request is not None else None)[key]

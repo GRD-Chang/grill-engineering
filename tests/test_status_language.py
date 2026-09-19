@@ -58,7 +58,7 @@ def test_delivery_progress_preserves_audit(
     publication: str | None, expected: str,
 ) -> None:
     state = {
-        "run_id": "run-progress", "schema_version": 1,
+        "run_id": "run-progress", "schema_version": 1, "language": "zh",
         "repository": "example/project", "parent": {"number": 1},
         "delivery_type": mode, "status": status, "diagnostics": [],
     }
@@ -105,7 +105,7 @@ def test_completed_status_requires_cleanup_when_closeout_crashed_before_scheduli
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
 ) -> None:
     state = {
-        "run_id": "run-cleanup-not-scheduled", "schema_version": 1,
+        "run_id": "run-cleanup-not-scheduled", "schema_version": 1, "language": "zh",
         "repository": "example/project", "parent": {"number": 1},
         "status": "completed", "run_branch": "agent-run/final-delivery",
         "run_publication": {
@@ -140,7 +140,7 @@ def test_completed_status_keeps_work_facts_without_internal_labels(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
 ) -> None:
     state = {
-        "run_id": "run-language", "schema_version": 1, "repository": "example/project",
+        "run_id": "run-language", "schema_version": 1, "language": "zh", "repository": "example/project",
         "parent": {"number": 1, "title": "整体需求"}, "status": "completed",
         "run_acceptance": {
             "phase": "accepted", "candidate_sha": "accepted-head",
@@ -210,7 +210,7 @@ def test_status_qualifies_manual_abandon_guidance_without_changing_json(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, status: str, command: str,
 ) -> None:
     state = {
-        "run_id": "run-action-language", "schema_version": 1, "repository": "example/project",
+        "run_id": "run-action-language", "schema_version": 1, "language": "zh", "repository": "example/project",
         "parent": {"number": 1}, "status": status, "diagnostics": [],
     }
     root = _save_run(git_repo, state)
@@ -229,11 +229,12 @@ def test_status_qualifies_manual_abandon_guidance_without_changing_json(
 
 
 @pytest.mark.parametrize("plain", [True, False])
+@pytest.mark.parametrize("language", ["zh", "en"])
 def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool, language: str,
 ) -> None:
     state = {
-        "run_id": "run-repair-language", "schema_version": 1, "repository": "example/project",
+        "run_id": "run-repair-language", "schema_version": 1, "language": language, "repository": "example/project",
         "parent": {"number": 1}, "status": "ready_for_human", "diagnostics": [],
         "run_acceptance": {
             "phase": "repairing", "acceptance_generation": 31,
@@ -241,7 +242,7 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
             "repair_job": {
                 "repair_generation": 99, "phase": "blocked", "candidate_sha": "private-candidate-sha",
                 "blocked_reason": "agent_requires_human", "human_blocker_phase": "reviewing",
-                "human_blockers": ["请批准读取 /config/resource 的权限。"],
+                "human_blockers": ["等待人工处理 / 原始 evidence"],
                 "repair_checkout": "/preserved/development",
                 "review_budget": {"window": 4, "development_attempts": 2,
                                   "reviewer_invocations": 1, "final_ci_fix_used": False},
@@ -254,6 +255,8 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
         }],
     }
     root = _save_run(git_repo, state)
+    with redirect_stdout(StringIO()):
+        assert cli.main(["settings", "configure", "--language", "en" if language == "zh" else "zh", "--json"]) == 0
     before = _file_snapshot(root)
     monkeypatch.chdir(git_repo)
     monkeypatch.setenv("TERM", "xterm-256color")
@@ -264,16 +267,63 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
         assert cli.main(["status", state["run_id"], *(["--plain"] if plain else [])]) == 0
     human = Text.from_ansi(output.getvalue()).plain
     readable = " ".join(human.replace("│", " ").split())
-    for expected in (
+    expected_terms = (
         "整体修复", "代码修改 2 / 10", "当前版本验收", "需要人工处理", "验收中",
-        "review-model", "high", "请批准读取 /config/resource 的权限。",
+        "review-model", "high", "等待人工处理 / 原始 evidence",
         "当前代码版本已保存", "开发工作区已保留", "整项任务已暂停，其他子任务也不会继续",
         "agent-run resume 1 --repo example/project",
-    ):
-        assert expected in readable
+    ) if language == "zh" else (
+        "Run repair", "Code modifications", "Human action required", "Review Agent",
+        "review-model", "high", "等待人工处理 / 原始 evidence",
+        "Current candidate saved", "Development workspace preserved",
+        "agent-run resume 1 --repo example/project",
+    )
+    for expected in expected_terms:
+        assert expected.casefold() in readable.casefold()
     for internal in (
         "Generation", "generation", "Human Blocker", "Candidate", "Managed Checkout",
-        "Delivery Run", "Ticket", "reviewer", "run-repair-language", "private-candidate-sha",
+        "Delivery Run", "reviewer", "run-repair-language", "private-candidate-sha",
     ):
         assert internal not in human
+    assert _file_snapshot(root) == before
+
+
+def test_status_json_is_identical_across_run_languages(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "run_id": "run-json-language", "schema_version": 1,
+        "repository": "example/project", "parent": {"number": 1, "title": "等待人工处理 / raw title"},
+        "status": "execution_failed", "diagnostics": [],
+        "active_ticket_job": {"ticket_number": 2, "phase": "execution_failed"},
+    }
+    monkeypatch.chdir(git_repo)
+    outputs = []
+    for language in ("zh", "en"):
+        state["language"] = language
+        root = _save_run(git_repo, state)
+        before = _file_snapshot(root)
+        output = StringIO()
+        with redirect_stdout(output):
+            assert cli.main(["status", state["run_id"], "--json"]) == 0
+        outputs.append(json.loads(output.getvalue()))
+        assert _file_snapshot(root) == before
+    assert outputs[0] == outputs[1]
+
+
+def test_missing_run_language_is_reported_without_guessing_or_writing(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "run_id": "run-missing-language", "schema_version": 1,
+        "repository": "example/project", "parent": {"number": 1},
+        "status": "active", "diagnostics": [],
+    }
+    root = _save_run(git_repo, state)
+    before = _file_snapshot(root)
+    monkeypatch.chdir(git_repo)
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], "--plain"]) == 2
+    assert "language" in output.getvalue()
     assert _file_snapshot(root) == before

@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_run.messages import error_message
 from agent_run.git import GitRepository
 from agent_run.git_errors import GitError
 from agent_run.git_output import git_environment, run_git
@@ -36,7 +37,7 @@ def normalize_repository(repository: str) -> str:
         or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1])
         or parts[1] in {".", ".."}
     ):
-        raise ManagedWorkspaceError("仓库必须使用 owner/name 格式")
+        raise ManagedWorkspaceError(error_message("cli.error.workspace_repository_format"))
     return repository.lower()
 
 

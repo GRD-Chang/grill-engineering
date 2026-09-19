@@ -46,7 +46,7 @@ def test_history_fallback_failure_sources(
     job = {"ticket_number": 3, "semantic_attempt_history": [attempt],
            "review_budget": {"window": 1, "review_artifacts": []},
            "fallback_publication_receipt": receipt}
-    state = {"run_id": "run-evidence", "ticket_jobs": {"3": job},
+    state = {"language": "zh", "run_id": "run-evidence", "ticket_jobs": {"3": job},
              "semantic_agent_attempts": [attempt], "agent_invocation_history": [{
                  "work_subject": "ticket:3", "role": "reviewer", "status": "completed",
                  "semantic_attempt": attempt, "currentness_boundary": identity}]}

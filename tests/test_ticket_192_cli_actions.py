@@ -390,8 +390,8 @@ def test_run_failure_receipt_recovers_the_durable_parent_run(
     assert crashed.returncode == 2
     state = load_only_run_state(git_repo)
     run_id = str(state["run_id"])
-    assert "Repository: example/project" in crashed.stdout
-    assert "Parent Issue: #1" in crashed.stdout
+    assert "仓库: example/project" in crashed.stdout
+    assert "父 Issue: #1" in crashed.stdout
     assert "交付状态: 正在初始化" in crashed.stdout
     assert "下一步: agent-run run 1 --repo example/project" in crashed.stdout
     assert run_id not in crashed.stdout
@@ -531,7 +531,7 @@ def test_default_precondition_failure_hides_machine_run_identity(
 
     assert human.returncode == 2
     assert "命令状态: 未应用" in human.stdout
-    assert "Parent Issue: #1" in human.stdout
+    assert "整体需求: #1" in human.stdout
     assert "交付状态: 等待人工批准" in human.stdout
     assert "下一步: agent-run approve 1 --repo example/project" in human.stdout
     assert "run_approval_pending" not in human.stdout
@@ -556,6 +556,7 @@ def test_default_interruption_output_hides_machine_run_identity(capsys) -> None:
     run_id = "run-1-machine-only"
     state = {
         "run_id": run_id,
+        "language": "zh",
         "repository": "example/project",
         "parent": {"number": 1},
         "status": "waiting_external",
@@ -575,7 +576,7 @@ def test_default_interruption_output_hides_machine_run_identity(capsys) -> None:
 
     rendered = capsys.readouterr().out
     assert "操作状态: 已中断" in rendered
-    assert "Parent Issue: #1" in rendered
+    assert "父 Issue: #1" in rendered
     assert "交付状态: 等待 GitHub 操作结果" in rendered
     assert "下一步: agent-run run 1 --repo example/project" in rendered
     assert "waiting_external" not in rendered

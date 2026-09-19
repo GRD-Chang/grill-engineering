@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from support.workspace import managed_state
+from support.inprocess_cli import invoke_cli_inprocess
 
 from agent_run.notification_cards import card
 from agent_run.notification_events import events, recovery_event
@@ -174,10 +175,26 @@ raise SystemExit(main(sys.argv[1:]))
         approval = next(event for event in events(snapshot) if event.get("current"))
         assert expected in approval["summary"]
     before = messages.read_bytes() if messages.exists() else b""
+    # Existing Runs keep their language after a personal preference change.
+    UserDefaultsStore().configure(language="en" if language == "zh" else "zh")
+    state_root = managed_state(git_repo)
+    durable_before = {
+        path.relative_to(state_root): path.read_bytes()
+        for path in state_root.rglob("*.json")
+    }
     for command in ("status", "history"):
         queried = run_cli(git_repo, fixture, command, output["run_id"], "--json")
         assert queried.returncode == 0, queried.stderr
         assert "notifications" in stdout_json(queried)
+        arguments = ("--plain", "--details") if command == "history" else ("--plain",)
+        human = invoke_cli_inprocess(git_repo, fixture, command, output["run_id"], *arguments)
+        assert human.returncode == 0, human.stderr
+        assert localized("下一步", "Next") in human.stdout
+        assert "agent-run approve" in human.stdout
+    assert {
+        path.relative_to(state_root): path.read_bytes()
+        for path in state_root.rglob("*.json")
+    } == durable_before
     assert (messages.read_bytes() if messages.exists() else b"") == before
     assert read_notifications(managed_state(git_repo), output["run_id"]) == journal
     # Approval reuses the immutable Run configuration even after defaults change.

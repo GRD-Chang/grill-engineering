@@ -22,7 +22,7 @@ from agent_run.delivery_policy import (
     resolve_delivery_policy,
 )
 from agent_run.paths import app_config_root
-from agent_run.messages import DEFAULT_LANGUAGE, text, validate_language
+from agent_run.messages import DEFAULT_LANGUAGE, ErrorMessage, error_message, text, validate_language
 
 _PROFILE_KEYS = frozenset(
     {"preset", "publication_from_development"}
@@ -37,20 +37,21 @@ class UserDefaultsError(ValueError):
 
 def _profile(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
-        raise UserDefaultsError("profile 必须是对象")
+        raise UserDefaultsError(error_message("defaults.profile_object"))
     for key, value in raw.items():
         if key not in _PROFILE_KEYS:
-            raise UserDefaultsError(f"未知 profile 配置项: {key}")
+            raise UserDefaultsError(error_message("defaults.profile_unknown", field=key))
         if value is None:
-            raise UserDefaultsError(f"profile.{key} 不允许 null")
+            raise UserDefaultsError(error_message("defaults.profile_null", field=key))
     result = dict(raw)
     preset = result.get("preset")
     if preset is not None and not isinstance(preset, str):
-        raise UserDefaultsError("profile.preset 必须是字符串")
+        raise UserDefaultsError(error_message("defaults.preset_string"))
     try:
         resolve_profiles(preset=preset, overrides={k: v for k, v in result.items() if k != "preset"})
     except AgentProfileError as error:
-        raise UserDefaultsError(f"profile: {error}") from error
+        reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+        raise UserDefaultsError(error_message("defaults.profile_error", reason=reason)) from error
     for key, value in result.items():
         if key.endswith("_model"):
             result[key] = value.strip()
@@ -74,31 +75,31 @@ def notification_snapshot(raw: object = None, *, disabled: bool = False, mode: s
 
 def _notifications(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
-        raise UserDefaultsError("notifications 必须是对象")
+        raise UserDefaultsError(error_message("defaults.notifications_object"))
     result: dict[str, Any] = {}
     for key, value in raw.items():
         if key == "enabled":
             if type(value) is not bool:
-                raise UserDefaultsError("notifications.enabled 必须是布尔值")
+                raise UserDefaultsError(error_message("defaults.notifications_bool"))
         elif key == "mode":
             if value not in ("concise", "detailed"):
-                raise UserDefaultsError("notifications.mode 必须是 concise 或 detailed")
+                raise UserDefaultsError(error_message("defaults.notifications_mode"))
         elif key in {"open_id", "profile", "app_id"}:
             if not isinstance(value, str) or not value.strip():
-                raise UserDefaultsError(f"notifications.{key} 必须是非空字符串")
+                raise UserDefaultsError(error_message("defaults.notifications_string", field=key))
             value = value.strip()
         else:
-            raise UserDefaultsError(f"未知 notifications 配置项: {key}")
+            raise UserDefaultsError(error_message("defaults.notifications_unknown", field=key))
         result[key] = value
     return result
 
 
 def _document(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
-        raise UserDefaultsError("用户默认配置必须是对象")
+        raise UserDefaultsError(error_message("defaults.document_object"))
     unknown = set(raw) - {"policy", "profile", "notifications", "language"}
     if unknown:
-        raise UserDefaultsError(f"未知配置项: {sorted(unknown)}")
+        raise UserDefaultsError(error_message("defaults.document_unknown", keys=sorted(unknown)))
     result: dict[str, Any] = {}
     if "language" in raw:
         try:
@@ -110,7 +111,8 @@ def _document(raw: object) -> dict[str, Any]:
             result["policy"] = normalize_policy_overrides(raw["policy"])
             resolve_delivery_policy(user_defaults=result["policy"])
         except DeliveryPolicyError as error:
-            raise UserDefaultsError(f"policy: {error}") from error
+            reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+            raise UserDefaultsError(error_message("defaults.policy_error", reason=reason)) from error
     if "profile" in raw:
         result["profile"] = _profile(raw["profile"])
     if "notifications" in raw:
@@ -138,7 +140,8 @@ class UserDefaultsStore:
         try:
             return app_config_root() / "user-defaults.json"
         except ValueError as error:
-            raise UserDefaultsError(str(error)) from error
+            reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+            raise UserDefaultsError(reason) from error
 
     def _read(self) -> tuple[dict[str, Any], str]:
         path = self.path if self.path.exists() else self.legacy_path
@@ -148,7 +151,8 @@ class UserDefaultsStore:
             raw = json.loads(path.read_text(encoding="utf-8"))
             document = _document(raw if path == self.path else {"policy": raw})
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, UserDefaultsError) as error:
-            raise UserDefaultsError(f"{path}: {error}") from error
+            reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+            raise UserDefaultsError(error_message("defaults.read_error", path=path, reason=reason)) from error
         return document, "user-defaults" if path == self.path else "legacy-delivery-policy"
 
     def load(self) -> dict[str, Any]:
@@ -217,7 +221,9 @@ class UserDefaultsStore:
         if notifications is not None:
             supplied["notifications"] = _notifications(notifications)
         if not any(supplied.values()):
-            raise UserDefaultsError("configure requires an explicit option")
+            raise UserDefaultsError(error_message(
+                "defaults.configure_option", audit="configure requires an explicit option"
+            ))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
             os.fchmod(lock.fileno(), 0o600)

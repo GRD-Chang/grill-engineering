@@ -11,6 +11,8 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from agent_run.messages import error_message
 from typing import Any
 
 from agent_run.review_budget import (
@@ -56,7 +58,7 @@ class DeliveryPolicy:
 
     def __post_init__(self) -> None:
         if self.development_thread_policy not in ("reuse", "new-per-attempt"):
-            raise DeliveryPolicyError("development_thread_policy must be reuse or new-per-attempt")
+            raise DeliveryPolicyError(error_message('policy.error.thread_policy', audit="development_thread_policy must be reuse or new-per-attempt"))
         object.__setattr__(
             self,
             "ticket_review_rounds",
@@ -141,7 +143,7 @@ def normalize_policy_overrides(
     """Normalize sparse config/CLI fields to the canonical policy keys."""
 
     if not isinstance(raw, Mapping):
-        raise DeliveryPolicyError("Delivery Policy must be an object")
+        raise DeliveryPolicyError(error_message('policy.error.object', audit="Delivery Policy must be an object"))
     normalized: dict[str, Any] = {}
     deadlines: dict[str, Any] = {}
 
@@ -149,7 +151,7 @@ def normalize_policy_overrides(
         if value is None and ignore_none:
             return
         if key in normalized and normalized[key] != value:
-            raise DeliveryPolicyError(f"Delivery Policy option {key!r} is duplicated")
+            raise DeliveryPolicyError(error_message('policy.error.duplicate_option', audit=f"Delivery Policy option {key!r} is duplicated", field=key))
         normalized[key] = value
 
     def put_deadline(role: str, value: Any) -> None:
@@ -157,7 +159,7 @@ def normalize_policy_overrides(
             return
         if role in deadlines and deadlines[role] != value:
             raise DeliveryPolicyError(
-                f"Delivery Policy deadline {role!r} is duplicated"
+                error_message('policy.error.duplicate_deadline', audit=f"Delivery Policy deadline {role!r} is duplicated", role=role)
             )
         deadlines[role] = value
 
@@ -190,11 +192,11 @@ def normalize_policy_overrides(
             if value is None and ignore_none:
                 continue
             if not isinstance(value, Mapping):
-                raise DeliveryPolicyError(f"{key} must be an object")
+                raise DeliveryPolicyError(error_message('policy.error.option_object', audit=f"{key} must be an object", field=key))
             for role, deadline in value.items():
                 if role not in _DEADLINE_KEYS:
                     raise DeliveryPolicyError(
-                        f"unknown Delivery Policy deadline role: {role!r}"
+                        error_message('policy.error.deadline_role', audit=f"unknown Delivery Policy deadline role: {role!r}", role=role)
                     )
                 put_deadline(role, deadline)
             continue
@@ -205,7 +207,7 @@ def normalize_policy_overrides(
         if matched_role is not None:
             put_deadline(matched_role, value)
             continue
-        raise DeliveryPolicyError(f"unknown Delivery Policy option: {key}")
+        raise DeliveryPolicyError(error_message('policy.error.unknown_option', audit=f"unknown Delivery Policy option: {key}", field=key))
     if deadlines:
         normalized["invocation_deadlines"] = deadlines
     return normalized
@@ -369,7 +371,7 @@ class DeliveryPolicyStore:
         if config_home:
             root = Path(config_home).expanduser()
             if not root.is_absolute():
-                raise DeliveryPolicyError("XDG_CONFIG_HOME 必须是绝对路径")
+                raise DeliveryPolicyError(error_message('policy.error.config_directory', audit="XDG_CONFIG_HOME 必须是绝对路径"))
         else:
             root = Path.home() / ".config"
         return root / cls._DIRECTORY_NAME / cls._FILE_NAME
@@ -384,9 +386,9 @@ class DeliveryPolicyStore:
         try:
             value: object = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise DeliveryPolicyError("用户级 Delivery Policy 无法解析") from error
+            raise DeliveryPolicyError(error_message('policy.error.parse_file', audit="用户级 Delivery Policy 无法解析")) from error
         if not isinstance(value, Mapping):
-            raise DeliveryPolicyError("用户级 Delivery Policy 必须是对象")
+            raise DeliveryPolicyError(error_message('policy.error.file_object', audit="用户级 Delivery Policy 必须是对象"))
         return normalize_policy_overrides(value)
 
     def configure(self, overrides: Mapping[str, Any]) -> DeliveryPolicy:
@@ -397,7 +399,7 @@ class DeliveryPolicyStore:
             return parse_policy_snapshot(result["policy"])
         supplied = normalize_policy_overrides(overrides)
         if not supplied:
-            raise DeliveryPolicyError("policy configure requires an explicit option")
+            raise DeliveryPolicyError(error_message('policy.error.option_required', audit="policy configure requires an explicit option"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.parent / self._LOCK_FILE_NAME
         with lock_path.open("a+", encoding="utf-8") as lock_file:
@@ -464,11 +466,11 @@ def _merge_policy_values(
     target: dict[str, Any], source: Mapping[str, Any], source_name: str
 ) -> None:
     if set(source) - _POLICY_KEYS:
-        raise DeliveryPolicyError(f"{source_name} contains unknown policy fields")
+        raise DeliveryPolicyError(error_message('policy.error.unknown_fields', audit=f"{source_name} contains unknown policy fields", source_name=source_name))
     for key, value in source.items():
         if key == "invocation_deadlines":
             if not isinstance(value, Mapping):
-                raise DeliveryPolicyError(f"{source_name} deadlines must be an object")
+                raise DeliveryPolicyError(error_message('policy.error.deadlines_object', audit=f"{source_name} deadlines must be an object", source_name=source_name))
             target["invocation_deadlines"].update(value)
         else:
             target[key] = value
@@ -477,9 +479,9 @@ def _merge_policy_values(
 def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
     deadlines = values.get("invocation_deadlines")
     if not isinstance(deadlines, Mapping):
-        raise DeliveryPolicyError("invocation_deadlines must be an object")
+        raise DeliveryPolicyError(error_message('policy.error.invocation_object', audit="invocation_deadlines must be an object"))
     if set(deadlines) - _DEADLINE_KEYS:
-        raise DeliveryPolicyError("invocation_deadlines contains an unknown role")
+        raise DeliveryPolicyError(error_message('policy.error.invocation_role', audit="invocation_deadlines contains an unknown role"))
     required = _DEADLINE_KEYS - set(deadlines)
     if required:
         raise DeliveryPolicyError(
@@ -510,31 +512,31 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
 
 def _positive_integer(value: Any, name: str) -> int:
     if type(value) is not int or value <= 0:
-        raise DeliveryPolicyError(f"{name} must be a positive integer")
+        raise DeliveryPolicyError(error_message('policy.error.positive_integer', audit=f"{name} must be a positive integer", name=name))
     return value
 
 
 def _positive_duration(value: Any, name: str) -> float:
     if isinstance(value, bool):
-        raise DeliveryPolicyError(f"{name} must be a positive duration")
+        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
     try:
         if isinstance(value, (int, float)):
             seconds = float(value)
         elif isinstance(value, str):
             match = _DURATION_PATTERN.fullmatch(value)
             if match is None:
-                raise DeliveryPolicyError(f"{name} must be a positive duration")
+                raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
             seconds = float(match.group(1)) * _DURATION_MULTIPLIERS[
                 match.group(2).lower()
             ]
         else:
-            raise DeliveryPolicyError(f"{name} must be a positive duration")
+            raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
     except OverflowError as error:
-        raise DeliveryPolicyError(f"{name} must be a positive duration") from error
+        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name)) from error
     if not isinstance(seconds, float):
-        raise DeliveryPolicyError(f"{name} must be a positive duration")
+        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
     if not math.isfinite(seconds) or seconds <= 0:
-        raise DeliveryPolicyError(f"{name} must be a positive duration")
+        raise DeliveryPolicyError(error_message('policy.error.positive_duration', audit=f"{name} must be a positive duration", name=name))
     return seconds
 
 

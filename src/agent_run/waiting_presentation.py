@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.messages import display_text
+
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any, TypeGuard
@@ -19,10 +21,10 @@ class WaitingPresentation:
 
 def cleanup_instruction(state: dict[str, Any]) -> str | None:
     if state.get("status") == "completed" and final_approval_cleanup_pending(state):
-        return "已合并，待清理；按恢复命令完成工作区清理。"
+        return display_text('presentation.status.merged_cleanup_pending_use_the_recovery_command_to_complete_works')
     cleanup = state.get("delivery_cleanup")
     if isinstance(cleanup, dict) and cleanup.get("status") == "cleanup_pending":
-        return "交付清理尚未完成；受管工作区已保留，请查看清理诊断。"
+        return display_text('presentation.status.delivery_cleanup_is_incomplete_managed_checkouts_are_preserved_in')
     return None
 
 
@@ -45,42 +47,42 @@ def waiting_presentation(
     number = subject.get("pr_number")
     target = f"PR #{number}" if type(number) is int else "GitHub"
     work = (
-        f"等待 {target} 的合并前检查" if checks
-        else f"等待 {target} 的合并确认" if status == "waiting_merge"
-        else f"等待 {target} 的操作结果"
+        display_text('presentation.status.waiting_for_pre_merge_checks_on_v1', v1=target) if checks
+        else display_text('presentation.status.waiting_for_merge_confirmation_on_v1', v1=target) if status == "waiting_merge"
+        else display_text('presentation.status.waiting_for_the_operation_result_on_v1', v1=target)
     )
     credential_failure = wait.get("credential_failure_class")
     if isinstance(credential_failure, str):
-        work = "等待工作凭据恢复可用"
+        work = display_text('presentation.status.waiting_for_working_credentials_to_become_available')
     control = audit.get("executor_control")
     activity = control.get("activity") if isinstance(control, dict) else "unknown"
     timed_out = status == "supervision_timeout"
     if timed_out:
-        description = "本轮自动等待已超时"
-        guidance = "需要恢复本轮等待，执行以下命令。"
+        description = display_text('presentation.status.automatic_waiting_timed_out_for_this_round')
+        guidance = display_text('presentation.status.run_the_following_command_to_resume_waiting')
     elif activity == "running":
-        description = "正在后台检查合并前检查结果" if checks else "正在后台等待操作结果"
+        description = display_text('presentation.status.checking_pre_merge_results_in_the_background') if checks else display_text('presentation.status.waiting_for_the_operation_result_in_the_background')
         cleanup = cleanup_instruction(state)
-        guidance = f"后台等待会继续。{cleanup}" if cleanup else "无需操作。"
+        guidance = display_text('presentation.status.background_waiting_will_continue_v1', v1=cleanup) if cleanup else display_text('presentation.status.no_action_required')
     elif activity == "not_running":
-        description = "自动等待已停止"
-        guidance = "需要继续时，执行以下命令。"
+        description = display_text('presentation.status.automatic_waiting_stopped')
+        guidance = display_text('presentation.status.run_the_following_command_when_ready_to_continue')
     else:
-        description = "无法确认后台等待是否仍在继续"
+        description = display_text('presentation.status.cannot_confirm_whether_background_waiting_is_continuing')
         guidance = unknown_execution_guidance(state)
     details = _wait_times(window, wait, timed_out=timed_out)
     if isinstance(credential_failure, str):
         reason = (
-            "暂时无法取得 GitHub 工作凭据" if credential_failure == "credential_unavailable"
-            else "GitHub 工作凭据不可用，详细原因见 --json 诊断"
+            display_text('presentation.status.github_working_credentials_are_temporarily_unavailable') if credential_failure == "credential_unavailable"
+            else display_text('presentation.status.github_working_credentials_are_unavailable_see_json_diagnostics_f')
         )
-        details.append(("原因", reason))
+        details.append((display_text('presentation.status.reason'), reason))
         if type(wait.get("retry_count")) is int:
-            details.append(("重试次数", str(wait["retry_count"])))
+            details.append((display_text('presentation.status.retry_count'), str(wait["retry_count"])))
     details.extend(_check_results(subject, checks=checks))
     observation = wait.get("latest_observation")
     if isinstance(observation, dict) and isinstance(observation.get("message"), str):
-        details.append(("外部情况", human_pause_reason(observation["message"])))
+        details.append((display_text('presentation.status.external_observation'), human_pause_reason(observation["message"])))
     return WaitingPresentation(
         work, description, guidance,
         show_command=timed_out or activity == "not_running",
@@ -103,9 +105,9 @@ def _wait_times(
     elif not timed_out:
         remaining = None
     return [
-        ("已等待", _duration(elapsed)),
-        ("本轮等待" if timed_out else "本轮最多还可等待",
-         "已超时" if timed_out else _duration(remaining)),
+        (display_text('presentation.status.waited'), _duration(elapsed)),
+        (display_text('presentation.status.this_wait_round') if timed_out else display_text('presentation.status.maximum_wait_remaining'),
+         display_text('presentation.status.timed_out') if timed_out else _duration(remaining)),
     ]
 
 
@@ -115,12 +117,12 @@ def _number(value: object) -> TypeGuard[int | float]:
 
 def _duration(value: object) -> str:
     if not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
-        return "未知"
+        return display_text('presentation.status.unknown')
     minutes = int(value) // 60
     if minutes < 1:
-        return "不足 1 分钟"
+        return display_text('presentation.status.less_than_1_minute')
     hours, minutes = divmod(minutes, 60)
-    return f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟"
+    return display_text('presentation.status.v0_hours_v2_minutes', v0=hours, v2=minutes) if hours else display_text('presentation.status.v0_minutes', v0=minutes)
 
 
 def _check_results(subject: dict[str, Any], *, checks: bool) -> list[tuple[str, str]]:
@@ -136,12 +138,12 @@ def _check_results(subject: dict[str, Any], *, checks: bool) -> list[tuple[str, 
         or evidence.get("head_sha") != expected_head
         or evidence.get("pr_number") != subject.get("pr_number")
     ):
-        return [("合并前检查结果", "尚未取得当前版本的检查结果")]
+        return [(display_text('presentation.status.pre_merge_checks'), display_text('presentation.status.no_check_results_for_the_current_candidate_yet'))]
     unavailable = subject.get("required_checks_observation_status") in {"unavailable", "unknown"}
     result = _check_result(evidence.get("result"))
-    details = [("上次合并前检查结果" if unavailable else "合并前检查结果", result)]
+    details = [(display_text('presentation.status.previous_pre_merge_checks') if unavailable else display_text('presentation.status.pre_merge_checks'), result)]
     if unavailable:
-        details.append(("当前观测", "暂时无法确认最新检查结果"))
+        details.append((display_text('presentation.status.current_observation'), display_text('presentation.status.latest_check_results_cannot_currently_be_confirmed')))
     values = evidence.get("checks")
     if isinstance(values, list):
         for check in values:
@@ -152,6 +154,6 @@ def _check_results(subject: dict[str, Any], *, checks: bool) -> list[tuple[str, 
 
 def _check_result(value: object) -> str:
     return {
-        "pending": "等待完成", "pass": "已通过", "fail": "未通过",
-        "cancel": "已取消", "none": "未配置合并前检查", "skipping": "已跳过",
-    }.get(str(value), "暂时无法确认")
+        "pending": display_text('presentation.status.pending_178'), "pass": display_text('presentation.status.passed'), "fail": display_text('presentation.status.failed'),
+        "cancel": display_text('presentation.status.canceled'), "none": display_text('presentation.status.no_pre_merge_checks_configured'), "skipping": display_text('presentation.status.skipped'),
+    }.get(str(value), display_text('presentation.status.cannot_currently_confirm'))

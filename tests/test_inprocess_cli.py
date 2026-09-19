@@ -26,7 +26,7 @@ def test_inprocess_cli_keeps_parser_errors_and_restores_the_environment(
     )
 
     assert result.returncode == 2
-    assert "unrecognized arguments: --unknown-option" in result.stderr
+    assert "无法识别的参数: --unknown-option" in result.stderr
     assert Path.cwd() == cwd
     assert dict(os.environ) == environment
     assert sys.stdout is stdout

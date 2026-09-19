@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.messages import display_text, display_language
+
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -98,10 +100,10 @@ def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
     """Summarize cumulative recovery facts without adding timeline events."""
     details: list[str] = []
     if invocation.get("ordinary_recovery_used") is True:
-        details.append("本轮累计：普通异常自动续接已触发 1 次")
+        details.append(display_text('presentation.status.recovery_this_round_ordinary_automatic_recovery_triggered_once'))
     capacity_count = invocation.get("capacity_recovery_count")
     if type(capacity_count) is int and capacity_count > 0:
-        details.append(f"本轮累计：模型容量不足等待已触发 {capacity_count} 次，每次等待 30 秒后自动续接")
+        details.append(display_text('presentation.status.recovery_this_round_capacity_wait_triggered_v1_times_resume_autom', v1=capacity_count))
     return details
 
 
@@ -214,11 +216,11 @@ def execution_guidance(
     state: dict[str, Any], activity: str, *, include_resume_command: bool = True
 ) -> str:
     if activity == "capacity_wait":
-        return "模型容量不足，等待 30 秒后自动续接；当前 Agent 未在生成，可使用 stop 停止。"
+        return display_text('presentation.status.model_capacity_unavailable_resuming_automatically_after_30_second')
     if activity == "recovery_wait":
-        return "执行异常，正在自动续接原工作；当前 Agent 未在生成。"
+        return display_text('presentation.status.execution_error_automatically_resuming_existing_work_the_agent_is')
     if activity == "interrupted":
-        guidance = "执行已中断，等待恢复"
+        guidance = display_text('presentation.status.execution_interrupted_waiting_to_resume')
         if include_resume_command:
             parent = state.get("parent")
             number = parent.get("number") if isinstance(parent, dict) else None
@@ -228,7 +230,7 @@ def execution_guidance(
                 if type(number) is int and isinstance(repository, str)
                 else "agent-run resume <run-id>"
             )
-            guidance += f"；使用 {command} 继续原工作"
+            guidance += display_text('presentation.status.use_v1_to_continue_existing_work', v1=command)
         return f"{guidance}。"
     return unknown_execution_guidance(state, include_command=include_resume_command)
 
@@ -242,66 +244,61 @@ def print_status_progress(
     print_operator_action: Callable[[dict[str, Any]], None],
 ) -> None:
     parent = view["parent"]
-    print(f"仓库:       {_terminal_safe(view['repository'] or '未知')}")
+    print(display_text('presentation.status.repository_v1', v1=_terminal_safe(view['repository'] or display_text('presentation.status.unknown'))))
     print(
-        "整体需求:   "
-        f"#{_terminal_safe(parent.get('number', '?'))} "
-        f"{_terminal_safe(parent.get('title') or '未命名需求')}"
+        display_text('presentation.status.parent_issue_v1_v3', v1=_terminal_safe(parent.get('number', '?')), v3=_terminal_safe(parent.get('title') or display_text('presentation.status.untitled_requirement')))
     )
     status_label = (
-        "已合并，待清理" if state.get("status") == "completed"
+        display_text('presentation.status.merged_cleanup_pending') if state.get("status") == "completed"
         and final_approval_cleanup_pending(state) else display_term(view["status"])
     )
     status_label = status_heading(state, view, status_label)
-    print(f"状态:       {_terminal_safe(status_label)}")
+    print(display_text('presentation.status.status_v1', v1=_terminal_safe(status_label)))
     for result in delivery_result_lines(state):
-        print(f"交付结果:   {result}")
+        print(display_text('presentation.status.delivery_result_v1', v1=result))
     phase = _phase_term(view["phase"], view["current_object"], display_term)
     print(
-        f"阶段:       {_terminal_safe(phase if phase is not None else '未进入具体阶段')}"
+        display_text('presentation.status.phase_v1', v1=_terminal_safe(phase if phase is not None else display_text('presentation.status.no_specific_phase_yet')))
     )
-    print(f"结论:       {_terminal_safe(_human_conclusion(view['conclusion']))}")
-    print(f"当前对象:   {_terminal_safe(human_delivery_object(view['current_object']))}")
+    print(display_text('presentation.status.conclusion_v1', v1=_terminal_safe(_human_conclusion(view['conclusion']))))
+    print(display_text('presentation.status.current_object_v1', v1=_terminal_safe(human_delivery_object(view['current_object']))))
 
     for detail in approval_lines(state):
         print(f"  {detail}")
     timing = status_timing(state)
     if "total_seconds" in timing:
-        print(f"累计 Agent 执行耗时: {_duration(timing['total_seconds'])}")
-    print("\n进度")
+        print(display_text('presentation.status.total_agent_execution_time_v1', v1=_duration(timing['total_seconds'])))
+    print(display_text('presentation.status.nprogress'))
     print(f"  {_ticket_progress_text(state, view)}")
     rounds = view["round_progress"]
     if rounds is not None and state.get("status") != "completed":
-        print("\n执行额度")
+        print(display_text('presentation.status.nexecution_allowance'))
         for line in _round_details(rounds):
             print(f"  {_terminal_safe(line)}")
     if view["elapsed_seconds"] is not None:
-        print(f"  任务历时             {_duration(view['elapsed_seconds'])}")
+        print(display_text('presentation.status.task_elapsed_time_v1', v1=_duration(view['elapsed_seconds'])))
 
     repair = view["run_repair"]
     if repair is not None:
-        print("\n整体修复")
+        print(display_text('presentation.status.nrun_repair'))
         print(
-            "  当前版本验收 "
-            f"{_terminal_safe(display_term(repair['candidate_validation_status']))}"
+            display_text('presentation.status.current_candidate_acceptance_v1', v1=_terminal_safe(display_term(repair['candidate_validation_status'])))
         )
         print(
-            "  代码修改 "
-            f"{repair['code_modification_attempts']} / "
-            f"{repair['code_modification_limit']}"
+            display_text('presentation.status.code_modifications_v1_v3', v1=repair['code_modification_attempts'], v3=repair['code_modification_limit'])
         )
 
     automatic_work = controller_work(state, audit)
     wait_view = waiting_presentation(state, audit)
     if wait_view is not None:
-        print("\n当前工作")
+        print(display_text('presentation.status.ncurrent_work'))
         print(f"  {_terminal_safe(wait_view.work)}")
         print(f"  {_terminal_safe(wait_view.activity)}")
         for label, text in wait_view.details:
             print(f"  {_terminal_safe(label)}：{_terminal_safe(text)}")
         _print_cleanup(audit.get("delivery_cleanup"))
         _print_scope_change(audit.get("scope_change"))
-        print("\n下一步")
+        print(display_text('presentation.status.nnext_step'))
         print(f"  {_terminal_safe(wait_view.guidance)}")
         action = audit.get("operator_action")
         if isinstance(action, dict):
@@ -311,44 +308,44 @@ def print_status_progress(
         _print_findings(view["findings"])
         return
 
-    print("\n当前工作")
+    print(display_text('presentation.status.ncurrent_work'))
     executor_control = audit.get("executor_control")
     if (
         isinstance(executor_control, dict)
         and executor_control.get("activity") == "unknown"
         and state.get("status") != "completed"
     ):
-        print("  Agent 活跃状态: 无法确认（运行状态无法确认）")
+        print(display_text('presentation.status.agent_activity_unknown_execution_status_cannot_be_confirmed'))
     activity = view["execution_activity"]
     if activity == "interrupted":
-        print("  执行已中断，等待恢复")
+        print(display_text('presentation.status.execution_interrupted_waiting_to_resume_24'))
     if automatic_work:
         print(f"  {automatic_work}")
     agent = view["current_agent"]
     if state.get("status") == "completed":
         agent = None
     if agent is None:
-        print("  当前没有运行中的 Agent")
+        print(display_text('presentation.status.no_agent_is_currently_running'))
     else:
-        agent_label = "当前 Agent" if agent["is_active"] else "最近 Agent"
+        agent_label = display_text('presentation.status.current_agent') if agent["is_active"] else display_text('presentation.status.latest_agent')
         print(
             f"  {agent_label}: {_terminal_safe(human_agent_role(agent['role']))} · "
             f"{_terminal_safe(human_delivery_object(agent['object']))}"
         )
-        print(f"  模型                  {_terminal_safe(agent['model'])}")
-        print(f"  推理强度              {_terminal_safe(agent['reasoning_effort'])}")
+        print(display_text('presentation.status.model_v1', v1=_terminal_safe(agent['model'])))
+        print(display_text('presentation.status.reasoning_effort_v1', v1=_terminal_safe(agent['reasoning_effort'])))
         if agent.get("started_at"):
-            print(f"  开始时间              {local_timestamp(agent['started_at'])}")
+            print(display_text('presentation.status.started_at_v1', v1=local_timestamp(agent['started_at'])))
         if agent["duration_seconds"] is not None:
-            duration_label = "本轮执行耗时"
+            duration_label = display_text('presentation.status.round_execution_time')
             print(f"  {duration_label:<20}{_duration(agent['duration_seconds'])}")
         if agent["remaining_seconds"] is not None:
-            print(f"  本轮剩余              {_duration(agent['remaining_seconds'])}")
+            print(display_text('presentation.status.round_time_remaining_v1', v1=_duration(agent['remaining_seconds'])))
         for detail in agent["recovery_details"]:
             print(f"  {_terminal_safe(detail)}")
 
     if activity in {"interrupted", "unknown", "capacity_wait", "recovery_wait"}:
-        print("\n下一步")
+        print(display_text('presentation.status.nnext_step'))
         print(f"  {_terminal_safe(execution_guidance(state, activity))}")
         _print_findings(view["findings"])
         return
@@ -357,18 +354,16 @@ def print_status_progress(
     if not isinstance(operator_action, dict):
         _print_cleanup(audit.get("delivery_cleanup"))
         _print_scope_change(audit.get("scope_change"))
-        print("\n下一步")
+        print(display_text('presentation.status.nnext_step'))
         cleanup = audit.get("delivery_cleanup")
         if isinstance(cleanup, dict) and cleanup.get("status") == "cleanup_pending":
-            print("  查看 --json 中的交付清理诊断，整理受管工作区后按恢复操作继续。")
+            print(display_text('presentation.status.inspect_cleanup_diagnostics_in_json_prepare_the_managed_checkout_'))
             print(
-                "  恢复命令: "
-                f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
+                display_text('presentation.status.recovery_command_v1', v1=_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id'))))
             )
         elif activity != "running" and not automatic_work:
             print(
-                "  下一步: "
-                f"{_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id')))}"
+                display_text('presentation.status.next_step_v1', v1=_terminal_safe(human_next_action(view['next_action'], run_id=state.get('run_id'))))
             )
         current_invocation = audit.get("agent_invocation")
         running_invocation = (
@@ -384,7 +379,7 @@ def print_status_progress(
     _print_scope_change(audit.get("scope_change"))
     print()
     if operator_action.get("type") == "Final Approval":
-        print(f"下一步: {_terminal_safe(view['next_action'])}")
+        print(display_text('presentation.status.next_step_v1_36', v1=_terminal_safe(view['next_action'])))
     else:
         print_operator_action(operator_action)
     _print_findings(view["findings"])
@@ -408,7 +403,7 @@ def print_rich_status_progress(
     raw_status = str(view.get("status") or "")
     status_style = _status_style(raw_status)
     status_label = (
-        "已合并，待清理" if raw_status == "completed"
+        display_text('presentation.status.merged_cleanup_pending') if raw_status == "completed"
         and final_approval_cleanup_pending(state) else _status_term(raw_status)
     )
 
@@ -430,45 +425,42 @@ def print_rich_status_progress(
             identity.add_row(label, _rich_value(value))
 
     add_identity(
-        "任务",
+        display_text('presentation.status.task'),
         f"{view.get('repository') or 'unknown'} · "
         f"#{parent_view.get('number', '?')} "
-        f"{parent_view.get('title') or '未命名需求'}",
+        f"{parent_view.get('title') or display_text('presentation.status.untitled_requirement')}",
     )
     add_identity(
-        "状态",
+        display_text('presentation.status.status'),
         f"{_status_symbol(raw_status)} {_human_conclusion(view.get('conclusion'))} · "
         f"{status_label}",
     )
     add_identity(
-        "阶段",
+        display_text('presentation.status.phase'),
         _phase_term(view.get("phase"), view.get("current_object"), _status_term)
-        or "未进入具体阶段",
+        or display_text('presentation.status.no_specific_phase_yet'),
     )
-    add_identity("当前对象", human_delivery_object(view.get("current_object")))
+    add_identity(display_text('presentation.status.current_object'), human_delivery_object(view.get("current_object")))
 
     for result in delivery_result_lines(state):
-        add_identity("交付结果", result)
+        add_identity(display_text('presentation.status.delivery_result'), result)
     for detail in approval_lines(state):
-        add_identity("批准合并", detail)
+        add_identity(display_text('presentation.status.approve_merge'), detail)
     timing = status_timing(state)
     if "total_seconds" in timing:
-        add_identity("累计 Agent 执行耗时", _duration(timing["total_seconds"]))
+        add_identity(display_text('presentation.status.total_agent_execution_time'), _duration(timing["total_seconds"]))
     progress_text = _ticket_progress_text(state, view)
     rounds = view.get("round_progress")
     if isinstance(rounds, dict) and state.get("status") != "completed":
-        add_identity("执行额度", "；".join(_round_details(rounds)))
+        add_identity(display_text('presentation.status.execution_allowance'), "；".join(_round_details(rounds)))
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (
-            "；整体修复："
-            f"当前版本验收 {_status_term(repair.get('candidate_validation_status'))}，"
-            f"代码修改 {repair.get('code_modification_attempts')} / "
-            f"{repair.get('code_modification_limit')}"
+            display_text('presentation.status.run_repair_candidate_acceptance_v1_code_modifications_v3_v5', v1=_status_term(repair.get('candidate_validation_status')), v3=repair.get('code_modification_attempts'), v5=repair.get('code_modification_limit'))
         )
     if view.get("elapsed_seconds") is not None:
-        progress_text += f"；任务历时 {_duration(view['elapsed_seconds'])}"
-    add_identity("总体进度", progress_text)
+        progress_text += display_text('presentation.status.task_elapsed_time_v1_48', v1=_duration(view['elapsed_seconds']))
+    add_identity(display_text('presentation.status.overall_progress'), progress_text)
 
     automatic_work = controller_work(state, audit)
     wait_view = waiting_presentation(state, audit)
@@ -476,31 +468,28 @@ def print_rich_status_progress(
     if wait_view is not None:
         agent_text = f"{wait_view.work}\n{wait_view.activity}"
     elif isinstance(agent, dict):
-        label = "当前 Agent" if agent.get("is_active") else "最近 Agent"
+        label = display_text('presentation.status.current_agent') if agent.get("is_active") else display_text('presentation.status.latest_agent')
         agent_text = (
-            f"{label}：{human_agent_role(agent.get('role'))} · "
-            f"{human_delivery_object(agent.get('object'))}\n"
-            f"模型：{agent.get('model') or '未绑定'}；推理强度："
-            f"{agent.get('reasoning_effort') or '未绑定'}\n"
+            display_text('presentation.status.v0_v2_v4_nmodel_v6_reasoning_effort_v8_n', v0=label, v2=human_agent_role(agent.get('role')), v4=human_delivery_object(agent.get('object')), v6=agent.get('model') or display_text('presentation.status.unbound'), v8=agent.get('reasoning_effort') or display_text('presentation.status.unbound'))
 
         )
         if agent.get("duration_seconds") is not None:
-            agent_text += f"本轮执行耗时：{_duration(agent['duration_seconds'])}"
+            agent_text += display_text('presentation.status.round_execution_time_v1', v1=_duration(agent['duration_seconds']))
         if agent.get("started_at"):
-            agent_text += f"；开始时间：{local_timestamp(agent['started_at'])}"
+            agent_text += display_text('presentation.status.started_at_v1_52', v1=local_timestamp(agent['started_at']))
         if agent.get("remaining_seconds") is not None:
-            agent_text += f"；本轮剩余：{_duration(agent['remaining_seconds'])}"
+            agent_text += display_text('presentation.status.round_time_remaining_v1_53', v1=_duration(agent['remaining_seconds']))
         recovery_details = agent.get("recovery_details")
         if isinstance(recovery_details, list):
             agent_text += "\n" + "\n".join(str(item) for item in recovery_details)
     else:
-        agent_text = "当前没有可确认的 Agent 工作记录"
-    add_identity("当前工作", automatic_work or agent_text)
+        agent_text = display_text('presentation.status.no_confirmed_agent_work_record')
+    add_identity(display_text('presentation.status.current_work'), automatic_work or agent_text)
 
     console.print(
         Panel(
             identity,
-            title=Text("agent-run · 交付状态卡", style="bold"),
+            title=Text(display_text('presentation.status.agent_run_delivery_status'), style="bold"),
             border_style=status_style,
             expand=True,
         )
@@ -519,7 +508,7 @@ def print_rich_status_progress(
         status_diagnostic_command(state) if needs_diagnostic else view.get("next_action")
         or (action.get("next_action") if isinstance(action, dict) else None)
     )
-    command_line = _rich_labeled("命令", command)
+    command_line = _rich_labeled(display_text('presentation.status.command'), command)
     action_lines: list[Text] = []
     if wait_view is not None and not isinstance(action, dict):
         action_lines.append(_rich_value(
@@ -535,39 +524,36 @@ def print_rich_status_progress(
             )
         )
     elif isinstance(action, dict) and action.get("type") == "Final Approval":
-        action_lines.append(Text("查看 PR、验收和合并前检查事实后，执行批准命令。"))
+        action_lines.append(Text(display_text('presentation.status.inspect_the_pr_acceptance_and_pre_merge_checks_then_run_the_appro')))
     elif isinstance(action, dict):
         action_lines.append(
-            _rich_labeled("类型", _human_action_type(action.get("type")))
+            _rich_labeled(display_text('presentation.status.type'), _human_action_type(action.get("type")))
         )
         for reason in action.get("reasons", []):
             message = reason if action.get("type") == "Human Blocker" else human_pause_reason(reason)
-            action_lines.append(_rich_labeled("原因", message))
+            action_lines.append(_rich_labeled(display_text('presentation.status.reason'), message))
         action_lines.append(
-            _rich_labeled("已保留成果", _rich_preserved_results(action.get("preserved")))
+            _rich_labeled(display_text('presentation.status.preserved_work'), _rich_preserved_results(action.get("preserved")))
         )
         action_lines.append(
             _rich_labeled(
-                "阻塞阶段",
-                _status_term(action.get("phase")) or action.get("phase") or "未知",
+                display_text('presentation.status.blocked_phase'),
+                _status_term(action.get("phase")) or action.get("phase") or display_text('presentation.status.unknown'),
             )
         )
         triggering = action.get("trigger_invocation")
         if isinstance(triggering, dict):
             action_lines.append(
                 _rich_labeled(
-                    "触发阻塞的 Agent",
+                    display_text('presentation.status.agent_that_triggered_the_blocker'),
                     (
-                        f"{_rich_role_label(triggering.get('role'))}；"
-                        f"模型 {triggering.get('model')}；"
-                        f"推理强度 {triggering.get('reasoning_effort')}；"
-                        f"本轮时长 {triggering.get('duration_seconds')} 秒"
+                        display_text('presentation.status.v0_model_v2_reasoning_effort_v4_round_duration_v6_seconds', v0=_rich_role_label(triggering.get('role')), v2=triggering.get('model'), v4=triggering.get('reasoning_effort'), v6=triggering.get('duration_seconds'))
                     ),
                 )
             )
-        action_lines.append(Text("整项任务已暂停，其他子任务也不会继续。"))
+        action_lines.append(Text(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue')))
         if action.get("type") == "Review Budget Checkpoint":
-            action_lines.append(Text("继续执行后，将按配置补充本次开发与验收额度，继续已有工作。"))
+            action_lines.append(Text(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t')))
     else:
         action_lines.append(
             _rich_value(automatic_work or _operator_instruction(state, audit.get("agent_invocation")))
@@ -577,21 +563,21 @@ def print_rich_status_progress(
     cleanup = audit.get("delivery_cleanup")
     if isinstance(cleanup, dict):
         cleanup_status = {
-            "completed": "已完成", "cleanup_pending": "等待清理", "pending": "待处理",
+            "completed": display_text('presentation.status.completed'), "cleanup_pending": display_text('presentation.status.cleanup_pending'), "pending": display_text('presentation.status.pending'),
         }.get(str(cleanup.get("status")), cleanup.get("status"))
-        action_lines.append(_rich_labeled("工作区清理", cleanup_status))
+        action_lines.append(_rich_labeled(display_text('presentation.status.workspace_cleanup'), cleanup_status))
         reason = _cleanup_reason(cleanup)
         if reason:
-            action_lines.append(_rich_labeled("保留原因", reason))
+            action_lines.append(_rich_labeled(display_text('presentation.status.preservation_reason'), reason))
         for path in _cleanup_paths(cleanup):
-            action_lines.append(_rich_labeled("待处理工作区", path))
+            action_lines.append(_rich_labeled(display_text('presentation.status.workspace_requiring_attention'), path))
     scope_change = audit.get("scope_change")
     if isinstance(scope_change, dict):
         summary = scope_change.get("graph_change_summary")
         action_lines.append(
             _rich_labeled(
-                "任务与依赖变化",
-                summary.get("summary") if isinstance(summary, dict) else "见 --json",
+                display_text('presentation.status.task_and_dependency_changes'),
+                summary.get("summary") if isinstance(summary, dict) else display_text('presentation.status.see_json'),
             )
         )
     # Put the executable next step before the detailed action panel so it is
@@ -604,7 +590,7 @@ def print_rich_status_progress(
     console.print(
         Panel(
             Group(*action_lines),
-            title=Text("下一步", style="bold yellow"),
+            title=Text(display_text('presentation.status.next_step'), style="bold yellow"),
             border_style="yellow" if action is not None else "cyan",
             expand=True,
         )
@@ -614,7 +600,7 @@ def print_rich_status_progress(
     finding_values = findings if isinstance(findings, list) else []
     finding_renderables: list[Text] = []
     if not finding_values:
-        finding_renderables.append(Text("当前没有属于本工作和当前代码版本的问题"))
+        finding_renderables.append(Text(display_text('presentation.status.no_findings_for_this_work_and_current_candidate')))
     else:
         for index, finding in enumerate(finding_values, start=1):
             finding_renderables.append(Text(f"{index}.", style="bold red"))
@@ -623,13 +609,13 @@ def print_rich_status_progress(
                 finding_renderables.append(_rich_value(finding))
                 continue
             for label, value in zip(
-                ("问题", "证据", "必须修复", "复验"), match.groups()
+                (display_text('presentation.status.problem'), display_text('presentation.status.evidence'), display_text('presentation.status.required_fix'), display_text('presentation.status.revalidation')), match.groups()
             ):
                 finding_renderables.append(_rich_labeled(label, value))
     console.print(
         Panel(
             Group(*finding_renderables),
-            title=Text(f"当前问题（{len(finding_values)}）", style="bold"),
+            title=Text(display_text('presentation.status.current_findings_v1', v1=len(finding_values)), style="bold"),
             border_style="red" if finding_values else "bright_black",
             expand=True,
         )
@@ -671,7 +657,7 @@ def _status_style(value: object) -> str:
 def _rich_value(value: object) -> Text:
     from rich.text import Text
 
-    return Text(_terminal_safe("未知" if value is None else value))
+    return Text(_terminal_safe(display_text('presentation.status.unknown') if value is None else value))
 
 
 def _rich_labeled(label: object, value: object) -> Text:
@@ -679,7 +665,7 @@ def _rich_labeled(label: object, value: object) -> Text:
 
     text = Text()
     text.append(f"{_terminal_safe(label)}：", style="bold")
-    text.append(_terminal_safe("未知" if value is None else value))
+    text.append(_terminal_safe(display_text('presentation.status.unknown') if value is None else value))
     return text
 
 
@@ -714,14 +700,16 @@ def _phase_term(
 ) -> object:
     if value == "pending":
         return {
-            "Run Acceptance": "待验收",
-            "Run Publication": "待发布",
-        }.get(str(current_object), "待处理")
+            "Run Acceptance": display_text('presentation.status.awaiting_acceptance'),
+            "Run Publication": display_text('presentation.status.awaiting_publication'),
+        }.get(str(current_object), display_text('presentation.status.pending'))
     return fallback(value)
 
 
 def _human_conclusion(value: object) -> object:
-    return "当前版本已通过验收" if value == "当前有效通过" else value
+    if display_language() != "zh" and isinstance(value, str):
+        return display_text("presentation.conclusion." + value)
+    return display_text('presentation.status.current_candidate_passed_acceptance') if value == "当前有效通过" else value
 
 
 def _human_action_type(value: object) -> str:
@@ -757,8 +745,8 @@ def _agent_view(
         "role": _role_label(str(role)),
         "started_at": started_at,
         "recovery_details": invocation_recovery_details(source),
-        "model": source.get("model") or "未绑定",
-        "reasoning_effort": source.get("reasoning_effort") or "未绑定",
+        "model": source.get("model") or display_text('presentation.status.unbound'),
+        "reasoning_effort": source.get("reasoning_effort") or display_text('presentation.status.unbound'),
         "duration_seconds": _invocation_duration(source, allow_open=is_active),
         "remaining_seconds": _remaining_until(deadline_at) if is_active else None,
         "is_active": is_active and agent_object == current_object,
@@ -795,17 +783,17 @@ def _run_repair_progress(value: object) -> dict[str, object] | None:
 
 def _ticket_progress_text(state: dict[str, Any], view: dict[str, Any]) -> str:
     if state.get("delivery_type") == "parent_only":
-        return "无子任务，直接推进需求"
+        return display_text('presentation.status.no_tickets_working_directly_on_the_requirement')
     progress = view.get("ticket_progress")
     if state.get("delivery_type") != "ticket_run" or not isinstance(progress, dict):
-        return "无法确认进度"
+        return display_text('presentation.status.progress_cannot_be_confirmed')
     completed, total = progress.get("completed"), progress.get("total")
     if (
         type(completed) is not int or type(total) is not int
         or total <= 0 or not 0 <= completed <= total
     ):
-        return "无法确认进度"
-    text = f"已完成 {completed} / {total} 个子任务"
+        return display_text('presentation.status.progress_cannot_be_confirmed')
+    text = display_text('presentation.status.completed_v1_v3_tickets', v1=completed, v3=total)
     if completed != total or state.get("status") == "completed":
         return text
     # Only active, normal workflow states may add a next-stage promise.
@@ -819,15 +807,15 @@ def _ticket_progress_text(state: dict[str, Any], view: dict[str, Any]) -> str:
     acceptance = state.get("run_acceptance")
     acceptance_phase = acceptance.get("phase") if isinstance(acceptance, dict) else None
     if publication_phase == "ready_for_approval":
-        return text + "，等待你确认后发布"
+        return text + display_text('presentation.status.awaiting_your_confirmation_before_publication')
     if publication_phase == "publishing":
-        return text + "，正在发布"
+        return text + display_text('presentation.status.publishing')
     if publication_phase not in {None, "pending"}:
         return text
     if acceptance_phase == "reviewing":
-        return text + "，正在验收"
+        return text + display_text('presentation.status.acceptance_in_progress')
     if acceptance_phase in {None, "pending"}:
-        return text + "，还要验收并发布"
+        return text + display_text('presentation.status.acceptance_and_publication_still_required')
     return text
 
 
@@ -891,25 +879,22 @@ def _round_progress(
 
 def _round_details(rounds: dict[str, Any]) -> list[str]:
     scope = {
-        "Ticket Development": "当前子任务",
-        "Parent Development": "当前整体需求",
-        "Run Development": "当前整体验收周期",
-    }.get(str(rounds.get("development_label")), "当前工作")
+        "Ticket Development": display_text('presentation.status.current_ticket'),
+        "Parent Development": display_text('presentation.status.current_parent_requirement'),
+        "Run Development": display_text('presentation.status.current_run_acceptance_cycle'),
+    }.get(str(rounds.get("development_label")), display_text('presentation.status.current_work'))
     details = []
     if rounds.get("cycle_development_attempts") is not None:
         details.append(
-            f"{scope}累计：开发 {rounds['cycle_development_attempts']} 次，"
-            f"验收 {rounds.get('cycle_review_attempts', '未知')} 次"
+            display_text('presentation.status.v0_totals_development_v2_acceptance_v4', v0=scope, v2=rounds['cycle_development_attempts'], v4=rounds.get('cycle_review_attempts', display_text('presentation.status.unknown')))
         )
     details.append(
-        f"本次授权已用：开发 {rounds.get('development_attempts')} / "
-        f"{rounds.get('development_limit')} 次，验收 {rounds.get('reviewer_invocations')} / "
-        f"{rounds.get('reviewer_limit')} 次"
+        display_text('presentation.status.current_allowance_used_development_v1_v3_acceptance_v5_v7', v1=rounds.get('development_attempts'), v3=rounds.get('development_limit'), v5=rounds.get('reviewer_invocations'), v7=rounds.get('reviewer_limit'))
     )
     if rounds.get("checkpoint_reason"):
-        details.append(f"暂停原因：{human_pause_reason(rounds['checkpoint_reason'])}")
+        details.append(display_text('presentation.status.pause_reason_v1', v1=human_pause_reason(rounds['checkpoint_reason'])))
     details.append(
-        "额外 CI 修复：" + human_ci_fix_usage(
+        display_text('presentation.status.extra_ci_repair') + human_ci_fix_usage(
             rounds.get("final_ci_fix_used"), rounds.get("final_ci_fix_limit")
         )
     )
@@ -1382,9 +1367,9 @@ _FINDING_PARTS = re.compile(
 
 def _print_findings(findings: object) -> None:
     values = findings if isinstance(findings, list) else []
-    print(f"\n当前问题（{len(values)}）")
+    print(display_text('presentation.status.ncurrent_findings_v1', v1=len(values)))
     if not values:
-        print("  无")
+        print(display_text('presentation.status.none_123'))
         return
     for index, finding in enumerate(values, start=1):
         text = _terminal_safe(finding)
@@ -1394,7 +1379,7 @@ def _print_findings(findings: object) -> None:
             continue
         print(f"  {index}.")
         for label, value in zip(
-            ("问题", "证据", "必须修复", "复验"), match.groups()
+            (display_text('presentation.status.problem'), display_text('presentation.status.evidence'), display_text('presentation.status.required_fix'), display_text('presentation.status.revalidation')), match.groups()
         ):
             print(f"     {_terminal_safe(label)}：{_terminal_safe(value)}")
 
@@ -1466,29 +1451,29 @@ def _operator_instruction(
     if cleanup:
         return cleanup
     if invocation is not None and invocation.get("status") in {"running", "resuming"}:
-        return "你暂时无需操作。"
+        return display_text('presentation.status.no_action_is_required_at_present')
     if state.get("status") in {"completed", "abandoned"}:
-        return "无需操作。"
-    return "按上述命令继续；不要重复启动同一项任务。"
+        return display_text('presentation.status.no_action_required')
+    return display_text('presentation.status.continue_with_the_command_above_do_not_start_this_task_again')
 
 
 def _print_cleanup(cleanup: object) -> None:
     if not isinstance(cleanup, dict):
         return
-    print("\n工作区清理")
-    print(f"  状态: {_terminal_safe(human_status_term(cleanup.get('status')))}")
+    print(display_text('presentation.status.nworkspace_cleanup'))
+    print(display_text('presentation.status.status_v1_128', v1=_terminal_safe(human_status_term(cleanup.get('status')))))
     if cleanup.get("status") == "completed":
         return
     reason = _cleanup_reason(cleanup)
     if reason:
-        print(f"  保留原因: {_terminal_safe(reason)}")
+        print(display_text('presentation.status.preservation_reason_v1', v1=_terminal_safe(reason)))
     items = cleanup.get("items")
     if isinstance(items, list):
         pending = sum(1 for item in items if isinstance(item, dict))
         if pending:
-            print(f"  已保留 {pending} 个开发工作区")
+            print(display_text('presentation.status.preserved_v1_development_workspaces', v1=pending))
         for path in _cleanup_paths(cleanup):
-            print(f"  待处理工作区: {_terminal_safe(path)}")
+            print(display_text('presentation.status.workspace_requiring_attention_v1', v1=_terminal_safe(path)))
 
 
 def _cleanup_paths(cleanup: dict[str, Any]) -> list[str]:
@@ -1504,18 +1489,18 @@ def _cleanup_reason(cleanup: dict[str, Any]) -> str | None:
     if cleanup.get("status") == "completed" or not isinstance(error, str) or not error:
         return None
     if "source head changed" in error or "foreign head" in error:
-        return "源分支或工作区的提交已变化，已保留新增工作。"
+        return display_text('presentation.status.source_branch_or_checkout_commits_changed_new_work_has_been_prese')
     if "branch identity changed" in error or "HEAD is not the managed branch" in error:
-        return "工作区已切换分支或处于游离 HEAD，已保留现场。"
+        return display_text('presentation.status.the_checkout_changed_branch_or_has_detached_head_it_has_been_pres')
     if any(reason in error for reason in ("tracked modifications", "untracked", "dirty checkout")):
-        return "工作区存在尚未提交的文件，已保留现场。"
-    return error if len(error) <= 240 else error[:232] + "…（已截断）"
+        return display_text('presentation.status.the_checkout_has_uncommitted_files_it_has_been_preserved')
+    return error if len(error) <= 240 else error[:232] + display_text('presentation.status.truncated')
 
 
 def _print_scope_change(scope_change: object) -> None:
     if not isinstance(scope_change, dict):
         return
     summary = scope_change.get("graph_change_summary")
-    print("\n任务与依赖变化")
+    print(display_text('presentation.status.ntask_and_dependency_changes'))
     if isinstance(summary, dict):
         print(f"  {_terminal_safe(summary.get('summary'))}")

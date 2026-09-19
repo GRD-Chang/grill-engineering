@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from agent_run.messages import error_message
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader
 from agent_run.github_fixture import FixtureGitHubReader
@@ -16,7 +17,7 @@ def selected_workspace(
     fixture: str | None = None,
 ) -> ManagedWorkspace:
     if os.environ.get("GH_HOST", "github.com").lower() not in {"", "github.com"}:
-        raise GitError("Runner 当前仅支持 github.com 仓库")
+        raise GitError(error_message("cli.error.github_host"))
     reader = (
         FixtureGitHubReader(Path(fixture))
         if fixture else GhGitHubReader(working_directory=Path.cwd())
@@ -25,7 +26,7 @@ def selected_workspace(
     if not identity:
         raise RunLocatorError(
             "run_selector_context",
-            "无法从当前目录识别 GitHub 仓库；请使用 --repo <owner/name>。",
+            error_message("cli.error.workspace_repository"),
         )
     return ManagedWorkspace.for_repository(identity)
 
@@ -48,7 +49,7 @@ def open_workspace(
         return workspace.ensure(remote_url=remote, identity=identity)
     if not workspace.root.exists():
         raise RunLocatorError(
-            "run_selector_not_found", "此仓库尚无 Runner 工作区；请先运行 run。"
+            "run_selector_not_found", error_message("cli.error.workspace_missing")
         )
     return workspace.open()
 

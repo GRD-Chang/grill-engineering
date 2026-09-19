@@ -66,13 +66,21 @@ def test_preview_uses_execution_assembler_and_frozen_resources(tmp_path: Path) -
     assert "新Run标记" not in frozen.stdout
 
 
-def test_unreadable_override_reports_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_unreadable_override_reports_error(tmp_path: Path, language: str) -> None:
+    from agent_run.user_defaults import UserDefaultsStore
+
+    UserDefaultsStore().configure(language=language)
     directory = prompt_resources.personal_method_directory()
     directory.mkdir(parents=True)
     (directory / "review.md").mkdir()
     result = cli("diff", "--json")
     assert result.returncode != 0
     assert "review" in result.stdout + result.stderr
+    human = cli("diff")
+    assert human.returncode != 0
+    assert ("无法读取 Prompt 资源" if language == "zh" else "Cannot read prompt resource") in human.stdout
+    assert ("普通 Markdown 文件" if language == "zh" else "regular Markdown file") in human.stdout
 
 
 def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_supplied(
@@ -165,3 +173,18 @@ def test_bilingual_resource_manifest_and_format_fields_match() -> None:
             assert [field for _, field, _, _ in formatter.parse(chinese[key])] == [
                 field for _, field, _, _ in formatter.parse(english[key])
             ], key
+
+    # Short CLI, history and notification copy shares the same resource contract.
+    catalogs = [
+        json.loads((prompt_resources.RESOURCE_ROOT.parent / language / "messages.json").read_text())
+        for language in ("zh", "en")
+    ]
+    assert catalogs[0].keys() == catalogs[1].keys()
+    for key, chinese_copy in catalogs[0].items():
+        english_copy = catalogs[1][key]
+        assert chinese_copy.strip() and english_copy.strip(), key
+        assert {
+            field for _, field, _, _ in formatter.parse(chinese_copy) if field is not None
+        } == {
+            field for _, field, _, _ in formatter.parse(english_copy) if field is not None
+        }, key

@@ -6,6 +6,7 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.messages import text, display_language, presentation_language, selected_language
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
@@ -101,104 +102,106 @@ def _print_precondition_failure(
         )
         return
 
+    language = selected_language(state)
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
-    print(f"Repository: {state.get('repository')}")
-    print(f"Parent Issue: #{parent_number}")
-    print(f"交付状态: {human_delivery_status(state.get('status'))}")
-    print(f"命令状态: 未应用（{diagnostic['message']}）")
-    print("下一步: " + str(human_next_action_for_state(state)))
+    print(text("presentation.precondition.repository", language=language, value=state.get("repository")))
+    print(text("presentation.precondition.parent", language=language, value=parent_number))
+    print(text("presentation.precondition.status", language=language, value=human_delivery_status(state.get("status"), language=language)))
+    print(text("presentation.precondition.rejected", language=language))
+    print(text("presentation.precondition.next", language=language, value=human_next_action_for_state(state)))
 
 
 def _print_status(
     state: dict[str, object], *, as_json: bool, plain: bool = False
 ) -> None:
-    _print_notification_warning(state, as_json=as_json)
-    active = _active_ticket_job(state)
-    active_ticket = active.get("ticket_number") if active else None
-    worker = _current_worker(state)
-    run_repair = _run_repair_status(state)
-    review_budget = _public_review_budget(state)
-    current_identity = _current_delivery_identity(state)
-    invocation = state.get("active_agent_invocation")
-    active_invocation = (
-        invocation
-        if isinstance(invocation, dict)
-        and invocation.get("status") in {"running", "failed", "resuming"}
-        else None
-    )
-    semantic_attempt = _current_semantic_attempt(state, active_invocation)
-    delivery_cleanup = _public_delivery_cleanup(state)
-    latest_resume = latest_resume_audit(state)
-    operator_action = _operator_action_view(state)
-    output = {
-        "notifications": state.get("_notifications", {}),
-        "run_id": state.get("run_id"),
-        "repository": state.get("repository"),
-        "parent": state.get("parent"),
-        "status": state.get("status"),
-        "active_ticket": active_ticket,
-        "phase": _current_phase(state),
-        "worker": worker,
-        "run_repair": run_repair,
-        "candidate_sha": current_identity.get("candidate_sha"),
-        "pr_number": current_identity.get("pr_number"),
-        "review_budget": review_budget,
-        "elapsed_seconds": run_elapsed_seconds(state),
-        "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
-        "next_action": (
-            operator_action["next_action"]
-            if operator_action is not None
-            else _next_action(state)
-        ),
-        "operator_action": operator_action,
-        "diagnostics": state.get("diagnostics", []),
-        "scope_change": state.get("unsupported_scope_change"),
-        "abandonment": state.get("run_abandonment"),
-        "agent_invocation": _public_invocation_view(active_invocation),
-        "semantic_agent_attempt": (
-            _history_attempt_view(semantic_attempt, include_history_facts=False)
-            if isinstance(semantic_attempt, dict)
+    with presentation_language("zh" if as_json else selected_language(state)):
+        _print_notification_warning(state, as_json=as_json)
+        active = _active_ticket_job(state)
+        active_ticket = active.get("ticket_number") if active else None
+        worker = _current_worker(state)
+        run_repair = _run_repair_status(state)
+        review_budget = _public_review_budget(state)
+        current_identity = _current_delivery_identity(state)
+        invocation = state.get("active_agent_invocation")
+        active_invocation = (
+            invocation
+            if isinstance(invocation, dict)
+            and invocation.get("status") in {"running", "failed", "resuming"}
             else None
-        ),
-        "output_attempt": _output_attempt(active_invocation),
-        "budget_window": (
-            semantic_attempt.get("budget_window")
-            if isinstance(semantic_attempt, dict)
-            else (
-                review_budget.get("window") if isinstance(review_budget, dict) else None
-            )
-        ),
-        "publication_operation_retry": _current_publication_operation_retry(state),
-        "delivery_cleanup": delivery_cleanup,
-        "latest_resume": latest_resume,
-        "supervision": public_supervision_snapshot(state),
-        "executor_control": state.get("_executor_control"),
-    }
-    progress_source = output
-    if not as_json:
-        progress_source = {
-            **output,
-            "next_action": human_next_action_for_state(state),
-        }
-    progress = status_progress_view(state, progress_source)
-    output["progress"] = progress
-    if as_json:
-        output["lifecycle_action"] = state.get("action_application_receipt")
-        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-        return
-    if _use_rich_status(plain):
-        print_rich_status_progress(state, output, progress)
-    else:
-        print_status_progress(
-            state,
-            output,
-            progress,
-            display_term=_display_term,
-            print_operator_action=lambda action: _print_human_operator_action(
-                state, action
-            ),
         )
+        semantic_attempt = _current_semantic_attempt(state, active_invocation)
+        delivery_cleanup = _public_delivery_cleanup(state)
+        latest_resume = latest_resume_audit(state)
+        operator_action = _operator_action_view(state)
+        output = {
+            "notifications": state.get("_notifications", {}),
+            "run_id": state.get("run_id"),
+            "repository": state.get("repository"),
+            "parent": state.get("parent"),
+            "status": state.get("status"),
+            "active_ticket": active_ticket,
+            "phase": _current_phase(state),
+            "worker": worker,
+            "run_repair": run_repair,
+            "candidate_sha": current_identity.get("candidate_sha"),
+            "pr_number": current_identity.get("pr_number"),
+            "review_budget": review_budget,
+            "elapsed_seconds": run_elapsed_seconds(state),
+            "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
+            "next_action": (
+                operator_action["next_action"]
+                if operator_action is not None
+                else _next_action(state)
+            ),
+            "operator_action": operator_action,
+            "diagnostics": state.get("diagnostics", []),
+            "scope_change": state.get("unsupported_scope_change"),
+            "abandonment": state.get("run_abandonment"),
+            "agent_invocation": _public_invocation_view(active_invocation),
+            "semantic_agent_attempt": (
+                _history_attempt_view(semantic_attempt, include_history_facts=False)
+                if isinstance(semantic_attempt, dict)
+                else None
+            ),
+            "output_attempt": _output_attempt(active_invocation),
+            "budget_window": (
+                semantic_attempt.get("budget_window")
+                if isinstance(semantic_attempt, dict)
+                else (
+                    review_budget.get("window") if isinstance(review_budget, dict) else None
+                )
+            ),
+            "publication_operation_retry": _current_publication_operation_retry(state),
+            "delivery_cleanup": delivery_cleanup,
+            "latest_resume": latest_resume,
+            "supervision": public_supervision_snapshot(state),
+            "executor_control": state.get("_executor_control"),
+        }
+        progress_source = output
+        if not as_json:
+            progress_source = {
+                **output,
+                "next_action": human_next_action_for_state(state),
+            }
+        progress = status_progress_view(state, progress_source)
+        output["progress"] = progress
+        if as_json:
+            output["lifecycle_action"] = state.get("action_application_receipt")
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            return
+        if _use_rich_status(plain):
+            print_rich_status_progress(state, output, progress)
+        else:
+            print_status_progress(
+                state,
+                output,
+                progress,
+                display_term=_display_term,
+                print_operator_action=lambda action: _print_human_operator_action(
+                    state, action
+                ),
+            )
 
 
 def _print_history(
@@ -208,91 +211,92 @@ def _print_history(
     plain: bool = False,
     details: bool = False,
 ) -> None:
-    _print_notification_warning(state, as_json=as_json)
-    timeline = state.get("timeline", [])
-    if not isinstance(timeline, list):
-        raise ValueError("timeline must be an array")
-    timeline_continuation = state.get("timeline_continuation", [])
-    if not isinstance(timeline_continuation, list):
-        raise ValueError("timeline_continuation must be an array")
-    invocations = state.get("agent_invocation_history", [])
-    if not isinstance(invocations, list):
-        raise ValueError("agent_invocation_history must be an array")
-    semantic_attempts = _semantic_attempt_history(state)
-    human_semantic_attempts = _semantic_attempt_history(
-        state, include_history_facts=True
-    )
-    operation_retries = _publication_operation_retries(state)
-    resume_audit = state.get("resume_audit")
-    public_resume_audit = resume_audit if isinstance(resume_audit, dict) else {}
-    agent_resumes = public_resume_audit.get("history", [])
-    if not isinstance(agent_resumes, list):
-        raise ValueError("resume_audit.history must be an array")
-    operator_action = _operator_action_view(state)
-    output = {
-        "notifications": state.get("_notifications", {}),
-        "run_id": state.get("run_id"),
-        "timeline": timeline,
-        "timeline_continuation": timeline_continuation,
-        "next_action": (
-            operator_action["next_action"]
-            if operator_action is not None
-            else _next_action(state)
-        ),
-        "operator_action": operator_action,
-        "abandonment": state.get("run_abandonment"),
-        "agent_invocations": [
-            _public_invocation_view(invocation)
-            if isinstance(invocation, dict)
-            else invocation
-            for invocation in invocations
-        ],
-        "semantic_agent_attempts": semantic_attempts,
-        "output_attempts": [
-            {
-                "invocation_started_at": invocation.get("started_at"),
-                "work_subject": invocation.get("work_subject"),
-                "attempt_count": invocation.get("attempt_count"),
-            }
-            for invocation in invocations
-            if isinstance(invocation, dict)
-        ],
-        "budget_windows": _budget_windows(semantic_attempts),
-        "publication_operation_retries": operation_retries,
-        "resume_audit": {
-            "total": public_resume_audit.get("total", 0),
-            "compacted": public_resume_audit.get("compacted", 0),
-            "rolling_digest": public_resume_audit.get("rolling_digest"),
-        },
-        "agent_resumes": agent_resumes,
-        "supervision": public_supervision_snapshot(state),
-        "executor_control": state.get("_executor_control"),
-    }
-    progress_source = output
-    if not as_json:
-        progress_source = {
-            **output,
-            "next_action": human_next_action_for_state(state),
-            "semantic_agent_attempts": human_semantic_attempts,
-        }
-    progress = history_progress_view(state, progress_source)
-    output.update(progress)
-    if as_json:
-        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-        return
-    if _use_rich_status(plain):
-        print_rich_history_progress(state, progress_source, progress, details=details)
-    else:
-        print_history_progress(
-            state,
-            progress_source,
-            progress,
-            display_term=_display_term,
-            print_operator_action=lambda action: _print_human_operator_action(
-                state, action
-            ),
-            details=details,
+    with presentation_language("zh" if as_json else selected_language(state)):
+        _print_notification_warning(state, as_json=as_json)
+        timeline = state.get("timeline", [])
+        if not isinstance(timeline, list):
+            raise ValueError("timeline must be an array")
+        timeline_continuation = state.get("timeline_continuation", [])
+        if not isinstance(timeline_continuation, list):
+            raise ValueError("timeline_continuation must be an array")
+        invocations = state.get("agent_invocation_history", [])
+        if not isinstance(invocations, list):
+            raise ValueError("agent_invocation_history must be an array")
+        semantic_attempts = _semantic_attempt_history(state)
+        human_semantic_attempts = _semantic_attempt_history(
+            state, include_history_facts=True
         )
+        operation_retries = _publication_operation_retries(state)
+        resume_audit = state.get("resume_audit")
+        public_resume_audit = resume_audit if isinstance(resume_audit, dict) else {}
+        agent_resumes = public_resume_audit.get("history", [])
+        if not isinstance(agent_resumes, list):
+            raise ValueError("resume_audit.history must be an array")
+        operator_action = _operator_action_view(state)
+        output = {
+            "notifications": state.get("_notifications", {}),
+            "run_id": state.get("run_id"),
+            "timeline": timeline,
+            "timeline_continuation": timeline_continuation,
+            "next_action": (
+                operator_action["next_action"]
+                if operator_action is not None
+                else _next_action(state)
+            ),
+            "operator_action": operator_action,
+            "abandonment": state.get("run_abandonment"),
+            "agent_invocations": [
+                _public_invocation_view(invocation)
+                if isinstance(invocation, dict)
+                else invocation
+                for invocation in invocations
+            ],
+            "semantic_agent_attempts": semantic_attempts,
+            "output_attempts": [
+                {
+                    "invocation_started_at": invocation.get("started_at"),
+                    "work_subject": invocation.get("work_subject"),
+                    "attempt_count": invocation.get("attempt_count"),
+                }
+                for invocation in invocations
+                if isinstance(invocation, dict)
+            ],
+            "budget_windows": _budget_windows(semantic_attempts),
+            "publication_operation_retries": operation_retries,
+            "resume_audit": {
+                "total": public_resume_audit.get("total", 0),
+                "compacted": public_resume_audit.get("compacted", 0),
+                "rolling_digest": public_resume_audit.get("rolling_digest"),
+            },
+            "agent_resumes": agent_resumes,
+            "supervision": public_supervision_snapshot(state),
+            "executor_control": state.get("_executor_control"),
+        }
+        progress_source = output
+        if not as_json:
+            progress_source = {
+                **output,
+                "next_action": human_next_action_for_state(state),
+                "semantic_agent_attempts": human_semantic_attempts,
+            }
+        progress = history_progress_view(state, progress_source)
+        output.update(progress)
+        if as_json:
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            return
+        if _use_rich_status(plain):
+            print_rich_history_progress(state, progress_source, progress, details=details)
+        else:
+            print_history_progress(
+                state,
+                progress_source,
+                progress,
+                display_term=_display_term,
+                print_operator_action=lambda action: _print_human_operator_action(
+                    state, action
+                ),
+                details=details,
+            )
 
 
 def _use_rich_status(plain: bool) -> bool:
@@ -571,15 +575,16 @@ def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
-def human_delivery_status(value: object) -> object:
+def human_delivery_status(value: object, *, language: str = "zh") -> object:
     """Render the same delivery terminology used by status and history."""
 
-    return _display_term(value)
+    return human_status_term(value, language=language)
 
 
-def human_next_action_for_state(state: Mapping[str, Any], *, language: str = "zh") -> object:
+def human_next_action_for_state(state: Mapping[str, Any], *, language: str | None = None) -> object:
     """Render the shared recovery decision using the public Parent selector."""
     public_state = state if isinstance(state, dict) else dict(state)
+    language = selected_language(public_state) if language is None else language
     fallback = render_next_action(
         next_action_fact(public_state), public_state, language=language, human=True,
     )
@@ -836,7 +841,7 @@ def _candidate_validation_status(job: dict[str, object]) -> str:
 
 
 def _display_term(value: object) -> object:
-    return human_status_term(value)
+    return human_status_term(value, language=display_language())
 
 
 def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> None:
@@ -848,6 +853,6 @@ def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> N
     reason = notifications.get("unavailable_reason")
     pending = notifications.get("pending", [])
     if reason:
-        print(f"飞书通知不可用: {reason}")
+        print(text("presentation.notification.unavailable", language=selected_language(state), reason=reason))
     if pending:
-        print(f"飞书通知未确认送达: {len(pending)} 条；原因见同命令 --json 的 notifications。")
+        print(text("presentation.notification.pending", language=selected_language(state), count=len(pending)))

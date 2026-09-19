@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.messages import display_text, display_language
+
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -145,51 +147,51 @@ def terminal_safe(value: object) -> str:
 def human_ci_fix_usage(used: object, limit: object) -> str:
     """Describe the extra CI allowance without exposing its boolean encoding."""
     if limit == 0:
-        return "不适用"
+        return display_text('presentation.status.not_applicable')
     count = int(used) if isinstance(used, bool) else used
-    return f"已用 {count if count is not None else '未知'} / {limit if limit is not None else '未知'} 次"
+    return display_text('presentation.status.used_v1_v3_times', v1=count if count is not None else display_text('presentation.status.unknown'), v3=limit if limit is not None else display_text('presentation.status.unknown'))
 
 
 def human_delivery_object(value: object) -> str:
     """Translate a display label, leaving machine work-subject identities intact."""
     text = str(value or "Delivery Run")
     labels = {
-        "Delivery Run": "整体交付", "Run Acceptance": "整体验收",
-        "Run Publication": "整体交付", "Run Repair": "整体修复",
+        "Delivery Run": display_text('presentation.status.overall_delivery'), "Run Acceptance": display_text('presentation.status.run_acceptance'),
+        "Run Publication": display_text('presentation.status.overall_delivery'), "Run Repair": display_text('presentation.status.run_repair'),
     }
     if text in labels:
         return labels[text]
     match = re.fullmatch(r"Ticket (#\S+)", text)
     if match:
-        return f"子任务 {match[1]}"
+        return display_text('presentation.status.ticket_v1', v1=match[1])
     match = re.fullmatch(r"Parent Issue (#\S+)", text)
     if match:
-        return f"整体需求 {match[1]}"
+        return display_text('presentation.status.parent_issue_v1', v1=match[1])
     match = re.fullmatch(r"Delivery Run（Parent Issue (#\S+)）", text)
     if match:
-        return f"整体交付（需求 {match[1]}）"
+        return display_text('presentation.status.overall_delivery_requirement_v1', v1=match[1])
     return text
 
 
 def human_agent_role(value: object) -> str:
     raw = str(value or "Agent")
     if "开发" in raw or raw in {"development", "Development Agent"}:
-        return "开发 Agent"
+        return display_text('presentation.status.development_agent')
     if "验收" in raw or raw in {"review", "reviewer", "fresh_acceptance", "Review Agent"}:
-        return "验收 Agent"
+        return display_text('presentation.status.review_agent')
     if "发布" in raw or raw in {"publication", "final_publication", "Publication Agent"}:
-        return "发布 Agent"
+        return display_text('presentation.status.publication_agent')
     return "Agent" if raw != "Agent" else raw
 
 
-def human_status_term(value: object, *, language: str = "zh") -> object:
+def human_status_term(value: object, *, language: str | None = None) -> object:
     """One human vocabulary shared by status, history and notifications."""
     if not isinstance(value, str):
         return value
     key = value.lower()
     if key not in _STATUS_TERMS:
         key = "fallback"
-    return text(f"guidance.status.{key}", language=language)
+    return text(f"guidance.status.{key}", language=language or display_language())
 
 
 def status_diagnostic_command(state: dict[str, Any]) -> str:
@@ -203,35 +205,33 @@ def status_diagnostic_command(state: dict[str, Any]) -> str:
 
 def unknown_execution_guidance(state: dict[str, Any], *, include_command: bool = True) -> str:
     diagnostic = (
-        f"\n诊断命令: {status_diagnostic_command(state)}" if include_command else ""
+        display_text('presentation.status.ndiagnostic_command_v1', v1=status_diagnostic_command(state)) if include_command else ""
     )
     return (
-        "运行状态无法确认；请先查看后台诊断。"
-        "继续操作时程序会先核验原执行的归属和退出状态，确认安全后才恢复。"
-        f"{diagnostic}"
+        display_text('presentation.status.execution_status_cannot_be_confirmed_inspect_background_diagnosti', v1=diagnostic)
     )
 
 
-def human_pause_reason(value: object, *, language: str = "zh") -> str:
+def human_pause_reason(value: object, *, language: str | None = None) -> str:
     """Render controller reasons without rewriting user evidence."""
     raw = str(value)
     if raw in _PAUSE_STATUS_TERMS:
-        return str(human_status_term(raw, language=language))
+        return str(human_status_term(raw, language=language or display_language()))
     if raw in _PAUSE_REASONS:
-        return text(f"guidance.pause.{raw}", language=language)
+        return text(f"guidance.pause.{raw}", language=language or display_language())
     return raw
 
 
 def local_timestamp(value: object) -> str:
     """Render persisted UTC timestamps in the querying device's local timezone."""
     if not isinstance(value, str):
-        return "未知"
+        return display_text('presentation.status.unknown')
     try:
         instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if instant.tzinfo is None:
             instant = instant.replace(tzinfo=UTC)
     except ValueError:
-        return "未知"
+        return display_text('presentation.status.unknown')
     fallback = False
     try:
         local = instant.astimezone()
@@ -239,7 +239,7 @@ def local_timestamp(value: object) -> str:
         local, fallback = instant.astimezone(UTC), True
     offset = local.strftime("%z")
     zone = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC"
-    suffix = "（本地时区不可用，已回退 UTC）" if fallback else ""
+    suffix = display_text('presentation.status.local_timezone_unavailable_using_utc') if fallback else ""
     return f"{local:%Y-%m-%d %H:%M:%S} {zone}{suffix}"
 
 
@@ -349,11 +349,11 @@ def delivery_object_label(
 def execution_duration(seconds: object) -> str:
     """Format trusted execution seconds without dropping minute remainders."""
     if type(seconds) is not int or seconds < 0:
-        return "未知"
+        return display_text('presentation.status.unknown')
     minutes, remainder = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
-        return f"{hours} 小时 {minutes} 分 {remainder} 秒"
+        return display_text('presentation.status.v0_hours_v2_minutes_v4_seconds', v0=hours, v2=minutes, v4=remainder)
     if minutes:
-        return f"{minutes} 分 {remainder} 秒"
-    return f"{seconds} 秒"
+        return display_text('presentation.status.v0_minutes_v2_seconds', v0=minutes, v2=remainder)
+    return display_text('presentation.status.v0_seconds', v0=seconds)

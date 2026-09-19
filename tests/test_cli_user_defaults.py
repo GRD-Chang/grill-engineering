@@ -199,7 +199,7 @@ def test_settings_human_output_and_complete_example(tmp_path: Path, monkeypatch:
     with redirect_stdout(output):
         assert cli.main(["settings", "configure", "--ticket-review-rounds", "4"]) == 0
     assert "仅影响之后创建的新 Run，已有 Run 保持原设置" in output.getvalue()
-    assert '"ticket_review_rounds": 4' in output.getvalue()
+    assert "子任务验收轮数: 4" in output.getvalue()
     example = Path(__file__).parents[1] / "docs/examples/user-defaults.json"
     document = json.loads(example.read_text())
     resolved = UserDefaultsStore().describe(document)
@@ -498,3 +498,115 @@ def test_short_copy_selects_frozen_run_or_personal_language() -> None:
     assert selected_language({"language": "zh"}) == "zh"
     assert text("settings.personal_title", language=selected_language()) == "Personal Run defaults"
     assert text("settings.personal_title", language=selected_language({"language": "zh"})) == "个人运行默认配置"
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], language: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["settings", "configure", "--language", language]) == 0
+    configured = capsys.readouterr().out
+    assert ("个人运行默认配置" if language == "zh" else "Personal Run defaults") in configured
+    assert ("语言: " if language == "zh" else "Language: ") + language in configured
+    for arguments in (["--help"], ["run", "--help"], ["settings", "configure", "--help"]):
+        with pytest.raises(SystemExit) as exit_info:
+            cli.main(arguments)
+        assert exit_info.value.code == 0
+        output = capsys.readouterr().out
+        assert ("用法:" if language == "zh" else "usage:") in output
+        assert ("显示此帮助并退出" if language == "zh" else "show this help message and exit") in output
+        if language == "en":
+            assert not re.search(r"[\u4e00-\u9fff]", output)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["run", "0"])
+    assert exit_info.value.code == 2
+    assert ("必须是正整数" if language == "zh" else "Must be a positive integer") in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["status", "--nonexistent"])
+    assert ("无法识别的参数" if language == "zh" else "unrecognized arguments") in capsys.readouterr().err
+    assert cli.main(["prompts", "init"]) == 0
+    initialized = capsys.readouterr().out
+    assert ("已创建:" if language == "zh" else "Created:") in initialized
+    assert "development-common.md" in initialized
+    assert cli.main(["run", "1", "--repo", "invalid-repository"]) == 2
+    failed = capsys.readouterr().out
+    assert ("命令状态: 未执行" if language == "zh" else "Command status: Not executed") in failed
+    if language == "en":
+        assert not re.search(r"[\u4e00-\u9fff]", failed)
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_run_configuration_receipt_keeps_frozen_language_after_personal_change(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], language: str,
+) -> None:
+    from conftest import seed_run
+    from support.inprocess_cli import invoke_cli_inprocess
+    from test_run_lifecycle import _file_snapshot
+
+    monkeypatch.chdir(git_repo)
+    UserDefaultsStore().configure(language=language)
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    started = seed_run(git_repo, fixture)
+    run_id = stdout_json(started)["run_id"]
+    UserDefaultsStore().configure(language="zh" if language == "en" else "en")
+    result = invoke_cli_inprocess(git_repo, fixture, "configure", run_id, "--development-model", "custom-model")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("配置状态: 已保存" if language == "zh" else "Configuration: Agent Profile Revision") in result.stdout
+    assert ("未启动、停止或推进" if language == "zh" else "was not started, stopped, or advanced") in result.stdout
+    before = _file_snapshot(managed_state(git_repo))
+    assert cli.main(["settings", "show", "--run", run_id]) == 0
+    shown = capsys.readouterr().out
+    assert ("执行配置:" if language == "zh" else "Execution profile:") in shown
+    assert "custom-model" in shown
+    assert _file_snapshot(managed_state(git_repo)) == before
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("arguments,expected_zh,expected_en,audit", [
+    ([], "需要至少一个显式配置选项", "requires an explicit option", "configure requires an explicit option"),
+    (["--notification-open-id", ""], "必须是非空字符串", "must be a non-empty string", "notifications.open_id 必须是非空字符串"),
+])
+def test_configuration_errors_localize_without_changing_audit_or_file(
+    capsys: pytest.CaptureFixture[str], language: str, arguments: list[str],
+    expected_zh: str, expected_en: str, audit: str,
+) -> None:
+    store = UserDefaultsStore()
+    store.configure(language=language)
+    before = store.path.read_bytes()
+    assert cli.main(["settings", "configure", *arguments]) == 2
+    output = capsys.readouterr().out
+    assert (expected_zh if language == "zh" else expected_en) in output
+    assert cli.main(["settings", "configure", *arguments, "--json"]) == 2
+    diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
+    assert diagnostic["message"] == audit + "；请排除上述原因后重试；已有交付请先查询 status 确认状态。"
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("arguments,expected_zh,expected_en,audit", [
+    (["--preset", "bad"], "未知 Agent 执行预设 'bad'", "unknown Agent Execution Preset 'bad'",
+     "unknown Agent Execution Preset 'bad'; choose one of: economy, premium"),
+    (["--development-effort", "bad"], "development_effort 必须是以下值之一", "development_effort must be one of",
+     "development_effort must be one of: high, low, max, medium, minimal, ultra, xhigh"),
+    (["--development-deadline", "bad"], "development deadline 必须是正时长", "development deadline must be a positive duration",
+     "development deadline must be a positive duration"),
+    (["--development-model", ""], "development_model 必须是非空模型标识", "development_model must be a non-empty model identifier",
+     "development_model must be a non-empty model identifier"),
+    (["--publication-from-development", "--publication-model", "custom"], "不能与发布角色的覆盖配置同时使用", "cannot be combined with Publication overrides",
+     "publication_from_development cannot be combined with Publication overrides"),
+])
+def test_profile_and_policy_cli_errors_are_bilingual_and_keep_original_audit(
+    capsys: pytest.CaptureFixture[str], language: str, arguments: list[str],
+    expected_zh: str, expected_en: str, audit: str,
+) -> None:
+    store = UserDefaultsStore()
+    store.configure(language=language)
+    before = store.path.read_bytes()
+    assert cli.main(["settings", "configure", *arguments]) == 2
+    output = capsys.readouterr().out
+    assert (expected_zh if language == "zh" else expected_en) in output
+    assert cli.main(["settings", "configure", *arguments, "--json"]) == 2
+    diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
+    assert diagnostic["message"] == audit + "；请排除上述原因后重试；已有交付请先查询 status 确认状态。"
+    assert store.path.read_bytes() == before

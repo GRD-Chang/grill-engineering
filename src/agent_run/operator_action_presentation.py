@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.messages import display_text
+
 from datetime import datetime
 from itertools import chain
 from typing import Any
@@ -94,49 +96,44 @@ def operator_action_view(
 def print_operator_action(
     action: dict[str, Any], *, run_id: object = None
 ) -> None:
-    print("需要你处理:")
-    print(f"类型: {terminal_safe(human_action_type(action['type']))}")
-    print(f"对象: {terminal_safe(human_delivery_object(action['object']))}")
-    print(f"阶段: {terminal_safe(human_status_term(action['phase']))}")
+    print(display_text('presentation.status.action_required'))
+    print(display_text('presentation.status.type_v1', v1=terminal_safe(human_action_type(action['type']))))
+    print(display_text('presentation.status.object_v1', v1=terminal_safe(human_delivery_object(action['object']))))
+    print(display_text('presentation.status.phase_v1_205', v1=terminal_safe(human_status_term(action['phase']))))
     for reason in action["reasons"]:
         message = reason if action["type"] == "Human Blocker" else human_pause_reason(reason)
-        print(f"原因: {terminal_safe(message)}")
+        print(display_text('presentation.status.reason_v1', v1=terminal_safe(message)))
     invocation = action.get("trigger_invocation")
     if isinstance(invocation, dict):
         print(
-            "触发阻塞的 Agent: "
-            f"{terminal_safe(_human_agent_role(invocation['role']))}；"
-            f"模型 {terminal_safe(invocation['model'])}；"
-            f"推理强度 {terminal_safe(invocation['reasoning_effort'])}；"
-            f"本轮时长: {terminal_safe(invocation['duration_seconds'])} 秒"
+            display_text('presentation.status.agent_that_triggered_the_blocker_v1_model_v3_reasoning_effort_v5_', v1=terminal_safe(_human_agent_role(invocation['role'])), v3=terminal_safe(invocation['model']), v5=terminal_safe(invocation['reasoning_effort']), v7=terminal_safe(invocation['duration_seconds']))
         )
     print(
-        f"已保留成果: {terminal_safe(human_preserved_results(action['preserved']))}"
+        display_text('presentation.status.preserved_work_v1', v1=terminal_safe(human_preserved_results(action['preserved'])))
     )
-    print("整项任务已暂停，其他子任务也不会继续。")
+    print(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue'))
     if action["type"] == "Review Budget Checkpoint":
-        print("继续执行后，将按配置补充本次开发与验收额度，继续已有工作。")
+        print(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t'))
     print(
-        "下一步: "
-        f"{terminal_safe(human_next_action(action['next_action'], run_id=run_id))}"
+        display_text('presentation.status.next_step_v1_36', v1=terminal_safe(human_next_action(action['next_action'], run_id=run_id)))
     )
 
 
 def human_action_type(value: object) -> str:
     raw = str(value)
     localized = {
-        "Human Blocker": "需要人工处理",
-        "Review Budget Checkpoint": "本次开发或验收额度已用尽",
-        "Execution Failure": "执行失败",
-        "Deterministic Contradiction": "交付记录与实际结果不一致",
-        "Supervision Timeout Pause": "自动等待已超时",
-        "Operator Stopped": "已手动停止",
-        "Requeue Required": "需要按更新后的需求重新开始",
-        "Final Approval": "等待最终批准",
-        "Publication Retry Exhausted": "发布重试已耗尽",
-        "Abandonment Recovery": "正在完成放弃操作",
+        "Human Blocker": display_text('presentation.status.human_action_required'),
+        "Review Budget Checkpoint": display_text('presentation.status.development_or_review_allowance_exhausted'),
+        "Execution Failure": display_text('presentation.status.execution_failed'),
+        "Deterministic Contradiction": display_text('presentation.status.delivery_records_conflict_with_actual_results'),
+        "Supervision Timeout Pause": display_text('presentation.status.automatic_waiting_timed_out'),
+        "Operator Stopped": display_text('presentation.status.stopped_by_operator'),
+        "Requeue Required": display_text('presentation.status.restart_required_with_updated_requirements'),
+        "Final Approval": display_text('presentation.status.awaiting_final_approval'),
+        "Publication Retry Exhausted": display_text('presentation.status.publication_retries_exhausted'),
+        "Abandonment Recovery": display_text('presentation.status.completing_abandonment'),
     }.get(raw)
-    return localized or "需要人工处理"
+    return localized or display_text('presentation.status.human_action_required')
 
 
 def _human_agent_role(value: object) -> str:
@@ -144,14 +141,14 @@ def _human_agent_role(value: object) -> str:
 
 
 def human_preserved_results(value: object) -> str:
-    if not isinstance(value, str):
-        return "当前状态与已有审计证据"
+    if not isinstance(value, str) or value == "当前状态与已有审计证据":
+        return display_text('presentation.status.current_state_and_existing_audit_evidence')
     parts: list[str] = []
     for item in value.split("；"):
         if item.startswith("Candidate "):
-            parts.append("当前代码版本已保存")
+            parts.append(display_text('presentation.status.current_candidate_saved'))
         elif item.startswith("Managed Checkout "):
-            parts.append("开发工作区已保留")
+            parts.append(display_text('presentation.status.development_workspace_preserved'))
         else:
             parts.append(item)
     return "；".join(parts)
@@ -264,8 +261,8 @@ def _triggering_invocation(
         )
         return {
             "role": role or "unknown",
-            "model": invocation.get("model") or "未绑定",
-            "reasoning_effort": invocation.get("reasoning_effort") or "未绑定",
+            "model": invocation.get("model") or display_text("presentation.status.unbound"),
+            "reasoning_effort": invocation.get("reasoning_effort") or display_text("presentation.status.unbound"),
             "duration_seconds": _invocation_duration_seconds(invocation),
         }
     return None

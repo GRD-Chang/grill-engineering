@@ -14,6 +14,7 @@ from agent_run.delivery_status import (
     invocation_execution_seconds,
     invocation_recovery_details,
 )
+from agent_run.messages import display_language, text
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS
 from agent_run.history_publication import group_final_pr_creation
 from agent_run.history_waits import collapse_check_waits
@@ -29,8 +30,12 @@ from agent_run.presentation_helpers import (
 from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
 
 
+def _copy(key: str, **values: object) -> str:
+    return text(key, language=display_language(), **values)
+
+
 HISTORY_DETAIL_LIMIT = 240
-_TRUNCATION_MARKER = "…（已截断；完整内容见 --json）"
+
 
 
 def _history_turning_points(
@@ -345,46 +350,44 @@ def print_history_progress(
     timezone, timezone_label = _local_timezone()
     parent = state.get("parent")
     parent_view = parent if isinstance(parent, dict) else {}
-    print(f"仓库:       {_safe_text(state.get('repository') or '未知')}")
+    print(_copy('presentation.history.repository', v1=_safe_text(state.get('repository') or _copy('presentation.history.unknown'))))
     print(
-        "整体需求:   "
-        f"#{_safe_text(parent_view.get('number', '?'))} "
-        f"{_safe_text(parent_view.get('title') or '未命名整体需求')}"
+        _copy('presentation.history.requirement', v1=_safe_text(parent_view.get('number', '?')), v3=_safe_text(parent_view.get('title') or _copy('presentation.history.untitled_requirement')))
     )
-    print(f"时区:       {timezone_label}")
+    print(_copy('presentation.history.timezone', v1=timezone_label))
     if progress["summary"]["elapsed_seconds"] is not None:
-        print(f"任务历时:   {_duration(progress['summary']['elapsed_seconds'])}")
+        print(_copy('presentation.history.elapsed', v1=_duration(progress['summary']['elapsed_seconds'])))
     executor_control = audit.get("executor_control")
     if (
         isinstance(executor_control, dict)
         and executor_control.get("activity") == "unknown"
     ):
-        print("Agent 活跃状态: 无法确认（运行状态无法确认）")
+        print(_copy('presentation.history.agent_activity_unknown_execution_status_cannot_be_confirmed'))
     if progress["execution_activity"] == "interrupted":
-        print("执行已中断，等待恢复")
+        print(_copy('presentation.history.execution_interrupted_waiting_to_resume'))
     records = history_records(state, audit, progress["events"])
-    print("\n工作时间线")
+    print(_copy('presentation.history.work_timeline'))
     if records:
         for record in records:
             for line in _record_lines(record, timezone=timezone, details=details):
                 print(line)
     else:
-        print("  尚无可确认的 Agent 工作记录")
+        print(_copy('presentation.history.no_confirmed_agent_work_records_yet'))
     cleanup_lines = _cleanup_history_lines(state, details=details)
     if cleanup_lines:
-        print("\n交付清理")
+        print(_copy('presentation.history.delivery_cleanup'))
         for line in cleanup_lines:
             print(line)
 
-    print("\n汇总")
+    print(_copy('presentation.history.summary'))
     rounds = progress["summary"]["rounds"]
     if rounds:
         for key, count in rounds.items():
-            print(f"  {_round_label(key):<22}{count} 轮")
+            print(_copy('presentation.history.rounds', v1=f'{_round_label(key):<22}', v2=count))
     else:
-        print("  尚无 Agent 轮次")
+        print(_copy('presentation.history.no_agent_rounds_yet'))
     if progress["summary"]["elapsed_seconds"] is not None:
-        print(f"  {'任务历时':<22}{_duration(progress['summary']['elapsed_seconds'])}")
+        print(f"  {_copy('presentation.history.elapsed_time'):<22}{_duration(progress['summary']['elapsed_seconds'])}")
     waiting_lines = _current_wait_lines(state, audit)
     if waiting_lines:
         print("\n" + "\n".join(waiting_lines))
@@ -395,7 +398,7 @@ def print_history_progress(
         "capacity_wait",
         "recovery_wait",
     }:
-        print(f"\n下一步: {execution_guidance(state, progress['execution_activity'])}")
+        print(_copy('presentation.history.next_step', v1=execution_guidance(state, progress['execution_activity'])))
         return
     operator_action = audit.get("operator_action")
     if isinstance(operator_action, dict):
@@ -409,8 +412,7 @@ def print_history_progress(
         print_operator_action(bounded_action)
     else:
         print(
-            f"\n下一步: {human_next_action(audit.get('next_action'), run_id=state.get('run_id'))}；"
-            f"{_operator_instruction(state, None)}"
+            _copy('presentation.history.next_step_17', v1=human_next_action(audit.get('next_action'), run_id=state.get('run_id')), v3=_operator_instruction(state, None))
         )
 
 
@@ -439,16 +441,14 @@ def print_rich_history_progress(
     console = Console(highlight=False, soft_wrap=False)
     header = [
         _rich_line(
-            "任务",
-            f"{state.get('repository') or 'unknown'} · "
-            f"#{parent_view.get('number', '?')} "
-            f"{parent_view.get('title') or '未命名整体需求'}",
+            _copy('presentation.history.task'),
+            f"{state.get('repository') or 'unknown'} · #{parent_view.get('number', '?')} {parent_view.get('title') or _copy('presentation.history.untitled_requirement')}",
         ),
-        _rich_line("时区", timezone_label),
+        _rich_line(_copy('presentation.history.timezone_19'), timezone_label),
 
     ]
     if progress["summary"]["elapsed_seconds"] is not None:
-        header.append(_rich_line("任务历时", _duration(progress["summary"]["elapsed_seconds"])))
+        header.append(_rich_line(_copy('presentation.history.elapsed_time'), _duration(progress["summary"]["elapsed_seconds"])))
     if progress.get("execution_activity") in {
         "interrupted",
         "unknown",
@@ -457,27 +457,27 @@ def print_rich_history_progress(
     }:
         header.append(
             _rich_line(
-                "活跃状态",
+                _copy('presentation.history.activity'),
                 _execution_activity_text(str(progress["execution_activity"])),
             )
         )
 
-    body: list[Text] = [*header, Text(""), Text("工作时间线", style="bold")]
+    body: list[Text] = [*header, Text(""), Text(_copy('presentation.history.work_timeline_21'), style="bold")]
     for record in records:
         body.extend(
             Text(line) for line in _record_lines(record, timezone=timezone, details=details)
         )
         body.append(Text(""))
     if not records:
-        body.append(Text("  尚无可确认的 Agent 工作记录"))
+        body.append(Text(_copy('presentation.history.no_confirmed_agent_work_records_yet')))
     cleanup_lines = _cleanup_history_lines(state, details=details)
     if cleanup_lines:
-        body.extend([Text(""), Text("交付清理", style="bold")])
+        body.extend([Text(""), Text(_copy('presentation.history.delivery_cleanup_22'), style="bold")])
         body.extend(Text(line) for line in cleanup_lines)
     action = audit.get("operator_action")
     if isinstance(action, dict):
-        body.extend([Text(""), Text("需要你处理", style="bold yellow")])
-        body.append(Text(f"  类型：{_safe_text(human_action_type(action.get('type')))}"))
+        body.extend([Text(""), Text(_copy('presentation.history.action_required'), style="bold yellow")])
+        body.append(Text(_copy('presentation.history.type', v1=_safe_text(human_action_type(action.get('type'))))))
         reasons = action.get("reasons")
         if isinstance(reasons, list):
             for reason in reasons:
@@ -486,20 +486,20 @@ def print_rich_history_progress(
                 )
                 if not details:
                     value = _truncate_history_detail(value)
-                body.append(Text(f"  原因：{value}"))
+                body.append(Text(_copy('presentation.history.reason', v1=value)))
         preserved = action.get("preserved")
         if preserved is not None:
-            body.append(Text(f"  已保留成果：{_safe_text(human_preserved_results(preserved))}"))
+            body.append(Text(_copy('presentation.history.preserved_results', v1=_safe_text(human_preserved_results(preserved)))))
         phase = action.get("phase")
         if phase is not None:
-            body.append(Text(f"  所在阶段：{_safe_text(human_status_term(phase))}"))
-        body.append(Text("整项任务已暂停，其他子任务也不会继续。"))
+            body.append(Text(_copy('presentation.history.phase', v1=_safe_text(human_status_term(phase)))))
+        body.append(Text(_copy('presentation.history.the_entire_task_is_paused_other_subtasks_will_not_continue')))
     body.extend(
         [
             Text(""),
-            Text("汇总", style="bold"),
+            Text(_copy('presentation.history.summary_29'), style="bold"),
             Text(
-                f"  Agent 轮次：{_round_summary_text(progress['summary']['rounds'])}"
+                _copy('presentation.history.agent_rounds', v1=_round_summary_text(progress['summary']['rounds']))
             ),
 
         ]
@@ -517,7 +517,7 @@ def print_rich_history_progress(
             [
                 Text(""),
                 _rich_line(
-                    "下一步",
+                    _copy('presentation.history.next_step_31'),
                     execution_guidance(
                         state,
                         str(progress["execution_activity"]),
@@ -531,7 +531,7 @@ def print_rich_history_progress(
             [
                 Text(""),
                 _rich_line(
-                    "下一步",
+                    _copy('presentation.history.next_step_31'),
                     human_next_action(next_action, run_id=state.get("run_id")),
                 ),
                 Text(_operator_instruction(state, None)),
@@ -551,7 +551,7 @@ def print_rich_history_progress(
     console.print(
         Panel(
             table,
-            title=Text("agent-run · 工作时间线", style="bold"),
+            title=Text(_copy('presentation.history.agent_run_work_timeline'), style="bold"),
             border_style=border_style,
             expand=True,
         ),
@@ -787,8 +787,8 @@ def _finalize_event_record(state: dict[str, Any], record: dict[str, Any]) -> Non
     )
     event_at = event.get("at") or record.get("event_at")
     record["object"] = _safe_text(record.get("work_subject") or "Delivery Run")
-    record["role_label"] = "生命周期节点"
-    record["role_zh"] = "节点"
+    record["role_label"] = _copy('presentation.history.lifecycle_event')
+    record["role_zh"] = _copy('presentation.history.event')
     record["started_at"] = event.get("wait_started_at", event_at)
     record["ended_at"] = event.get("wait_observed_until", event_at)
     record["activity"] = "not_running"
@@ -950,17 +950,17 @@ def history_record_status_code(record: dict[str, Any]) -> str:
 
 def _history_record_status(record: dict[str, Any]) -> str:
     return {
-        "execution_failed": "执行失败", "review_failed": "验收未通过",
-        "review_passed": "验收通过", "review_blocked": "验收受阻",
-        "running": "进行中", "interrupted": "执行已中断，等待恢复",
-        "unknown": "运行状态无法确认", "pending": "待执行",
-        "candidate": "开发完成，待验收",
-        "publication_artifact": "发布说明已完成",
-        "acceptance_artifact": "验收结果已记录",
-        "currentness_invalidated": "因版本变化失效",
-        "no_code_changes": "开发未产生代码变更",
-        "git_integrity_repair": "已记录 Git 修复边界",
-        "completed": "已完成",
+        "execution_failed": _copy('presentation.history.execution_failed'), "review_failed": _copy('presentation.history.acceptance_failed'),
+        "review_passed": _copy('presentation.history.acceptance_passed'), "review_blocked": _copy('presentation.history.acceptance_blocked'),
+        "running": _copy('presentation.history.in_progress'), "interrupted": _copy('presentation.history.execution_interrupted_waiting_to_resume'),
+        "unknown": _copy('presentation.history.execution_status_unknown'), "pending": _copy('presentation.history.pending'),
+        "candidate": _copy('presentation.history.development_complete_awaiting_acceptance'),
+        "publication_artifact": _copy('presentation.history.publication_narrative_complete'),
+        "acceptance_artifact": _copy('presentation.history.acceptance_result_recorded'),
+        "currentness_invalidated": _copy('presentation.history.invalidated_by_revision_change'),
+        "no_code_changes": _copy('presentation.history.development_produced_no_code_changes'),
+        "git_integrity_repair": _copy('presentation.history.git_repair_boundary_recorded'),
+        "completed": _copy('presentation.history.completed'),
     }[history_record_status_code(record)]
 
 
@@ -1675,50 +1675,45 @@ def _record_lines(
     ended = (
         _format_local_timestamp(ended_value, timezone)
         if ended_value is not None
-        else ("进行中" if record.get("activity") == "running" else "未知时间")
+        else (_copy('presentation.history.in_progress') if record.get("activity") == "running" else _copy('presentation.history.unknown_time'))
     )
     interval = f"{started} → {ended}" if ended_value is not None else started
     if ended_value is None and record.get("activity") == "running":
-        interval += " → 进行中"
+        interval += _copy('presentation.history.in_progress_50')
     ordinal = record.get("ordinal")
-    round_text = f"第 {ordinal} 轮" if isinstance(ordinal, int) else "轮次未记录"
+    round_text = _copy('presentation.history.round', v1=ordinal) if isinstance(ordinal, int) else _copy('presentation.history.round_not_recorded')
     finding_values = record.get("findings")
     findings = finding_values if isinstance(finding_values, list) else []
     title = (
-        f"{_safe_text(human_delivery_object(record.get('object') or 'Delivery Run'))} · "
-        f"{_safe_text(record.get('role_label') or 'Agent')} {round_text} · "
-        f"{_safe_text(record.get('status_text') or '未知')}"
+        f"{_safe_text(human_delivery_object(record.get('object') or 'Delivery Run'))} · {_safe_text(record.get('role_label') or 'Agent')} {round_text} · {_safe_text(record.get('status_text') or _copy('presentation.history.unknown'))}"
     )
     if findings:
-        title += f"（问题 {len(findings)}）"
+        title += _copy('presentation.history.findings', v1=len(findings))
     lines = [f"  {title}"]
     if _parse_optional_timestamp(record.get("started_at")) is not None:
-        lines.append(f"    时间区间：{interval}")
+        lines.append(_copy('presentation.history.time_range', v1=interval))
     if record.get("execution_seconds") is not None:
-        lines.append(f"    本轮执行耗时：{_duration(record['execution_seconds'])}")
+        lines.append(_copy('presentation.history.round_execution_time', v1=_duration(record['execution_seconds'])))
     if record.get("span_seconds") is not None and record.get("span_seconds") != record.get("execution_seconds"):
-        lines.append(f"    本轮历时：{_duration(record['span_seconds'])}")
+        lines.append(_copy('presentation.history.round_elapsed_time', v1=_duration(record['span_seconds'])))
     if details and _role_family(str(record.get("role") or "")) != "publication":
         lines.append(f"    {_budget_line(record)}")
     configurations = record.get("configurations")
     if isinstance(configurations, list) and configurations:
         for index, configuration in enumerate(configurations, start=1):
             lines.append(
-                f"    {'配置 ' + str(index) if len(configurations) > 1 else '配置'}：模型={_safe_text(configuration.get('model') or '未记录')}；"
-                f"推理强度={_safe_text(configuration.get('reasoning_effort') or '未记录')}"
+                _copy('presentation.history.model_reasoning_effort', v1=_copy('presentation.history.configuration') + str(index) if len(configurations) > 1 else _copy('presentation.history.configuration_59'), v3=_safe_text(configuration.get('model') or _copy('presentation.history.not_recorded')), v5=_safe_text(configuration.get('reasoning_effort') or _copy('presentation.history.not_recorded')))
             )
     else:
-        lines.append("    配置：模型=未记录；推理强度=未记录")
+        lines.append(_copy('presentation.history.configuration_model_not_recorded_reasoning_effort_not_recorded'))
     if record.get("resumption_count", 0):
-        lines.append(f"    显式恢复/继续：{record['resumption_count']} 次，已归入本轮")
+        lines.append(_copy('presentation.history.explicit_resumes_continuations_included_in_this_round', v1=record['resumption_count']))
     output_attempts = record.get("output_attempts")
     if isinstance(output_attempts, list) and any(
         isinstance(value, int) and value > 1 for value in output_attempts
     ):
         lines.append(
-            "    输出续接："
-            f"{max(value for value in output_attempts if isinstance(value, int)) - 1} 次，"
-            "仍归入本轮"
+            _copy('presentation.history.output_continuations_included_in_this_round', v1=max((value for value in output_attempts if isinstance(value, int))) - 1)
         )
     recovery_details = record.get("recovery_details")
     if isinstance(recovery_details, list):
@@ -1727,7 +1722,7 @@ def _record_lines(
             for detail in recovery_details
         )
     if findings:
-        lines.append(f"    问题（{len(findings)}）")
+        lines.append(_copy('presentation.history.findings_64', v1=len(findings)))
         lines.extend(
             f"      {_finding_question(finding)}"
             for finding in findings
@@ -1735,12 +1730,12 @@ def _record_lines(
     elif record.get("role") in {"reviewer", "fresh_acceptance"} and record.get(
         "acceptance_artifact"
     ) is None:
-        lines.append("    验收结论：尚无可确认的验收资料")
+        lines.append(_copy('presentation.history.acceptance_outcome_no_confirmed_acceptance_evidence_yet'))
     if details:
         lines.extend(_record_detail_lines(record, timezone=timezone))
     turning_points = record.get("turning_points")
     if isinstance(turning_points, list) and turning_points:
-        lines.append("    关键转折")
+        lines.append(_copy('presentation.history.key_transitions'))
         for point in turning_points:
             if not isinstance(point, dict):
                 continue
@@ -1776,15 +1771,14 @@ def _event_record_lines(
     )
     lines = [
         f"  {_safe_text(human_delivery_object(record.get('object') or 'Delivery Run'))} · {_event_title(point)}",
-        f"    时间：{_format_local_timestamp(point.get('at'), timezone)}",
+        _copy('presentation.history.time', v1=_format_local_timestamp(point.get('at'), timezone)),
     ]
     if point.get("kind") in {"required_checks", "approval", "pr_creation"} and record.get("span_seconds"):
         lines[1] = (
-            f"    时间区间：{_format_local_timestamp(record.get('started_at'), timezone)} → "
-            f"{_format_local_timestamp(record.get('ended_at'), timezone)}"
+            _copy('presentation.history.time_range_68', v1=_format_local_timestamp(record.get('started_at'), timezone), v3=_format_local_timestamp(record.get('ended_at'), timezone))
         )
         if point.get("kind") != "pr_creation":
-            lines.append(f"    记录到的等待时间：{_duration(record['span_seconds'])}")
+            lines.append(_copy('presentation.history.recorded_wait_time', v1=_duration(record['span_seconds'])))
     point_details = point.get("details")
     if isinstance(point_details, list):
         lines.extend(
@@ -1801,28 +1795,28 @@ def _event_record_lines(
 def _event_title(point: dict[str, Any]) -> str:
     kind = point.get("kind")
     if kind == "pr_creation":
-        return f"最终 PR #{point['pr_number']} 已创建"
+        return _copy('presentation.history.final_pr_created', v1=point['pr_number'])
     if kind == "completion":
-        return "交付已放弃" if point.get("status") == "abandoned" else "整体交付完成"
+        return _copy('presentation.history.delivery_abandoned') if point.get("status") == "abandoned" else _copy('presentation.history.delivery_completed')
     if kind == "integration":
         if point.get("status") == "parent_closeout_pending":
-            return "代码已合并，正在关闭整体需求 Issue"
-        return "代码已合并" if point.get("commit_sha") else "合并代码"
+            return _copy('presentation.history.code_merged_closing_the_requirement_issue')
+        return _copy('presentation.history.code_merged') if point.get("commit_sha") else _copy('presentation.history.merge_code')
     if kind == "approval":
-        return "已获人工批准" if point.get("approval_granted_at") else "等待人工批准"
+        return _copy('presentation.history.human_approval_granted') if point.get("approval_granted_at") else _copy('presentation.history.awaiting_human_approval')
     if kind == "required_checks":
         return _turning_point_status(point)
     if kind == "publication":
         return (
-            f"创建／更新 PR #{point['pr_number']}"
-            if point.get("pr_number") is not None else "准备提交代码与创建 PR"
+            _copy('presentation.history.create_update_pr', v1=point['pr_number'])
+            if point.get("pr_number") is not None else _copy('presentation.history.prepare_code_commit_and_pr_creation')
         )
     action = point.get("github_write_action")
     if action in {"ensure_final_run_ref", "create_final_pr", "refresh_final_pr_narrative"}:
         label = {
-            "ensure_final_run_ref": "准备远端分支",
-            "create_final_pr": "创建最终 PR",
-            "refresh_final_pr_narrative": "更新最终 PR 说明",
+            "ensure_final_run_ref": _copy('presentation.history.prepare_remote_branch'),
+            "create_final_pr": _copy('presentation.history.create_final_pr'),
+            "refresh_final_pr_narrative": _copy('presentation.history.update_final_pr_narrative'),
         }[action]
         return f"{label} · {_turning_point_status(point)}"
     return f"{_turning_point_kind(point)} · {_turning_point_status(point)}"
@@ -1830,12 +1824,12 @@ def _event_title(point: dict[str, Any]) -> str:
 
 def _budget_line(record: dict[str, Any]) -> str:
     if _role_family(str(record.get("role") or "")) == "publication":
-        return "执行额度：不适用（编写发布说明）"
+        return _copy('presentation.history.execution_allowance_not_applicable_publication_narrative')
     facts = record.get("budget_facts")
     if not isinstance(facts, dict):
-        return "本轮开始时已用：开发次数未记录；验收次数未记录"
+        return _copy('presentation.history.used_at_round_start_development_count_not_recorded_acceptance_cou')
     window = facts.get("window")
-    window_text = window if isinstance(window, int) else "未记录"
+    window_text = window if isinstance(window, int) else _copy('presentation.history.not_recorded')
     development = _budget_fraction(
         facts.get("development_attempts"), facts.get("development_limit")
     )
@@ -1843,14 +1837,13 @@ def _budget_line(record: dict[str, Any]) -> str:
         facts.get("reviewer_invocations"), facts.get("reviewer_limit")
     )
     return (
-        f"第 {window_text} 次授权额度；本轮开始时已用：开发 {development} 次；"
-        f"验收 {review} 次"
+        _copy('presentation.history.authorization_window_used_at_round_start_development_acceptance', v1=window_text, v3=development, v5=review)
     )
 
 
 def _budget_fraction(used: object, limit: object) -> str:
-    used_text = str(used) if type(used) is int else "未记录"
-    limit_text = str(limit) if type(limit) is int else "未记录"
+    used_text = str(used) if type(used) is int else _copy('presentation.history.not_recorded')
+    limit_text = str(limit) if type(limit) is int else _copy('presentation.history.not_recorded')
     return f"{used_text} / {limit_text}"
 
 
@@ -1902,14 +1895,15 @@ def _append_check_observation_detail(
     observation: object,
     *,
     indent: str,
-    result_label: str = "合并前检查结果",
+    result_label: str | None = None,
 ) -> None:
+    result_label = result_label or _copy('presentation.history.pre_merge_check_result')
     if not isinstance(observation, dict):
         return
     _append_detail_scalar(
         lines,
         indent=indent,
-        label="PR 编号",
+        label=_copy('presentation.history.pr_number'),
         value=observation.get("pr_number"),
     )
     _append_detail_scalar(
@@ -1921,7 +1915,7 @@ def _append_check_observation_detail(
     _append_detail_scalar(
         lines,
         indent=indent,
-        label="检查结果获取时间",
+        label=_copy('presentation.history.check_result_observed_at'),
         value=(
             _format_local_timestamp(observed_at, _local_timezone()[0])
             if (observed_at := _first_detail_value(observation, ("observed_at", "required_checks_observed_at")))
@@ -1942,20 +1936,20 @@ def _append_check_observation_detail(
             continue
         details: list[str] = []
         if isinstance(name, (str, int, float, bool)):
-            details.append(f"名称={_safe_text(name)}")
+            details.append(_copy('presentation.history.name', v1=_safe_text(name)))
         if isinstance(result, (str, int, float, bool)):
-            details.append(f"结果={_safe_text(human_status_term(result))}")
+            details.append(_copy('presentation.history.result', v1=_safe_text(human_status_term(result))))
         for key, label in (
-            ("workflow", "工作流"),
-            ("link", "链接"),
-            ("description", "说明"),
+            ("workflow", _copy('presentation.history.workflow')),
+            ("link", _copy('presentation.history.link')),
+            ("description", _copy('presentation.history.description')),
         ):
             extra = check.get(key)
             if isinstance(extra, (str, int, float, bool)) and (
                 not isinstance(extra, str) or extra.strip()
             ):
                 details.append(f"{label}={_safe_text(extra)}")
-        lines.append(f"{indent}检查项：{'；'.join(details)}")
+        lines.append(_copy('presentation.history.check', v0=indent, v2='；'.join(details)))
 
 
 def _git_integrity_detail_lines(
@@ -1963,24 +1957,24 @@ def _git_integrity_detail_lines(
 ) -> list[str]:
     lines: list[str] = []
     for key, label in (
-        ("status", "结果"),
-        ("reason", "失败原因"),
-        ("expected_head", "期望 HEAD"),
-        ("observed_head", "实际 HEAD"),
-        ("base_sha", "基础 HEAD"),
-        ("previous_candidate_sha", "上一个代码版本"),
-        ("workspace_clean", "工作区清洁"),
-        ("recovery_head", "恢复后 HEAD"),
-        ("recovery_action", "恢复方式"),
-        ("recovery_error", "恢复错误"),
+        ("status", _copy('presentation.history.result_95')),
+        ("reason", _copy('presentation.history.failure_reason')),
+        ("expected_head", _copy('presentation.history.expected_head')),
+        ("observed_head", _copy('presentation.history.observed_head')),
+        ("base_sha", _copy('presentation.history.base_head')),
+        ("previous_candidate_sha", _copy('presentation.history.previous_code_revision')),
+        ("workspace_clean", _copy('presentation.history.workspace_clean')),
+        ("recovery_head", _copy('presentation.history.recovered_head')),
+        ("recovery_action", _copy('presentation.history.recovery_action')),
+        ("recovery_error", _copy('presentation.history.recovery_error')),
     ):
         value = evidence.get(key)
         if key == "status":
             value = human_status_term(value)
         elif key == "workspace_clean" and isinstance(value, bool):
-            value = "是" if value else "否"
+            value = _copy('presentation.history.yes') if value else _copy('presentation.history.no')
         elif key == "recovery_action" and value == "controller_reset_and_clean":
-            value = "恢复已保存版本并清理工作区"
+            value = _copy('presentation.history.restore_saved_revision_and_clean_workspace')
         _append_detail_scalar(lines, indent=indent, label=label, value=value)
     return lines
 
@@ -1999,7 +1993,7 @@ def _supporting_record_detail_lines(
 
     lines: list[str] = []
     mode_text = {
-        "configured": "已配置合并前检查", "not_configured": "未配置合并前检查",
+        "configured": _copy('presentation.history.pre_merge_checks_configured'), "not_configured": _copy('presentation.history.no_pre_merge_checks_configured'),
     }.get(str(_required_checks_mode(value)))
     if kind == "required_checks_evidence":
         if mode_text:
@@ -2010,47 +2004,47 @@ def _supporting_record_detail_lines(
     if kind == "deterministic_integration_record":
         source = value.get("source")
         if source == "accepted":
-            lines.append("      验收通过后合并")
+            lines.append(_copy('presentation.history.merged_after_acceptance_passed'))
         elif source == "fallback":
-            lines.append("      通过兜底校验后合并，未经独立验收通过")
+            lines.append(_copy('presentation.history.merged_after_fallback_checks_without_independent_acceptance_passi'))
         if mode_text:
             lines.append(f"      {mode_text}")
         _append_detail_scalar(
             lines,
             indent="      ",
-            label="合并前检查结果",
+            label=_copy('presentation.history.pre_merge_check_result'),
             value=human_status_term(_first_detail_value(value, ("required_checks", "required_checks_result"))),
         )
         _append_detail_scalar(
-            lines, indent="      ", label="PR 编号", value=value.get("pr_number")
+            lines, indent="      ", label=_copy('presentation.history.pr_number'), value=value.get("pr_number")
         )
         pr = value.get("pr")
         if isinstance(pr, dict):
             _append_detail_scalar(
-                lines, indent="      ", label="PR 状态", value=human_status_term(pr.get("state"))
+                lines, indent="      ", label=_copy('presentation.history.pr_status'), value=human_status_term(pr.get("state"))
             )
         _append_detail_scalar(
             lines,
             indent="      ",
-            label="集成说明",
+            label=_copy('presentation.history.integration_summary'),
             value=value.get("integrated_message"),
         )
         evidence = value.get("required_checks_evidence")
         if isinstance(evidence, dict):
-            lines.append("      合并前检查证据")
+            lines.append(_copy('presentation.history.pre_merge_check_evidence'))
             _append_check_observation_detail(lines, evidence, indent="        ")
         return lines
 
     if kind == "fallback_publication_receipt":
-        lines.append("      验收额度已用尽，按兜底校验发布；不代表独立验收通过")
+        lines.append(_copy('presentation.history.acceptance_allowance_exhausted_published_using_fallback_checks_no'))
         _append_detail_scalar(
-            lines, indent="      ", label="PR 编号", value=value.get("pr_number")
+            lines, indent="      ", label=_copy('presentation.history.pr_number'), value=value.get("pr_number")
         )
         if mode_text:
             lines.append(f"      {mode_text}")
         evidence = value.get("required_checks_evidence")
         if isinstance(evidence, dict):
-            lines.append("      合并前检查证据")
+            lines.append(_copy('presentation.history.pre_merge_check_evidence'))
             _append_check_observation_detail(lines, evidence, indent="        ")
         source = value.get("failure_evidence_source")
         failure_evidence = (
@@ -2062,20 +2056,20 @@ def _supporting_record_detail_lines(
         )
         if isinstance(failure_evidence, dict):
             failure_lines: list[str] = []
-            label = "检查失败依据"
+            label = _copy('presentation.history.check_failure_evidence')
             if source == "git_integrity":
-                label = "Git 完整性失败依据"
+                label = _copy('presentation.history.git_integrity_failure_evidence')
                 failure_lines = _git_integrity_detail_lines(
                     failure_evidence, indent="        "
                 )
             elif source == "acceptance":
-                label = "验收失败依据"
+                label = _copy('presentation.history.acceptance_failure_evidence')
                 checks = failure_evidence.get("checks")
                 if isinstance(checks, dict):
                     for lane, lane_label in (
-                        ("e2e", "功能验证"),
-                        ("standards", "工程审查"),
-                        ("spec", "需求核对"),
+                        ("e2e", _copy('presentation.history.functional_verification')),
+                        ("standards", _copy('presentation.history.engineering_review')),
+                        ("spec", _copy('presentation.history.requirements_verification')),
                     ):
                         check = checks.get(lane)
                         if not isinstance(check, dict):
@@ -2085,7 +2079,7 @@ def _supporting_record_detail_lines(
                             value=human_status_term(check.get("status")),
                         )
                         _append_detail_scalar(
-                            failure_lines, indent="          ", label="证据",
+                            failure_lines, indent="          ", label=_copy('presentation.history.evidence'),
                             value=check.get("evidence"),
                         )
                         findings = check.get("findings")
@@ -2098,7 +2092,7 @@ def _supporting_record_detail_lines(
             else:
                 _append_check_observation_detail(
                     failure_lines, failure_evidence, indent="        ",
-                    result_label="结果",
+                    result_label=_copy('presentation.history.result_95'),
                 )
             if failure_lines:
                 lines.append(f"      {label}")
@@ -2112,34 +2106,34 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
     lines: list[str] = []
     summary = record.get("development_summary")
     if isinstance(summary, str) and summary.strip():
-        lines.extend(["    开发说明", f"      {_safe_text(summary)}"])
+        lines.extend([_copy('presentation.history.development_summary'), f"      {_safe_text(summary)}"])
     elif record.get("role") == "development":
-        lines.append("    开发说明：未记录")
+        lines.append(_copy('presentation.history.development_summary_not_recorded'))
     artifact = record.get("acceptance_artifact")
     if isinstance(artifact, dict):
         checks = artifact.get("checks")
         if not _artifact_is_structured(artifact):
             lines.append(
-                "    验收资料原文："
+                _copy('presentation.history.original_acceptance_evidence')
                 + _safe_text(json.dumps(artifact, ensure_ascii=False, default=str))
             )
         if isinstance(checks, dict):
-            lines.append("    验收证据")
+            lines.append(_copy('presentation.history.acceptance_evidence'))
             for lane, label in (
-                ("e2e", "功能验证"),
-                ("standards", "工程审查"),
-                ("spec", "需求核对"),
+                ("e2e", _copy('presentation.history.functional_verification')),
+                ("standards", _copy('presentation.history.engineering_review')),
+                ("spec", _copy('presentation.history.requirements_verification')),
             ):
                 check = checks.get(lane)
                 if not isinstance(check, dict):
-                    lines.append(f"      {label}：未记录")
+                    lines.append(_copy('presentation.history.not_recorded_127', v1=label))
                     continue
                 lines.append(
-                    f"      {label}：{_safe_text(human_status_term(check.get('status') or '未知'))}"
+                    f"      {label}：{_safe_text(human_status_term(check.get('status') or _copy('presentation.history.unknown')))}"
                 )
                 evidence = check.get("evidence")
                 if isinstance(evidence, str) and evidence.strip():
-                    lines.append(f"        证据：{_safe_text(evidence)}")
+                    lines.append(_copy('presentation.history.evidence_128', v1=_safe_text(evidence)))
                 lane_findings = check.get("findings")
                 if isinstance(lane_findings, list):
                     for finding in lane_findings:
@@ -2147,24 +2141,24 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
                             lines.extend(_full_finding_lines(finding, indent="        "))
     publication = record.get("publication")
     if isinstance(publication, dict):
-        lines.append("    发布说明")
+        lines.append(_copy('presentation.history.publication_narrative'))
         for key, label in (
-            ("commit_message", "提交说明"),
-            ("pr_title", "PR 标题"),
-            ("pr_body_markdown", "PR 正文"),
+            ("commit_message", _copy('presentation.history.commit_message')),
+            ("pr_title", _copy('presentation.history.pr_title')),
+            ("pr_body_markdown", _copy('presentation.history.pr_body')),
         ):
             value = publication.get(key)
             if isinstance(value, str) and value.strip():
                 lines.append(f"      {label}：{_safe_text(value)}")
         for key, label in (
-            ("pr_number", "PR 编号"),
+            ("pr_number", _copy('presentation.history.pr_number')),
         ):
             value = publication.get(key)
             if value is not None:
                 lines.append(f"      {label}：{_safe_text(value)}")
     invocations = record.get("invocations")
     if isinstance(invocations, list) and invocations:
-        lines.append("    本轮执行记录")
+        lines.append(_copy('presentation.history.round_execution_records'))
         for index, invocation in enumerate(invocations, start=1):
             if not isinstance(invocation, dict):
                 continue
@@ -2176,7 +2170,7 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
             ended = (
                 _format_local_timestamp(ended_value, timezone)
                 if ended_value is not None
-                else ("进行中" if is_current_running_invocation else "未知时间")
+                else (_copy('presentation.history.in_progress') if is_current_running_invocation else _copy('presentation.history.unknown_time'))
             )
             duration = _invocation_duration(
                 invocation,
@@ -2185,25 +2179,22 @@ def _record_detail_lines(record: dict[str, Any], *, timezone: tzinfo) -> list[st
                 else {},
             )
             lines.append(
-                f"      {index}：{started} → {ended}；"
-                f"状态={_safe_text(human_status_term(invocation.get('status') or '未记录'))}；"
-                f"时长={_duration(duration)}"
+                _copy('presentation.history.status_duration', v1=index, v3=started, v5=ended, v7=_safe_text(human_status_term(invocation.get('status') or _copy('presentation.history.not_recorded'))), v9=_duration(duration))
             )
             lines.append(
-                f"        模型={_safe_text(invocation.get('model') or '未记录')}；"
-                f"推理强度={_safe_text(invocation.get('reasoning_effort') or '未记录')}"
+                _copy('presentation.history.model_reasoning_effort_135', v1=_safe_text(invocation.get('model') or _copy('presentation.history.not_recorded')), v3=_safe_text(invocation.get('reasoning_effort') or _copy('presentation.history.not_recorded')))
             )
             if isinstance(invocation.get("attempt_count"), int) and invocation["attempt_count"] > 1:
-                lines.append(f"        输出续接={_output_continuation_text(invocation['attempt_count'])} 次")
+                lines.append(_copy('presentation.history.output_continuations', v1=_output_continuation_text(invocation['attempt_count'])))
             elif invocation.get("attempt_count") is None:
-                lines.append("        输出续接次数：未记录")
+                lines.append(_copy('presentation.history.output_continuation_count_not_recorded'))
             for key, label in (
-                ("error", "错误"),
-                ("validation_error", "验证错误"),
-                ("interruption_observed_at", "中断观测时间"),
-                ("last_failure_at", "最近失败时间"),
-                ("signal", "信号"),
-                ("return_code", "返回码"),
+                ("error", _copy('presentation.history.error')),
+                ("validation_error", _copy('presentation.history.validation_error')),
+                ("interruption_observed_at", _copy('presentation.history.interruption_observed_at')),
+                ("last_failure_at", _copy('presentation.history.last_failure_at')),
+                ("signal", _copy('presentation.history.signal')),
+                ("return_code", _copy('presentation.history.return_code')),
             ):
                 value = invocation.get(key)
                 if value is not None and (
@@ -2237,35 +2228,34 @@ def _cleanup_history_lines(state: dict[str, Any], *, details: bool) -> list[str]
     last_error = cleanup.get("last_error")
     if status == "completed" and not last_error and not pending_items:
         return []
-    lines = [f"  状态：{_cleanup_status_text(status)}"]
+    lines = [_copy('presentation.history.status', v1=_cleanup_status_text(status))]
     if last_error is not None:
         value = _safe_text(last_error)
         lines.append(
-            f"  最后错误：{value if details else _truncate_history_detail(value)}"
+            _copy('presentation.history.last_error', v1=value if details else _truncate_history_detail(value))
         )
     for item in pending_items:
-        branch = item.get("branch") or "未记录分支"
-        checkout = item.get("checkout") or "未记录工作区"
+        branch = item.get("branch") or _copy('presentation.history.branch_not_recorded')
+        checkout = item.get("checkout") or _copy('presentation.history.workspace_not_recorded')
         lines.append(
-            f"  待清理：分支={_safe_text(branch)}；工作区={_safe_text(checkout)}；"
-            f"状态={_cleanup_status_text(item.get('status'))}"
+            _copy('presentation.history.pending_cleanup_branch_workspace_status', v1=_safe_text(branch), v3=_safe_text(checkout), v5=_cleanup_status_text(item.get('status')))
         )
         if details:
             recovery_kind = item.get("recovery_kind")
             if recovery_kind == "stale_dirty_checkout":
-                lines.append("    保留原因：工作区仍有未提交修改")
+                lines.append(_copy('presentation.history.retained_because_the_workspace_has_uncommitted_changes'))
             item_error = item.get("last_error")
             if item_error is not None:
-                lines.append(f"    项错误：{_safe_text(item_error)}")
+                lines.append(_copy('presentation.history.item_error', v1=_safe_text(item_error)))
     return lines
 
 
 def _cleanup_status_text(value: object) -> str:
     return {
-        "pending": "待处理",
-        "cleanup_pending": "等待清理",
-        "completed": "已完成",
-    }.get(str(value or ""), _safe_text(value or "未记录"))
+        "pending": _copy('presentation.history.pending_151'),
+        "cleanup_pending": _copy('presentation.history.awaiting_cleanup'),
+        "completed": _copy('presentation.history.completed'),
+    }.get(str(value or ""), _safe_text(value or _copy('presentation.history.not_recorded')))
 
 
 def _turning_point_evidence_lines(
@@ -2273,7 +2263,7 @@ def _turning_point_evidence_lines(
 ) -> list[str]:
     lines: list[str] = []
     if point.get("pr_number") is not None and point.get("kind") != "pr_creation":
-        lines.append(f"        PR 编号：{_safe_text(point['pr_number'])}")
+        lines.append(_copy('presentation.history.pr_number_153', v1=_safe_text(point['pr_number'])))
     if (
         point.get("kind") not in {"required_checks", "pr_creation"}
         and point.get("required_checks_signature") is None
@@ -2282,19 +2272,18 @@ def _turning_point_evidence_lines(
         # Older records may only retain this result on the completion event.
         # Without an observation identity, do not assume a separate check
         # record already carries it.
-        lines.append(f"        合并前检查结果：{_safe_text(human_status_term(point['required_checks_result']))}")
+        lines.append(_copy('presentation.history.pre_merge_check_result_154', v1=_safe_text(human_status_term(point['required_checks_result']))))
     observed_at = point.get("required_checks_observed_at")
     if details and point.get("kind") == "required_checks" and observed_at is not None:
         lines.append(
-            "        检查结果获取时间："
-            f"{_format_local_timestamp(observed_at, timezone)}"
+            _copy('presentation.history.check_result_observed_at_155', v1=_format_local_timestamp(observed_at, timezone))
         )
     next_action = point.get("next_action")
     if next_action is not None:
         value = _safe_text(next_action)
         if not details:
             value = _truncate_history_detail(value)
-        lines.append(f"        下一步：{value}")
+        lines.append(_copy('presentation.history.next_step_156', v1=value))
     evidence = point.get("required_checks_evidence")
     if point.get("kind") == "required_checks" and isinstance(evidence, dict) and (
         evidence.get("checks") or evidence.get("omitted_checks")
@@ -2306,12 +2295,12 @@ def _turning_point_evidence_lines(
                 if isinstance(check, dict) and check.get("name")
             )
             if names:
-                lines.append(f"        检查名称：{_safe_text('、'.join(names))}")
+                lines.append(_copy('presentation.history.check_names', v1=_safe_text('、'.join(names))))
         if details:
-            lines.append("        合并前检查证据：")
+            lines.append(_copy('presentation.history.pre_merge_check_evidence_158'))
             _append_check_observation_detail(lines, evidence, indent="          ")
         if details and evidence.get("omitted_checks"):
-            lines.append(f"          另有 {evidence['omitted_checks']} 项未保留明细")
+            lines.append(_copy('presentation.history.details_omitted_for_more_checks', v1=evidence['omitted_checks']))
     reason = point.get("external_wait_reason")
     if (
         isinstance(reason, dict) and reason.get("message")
@@ -2322,7 +2311,7 @@ def _turning_point_evidence_lines(
             }
         )
     ):
-        lines.append(f"        外部情况：{_safe_text(reason['message'])}")
+        lines.append(_copy('presentation.history.external_situation', v1=_safe_text(reason['message'])))
     return lines
 
 
@@ -2349,95 +2338,95 @@ def _artifact_is_structured(artifact: dict[str, Any]) -> bool:
 def _full_finding_lines(finding: str, *, indent: str) -> list[str]:
     match = _FINDING.fullmatch(finding)
     if match is None:
-        return [f"{indent}问题原文：{_safe_text(finding)}"]
+        return [_copy('presentation.history.original_finding', v0=indent, v2=_safe_text(finding))]
     lines = [
         f"{indent}{label}：{_safe_text(value)}"
-        for label, value in zip(("问题", "证据", "必须修复", "复验"), match.groups())
+        for label, value in zip((_copy('presentation.history.finding'), _copy('presentation.history.evidence'), _copy('presentation.history.required_fix'), _copy('presentation.history.reverification')), match.groups())
     ]
     return lines
 
 
 def _finding_question(finding: object) -> str:
     if not isinstance(finding, str):
-        return f"问题原文：{_safe_text(finding)}"
+        return _copy('presentation.history.original_finding_165', v1=_safe_text(finding))
     match = _FINDING.fullmatch(finding)
     return (
-        f"问题：{_safe_text(match.group(1))}"
+        _copy('presentation.history.finding_166', v1=_safe_text(match.group(1)))
         if match is not None
-        else f"问题原文：{_safe_text(finding)}"
+        else _copy('presentation.history.original_finding_165', v1=_safe_text(finding))
     )
 
 
 def _record_action(record: dict[str, Any]) -> str:
     role = _role_family(str(record.get("role") or ""))
     return {
-        "development": "实现任务",
-        "review": "验收代码",
-        "publication": "编写提交与 PR 说明",
-    }.get(role or "", "交付状态变更")
+        "development": _copy('presentation.history.implement_task'),
+        "review": _copy('presentation.history.review_code'),
+        "publication": _copy('presentation.history.write_commit_and_pr_narrative'),
+    }.get(role or "", _copy('presentation.history.delivery_status_changed'))
 
 
 def _turning_point_kind(event: dict[str, Any]) -> str:
     return {
-        "human_blocker": "人工阻塞",
-        "supervision": "确认外部操作结果",
-        "required_checks": "合并前检查",
-        "integration": "集成",
-        "publication": "发布",
-        "approval": "人工批准",
-        "abandonment": "放弃处理",
-        "completion": "整体完成",
-        "resume": "恢复",
-        "unsupported_scope_change": "范围变化",
-    }.get(str(event.get("kind") or ""), "状态变化")
+        "human_blocker": _copy('presentation.history.human_blocker'),
+        "supervision": _copy('presentation.history.confirm_external_operation_outcome'),
+        "required_checks": _copy('presentation.history.pre_merge_checks'),
+        "integration": _copy('presentation.history.integration'),
+        "publication": _copy('presentation.history.publication'),
+        "approval": _copy('presentation.history.human_approval'),
+        "abandonment": _copy('presentation.history.abandonment'),
+        "completion": _copy('presentation.history.delivery_completion'),
+        "resume": _copy('presentation.history.resume'),
+        "unsupported_scope_change": _copy('presentation.history.scope_change'),
+    }.get(str(event.get("kind") or ""), _copy('presentation.history.status_change'))
 
 
 def _turning_point_status(event: dict[str, Any]) -> str:
     if event.get("kind") == "approval":
-        return "已批准" if event.get("approval_granted_at") else "等待人工批准"
+        return _copy('presentation.history.approved') if event.get("approval_granted_at") else _copy('presentation.history.awaiting_human_approval')
     if event.get("kind") == "required_checks":
         if event.get("required_checks_observation_status") in {"unavailable", "unknown"}:
-            return "合并前检查结果无法读取"
+            return _copy('presentation.history.pre_merge_check_results_unavailable')
         return {
-            "pending": "等待合并前检查", "pass": "合并前检查通过",
-            "none": "未配置合并前检查", "fail": "合并前检查失败",
-            "unknown": "合并前检查结果未知",
-        }.get(str(event.get("required_checks_result")), "合并前检查结果未知")
+            "pending": _copy('presentation.history.awaiting_pre_merge_checks'), "pass": _copy('presentation.history.pre_merge_checks_passed'),
+            "none": _copy('presentation.history.no_pre_merge_checks_configured'), "fail": _copy('presentation.history.pre_merge_checks_failed'),
+            "unknown": _copy('presentation.history.pre_merge_check_results_unknown'),
+        }.get(str(event.get("required_checks_result")), _copy('presentation.history.pre_merge_check_results_unknown'))
     if event.get("kind") == "resume":
-        return "人工恢复/继续"
+        return _copy('presentation.history.human_resume_continue')
     if event.get("activity") == "interrupted":
-        return "执行已中断，等待恢复"
+        return _copy('presentation.history.execution_interrupted_waiting_to_resume')
     if event.get("activity") == "unknown":
-        return "运行状态无法确认"
+        return _copy('presentation.history.execution_status_unknown')
     if event.get("activity") == "capacity_wait":
-        return "模型容量不足，等待自动续接"
+        return _copy('presentation.history.model_capacity_unavailable_awaiting_automatic_continuation')
     if event.get("activity") == "recovery_wait":
-        return "执行异常，等待自动续接"
-    return str(human_status_term(event.get("status") or "状态变化"))
+        return _copy('presentation.history.execution_error_awaiting_automatic_continuation')
+    return str(human_status_term(event.get("status") or _copy('presentation.history.status_change')))
 
 
 def _format_local_timestamp(value: object, timezone: tzinfo) -> str:
     timestamp = _parse_optional_timestamp(value)
     if timestamp is None:
-        return "未知时间"
+        return _copy('presentation.history.unknown_time')
     return timestamp.astimezone(timezone).strftime("%Y-%m-%d %H:%M %z")
 
 
 def _execution_activity_text(activity: str) -> str:
     return {
-        "running": "正在执行",
-        "interrupted": "执行已中断，等待恢复",
-        "unknown": "运行状态无法确认",
-        "capacity_wait": "模型容量不足，等待自动续接",
-        "recovery_wait": "执行异常，等待自动续接",
-        "not_running": "未在执行",
-    }.get(activity, "未知")
+        "running": _copy('presentation.history.executing'),
+        "interrupted": _copy('presentation.history.execution_interrupted_waiting_to_resume'),
+        "unknown": _copy('presentation.history.execution_status_unknown'),
+        "capacity_wait": _copy('presentation.history.model_capacity_unavailable_awaiting_automatic_continuation'),
+        "recovery_wait": _copy('presentation.history.execution_error_awaiting_automatic_continuation'),
+        "not_running": _copy('presentation.history.not_executing'),
+    }.get(activity, _copy('presentation.history.unknown'))
 
 
 def _round_summary_text(rounds: object) -> str:
     if not isinstance(rounds, dict) or not rounds:
-        return "尚无 Agent 轮次"
-    return "；".join(f"{_round_label(str(key))} {value} 轮" for key, value in rounds.items())
+        return _copy('presentation.history.no_agent_rounds_yet_193')
+    return "；".join(_copy('presentation.history.rounds_194', v0=_round_label(str(key)), v2=value) for key, value in rounds.items())
 
 
 def _rich_line(label: object, value: object) -> Any:
@@ -2445,7 +2434,7 @@ def _rich_line(label: object, value: object) -> Any:
 
     line = Text()
     line.append(f"{_safe_text(label)}：", style="bold")
-    line.append(_safe_text("未知" if value is None else value))
+    line.append(_safe_text(_copy('presentation.history.unknown') if value is None else value))
     return line
 
 
@@ -2749,8 +2738,8 @@ def _scope_change_details(event: dict[str, Any], *, human: bool = False) -> list
     if isinstance(headline, str):
         details.append(headline)
     for key, label in (
-        ("added_tickets", "新增子任务" if human else "新增 Ticket"),
-        ("removed_tickets", "移除子任务" if human else "移除 Ticket"),
+        ("added_tickets", _copy('presentation.history.added_subtasks') if human else "新增 Ticket"),
+        ("removed_tickets", _copy('presentation.history.removed_subtasks') if human else "移除 Ticket"),
     ):
         values = summary.get(key)
         if isinstance(values, list) and values:
@@ -2781,9 +2770,9 @@ def _role_label(role: str) -> str:
     if family is None:
         return role
     return {
-        "development": "开发 Agent",
-        "review": "验收 Agent",
-        "publication": "发布 Agent",
+        "development": _copy('presentation.history.development_agent'),
+        "review": _copy('presentation.history.acceptance_agent'),
+        "publication": _copy('presentation.history.publication_agent'),
     }[family]
 
 
@@ -2802,9 +2791,9 @@ def _machine_role_label(role: str) -> str:
 
 def _role_zh_label(role: str) -> str:
     return {
-        "development": "开发",
-        "review": "验收",
-        "publication": "发布",
+        "development": _copy('presentation.history.development'),
+        "review": _copy('presentation.history.acceptance'),
+        "publication": _copy('presentation.history.publication'),
     }.get(_role_family(role) or "", "Agent")
 
 
@@ -2828,17 +2817,17 @@ def _artifact_outcome(artifact: dict[str, Any]) -> str:
 
 def _supporting_label(kind: str) -> str:
     return {
-        "required_checks_evidence": "合并前检查证据",
-        "deterministic_integration_record": "PR 合并记录",
-        "fallback_publication_receipt": "兜底发布记录",
+        "required_checks_evidence": _copy('presentation.history.pre_merge_check_evidence_202'),
+        "deterministic_integration_record": _copy('presentation.history.pr_merge_record'),
+        "fallback_publication_receipt": _copy('presentation.history.fallback_publication_record'),
     }.get(kind, kind)
 
 
 def _round_label(key: str) -> str:
     scope, _, role = key.partition("_")
-    subject = {"ticket": "子任务", "parent": "整体任务", "run": "整体"}.get(scope, "任务")
-    action = {"development": "开发", "review": "验收", "publication": "发布说明"}.get(role, "执行")
-    return f"{subject}{action}"
+    subject = {"ticket": _copy('presentation.history.subtask'), "parent": _copy('presentation.history.overall_task'), "run": _copy('presentation.history.overall')}.get(scope, _copy('presentation.history.task'))
+    action = {"development": _copy('presentation.history.development'), "review": _copy('presentation.history.acceptance'), "publication": _copy('presentation.history.publication_narrative_208')}.get(role, _copy('presentation.history.execution'))
+    return _copy("presentation.history.round_summary_label", subject=subject, action=action)
 
 
 def _invocation_attempt_view(invocation: dict[str, Any]) -> dict[str, Any]:
@@ -2958,14 +2947,15 @@ def _duration(seconds: object) -> str:
 def _output_continuation_text(value: object) -> str:
     if type(value) is int and value >= 1:
         return str(value - 1)
-    return "未记录"
+    return _copy('presentation.history.not_recorded')
 
 
 def _truncate_history_detail(value: str) -> str:
     if len(value) <= HISTORY_DETAIL_LIMIT:
         return value
-    keep = HISTORY_DETAIL_LIMIT - len(_TRUNCATION_MARKER)
-    return value[:keep] + _TRUNCATION_MARKER
+    marker = _copy('presentation.history.truncated_see_json_for_full_content')
+    keep = HISTORY_DETAIL_LIMIT - len(marker)
+    return value[:keep] + marker
 
 
 def _operator_instruction(
@@ -2975,19 +2965,19 @@ def _operator_instruction(
     if cleanup:
         return cleanup
     if invocation is not None and invocation.get("status") in {"running", "resuming"}:
-        return "你暂时无需操作。"
+        return _copy('presentation.history.no_action_is_needed_for_now')
     if state.get("status") in {"completed", "abandoned"}:
-        return "无需操作。"
-    return "按上述命令继续；不要重复启动同一项任务。"
+        return _copy('presentation.history.no_action_needed')
+    return _copy('presentation.history.continue_with_the_command_above_do_not_start_the_same_task_again')
 
 
 def _current_wait_lines(state: dict[str, Any], audit: dict[str, Any]) -> list[str]:
     waiting = waiting_presentation(state, audit)
     if waiting is None:
         return []
-    lines = [f"当前工作：{_safe_text(waiting.work)}", f"执行情况：{_safe_text(waiting.activity)}"]
+    lines = [_copy('presentation.history.current_work', v1=_safe_text(waiting.work)), _copy('presentation.history.execution_214', v1=_safe_text(waiting.activity))]
     lines.extend(f"{label}：{_safe_text(value)}" for label, value in waiting.details)
-    lines.append(f"下一步：{_safe_text(waiting.guidance)}")
+    lines.append(_copy('presentation.history.next_step_215', v1=_safe_text(waiting.guidance)))
     if waiting.show_command:
-        lines.append(f"命令：{human_next_action(audit.get('next_action'), run_id=state.get('run_id'))}")
+        lines.append(_copy('presentation.history.command', v1=human_next_action(audit.get('next_action'), run_id=state.get('run_id'))))
     return lines

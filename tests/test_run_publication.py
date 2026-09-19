@@ -781,7 +781,7 @@ def test_revise_and_abandon_preserve_audit_but_stop_future_mutation(
         str(state["run_id"]),
     )
     assert removed_command.returncode == 2
-    assert "invalid choice" in removed_command.stderr
+    assert "无效选项 'confirm-structure'" in removed_command.stderr
     assert not Controller(
         FixtureGitHubReader(repo / "github.json"), git, states
     ).record_execution_failure(str(state["run_id"]), "must not overwrite abandonment")

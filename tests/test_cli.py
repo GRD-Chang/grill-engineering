@@ -328,6 +328,7 @@ def test_status_keeps_matching_acceptance_conclusion_after_completion(
         }
     }
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-completed-conclusion",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Completed Parent"},
@@ -676,6 +677,7 @@ def test_status_exposes_current_cycle_rounds_alongside_window_budget(
     git_repo: Path,
 ) -> None:
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Status card"},
@@ -768,6 +770,7 @@ def test_plain_status_places_next_action_before_complete_finding_details(
 ) -> None:
     finding = "问题：缺少修复；证据：feature.txt 只有一行；必须修复：补齐实现；复验：运行 CLI"
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Status card"},
@@ -1691,6 +1694,7 @@ def test_status_distinguishes_semantic_invocation_output_budget_and_publication_
         "semantic_attempt": deepcopy(attempt),
     }
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "status": "execution_failed",
         "active_ticket_job": {
@@ -1771,6 +1775,7 @@ def test_history_deduplicates_attempt_mirrors_and_projects_each_counter(
         "publication_operation_retry": {"attempts": 1, "limit": 3},
     }
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "status": "execution_failed",
         "timeline": [
@@ -1871,6 +1876,7 @@ def test_history_human_output_groups_invocations_and_keeps_resume_as_a_turning_p
         }
     )
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1, "title": "History timeline"},
@@ -2293,6 +2299,7 @@ def test_history_merges_internal_publication_snapshots_and_same_integration(
         },
     ]
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-history-snapshot-merge",
         "repository": "example/project",
         "parent": {"number": 1, "title": "History snapshots"},
@@ -2648,6 +2655,7 @@ def test_history_does_not_accumulate_prior_unclosed_invocation(
         },
     }
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "ticket_jobs": {"3": job},
         "active_ticket_job": deepcopy(job),
@@ -2759,6 +2767,7 @@ def test_history_details_reuses_development_acceptance_and_publication_records(
     publication = attempt("attempt-publication-1", "publication", 1)
     review_finding = "问题：需要补充验证；证据：e2e log；必须修复：增加断言；复验：重跑测试。"
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Details"},
@@ -2900,6 +2909,7 @@ def test_history_default_keeps_the_complete_finding_question(
         "semantic_attempt": deepcopy(attempt),
     }
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-long",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Long finding"},
@@ -3070,6 +3080,7 @@ def test_status_exposes_preserved_dirty_checkout_and_recovery_action(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "status": "completed",
         "diagnostics": [],
@@ -3341,6 +3352,7 @@ def test_status_labels_the_latest_agent_with_its_own_ticket(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1-1234567890abcdef",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Parent spec"},
@@ -3377,6 +3389,7 @@ def test_status_localizes_profiled_review_agent(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Status card"},
@@ -3456,6 +3469,7 @@ def test_history_uses_chinese_role_names_for_all_role_aliases(
             }
         )
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-history-role-labels",
         "repository": "example/project",
         "parent": {"number": 1, "title": "History role labels"},
@@ -3508,6 +3522,7 @@ def test_status_localizes_pending_publication_phase(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Status card"},
@@ -3540,6 +3555,7 @@ def test_status_distinguishes_stale_dirty_checkout_from_resumable_work(
 ) -> None:
     checkout = "/repo/.agent-run/worktrees/run-1/run-repair"
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-1",
         "repository": "example/project",
         "parent": {"number": 1},
@@ -3605,7 +3621,7 @@ def test_removed_stage_commands_are_rejected_by_the_real_cli(command: str) -> No
     )
 
     assert result.returncode == 2
-    assert "invalid choice" in result.stderr
+    assert "无效选项" in result.stderr
 
 
 def test_removed_promotion_command_is_rejected_by_the_public_cli(
@@ -3617,7 +3633,7 @@ def test_removed_promotion_command_is_rejected_by_the_public_cli(
         main(["promotion-handshake", "not-a-sha"])
 
     assert error.value.code == 2
-    assert "invalid choice" in capsys.readouterr().err
+    assert "无效选项" in capsys.readouterr().err
 
 
 def test_source_checkout_cannot_run_production_lifecycle_without_active_runner(
@@ -6353,6 +6369,7 @@ def test_history_supporting_records_are_bound_to_attempt_version(
         },
     ]
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-supporting-records",
         "ticket_jobs": {"3": job},
         "active_ticket_job": deepcopy(job),
@@ -6643,6 +6660,7 @@ def test_plain_status_and_history_strip_terminal_controls_but_keep_text(
         },
     }
     history_state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-history-controls",
         "repository": "example/project",
         "parent": {"number": 1, "title": "安全展示"},
@@ -6723,6 +6741,7 @@ def test_history_details_distinguish_output_continuations_and_missing_counts(
         "review_budget": {"window": 1, "review_artifacts": []},
     }
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-output-counts",
         "repository": "example/project",
         "parent": {"number": 1, "title": "输出计数"},
@@ -6769,6 +6788,7 @@ def test_history_details_omit_empty_validation_errors_but_keep_real_error(
             invocation["return_code"] = 0
         invocations.append(invocation)
     state: dict[str, object] = {
+        "language": "zh",
         "run_id": "run-validation-errors",
         "repository": "example/project",
         "parent": {"number": 1, "title": "Validation errors"},
@@ -6829,7 +6849,7 @@ def test_human_recovery_guidance_translates_copy_without_parsing_it() -> None:
     english = next_action(state)
     assert "Inspect why publication retries failed" in english
     assert "agent-run abandon 42 --repo example/project" in english
-    assert "检查发布重试失败的原因" in str(human_next_action_for_state(state))
+    assert "Inspect why publication retries failed" in str(human_next_action_for_state(state))
     raw_evidence = "外部工具原始证据: user supplied details"
     assert pause_reason(raw_evidence, "en") == raw_evidence
     assert pause_reason("review_budget_exhausted", "en") == (

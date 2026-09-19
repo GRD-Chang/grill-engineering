@@ -6,6 +6,8 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from agent_run.messages import error_message
+
 
 def _directory(
     variable: str, fallback: Path, environment: Mapping[str, str] | None
@@ -14,7 +16,7 @@ def _directory(
     value = selected.get(variable)
     root = Path(value).expanduser() if value else fallback
     if not root.is_absolute():
-        raise ValueError(f"{variable} 必须是绝对路径")
+        raise ValueError(error_message("defaults.absolute_path", variable=variable))
     return Path(os.path.normpath(root))
 
 
