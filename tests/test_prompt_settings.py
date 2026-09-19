@@ -114,3 +114,54 @@ def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypat
         monkeypatch.setattr(prompt_resources, "RESOURCE_ROOT", tmp_path / "missing-builtin")
     assert main(["prompts", "diff", "--json"]) != 0
     assert "Cannot read prompt resource" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_language_methods_are_independent_and_preview_matches(tmp_path: Path, language: str) -> None:
+    from agent_run.cli import main
+
+    assert main(["settings", "configure", "--language", language, "--json"]) == 0
+    other = "en" if language == "zh" else "zh"
+    other_directory = prompt_resources.personal_method_directory(other)
+    other_directory.mkdir(parents=True)
+    other_method = other_directory / "review.md"
+    other_method.write_text("OTHER LANGUAGE CUSTOM METHOD", encoding="utf-8")
+    assert prompt_resources.resolve_resources()["methods/review"] == prompt_resources.builtin_resources(language)["methods/review"]
+    initialized = cli("init", "--json")
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+    assert len(json.loads(initialized.stdout)["created"]) == 5
+    assert other_method.read_text() == "OTHER LANGUAGE CUSTOM METHOD"
+    directory = prompt_resources.personal_method_directory()
+    method = directory / "review.md"
+    method.write_text("SELECTED LANGUAGE CUSTOM METHOD", encoding="utf-8")
+    before = method.stat().st_mtime_ns
+    assert cli("init", "--json").returncode == 0
+    assert method.stat().st_mtime_ns == before
+    diff = cli("diff", "--json")
+    assert diff.returncode == 0
+    assert "+SELECTED LANGUAGE CUSTOM METHOD" in diff.stdout
+    assert "OTHER LANGUAGE CUSTOM METHOD" not in diff.stdout
+    request = {"acceptance_scope": "ticket", "language": language,
+               "task_issue_url": "https://example.invalid/2"}
+    request_file = tmp_path / "request.json"
+    request_file.write_text(json.dumps(request))
+    preview = cli("preview", "--role", "development", "--request", str(request_file), "--json")
+    assert preview.returncode == 0, preview.stdout + preview.stderr
+    assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+
+
+def test_bilingual_resource_manifest_and_format_fields_match() -> None:
+    from string import Formatter
+
+    chinese = prompt_resources.builtin_resources("zh")
+    english = prompt_resources.builtin_resources("en")
+    assert chinese.keys() == english.keys()
+    formatter = Formatter()
+    for key in chinese:
+        assert english[key].strip(), key
+        # Only resources interpolated by assemblers use Python format fields;
+        # JSON examples in output contracts intentionally contain literal braces.
+        if "{}" in chinese[key]:
+            assert [field for _, field, _, _ in formatter.parse(chinese[key])] == [
+                field for _, field, _, _ in formatter.parse(english[key])
+            ], key

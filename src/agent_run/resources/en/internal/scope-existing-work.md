@@ -1,0 +1,1 @@
+The workspace may contain results from earlier tasks. Make only the minimum necessary repairs when those results directly block this task, break the current accumulated integration result, or must be repaired to satisfy the current acceptance criteria.

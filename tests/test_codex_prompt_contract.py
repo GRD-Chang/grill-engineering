@@ -1972,3 +1972,58 @@ def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
     assert "新版内置开发角色" not in old
     assert "新版内置开发角色" in fresh
     assert request["task_issue_url"] in old and request["task_issue_url"] in fresh
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("continuation", [False, True], ids=["fresh", "resume"])
+@pytest.mark.parametrize(
+    ("method", "facts", "role_key", "method_keys"),
+    [
+        ("develop", {}, "development", ("development-common", "development-initial")),
+        (
+            "develop",
+            {"repair_source": "required_checks", "ci_evidence": {"log": "原始 raw failure"}},
+            "repair", ("development-common", "development-repair"),
+        ),
+        ("review", {"acceptance_scope": "ticket"}, "review", ("review",)),
+        ("review", {"acceptance_scope": "run"}, "review", ("review",)),
+        (
+            "review", {"acceptance_scope": "run", "candidate_acceptance": True,
+                       "repair_scope": "run_repair"}, "review", ("review",),
+        ),
+        ("publication", {"acceptance_scope": "ticket", "acceptance_artifact": {}},
+         "publication", ("publication",)),
+        ("publication", {"acceptance_scope": "run", "acceptance_artifact": {}},
+         "publication", ("publication",)),
+        ("run_publication", {"acceptance_artifact": {}}, "publication", ("publication",)),
+    ],
+)
+def test_selected_language_resources_reach_actual_role_calls(
+    tmp_path: Path, monkeypatch: Any, language: str, continuation: bool,
+    method: str, facts: dict[str, Any], role_key: str, method_keys: tuple[str, ...],
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    resources = resolve_resources(language=language)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    request = {**facts, "_prompt_resources": resources,
+               "parent_issue_url": "https://github.com/example/project/issues/1",
+               "task_issue_url": "https://github.com/example/project/issues/2"}
+    if continuation:
+        request.update(thread_id="fixed-thread", _invocation_mode="resume")
+        if method == "review":
+            request["current_review_identity"] = {"reviewed_candidate_sha": "CURRENT_CANDIDATE"}
+    prompt = _capture_public_prompt(
+        tmp_path, monkeypatch, method, request, name="selected-language", worker_calls=calls,
+    )
+
+    assert len(calls) == 1
+    if continuation:
+        assert resources[f"internal/{role_key}-resume"].strip() in prompt
+        assert "resume" in calls[0][0]
+    else:
+        assert resources[f"internal/{role_key}-role"].strip() in prompt
+        for key in method_keys:
+            assert resources[f"methods/{key}"].strip() in prompt
+    if "ci_evidence" in facts:
+        assert "原始 raw failure" in prompt

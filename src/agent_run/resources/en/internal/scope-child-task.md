@@ -1,0 +1,1 @@
+The specific task's title, body and acceptance criteria define this scope. Background explains the overall goal and necessary constraints explicitly referenced by the task; it does not automatically add work from other subtasks.

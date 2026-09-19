@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
-from agent_run.prompt_resources import resolve_resources
+from agent_run.prompt_resources import resolve_resources, selected_language
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.agent_invocation import fail_interrupted_invocation, restore_operator_stop
 from agent_run.change_currentness import (
@@ -110,6 +110,7 @@ class Controller:
         self.profiles = profiles
         self.delivery_policy = delivery_policy or default_delivery_policy()
         self.delivery_policy_provider = delivery_policy_provider
+        self.creation_language: str | None = None
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -1259,9 +1260,11 @@ class Controller:
     ) -> dict[str, Any]:
         now = _now()
         policy = delivery_policy or self.delivery_policy
+        language = selected_language(self.creation_language)
         state: dict[str, Any] = {
             "run_id": run_id,
-            "prompt_resources": resolve_resources(),
+            "language": language,
+            "prompt_resources": resolve_resources(language),
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,

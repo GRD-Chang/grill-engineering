@@ -12,6 +12,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 try:
     from agent_run.process_cleanup import (
         capture_process_scope,

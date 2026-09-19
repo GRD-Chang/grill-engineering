@@ -162,7 +162,7 @@ def test_wrong_repository_cannot_mutate_existing_run_state(
         wrong.resume(str(state["run_id"]))
 
 
-@pytest.mark.parametrize("incompatibility", ["legacy", "missing_prompts", "partial_prompts"])
+@pytest.mark.parametrize("incompatibility", ["legacy", "missing_prompts", "partial_prompts", "missing_language", "invalid_language"])
 def test_legacy_state_fails_closed_before_controller_mutates_it(
     git_repo: Path, incompatibility: str,
 ) -> None:
@@ -178,6 +178,10 @@ def test_legacy_state_fails_closed_before_controller_mutates_it(
         state["schema_version"] = 1
     elif incompatibility == "missing_prompts":
         state.pop("prompt_resources")
+    elif incompatibility == "missing_language":
+        state.pop("language")
+    elif incompatibility == "invalid_language":
+        state["language"] = "fr"
     else:
         state["prompt_resources"].pop("methods/review")
     store.save_run(str(state["run_id"]), state)

@@ -4896,3 +4896,90 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
         "systemd_private": False,
         "user_bus": False,
     }
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("output_repair", [False, True], ids=["valid-first", "format-repair"])
+@pytest.mark.parametrize("method", ["develop", "review", "publication", "run_publication"])
+def test_language_does_not_rewrite_or_retry_valid_agent_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    language: str, output_repair: bool, method: str,
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    # Both opposite-language and mixed-language prose are valid wire content.
+    prose = "Verified without changes." if language == "zh" else "已验证，无需改动。"
+    mixed = "原始 evidence: pytest exited 0，保持原文。"
+    if method == "develop":
+        artifact: dict[str, Any] = {
+            "result_kind": "development", "summary": prose + mixed, "human_blockers": None,
+        }
+        role = "development"
+    elif method == "review":
+        artifact = failed_acceptance_artifact(mixed)
+        artifact["checks"]["e2e"]["findings"] = [prose + mixed]
+        artifact["checks"]["standards"]["evidence"] = prose
+        role = "review"
+    else:
+        artifact = {
+            "result_kind": "publication", "commit_message": prose,
+            "pr_title": mixed, "pr_body_markdown": prose + "\n\n" + mixed,
+            "human_blockers": None,
+        }
+        role = "publication"
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((arguments, str(options["prompt"])))
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(json.dumps(
+            {"invalid": True} if output_repair and len(calls) == 1 else artifact,
+            ensure_ascii=False,
+        ), encoding="utf-8")
+        return subprocess.CompletedProcess(
+            arguments, 0, '{"type":"thread.started","thread_id":"language-test"}\n', "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    resources = resolve_resources(language=language)
+    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
+    result = getattr(backend, method)({
+        "checkout": str(tmp_path), "acceptance_artifact": {}, "_prompt_resources": resources,
+    })
+    assert len(calls) == (2 if output_repair else 1)
+    if method == "develop":
+        assert result.summary == artifact["summary"]
+    elif method == "run_publication":
+        assert result == {**artifact, "_thread_id": "language-test"}
+    else:
+        assert result.artifact == artifact
+    if output_repair:
+        assert "resume" in calls[1][0]
+        for static_part in resources[f"internal/{role}-output-repair"].strip().split("{0}"):
+            assert static_part in calls[1][1]
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_no_run_publication_probe_uses_personal_language(
+    tmp_path: Path, monkeypatch: Any, language: str,
+) -> None:
+    from agent_run.prompt_resources import read_builtin_resource
+    from agent_run.user_defaults import UserDefaultsStore
+
+    UserDefaultsStore().configure(language=language)
+    prompts: list[str] = []
+    wire = {"result_kind": "human_blocker", "commit_message": None,
+            "pr_title": None, "pr_body_markdown": None,
+            "human_blockers": ["原始 mixed language probe result"]}
+
+    def worker(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        prompts.append(options["prompt"])
+        Path(arguments[arguments.index("--output-last-message") + 1]).write_text(json.dumps(wire))
+        return subprocess.CompletedProcess(arguments, 0,
+            '{"type":"thread.started","thread_id":"probe-thread"}\n', "")
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", worker)
+    output, thread = CodexCliBackend(credential_provider=lambda: "isolated-reader").publication_schema_handshake(tmp_path)
+    assert prompts == [read_builtin_resource("internal/publication-handshake", language=language).rstrip("\n")]
+    assert json.loads(output) == wire
+    assert thread == "probe-thread"

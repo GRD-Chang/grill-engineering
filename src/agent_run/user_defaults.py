@@ -22,8 +22,8 @@ from agent_run.delivery_policy import (
     resolve_delivery_policy,
 )
 from agent_run.paths import app_config_root
+from agent_run.messages import DEFAULT_LANGUAGE, text, validate_language
 
-SCOPE_NOTICE = "仅影响之后创建的新 Run，已有 Run 保持原设置"
 _PROFILE_KEYS = frozenset(
     {"preset", "publication_from_development"}
     | {f"{role}_{field}" for role in ("development", "review", "publication")
@@ -96,10 +96,15 @@ def _notifications(raw: object) -> dict[str, Any]:
 def _document(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise UserDefaultsError("用户默认配置必须是对象")
-    unknown = set(raw) - {"policy", "profile", "notifications"}
+    unknown = set(raw) - {"policy", "profile", "notifications", "language"}
     if unknown:
         raise UserDefaultsError(f"未知配置项: {sorted(unknown)}")
     result: dict[str, Any] = {}
+    if "language" in raw:
+        try:
+            result["language"] = validate_language(raw["language"])
+        except ValueError as error:
+            raise UserDefaultsError(str(error)) from error
     if "policy" in raw:
         try:
             result["policy"] = normalize_policy_overrides(raw["policy"])
@@ -149,6 +154,11 @@ class UserDefaultsStore:
     def load(self) -> dict[str, Any]:
         return self._read()[0]
 
+    def language(self, document: dict[str, Any] | None = None) -> str:
+        """Resolve the single personal language setting, never the host locale."""
+        loaded = self.load() if document is None else _document(document)
+        return validate_language(loaded.get("language", DEFAULT_LANGUAGE))
+
     def _describe(self, document: dict[str, Any], source: str) -> dict[str, Any]:
         profile = document.get("profile", {})
         resolved = resolve_profiles(
@@ -182,7 +192,10 @@ class UserDefaultsStore:
             "policy": policy, "policy_sources": policy_sources,
             "profile": resolved, "profile_sources": sources,
             "notifications": notification_snapshot(document.get("notifications")),
-            "scope": "future-runs", "notice": SCOPE_NOTICE,
+            "language": self.language(document),
+            "language_source": source if "language" in document else "builtin",
+            "scope": "future-runs",
+            "notice": text("settings.scope_notice", language=self.language(document)),
         }
 
     def describe(self, document: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -192,9 +205,15 @@ class UserDefaultsStore:
 
     def configure(self, *, policy: Mapping[str, Any] | None = None,
                   profile: Mapping[str, Any] | None = None,
-                  notifications: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                  notifications: Mapping[str, Any] | None = None,
+                  language: str | None = None) -> dict[str, Any]:
         supplied = _document({**({"policy": policy} if policy is not None else {}),
                               **({"profile": profile} if profile is not None else {})})
+        if language is not None:
+            try:
+                supplied["language"] = validate_language(language)
+            except ValueError as error:
+                raise UserDefaultsError(text("settings.invalid_language", language=self.language())) from error
         if notifications is not None:
             supplied["notifications"] = _notifications(notifications)
         if not any(supplied.values()):
@@ -206,6 +225,8 @@ class UserDefaultsStore:
             try:
                 current = self.load()
                 merged = dict(current)
+                if "language" in supplied:
+                    merged["language"] = supplied["language"]
                 if "policy" in supplied:
                     prior = current.get("policy", {})
                     update = supplied["policy"]

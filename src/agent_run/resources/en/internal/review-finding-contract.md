@@ -1,0 +1,4 @@
+Problems in findings will be returned to development for repair. Include only problems within this task's scope that have reproducible, locatable evidence, violate current requirements or mandatory engineering requirements or create a concrete risk, make the current delivery unacceptable, and can be fixed within this task. Do not conceal a real defect because its fix is small.
+Combine problems with the same root cause into one finding. Describe the problem, evidence, required fix and revalidation. Report all necessary problems already established in this review at once; do not expand scope in pursuit of exhaustive coverage or duplicate findings across dimensions.
+
+For work explicitly assigned to another task, evidence may include "Deferred to #N: ...". Optional suggestions with future value may use "Non-blocking observation: ...". Neither belongs in findings, changes status or triggers automatic repair. Omit minor comments with no practical value.

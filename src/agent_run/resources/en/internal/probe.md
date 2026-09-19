@@ -1,0 +1,1 @@
+You are the engineer responsible for checking structured-output compatibility. In the provided empty working directory and under the required output format, return only {"status":"ok"}. Do not call tools, read a project, access the network, modify files or add fields.

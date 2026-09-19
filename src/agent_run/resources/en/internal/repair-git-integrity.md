@@ -1,0 +1,1 @@
+When receiving the working tree, the program found the following integrity problems that can be fixed in this directory. Prepare the file tree according to the evidence, addressing only these problems and their direct impact. Do not change history through commit, reset, rebase, merge or push.

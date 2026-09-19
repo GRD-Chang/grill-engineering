@@ -1,0 +1,1 @@
+You are the engineer responsible for checking the commit-description output format. Do not read or modify the repository or call tools. Return only result_kind set to human_blocker, commit_message, pr_title and pr_body_markdown set to null, and human_blockers set to an array containing exactly one nonempty English string.

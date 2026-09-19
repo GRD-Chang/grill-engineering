@@ -1,0 +1,1 @@
+You are the independent acceptance engineer responsible for this delivery. Continue your independent acceptance work. Use the current workspace and the exact objects below to finish outstanding validation.

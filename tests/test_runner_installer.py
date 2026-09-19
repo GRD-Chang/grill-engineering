@@ -436,7 +436,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
-    probe = source / "src/agent_run/resources/zh/internal/probe.md"
+    probe = source / "src/agent_run/resources/en/internal/probe.md"
     probe.write_text(probe.read_text() + "\n候选包探针独有内容", encoding="utf-8")
     captured_prompt = tmp_path / "probe-prompt"
     executable = fake_bin / "codex"
@@ -445,6 +445,9 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     ), encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir()
+    defaults = home / "config/agent-run/user-defaults.json"
+    defaults.parent.mkdir(parents=True)
+    defaults.write_text('{"language":"en"}', encoding="utf-8")
 
     first = _run(source, home, fake_bin)
     assert first.returncode == 0, first.stderr
@@ -453,7 +456,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     first_manifest = _manifest(first_snapshot)
     first_identity = first_manifest["content_identity"]
     package = runner_installer.find_runtime_package(first_snapshot)
-    default_method = package / "resources/zh/methods/development-common.md"
+    default_method = package / "resources/en/methods/development-common.md"
     old_method = default_method.read_text(encoding="utf-8")
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
     assert int(count.read_text()) == 1
@@ -472,7 +475,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     assert command.returncode == 0
     assert "agent-run" in command.stdout
 
-    (source / "src/agent_run/resources/zh/methods/development-common.md").write_text(
+    (source / "src/agent_run/resources/en/methods/development-common.md").write_text(
         "新版内置方法\n", encoding="utf-8",
     )
     second = _run(source, home, fake_bin)
@@ -1518,8 +1521,10 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert len(packaged_licenses) == 1
     assert packaged_licenses[0].read_bytes() == (PROJECT_ROOT / "LICENSE").read_bytes()
     package = runner_installer.find_runtime_package(_active_snapshot(home))
-    assert len(list((package / "resources/zh/methods").glob("*.md"))) == 5
-    assert (package / "resources/zh/internal/probe.md").is_file()
+    for language in ("zh", "en"):
+        assert len(list((package / f"resources/{language}/methods").glob("*.md"))) == 5
+        assert (package / f"resources/{language}/internal/probe.md").is_file()
+        assert (package / f"resources/{language}/messages.json").is_file()
     request_path = tmp_path / "preview-request.json"
     request_path.write_text('{"acceptance_scope":"parent_only"}', encoding="utf-8")
     source_resources = source / "src/agent_run/resources"
@@ -1532,6 +1537,18 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
         )
         assert preview.returncode == 0, preview.stdout + preview.stderr
         assert "skill:implement" in preview.stdout
+        configured = subprocess.run(
+            [str(stable_entry), "settings", "configure", "--language", "en", "--json"],
+            env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
+        )
+        assert configured.returncode == 0, configured.stdout + configured.stderr
+        english = subprocess.run(
+            [str(stable_entry), "prompts", "preview", "--role", "development", "--request", str(request_path)],
+            env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
+        )
+        assert english.returncode == 0, english.stdout + english.stderr
+        assert "Use English" in english.stdout
+        assert "skill:implement" in english.stdout
     finally:
         hidden_resources.rename(source_resources)
 

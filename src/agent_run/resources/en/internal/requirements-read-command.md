@@ -1,0 +1,1 @@
+Use read-only `gh issue view` from the inherited environment to read the title, body and acceptance criteria for the Issue numbers in the links. Preserve the inherited PATH and authentication environment; do not find another client, reauthenticate or change authentication configuration.

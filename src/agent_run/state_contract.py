@@ -118,9 +118,11 @@ def require_current_run_state(state: dict[str, Any]) -> None:
 
     try:
         validate_resources(state.get("prompt_resources"))
+        if state.get("language") not in ("zh", "en"):
+            raise ValueError("Run language must be zh or en")
     except ValueError as error:
         raise IncompatibleRunStateError(
-            "Run 缺少或包含不兼容的静态 Prompt 资源快照；不能恢复，请创建新 Run"
+            "Run 缺少或包含不兼容的语言或静态 Prompt 资源快照；不能恢复，请创建新 Run"
         ) from error
 
     if "schema_version" in state:

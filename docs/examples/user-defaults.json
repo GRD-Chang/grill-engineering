@@ -1,4 +1,5 @@
 {
+  "language": "zh",
   "policy": {
     "development_thread_policy": "reuse",
     "ticket_review_rounds": 3,

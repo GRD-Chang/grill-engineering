@@ -357,9 +357,9 @@ def test_new_run_freezes_notification_mode(
     assert load_only_run_state(git_repo)["notifications"] == state["notifications"]
 
 
-@pytest.mark.parametrize("ticket", [False, True])
+@pytest.mark.parametrize("ticket,language", [(False, "zh"), (True, "en")])
 def test_cli_restart_passes_frozen_methods_to_real_prompt_boundary(
-    git_repo: Path, tmp_path: Path, ticket: bool,
+    git_repo: Path, tmp_path: Path, ticket: bool, language: str,
 ) -> None:
     """Keep CLI/restart/files real; replace only the existing Worker process seam."""
     import os
@@ -367,13 +367,15 @@ def test_cli_restart_passes_frozen_methods_to_real_prompt_boundary(
     import sys
     from agent_run import prompt_resources
 
+    assert settings("configure", "--language", language)[0] == 0
     methods = prompt_resources.personal_method_directory()
     methods.mkdir(parents=True)
     custom = methods / "development-common.md"
     custom.write_text("创建时个人开发方法", encoding="utf-8")
-    builtin = tmp_path / "builtin"
-    shutil.copytree(prompt_resources.RESOURCE_ROOT, builtin)
-    resume_resource = builtin / "internal/development-resume.md"
+    builtin = tmp_path / "builtin" / "zh"
+    shutil.copytree(prompt_resources.RESOURCE_ROOT.parent, builtin.parent)
+    selected_builtin = builtin.parent / language
+    resume_resource = selected_builtin / "internal/development-resume.md"
     resume_resource.write_text(resume_resource.read_text() + "\n创建时内部续接方法", encoding="utf-8")
     capture = tmp_path / "prompts.jsonl"
     driver = tmp_path / "cli-worker-capture.py"
@@ -417,6 +419,12 @@ raise SystemExit(cli.main(sys.argv[1:]))
     initial = call(git_repo, fixture, "run", "1", "--no-notifications")
     assert "创建时个人开发方法" in initial
     state = load_only_run_state(git_repo)
+    assert state["language"] == language
+    other_language = "en" if language == "zh" else "zh"
+    assert settings("configure", "--language", other_language)[0] == 0
+    other_methods = prompt_resources.personal_method_directory()
+    other_methods.mkdir(parents=True)
+    (other_methods / "development-common.md").write_text("另一语言新任务方法", encoding="utf-8")
     custom.write_text("修改后个人开发方法", encoding="utf-8")
     resume_resource.write_text("修改后内部续接方法", encoding="utf-8")
     resumed = call(git_repo, fixture, "resume", state["run_id"], "--message", "继续核验")
@@ -431,5 +439,62 @@ raise SystemExit(cli.main(sys.argv[1:]))
     subprocess.run(["git", "clone", "--local", str(git_repo), str(second)], check=True, capture_output=True)
     other_fixture = write_fixture(second / "github.json", issues={}, repository="example/second")
     fresh = call(second, other_fixture, "run", "1", "--no-notifications")
-    assert "修改后个人开发方法" in fresh
+    assert "另一语言新任务方法" in fresh
+    assert "修改后个人开发方法" not in fresh
     assert "创建时个人开发方法" not in fresh
+    assert load_only_run_state(second)["language"] == other_language
+    assert load_only_run_state(git_repo)["language"] == language
+
+
+@pytest.mark.parametrize("language,notice,help_text", [
+    ("zh", "仅影响之后创建的新 Run", "设置新 Run 语言"),
+    ("en", "Only affects future Runs", "Language for future Runs"),
+])
+def test_public_language_setting_help_and_validation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    language: str, notice: str, help_text: str,
+) -> None:
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    assert settings("show")[1]["language"] == "zh"
+    code, saved = settings("configure", "--language", language, "--ticket-review-rounds", "7")
+    assert code == 0
+    assert saved["language"] == language
+    assert notice in saved["notice"]
+    assert saved["language_source"] == "user-defaults"
+    assert settings("show")[1]["language"] == language
+    assert UserDefaultsStore().load()["policy"]["ticket_review_rounds"] == 7
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["settings", "configure", "--help"])
+    assert exited.value.code == 0
+    assert help_text in capsys.readouterr().out
+    previous = UserDefaultsStore().path.read_bytes()
+    code, error = settings("configure", "--language", "fr")
+    assert code == 2
+    assert "language" in json.dumps(error, ensure_ascii=False)
+    assert ("must be" if language == "en" else "必须是") in json.dumps(error, ensure_ascii=False)
+    assert UserDefaultsStore().path.read_bytes() == previous
+    settings("configure", "--development-model", "preserved-language")
+    assert settings("show")[1]["language"] == language
+
+
+@pytest.mark.parametrize("value", [None, False, 1, "fr", [], {}])
+def test_language_file_validation_preserves_original(value: object) -> None:
+    store = UserDefaultsStore()
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps({"language": value})
+    store.path.write_text(raw)
+    code, error = settings("show")
+    assert code == 2
+    assert "language" in json.dumps(error)
+    assert store.path.read_text() == raw
+
+
+def test_short_copy_selects_frozen_run_or_personal_language() -> None:
+    from agent_run.messages import selected_language, text
+
+    assert selected_language() == "zh"
+    UserDefaultsStore().configure(language="en")
+    assert selected_language() == "en"
+    assert selected_language({"language": "zh"}) == "zh"
+    assert text("settings.personal_title", language=selected_language()) == "Personal Run defaults"
+    assert text("settings.personal_title", language=selected_language({"language": "zh"})) == "个人运行默认配置"

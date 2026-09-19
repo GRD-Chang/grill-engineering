@@ -44,4 +44,4 @@ code-failure-steps = [
 ]
 
 [tool.setuptools.package-data]
-agent_run = ["resources/**/*.md"]
+agent_run = ["resources/**/*.md", "resources/**/*.json"]

@@ -76,28 +76,31 @@ def test_validation_and_atomic_replace_failure_preserve_file(tmp_path: Path, mon
         raise OSError("replace failed")
     monkeypatch.setattr("agent_run.user_defaults.os.replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
-        store.configure(profile={"preset": "premium"})
+        store.configure(profile={"preset": "premium"}, language="en")
     assert store.path.read_bytes() == before
     assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_concurrent_updates_preserve_both_sections(tmp_path: Path) -> None:
     path = tmp_path / "user-defaults.json"
-    barrier = Barrier(2, timeout=5)
-    def update(policy: bool) -> None:
+    barrier = Barrier(3, timeout=5)
+    def update(section: str) -> None:
         barrier.wait()
         store = UserDefaultsStore(path)
-        if policy:
+        if section == "policy":
             store.configure(policy={"ticket_review_rounds": 9})
-        else:
+        elif section == "profile":
             store.configure(profile={"review_model": "custom-review"})
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(update, policy) for policy in (True, False)]
+        else:
+            store.configure(language="en")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(update, section) for section in ("policy", "profile", "language")]
         for future in futures:
             future.result(timeout=10)
     document = UserDefaultsStore(path).load()
     assert document["policy"]["ticket_review_rounds"] == 9
     assert document["profile"]["review_model"] == "custom-review"
+    assert document["language"] == "en"
 
 
 @pytest.mark.parametrize("existing", [False, True])

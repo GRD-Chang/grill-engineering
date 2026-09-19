@@ -6,10 +6,9 @@ from pathlib import Path
 import stat
 from typing import Any
 
-try:
-    from agent_run.paths import app_config_root
-except ModuleNotFoundError:  # source-tree installer probe
-    from paths import app_config_root  # type: ignore[import-not-found, no-redef]
+from agent_run.messages import validate_language
+
+from agent_run.paths import app_config_root
 
 METHOD_NAMES = (
     "development-common", "development-initial", "development-repair", "review", "publication",
@@ -101,14 +100,25 @@ RESOURCE_KEYS = (
 )
 
 
-def personal_method_directory() -> Path:
-    return app_config_root() / "prompts" / "zh"
+def selected_language(language: str | None = None) -> str:
+    if language is None:
+        from agent_run.user_defaults import UserDefaultsStore
+        language = UserDefaultsStore().language()
+    return validate_language(language)
 
 
-def read_builtin_resource(key: str, package_root: Path | None = None) -> str:
+def personal_method_directory(language: str | None = None) -> Path:
+    return app_config_root() / "prompts" / selected_language(language)
+
+
+def read_builtin_resource(key: str, package_root: Path | None = None, *, language: str | None = None) -> str:
     if key not in RESOURCE_KEYS:
         raise ValueError(f"Unknown prompt resource: {key}")
-    root = RESOURCE_ROOT if package_root is None else package_root / "resources" / "zh"
+    language = selected_language(language)
+    if package_root is None:
+        root = RESOURCE_ROOT if language == "zh" else RESOURCE_ROOT.parent / language
+    else:
+        root = package_root / "resources" / language
     return _read(root / f"{key}.md")
 
 
@@ -126,16 +136,18 @@ def _read(path: Path) -> str:
         raise ValueError(f"Cannot read prompt resource {path}: {error}") from error
 
 
-def builtin_resources() -> dict[str, str]:
-    resources = {key: read_builtin_resource(key) for key in RESOURCE_KEYS}
+def builtin_resources(language: str | None = None) -> dict[str, str]:
+    language = selected_language(language)
+    resources = {key: read_builtin_resource(key, language=language) for key in RESOURCE_KEYS}
     validate_resources(resources)
     return resources
 
 
-def resolve_resources() -> dict[str, str]:
-    resources = builtin_resources()
+def resolve_resources(language: str | None = None) -> dict[str, str]:
+    language = selected_language(language)
+    resources = builtin_resources(language)
     for name in METHOD_NAMES:
-        path = personal_method_directory() / f"{name}.md"
+        path = personal_method_directory(language) / f"{name}.md"
         # lexists semantics: broken symlinks and unreadable entries must fail.
         if path.exists() or path.is_symlink():
             resources[f"methods/{name}"] = _read(path)
@@ -166,7 +178,7 @@ def resource(request: dict[str, Any] | None, key: str) -> str:
             raise ValueError(f"Incompatible prompt resource snapshot: missing {key}")
         value = str(snapshot[key])
         return value.removesuffix("\n") if key.startswith("internal/") else value
-    value = resolve_resources()[key]
+    value = resolve_resources(request.get("language") if request is not None else None)[key]
     return value.removesuffix("\n") if key.startswith("internal/") else value
 
 
@@ -174,4 +186,4 @@ def bind_resources(request: dict[str, Any]) -> dict[str, Any]:
     """Resolve current resources once, without changing the caller's request."""
     if "_prompt_resources" in request:
         return request
-    return {**request, "_prompt_resources": resolve_resources()}
+    return {**request, "_prompt_resources": resolve_resources(request.get("language"))}

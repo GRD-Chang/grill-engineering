@@ -1,0 +1,1 @@
+Completion: implement all acceptance criteria for this task, validate directly affected paths, address known problems within the current scope, and leave a file tree ready for submission. Report only actual development and self-test results; a separate acceptance engineer determines whether the delivery passes review.

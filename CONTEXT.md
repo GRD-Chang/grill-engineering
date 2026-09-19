@@ -6,12 +6,15 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 ## 静态 Prompt 资源与个人方法
 
-新 Delivery Run 在首次持久化前一次读取并固定全部中文方法及内部 Markdown 资源。
-个人方法位于个人配置目录的 `prompts/zh/`，跨项目共用；五份完整文件分别用于开发共用、初次开发、修复、验收和发布。
+新 Delivery Run 在首次持久化前一次读取并固定所选语言及全部方法和内部 Markdown 资源。
+个人配置的 `language` 仅接受 `zh`/`en`，默认中文，不跟随宿主 locale。
+个人方法按语言分别位于个人配置目录的 `prompts/zh/` 与 `prompts/en/`，跨项目共用；五份完整文件分别用于开发共用、初次开发、修复、验收和发布。
 同线程新修复与新线程修复均组合固定的开发共用与修复方法；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
 每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。
 资源固定不改变 Thread Execution Binding、Controller/Worker/Publisher 权限或 Development Brief 的需求读取边界。
-缺少必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用候选安装包的内部资源。
+缺少固定语言或必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用个人语言与候选安装包的内部资源。
+短界面文案通过 `messages.text` 统一选择，`messages.selected_language` 区分个人配置与固定 Run 语言；长指令继续按角色组织为 Markdown。
+本阶段只迁移 Prompt、语言配置与方法管理；其他界面的双语迁移不属于已交付能力。
 初始化、只读差异与真实组装预览见[个人运行配置](docs/user-defaults.md)；升级不覆盖个人方法，定制正文不会自动继承默认更新。
 
 ## Language
@@ -61,7 +64,7 @@ _Avoid_: Ticket Contract、Parent-only Delivery 范围、Run Acceptance 范围
 _Avoid_: 最少代码行、顺手重构、未来扩展点、假想复用、为拆分而拆分
 
 **Prompt 用语约定（Prompt Language Convention）**:
-面向 Codex Worker 的角色、任务、范围与完成条件采用清楚直接的中文工作语言，不预设它理解本项目的领域术语；内部领域定义继续保留，Prompt 用具体责任与动作表达对应含义。必须与程序、JSON、命令或 Skill 精确匹配的名称保留原文。
+面向 Codex Worker 的角色、任务、范围与完成条件采用所选语言的清楚直接工作用语（默认中文，支持英文），不预设它理解本项目的领域术语；内部领域定义继续保留，Prompt 用具体责任与动作表达对应含义。必须与程序、JSON、命令或 Skill 精确匹配的名称保留原文。自然语言输出只由 Prompt 引导，不做语言识别、比例验收、纠正、翻译或额外调用；合法另一语言输出、原始标题、用户反馈及技术证据原样保留。
 _Avoid_: 用 Ticket 或 Review Boundary 等名称代替任务说明、要求 Worker 理解 Delivery Run 的全局流转、翻译机器字段
 
 **验收 Lane 状态（Acceptance Lane Status）**:

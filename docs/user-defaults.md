@@ -1,6 +1,6 @@
 # 个人运行默认配置
 
-`agent-run settings` 统一查看和编辑轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
+`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
 
 运行参数文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
@@ -151,9 +151,9 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 ## 个人 Markdown 方法
 
-`agent-run prompts` 管理当前系统用户跨项目共用的中文方法。个人目录为
-`$XDG_CONFIG_HOME/agent-run/prompts/zh`，未设置 XDG 时为
-`~/.config/agent-run/prompts/zh`；没有项目级覆盖。
+`agent-run prompts` 管理当前系统用户跨项目共用的所选语言方法。个人目录为
+`$XDG_CONFIG_HOME/agent-run/prompts/<language>`，未设置 XDG 时为
+`~/.config/agent-run/prompts/<language>`；没有项目级覆盖。
 
 ```bash
 agent-run prompts init
@@ -191,4 +191,32 @@ agent-run prompts preview --role development --request request.json --continuati
 
 角色可选 `development`、`review`、`publication`、`final-publication`、`output-repair`。输出格式修复需要 `output_name`（`Development result`、`Acceptance Artifact` 或 `Publication Artifact`）和 `contract_error` 字符串，不接受 `--continuation`。请求使用真实角色的字段：`repair_source` 指定修复来源，`acceptance_scope` 区分 `ticket`、`parent_only`、`run`，相关证据字段按实际工作提供；最终发布需要 `acceptance_artifact`。`--continuation` 预览同轮续接；请求中的 `_invocation_mode` 可指定 `resume` 或 `new-thread`，遵循真实组装规则。预览和执行共用资源读取与角色组装，不访问 GitHub、不调用模型，也不推进 Run。
 
-没有资源快照的请求使用当前个人方法与内置资源。请求包含 `_prompt_resources` 时使用该固定资源集合，可从 Run 的 `prompt_resources` 字段取得；动态任务和证据仍由请求提供。新 Run 创建时一次固定所有静态资源，此后个人或内置修改只影响新 Run，原 Run 恢复和阶段切换沿用创建时资源。缺少必需资源的旧 Run 按不兼容状态明确失败，不自动补齐或迁移。不保存逐次完整动态 Prompt 或对话历史。
+没有资源快照的请求按个人语言使用方法与内置资源，也可在预览请求中提供 `language`（`zh` 或 `en`）选择资源；这不是另一项持久配置。请求包含 `_prompt_resources` 时使用该固定资源集合，可从 Run 的 `prompt_resources` 字段取得；动态任务和证据仍由请求提供。新 Run 创建时一次固定语言和所有所选语言的静态资源，此后个人或内置修改只影响新 Run，原 Run 恢复和阶段切换沿用创建时资源。缺少固定语言或必需资源的旧 Run 按不兼容状态明确失败，不自动补齐或迁移。不保存逐次完整动态 Prompt 或对话历史。
+
+
+## 统一语言设置
+
+```bash
+agent-run settings show
+agent-run settings configure --language en
+agent-run prompts init
+agent-run prompts diff
+agent-run settings configure --language zh
+agent-run settings show --run <run-id>
+```
+
+唯一持久语言设置是个人 `user-defaults.json` 顶层 `language`，只接受 `zh` 和 `en`。
+未设置时固定使用中文，不读取宿主 locale。语言配置的帮助、查询、错误与回执支持中英文。
+本阶段已迁移全部 Prompt 和上述配置操作，并建立供终端与飞书复用的短文案入口；
+其余 CLI、Status/History 与飞书界面的完整双语迁移由后续工作完成。
+
+五份方法分别位于 `prompts/zh/` 和 `prompts/en/`。初始化只补所选语言的缺失文件，
+差异查看只比较同语言默认版本；不覆盖另一语言文件，不跨语言回退，也不自动翻译个人内容。
+无 Run 的预览和安装探针使用个人语言。已有 Run 的语言及全部静态 Prompt 在创建时固定，
+切换个人语言或修改正文不会改变恢复、修复、验收、发布和输出格式修复所使用的资源；
+每次调用的任务事实、原始证据与用户回复仍使用最新内容。
+`settings show --run` 显示该 Run 的固定语言；模型与推理强度继续使用独立的 Thread Binding 规则。
+
+摘要、Findings、验收 evidence、提交和 PR 文案只由方法 Prompt 引导语言。
+合法的另一语言或混合语言输出原样接受，不检测语言、不拒收重试、不纠正翻译或增加模型调用。
+原始 Issue 标题、用户反馈、技术证据、机器字段、命令和状态枚举保持原文。

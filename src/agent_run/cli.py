@@ -2014,6 +2014,7 @@ def _run_lifecycle(
                     preset=preset, overrides=overrides, document=document,
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
+                payload["language"] = defaults.language(document)
                 payload["notifications"] = notification_snapshot(
                     document.get("notifications"), disabled=parsed.no_notifications, mode=parsed.notification_mode,
                 )
@@ -2386,6 +2387,7 @@ def _run_lifecycle(
             raise TaskControlError("run Action 缺少配置 payload")
         frozen_policy = parse_policy_snapshot(run_payload.get("policy"))
         controller.delivery_policy_provider = lambda: frozen_policy
+        controller.creation_language = str(run_payload.get("language", "zh"))
         def prepare_creation(state: dict[str, Any]) -> None:
             # Keep the initial configuration beside the creation receipt so a
             # lost Task Control can be reconciled without reading user defaults.
@@ -2534,6 +2536,8 @@ def _run_payload_for_existing_action(
         elif getattr(parsed, "notification_mode", None):
             notifications = notification_snapshot(notifications, mode=parsed.notification_mode)
     notification_payload = {"notifications": dict(notifications)} if isinstance(notifications, Mapping) else {}
+    if "language" in existing_payload:
+        notification_payload["language"] = existing_payload["language"]
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")
     if isinstance(stored_policy, Mapping):
