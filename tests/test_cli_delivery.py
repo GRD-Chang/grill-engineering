@@ -2665,7 +2665,10 @@ def test_completed_parent_closeout_assets_remain_frozen_after_graph_drift(
 def test_parent_only_approve_supervises_unrepairable_required_checks(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={})
+    # Preserve repeated real checks; detailed backoff lives in test_external_supervision.
+    fixture = write_fixture(
+        git_repo / "github.json", issues={}, supervision_clock_multiplier=40,
+    )
     agents = git_repo / "parent-only-agents.json"
     agents.write_text(
         json.dumps(
@@ -2718,6 +2721,7 @@ def test_parent_only_approve_supervises_unrepairable_required_checks(
     assert approval.returncode == 2, approval.stderr
     assert stdout_json(approval)["status"] == "supervision_timeout"
     state = load_only_run_state(git_repo)
+    assert state["supervision_wait"]["retry_count"] >= 2
     job = state["parent_job"]
     assert job["phase"] == "waiting_checks"
     assert job["required_checks_evidence"] == {
