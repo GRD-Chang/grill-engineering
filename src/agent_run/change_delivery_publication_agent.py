@@ -83,6 +83,7 @@ def publication(
             )
         stage.save(state)
         request = stage.adapter.publication_request(state, job, checkout)
+        request["_prompt_resources"] = state["prompt_resources"]
         request["_invocation_event"] = stage._invocation_events(
             state,
             job,

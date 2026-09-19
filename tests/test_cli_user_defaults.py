@@ -80,6 +80,12 @@ def test_public_settings_file_cli_and_new_old_run_execution(
 ) -> None:
     """Two creations are needed to prove defaults affect execution, not just JSON."""
     monkeypatch.chdir(git_repo)
+    from agent_run.prompt_resources import personal_method_directory
+
+    methods = personal_method_directory()
+    methods.mkdir(parents=True)
+    common = methods / "development-common.md"
+    common.write_text("旧任务个人方法 token=literal-example\n", encoding="utf-8")
     store = UserDefaultsStore()
     store.path.parent.mkdir(parents=True, exist_ok=True)
     store.path.write_text(json.dumps({
@@ -100,6 +106,8 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     original = load_only_run_state(git_repo)
     assert original["notifications"]["enabled"] is False
     assert original["creation_configuration"]["notifications"] == original["notifications"]
+    assert original["prompt_resources"]["methods/development-common"] == "旧任务个人方法 token=literal-example\n"
+    common.write_text("新任务个人方法\n", encoding="utf-8")
     run_id = original["run_id"]
     profile = AgentProfileStore(managed_state(git_repo)).load(run_id)
     assert profile is not None
@@ -126,6 +134,8 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     resumed = run_cli(git_repo, fixture, "resume", run_id, "--message", "Access restored", "--agent-fixture", str(agents))
     assert resumed.returncode == 2, resumed.stdout + resumed.stderr
     original_after = load_only_run_state(git_repo)
+    assert original_after["prompt_resources"] == original["prompt_resources"]
+    assert all("prompt_resources" not in item for item in original_after["agent_invocation_history"])
     assert [i["deadline_seconds"] for i in original_after["agent_invocation_history"]] == [660, 660], resumed.stdout + resumed.stderr
     frozen = AgentProfileStore(managed_state(git_repo)).load(run_id)
     assert frozen is not None
@@ -138,6 +148,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     created = run_cli(second_repo, second_fixture, "run", "1", "--agent-fixture", str(agents))
     assert created.returncode == 2, created.stdout + created.stderr
     new_state = load_only_run_state(second_repo)
+    assert new_state["prompt_resources"]["methods/development-common"] == "新任务个人方法\n"
     assert new_state["notifications"]["enabled"] is False
     assert new_state["notifications"]["open_id"] == "ou_new"
     new_profile = AgentProfileStore(managed_state(second_repo)).load(new_state["run_id"])
@@ -201,7 +212,12 @@ def test_settings_human_output_and_complete_example(tmp_path: Path, monkeypatch:
             assert resolved["profile"]["profiles"][role][field] == profile[field]
     guide = example.parent.parent / "user-defaults.md"
     for block in re.findall(r"```json\n(.*?)\n```", guide.read_text(), re.DOTALL):
-        independent = UserDefaultsStore().describe({"profile": json.loads(block)})
+        payload = json.loads(block)
+        if "acceptance_scope" in payload:
+            from agent_run.development_prompts import development_prompt
+            assert payload["task_issue_url"] in development_prompt(payload)
+            continue
+        independent = UserDefaultsStore().describe({"profile": payload})
         assert independent["profile"]["profiles"]["publication"]["reference"] is None
 
 
@@ -339,3 +355,81 @@ def test_new_run_freezes_notification_mode(
     attached = run_cli(git_repo, fixture, "run", "1", "--notification-mode", "detailed")
     assert attached.returncode == 2, attached.stdout + attached.stderr
     assert load_only_run_state(git_repo)["notifications"] == state["notifications"]
+
+
+@pytest.mark.parametrize("ticket", [False, True])
+def test_cli_restart_passes_frozen_methods_to_real_prompt_boundary(
+    git_repo: Path, tmp_path: Path, ticket: bool,
+) -> None:
+    """Keep CLI/restart/files real; replace only the existing Worker process seam."""
+    import os
+    import shutil
+    import sys
+    from agent_run import prompt_resources
+
+    methods = prompt_resources.personal_method_directory()
+    methods.mkdir(parents=True)
+    custom = methods / "development-common.md"
+    custom.write_text("创建时个人开发方法", encoding="utf-8")
+    builtin = tmp_path / "builtin"
+    shutil.copytree(prompt_resources.RESOURCE_ROOT, builtin)
+    resume_resource = builtin / "internal/development-resume.md"
+    resume_resource.write_text(resume_resource.read_text() + "\n创建时内部续接方法", encoding="utf-8")
+    capture = tmp_path / "prompts.jsonl"
+    driver = tmp_path / "cli-worker-capture.py"
+    driver.write_text('''import json, subprocess, sys
+from pathlib import Path
+from agent_run import cli, codex, prompt_resources
+prompt_resources.RESOURCE_ROOT = Path(sys.argv.pop(1))
+capture = Path(sys.argv.pop(1))
+class Backend(codex.CodexCliBackend):
+    def __init__(self, **kwargs):
+        super().__init__(credential_provider=lambda: "isolated-reader", **kwargs)
+def worker(arguments, **options):
+    with capture.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(options["prompt"], ensure_ascii=False) + "\\n")
+    Path(arguments[arguments.index("--output-last-message") + 1]).write_text(json.dumps({
+        "result_kind": "human_blocker", "summary": None,
+        "human_blockers": ["测试边界：等待人工回复"]
+    }), encoding="utf-8")
+    return subprocess.CompletedProcess(arguments, 0,
+        '{"type":"thread.started","thread_id":"isolated-prompt-thread"}\\n', "")
+cli.CodexCliBackend = Backend
+codex.run_worker_process = worker
+raise SystemExit(cli.main(sys.argv[1:]))
+''', encoding="utf-8")
+    fixture = write_fixture(git_repo / "github.json", issues={"2": {
+        "number": 2, "title": "Prompt integration", "body": "Implement this task.",
+        "state": "OPEN", "labels": ["ready-for-agent"], "blocked_by": [],
+    }} if ticket else {})
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+    def call(repo: Path, github: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            [sys.executable, str(driver), str(builtin), str(capture), *arguments,
+             "--github-fixture", str(github), "--json"], cwd=repo, env=environment,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        return json.loads(capture.read_text().splitlines()[-1])
+
+    initial = call(git_repo, fixture, "run", "1", "--no-notifications")
+    assert "创建时个人开发方法" in initial
+    state = load_only_run_state(git_repo)
+    custom.write_text("修改后个人开发方法", encoding="utf-8")
+    resume_resource.write_text("修改后内部续接方法", encoding="utf-8")
+    resumed = call(git_repo, fixture, "resume", state["run_id"], "--message", "继续核验")
+    assert "创建时内部续接方法" in resumed
+    assert "修改后内部续接方法" not in resumed
+    assert "继续核验" in resumed
+    restarted = call(git_repo, fixture, "resume", state["run_id"], "--new-thread", "--message", "重新核验")
+    assert "创建时个人开发方法" in restarted
+    assert "修改后个人开发方法" not in restarted
+    assert "重新核验" in restarted
+    second = tmp_path / "second"
+    subprocess.run(["git", "clone", "--local", str(git_repo), str(second)], check=True, capture_output=True)
+    other_fixture = write_fixture(second / "github.json", issues={}, repository="example/second")
+    fresh = call(second, other_fixture, "run", "1", "--no-notifications")
+    assert "修改后个人开发方法" in fresh
+    assert "创建时个人开发方法" not in fresh

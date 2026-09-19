@@ -14,7 +14,7 @@ from agent_run import cli_presentation, cli_surface
 from agent_run import doctor
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
-from agent_run import settings_cli
+from agent_run import settings_cli, prompt_cli
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_session_interruption
 from agent_run.agent_profiles import (
@@ -167,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar=(
             "{run,resume,requeue,approve,revise,stop,abandon,status,history,"
-            "runs,configure,settings,policy,auth,doctor}"
+            "runs,configure,settings,prompts,policy,auth,doctor}"
         ),
     )
     run = subcommands.add_parser(
@@ -317,6 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
     settings_cli.add_parser(
         subcommands, _add_common_options, _add_policy_options, _add_profile_options
     )
+    prompt_cli.add_parser(subcommands)
     auth = subcommands.add_parser("auth", help="配置 Worker 的 GitHub 只读身份")
     auth_commands = auth.add_subparsers(
         dest="auth_command", required=True, metavar="{status,app}"
@@ -392,6 +393,8 @@ def _main_with_parser_resources(
             return _auth_command(parsed)
         if parsed.command == "doctor":
             return doctor.run(as_json=parsed.as_json)
+        if parsed.command == "prompts":
+            return prompt_cli.execute(parsed)
         if parsed.command == "settings":
             return settings_cli.execute(
                 parsed, policy_overrides=_policy_overrides,

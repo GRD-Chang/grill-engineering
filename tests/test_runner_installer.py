@@ -436,14 +436,25 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
+    probe = source / "src/agent_run/resources/zh/internal/probe.md"
+    probe.write_text(probe.read_text() + "\n候选包探针独有内容", encoding="utf-8")
+    captured_prompt = tmp_path / "probe-prompt"
+    executable = fake_bin / "codex"
+    executable.write_text(executable.read_text().replace(
+        "import time\n", "import time\n" + f"pathlib.Path({str(captured_prompt)!r}).write_text(sys.stdin.read())\n",
+    ), encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir()
 
     first = _run(source, home, fake_bin)
     assert first.returncode == 0, first.stderr
+    assert "候选包探针独有内容" in captured_prompt.read_text()
     first_snapshot = _active_snapshot(home)
     first_manifest = _manifest(first_snapshot)
     first_identity = first_manifest["content_identity"]
+    package = runner_installer.find_runtime_package(first_snapshot)
+    default_method = package / "resources/zh/methods/development-common.md"
+    old_method = default_method.read_text(encoding="utf-8")
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
     assert int(count.read_text()) == 1
     assert (home / ".local" / "bin" / "agent-run").is_symlink()
@@ -461,15 +472,16 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     assert command.returncode == 0
     assert "agent-run" in command.stdout
 
-    (source / "src" / "agent_run" / "__init__.py").write_text(
-        "\"\"\"changed source after install\"\"\"\n__version__ = 'changed'\n",
-        encoding="utf-8",
+    (source / "src/agent_run/resources/zh/methods/development-common.md").write_text(
+        "新版内置方法\n", encoding="utf-8",
     )
     second = _run(source, home, fake_bin)
     assert second.returncode == 0, second.stderr
     assert int(count.read_text()) == 2
     assert _manifest(first_snapshot)["content_identity"] == first_identity
     second_identity = _manifest(_active_snapshot(home))["content_identity"]
+    assert second_identity != first_identity
+    assert default_method.read_text(encoding="utf-8") == old_method
 
     repeat = _run(source, home, fake_bin)
     assert repeat.returncode == 0, repeat.stderr
@@ -547,6 +559,9 @@ def test_probe_timeout_terminates_its_process_group(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    resource_dir = candidate / "resources" / "zh" / "internal"
+    resource_dir.mkdir(parents=True)
+    shutil.copyfile(PROJECT_ROOT / "src/agent_run/resources/zh/internal/probe.md", resource_dir / "probe.md")
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/python3\nimport time\ntime.sleep(10)\n", encoding="utf-8"
@@ -564,6 +579,9 @@ def test_probe_success_terminates_descendants_after_codex_exits(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    resource_dir = candidate / "resources" / "zh" / "internal"
+    resource_dir.mkdir(parents=True)
+    shutil.copyfile(PROJECT_ROOT / "src/agent_run/resources/zh/internal/probe.md", resource_dir / "probe.md")
     child_pid_file = tmp_path / "child.pid"
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
@@ -1499,6 +1517,24 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     packaged_licenses = list(_active_snapshot(home).glob("lib/python*/site-packages/agent_run-*.dist-info/licenses/LICENSE"))
     assert len(packaged_licenses) == 1
     assert packaged_licenses[0].read_bytes() == (PROJECT_ROOT / "LICENSE").read_bytes()
+    package = runner_installer.find_runtime_package(_active_snapshot(home))
+    assert len(list((package / "resources/zh/methods").glob("*.md"))) == 5
+    assert (package / "resources/zh/internal/probe.md").is_file()
+    request_path = tmp_path / "preview-request.json"
+    request_path.write_text('{"acceptance_scope":"parent_only"}', encoding="utf-8")
+    source_resources = source / "src/agent_run/resources"
+    hidden_resources = source / "resources-hidden-for-installed-check"
+    source_resources.rename(hidden_resources)
+    try:
+        preview = subprocess.run(
+            [str(stable_entry), "prompts", "preview", "--role", "development", "--request", str(request_path)],
+            env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
+        )
+        assert preview.returncode == 0, preview.stdout + preview.stderr
+        assert "skill:implement" in preview.stdout
+    finally:
+        hidden_resources.rename(source_resources)
+
     _assert_clean_installer_source(source, isolated_environment)
 
     delivery = tmp_path / "delivery"
@@ -2592,3 +2628,13 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
         path.relative_to(state_root)
         for path in (state_root).rglob("*")
     ) == target_paths_before
+
+
+def test_probe_missing_candidate_resource_fails_before_codex(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    package = candidate / "lib/python3.11/site-packages/agent_run"
+    package.mkdir(parents=True)
+    fake_bin, count, _status = _fake_codex(tmp_path)
+    with pytest.raises(RunnerProbeError, match="Cannot read prompt resource"):
+        RunnerProbeBackend(executable=str(fake_bin / "codex")).check(candidate)
+    assert not count.exists()

@@ -4,6 +4,7 @@ import math
 import re
 from typing import Any
 
+from agent_run.prompt_resources import validate_resources
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     parent_only_budget_policy_for_job,
@@ -114,6 +115,13 @@ _INTEGRATED_REVALIDATION_MERGE_KEYS = frozenset(
 )
 def require_current_run_state(state: dict[str, Any]) -> None:
     """Reject non-canonical persisted Runs before they are read or mutated."""
+
+    try:
+        validate_resources(state.get("prompt_resources"))
+    except ValueError as error:
+        raise IncompatibleRunStateError(
+            "Run 缺少或包含不兼容的静态 Prompt 资源快照；不能恢复，请创建新 Run"
+        ) from error
 
     if "schema_version" in state:
         raise IncompatibleRunStateError(

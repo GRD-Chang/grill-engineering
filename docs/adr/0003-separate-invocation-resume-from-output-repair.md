@@ -37,7 +37,7 @@ branch/PR；它们的边界漂移回到 fresh Run Acceptance。未知外部 PR m
 
 Output Repair 不增加 Development、Reviewer 或 Publication 的领域 attempt。Candidate 与
 仍 current 的 Acceptance 可在 Invocation 失败后保留。`status`/`history` 可展示有界错误与
-Invocation 事实，而无需保存 stdout、Prompt、transcript 或 tool events。
+Invocation 事实，而无需保存 stdout、逐次完整动态 Prompt、transcript 或 tool events。Run 根状态允许一次固定静态方法与内部资源，缺少必需快照的旧状态明确不兼容，不猜测填充。
 
 这个分层使三种动作互不替代：Output Repair 只修复零退出后的格式问题；Resume 继续当前失败或
 Human Blocker Invocation，并在适用的预算耗尽边界依据维护者的显式命令创建新的审计窗口；Requeue 只替换已经 stale 的 Generation。任何一层都不授予 Publisher

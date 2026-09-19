@@ -14,11 +14,17 @@ from agent_run.agents import DevelopmentResult
 from agent_run.review_budget import TICKET_POLICY, new_budget, mark_development, reset_budget
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.semantic_attempt import allocate_semantic_attempt
+from agent_run.prompt_resources import resolve_resources
 
 
 @pytest.mark.parametrize("source", ["acceptance", "required_checks", "git_integrity", "human_revision", "merge_conflict", "final_ci_fix", "new_budget_window"])
 def test_shared_development_allocates_once_and_preserves_pending_work(source: str, tmp_path: Path) -> None:
-    state: dict[str, Any] = {"policy_snapshot": DeliveryPolicy(development_thread_policy="new-per-attempt").snapshot()}
+    frozen_resources = resolve_resources()
+    frozen_resources["methods/development-repair"] = "Run 创建时固定的修复方法"
+    state: dict[str, Any] = {
+        "policy_snapshot": DeliveryPolicy(development_thread_policy="new-per-attempt").snapshot(),
+        "prompt_resources": deepcopy(frozen_resources),
+    }
     used = 4 if source == "final_ci_fix" else 1
     repair_source = {"final_ci_fix": "required_checks", "new_budget_window": "acceptance"}.get(source, source)
     job: dict[str, Any] = {
@@ -37,6 +43,7 @@ def test_shared_development_allocates_once_and_preserves_pending_work(source: st
 
     def worker(request: dict[str, Any]) -> DevelopmentResult:
         requests.append(request)
+        assert request["_prompt_resources"] == frozen_resources
         assert saved[-1]["pending_semantic_attempt"]["status"] == "pending"
         assert (tmp_path / "uncommitted.txt").read_text() == "existing work"
         return DevelopmentResult(thread_id="new", summary="Work retained")

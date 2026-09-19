@@ -19,12 +19,14 @@ try:
         terminate_process_group,
     )
     from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
+    from agent_run.prompt_resources import read_builtin_resource
 except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
     from process_cleanup import (  # type: ignore[import-not-found, no-redef]
         capture_process_scope,
         child_subreaper,
         terminate_process_group,
     )
+    from prompt_resources import read_builtin_resource  # type: ignore[import-not-found, no-redef]
     from runner_runtime import (  # type: ignore[import-not-found, no-redef]
         RuntimeTreeError,
         find_runtime_package,
@@ -66,7 +68,7 @@ class RunnerProbeBackend:
             return self._check(candidate)
 
     def _check(self, candidate: Path) -> dict[str, str]:
-        _require_runtime_package(candidate)
+        package = _require_runtime_package(candidate)
         with tempfile.TemporaryDirectory(prefix="agent-run-probe-") as temporary_name:
             temporary = Path(temporary_name)
             empty_directory = temporary / "empty"
@@ -92,12 +94,10 @@ class RunnerProbeBackend:
                 str(output_path),
                 "-",
             ]
-            prompt = (
-                "你是负责结构化输出兼容性检查的工程师。"
-                "本次只需在提供的空工作目录和输出格式要求下返回 "
-                '{"status":"ok"}。'
-                "不调用工具、不读取项目、不访问网络或修改文件，不增加字段。"
-            )
+            try:
+                prompt = read_builtin_resource("internal/probe", package)
+            except ValueError as error:
+                raise RunnerProbeError(str(error)) from error
             process: subprocess.Popen[str] | None = None
             adopted_baseline = capture_process_scope()
             try:

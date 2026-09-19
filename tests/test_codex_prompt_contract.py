@@ -1889,3 +1889,86 @@ def test_human_blocker_resume_rejects_a_different_reported_thread(
                 "prior_human_blockers": ["Grant Issue read access."],
             }
         )
+
+
+@pytest.mark.parametrize("scope", ["ticket", "parent_only", "run"])
+@pytest.mark.parametrize("source", [None, "acceptance", "git_integrity", "required_checks", "human_revision", "merge_conflict"])
+@pytest.mark.parametrize("thread", [None, "development-thread"])
+def test_custom_methods_reach_actual_development_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
+    source: str | None, thread: str | None,
+) -> None:
+    from agent_run.prompt_resources import personal_method_directory, resolve_resources
+
+    directory = personal_method_directory()
+    directory.mkdir(parents=True)
+    for name, text in (("development-common", "个人共同方法：检查真实边界。"),
+                       ("development-initial", "个人初次方法：实现本次需求。"),
+                       ("development-repair", "个人修复方法：定位根因。")):
+        (directory / f"{name}.md").write_text(text, encoding="utf-8")
+    resources = resolve_resources()
+    request: dict[str, Any] = {
+        "_prompt_resources": resources, "acceptance_scope": scope,
+        "thread_id": thread, "parent_issue_url": "https://github.com/example/project/issues/1",
+        "task_issue_url": "https://github.com/example/project/issues/2",
+    }
+    if source:
+        request["repair_source"] = source
+        field = {"acceptance": "acceptance_artifact", "git_integrity": "git_integrity_evidence",
+                 "required_checks": "ci_evidence", "human_revision": "human_feedback",
+                 "merge_conflict": "merge_conflict_evidence"}[source]
+        request[field] = "当前原始失败证据" if source in {"human_revision", "merge_conflict"} else {"raw": "当前原始失败证据"}
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="custom")
+    assert resources["methods/development-common"] in prompt
+    selected = "methods/development-repair" if source else "methods/development-initial"
+    assert resources[selected] in prompt
+    other = "methods/development-initial" if source else "methods/development-repair"
+    assert resources[other] not in prompt
+    if source:
+        assert "当前原始失败证据" in prompt
+    assert DEVELOPMENT_BLOCKER_SHAPE in prompt
+
+
+@pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("publication", "run"), ("run_publication", "run")])
+def test_custom_review_and_publication_methods_reach_actual_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, scope: str,
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    resources = resolve_resources()
+    resources["methods/review"] = "个人验收方法：核对当前真实对象。"
+    resources["methods/publication"] = "个人发布方法：说明实际用户变化。"
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, method, {
+        "_prompt_resources": resources, "acceptance_scope": scope,
+        "acceptance_artifact": {},
+    }, name="custom")
+    key = "methods/review" if method == "review" else "methods/publication"
+    assert resources[key] in prompt
+
+
+def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+    from agent_run import prompt_resources
+    from agent_run.state import StateStore
+
+    root = tmp_path / "builtin"
+    shutil.copytree(prompt_resources.RESOURCE_ROOT, root)
+    monkeypatch.setattr(prompt_resources, "RESOURCE_ROOT", root)
+    store = StateStore(tmp_path / "state")
+    resources = prompt_resources.resolve_resources()
+    store.save_run("frozen", {"prompt_resources": resources})
+    role = root / "internal/development-role.md"
+    role.write_text("新版内置开发角色", encoding="utf-8")
+    saved = store.load_run("frozen")
+    assert saved is not None
+    request = {"_prompt_resources": saved["prompt_resources"],
+               "task_issue_url": "https://github.com/example/project/issues/999"}
+    old = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="old")
+    fresh = _capture_public_prompt(tmp_path, monkeypatch, "develop", {
+        "task_issue_url": request["task_issue_url"],
+    }, name="new")
+    assert "新版内置开发角色" not in old
+    assert "新版内置开发角色" in fresh
+    assert request["task_issue_url"] in old and request["task_issue_url"] in fresh

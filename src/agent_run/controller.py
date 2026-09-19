@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
+from agent_run.prompt_resources import resolve_resources
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.agent_invocation import fail_interrupted_invocation, restore_operator_stop
 from agent_run.change_currentness import (
@@ -1260,6 +1261,7 @@ class Controller:
         policy = delivery_policy or self.delivery_policy
         state: dict[str, Any] = {
             "run_id": run_id,
+            "prompt_resources": resolve_resources(),
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,

@@ -4,6 +4,16 @@
 
 Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务。
 
+## 静态 Prompt 资源与个人方法
+
+新 Delivery Run 在首次持久化前一次读取并固定全部中文方法及内部 Markdown 资源。
+个人方法位于个人配置目录的 `prompts/zh/`，跨项目共用；五份完整文件分别用于开发共用、初次开发、修复、验收和发布。
+同线程新修复与新线程修复均组合固定的开发共用与修复方法；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
+每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。
+资源固定不改变 Thread Execution Binding、Controller/Worker/Publisher 权限或 Development Brief 的需求读取边界。
+缺少必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用候选安装包的内部资源。
+初始化、只读差异与真实组装预览见[个人运行配置](docs/user-defaults.md)；升级不覆盖个人方法，定制正文不会自动继承默认更新。
+
 ## Language
 
 **Codex Worker（Codex 工作器）**:
@@ -659,7 +669,7 @@ _Avoid_: 每次命令重新读取默认值、普通恢复中途改预算、追�
 Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
 Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output Attempt 前成为 active，
 并绑定 Work Subject、Generation、输入指纹、机械 Currentness Boundary、当前 Semantic Agent Attempt 与实际 Thread Execution Binding；记录只保存输入指纹、有界边界事实、model、reasoning effort 与 Agent Profile Revision，
-不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
+不保存逐次完整动态 Prompt、transcript 或 Acceptance Artifact；Run 根状态只保存一次静态 Prompt 资源。`thread.started` 在进程运行中
 立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
 checkout 只读，使用按角色区分的短格式 Prompt，且不增加领域 Development Attempt、Reviewer Invocation 或 Publication Attempt。一个 Invocation 只有一个覆盖初始 Output Attempt 与其 Output Repair 的按角色总 Deadline；Development 默认五小时，Review 默认两小时，Publication 默认一小时，均可由 Run Policy Snapshot 中的角色覆盖值替代。successor Invocation 获得新的完整角色 Deadline，但仍可属于同一个 Semantic Agent Attempt。进程失败、缺失或
 不匹配的 Thread 结束当前 Invocation；只有符合 Automatic Invocation Recovery 边界的异常才允许自动同 Thread 恢复，普通异常最多一次，准确容量不足可持续恢复，不自动创建替代 Thread。自动或人工同 Thread 续接均按当前角色使用短 Prompt；操作者可用 `--new-thread` 明确以相应角色和任务模式的完整标准 Prompt 新开 Thread。

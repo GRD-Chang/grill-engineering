@@ -438,6 +438,10 @@ def test_run_publication_marks_exhausted_empty_output_as_failed(
 def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    resources = resolve_resources()
+    resources["internal/development-output-repair"] += "\n固定格式修复资源"
     attempts: list[list[str]] = []
     prompts: list[str] = []
 
@@ -468,11 +472,13 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
     result = CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
-        {"checkout": str(tmp_path)}
+        {"checkout": str(tmp_path), "_prompt_resources": resources}
     )
 
     assert result.thread_id == "development-thread"
     assert len(attempts) == 2
+    assert "固定格式修复资源" in prompts[1]
+    assert "固定格式修复资源" not in prompts[0]
     assert "resume" in attempts[1]
     assert "你已完成本次开发或修复" in prompts[1]
     assert "开发结果 JSON" in prompts[1]

@@ -62,6 +62,7 @@ def review(
     try:
         stage.publisher.prepare_validation(checkout, job, validation)
         request = stage.adapter.review_request(state, job, validation)
+        request["_prompt_resources"] = state["prompt_resources"]
         request["review_budget_context"] = reviewer_budget_context(
             job,
             stage.review_budget_policy(),

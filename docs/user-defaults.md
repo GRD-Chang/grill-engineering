@@ -2,7 +2,7 @@
 
 `agent-run settings` 统一查看和编辑轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
 
-唯一文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
+运行参数文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
 
 ```bash
@@ -148,3 +148,47 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 账号凭据由 `auth` 管理，项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录；这些内容均不合并到个人默认文件。
 
 发送、恢复与本地记录的边界见[飞书进度通知](notifications.md)。
+
+## 个人 Markdown 方法
+
+`agent-run prompts` 管理当前系统用户跨项目共用的中文方法。个人目录为
+`$XDG_CONFIG_HOME/agent-run/prompts/zh`，未设置 XDG 时为
+`~/.config/agent-run/prompts/zh`；没有项目级覆盖。
+
+```bash
+agent-run prompts init
+agent-run prompts diff
+agent-run prompts diff --json
+```
+
+初始化一次生成五份完整 Markdown：
+
+| 文件 | 适用工作 |
+| --- | --- |
+| `development-common.md` | 所有开发与修复共用方法 |
+| `development-initial.md` | 初次开发，与共用方法组合 |
+| `development-repair.md` | 各类修复，与共用方法组合 |
+| `review.md` | 子任务、完整需求与整体验收 |
+| `publication.md` | 交付说明与最终发布说明 |
+
+重复初始化只补缺失文件，保留已有正文。可自由编辑标题与排版，程序按文件职责选择方法，不解析 Markdown 标题。缺少个人文件时回退内置默认；存在但无法读取时明确失败。用户方法不改变 Worker 的权限、任务范围和结构化输出接口，内部续接、输出格式修复与探针由程序资源维护。
+
+升级会保留个人文件；**定制副本不会自动继承默认正文更新**。`diff` 只读比较当前内置正文与个人生效正文，不合并、不改写文件。无差异时返回成功，JSON 中每份文件对应空字符串。
+
+### 预览实际 Prompt
+
+准备角色请求 JSON，例如 `request.json`：
+
+```json
+{"acceptance_scope":"ticket","task_issue_url":"https://github.com/OWNER/REPO/issues/2","parent_issue_url":"https://github.com/OWNER/REPO/issues/1"}
+```
+
+```bash
+agent-run prompts preview --role development --request request.json
+agent-run prompts preview --role review --request request.json --json
+agent-run prompts preview --role development --request request.json --continuation
+```
+
+角色可选 `development`、`review`、`publication`、`final-publication`、`output-repair`。输出格式修复需要 `output_name`（`Development result`、`Acceptance Artifact` 或 `Publication Artifact`）和 `contract_error` 字符串，不接受 `--continuation`。请求使用真实角色的字段：`repair_source` 指定修复来源，`acceptance_scope` 区分 `ticket`、`parent_only`、`run`，相关证据字段按实际工作提供；最终发布需要 `acceptance_artifact`。`--continuation` 预览同轮续接；请求中的 `_invocation_mode` 可指定 `resume` 或 `new-thread`，遵循真实组装规则。预览和执行共用资源读取与角色组装，不访问 GitHub、不调用模型，也不推进 Run。
+
+没有资源快照的请求使用当前个人方法与内置资源。请求包含 `_prompt_resources` 时使用该固定资源集合，可从 Run 的 `prompt_resources` 字段取得；动态任务和证据仍由请求提供。新 Run 创建时一次固定所有静态资源，此后个人或内置修改只影响新 Run，原 Run 恢复和阶段切换沿用创建时资源。缺少必需资源的旧 Run 按不兼容状态明确失败，不自动补齐或迁移。不保存逐次完整动态 Prompt 或对话历史。
