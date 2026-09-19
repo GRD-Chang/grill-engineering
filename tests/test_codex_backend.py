@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from test_codex_prompt_contract import _capture_public_prompt
+from support.worker_sigint_probe import cleanup_probe_controller
 from support.worker_process_timing import (
     AdvancingClock,
     run_worker_expecting_early_failure,
@@ -4220,21 +4221,28 @@ def test_sigint_terminates_worker_process_group(
 ) -> None:
     project_root = Path(__file__).parents[1]
     child_path = tmp_path / "child.pid"
-    # Reap the child in its owning shell, including on group termination. A
-    # runner's init/subreaper need not reap orphans before our exit assertion.
+    reaped_path = tmp_path / "child-reaped"
+    group_path = tmp_path / "worker.pgid"
+    # Group cleanup may kill the shell before it can reap its child. Own orphan
+    # reaping in this isolated controller; kill(pid, 0) alone also sees zombies.
     code = f"""
 from pathlib import Path
 from agent_run.worker_sandbox import run_worker_process
-run_worker_process(
-    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; wait"],
-    cwd=Path({str(tmp_path)!r}),
-    prompt="",
-    environment={{"PATH": "/usr/bin:/bin"}},
-    timeout=120,
-)
+from support.worker_sigint_probe import expect_sigint_cleanup
+with expect_sigint_cleanup(Path("child.pid"), Path("child-reaped")):
+    run_worker_process(
+        ["sh", "-c", "sleep 60 & echo $! > child.pid; wait"],
+        cwd=Path({str(tmp_path)!r}),
+        prompt="",
+        environment={{"PATH": "/usr/bin:/bin"}},
+        timeout=120,
+        on_process_started=lambda pid: Path("worker.pgid").write_text(str(pid)),
+    )
 """
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(project_root / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(project_root / "src"), str(project_root / "tests")]
+    )
     controller = subprocess.Popen(
         [sys.executable, "-c", code],
         cwd=tmp_path,
@@ -4244,7 +4252,6 @@ run_worker_process(
         stderr=subprocess.PIPE,
     )
     child_pid: int | None = None
-    child_gone = False
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -4257,38 +4264,20 @@ run_worker_process(
         os.kill(controller.pid, signal.SIGINT)
         controller.wait(timeout=5)
 
-        assert controller.returncode not in {None, 0}
+        stdout, stderr = controller.communicate(timeout=5)
+        assert controller.returncode == 130, (stdout, stderr)
+        assert reaped_path.read_text() == "SIGINT cleanup passed"
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             try:
                 os.kill(child_pid, 0)
             except ProcessLookupError:
-                child_gone = True
                 break
             time.sleep(0.02)
         else:
             pytest.fail("background Worker process survived SIGINT cleanup")
     finally:
-        if controller.poll() is None:
-            controller.send_signal(signal.SIGINT)
-            try:
-                controller.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                controller.kill()
-                controller.wait(timeout=5)
-        if not child_gone and child_pid is None and child_path.exists():
-            recorded_pid = child_path.read_text().strip()
-            if recorded_pid:
-                child_pid = int(recorded_pid)
-        if not child_gone and child_pid is not None:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if controller.stdout is not None:
-            controller.stdout.close()
-        if controller.stderr is not None:
-            controller.stderr.close()
+        cleanup_probe_controller(controller, group_path)
 
 
 @pytest.mark.parametrize(
@@ -4307,6 +4296,8 @@ def test_sigint_cleans_worker_during_thread_startup_and_wait(
     project_root = Path(__file__).parents[1]
     child_path = tmp_path / "child.pid"
     marker_path = tmp_path / "thread-start.marker"
+    reaped_path = tmp_path / "child-reaped"
+    group_path = tmp_path / "worker.pgid"
     target_start = {"before_start": 1, "partial_start": 2}.get(sigint_phase)
     code = f"""
 import os
@@ -4314,6 +4305,7 @@ import signal
 import threading
 from pathlib import Path
 from agent_run.worker_sandbox import run_worker_process
+from support.worker_sigint_probe import expect_sigint_cleanup
 
 phase = {sigint_phase!r}
 marker = Path({str(marker_path)!r})
@@ -4347,17 +4339,21 @@ def interrupt_when_ready(line):
     if line == "ready":
         os.kill(os.getpid(), signal.SIGINT)
 
-run_worker_process(
-    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; echo ready; wait"],
-    cwd=Path({str(tmp_path)!r}),
-    prompt="",
-    environment={{"PATH": "/usr/bin:/bin"}},
-    timeout=120,
-    on_stdout_line=interrupt_when_ready if phase == "normal_wait" else None,
-)
+with expect_sigint_cleanup(Path("child.pid"), Path("child-reaped")):
+    run_worker_process(
+        ["sh", "-c", "sleep 60 & echo $! > child.pid; echo ready; wait"],
+        cwd=Path({str(tmp_path)!r}),
+        prompt="",
+        environment={{"PATH": "/usr/bin:/bin"}},
+        timeout=120,
+        on_process_started=lambda pid: Path("worker.pgid").write_text(str(pid)),
+        on_stdout_line=interrupt_when_ready if phase == "normal_wait" else None,
+    )
 """
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(project_root / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(project_root / "src"), str(project_root / "tests")]
+    )
     controller = subprocess.Popen(
         [sys.executable, "-c", code],
         cwd=tmp_path,
@@ -4367,31 +4363,35 @@ run_worker_process(
     )
     try:
         deadline = time.monotonic() + 5
-        while not child_path.exists() and time.monotonic() < deadline:
+        # Redirection creates the file before echo writes the child PID.
+        # Interrupting that gap prevents both the assertion and orphan reaping.
+        while time.monotonic() < deadline:
+            if child_path.exists() and child_path.read_text().strip():
+                break
             time.sleep(0.02)
-        assert child_path.exists()
+        assert child_path.exists() and child_path.read_text().strip()
         if sigint_phase != "normal_wait":
             while not marker_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert marker_path.exists()
             os.kill(controller.pid, signal.SIGINT)
         controller.wait(timeout=5)
-    finally:
-        if controller.poll() is None:
-            controller.kill()
-            controller.wait(timeout=5)
 
-    assert controller.returncode not in {None, 0}
-    child_pid = int(child_path.read_text(encoding="utf-8").strip())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail(f"background Worker process survived {sigint_phase} cleanup")
+        stdout, stderr = controller.communicate(timeout=5)
+        assert controller.returncode == 130, (stdout, stderr)
+        assert reaped_path.read_text() == "SIGINT cleanup passed"
+        child_pid = int(child_path.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"background Worker process survived {sigint_phase} cleanup")
+    finally:
+        cleanup_probe_controller(controller, group_path)
 
 
 def test_successful_worker_cleans_background_processes(
