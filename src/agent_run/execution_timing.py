@@ -13,6 +13,25 @@ def _time(value: object) -> datetime | None:
         return None
 
 
+def invocation_links_complete(
+    state: dict[str, Any], records: list[dict[str, Any]],
+) -> bool:
+    """Reject totals when Resume proves a retained Attempt lost a segment."""
+    starts = {
+        record.get("attempt_id"): {invocation.get("started_at")
+                                   for invocation in record.get("invocations", [])}
+        for record in records
+    }
+    for resume in (state.get("resume_audit") or {}).get("history", []):
+        identity = resume.get("semantic_attempt_id")
+        if identity not in starts:
+            continue
+        for endpoint in ("source_invocation_started_at", "successor_invocation_started_at"):
+            if resume.get(endpoint) is not None and resume[endpoint] not in starts[identity]:
+                return False
+    return True
+
+
 def execution_totals(
     state: dict[str, Any], records: list[dict[str, Any]], at: object,
     *, work_subject: str | None = None,
@@ -32,6 +51,8 @@ def execution_totals(
     # omission from history projection makes an aggregate incomplete.
     if any(invocation not in known for invocation in raw):
         return facts
+    if not invocation_links_complete(state, rounds):
+        return facts
     complete = rounds and all(
         _time(record.get("ended_at")) is not None
         and type(record.get("execution_seconds")) is int
@@ -42,4 +63,3 @@ def execution_totals(
             return facts
         facts["total_seconds"] = sum(record["execution_seconds"] for record in rounds)
     return facts
-

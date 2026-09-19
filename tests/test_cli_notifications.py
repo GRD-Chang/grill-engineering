@@ -8,6 +8,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -85,6 +86,16 @@ else:
                 "write_files": {"repair.txt": f"round {ordinal}\n"},
             })
         data["publications"].append(deepcopy(data["publications"][0]))
+    elif drain:
+        data["reviews"] = [repair_acceptance("ticket-reviewer-1"),
+                           repair_acceptance("ticket-reviewer-2"),
+                           passing_acceptance("ticket-reviewer-3", "Ticket repairs passed.")]
+        for ordinal in (1, 2):
+            data["developments"].append({
+                "expected_thread_id": "ticket-developer-3", "thread_id": "ticket-developer-3",
+                "summary": f"Ticket repair {ordinal}",
+                "write_files": {"ticket-repair.txt": f"round {ordinal}\n"},
+            })
     agents.write_text(json.dumps(data))
 
     def invoke(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -197,8 +208,10 @@ raise SystemExit(main(sys.argv[1:]))
     assert localized("任务已开始", "Task started") in titles
     if mode == "detailed":
         assert sum(event["kind"] == "ticket_started" for event in events(current)) == 1
-        assert not any(event["kind"] == "stage_start" and event.get("role") == "development"
-                       for event in events(current))
+        development_starts = [event for event in events(current)
+                              if event["kind"] == "stage_start" and event.get("role") == "development"]
+        assert len(development_starts) == (2 if drain else 0)
+        assert all(event["round"] in {2, 3} for event in development_starts)
         assert any(localized("开始开发子任务", "Started developing ticket") in value for value in titles), titles
         assert any(localized("正在验收", "Reviewing") in value for value in titles), titles
         assert any(localized("说明已准备好", "description is ready") in value for value in titles), titles
@@ -257,6 +270,49 @@ raise SystemExit(main(sys.argv[1:]))
         queried = run_cli(git_repo, fixture, command, output["run_id"], "--json")
         assert queried.returncode == 0, queried.stderr
         assert "notifications" in stdout_json(queried)
+        if command == "history" and scope == "ticket" and drain:
+            history = stdout_json(queried)
+            completion = next(event for event in events(current) if event["kind"] == "ticket_completed")
+            actual_card = next(item for item in delivered
+                               if item["header"]["title"]["content"] == completion["title"])
+            assert actual_card == card(completion)
+            rendered = json.dumps(actual_card, ensure_ascii=False)
+            assert current["ticket_jobs"]["3"]["phase"] in {"completed", "merged"}
+            assert ticket()["title"] in rendered
+            assert completion["summary"] in rendered
+            assert completion["query"] in rendered
+            invocations = [item for item in history["agent_invocations"]
+                           if item["work_subject"] == "ticket:3"]
+            expected_rounds = 3 if mode == "detailed" else 1
+            for role, label in (("development", localized("开发投入", "Development effort")),
+                                ("review", localized("验收投入", "Review effort"))):
+                attempts = [item for item in history["semantic_agent_attempts"]
+                            if item["work_subject"] == "ticket:3"
+                            and item["role"] == ("reviewer" if role == "review" else role)]
+                assert len({item["attempt_id"] for item in attempts}) == expected_rounds
+                facts = completion["effort"][role]
+                assert facts["rounds"] == expected_rounds
+                role_invocations = [item for item in invocations
+                                    if item["role"] == ("fresh_acceptance" if role == "review" else role)]
+                seconds = sum(int((datetime.fromisoformat(item["ended_at"])
+                                   - datetime.fromisoformat(item["started_at"])).total_seconds())
+                              for item in role_invocations)
+                assert facts["execution_seconds"] == seconds
+                assert label in rendered
+                assert localized(f"{expected_rounds} 轮", f"{expected_rounds} rounds") in rendered
+                assert len(facts["configurations"]) == 1
+                configuration = facts["configurations"][0]
+                assert configuration["rounds"] == expected_rounds
+                assert configuration["execution_seconds"] == seconds
+                assert {(item["model"], item["reasoning_effort"]) for item in role_invocations} == {
+                    (configuration["model"], configuration["reasoning_effort"])}
+                assert configuration["model"] in rendered
+                assert configuration["reasoning_effort"] in rendered
+            assert any(item["role"] == "publication" for item in invocations)
+            assert completion["total_seconds"] == sum(
+                int((datetime.fromisoformat(item["ended_at"])
+                     - datetime.fromisoformat(item["started_at"])).total_seconds())
+                for item in invocations)
         arguments = ("--plain", "--details") if command == "history" else ("--plain",)
         human = invoke_cli_inprocess(git_repo, fixture, command, output["run_id"], *arguments)
         assert human.returncode == 0, human.stderr

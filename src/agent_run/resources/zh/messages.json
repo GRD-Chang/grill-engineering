@@ -984,5 +984,11 @@
   "notification.event.resume_worker_started_summary": "Agent 已实际开始工作。",
   "notification.event.resume_controller_progress_summary": "程序已实际继续推进交付。",
   "notification.event.resume_controller_check_summary": "程序已实际继续检查交付状态。",
-  "notification.event.review_result_pending": "验收结果已返回，等待正式确认"
+  "notification.event.review_result_pending": "验收结果已返回，等待正式确认",
+  "card.effort.development": "开发投入",
+  "card.effort.review": "验收投入",
+  "card.effort.rounds": "{count} 轮",
+  "card.effort.execution": "执行 {duration}",
+  "card.effort.participation": "参与 {count} 轮",
+  "card.effort.shared_rounds": "同一轮可参与多组配置；各组参与轮数不可相加。"
 }

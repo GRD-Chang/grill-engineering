@@ -560,3 +560,51 @@ def test_approval_summary_does_not_infer_pass_from_missing_findings() -> None:
     approval = next(event for event in events(state) if event["kind"] == "boundary")
     assert "尚无有效通过结论" in approval["summary"]
     assert not any(event["kind"] == "acceptance_passed" for event in events(state))
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_completion_effort_groups_are_compact_and_share_rounds(language: str) -> None:
+    event = events(state_with_round())[-1]
+    event.update(language=language, kind="ticket_completed", effort={
+        "development": {"rounds": 2, "execution_seconds": 90, "shared_rounds": True,
+                        "configurations": [
+                            {"model": "model_a", "reasoning_effort": "low", "rounds": 2, "execution_seconds": 60},
+                            {"model": "model_b", "reasoning_effort": "high", "rounds": 1, "execution_seconds": 30}]},
+        "review": {"rounds": 1, "configurations": [
+            {"model": "model_c", "reasoning_effort": "medium", "rounds": 1}]}})
+    content = card(event)["body"]["elements"][0]["content"]
+    assert ("开发投入" if language == "zh" else "Development effort") in content
+    assert ("验收投入" if language == "zh" else "Review effort") in content
+    assert ("2 轮" if language == "zh" else "2 rounds") in content
+    assert ("不可相加" if language == "zh" else "not additive") in content
+    assert "model\\_a / low" in content
+    assert "model\\_b / high" in content
+    assert "model\\_c / medium" in content
+    assert "agent-run history r --details" in str(card(event))
+
+
+@pytest.mark.parametrize("role", ["development", "publication"])
+def test_completion_omits_total_when_resume_proves_missing_execution(role: str) -> None:
+    state = state_with_round(role, "candidate" if role == "development" else "publication_artifact")
+    attempt = state["semantic_agent_attempts"][0]
+    attempt["work_subject"] = "ticket:2"
+    state["agent_invocation_history"][0]["semantic_attempt"] = attempt.copy()
+    state["ticket_jobs"] = {"2": {"phase": "completed", "generation": 1}}
+    state["resume_audit"] = {"history": [{
+        "semantic_attempt_id": "a1", "work_subject": "ticket:2",
+        "source_invocation_started_at": "2025-12-31T23:00:00+00:00",
+        "successor_invocation_started_at": state["agent_invocation_history"][0]["started_at"],
+    }]}
+    completed = next(event for event in events(state) if event["kind"] == "ticket_completed")
+    assert "total_seconds" not in completed
+    assert "累计 Agent 执行耗时" not in str(card(completed))
+    if role == "development":
+        assert completed["effort"][role]["rounds"] == 1
+        assert "execution_seconds" not in completed["effort"][role]
+    # Restoring the actual missing segment makes the full total provable.
+    earlier = {**state["agent_invocation_history"][0],
+               "started_at": "2025-12-31T23:00:00+00:00",
+               "ended_at": "2025-12-31T23:00:05+00:00"}
+    state["agent_invocation_history"].insert(0, earlier)
+    completed = next(event for event in events(state) if event["kind"] == "ticket_completed")
+    assert completed["total_seconds"] == 14

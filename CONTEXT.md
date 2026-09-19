@@ -636,6 +636,7 @@ _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态�
 
 **Notification Facts（通知事实）**:
 通知只读消费 History 已关联的 Semantic Attempt、Invocation、Acceptance Artifact 和当前交付事实。History 的 `status_code` 是与 `status_text` 同源的稳定结果分类；通知不比较展示后的状态、标题或角色文案，当前动作与 Status 共用原有动作判定。事件身份仅包含业务身份与结构化结果，不包含语言或翻译文本；恢复筛选使用稳定 Attempt 身份。卡片使用 Run 固定语言及统一短文案入口，原始标题、摘要、Findings 和证据不翻译。关键节点采用下述精简规则，详细过程对同一事实只描述一次。异步发送、有限重试、unknown 保守处理和只读查询边界保持不变。
+子任务完成仍以完成并进入集成成果为准。其卡片从 History 的 Semantic Attempt 身份与关联 Invocation 汇总开发（包括修复）和验收投入：同轮续接、Output Repair 与 Thread 更换不增加轮数，预算窗口 ordinal 重置不替代累计身份计数。执行时间只累计实际执行段，排除暂停及人工／CI 等待；原有包含 Publication 的全部 Agent 执行总时间保留，分项之和不冒充全部总计或任务历时。模型和推理强度取真实 Invocation／Thread Binding，角色内一致时简洁展示，多组合按参与轮数和执行段汇总，同轮跨配置明确标记参与数不可相加。缺失或裁剪时省略无法证明的累计项，独立可靠字段保留，不补零或猜测。仅统计顶层角色，不推断内部 subagent、Token 或费用；卡片不列逐轮时间表，不增加模型调用或平行统计存储，明细继续由 History 追溯。
 _Avoid_: 反向解析翻译文案、通知独立状态机、按发送时个人默认选择语言、语言变化重发
 
 **精简通知**:

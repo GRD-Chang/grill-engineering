@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 from agent_run.execution_timing import execution_totals
+from agent_run.ticket_effort import ticket_effort
 from agent_run.final_approval_operation import final_approval_cleanup_pending
 from typing import Any
 
@@ -201,6 +202,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
                                 _copy(state, "ticket_completed", title=_subject(state, f"ticket:{number}").get("task_title") or "#" + str(number)), "green",
                                 **_subject(state, f"ticket:{number}"),
                                 **execution_totals(state, records, None, work_subject=f"ticket:{number}"),
+                                effort=ticket_effort(state, records, f"ticket:{number}"),
                                 next_step=_copy(state, "ticket_next") if progress['completed'] < progress['total'] else _copy(state, "ticket_final_next"),
                                 summary=_copy(state, "progress", completed=progress["completed"], total=progress["total"])))
     publication = (state.get("parent_job") if state.get("delivery_type") == "parent_only"

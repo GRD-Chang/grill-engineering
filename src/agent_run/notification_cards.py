@@ -24,6 +24,12 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
     def copy(key: str, **values: object) -> str:
         return text("card." + key, language=language, **values)
 
+    def duration(value: int) -> str:
+        minutes, seconds = divmod(value, 60)
+        hours, minutes = divmod(minutes, 60)
+        unit = "hours" if hours else "minutes" if minutes else "seconds"
+        return copy("duration." + unit, hours=hours, minutes=minutes, seconds=seconds)
+
     number = event.get("task_number") or "?"
     repository = _text(event.get("repository", copy("unknown_repository")), 100)
     lines = []
@@ -50,15 +56,34 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
     for field in ("duration_seconds", "total_seconds", "elapsed_seconds"):
         value = event.get(field)
         if type(value) is int and value >= 0:
-            minutes, seconds = divmod(value, 60)
-            hours, minutes = divmod(minutes, 60)
-            unit = "hours" if hours else "minutes" if minutes else "seconds"
-            duration = copy("duration." + unit, hours=hours, minutes=minutes, seconds=seconds)
-            lines.append(copy("field", label=f"**{copy(field)}**", value=duration))
+            lines.append(copy("field", label=f"**{copy(field)}**", value=duration(value)))
+    effort = event.get("effort") or {}
+    for role in ("development", "review"):
+        facts = effort.get(role) or {}
+        parts = []
+        if "rounds" in facts:
+            parts.append(copy("effort.rounds", count=facts["rounds"]))
+        if "execution_seconds" in facts:
+            parts.append(copy("effort.execution", duration=duration(facts["execution_seconds"])))
+        configurations = facts.get("configurations") or []
+        if len(configurations) == 1:
+            config = configurations[0]
+            parts.append(_markdown(f"{config['model']} / {config['reasoning_effort']}"))
+        if parts:
+            lines.append(copy("field", label=f"**{copy('effort.' + role)}**", value=" · ".join(parts)))
+        if len(configurations) > 1:
+            for config in configurations:
+                participation = [copy("effort.participation", count=config["rounds"])]
+                if "execution_seconds" in config:
+                    participation.append(duration(config["execution_seconds"]))
+                lines.append(copy("field", label=_markdown(f"{config['model']} / {config['reasoning_effort']}"),
+                                  value=" · ".join(participation)))
+            if facts.get("shared_rounds"):
+                lines.append(copy("effort.shared_rounds"))
     if event.get("next_step"):
         lines.append(copy("field", label=f"**{copy('next_step')}**", value=_markdown(event["next_step"])))
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
-    if any(len(str(event.get(key) or "")) > 260 for key in ("summary", "next_step")):
+    if effort or any(len(str(event.get(key) or "")) > 260 for key in ("summary", "next_step")):
         elements.append({"tag": "markdown", "content": copy("field", label=copy("full_record"), value=f"`{_text(event.get('query', ''), 160).replace('`', '')}`")})
     url = event.get("url")
     if isinstance(url, str) and urlparse(url).scheme == "https" and urlparse(url).hostname == "github.com":

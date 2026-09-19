@@ -984,5 +984,11 @@
   "notification.event.resume_worker_started_summary": "The Agent has actually started working.",
   "notification.event.resume_controller_progress_summary": "The controller has resumed delivery work.",
   "notification.event.resume_controller_check_summary": "The controller has resumed checking delivery state.",
-  "notification.event.review_result_pending": "Review result returned; awaiting formal confirmation"
+  "notification.event.review_result_pending": "Review result returned; awaiting formal confirmation",
+  "card.effort.development": "Development effort",
+  "card.effort.review": "Review effort",
+  "card.effort.rounds": "{count} rounds",
+  "card.effort.execution": "Execution {duration}",
+  "card.effort.participation": "Participated in {count} rounds",
+  "card.effort.shared_rounds": "A round may use multiple configurations; participation counts are not additive."
 }
