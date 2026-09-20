@@ -8,7 +8,9 @@ import shutil
 import sys
 import uuid
 
-if __name__ == "__main__":
+# Direct scripts locate their own package before importing business modules.
+# Keep this rule identical in installer, setup and compatibility probe.
+if __package__ in (None, ""):
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

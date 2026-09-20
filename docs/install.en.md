@@ -17,6 +17,8 @@ The tool's source directory is used for installation. Delivery uses Runner's ind
 
    If Git is unavailable, download and extract the GitHub source archive for the selected ref, then run `./setup.sh` from its root.
    Branches, forks, and locally modified checkouts are supported. Record the actual source; a clean working tree is not required.
+   Scripts locate the source relative to themselves: `sh "/path/source with spaces/setup.sh"` also works from another directory, including paths with Chinese characters.
+   Help, install, rollback, and uninstall require neither a preinstalled project nor `PYTHONPATH`.
 
 2. Check the changes proposed by Setup. Use `./setup.sh --yes` when existing authorization covers the plan.
    This confirms the plan; it does not grant administrator privileges or authenticate accounts. Report any required login, privilege escalation, or host-session changes. After resolving them, rerun Setup from the same source directory.
@@ -42,9 +44,22 @@ Use the installed `agent-run` for delivery, rather than a source or editable env
 
 ### Missing prerequisites
 
-Setup runs on Linux only. On Ubuntu/Debian, it installs missing or incompatible dependencies from existing APT sources.
-It does not add package sources, upgrade the whole system, or install or log in to Codex. On other Linux distributions, resolve unsupported prerequisites separately.
-Complete real-host validation of Ubuntu/Debian release and architecture combinations has not been performed; dependency setup support does not establish platform validation.
+Setup runs on Linux only. Automatic APT preparation is limited to **Ubuntu 24.04 and Debian 13 on x86_64 / aarch64**, with `apt-get` available.
+Their base releases provide CPython 3.11+ and Git 2.40+; actual tools are checked individually and compatible versions reused.
+Ubuntu 22.04, Debian 12, derivatives, and other architectures receive missing-dependency instructions and continue feasible installation steps, even with custom package sources.
+
+GitHub CLI is excluded from automatic APT preparation: gh 2.45.0 in the Ubuntu 24.04 native repositories lacks the required `gh api --slurp`. Compatible installations are reused. If gh is missing or incompatible, install or upgrade it manually using the official instructions below, verify that `gh api --help` includes `--paginate`, `--slurp`, `--method`, and `--header`, then rerun Setup. Setup does not add GitHub CLI repositories or suggest reinstalling an incompatible candidate.
+
+Setup presents missing dependencies, APT candidates and sources, and the plan before one confirmation. It installs only listed dependencies, without adding repositories, upgrading the whole system, or installing or logging in to Codex.
+It uses current root privileges or existing noninteractive `sudo -n` authorization; `--yes` neither obtains privileges nor prompts for passwords.
+Missing privileges require administrator action; authentication requires user login. Missing user systemd or namespace capabilities require host repair without changing system-wide security policy.
+Unavailable or incompatible candidates and package-manager failures must be resolved; they do not establish execution readiness.
+
+This is the automatic preparation policy. Fake-tool tests verify policy and authorization branches, not platform support.
+Host evidence for this change: Ubuntu 24.04 x86_64, CPython 3.11.16, Git 2.43.0, and bubblewrap 0.9.0.
+The real `bwrap --die-with-parent --ro-bind / / --dev /dev --unshare-pid --proc /proc -- /bin/true` probe succeeded.
+`systemctl --user show-environment` returned `Failed to connect to bus: Connection refused`; user systemd is not ready.
+No real model was invoked. Full execution compatibility, Debian 13, and aarch64 remain unverified; this is not full host acceptance.
 
 | Missing requirement | Action and verification |
 | --- | --- |
@@ -123,7 +138,9 @@ Run these commands from the selected tool source root. Rerun `./setup.sh` first 
 | Uninstall | `./install.sh --uninstall` removes Runner, the managed entry point, and the PATH block; check cleanup results and command resolution in a new login shell |
 
 Installation retains only the current and previous versions. Reinstalling still builds a candidate; if its content matches the current version, that version is reused and the compatibility call is skipped.
-Build or activation failure preserves the previous active version.
+Build or activation failure preserves the previous active version. Follow the reported stage, cause, and next step, then rerun from the same source; do not remove the old installation or manually create a virtual environment.
+When installation succeeds but doctor reports missing host conditions, the activated version remains installed; resolve the conditions and rerun Setup.
+Installed resources ship with the package, so daily commands do not depend on the source directory. Updates and management still use the selected source entry point.
 
 Installation, rollback, and uninstall do not alter existing delivery tasks. Uninstall preserves the installation lock, Run locator records, App configuration, private keys, Runner-owned clones, and run data.
 A user-replaced command entry point is preserved and reported as incomplete cleanup. If task state is incompatible, follow the reported error rather than manually migrating it.

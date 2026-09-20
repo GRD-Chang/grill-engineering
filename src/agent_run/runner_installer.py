@@ -22,40 +22,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence, cast
 
-if __name__ == "__main__":
-    # The public source-tree entry point must not create its own bytecode files
-    # before provenance is captured.
+# Direct scripts locate their own package before importing business modules.
+# Keep this rule identical in installer, setup and compatibility probe.
+if __package__ in (None, ""):
     sys.dont_write_bytecode = True
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-try:
-    from agent_run.paths import app_data_root
-    from agent_run.process_cleanup import (
-        capture_process_scope,
-        child_subreaper,
-        terminate_process_group as _terminate_process_group,
-    )
-    from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
-    from agent_run.runner_lease import (
-        RunnerLeaseBusy,
-        RunnerLeaseError,
-        runner_management_lease,
-    )
-except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
-    from paths import app_data_root  # type: ignore[import-not-found, no-redef]
-    from process_cleanup import (  # type: ignore[import-not-found, no-redef]
-        capture_process_scope,
-        child_subreaper,
-        terminate_process_group as _terminate_process_group,
-    )
-    from runner_runtime import (  # type: ignore[import-not-found, no-redef]
-        RuntimeTreeError,
-        find_runtime_package,
-    )
-    from runner_lease import (  # type: ignore[import-not-found, no-redef]
-        RunnerLeaseBusy,
-        RunnerLeaseError,
-        runner_management_lease,
-    )
+from agent_run.paths import app_data_root
+from agent_run.process_cleanup import (
+    capture_process_scope,
+    child_subreaper,
+    terminate_process_group as _terminate_process_group,
+)
+from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
+from agent_run.runner_lease import (
+    RunnerLeaseBusy,
+    RunnerLeaseError,
+    runner_management_lease,
+)
 
 
 PATH_BLOCK_START = "# >>> agent-run managed PATH >>>"
@@ -69,6 +53,8 @@ _PATH_BLOCK_RE = re.compile(
     rf"(?ms)^{re.escape(PATH_BLOCK_START)}\n.*?^{re.escape(PATH_BLOCK_END)}\n?"
 )
 _MAX_GIT_FIELD_BYTES = 512
+_MAX_BUILD_OUTPUT_BYTES = 64 * 1024
+_BUILD_TIMEOUT_SECONDS = 15 * 60
 _CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0
 _MAX_CANDIDATE_PROBE_OUTPUT_BYTES = 16 * 1024
 _SAFE_CANDIDATE_PROBE_ERRORS = frozenset(
@@ -435,7 +421,10 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
     try:
         venv.EnvBuilder(with_pip=True, clear=True, symlinks=True).create(candidate)
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
-        raise InstallerError("无法创建隔离 Python 环境") from error
+        raise InstallerError(
+            "创建虚拟环境阶段失败；请运行 ./setup.sh 检查 Python venv/ensurepip，"
+            "并检查安装目录权限与可用磁盘空间后重试"
+        ) from error
     python = candidate / "bin" / "python"
     if not python.exists():
         raise InstallerError("隔离环境缺少 Python 入口")
@@ -452,7 +441,9 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
                 ignore=shutil.ignore_patterns(".git", ".agent-run"),
             )
         except (OSError, shutil.Error) as error:
-            raise InstallerError("无法准备隔离 Python package build source") from error
+            raise InstallerError(
+                "准备构建源码阶段失败；请检查源码读取权限、安装目录写入权限和磁盘空间后重试"
+            ) from error
         return_code = _run_pip_install(python, build_source)
     finally:
         try:
@@ -460,7 +451,7 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
         except OSError:
             pass
     if return_code != 0:
-        raise InstallerError("Python package build or non-editable installation failed")
+        raise InstallerError(_build_failure_message(b"", return_code))
     package = _runtime_package(candidate)
     identity = _runtime_identity(package)
     return identity, f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -481,22 +472,87 @@ def _run_pip_install(python: Path, source: Path) -> int:
                 str(source),
             ],
             cwd=source,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except OSError as error:
-        raise InstallerError("Python package build or non-editable installation failed") from error
+        raise InstallerError(
+            "启动包构建阶段失败；请检查候选 Python 可执行权限与宿主 Python 安装后重试"
+        ) from error
     try:
-        try:
-            return_code = process.wait(timeout=15 * 60)
-        except subprocess.TimeoutExpired as error:
-            raise InstallerError(
-                "Python package build or non-editable installation timed out"
-            ) from error
+        output = _read_build_output(process, adopted_baseline=adopted_baseline)
+        return_code = process.returncode
+        assert return_code is not None
+        if return_code != 0:
+            raise InstallerError(_build_failure_message(output, return_code))
         return return_code
     finally:
         _terminate_process_group(process, adopted_baseline=adopted_baseline)
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def _read_build_output(
+    process: subprocess.Popen[Any], *, adopted_baseline: set[int],
+) -> bytes:
+    """Drain pip output with bounded memory; never persist or echo backend text."""
+    assert process.stdout is not None
+    deadline = time.monotonic() + _BUILD_TIMEOUT_SECONDS
+    output = bytearray()
+    parent_finished = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                if not parent_finished and process.poll() is not None:
+                    # Backends may leave children holding or writing stdout.
+                    # Stop them, then drain the finite buffered pip diagnostics.
+                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
+                    parent_finished = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired("pip install", _BUILD_TIMEOUT_SECONDS)
+                if not selector.select(timeout=min(remaining, 0.1)):
+                    continue
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    selector.unregister(process.stdout)
+                    continue
+                output.extend(chunk)
+                del output[:-_MAX_BUILD_OUTPUT_BYTES]
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        raise InstallerError(
+            "包构建/安装阶段超时；请检查网络、包源连通性与构建后端后重试；新版未激活"
+        ) from error
+    except OSError as error:
+        raise InstallerError(
+            "读取包构建输出阶段失败；请检查宿主进程与文件描述符资源后重试；新版未激活"
+        ) from error
+    return bytes(output)
+
+
+def _build_failure_message(output: bytes, return_code: int) -> str:
+    # Only fixed classifications leave this boundary: arbitrary backend output may
+    # contain credentials even when it does not resemble a URL or a known token.
+    lowered = output.lower()
+    if b"no space left on device" in lowered:
+        reason = "磁盘空间不足；请释放安装目录和临时目录所在磁盘的空间后重试"
+    elif b"permission denied" in lowered:
+        reason = "访问权限不足；请检查源码、安装目录及临时目录的读写权限后重试"
+    elif any(marker in lowered for marker in (
+        b"certificate_verify_failed", b"connection refused", b"connectionerror",
+        b"temporary failure in name resolution", b"read timed out", b"proxyerror",
+    )):
+        reason = "依赖下载连接或证书检查失败；请检查网络、代理和包源证书配置后重试"
+    elif b"no matching distribution found" in lowered or b"could not find a version" in lowered:
+        reason = "包源中没有匹配的构建或运行依赖；请检查 Python 版本、包源和离线 wheel 是否齐全后重试"
+    elif b"no module named pip" in lowered:
+        reason = "候选环境缺少 pip；请运行 ./setup.sh 检查 Python venv/ensurepip 后重试"
+    else:
+        reason = "pip 或构建后端拒绝安装；请检查源码 pyproject.toml、构建依赖与包源配置后重试"
+    return f"包构建/安装阶段失败（退出码 {return_code}）；{reason}；新版未激活"
 
 
 def _run_candidate_probe(candidate: Path) -> None:

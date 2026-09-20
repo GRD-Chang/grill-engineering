@@ -20,7 +20,8 @@ if [ -r /etc/os-release ]; then
     ID=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '\042\047')
     VERSION_ID=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '\042\047')
 fi
-printf '宿主：%s %s / %s；自动准备使用当前已配置的 apt 软件源。\n' "$ID" "$VERSION_ID" "$(uname -m)"
+architecture=$(uname -m)
+printf '宿主：%s %s / %s；自动准备使用当前已配置的 apt 软件源。\n' "$ID" "$VERSION_ID" "$architecture"
 echo '发行版适配不是完整宿主验证；支持证据见安装文档。'
 # Bootstrap only the interpreter with coreutils; once available, all tool probes
 # use the same bounded output and descendant cleanup as doctor.
@@ -66,7 +67,13 @@ gh_ok() {
         case "$capabilities" in *"$flag"*) ;; *) return 1;; esac
     done
 }
-if gh_ok; then echo '复用：gh api 生产调用选项可用；认证在确认前检查，安装后由 doctor 复验。'; else need gh 'apt 补装支持 gh api --paginate --slurp 的版本'; fi
+if gh_ok; then
+    echo '复用：gh api 生产调用选项可用；认证在确认前检查，安装后由 doctor 复验。'
+else
+    # Distribution candidates may lack --slurp (including Ubuntu 24.04).
+    # Keep gh outside automatic APT preparation instead of guessing compatibility.
+    echo '人工待办：gh 缺失或不兼容；不自动 apt 补装 gh。请按 https://github.com/cli/cli/blob/trunk/docs/install_linux.md 安装或升级 GitHub CLI，确认 gh api --help 包含 --paginate、--slurp、--method、--header 后重跑 setup.sh；认证另用 gh auth status 检查。'
+fi
 for tool in bwrap openssl; do
     case "$tool" in bwrap) package=bubblewrap;; *) package=$tool;; esac
     if command -v "$tool" >/dev/null 2>&1 && { if [ "$tool" = openssl ]; then probe "$tool" version; else probe "$tool" --version; fi; } >/dev/null 2>&1; then
@@ -105,7 +112,12 @@ check_host() {
 check_host
 echo '人工待办：复用现有登录；缺失时自行 gh auth login / codex login；Skills、项目工具链、忽略规则、标签和 CI 按接入文档准备。'
 apt_supported=no
-case "$ID" in ubuntu|debian) if command -v apt-get >/dev/null 2>&1; then apt_supported=yes; fi;; esac
+# These base releases provide Python >= 3.11 and Git >= 2.40. Do not
+# silently install known-too-old packages on earlier or derivative releases.
+case "$ID:$VERSION_ID:$architecture" in
+    ubuntu:24.04:x86_64|ubuntu:24.04:aarch64|debian:13:x86_64|debian:13:aarch64)
+        if command -v apt-get >/dev/null 2>&1; then apt_supported=yes; fi ;;
+esac
 if [ -n "$packages" ]; then
     if [ "$apt_supported" = yes ]; then
         printf '计划：在 Runner 管理租约下刷新已有 APT 索引，再 apt-get install --no-install-recommends%s（不执行全系统升级、不新增软件源）。\n' "$packages"
@@ -113,7 +125,7 @@ if [ -n "$packages" ]; then
             # Package names are fixed above, never user-supplied shell text.
             probe apt-cache policy $packages || echo '软件源候选无法读取；请管理员核对 apt-cache policy 后重跑。'
         fi
-    else printf '跳过自动补装：当前 Linux 无 apt 适配；请用本发行版包管理器补齐：%s。继续可行步骤。\n' "$packages"; fi
+    else printf '跳过自动补装：当前 Linux 无 apt 适配（自动范围：Ubuntu 24.04 / Debian 13，x86_64 / aarch64，且 apt-get 可用）；请用本发行版包管理器补齐：%s。继续可行步骤。\n' "$packages"; fi
 fi
 echo '计划：调用现有 install.sh 构建候选、检查兼容性并原子激活；随后运行 doctor 和短命 user systemd 探针（失败时清理本次 unit）。'
 if [ "$confirmed" != yes ]; then

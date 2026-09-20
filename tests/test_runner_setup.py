@@ -30,8 +30,8 @@ def setup_host(tmp_path: Path, request: pytest.FixtureRequest):
     log = tmp_path / 'calls'
     for name in ('dirname', 'tr', 'awk', 'sh', 'mkdir', 'chmod', 'cat', 'timeout', 'flock'):
         (binaries / name).symlink_to(shutil.which(name))
-    _script(binaries / 'uname', 'case "$1" in -s) echo "${TEST_KERNEL:-Linux}";; *) echo x86_64;; esac\n')
-    _script(binaries / 'sed', 'case "$1" in *VERSION_ID*) echo 24.04;; *) echo "${TEST_DISTRO:-ubuntu}";; esac\n')
+    _script(binaries / 'uname', 'case "$1" in -s) echo "${TEST_KERNEL:-Linux}";; *) echo "${TEST_ARCH:-x86_64}";; esac\n')
+    _script(binaries / 'sed', 'case "$2" in *VERSION_ID*) echo "${TEST_RELEASE:-24.04}";; *) echo "${TEST_DISTRO:-ubuntu}";; esac\n')
     _script(binaries / 'id', 'echo "${TEST_UID:-1000}"\n')
     _script(binaries / 'sudo', 'exit 1\n')
     _script(binaries / 'apt-cache', 'echo "Candidate: test-version; configured test source"\n')
@@ -80,17 +80,17 @@ def test_compatible_tools_reused_and_rerun(setup_host):
 
 def test_one_confirmation_installs_only_missing_package(setup_host):
     run, binaries, _, log, _ = setup_host
-    (binaries / 'gh').unlink()
+    (binaries / 'openssl').unlink()
     result = run(answer='y\n', TEST_UID='0')
     assert result.returncode == 0, result.stderr
     assert result.stdout.count('执行以上计划？') == 1
-    assert log.read_text().splitlines() == ['apt update', 'apt install -y --no-install-recommends gh', 'install']
+    assert log.read_text().splitlines() == ['apt update', 'apt install -y --no-install-recommends openssl', 'install']
     assert 'Candidate: test-version' in result.stdout
 
 
 def test_rejection_performs_no_changes(setup_host):
     run, binaries, _, log, _ = setup_host
-    (binaries / 'gh').unlink()
+    (binaries / 'openssl').unlink()
     result = run(answer='n\n', TEST_UID='0')
     assert result.returncode == 1
     assert not log.exists()
@@ -99,7 +99,7 @@ def test_rejection_performs_no_changes(setup_host):
 @pytest.mark.parametrize('settings,reason', [({}, '权限不足'), ({'TEST_DISTRO': 'alpine'}, '无 apt 适配'), ({'TEST_UID': '0', 'TEST_APT_EXIT': '1'}, '依赖准备失败')])
 def test_unavailable_preparation_continues_install(setup_host, settings, reason):
     run, binaries, _, log, _ = setup_host
-    (binaries / 'gh').unlink()
+    (binaries / 'openssl').unlink()
     result = run('--yes', **settings)
     assert reason in result.stdout
     assert log.read_text().splitlines()[-1] == 'install'
@@ -185,12 +185,36 @@ def test_git_empty_failed_or_invalid_output_is_not_reused(setup_host, body):
     assert 'apt install -y --no-install-recommends git' in log.read_text()
 
 
-def test_old_github_cli_is_included_in_preparation(setup_host):
+@pytest.mark.parametrize('gh_body', [None, 'echo "--paginate --method --header"\n'])
+@pytest.mark.parametrize('distro,release', [('ubuntu', '24.04'), ('debian', '13')])
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_missing_or_old_github_cli_requires_manual_upgrade(
+    setup_host, gh_body, distro, release, confirmed,
+):
     run, binaries, _, log, _ = setup_host
-    _script(binaries / 'gh', 'echo "--paginate --method --header"\n')
-    result = run('--yes', TEST_UID='0')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'apt install -y --no-install-recommends gh' in log.read_text()
+    if gh_body is None:
+        (binaries / 'gh').unlink()
+    else:
+        _script(binaries / 'gh', gh_body)
+    # An unrelated supported missing dependency must still be prepared.
+    (binaries / 'openssl').unlink()
+    result = run(*(['--yes'] if confirmed else []), answer='n\n',
+                 TEST_UID='0', TEST_DISTRO=distro, TEST_RELEASE=release)
+    assert result.returncode == (0 if confirmed else 1), result.stdout + result.stderr
+    assert 'gh 缺失或不兼容；不自动 apt 补装 gh' in result.stdout
+    assert 'https://github.com/cli/cli/blob/trunk/docs/install_linux.md' in result.stdout
+    assert 'gh api --help' in result.stdout
+    assert '重跑 setup.sh' in result.stdout
+    assert 'apt 补装支持 gh' not in result.stdout
+    plan = next(line for line in result.stdout.splitlines() if 'apt-get install' in line)
+    assert ' gh' not in plan
+    assert 'openssl' in plan
+    if confirmed:
+        assert log.read_text().splitlines() == [
+            'apt update', 'apt install -y --no-install-recommends openssl', 'install',
+        ]
+    else:
+        assert not log.exists()
 
 
 @pytest.mark.parametrize('setup_host', [True], indirect=True, ids=['real-probes'])
@@ -214,7 +238,7 @@ def test_host_package_preparation_respects_runner_usage_lease(setup_host):
     from agent_run.runner_lease import runner_usage_lease
 
     run, binaries, _, log, home = setup_host
-    (binaries / 'gh').unlink()
+    (binaries / 'openssl').unlink()
     lock = home.parent / 'XDG_DATA_HOME' / 'agent-run' / 'install.lock'
     with runner_usage_lease(lock):
         result = run('--yes', TEST_UID='0')
@@ -264,3 +288,43 @@ def test_readonly_host_failures_are_reported_before_confirmation(
         assert '新版本未激活' in result.stdout
     assert '安装及执行条件均满足' not in result.stdout
     assert 'private-host-output' not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('distro,release,architecture,supported', [
+    ('ubuntu', '24.04', 'x86_64', True),
+    ('ubuntu', '24.04', 'aarch64', True),
+    ('debian', '13', 'x86_64', True),
+    ('debian', '13', 'aarch64', True),
+    ('ubuntu', '22.04', 'x86_64', False),
+    ('debian', '12', 'x86_64', False),
+    ('ubuntu', '24.04', 'riscv64', False),
+    ('linuxmint', '24.04', 'x86_64', False),
+])
+def test_automatic_preparation_has_explicit_host_scope(
+    setup_host, distro, release, architecture, supported,
+):
+    run, binaries, _, log, _ = setup_host
+    (binaries / 'openssl').unlink()
+    result = run('--yes', TEST_UID='0', TEST_DISTRO=distro,
+                 TEST_RELEASE=release, TEST_ARCH=architecture)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ('apt install -y --no-install-recommends openssl' in log.read_text()) == supported
+    if not supported:
+        assert '跳过自动补装' in result.stdout
+        assert '请用本发行版包管理器补齐' in result.stdout
+
+
+def test_preparation_reuses_only_existing_noninteractive_sudo_authorization(setup_host):
+    run, binaries, _, log, _ = setup_host
+    (binaries / 'openssl').unlink()
+    _script(binaries / 'sudo',
+            'echo "sudo $*" >> "$TEST_LOG"\n'
+            '[ "$1" = -n ] || exit 99\nshift\n'
+            '[ "$1" = true ] && exit 0\nexec "$@"\n')
+    result = run('--yes')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().splitlines() == [
+        'sudo -n true', 'sudo -n apt-get update', 'apt update',
+        'sudo -n apt-get install -y --no-install-recommends openssl',
+        'apt install -y --no-install-recommends openssl', 'install',
+    ]

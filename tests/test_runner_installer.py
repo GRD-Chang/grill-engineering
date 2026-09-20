@@ -24,6 +24,89 @@ from support.offline_install import offline_pip_environment, prepare_offline_whe
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "expected"),
+    [
+        ("No space left on device", "磁盘空间不足"),
+        ("No matching distribution found for private-package", "没有匹配"),
+        ("CERTIFICATE_VERIFY_FAILED", "证书"),
+        ("unexpected backend error", "构建后端拒绝安装"),
+    ],
+)
+def test_build_diagnostic_is_bounded_and_does_not_echo_credentials(
+    tmp_path: Path, diagnostic: str, expected: str,
+) -> None:
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "sys.stdout.write('x' * 200000)\n"
+        "sys.stderr.write('https://user:private-password@example.test token=private-token\\n')\n"
+        f"sys.stderr.write({diagnostic!r})\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    with pytest.raises(runner_installer.InstallerError) as caught:
+        runner_installer._run_pip_install(fake_python, tmp_path)
+    message = str(caught.value)
+    assert expected in message
+    assert "退出码 7" in message
+    assert "新版未激活" in message
+    assert "重试" in message
+    assert "private-password" not in message
+    assert "private-token" not in message
+    assert len(message) < 400
+
+
+def test_build_output_timeout_cleans_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\nimport time\ntime.sleep(60)\n", encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    monkeypatch.setattr(runner_installer, "_BUILD_TIMEOUT_SECONDS", 0.1)
+    started: list[subprocess.Popen[Any]] = []
+    original = subprocess.Popen
+
+    def record_process(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        process = original(*args, **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(runner_installer.subprocess, "Popen", record_process)
+    with pytest.raises(runner_installer.InstallerError, match="包构建/安装阶段超时"):
+        runner_installer._run_pip_install(fake_python, tmp_path)
+    assert started[0].poll() is not None
+    assert started[0].stdout is not None and started[0].stdout.closed
+
+
+@pytest.mark.parametrize("child_code", [
+    "import time; time.sleep(60)",
+    "import os\nwhile True: os.write(1, b'backend progress' * 512)",
+])
+def test_build_completed_with_child_holding_output_is_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child_code: str,
+) -> None:
+    monkeypatch.setattr(runner_installer, "_BUILD_TIMEOUT_SECONDS", 2)
+    fake_python = tmp_path / "python"
+    child_pid = tmp_path / "child-pid"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"Path({str(child_pid)!r}).write_text(str(child.pid))\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    with runner_installer.child_subreaper():
+        assert runner_installer._run_pip_install(fake_python, tmp_path) == 0
+    _assert_process_gone(child_pid)
+
+
 @pytest.fixture(scope="session")
 def installer_build_wheels(tmp_path_factory: pytest.TempPathFactory) -> Path:
     source = Path(os.environ.get("AGENT_RUN_TEST_WHEELHOUSE", PROJECT_ROOT / ".test-wheels"))
@@ -1450,6 +1533,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     offline_install_environment: dict[str, str],
 ) -> None:
     source = _source_tree(tmp_path, real_install=True)
+    source = source.rename(tmp_path / "源码 archive with spaces")
     fake_bin, count, _status_file = _fake_codex(tmp_path, behavior="fork-setsid")
     isolated_environment, tool_directory, markers = (
         _isolated_quickstart_environment(tmp_path, fake_bin)
@@ -1674,6 +1758,38 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert profile.count("# >>> agent-run managed PATH >>>") == 1
     assert profile.count("# <<< agent-run managed PATH <<<") == 1
     assert len(list((_data_root(home) / "snapshots").iterdir())) == 1
+
+    # Reuse this isolated real build boundary for archive update, failed build
+    # preservation and rollback. Other lifecycle combinations stay lightweight.
+    first_snapshot = _active_snapshot(home)
+    shutil.rmtree(source / ".git")
+    version_file = source / "src/agent_run/__init__.py"
+    version_file.write_text(version_file.read_text() + "\n# archive update\n")
+    updated = _run(source, home, fake_bin, cwd=tmp_path,
+                   path=isolated_path, environment=isolated_environment)
+    assert updated.returncode == 0, updated.stderr
+    second_snapshot = _active_snapshot(home)
+    assert second_snapshot != first_snapshot
+    assert _manifest(second_snapshot)["source_provenance"] == {"kind": "source-directory"}
+    assert (_data_root(home) / "active/previous").resolve() == first_snapshot
+    build_config = source / "pyproject.toml"
+    original_config = build_config.read_text()
+    build_config.write_text(original_config.replace("setuptools.build_meta", "missing_backend"))
+    failed = _run(source, home, fake_bin, cwd=tmp_path,
+                  path=isolated_path, environment=isolated_environment)
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert _active_snapshot(home) == second_snapshot
+    assert (_data_root(home) / "active/previous").resolve() == first_snapshot
+    assert not list((_data_root(home) / "staging").iterdir())
+    still_usable = subprocess.run([str(stable_entry), "--help"], cwd=tmp_path,
+                                 env=isolated_environment, capture_output=True, timeout=15)
+    assert still_usable.returncode == 0
+    build_config.write_text(original_config)
+    rolled_back = _run(source, home, fake_bin, "--rollback", cwd=tmp_path,
+                      path=isolated_path, environment=isolated_environment)
+    assert rolled_back.returncode == 0, rolled_back.stderr
+    assert _active_snapshot(home) == first_snapshot
+    assert (_data_root(home) / "active/previous").resolve() == second_snapshot
 
     uninstalled = _run(
         source,

@@ -12,28 +12,19 @@ import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
+# Direct scripts locate their own package before importing business modules.
+# Keep this rule identical in installer, setup and compatibility probe.
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-try:
-    from agent_run.process_cleanup import (
-        capture_process_scope,
-        child_subreaper,
-        terminate_process_group,
-    )
-    from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
-    from agent_run.prompt_resources import read_builtin_resource
-except ModuleNotFoundError:  # pragma: no cover - used by the source-tree script
-    from process_cleanup import (  # type: ignore[import-not-found, no-redef]
-        capture_process_scope,
-        child_subreaper,
-        terminate_process_group,
-    )
-    from prompt_resources import read_builtin_resource  # type: ignore[import-not-found, no-redef]
-    from runner_runtime import (  # type: ignore[import-not-found, no-redef]
-        RuntimeTreeError,
-        find_runtime_package,
-    )
+from agent_run.process_cleanup import (
+    capture_process_scope,
+    child_subreaper,
+    terminate_process_group,
+)
+from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
+from agent_run.prompt_resources import read_builtin_resource
 
 
 PROBE_TIMEOUT_SECONDS = 120.0
