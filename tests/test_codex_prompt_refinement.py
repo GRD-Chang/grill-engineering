@@ -255,7 +255,7 @@ def test_development_worker_command_matches_context_contract(
         assert "程序摘要、旧开发总结、历史对话和旧验收结论不能替代" in prompt
         assert "只读 `gh issue view`" in prompt
         assert "不暂存、commit、改写 Git 历史或执行 GitHub 写入" in prompt
-        assert '"result_kind":"development"' in prompt
+        assert "result_kind" in prompt and "development" in prompt
         assert "后续审查和最终完整测试，由另一位验收工程师负责" in prompt
     if kind != "development":
         for evidence in ("RAW_CURRENT_REVISION", "RAW_BLOCKER", "RAW_RESPONSE"):

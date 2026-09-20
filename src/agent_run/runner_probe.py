@@ -89,7 +89,7 @@ class RunnerProbeBackend:
                 "-",
             ]
             try:
-                prompt = read_builtin_resource("internal/probe", package)
+                prompt = read_builtin_resource("context/probe", package)
             except ValueError as error:
                 raise RunnerProbeError(str(error)) from error
             process: subprocess.Popen[str] | None = None

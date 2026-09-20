@@ -163,7 +163,7 @@ class CodexCliBackend:
         """Exercise the production Publication schema boundary once, read-only."""
 
         return self._invoke(
-            prompt=resource({}, "internal/publication-handshake"),
+            prompt=resource({}, "publication/handshake"),
             checkout=checkout,
             thread_id=None,
             schema=publication_or_human_blocker_schema(),

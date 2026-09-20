@@ -249,3 +249,28 @@ def test_preview_and_diff_do_not_execute_workers_or_write_runs(tmp_path: Path, m
     capsys.readouterr()
     assert main(["prompts", "preview", "--request", str(request_file), "--role", "development", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["prompt"]
+
+
+@pytest.mark.parametrize(
+    "texts",
+    [
+        {"resume": {"zh": "继续 {task}"}},
+        {"resume": {"zh": "继续 {task}", "en": "Continue {other}"}},
+        {"resume": {"zh": "继续 {task}", "en": " "}},
+    ],
+    ids=["missing-translation", "different-facts", "empty-translation"],
+)
+def test_internal_copy_rejects_incomplete_bilingual_contract(texts) -> None:
+    from agent_run.internal_prompt_text import validate_bilingual_texts
+
+    with pytest.raises(ValueError):
+        validate_bilingual_texts(texts)
+
+
+def test_internal_copy_accepts_reordered_translated_facts() -> None:
+    from agent_run.internal_prompt_text import validate_bilingual_texts
+
+    validate_bilingual_texts({
+        "task": {"zh": "任务 {task}，路径 {path}",
+                 "en": "At {path}, complete {task}"},
+    })

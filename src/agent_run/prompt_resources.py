@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import stat
 from typing import Any
@@ -10,78 +9,13 @@ from typing import Any
 from agent_run.messages import ErrorMessage, error_message, validate_language
 
 from agent_run.paths import app_config_root
+from agent_run.internal_prompt_text import INTERNAL_KEYS, internal_resources
 
 METHOD_NAMES = ("development", "repair", "acceptance", "publishing")
 RESOURCE_ROOT = Path(__file__).parent / "resources" / "zh"
 MAX_RESOURCE_BYTES = 512 * 1024
-# The manifest fixes resource identities independently of mutable files on disk.
-COPY_KEYS = (
-    'internal/checkout',
-    'internal/full-requirement-url',
-    'internal/identity-candidate',
-    'internal/identity-default-base',
-    'internal/identity-expected-tree',
-    'internal/identity-repair-candidate',
-    'internal/identity-reviewed-base',
-    'internal/identity-reviewed-candidate',
-    'internal/identity-reviewed-tree',
-    'internal/identity-run-base',
-    'internal/identity-run-head',
-    'internal/parent-url',
-    'internal/previous-review-artifact-label',
-    'internal/previous-review-object-label',
-    'internal/publication-acceptance-evidence',
-    'internal/repair-evidence',
-    'internal/review-object-label',
-    'internal/task-url',
-)
-MARKDOWN_KEYS = (
-    'internal/development-output-repair',
-    'internal/development-resume',
-    'internal/development-review-budget',
-    'internal/git',
-    'internal/human-response',
-    'internal/initial-review-baseline',
-    'internal/integration-evidence',
-    'internal/output',
-    'internal/previous-review-boundary',
-    'internal/probe',
-    'internal/publication-boundary',
-    'internal/publication-fallback',
-    'internal/publication-handshake',
-    'internal/publication-output',
-    'internal/publication-output-repair',
-    'internal/publication-resume',
-    'internal/read-only-validation',
-    'internal/repair-acceptance',
-    'internal/repair-git-integrity',
-    'internal/repair-human-revision',
-    'internal/repair-merge-conflict',
-    'internal/repair-required-checks',
-    'internal/repair-requirement-refresh',
-    'internal/repair-resume',
-    'internal/requirement-baseline',
-    'internal/requirements-read',
-    'internal/requirements-read-dependencies',
-    'internal/review-attempt-budget',
-    'internal/review-candidate-object',
-    'internal/review-commit-object',
-    'internal/review-output',
-    'internal/review-output-repair',
-    'internal/review-resume',
-    'internal/review-run-object',
-    'internal/review-run-repair-object',
-    'internal/scope-child-task',
-    'internal/scope-current-regressions',
-    'internal/scope-existing-work',
-    'internal/scope-full-requirement',
-    'internal/scope-integrated-run',
-    'methods/acceptance',
-    'methods/development',
-    'methods/publishing',
-    'methods/repair',
-)
-RESOURCE_KEYS = MARKDOWN_KEYS + COPY_KEYS
+MARKDOWN_KEYS = tuple(f"methods/{name}" for name in METHOD_NAMES)
+RESOURCE_KEYS = MARKDOWN_KEYS + INTERNAL_KEYS
 
 
 def selected_language(language: str | None = None) -> str:
@@ -105,25 +39,15 @@ def read_builtin_resource(key: str, package_root: Path | None = None, *, languag
         root = RESOURCE_ROOT if language == "zh" else RESOURCE_ROOT.parent / language
     else:
         root = package_root / "resources" / language
-    if key in COPY_KEYS:
-        return _read_copy(root)[key]
+    if key in INTERNAL_KEYS:
+        try:
+            return internal_resources(language, package_root)[key]
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError, ImportError) as error:
+            raise ValueError(error_message(
+                "prompts.error.read", audit=f"Cannot read internal prompt {key}: {error}",
+                path=package_root or Path(__file__).parent, reason=str(error),
+            )) from error
     return _read(root / f"{key}.md")
-
-
-def _read_copy(root: Path) -> dict[str, str]:
-    path = root / "prompt-copy.json"
-    try:
-        values = json.loads(_read(path))
-        if not isinstance(values, dict) or set(values) != set(COPY_KEYS):
-            raise ValueError("prompt copy identities differ")
-        if any(not isinstance(value, str) or not value.strip() for value in values.values()):
-            raise ValueError("prompt copy must contain non-empty text")
-        return values
-    except (ValueError, TypeError) as error:
-        raise ValueError(error_message(
-            "prompts.error.read", audit=f"Cannot read prompt resource {path}: {error}",
-            path=path, reason=str(error),
-        )) from error
 
 
 def _read(path: Path) -> str:
@@ -152,8 +76,7 @@ def _read(path: Path) -> str:
 def builtin_resources(language: str | None = None) -> dict[str, str]:
     language = selected_language(language)
     resources = {key: read_builtin_resource(key, language=language) for key in MARKDOWN_KEYS}
-    root = RESOURCE_ROOT if language == "zh" else RESOURCE_ROOT.parent / language
-    resources.update(_read_copy(root))
+    resources.update(internal_resources(language))
     validate_resources(resources)
     return resources
 
@@ -205,9 +128,9 @@ def resource(request: dict[str, Any] | None, key: str) -> str:
                 resource=key,
             ))
         value = str(snapshot[key])
-        return value.removesuffix("\n") if key.startswith("internal/") else value
+        return value.removesuffix("\n") if key in INTERNAL_KEYS else value
     value = resolve_resources(request.get("language") if request is not None else None)[key]
-    return value.removesuffix("\n") if key.startswith("internal/") else value
+    return value.removesuffix("\n") if key in INTERNAL_KEYS else value
 
 
 def bind_resources(request: dict[str, Any]) -> dict[str, Any]:

@@ -519,8 +519,11 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
-    probe = source / "src/agent_run/resources/en/internal/probe.md"
-    probe.write_text(probe.read_text() + "\n候选包探针独有内容", encoding="utf-8")
+    probe = source / "src/agent_run/prompt_text_context.py"
+    probe.write_text(
+        probe.read_text() + '\nTEXTS["context/probe"]["en"] += "\\n候选包探针独有内容"\n',
+        encoding="utf-8",
+    )
     captured_prompt = tmp_path / "probe-prompt"
     executable = fake_bin / "codex"
     executable.write_text(executable.read_text().replace(
@@ -645,9 +648,8 @@ def test_probe_timeout_terminates_its_process_group(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    resource_dir = candidate / "resources" / "zh" / "internal"
-    resource_dir.mkdir(parents=True)
-    shutil.copyfile(PROJECT_ROOT / "src/agent_run/resources/zh/internal/probe.md", resource_dir / "probe.md")
+    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
+        shutil.copyfile(module, candidate / module.name)
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/python3\nimport time\ntime.sleep(10)\n", encoding="utf-8"
@@ -665,9 +667,8 @@ def test_probe_success_terminates_descendants_after_codex_exits(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    resource_dir = candidate / "resources" / "zh" / "internal"
-    resource_dir.mkdir(parents=True)
-    shutil.copyfile(PROJECT_ROOT / "src/agent_run/resources/zh/internal/probe.md", resource_dir / "probe.md")
+    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
+        shutil.copyfile(module, candidate / module.name)
     child_pid_file = tmp_path / "child.pid"
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
@@ -2773,11 +2774,30 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
     ) == target_paths_before
 
 
-def test_probe_missing_candidate_resource_fails_before_codex(tmp_path: Path) -> None:
+def test_probe_missing_candidate_package_fails_before_codex(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    fake_bin, count, _status = _fake_codex(tmp_path)
+    with pytest.raises(RunnerProbeError):
+        RunnerProbeBackend(executable=str(fake_bin / "codex")).check(candidate)
+    assert not count.exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "syntax", "translation"])
+def test_probe_invalid_candidate_text_fails_before_codex(tmp_path: Path, failure: str) -> None:
     candidate = tmp_path / "candidate"
     package = candidate / "lib/python3.11/site-packages/agent_run"
     package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
+        shutil.copyfile(module, package / module.name)
+    context = package / "prompt_text_context.py"
+    if failure == "missing":
+        context.unlink()
+    elif failure == "syntax":
+        context.write_text("TEXTS = {\n", encoding="utf-8")
+    else:
+        context.write_text("TEXTS = {'context/probe': {'zh': '仅中文'}}\n", encoding="utf-8")
     fake_bin, count, _status = _fake_codex(tmp_path)
-    with pytest.raises(RunnerProbeError, match="Cannot read prompt resource"):
+    with pytest.raises(RunnerProbeError, match="Cannot read internal prompt"):
         RunnerProbeBackend(executable=str(fake_bin / "codex")).check(candidate)
     assert not count.exists()

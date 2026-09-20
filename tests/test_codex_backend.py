@@ -441,7 +441,7 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     from agent_run.prompt_resources import resolve_resources
 
     resources = resolve_resources()
-    resources["internal/development-output-repair"] += "\n固定格式修复资源"
+    resources["development/output-repair"] += "\n固定格式修复资源"
     attempts: list[list[str]] = []
     prompts: list[str] = []
 
@@ -4955,7 +4955,7 @@ def test_language_does_not_rewrite_or_retry_valid_agent_prose(
         assert result.artifact == artifact
     if output_repair:
         assert "resume" in calls[1][0]
-        for static_part in resources[f"internal/{role}-output-repair"].strip().split("{0}"):
+        for static_part in resources[f"{role}/output-repair"].strip().split("{0}"):
             assert static_part in calls[1][1]
 
 
@@ -4980,6 +4980,6 @@ def test_no_run_publication_probe_uses_personal_language(
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", worker)
     output, thread = CodexCliBackend(credential_provider=lambda: "isolated-reader").publication_schema_handshake(tmp_path)
-    assert prompts == [read_builtin_resource("internal/publication-handshake", language=language).rstrip("\n")]
+    assert prompts == [read_builtin_resource("publication/handshake", language=language).rstrip("\n")]
     assert json.loads(output) == wire
     assert thread == "probe-thread"

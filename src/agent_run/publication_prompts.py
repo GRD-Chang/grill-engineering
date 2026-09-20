@@ -28,8 +28,7 @@ def publication_prompt(
         task_brief(request, read_issues=True),
         evidence,
         human_continuation(request),
-        resource(request, "internal/publication-boundary"),
-        resource(request, "internal/publication-output"),
+        resource(request, "publication/output"),
     )
     return "\n\n".join(block for block in blocks if block)
 
@@ -41,7 +40,7 @@ def publication_continuation_prompt(
     if final_run:
         request = _final_request(request)
     blocks = (
-        resource(request, "internal/publication-resume"),
+        resource(request, "publication/resume"),
         task_brief(request, read_issues=False),
         _publication_evidence(request),
         human_continuation(request),
@@ -63,11 +62,11 @@ def _publication_evidence(request: dict[str, Any]) -> str:
     artifact = request.get("acceptance_artifact")
     if isinstance(fallback, dict):
         return (
-            resource(request, "internal/publication-fallback").format(pretty(fallback))
+            resource(request, "publication/fallback-evidence").format(pretty(fallback))
         )
     if isinstance(artifact, dict):
         return (
-            resource(request, "internal/publication-acceptance-evidence")
+            resource(request, "publication/accepted-evidence")
             + "\n" + pretty(artifact)
         )
     raise ValueError(

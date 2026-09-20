@@ -374,15 +374,17 @@ def test_cli_restart_passes_frozen_methods_to_real_prompt_boundary(
     custom.write_text("创建时个人开发方法", encoding="utf-8")
     builtin = tmp_path / "builtin" / "zh"
     shutil.copytree(prompt_resources.RESOURCE_ROOT.parent, builtin.parent)
-    selected_builtin = builtin.parent / language
-    resume_resource = selected_builtin / "internal/development-resume.md"
-    resume_resource.write_text(resume_resource.read_text() + "\n创建时内部续接方法", encoding="utf-8")
+    resume_resource = tmp_path / "internal-resume.txt"
+    resume_resource.write_text("创建时内部续接方法", encoding="utf-8")
     capture = tmp_path / "prompts.jsonl"
     driver = tmp_path / "cli-worker-capture.py"
     driver.write_text('''import json, subprocess, sys
 from pathlib import Path
-from agent_run import cli, codex, prompt_resources
+from agent_run import cli, codex, prompt_resources, prompt_text_development
 prompt_resources.RESOURCE_ROOT = Path(sys.argv.pop(1))
+resume_text = Path(sys.argv.pop(1)).read_text(encoding="utf-8")
+for language in ("zh", "en"):
+    prompt_text_development.TEXTS["development/resume"][language] += "\\n" + resume_text
 capture = Path(sys.argv.pop(1))
 class Backend(codex.CodexCliBackend):
     def __init__(self, **kwargs):
@@ -409,7 +411,7 @@ raise SystemExit(cli.main(sys.argv[1:]))
 
     def call(repo: Path, github: Path, *arguments: str) -> str:
         result = subprocess.run(
-            [sys.executable, str(driver), str(builtin), str(capture), *arguments,
+            [sys.executable, str(driver), str(builtin), str(resume_resource), str(capture), *arguments,
              "--github-fixture", str(github), "--json"], cwd=repo, env=environment,
             capture_output=True, text=True, timeout=30,
         )

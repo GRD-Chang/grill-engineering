@@ -19,35 +19,35 @@ _REPAIR_SOURCES = {
     "acceptance": (
         "acceptance_artifact",
         "Acceptance Repair",
-        'internal/repair-acceptance',
+        'development/repair-acceptance',
     ),
     "git_integrity": (
         "git_integrity_evidence",
         "Git Integrity Repair",
-        'internal/repair-git-integrity',
+        'development/repair-git-integrity',
     ),
     "required_checks": (
         "ci_evidence",
         "Required-Checks Repair",
-        'internal/repair-required-checks',
+        'development/repair-required-checks',
     ),
     "human_revision": (
         "human_feedback",
         "Human Revision",
-        'internal/repair-human-revision',
+        'development/repair-human-revision',
     ),
     "merge_conflict": (
         "merge_conflict_evidence",
         "Merge Conflict Repair",
-        'internal/repair-merge-conflict',
+        'development/repair-merge-conflict',
     ),
 }
 
 
-def _repair_evidence(request: dict[str, Any]) -> tuple[str, str]:
+def _repair_evidence(request: dict[str, Any]) -> str:
     source = request.get("repair_source")
     if source is None:
-        return "", ""
+        return ""
     if not isinstance(source, str) or source not in _REPAIR_SOURCES:
         raise ValueError(f"unknown repair_source: {source}")
     field, error_role, instruction = _REPAIR_SOURCES[source]
@@ -60,7 +60,7 @@ def _repair_evidence(request: dict[str, Any]) -> tuple[str, str]:
         if not isinstance(evidence, dict):
             raise ValueError(f"{error_role} requires {field}")
         raw = pretty(evidence)
-    return resource(request, instruction), resource(request, "internal/repair-evidence").format(field, raw)
+    return resource(request, instruction).format(field, raw)
 
 
 def development_prompt(
@@ -68,14 +68,13 @@ def development_prompt(
 ) -> str:
     request = bind_resources(request)
     repair = request.get("repair_source") is not None
-    source_instruction, evidence = _repair_evidence(request)
+    evidence = _repair_evidence(request)
     if force_continuation or uses_short_role_prompt(request):
         return "\n\n".join(
             block
             for block in (
-                resource(request, 'internal/repair-resume' if repair else 'internal/development-resume'),
+                resource(request, 'development/repair-resume' if repair else 'development/resume'),
                 task_brief(request, read_issues=False, development=True),
-                source_instruction,
                 evidence,
                 review_budget(request, reviewer=False) if repair else "",
                 human_continuation(request),
@@ -94,18 +93,16 @@ def development_prompt(
         resource(request, 'methods/repair' if repair else 'methods/development'),
         task_brief(request, read_issues=not compact, development=True),
         (
-            resource(request, "internal/requirement-baseline")
+            resource(request, "context/requirement-baseline")
             if not compact else ""
         ),
-        source_instruction,
         evidence,
         (
-            resource(request, "internal/repair-requirement-refresh")
+            resource(request, "development/repair-requirement-refresh")
             if compact else ""
         ),
-        resource(request, "internal/git"),
         review_budget(request, reviewer=False) if repair else "",
         human_continuation(request),
-        resource(request, "internal/output"),
+        resource(request, "development/output"),
     ]
     return "\n\n".join(block for block in blocks if block)

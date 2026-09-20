@@ -184,7 +184,7 @@ agent-run prompts diff --json
 | `review.md` | `acceptance.md` |
 | `publication.md` | `publishing.md` |
 
-先初始化新主体，再根据差异将需要保留的定制手工迁入对应文件，并用预览确认；程序不猜测合并旧内容，也不删除旧文件。旧文件存在不代表新版使用它。内部 Resume、输出修复、探针及固定约束由内置资源维护，合并去向见[资源清单](agents/prompt-resource-map.md)。
+先初始化新主体，再根据差异将需要保留的定制手工迁入对应文件，并用预览确认；程序不猜测合并旧内容，也不删除旧文件。旧文件存在不代表新版使用它。内部 Resume、输出修复、探针及固定约束由程序中的双语文案维护，不另提供可编辑 Markdown；维护边界见[资源清单](agents/prompt-resource-map.md)。
 
 ### 预览实际 Prompt
 

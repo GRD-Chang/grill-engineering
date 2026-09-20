@@ -1,1 +1,0 @@
-The current workspace is an uncommitted preview of the repair under review merged with the default branch. HEAD remaining at the default-branch base is normal. Use the actual default-branch base and commit to merge below to inspect the complete result in the working tree; proving only the local repair passes is insufficient.

@@ -24,12 +24,12 @@ def review_prompt(request: dict[str, Any]) -> str:
         resource(request, "methods/acceptance"),
         task_brief(request, read_issues=True),
         _review_object(request),
-        resource(request, "internal/read-only-validation"),
+        resource(request, "review/read-only-validation"),
         _integration_evidence(request),
         _previous_review(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
-        resource(request, "internal/review-output"),
+        resource(request, "review/output"),
     )
     return "\n\n".join(block for block in blocks if block)
 
@@ -37,7 +37,7 @@ def review_prompt(request: dict[str, Any]) -> str:
 def review_continuation_prompt(request: dict[str, Any]) -> str:
     request = bind_resources(request)
     blocks = (
-        resource(request, "internal/review-resume"),
+        resource(request, "review/resume"),
         task_brief(request, read_issues=False),
         _review_object(request),
         _integration_evidence(request),
@@ -51,35 +51,35 @@ def _review_object(request: dict[str, Any]) -> str:
     identity = request.get("current_review_identity")
     facts = identity if isinstance(identity, dict) else {}
     if request.get("acceptance_scope") != "run":
-        description = resource(request, "internal/review-commit-object")
+        description = resource(request, "review/commit-object")
     elif request.get("repair_scope") == "run_repair":
         description = (
-            resource(request, "internal/review-run-repair-object")
+            resource(request, "review/run-repair-object")
         )
     elif request.get("candidate_acceptance") is True:
         description = (
-            resource(request, "internal/review-candidate-object")
+            resource(request, "review/candidate-object")
         )
     else:
         description = (
-            resource(request, "internal/review-run-object")
+            resource(request, "review/run-object")
         )
     return "\n".join(
-        [resource(request, "internal/review-object-label"), description, *_identity_lines(facts, request)]
+        [description, *_identity_lines(facts, request)]
     )
 
 
 def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[str]:
     labels = (
-        (resource(request, "internal/identity-run-base"), "run_base_sha"),
-        (resource(request, "internal/identity-repair-candidate"), "repair_candidate_sha"),
-        (resource(request, "internal/identity-default-base"), "default_base_sha"),
-        (resource(request, "internal/identity-run-head"), "run_head_sha"),
-        (resource(request, "internal/identity-candidate"), "candidate_sha"),
-        (resource(request, "internal/identity-reviewed-base"), "reviewed_base_sha"),
-        (resource(request, "internal/identity-reviewed-candidate"), "reviewed_candidate_sha"),
-        (resource(request, "internal/identity-reviewed-tree"), "reviewed_candidate_tree"),
-        (resource(request, "internal/identity-expected-tree"), "expected_merge_tree"),
+        (resource(request, "review/identity-run-base"), "run_base_sha"),
+        (resource(request, "review/identity-repair-candidate"), "repair_candidate_sha"),
+        (resource(request, "review/identity-default-base"), "default_base_sha"),
+        (resource(request, "review/identity-run-head"), "run_head_sha"),
+        (resource(request, "review/identity-candidate"), "candidate_sha"),
+        (resource(request, "review/identity-reviewed-base"), "reviewed_base_sha"),
+        (resource(request, "review/identity-reviewed-candidate"), "reviewed_candidate_sha"),
+        (resource(request, "review/identity-reviewed-tree"), "reviewed_candidate_tree"),
+        (resource(request, "review/identity-expected-tree"), "expected_merge_tree"),
     )
     return [
         f"{label}（{key}）：{identity[key]}"
@@ -91,19 +91,11 @@ def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[s
 def _previous_review(request: dict[str, Any]) -> str:
     artifact = request.get("previous_acceptance_artifact")
     if not isinstance(artifact, dict):
-        return resource(request, "internal/initial-review-baseline")
+        return resource(request, "review/initial-baseline")
     identity = request.get("previous_review_identity")
     facts = identity if isinstance(identity, dict) else {}
-    return "\n".join(
-        [
-            resource(request, "internal/previous-review-object-label"),
-            *_identity_lines(facts, request),
-            "",
-            resource(request, "internal/previous-review-artifact-label"),
-            pretty(artifact),
-            "",
-            resource(request, "internal/previous-review-boundary"),
-        ]
+    return resource(request, "review/previous-result").format(
+        "\n".join(_identity_lines(facts, request)), pretty(artifact)
     )
 
 
@@ -116,5 +108,5 @@ def _integration_evidence(request: dict[str, Any]) -> str:
     if not evidence:
         return ""
     return (
-        resource(request, "internal/integration-evidence").format(pretty(evidence))
+        resource(request, "review/integration-evidence").format(pretty(evidence))
     )

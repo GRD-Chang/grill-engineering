@@ -1,1 +1,0 @@
-Your responsibility covers the integrated result of multiple subtasks. Check accumulated changes, interactions between tasks and final user paths. A passing individual subtask or local repair cannot substitute for overall completion.

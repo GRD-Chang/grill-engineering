@@ -160,9 +160,9 @@ def scenarios(parent_url: str, task_url: str) -> dict[str, tuple[str, str]]:
     ):
         add(f"output-repair-{name}", f"仅修复输出格式：{title}",
             structured_output_repair_prompt(role, "【示例】输出缺少必填字段。", request=task))
-    add("runner-probe", "安装器结构化输出兼容性检查", resource(task, "internal/probe"))
+    add("runner-probe", "安装器结构化输出兼容性检查", resource(task, "context/probe"))
     add("publication-probe", "文案输出格式握手检查",
-        resource(task, "internal/publication-handshake"))
+        resource(task, "publication/handshake"))
     return previews
 
 

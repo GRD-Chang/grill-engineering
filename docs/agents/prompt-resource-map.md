@@ -1,37 +1,34 @@
-# Prompt 资源合并清单
+# Prompt 维护边界
 
-中英文采用相同角色及场景划分。实际资源位于 `src/agent_run/resources/{zh,en}/`；个人仅覆盖四份 `methods/*.md` 主体。此清单记录用途与合并去向，不以文件数量衡量 Token、速度或质量。
+每种语言只将四份用户方法保存在 `src/agent_run/resources/{zh,en}/methods/`。内部指令、字段标签和场景说明由代码维护；不将每句话映射为一个文件，也不以文件数量衡量 Token、速度或模型质量。
 
-## 四份完整主体
+## 按修改目的定位
 
-| 当前主体 | 原有内容去向 | 一份正文可维护的范围 |
-| --- | --- | --- |
-| `methods/development.md` | `development-common`、`development-initial`，内部 `development-role`、`development-delivery-boundary`、`development-completion` | 开发职责、Skill、按风险验证、单轮审查、交付清理与完成标准 |
-| `methods/repair.md` | `development-common`、`development-repair`，内部 `repair-role`、`development-delivery-boundary`、`repair-completion` | 修复职责、根因与直接回归验证、修复审查例外、交付清理与完成标准 |
-| `methods/acceptance.md` | `review`，内部 `review-role`、`review-finding-contract` 中的方法指导 | 独立验收职责、E2E、Standards/Spec、证据要求、Finding 边界与完成标准 |
-| `methods/publishing.md` | `publication`、内部 `publication-role` | 文案职责、四部分写作方法、证据限制、完成标准 |
-
-主体不含全部动态分支。程序仍选择修复来源、验收对象和调用方式，并附加当前任务、证据、工作区、固定权限及输出合同。个人正文可修改全部角色指导；程序权限、Artifact 校验与交付门禁由代码保持。
-
-## 内部资源
-
-| 合并后的用途 | 原有内容去向 |
+| 修改目的 | 维护位置与边界 |
 | --- | --- |
-| `prompt-copy.json` | checkout、任务/背景/完整需求 URL、identity 系列、前次验收标签、修复证据、验收对象及发布验收证据等短标签；键保持普通字符串，不执行模板语言 |
-| `internal/requirements-read.md` | requirements-read-order、requirements-read-command、requirements-source-authority 合并为权威需求读取指导 |
-| `internal/human-response.md` | human-response-label 与 human-response-boundary 合并；原始人工回复填入正文槽位 |
-| `internal/integration-evidence.md` | integration-evidence-label 与 integration-evidence-boundary 合并；当前集成证据填入正文槽位 |
-| `internal/publication-fallback.md` | publication-fallback-evidence 与 publication-fallback-boundary 合并；回退证据填入正文槽位，仅文案回退分支使用 |
-| `internal/*-resume.md` | 开发、修复、验收、发布分别按完整续接用途组织；原对应 resume-output 并入续接正文，保持当前角色结果格式提醒 |
-| `internal/development-review-budget.md`、`review-attempt-budget.md` | 各自预算上下文与原 review-budget-boundary 的适用约束放在一起 |
-| `internal/read-only-validation.md`、`publication-boundary.md`、`git.md` | 集中维护验收、发布与开发/修复的真实权限；完整预览包含适用边界 |
-| `internal/output.md`、`review-output.md`、`publication-output.md` | 固定结构化结果合同保留独立用途，不由个人正文替换 |
-| `internal/*-output-repair.md` | 开发、验收与发布的输出格式修复；仅修复结构化交付，不重新开展语义工作 |
-| `internal/probe.md`、`publication-handshake.md` | 安装兼容性探针与文案 schema 握手，继续作为独立调用用途 |
-| 其余范围、修复来源、验收对象与基线资源 | 保留现有条件选择，仅发送当前适用内容；没有为合并而把所有分支发送给 Worker |
+| 用户可定制的开发、修复、验收、发布方法 | `methods/development.md`、`repair.md`、`acceptance.md`、`publishing.md`；分别包含职责、方法、验证与完成标准 |
+| 开发/修复的内部权限、修复来源、续接和输出指导 | `prompt_text_development.py`；相同 Git 约束在开发与修复之间共用 |
+| 验收对象、只读验证、证据和输出指导 | `prompt_text_review.py`；保留不同验收对象的实际身份与证据边界 |
+| 发布证据、权限、续接和输出指导 | `prompt_text_publication.py`；区分当前通过独立验收和仅有旧审查证据 |
+| 需求范围、权威来源、人工回复及探针 | `prompt_text_context.py`；只共享真正相同的责任，不强行统一不同角色的权限 |
+| 场景选择与当前事实 | 现有 `development_prompts.py`、`reviewer_prompts.py`、`publication_prompts.py`、`prompt_context.py` |
+| 模型输出结构 | `agent_schemas.py`；通过输出 schema 独立传入，不在内部文案中重复手写完整 JSON 样例 |
+| 输出的业务合法性 | `artifacts.py`；例如结果类别与字段空值、验收状态与 findings 的关系仍由程序校验 |
 
-`messages.json` 继续负责 CLI 等界面文案；`prompt-copy.json` 负责 Worker Prompt 的短标签。新 Run 固定全部所选静态正文和 Prompt 短标签。旧 Run 缺少所需资源时明确不兼容，不补齐状态。旧个人文件的手工处理见[个人配置](../user-defaults.md#个人-markdown-方法)。
+内部输出指导说明如何陈述真实改动、验证、证据及人工阻塞。schema 不能替代这些语义要求；也不从 schema 自动生成全部自然语言规则。安装探针保持自己的最小 schema 和候选代码边界。
 
-## 可读性核对范围
+## 双语与动态信息
 
-维护时逐份阅读两种语言的四份主体，核对职责、方法、验证要求和完成标准是否独立可理解；再通过 `show-prompts.py` 或 `agent-run prompts preview` 检查开发、五类修复、各验收对象、文案、Resume、输出修复及探针的完整组装。动态权限和输出合同在完整预览核对，主体无需复制另一份隐藏角色指导。资源清单说明合并去向；测试保护公开行为和打包可读性，不镜像目录树或限制文件数。
+内部文案以完整用途为单位，将中文与英文相邻定义。两种语言共用场景判断和事实投影；缺少语言、空白正文或占位符不匹配明确失败，不回退另一语言。参数只替换一次，原始证据中的花括号等文本不作为模板再次解释。
+
+用户主体仍按语言分别编辑；修改角色方法时核对另一语言是否需要同步。CLI、History 与通知文案继续使用 `messages.json`，不与 Worker 指令混用。
+
+程序根据当前场景选择适用文案，注入 Issue URL、工作区、提交身份、原始证据及最新人工回复。需求正文仍由 Agent 根据 URL 读取。新修复使用完整修复主体；同次执行续接与输出格式修复只发送对应短指令，不因合并文案而重发全部角色或所有条件分支。
+
+## 固定内容与验证
+
+新 Run 创建时固定语言、四份主体和所选语言的内部静态内容。之后修改个人方法或升级内置文案不改写已有快照；当前对象、证据和人工回复逐次注入，不保存逐次完整 Prompt 或对话。本次不迁移旧 Run，旧快照缺少所需用途时明确拒绝。
+
+通过 `show-prompts.py` 或 `agent-run prompts preview` 检查实际正文：覆盖开发、五类修复、验收对象、两类发布证据、续接、人工回复、格式修复及探针。预览与执行使用同一组装函数。
+
+测试验证双语与占位符完整性、适用分支、固定权限及输出语义、个人覆盖和快照稳定；真实安装验证包内主体与代码文案可用。人工逐份阅读中英文关键约束，不能用键集合或关键词命中代替语义审查，也不以目录树镜像测试限制合理重构。

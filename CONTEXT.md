@@ -6,14 +6,14 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 ## 静态 Prompt 资源与个人方法
 
-新 Delivery Run 在首次持久化前一次读取并固定所选语言及全部角色正文、内部 Markdown 资源和集中 Prompt 文案。
+新 Delivery Run 在首次持久化前一次读取并固定语言、四份角色正文及代码定义的对应语言内部静态文案。
 个人配置的 `language` 仅接受 `zh`/`en`，默认中文，不跟随宿主 locale。
 个人方法按语言分别位于个人配置目录的 `prompts/zh/` 与 `prompts/en/`，跨项目共用；四份完整文件 `development.md`、`repair.md`、`acceptance.md`、`publishing.md` 分别用于开发、修复、验收和发布文案准备。
 同线程新修复与新线程修复均使用固定的完整修复正文；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
 每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。
 资源固定不改变 Thread Execution Binding、Controller/Worker/Publisher 权限或 Development Brief 的需求读取边界。
 缺少固定语言或必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用个人语言与候选安装包的内部资源。
-短界面文案通过 `messages.text` 统一选择，`messages.selected_language` 区分个人配置与固定 Run 语言；长指令继续按角色组织为 Markdown。
+短界面文案通过 `messages.text` 统一选择，`messages.selected_language` 区分个人配置与固定 Run 语言；用户方法按角色组织为 Markdown；内部指令按职责在代码中以中英文配对的完整用途块维护，共用场景组装逻辑。
 Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与详情）及飞书卡片共用中英文资源。
 无 Run 的界面使用个人语言，已有 Run 的展示使用固定语言；机器 JSON、审计事实和通知选择不随展示语言变化。
 原始标题、日志、用户反馈、Agent 摘要、Findings 与证据保持原文；查询不写入 Run 或通知记录，也不发送通知。

@@ -1,1 +1,0 @@
-Use current code, original evidence and requirements already known. When scope is unclear, evidence conflicts with requirements or acceptance criteria need checking, revisit the relevant Issue through read-only `gh issue view`. Do not reread unchanged requirements solely because a new repair round has started.

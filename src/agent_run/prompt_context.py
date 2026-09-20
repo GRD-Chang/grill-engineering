@@ -65,35 +65,31 @@ def task_brief(
     lines: list[str] = []
     if scope in ("parent_only", "run"):
         if isinstance(parent, str) and parent.strip():
-            lines.append(resource(request, "internal/full-requirement-url").format(parent))
-        lines.append(resource(request, "internal/scope-full-requirement"))
+            lines.append(resource(request, "context/full-requirement-url").format(parent))
+        lines.append(resource(request, "context/integrated-run" if scope == "run" else "context/full-requirement"))
         if scope == "run":
-            lines.append(
-                resource(request, "internal/scope-integrated-run")
-            )
             if read_issues:
-                lines.append(resource(request, "internal/requirements-read-dependencies"))
+                lines.append(resource(request, "context/requirements-read-dependencies"))
     else:
         if isinstance(task, str) and task.strip():
-            lines.append(resource(request, "internal/task-url").format(task))
+            lines.append(resource(request, "context/task-url").format(task))
         if isinstance(parent, str) and parent.strip():
-            lines.append(resource(request, "internal/parent-url").format(parent))
+            lines.append(resource(request, "context/parent-url").format(parent))
         lines.append(
-            resource(request, "internal/scope-child-task")
+            resource(request, "context/child-task")
         )
         if development:
             lines.append(
-                resource(request, "internal/scope-existing-work")
+                resource(request, "context/scope-existing-work")
             )
-    lines.append(resource(request, "internal/scope-current-regressions"))
     checkout = request.get("checkout")
     if isinstance(checkout, str) and checkout.strip():
-        lines.append(resource(request, "internal/checkout").format(checkout))
+        lines.append(resource(request, "context/checkout").format(checkout))
     if read_issues:
         lines.extend(
             [
                 "",
-                resource(request, "internal/requirements-read"),
+                resource(request, "context/requirements-read"),
             ]
         )
     return "\n".join(lines)
@@ -106,7 +102,7 @@ def human_continuation(request: dict[str, Any]) -> str:
     if "prior_human_blockers" in facts:
         facts["current_human_blockers"] = facts.pop("prior_human_blockers")
     return (
-        resource(request, "internal/human-response").format(pretty(facts))
+        resource(request, "context/human-response").format(pretty(facts))
     )
 
 
@@ -124,22 +120,22 @@ def review_budget(request: dict[str, Any], *, reviewer: bool) -> str:
         if type(current) is not int or current < 1:
             raise ValueError("current_review_attempt must be a positive integer")
         text = (
-            resource(request, "internal/review-attempt-budget").format(current, remaining)
+            resource(request, "review/attempt-budget").format(current, remaining)
         )
     else:
         completed = context.get("completed_review_attempts")
         if type(completed) is not int or completed < 0:
             raise ValueError("completed_review_attempts must be a non-negative integer")
-        text = resource(request, "internal/development-review-budget").format(completed, remaining)
+        text = resource(request, "development/review-budget").format(completed, remaining)
     return text
 
 
 def structured_output_repair_prompt(output_name: str, contract_error: str, *, request: dict[str, Any] | None = None) -> str:
     request = bind_resources(request or {})
     roles = {
-        "Development result": "internal/development-output-repair",
-        "Acceptance Artifact": "internal/review-output-repair",
-        "Publication Artifact": "internal/publication-output-repair",
+        "Development result": "development/output-repair",
+        "Acceptance Artifact": "review/output-repair",
+        "Publication Artifact": "publication/output-repair",
     }
     if output_name not in roles:
         raise ValueError(f"unknown structured output role: {output_name}")

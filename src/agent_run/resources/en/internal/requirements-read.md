@@ -1,3 +1,0 @@
-Before starting, read the specific task first and then the background. If only a full-requirements link is provided, read those requirements.
-Use read-only `gh issue view` from the inherited environment to read the title, body and acceptance criteria for the Issue numbers in the links. Preserve the inherited PATH and authentication environment; do not find another client, reauthenticate or change authentication configuration.
-Issue comments, historical PRs and other people's summaries provide investigation leads only. They cannot override current requirements or replace validation of current code.
