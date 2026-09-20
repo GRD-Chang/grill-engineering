@@ -6,10 +6,10 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 ## 静态 Prompt 资源与个人方法
 
-新 Delivery Run 在首次持久化前一次读取并固定所选语言及全部方法和内部 Markdown 资源。
+新 Delivery Run 在首次持久化前一次读取并固定所选语言及全部角色正文、内部 Markdown 资源和集中 Prompt 文案。
 个人配置的 `language` 仅接受 `zh`/`en`，默认中文，不跟随宿主 locale。
-个人方法按语言分别位于个人配置目录的 `prompts/zh/` 与 `prompts/en/`，跨项目共用；五份完整文件分别用于开发共用、初次开发、修复、验收和发布。
-同线程新修复与新线程修复均组合固定的开发共用与修复方法；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
+个人方法按语言分别位于个人配置目录的 `prompts/zh/` 与 `prompts/en/`，跨项目共用；四份完整文件 `development.md`、`repair.md`、`acceptance.md`、`publishing.md` 分别用于开发、修复、验收和发布文案准备。
+同线程新修复与新线程修复均使用固定的完整修复正文；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
 每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。
 资源固定不改变 Thread Execution Binding、Controller/Worker/Publisher 权限或 Development Brief 的需求读取边界。
 缺少固定语言或必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用个人语言与候选安装包的内部资源。

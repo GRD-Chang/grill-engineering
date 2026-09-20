@@ -1,0 +1,20 @@
+{
+  "internal/checkout": "Current checkout: {0}",
+  "internal/full-requirement-url": "Full requirements assigned for this task: {0}",
+  "internal/identity-candidate": "Commit to merge",
+  "internal/identity-default-base": "Default-branch merge base",
+  "internal/identity-expected-tree": "Expected merged file tree",
+  "internal/identity-repair-candidate": "Repair commit to merge",
+  "internal/identity-reviewed-base": "Comparison base",
+  "internal/identity-reviewed-candidate": "Commit under acceptance review",
+  "internal/identity-reviewed-tree": "File tree under acceptance review",
+  "internal/identity-run-base": "Overall development base",
+  "internal/identity-run-head": "Commit containing the complete delivery",
+  "internal/parent-url": "Background for understanding the overall requirements: {0}",
+  "internal/previous-review-artifact-label": "Previous complete review result (original previous_acceptance_artifact JSON):",
+  "internal/previous-review-object-label": "Previous acceptance review object:",
+  "internal/publication-acceptance-evidence": "Validation facts available for this task:\nThe current code has passed independent acceptance review. Use only the actual evidence in its e2e, standards and spec dimensions; do not substitute development claims for validation.\nComplete independent review result for this task (original acceptance_artifact JSON):",
+  "internal/repair-evidence": "{0} (complete original evidence):\n{1}",
+  "internal/review-object-label": "Current acceptance review object:",
+  "internal/task-url": "Specific task assigned for this work: {0}"
+}

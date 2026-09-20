@@ -86,13 +86,14 @@ def task_brief(
                 resource(request, "internal/scope-existing-work")
             )
     lines.append(resource(request, "internal/scope-current-regressions"))
+    checkout = request.get("checkout")
+    if isinstance(checkout, str) and checkout.strip():
+        lines.append(resource(request, "internal/checkout").format(checkout))
     if read_issues:
         lines.extend(
             [
                 "",
-                resource(request, "internal/requirements-read-order"),
-                resource(request, "internal/requirements-read-command"),
-                resource(request, "internal/requirements-source-authority"),
+                resource(request, "internal/requirements-read"),
             ]
         )
     return "\n".join(lines)
@@ -105,9 +106,7 @@ def human_continuation(request: dict[str, Any]) -> str:
     if "prior_human_blockers" in facts:
         facts["current_human_blockers"] = facts.pop("prior_human_blockers")
     return (
-        resource(request, "internal/human-response-label")
-        + pretty(facts)
-        + resource(request, "internal/human-response-boundary")
+        resource(request, "internal/human-response").format(pretty(facts))
     )
 
 
@@ -132,7 +131,7 @@ def review_budget(request: dict[str, Any], *, reviewer: bool) -> str:
         if type(completed) is not int or completed < 0:
             raise ValueError("completed_review_attempts must be a non-negative integer")
         text = resource(request, "internal/development-review-budget").format(completed, remaining)
-    return text + resource(request, "internal/review-budget-boundary")
+    return text
 
 
 def structured_output_repair_prompt(output_name: str, contract_error: str, *, request: dict[str, Any] | None = None) -> str:

@@ -18,7 +18,7 @@
   "settings.run_required": "Specify --run or --parent when querying Run settings",
   "settings.invalid_language": "language must be zh or en",
   "prompts.help": "Initialize personal methods, compare defaults and preview actual Prompts",
-  "prompts.init_help": "Create five missing personal methods, preserving existing files",
+  "prompts.init_help": "Initialize four complete role bodies, preserving existing files",
   "prompts.diff_help": "Compare personal methods with current built-in defaults without writing",
   "prompts.preview_help": "Assemble the final Prompt without calling an Agent",
   "prompts.request_help": "JSON object file containing an actual role request",
@@ -968,7 +968,7 @@
   "prompts.error.read": "Cannot read prompt resource {path}: {reason}",
   "prompts.error.inspect": "Cannot inspect prompt resource {path}: {reason}",
   "prompts.error.identities": "Incompatible prompt resource snapshot: required resource identities differ",
-  "prompts.error.content": "Invalid prompt resource snapshot: content must be text",
+  "prompts.error.content": "Invalid prompt resource snapshot: content must be non-empty text",
   "prompts.error.snapshot_size": "Prompt resource snapshot exceeds 512 KiB",
   "prompts.error.missing": "Incompatible prompt resource snapshot: missing {resource}",
   "notification.event.ticket_started": "Started developing ticket: {title}",
@@ -1015,5 +1015,6 @@
   "workspace.error.resolve_host": "Cannot resolve the remote host",
   "workspace.error.connect": "Cannot connect to the remote host",
   "workspace.error.disk_full": "The data directory has insufficient disk space",
-  "workspace.error.command_failed": "Runner independent repository operation failed (exit code {returncode}): {reason}"
+  "workspace.error.command_failed": "Runner independent repository operation failed (exit code {returncode}): {reason}",
+  "prompts.legacy_notice": "Legacy personal files are preserved but inactive: {mapping}. Compare your old edits with the new complete bodies and manually transfer the desired changes; no automatic merge is performed. See sources for effective bodies; a preview supplied with a snapshot uses that snapshot."
 }

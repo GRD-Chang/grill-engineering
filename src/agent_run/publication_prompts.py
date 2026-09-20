@@ -24,12 +24,11 @@ def publication_prompt(
     if uses_short_role_prompt(request):
         return publication_continuation_prompt(request)
     blocks = (
-        resource(request, "internal/publication-role"),
+        resource(request, "methods/publishing"),
         task_brief(request, read_issues=True),
         evidence,
         human_continuation(request),
         resource(request, "internal/publication-boundary"),
-        resource(request, "methods/publication"),
         resource(request, "internal/publication-output"),
     )
     return "\n\n".join(block for block in blocks if block)
@@ -46,7 +45,6 @@ def publication_continuation_prompt(
         task_brief(request, read_issues=False),
         _publication_evidence(request),
         human_continuation(request),
-        resource(request, "internal/publication-resume-output"),
     )
     return "\n\n".join(block for block in blocks if block)
 
@@ -65,14 +63,12 @@ def _publication_evidence(request: dict[str, Any]) -> str:
     artifact = request.get("acceptance_artifact")
     if isinstance(fallback, dict):
         return (
-            resource(request, "internal/publication-fallback-evidence")
-            + pretty(fallback)
-            + resource(request, "internal/publication-fallback-boundary")
+            resource(request, "internal/publication-fallback").format(pretty(fallback))
         )
     if isinstance(artifact, dict):
         return (
             resource(request, "internal/publication-acceptance-evidence")
-            + pretty(artifact)
+            + "\n" + pretty(artifact)
         )
     raise ValueError(
         "Publication requires acceptance_artifact or fallback_publication_context"

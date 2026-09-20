@@ -20,7 +20,7 @@ from agent_run.prompt_resources import resolve_resources
 @pytest.mark.parametrize("source", ["acceptance", "required_checks", "git_integrity", "human_revision", "merge_conflict", "final_ci_fix", "new_budget_window"])
 def test_shared_development_allocates_once_and_preserves_pending_work(source: str, tmp_path: Path) -> None:
     frozen_resources = resolve_resources()
-    frozen_resources["methods/development-repair"] = "Run 创建时固定的修复方法"
+    frozen_resources["methods/repair"] = "Run 创建时固定的修复方法"
     state: dict[str, Any] = {
         "policy_snapshot": DeliveryPolicy(development_thread_policy="new-per-attempt").snapshot(),
         "prompt_resources": deepcopy(frozen_resources),

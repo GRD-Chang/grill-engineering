@@ -84,7 +84,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
 
     methods = personal_method_directory()
     methods.mkdir(parents=True)
-    common = methods / "development-common.md"
+    common = methods / "development.md"
     common.write_text("旧任务个人方法 token=literal-example\n", encoding="utf-8")
     store = UserDefaultsStore()
     store.path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +106,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     original = load_only_run_state(git_repo)
     assert original["notifications"]["enabled"] is False
     assert original["creation_configuration"]["notifications"] == original["notifications"]
-    assert original["prompt_resources"]["methods/development-common"] == "旧任务个人方法 token=literal-example\n"
+    assert original["prompt_resources"]["methods/development"] == "旧任务个人方法 token=literal-example\n"
     common.write_text("新任务个人方法\n", encoding="utf-8")
     run_id = original["run_id"]
     profile = AgentProfileStore(managed_state(git_repo)).load(run_id)
@@ -148,7 +148,7 @@ def test_public_settings_file_cli_and_new_old_run_execution(
     created = run_cli(second_repo, second_fixture, "run", "1", "--agent-fixture", str(agents))
     assert created.returncode == 2, created.stdout + created.stderr
     new_state = load_only_run_state(second_repo)
-    assert new_state["prompt_resources"]["methods/development-common"] == "新任务个人方法\n"
+    assert new_state["prompt_resources"]["methods/development"] == "新任务个人方法\n"
     assert new_state["notifications"]["enabled"] is False
     assert new_state["notifications"]["open_id"] == "ou_new"
     new_profile = AgentProfileStore(managed_state(second_repo)).load(new_state["run_id"])
@@ -370,7 +370,7 @@ def test_cli_restart_passes_frozen_methods_to_real_prompt_boundary(
     assert settings("configure", "--language", language)[0] == 0
     methods = prompt_resources.personal_method_directory()
     methods.mkdir(parents=True)
-    custom = methods / "development-common.md"
+    custom = methods / "development.md"
     custom.write_text("创建时个人开发方法", encoding="utf-8")
     builtin = tmp_path / "builtin" / "zh"
     shutil.copytree(prompt_resources.RESOURCE_ROOT.parent, builtin.parent)
@@ -424,7 +424,7 @@ raise SystemExit(cli.main(sys.argv[1:]))
     assert settings("configure", "--language", other_language)[0] == 0
     other_methods = prompt_resources.personal_method_directory()
     other_methods.mkdir(parents=True)
-    (other_methods / "development-common.md").write_text("另一语言新任务方法", encoding="utf-8")
+    (other_methods / "development.md").write_text("另一语言新任务方法", encoding="utf-8")
     custom.write_text("修改后个人开发方法", encoding="utf-8")
     resume_resource.write_text("修改后内部续接方法", encoding="utf-8")
     resumed = call(git_repo, fixture, "resume", state["run_id"], "--message", "继续核验")
@@ -528,7 +528,7 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
     assert cli.main(["prompts", "init"]) == 0
     initialized = capsys.readouterr().out
     assert ("已创建:" if language == "zh" else "Created:") in initialized
-    assert "development-common.md" in initialized
+    assert "development.md" in initialized
     assert cli.main(["run", "1", "--repo", "invalid-repository"]) == 2
     failed = capsys.readouterr().out
     assert ("命令状态: 未执行" if language == "zh" else "Command status: Not executed") in failed

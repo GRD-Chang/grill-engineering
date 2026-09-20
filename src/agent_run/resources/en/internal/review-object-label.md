@@ -1,1 +1,0 @@
-Current acceptance review object:

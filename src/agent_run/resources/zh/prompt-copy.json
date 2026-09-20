@@ -1,0 +1,20 @@
+{
+  "internal/checkout": "当前 checkout：{0}",
+  "internal/full-requirement-url": "本次负责的完整需求：{0}",
+  "internal/identity-candidate": "待合并提交",
+  "internal/identity-default-base": "默认分支合并基准",
+  "internal/identity-expected-tree": "预期合并文件树",
+  "internal/identity-repair-candidate": "待合并的修复提交",
+  "internal/identity-reviewed-base": "比较基准",
+  "internal/identity-reviewed-candidate": "待验收提交",
+  "internal/identity-reviewed-tree": "待验收文件树",
+  "internal/identity-run-base": "整体开发基准",
+  "internal/identity-run-head": "本次全部交付的提交",
+  "internal/parent-url": "用于理解整体需求的背景：{0}",
+  "internal/previous-review-artifact-label": "上一次完整审查结果（previous_acceptance_artifact 原始 JSON）：",
+  "internal/previous-review-object-label": "上一次验收对象：",
+  "internal/publication-acceptance-evidence": "本次可使用的验证事实：\n当前代码已获独立验收；只使用其中 e2e、standards、spec 三个维度的实际证据，不用开发自述代替验证。\n本次完整独立审查结果（acceptance_artifact 原始 JSON）：",
+  "internal/repair-evidence": "{0}（完整原始证据）：\n{1}",
+  "internal/review-object-label": "本次验收对象：",
+  "internal/task-url": "本次负责的具体任务：{0}"
+}

@@ -1,7 +1,8 @@
-"""Read whole Markdown resources; personal methods are shared across repositories."""
+"""Read complete role bodies and fixed prompt copy, shared across repositories."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import stat
 from typing import Any
@@ -10,25 +11,13 @@ from agent_run.messages import ErrorMessage, error_message, validate_language
 
 from agent_run.paths import app_config_root
 
-METHOD_NAMES = (
-    "development-common", "development-initial", "development-repair", "review", "publication",
-)
+METHOD_NAMES = ("development", "repair", "acceptance", "publishing")
 RESOURCE_ROOT = Path(__file__).parent / "resources" / "zh"
 MAX_RESOURCE_BYTES = 512 * 1024
 # The manifest fixes resource identities independently of mutable files on disk.
-RESOURCE_KEYS = (
+COPY_KEYS = (
     'internal/checkout',
-    'internal/development-completion',
-    'internal/development-delivery-boundary',
-    'internal/development-output-repair',
-    'internal/development-resume',
-    'internal/development-resume-output',
-    'internal/development-review-budget',
-    'internal/development-role',
     'internal/full-requirement-url',
-    'internal/git',
-    'internal/human-response-boundary',
-    'internal/human-response-label',
     'internal/identity-candidate',
     'internal/identity-default-base',
     'internal/identity-expected-tree',
@@ -38,52 +27,48 @@ RESOURCE_KEYS = (
     'internal/identity-reviewed-tree',
     'internal/identity-run-base',
     'internal/identity-run-head',
-    'internal/initial-review-baseline',
-    'internal/integration-evidence-boundary',
-    'internal/integration-evidence-label',
-    'internal/output',
     'internal/parent-url',
     'internal/previous-review-artifact-label',
-    'internal/previous-review-boundary',
     'internal/previous-review-object-label',
-    'internal/probe',
     'internal/publication-acceptance-evidence',
+    'internal/repair-evidence',
+    'internal/review-object-label',
+    'internal/task-url',
+)
+MARKDOWN_KEYS = (
+    'internal/development-output-repair',
+    'internal/development-resume',
+    'internal/development-review-budget',
+    'internal/git',
+    'internal/human-response',
+    'internal/initial-review-baseline',
+    'internal/integration-evidence',
+    'internal/output',
+    'internal/previous-review-boundary',
+    'internal/probe',
     'internal/publication-boundary',
-    'internal/publication-fallback-boundary',
-    'internal/publication-fallback-evidence',
+    'internal/publication-fallback',
     'internal/publication-handshake',
     'internal/publication-output',
     'internal/publication-output-repair',
     'internal/publication-resume',
-    'internal/publication-resume-output',
-    'internal/publication-role',
     'internal/read-only-validation',
     'internal/repair-acceptance',
-    'internal/repair-completion',
-    'internal/repair-evidence',
     'internal/repair-git-integrity',
     'internal/repair-human-revision',
     'internal/repair-merge-conflict',
     'internal/repair-required-checks',
     'internal/repair-requirement-refresh',
-    'internal/repair-role',
     'internal/repair-resume',
     'internal/requirement-baseline',
-    'internal/requirements-read-command',
+    'internal/requirements-read',
     'internal/requirements-read-dependencies',
-    'internal/requirements-read-order',
-    'internal/requirements-source-authority',
     'internal/review-attempt-budget',
-    'internal/review-budget-boundary',
     'internal/review-candidate-object',
     'internal/review-commit-object',
-    'internal/review-object-label',
     'internal/review-output',
-    'internal/review-finding-contract',
     'internal/review-output-repair',
     'internal/review-resume',
-    'internal/review-resume-output',
-    'internal/review-role',
     'internal/review-run-object',
     'internal/review-run-repair-object',
     'internal/scope-child-task',
@@ -91,13 +76,12 @@ RESOURCE_KEYS = (
     'internal/scope-existing-work',
     'internal/scope-full-requirement',
     'internal/scope-integrated-run',
-    'internal/task-url',
-    'methods/development-common',
-    'methods/development-initial',
-    'methods/development-repair',
-    'methods/publication',
-    'methods/review',
+    'methods/acceptance',
+    'methods/development',
+    'methods/publishing',
+    'methods/repair',
 )
+RESOURCE_KEYS = MARKDOWN_KEYS + COPY_KEYS
 
 
 def selected_language(language: str | None = None) -> str:
@@ -121,7 +105,25 @@ def read_builtin_resource(key: str, package_root: Path | None = None, *, languag
         root = RESOURCE_ROOT if language == "zh" else RESOURCE_ROOT.parent / language
     else:
         root = package_root / "resources" / language
+    if key in COPY_KEYS:
+        return _read_copy(root)[key]
     return _read(root / f"{key}.md")
+
+
+def _read_copy(root: Path) -> dict[str, str]:
+    path = root / "prompt-copy.json"
+    try:
+        values = json.loads(_read(path))
+        if not isinstance(values, dict) or set(values) != set(COPY_KEYS):
+            raise ValueError("prompt copy identities differ")
+        if any(not isinstance(value, str) or not value.strip() for value in values.values()):
+            raise ValueError("prompt copy must contain non-empty text")
+        return values
+    except (ValueError, TypeError) as error:
+        raise ValueError(error_message(
+            "prompts.error.read", audit=f"Cannot read prompt resource {path}: {error}",
+            path=path, reason=str(error),
+        )) from error
 
 
 def _read(path: Path) -> str:
@@ -135,7 +137,10 @@ def _read(path: Path) -> str:
             data = stream.read(MAX_RESOURCE_BYTES + 1)
         if len(data) > MAX_RESOURCE_BYTES:
             raise ValueError(error_message("prompts.error.size", audit="resource exceeds 512 KiB"))
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
+        if not text.strip():
+            raise ValueError("resource must contain non-empty text")
+        return text
     except (OSError, UnicodeError, ValueError) as error:
         reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
         raise ValueError(error_message(
@@ -146,7 +151,9 @@ def _read(path: Path) -> str:
 
 def builtin_resources(language: str | None = None) -> dict[str, str]:
     language = selected_language(language)
-    resources = {key: read_builtin_resource(key, language=language) for key in RESOURCE_KEYS}
+    resources = {key: read_builtin_resource(key, language=language) for key in MARKDOWN_KEYS}
+    root = RESOURCE_ROOT if language == "zh" else RESOURCE_ROOT.parent / language
+    resources.update(_read_copy(root))
     validate_resources(resources)
     return resources
 
@@ -179,9 +186,9 @@ def validate_resources(snapshot: object) -> None:
             "prompts.error.identities",
             audit="Incompatible prompt resource snapshot: required resource identities differ",
         ))
-    if any(not isinstance(value, str) for value in snapshot.values()):
+    if any(not isinstance(value, str) or not value.strip() for value in snapshot.values()):
         raise ValueError(error_message(
-            "prompts.error.content", audit="Invalid prompt resource snapshot: content must be text"
+            "prompts.error.content", audit="Invalid prompt resource snapshot: content must be non-empty text"
         ))
     if sum(len(value.encode("utf-8")) for value in snapshot.values()) > MAX_RESOURCE_BYTES:
         raise ValueError(error_message(

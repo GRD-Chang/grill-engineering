@@ -161,19 +161,30 @@ agent-run prompts diff
 agent-run prompts diff --json
 ```
 
-初始化一次生成五份完整 Markdown：
+初始化一次生成四份完整 Markdown，每份包括该角色的职责、工作方法、验证要求和完成标准：
 
 | 文件 | 适用工作 |
 | --- | --- |
-| `development-common.md` | 所有开发与修复共用方法 |
-| `development-initial.md` | 初次开发，与共用方法组合 |
-| `development-repair.md` | 各类修复，与共用方法组合 |
-| `review.md` | 子任务、完整需求与整体验收 |
-| `publication.md` | 交付说明与最终发布说明 |
+| `development.md` | 初次开发 |
+| `repair.md` | 各类定向修复 |
+| `acceptance.md` | 子任务、完整需求与整体验收 |
+| `publishing.md` | 交付说明与最终发布说明准备 |
 
-重复初始化只补缺失文件，保留已有正文。可自由编辑标题与排版，程序按文件职责选择方法，不解析 Markdown 标题。缺少个人文件时回退内置默认；存在但无法读取时明确失败。用户方法不改变 Worker 的权限、任务范围和结构化输出接口，内部续接、输出格式修复与探针由程序资源维护。
+重复初始化只补缺失文件，保留已有正文。用户可完整修改主要正文，程序不解析 Markdown 标题。缺少个人文件时直接回退同语言内置默认，无需初始化；存在但不可读、空白或无效编码时明确失败。程序另行附加当前任务、证据、工作区、实际权限和固定输出合同，完整预览可见这些内容。正文定制不改变 Controller、Worker、Publisher 的程序权限、Artifact 校验与交付门禁。发布角色只准备文案，外部写入仍由 Publisher 执行。
 
 升级会保留个人文件；**定制副本不会自动继承默认正文更新**。`diff` 只读比较当前内置正文与个人生效正文，不合并、不改写文件。无差异时返回成功，JSON 中每份文件对应空字符串。
+
+旧格式个人文件保留但不再生效。初始化、差异和预览会提示旧文件的对应关系及当前生效来源：
+
+| 旧文件 | 手工迁入的新主体 |
+| --- | --- |
+| `development-common.md` | `development.md` 与 `repair.md` 中适用的共用指导 |
+| `development-initial.md` | `development.md` |
+| `development-repair.md` | `repair.md` |
+| `review.md` | `acceptance.md` |
+| `publication.md` | `publishing.md` |
+
+先初始化新主体，再根据差异将需要保留的定制手工迁入对应文件，并用预览确认；程序不猜测合并旧内容，也不删除旧文件。旧文件存在不代表新版使用它。内部 Resume、输出修复、探针及固定约束由内置资源维护，合并去向见[资源清单](agents/prompt-resource-map.md)。
 
 ### 预览实际 Prompt
 
@@ -191,7 +202,7 @@ agent-run prompts preview --role development --request request.json --continuati
 
 角色可选 `development`、`review`、`publication`、`final-publication`、`output-repair`。输出格式修复需要 `output_name`（`Development result`、`Acceptance Artifact` 或 `Publication Artifact`）和 `contract_error` 字符串，不接受 `--continuation`。请求使用真实角色的字段：`repair_source` 指定修复来源，`acceptance_scope` 区分 `ticket`、`parent_only`、`run`，相关证据字段按实际工作提供；最终发布需要 `acceptance_artifact`。`--continuation` 预览同轮续接；请求中的 `_invocation_mode` 可指定 `resume` 或 `new-thread`，遵循真实组装规则。预览和执行共用资源读取与角色组装，不访问 GitHub、不调用模型，也不推进 Run。
 
-没有资源快照的请求按个人语言使用方法与内置资源，也可在预览请求中提供 `language`（`zh` 或 `en`）选择资源；这不是另一项持久配置。请求包含 `_prompt_resources` 时使用该固定资源集合，可从 Run 的 `prompt_resources` 字段取得；动态任务和证据仍由请求提供。新 Run 创建时一次固定语言和所有所选语言的静态资源，此后个人或内置修改只影响新 Run，原 Run 恢复和阶段切换沿用创建时资源。缺少固定语言或必需资源的旧 Run 按不兼容状态明确失败，不自动补齐或迁移。不保存逐次完整动态 Prompt 或对话历史。
+没有资源快照的请求按个人语言使用方法与内置资源，也可在预览请求中提供 `language`（`zh` 或 `en`）选择资源；这不是另一项持久配置。请求包含 `_prompt_resources` 时使用该固定资源集合，可从 Run 的 `prompt_resources` 字段取得；动态任务和证据仍由请求提供。新 Run 创建时一次固定语言和所有所选语言的静态正文及集中 Prompt 文案，此后个人或内置修改只影响新 Run，原 Run 恢复和阶段切换沿用创建时资源。缺少固定语言或必需资源的旧 Run 按不兼容状态明确失败，不自动补齐或迁移。不保存逐次完整动态 Prompt 或对话历史。
 
 
 ## 统一语言设置
@@ -211,7 +222,7 @@ agent-run settings show --run <run-id>
 无 Run 的帮助和个人设置使用当前个人语言；已有 Run 的状态、历史及适用操作回执
 使用创建时固定的语言。切换个人语言不会改写已有 Run 或历史记录。
 
-五份方法分别位于 `prompts/zh/` 和 `prompts/en/`。初始化只补所选语言的缺失文件，
+四份主要正文分别位于 `prompts/zh/` 和 `prompts/en/`。初始化只补所选语言的缺失文件，
 差异查看只比较同语言默认版本；不覆盖另一语言文件，不跨语言回退，也不自动翻译个人内容。
 无 Run 的预览和安装探针使用个人语言。已有 Run 的语言及全部静态 Prompt 在创建时固定，
 切换个人语言或修改正文不会改变恢复、修复、验收、发布和输出格式修复所使用的资源；

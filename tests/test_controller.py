@@ -183,7 +183,7 @@ def test_legacy_state_fails_closed_before_controller_mutates_it(
     elif incompatibility == "invalid_language":
         state["language"] = "fr"
     else:
-        state["prompt_resources"].pop("methods/review")
+        state["prompt_resources"].pop("methods/acceptance")
     store.save_run(str(state["run_id"]), state)
     before = deepcopy(store.load_run(str(state["run_id"])))
 

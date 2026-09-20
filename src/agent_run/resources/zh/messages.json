@@ -18,7 +18,7 @@
   "settings.run_required": "查询 Run 配置时请同时指定 --run 或 --parent",
   "settings.invalid_language": "language 必须是 zh 或 en",
   "prompts.help": "初始化个人方法、查看默认差异和预览实际 Prompt",
-  "prompts.init_help": "补齐五份个人方法，保留已有文件",
+  "prompts.init_help": "补齐四份完整角色正文，保留已有文件",
   "prompts.diff_help": "只读比较个人方法与当前内置默认",
   "prompts.preview_help": "只读组装请求的最终 Prompt，不调用 Agent",
   "prompts.request_help": "实际角色请求 JSON 对象文件",
@@ -968,7 +968,7 @@
   "prompts.error.read": "无法读取 Prompt 资源 {path}: {reason}",
   "prompts.error.inspect": "无法检查 Prompt 资源 {path}: {reason}",
   "prompts.error.identities": "Prompt 资源快照不兼容：必需资源标识不匹配",
-  "prompts.error.content": "Prompt 资源快照无效：内容必须是文本",
+  "prompts.error.content": "Prompt 资源快照无效：内容必须是非空文本",
   "prompts.error.snapshot_size": "Prompt 资源快照超过 512 KiB",
   "prompts.error.missing": "Prompt 资源快照不兼容：缺少 {resource}",
   "notification.event.ticket_started": "开始开发子任务：{title}",
@@ -1015,5 +1015,6 @@
   "workspace.error.resolve_host": "无法解析远端主机",
   "workspace.error.connect": "无法连接远端主机",
   "workspace.error.disk_full": "数据目录磁盘空间不足",
-  "workspace.error.command_failed": "Runner 独立仓库操作失败（退出码 {returncode}）：{reason}"
+  "workspace.error.command_failed": "Runner 独立仓库操作失败（退出码 {returncode}）：{reason}",
+  "prompts.legacy_notice": "旧格式个人文件已保留，但不再生效：{mapping}。请自行对照旧修改与新完整正文，将需要的内容手动写入新文件；程序不会自动合并。实际生效来源见 sources（来源）；预览若提供快照，则使用该快照。"
 }

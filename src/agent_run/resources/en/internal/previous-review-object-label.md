@@ -1,1 +1,0 @@
-Previous acceptance review object:

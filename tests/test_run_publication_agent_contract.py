@@ -680,7 +680,7 @@ def test_final_run_publication_receives_only_role_required_facts(
         state["ticket_jobs"]["2"],
         state["ticket_jobs"]["2"]["deterministic_integration_record"],
     )
-    state["prompt_resources"]["methods/publication"] = "Run 创建时固定的发布方法"
+    state["prompt_resources"]["methods/publishing"] = "Run 创建时固定的发布方法"
     states.save_run(str(state["run_id"]), state)
     agents = RunPublicationAgents()
 

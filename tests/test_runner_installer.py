@@ -539,7 +539,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     first_manifest = _manifest(first_snapshot)
     first_identity = first_manifest["content_identity"]
     package = runner_installer.find_runtime_package(first_snapshot)
-    default_method = package / "resources/en/methods/development-common.md"
+    default_method = package / "resources/en/methods/development.md"
     old_method = default_method.read_text(encoding="utf-8")
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
     assert int(count.read_text()) == 1
@@ -558,7 +558,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     assert command.returncode == 0
     assert "agent-run" in command.stdout
 
-    (source / "src/agent_run/resources/en/methods/development-common.md").write_text(
+    (source / "src/agent_run/resources/en/methods/development.md").write_text(
         "新版内置方法\n", encoding="utf-8",
     )
     second = _run(source, home, fake_bin)
@@ -1605,34 +1605,44 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert len(packaged_licenses) == 1
     assert packaged_licenses[0].read_bytes() == (PROJECT_ROOT / "LICENSE").read_bytes()
     package = runner_installer.find_runtime_package(_active_snapshot(home))
-    for language in ("zh", "en"):
-        assert len(list((package / f"resources/{language}/methods").glob("*.md"))) == 5
-        assert (package / f"resources/{language}/internal/probe.md").is_file()
-        assert (package / f"resources/{language}/messages.json").is_file()
     request_path = tmp_path / "preview-request.json"
-    request_path.write_text('{"acceptance_scope":"parent_only"}', encoding="utf-8")
     source_resources = source / "src/agent_run/resources"
     hidden_resources = source / "resources-hidden-for-installed-check"
     source_resources.rename(hidden_resources)
     try:
-        preview = subprocess.run(
-            [str(stable_entry), "prompts", "preview", "--role", "development", "--request", str(request_path)],
-            env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
-        )
-        assert preview.returncode == 0, preview.stdout + preview.stderr
-        assert "skill:implement" in preview.stdout
-        configured = subprocess.run(
-            [str(stable_entry), "settings", "configure", "--language", "en", "--json"],
-            env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
-        )
-        assert configured.returncode == 0, configured.stdout + configured.stderr
-        english = subprocess.run(
-            [str(stable_entry), "prompts", "preview", "--role", "development", "--request", str(request_path)],
-            env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
-        )
-        assert english.returncode == 0, english.stdout + english.stderr
-        assert "Use English" in english.stdout
-        assert "skill:implement" in english.stdout
+        # Reuse this real installed snapshot for both languages and every body;
+        # source-only tests cannot detect a wheel omitting Markdown or JSON.
+        assert "PYTHONPATH" not in isolated_environment
+        for language in ("zh", "en"):
+            configured = subprocess.run(
+                [str(stable_entry), "settings", "configure", "--language", language, "--json"],
+                env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
+            )
+            assert configured.returncode == 0, configured.stdout + configured.stderr
+            for body, role, context in (
+                ("development", "development", {}),
+                ("repair", "development", {
+                    "repair_source": "acceptance", "acceptance_artifact": {"verdict": "reject"},
+                }),
+                ("acceptance", "review", {}),
+                ("publishing", "publication", {"acceptance_artifact": {"verdict": "accept"}}),
+            ):
+                request_path.write_text(json.dumps({
+                    "acceptance_scope": "parent_only", **context,
+                }), encoding="utf-8")
+                preview = subprocess.run(
+                    [str(stable_entry), "prompts", "preview", "--role", role,
+                     "--request", str(request_path)],
+                    env=isolated_environment, cwd=tmp_path, capture_output=True,
+                    text=True, timeout=15,
+                )
+                assert preview.returncode == 0, preview.stdout + preview.stderr
+                builtin = (package / f"resources/{language}/methods/{body}.md").read_text(
+                    encoding="utf-8",
+                ).strip()
+                assert builtin and builtin in preview.stdout
+                language_instruction = "Use English" if language == "en" else "中文"
+                assert language_instruction in preview.stdout
     finally:
         hidden_resources.rename(source_resources)
 

@@ -79,7 +79,6 @@ def development_prompt(
                 evidence,
                 review_budget(request, reviewer=False) if repair else "",
                 human_continuation(request),
-                resource(request, "internal/development-resume-output"),
             )
             if block
         )
@@ -91,18 +90,9 @@ def development_prompt(
         and bool(thread.strip())
         and request.get("_invocation_mode") != "new-thread"
     )
-    completion = (
-        resource(request, "internal/repair-completion")
-        if repair
-        else resource(request, "internal/development-completion")
-    )
     blocks = [
-        resource(request, 'internal/repair-role' if repair else 'internal/development-role'),
+        resource(request, 'methods/repair' if repair else 'methods/development'),
         task_brief(request, read_issues=not compact, development=True),
-        (
-            resource(request, "internal/checkout").format(request['checkout'])
-            if request.get("checkout") and not compact else ""
-        ),
         (
             resource(request, "internal/requirement-baseline")
             if not compact else ""
@@ -113,11 +103,7 @@ def development_prompt(
             resource(request, "internal/repair-requirement-refresh")
             if compact else ""
         ),
-        resource(request, "methods/development-common"),
-        resource(request, "methods/development-repair" if repair else "methods/development-initial"),
         resource(request, "internal/git"),
-        resource(request, "internal/development-delivery-boundary"),
-        completion,
         review_budget(request, reviewer=False) if repair else "",
         human_continuation(request),
         resource(request, "internal/output"),

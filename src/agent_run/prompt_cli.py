@@ -5,6 +5,7 @@ import argparse
 import difflib
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 from agent_run import prompt_resources
@@ -14,6 +15,35 @@ from agent_run.development_prompts import development_prompt
 from agent_run.prompt_context import structured_output_repair_prompt
 from agent_run.publication_prompts import publication_continuation_prompt, publication_prompt
 from agent_run.reviewer_prompts import review_continuation_prompt, review_prompt
+
+
+LEGACY_METHODS = {
+    "development-common.md": ["development.md", "repair.md"],
+    "development-initial.md": ["development.md"],
+    "development-repair.md": ["repair.md"],
+    "review.md": ["acceptance.md"],
+    "publication.md": ["publishing.md"],
+}
+
+
+def _configuration_details(language: str) -> dict[str, Any]:
+    directory = prompt_resources.personal_method_directory(language)
+    legacy = {
+        name: replacements for name, replacements in LEGACY_METHODS.items()
+        if (directory / name).exists() or (directory / name).is_symlink()
+    }
+    sources = {}
+    for name in prompt_resources.METHOD_NAMES:
+        path = directory / f"{name}.md"
+        sources[path.name] = str(path) if path.exists() or path.is_symlink() else f"builtin/{language}/methods/{name}.md"
+    return {"sources": sources, "legacy_files": legacy}
+
+
+def _legacy_notice(details: dict[str, Any], language: str) -> str:
+    if not details["legacy_files"]:
+        return ""
+    mapping = "; ".join(f"{old} → {', '.join(new)}" for old, new in details["legacy_files"].items())
+    return text("prompts.legacy_notice", language=language, mapping=mapping)
 
 
 def add_parser(commands: Any) -> None:
@@ -42,12 +72,25 @@ def execute(parsed: argparse.Namespace) -> int:
         request = json.loads(parsed.request.read_text(encoding="utf-8"))
         if not isinstance(request, dict):
             raise ValueError(text("prompts.request_object", language=prompt_resources.selected_language()))
-        if "_prompt_resources" not in request:
+        frozen = "_prompt_resources" in request
+        language = prompt_resources.selected_language(request.get("language"))
+        details = _configuration_details(language)
+        if not frozen:
             request["_prompt_resources"] = prompt_resources.resolve_resources(request.get("language"))
         prompt_resources.validate_resources(request["_prompt_resources"])
         prompt = _preview(request, parsed.role, parsed.continuation)
         result: dict[str, Any] = {"result": "prompt_preview", "role": parsed.role, "prompt": prompt}
+        result.update(details)
+        if frozen:
+            result["sources"] = {f"{name}.md": "request_snapshot" for name in prompt_resources.METHOD_NAMES}
         plain = prompt
+        notice = _legacy_notice(details, language)
+        if notice:
+            result["notice"] = notice
+            print(notice, file=sys.stderr)
+            if not parsed.as_json:
+                for name, source in result["sources"].items():
+                    print(f"{name}: {source}", file=sys.stderr)
     else:
         language = prompt_resources.selected_language()
         directory = prompt_resources.personal_method_directory(language)
@@ -82,6 +125,14 @@ def execute(parsed: argparse.Namespace) -> int:
                 ))
             result = {"result": "prompts_diff", "directory": str(directory), "differences": differences}
             plain = "\n".join(value for value in differences.values() if value) or text("prompts.no_diff", language=language)
+    if parsed.prompts_command != "preview":
+        details = _configuration_details(language)
+        result.update(details)
+        plain += "\n" + "\n".join(f"{name}: {source}" for name, source in details["sources"].items())
+        notice = _legacy_notice(details, language)
+        if notice:
+            result["notice"] = notice
+            plain += "\n" + notice
     print(json.dumps(result, ensure_ascii=False, sort_keys=True) if parsed.as_json else plain)
     return 0
 

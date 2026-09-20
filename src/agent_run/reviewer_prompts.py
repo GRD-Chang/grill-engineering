@@ -21,16 +21,14 @@ def review_prompt(request: dict[str, Any]) -> str:
     if uses_short_role_prompt(request, reviewer=True):
         return review_continuation_prompt(request)
     blocks = (
-        resource(request, "internal/review-role"),
+        resource(request, "methods/acceptance"),
         task_brief(request, read_issues=True),
         _review_object(request),
-        resource(request, "methods/review"),
         resource(request, "internal/read-only-validation"),
         _integration_evidence(request),
         _previous_review(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
-        resource(request, "internal/review-finding-contract"),
         resource(request, "internal/review-output"),
     )
     return "\n\n".join(block for block in blocks if block)
@@ -45,7 +43,6 @@ def review_continuation_prompt(request: dict[str, Any]) -> str:
         _integration_evidence(request),
         review_budget(request, reviewer=True),
         human_continuation(request),
-        resource(request, "internal/review-resume-output"),
     )
     return "\n\n".join(block for block in blocks if block)
 
@@ -119,7 +116,5 @@ def _integration_evidence(request: dict[str, Any]) -> str:
     if not evidence:
         return ""
     return (
-        resource(request, "internal/integration-evidence-label")
-        + pretty(evidence)
-        + resource(request, "internal/integration-evidence-boundary")
+        resource(request, "internal/integration-evidence").format(pretty(evidence))
     )

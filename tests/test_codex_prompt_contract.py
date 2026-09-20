@@ -1273,7 +1273,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "OLD_RESPONSE_SENTINEL" not in prompt
             else:
                 assert "PRIOR_BLOCKER_SENTINEL" not in prompt
-            assert ("PRIVATE_CHECKOUT_SENTINEL" in prompt) is (method == "develop")
+            assert "PRIVATE_CHECKOUT_SENTINEL" in prompt
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
@@ -1902,9 +1902,8 @@ def test_custom_methods_reach_actual_development_calls(
 
     directory = personal_method_directory()
     directory.mkdir(parents=True)
-    for name, text in (("development-common", "个人共同方法：检查真实边界。"),
-                       ("development-initial", "个人初次方法：实现本次需求。"),
-                       ("development-repair", "个人修复方法：定位根因。")):
+    for name, text in (("development", "个人开发正文：检查真实边界，实现本次需求。"),
+                       ("repair", "个人修复正文：定位根因。")):
         (directory / f"{name}.md").write_text(text, encoding="utf-8")
     resources = resolve_resources()
     request: dict[str, Any] = {
@@ -1919,31 +1918,51 @@ def test_custom_methods_reach_actual_development_calls(
                  "merge_conflict": "merge_conflict_evidence"}[source]
         request[field] = "当前原始失败证据" if source in {"human_revision", "merge_conflict"} else {"raw": "当前原始失败证据"}
     prompt = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="custom")
-    assert resources["methods/development-common"] in prompt
-    selected = "methods/development-repair" if source else "methods/development-initial"
+    selected = "methods/repair" if source else "methods/development"
     assert resources[selected] in prompt
-    other = "methods/development-initial" if source else "methods/development-repair"
+    other = "methods/development" if source else "methods/repair"
     assert resources[other] not in prompt
     if source:
         assert "当前原始失败证据" in prompt
     assert DEVELOPMENT_BLOCKER_SHAPE in prompt
+    assert "只整理当前工作树，不暂存、commit、改写 Git 历史或执行 GitHub 写入" in prompt
+    assert request["parent_issue_url"] in prompt
+    assert str(tmp_path / "custom") in prompt
 
 
 @pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("publication", "run"), ("run_publication", "run")])
 def test_custom_review_and_publication_methods_reach_actual_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, scope: str,
 ) -> None:
-    from agent_run.prompt_resources import resolve_resources
+    from agent_run.prompt_resources import personal_method_directory, resolve_resources
 
+    directory = personal_method_directory()
+    directory.mkdir(parents=True)
+    for name, text in (("acceptance", "个人验收正文：核对当前真实对象。"),
+                       ("publishing", "个人发布正文：说明实际用户变化。")):
+        (directory / f"{name}.md").write_text(text, encoding="utf-8")
     resources = resolve_resources()
-    resources["methods/review"] = "个人验收方法：核对当前真实对象。"
-    resources["methods/publication"] = "个人发布方法：说明实际用户变化。"
     prompt = _capture_public_prompt(tmp_path, monkeypatch, method, {
         "_prompt_resources": resources, "acceptance_scope": scope,
-        "acceptance_artifact": {},
+        "parent_issue_url": "https://github.com/example/project/issues/1",
+        "task_issue_url": "https://github.com/example/project/issues/2",
+        "current_review_identity": {"reviewed_candidate_sha": "CURRENT_CANDIDATE"},
+        "acceptance_artifact": {"raw": "当前原始验收证据"},
     }, name="custom")
-    key = "methods/review" if method == "review" else "methods/publication"
+    key = "methods/acceptance" if method == "review" else "methods/publishing"
+    other = "methods/publishing" if method == "review" else "methods/acceptance"
     assert resources[key] in prompt
+    assert resources[other] not in prompt
+    assert "https://github.com/example/project/issues/1" in prompt
+    assert str(tmp_path / "custom") in prompt
+    if method == "review":
+        assert "CURRENT_CANDIDATE" in prompt
+        assert "整个工作区保持只读" in prompt
+        assert '"checks":{"e2e"' in prompt
+    else:
+        assert "当前原始验收证据" in prompt
+        assert "不修改文件、重新验收或执行 Git/GitHub 写入" in prompt
+        assert PUBLICATION_BLOCKER_SHAPE in prompt
 
 
 def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
@@ -1959,8 +1978,12 @@ def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
     store = StateStore(tmp_path / "state")
     resources = prompt_resources.resolve_resources()
     store.save_run("frozen", {"prompt_resources": resources})
-    role = root / "internal/development-role.md"
+    role = root / "methods/development.md"
     role.write_text("新版内置开发角色", encoding="utf-8")
+    copy_file = root / "prompt-copy.json"
+    copy = json.loads(copy_file.read_text(encoding="utf-8"))
+    copy["internal/task-url"] = "新版集中任务标签：{0}"
+    copy_file.write_text(json.dumps(copy, ensure_ascii=False), encoding="utf-8")
     saved = store.load_run("frozen")
     assert saved is not None
     request = {"_prompt_resources": saved["prompt_resources"],
@@ -1971,6 +1994,8 @@ def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
     }, name="new")
     assert "新版内置开发角色" not in old
     assert "新版内置开发角色" in fresh
+    assert "新版集中任务标签" not in old
+    assert "新版集中任务标签" in fresh
     assert request["task_issue_url"] in old and request["task_issue_url"] in fresh
 
 
@@ -1979,23 +2004,23 @@ def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
 @pytest.mark.parametrize(
     ("method", "facts", "role_key", "method_keys"),
     [
-        ("develop", {}, "development", ("development-common", "development-initial")),
+        ("develop", {}, "development", ("development",)),
         (
             "develop",
             {"repair_source": "required_checks", "ci_evidence": {"log": "原始 raw failure"}},
-            "repair", ("development-common", "development-repair"),
+            "repair", ("repair",),
         ),
-        ("review", {"acceptance_scope": "ticket"}, "review", ("review",)),
-        ("review", {"acceptance_scope": "run"}, "review", ("review",)),
+        ("review", {"acceptance_scope": "ticket"}, "review", ("acceptance",)),
+        ("review", {"acceptance_scope": "run"}, "review", ("acceptance",)),
         (
             "review", {"acceptance_scope": "run", "candidate_acceptance": True,
-                       "repair_scope": "run_repair"}, "review", ("review",),
+                       "repair_scope": "run_repair"}, "review", ("acceptance",),
         ),
         ("publication", {"acceptance_scope": "ticket", "acceptance_artifact": {}},
-         "publication", ("publication",)),
+         "publication", ("publishing",)),
         ("publication", {"acceptance_scope": "run", "acceptance_artifact": {}},
-         "publication", ("publication",)),
-        ("run_publication", {"acceptance_artifact": {}}, "publication", ("publication",)),
+         "publication", ("publishing",)),
+        ("run_publication", {"acceptance_artifact": {}}, "publication", ("publishing",)),
     ],
 )
 def test_selected_language_resources_reach_actual_role_calls(
@@ -2022,7 +2047,6 @@ def test_selected_language_resources_reach_actual_role_calls(
         assert resources[f"internal/{role_key}-resume"].strip() in prompt
         assert "resume" in calls[0][0]
     else:
-        assert resources[f"internal/{role_key}-role"].strip() in prompt
         for key in method_keys:
             assert resources[f"methods/{key}"].strip() in prompt
     if "ci_evidence" in facts:
