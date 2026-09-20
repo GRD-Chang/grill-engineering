@@ -1,8 +1,8 @@
 # 个人运行默认配置
 
-`agent-run settings` 统一查看和编辑轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
+`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
 
-唯一文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
+运行参数文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
 
 ```bash
@@ -148,3 +148,87 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 账号凭据由 `auth` 管理，项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录；这些内容均不合并到个人默认文件。
 
 发送、恢复与本地记录的边界见[飞书进度通知](notifications.md)。
+
+## 个人 Markdown 方法
+
+`agent-run prompts` 管理当前系统用户跨项目共用的所选语言方法。个人目录为
+`$XDG_CONFIG_HOME/agent-run/prompts/<language>`，未设置 XDG 时为
+`~/.config/agent-run/prompts/<language>`；没有项目级覆盖。
+
+```bash
+agent-run prompts init
+agent-run prompts diff
+agent-run prompts diff --json
+```
+
+初始化一次生成四份完整 Markdown，每份包括该角色的职责、工作方法、验证要求和完成标准：
+
+| 文件 | 适用工作 |
+| --- | --- |
+| `development.md` | 初次开发 |
+| `repair.md` | 各类定向修复 |
+| `acceptance.md` | 子任务、完整需求与整体验收 |
+| `publishing.md` | 交付说明与最终发布说明准备 |
+
+重复初始化只补缺失文件，保留已有正文。用户可完整修改主要正文，程序不解析 Markdown 标题。缺少个人文件时直接回退同语言内置默认，无需初始化；存在但不可读、空白或无效编码时明确失败。程序另行附加当前任务、证据、工作区、实际权限和固定输出合同，完整预览可见这些内容。正文定制不改变 Controller、Worker、Publisher 的程序权限、Artifact 校验与交付门禁。发布角色只准备文案，外部写入仍由 Publisher 执行。
+
+升级会保留个人文件；**定制副本不会自动继承默认正文更新**。`diff` 只读比较当前内置正文与个人生效正文，不合并、不改写文件。无差异时返回成功，JSON 中每份文件对应空字符串。
+
+旧格式个人文件保留但不再生效。初始化、差异和预览会提示旧文件的对应关系及当前生效来源：
+
+| 旧文件 | 手工迁入的新主体 |
+| --- | --- |
+| `development-common.md` | `development.md` 与 `repair.md` 中适用的共用指导 |
+| `development-initial.md` | `development.md` |
+| `development-repair.md` | `repair.md` |
+| `review.md` | `acceptance.md` |
+| `publication.md` | `publishing.md` |
+
+先初始化新主体，再根据差异将需要保留的定制手工迁入对应文件，并用预览确认；程序不猜测合并旧内容，也不删除旧文件。旧文件存在不代表新版使用它。内部 Resume、输出修复、探针及固定约束由程序中的双语文案维护，不另提供可编辑 Markdown；维护边界见[资源清单](agents/prompt-resource-map.md)。
+
+### 预览实际 Prompt
+
+准备角色请求 JSON，例如 `request.json`：
+
+```json
+{"acceptance_scope":"ticket","task_issue_url":"https://github.com/OWNER/REPO/issues/2","parent_issue_url":"https://github.com/OWNER/REPO/issues/1"}
+```
+
+```bash
+agent-run prompts preview --role development --request request.json
+agent-run prompts preview --role review --request request.json --json
+agent-run prompts preview --role development --request request.json --continuation
+```
+
+角色可选 `development`、`review`、`publication`、`final-publication`、`output-repair`。输出格式修复需要 `output_name`（`Development result`、`Acceptance Artifact` 或 `Publication Artifact`）和 `contract_error` 字符串，不接受 `--continuation`。请求使用真实角色的字段：`repair_source` 指定修复来源，`acceptance_scope` 区分 `ticket`、`parent_only`、`run`，相关证据字段按实际工作提供；最终发布需要 `acceptance_artifact`。`--continuation` 预览同轮续接；请求中的 `_invocation_mode` 可指定 `resume` 或 `new-thread`，遵循真实组装规则。预览和执行共用资源读取与角色组装，不访问 GitHub、不调用模型，也不推进 Run。
+
+没有资源快照的请求按个人语言使用方法与内置资源，也可在预览请求中提供 `language`（`zh` 或 `en`）选择资源；这不是另一项持久配置。请求包含 `_prompt_resources` 时使用该固定资源集合，可从 Run 的 `prompt_resources` 字段取得；动态任务和证据仍由请求提供。新 Run 创建时一次固定语言和所有所选语言的静态正文及集中 Prompt 文案，此后个人或内置修改只影响新 Run，原 Run 恢复和阶段切换沿用创建时资源。缺少固定语言或必需资源的旧 Run 按不兼容状态明确失败，不自动补齐或迁移。不保存逐次完整动态 Prompt 或对话历史。
+
+
+## 统一语言设置
+
+```bash
+agent-run settings show
+agent-run settings configure --language en
+agent-run prompts init
+agent-run prompts diff
+agent-run settings configure --language zh
+agent-run settings show --run <run-id>
+```
+
+唯一持久语言设置是个人 `user-defaults.json` 顶层 `language`，只接受 `zh` 和 `en`。
+未设置时固定使用中文，不读取宿主 locale。语言配置的帮助、查询、错误与回执支持中英文。
+日常命令帮助、设置、错误说明、操作回执、Status/History 和飞书通知共用语言资源。
+无 Run 的帮助和个人设置使用当前个人语言；已有 Run 的状态、历史及适用操作回执
+使用创建时固定的语言。切换个人语言不会改写已有 Run 或历史记录。
+
+四份主要正文分别位于 `prompts/zh/` 和 `prompts/en/`。初始化只补所选语言的缺失文件，
+差异查看只比较同语言默认版本；不覆盖另一语言文件，不跨语言回退，也不自动翻译个人内容。
+无 Run 的预览和安装探针使用个人语言。已有 Run 的语言及全部静态 Prompt 在创建时固定，
+切换个人语言或修改正文不会改变恢复、修复、验收、发布和输出格式修复所使用的资源；
+每次调用的任务事实、原始证据与用户回复仍使用最新内容。
+`settings show --run` 显示该 Run 的固定语言；模型与推理强度继续使用独立的 Thread Binding 规则。
+
+摘要、Findings、验收 evidence、提交和 PR 文案只由方法 Prompt 引导语言。
+合法的另一语言或混合语言输出原样接受，不检测语言、不拒收重试、不纠正翻译或增加模型调用。
+原始 Issue 标题、用户反馈、技术证据、机器字段、命令和状态枚举保持原文。

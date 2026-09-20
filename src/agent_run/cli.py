@@ -12,9 +12,12 @@ from typing import Any, Sequence
 
 from agent_run import cli_presentation, cli_surface
 from agent_run import doctor
+from agent_run.cli_parser import ArgumentParser
+from agent_run.cli_messages import cli_message, personal_language, error_message, error_detail
+from agent_run.messages import selected_language, text
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
-from agent_run import settings_cli
+from agent_run import settings_cli, prompt_cli
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_session_interruption
 from agent_run.agent_profiles import (
@@ -101,6 +104,7 @@ from agent_run.run_lifecycle import (
     prepare_action_application_receipt,
     _unbound_action_matches_run_receipt,
 )
+from agent_run.resume_feedback import ResumeFeedback
 from agent_run.resume_intent import (
     ResumeIntentError,
     bind_resume_intent,
@@ -158,36 +162,36 @@ class ExecutionReadinessError(ValueError):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = ArgumentParser(
         prog="agent-run",
-        description="从 GitHub 父 Issue 启动或恢复本地交付运行",
+        description=cli_message('cli.description'),
     )
     subcommands = parser.add_subparsers(
         dest="command",
         required=True,
         metavar=(
             "{run,resume,requeue,approve,revise,stop,abandon,status,history,"
-            "runs,configure,settings,policy,auth,doctor}"
+            "runs,configure,settings,prompts,policy,auth,doctor}"
         ),
     )
     run = subcommands.add_parser(
-        "run", help="创建或继续 Parent 的自动交付，停在需要操作者处理的边界"
+        "run", help=cli_message('cli.run_help')
     )
-    run.add_argument("parent", type=_positive_integer, help="Parent Issue 编号")
+    run.add_argument("parent", type=_positive_integer, help=cli_message('cli.parent_help'))
     _add_common_options(run)
     _add_profile_options(run)
     _add_policy_options(run)
     run.add_argument("--json", action="store_true", dest="as_json")
     notification_options = run.add_mutually_exclusive_group()
-    notification_options.add_argument("--notification-mode", choices=("concise", "detailed"), help="创建本次 Run 时启用精简或详细飞书通知")
-    notification_options.add_argument("--no-notifications", action="store_true", help="创建本次 Run 时关闭飞书通知")
+    notification_options.add_argument("--notification-mode", choices=("concise", "detailed"), help=cli_message('cli.notifications_help'))
+    notification_options.add_argument("--no-notifications", action="store_true", help=cli_message('cli.no_notifications_help'))
     run.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume = subcommands.add_parser(
-        "resume", help="恢复 Stop、失败/Human Blocker Invocation 或监督超时窗口"
+        "resume", help=cli_message('cli.resume_help')
     )
     resume.add_argument(
         "run_id",
-        help="Parent Issue 编号；也可传入完整 Run ID 走精确恢复路径",
+        help=cli_message('cli.resume_selector_help'),
     )
     _add_common_options(resume)
     _add_policy_options(resume, allow_thread_policy=False)
@@ -196,149 +200,150 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--new-thread",
         action="store_true",
-        help="为当前失败或人工阻塞的 Agent 阶段新开 Thread（监督超时不可用）",
+        help=cli_message('cli.new_thread_help'),
     )
     requeue = subcommands.add_parser(
-        "requeue", help="仅从 requeue_required 创建新的 Change Job Generation"
+        "requeue", help=cli_message('cli.requeue_help')
     )
     requeue.add_argument(
         "run_id",
         metavar="parent-issue-or-run-id",
-        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+        help=cli_message('cli.selector_help'),
     )
     _add_common_options(requeue)
     requeue.add_argument("--json", action="store_true", dest="as_json")
     requeue.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--message",
-        help="仅用于当前 Human Blocker 的未经改写人工响应（最多 8 KiB）",
+        help=cli_message('cli.response_help'),
     )
     approve = subcommands.add_parser(
-        "approve", help="显式批准并合并已通过门禁的最终 Run PR"
+        "approve", help=cli_message('cli.approve_help')
     )
     approve.add_argument(
         "run_id",
         metavar="parent-issue-or-run-id",
-        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+        help=cli_message('cli.selector_help'),
     )
     _add_common_options(approve)
     approve.add_argument("--json", action="store_true", dest="as_json")
     approve.add_argument("--agent-fixture", help=argparse.SUPPRESS)
-    revise = subcommands.add_parser("revise", help="以 Run 级人工反馈开启新的修复窗口")
+    revise = subcommands.add_parser("revise", help=cli_message('cli.revise_help'))
     revise.add_argument(
         "run_id",
         metavar="parent-issue-or-run-id",
-        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+        help=cli_message('cli.selector_help'),
     )
-    revise.add_argument("--message", required=True, help="未经改写的修订反馈")
+    revise.add_argument("--message", required=True, help=cli_message('cli.feedback_help'))
     _add_common_options(revise)
     revise.add_argument("--json", action="store_true", dest="as_json")
     revise.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     stop = subcommands.add_parser(
-        "stop", help="立即停止活动 Executor 并保留可显式恢复的现场"
+        "stop", help=cli_message('cli.stop_help')
     )
     stop.add_argument(
         "run_id",
         metavar="parent-issue-or-run-id",
-        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+        help=cli_message('cli.selector_help'),
     )
     _add_common_options(stop)
     stop.add_argument("--json", action="store_true", dest="as_json")
-    abandon = subcommands.add_parser("abandon", help="放弃交付运行并执行受限恢复与清理")
+    abandon = subcommands.add_parser("abandon", help=cli_message('cli.abandon_help'))
     abandon.add_argument(
         "run_id",
         metavar="parent-issue-or-run-id",
-        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+        help=cli_message('cli.selector_help'),
     )
     abandon.add_argument(
         "--discard-worktree",
         action="store_true",
-        help="不可恢复地丢弃该 Run 的 dirty Managed Development Checkout",
+        help=cli_message('cli.discard_help'),
     )
     _add_common_options(abandon)
     abandon.add_argument("--json", action="store_true", dest="as_json")
-    status = subcommands.add_parser("status", help="显示当前状态与下一条允许的操作")
-    status.add_argument("run_id", nargs="?", help="完整 Run ID；省略时使用 Human Run Selector")
+    status = subcommands.add_parser("status", help=cli_message('cli.status_help'))
+    status.add_argument("run_id", nargs="?", help=cli_message('cli.optional_selector_help'))
     _add_common_options(status)
-    status.add_argument("--parent", type=_positive_integer, help="按 Parent Issue 选择 Run")
+    status.add_argument("--parent", type=_positive_integer, help=cli_message('cli.parent_selector_help'))
     status.add_argument("--json", action="store_true", dest="as_json")
     status.add_argument(
         "--plain",
         action="store_true",
-        help="使用可复制的朴素文本，关闭 Rich 装饰",
+        help=cli_message('cli.plain_help'),
     )
-    history = subcommands.add_parser("history", help="查看各轮 Agent 工作、关键进展与结果")
-    history.add_argument("run_id", nargs="?", help="完整 Run ID；省略时使用 Human Run Selector")
+    history = subcommands.add_parser("history", help=cli_message('cli.history_help'))
+    history.add_argument("run_id", nargs="?", help=cli_message('cli.optional_selector_help'))
     _add_common_options(history)
-    history.add_argument("--parent", type=_positive_integer, help="按 Parent Issue 选择 Run")
+    history.add_argument("--parent", type=_positive_integer, help=cli_message('cli.parent_selector_help'))
     history.add_argument("--json", action="store_true", dest="as_json")
     history.add_argument(
         "--plain",
         action="store_true",
-        help="使用朴素文本（JSON 不受此选项影响）",
+        help=cli_message('cli.history_plain_help'),
     )
     history.add_argument(
         "--details",
         action="store_true",
-        help="在每轮时间线记录中展开已保存的完整证据与结果",
+        help=cli_message('cli.details_help'),
     )
-    runs = subcommands.add_parser("runs", help="发现本机已登记的 Delivery Run")
+    runs = subcommands.add_parser("runs", help=cli_message('cli.runs_help'))
     _add_common_options(runs)
-    runs.add_argument("--parent", type=_positive_integer, help="仅列出指定 Parent Issue")
+    runs.add_argument("--parent", type=_positive_integer, help=cli_message('cli.parent_filter_help'))
     runs.add_argument("--json", action="store_true", dest="as_json")
     configure = subcommands.add_parser(
         "configure",
         aliases=["config", "profile"],
-        help="为未来创建的顶层 Codex Thread 创建新的 Agent Profile Revision",
+        help=cli_message('cli.configure_help'),
     )
     configure.add_argument(
         "run_id",
         metavar="parent-issue-or-run-id",
-        help="Parent Issue 编号；自动化与精确排障可使用完整交付运行标识",
+        help=cli_message('cli.selector_help'),
     )
     _add_common_options(configure)
     _add_profile_options(configure)
     configure.add_argument("--json", action="store_true", dest="as_json")
     policy = subcommands.add_parser(
         "policy",
-        help="查看或配置用户级 Delivery Policy 默认值",
+        help=cli_message('cli.policy_help'),
     )
     policy.add_argument("--json", action="store_true", dest="as_json")
     policy_commands = policy.add_subparsers(
         dest="policy_command", metavar="{show,configure}"
     )
-    policy_show = policy_commands.add_parser("show", help="显示当前生效策略")
+    policy_show = policy_commands.add_parser("show", help=cli_message('cli.policy_show_help'))
     policy_show.add_argument("--json", action="store_true", dest="as_json")
     policy_configure = policy_commands.add_parser(
-        "configure", help="保存用户级 Delivery Policy 默认值"
+        "configure", help=cli_message('cli.policy_configure_help')
     )
     _add_policy_options(policy_configure, dest_prefix="policy_")
     policy_configure.add_argument("--json", action="store_true", dest="as_json")
     settings_cli.add_parser(
         subcommands, _add_common_options, _add_policy_options, _add_profile_options
     )
-    auth = subcommands.add_parser("auth", help="配置 Worker 的 GitHub 只读身份")
+    prompt_cli.add_parser(subcommands)
+    auth = subcommands.add_parser("auth", help=cli_message('cli.auth_help'))
     auth_commands = auth.add_subparsers(
         dest="auth_command", required=True, metavar="{status,app}"
     )
-    auth_commands.add_parser("status", help="显示当前 Worker GitHub 只读身份")
-    auth_app = auth_commands.add_parser("app", help="管理专用只读 GitHub App")
+    auth_commands.add_parser("status", help=cli_message('cli.auth_status_help'))
+    auth_app = auth_commands.add_parser("app", help=cli_message('cli.auth_app_help'))
     auth_app_commands = auth_app.add_subparsers(
         dest="auth_app_command", required=True, metavar="{configure,remove}"
     )
     configure_app = auth_app_commands.add_parser(
-        "configure", help="保存 GitHub App ID、Installation ID 和私钥路径"
+        "configure", help=cli_message('cli.auth_configure_help')
     )
     configure_app.add_argument("--app-id", required=True, help="GitHub App ID")
     configure_app.add_argument(
         "--installation-id", required=True, help="GitHub App Installation ID"
     )
     configure_app.add_argument(
-        "--private-key", required=True, help="仓库外私钥文件的绝对路径"
+        "--private-key", required=True, help=cli_message('cli.private_key_help')
     )
-    auth_app_commands.add_parser("remove", help="移除专用 App 并恢复宿主 gh")
+    auth_app_commands.add_parser("remove", help=cli_message('cli.auth_remove_help'))
     doctor_command = subcommands.add_parser(
-        "doctor", help="只读检查本机依赖、Active Runner、PATH 与 Worker read provider"
+        "doctor", help=cli_message('cli.doctor_help')
     )
     doctor_command.add_argument("--json", action="store_true", dest="as_json")
     return parser
@@ -363,6 +368,7 @@ def _main_with_parser_resources(
 ) -> int:
     supplied_arguments = list(arguments) if arguments is not None else sys.argv[1:]
     parsed = parser.parse_args(supplied_arguments)
+    resume_feedback: ResumeFeedback | None = None
     controller: Controller | None = None
     states: StateStore | FaultInjectingStateStore | None = None
     git: GitRepository | None = None
@@ -392,6 +398,8 @@ def _main_with_parser_resources(
             return _auth_command(parsed)
         if parsed.command == "doctor":
             return doctor.run(as_json=parsed.as_json)
+        if parsed.command == "prompts":
+            return prompt_cli.execute(parsed)
         if parsed.command == "settings":
             return settings_cli.execute(
                 parsed, policy_overrides=_policy_overrides,
@@ -446,7 +454,7 @@ def _main_with_parser_resources(
         state_root = workspace_state_root(git.root)
         if parsed.state_dir and Path(parsed.state_dir).resolve() != state_root.resolve():
             raise ValueError(
-                "变更命令不能覆盖 Runner 的统一状态目录；请通过 XDG_DATA_HOME 设置数据根目录。"
+                error_message('cli.error.state_dir_mutation')
             )
         fixture_path = Path(parsed.github_fixture) if parsed.github_fixture else None
         github = (
@@ -483,6 +491,13 @@ def _main_with_parser_resources(
             _resolve_mutation_selection(parsed, git, states)
         if parsed.command == "resume":
             selected_resume = cli_surface._load_local_run(states, parsed.run_id)
+            resume_notifications = selected_resume.get("notifications")
+            if isinstance(resume_notifications, dict) and resume_notifications.get("enabled") is True:
+                resume_feedback = ResumeFeedback(
+                    states.root, selected_resume,
+                    lambda: states.load_current_run(parsed.run_id),
+                )
+                resources.callback(resume_feedback.close)
             selected_parent = selected_resume.get("parent")
             selected_parent_number = (
                 selected_parent.get("number")
@@ -495,6 +510,8 @@ def _main_with_parser_resources(
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
         executor_binding = _executor_binding_from_environment()
+        if resume_feedback is not None and executor_binding is not None:
+            resume_feedback.identity = executor_binding[0]
         executor_backed = parsed.command in {
             "run",
             "resume",
@@ -684,6 +701,9 @@ def _main_with_parser_resources(
                     current = _reconcile_resume_exit(
                         parsed, states, git, github, executor_host, current
                     )
+                    if (resume_feedback is not None and final_receipt_pending
+                            and not has_unfinished_final_receipt(current, git.root)):
+                        resume_feedback.progressed(current, "terminal_completion")
                 resume_attachable = executor_binding is not None or (
                     _resume_action_is_attachable(parsed, github, git)
                 )
@@ -693,6 +713,8 @@ def _main_with_parser_resources(
                     and not cli_surface._resume_is_ready(current)
                 ):
                     _reject_if_task_action_pending(parsed, states, git)
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -702,6 +724,8 @@ def _main_with_parser_resources(
                     and parsed.message is not None
                     and human_blocker_subject_count(current) != 1
                 ):
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -709,6 +733,8 @@ def _main_with_parser_resources(
                 if current.get("status") == "supervision_timeout" and (
                     parsed.new_thread or parsed.message is not None
                 ):
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -716,6 +742,8 @@ def _main_with_parser_resources(
                 if has_non_invocation_execution_failure(current) and (
                     parsed.new_thread or parsed.message is not None
                 ):
+                    if resume_feedback is not None:
+                        resume_feedback.failure("")
                     cli_presentation._print_precondition_failure(
                         current, as_json=parsed.as_json
                     )
@@ -733,11 +761,18 @@ def _main_with_parser_resources(
                 lifecycle_arguments=tuple(supplied_arguments),
                 executor_binding=executor_binding,
                 prepare_executor_session=prepare_executor_session,
+                resume_feedback=resume_feedback,
             )
         else:  # pragma: no cover - lifecycle commands are Executor-backed
-            raise ExecutionReadinessError("Lifecycle Action 缺少 Executor Host")
+            raise ExecutionReadinessError(error_message('cli.error.missing_executor'))
         if lifecycle_receipt is not None and lifecycle_receipt.status == "failed":
             control_failure = bounded_error(lifecycle_receipt.failure or "操作未完成")
+        if resume_feedback is not None and lifecycle_receipt is not None:
+            if lifecycle_receipt.attached and resume_feedback.result is None:
+                resume_feedback.suppressed = True
+            elif lifecycle_receipt.status == "failed":
+                resume_feedback.identity = lifecycle_receipt.action_id or resume_feedback.identity
+                resume_feedback.failure(lifecycle_receipt.failure or "execution_failed")
         active_ticket_job = state.get("active_ticket_job")
         diagnostics = state.get("diagnostics")
         current_diagnostics = diagnostics if isinstance(diagnostics, list) else []
@@ -936,6 +971,8 @@ def _main_with_parser_resources(
         ValueError,
         WorkerSandboxError,
     ) as error:
+        if resume_feedback is not None:
+            resume_feedback.failure(bounded_error(error_detail(error, selected_language(resume_feedback.state))))
         selected_run_id = getattr(parsed, "run_id", None)
         run_id = selected_run_id
         if (
@@ -1111,22 +1148,40 @@ def _main_with_parser_resources(
                 )
             )
         else:
+            display_state = failure_state
+            if display_state is None:
+                possible_state = locals().get("state")
+                if isinstance(possible_state, dict) and "language" in possible_state:
+                    display_state = possible_state
+            valid_display_state = (
+                display_state is not None and display_state.get("language") in {"zh", "en"}
+            )
+            language = selected_language(display_state) if valid_display_state else personal_language()
+            if not valid_display_state and getattr(parsed, "display_language", None) in {"zh", "en"}:
+                language = parsed.display_language
+            localized_detail = bounded_error(error_detail(error, language))
+            if not locator_error:
+                localized_detail = (localized_detail.splitlines() or [type(error).__name__])[0]
             human_message = _human_failure_reason(
-                error, diagnostic_message.partition("\n候选：")[0]
+                error, localized_detail, language=language
             )
-            print(
-                ("命令状态: 应用结果待确认（" if command_dispatched else "命令状态: 未执行（")
-                + f"{cli_presentation.human_delivery_status(error_status)}）"
-            )
-            print(f"原因: {bounded_error(human_message)[:600]}")
-            print(f"本次命令下一步: {diagnostic_next_action}")
-            if failure_state is not None:
+            if diagnostic_code in {"workspace_required", "incompatible_run_state"}:
+                human_message = cli_message(f"cli.error.{diagnostic_code}", language=language,
+                                            reason=localized_detail)
+            print(cli_message("cli.command_unknown" if command_dispatched else "cli.command_not_applied",
+                              language=language, status=cli_presentation.human_delivery_status(
+                                  error_status, language=language)))
+            print(cli_message("cli.reason", language=language, reason=bounded_error(human_message)[:600]))
+            print(cli_message("cli.command_next_action", language=language,
+                              action=cli_message("cli.retry_workspace" if diagnostic_code == "workspace_required"
+                                                 else "cli.retry_command", language=language)))
+            if failure_state is not None and valid_display_state:
                 _print_lifecycle_result(failure_state, {}, None)
             if isinstance(error, RunLocatorError) and error.candidates:
-                print("候选交付:")
+                print(cli_message("cli.delivery_candidates", language=language))
                 for candidate in error.candidates:
                     candidate_status = cli_presentation.human_delivery_status(
-                        candidate.get("status") or "unknown"
+                        candidate.get("status") or "unknown", language=language
                     )
                     print(
                         f"- repository={candidate.get('repository') or 'unknown'} "
@@ -1157,13 +1212,13 @@ def _executor_binding_from_environment() -> tuple[str, int] | None:
     if action_id is None and raw_generation is None:
         return None
     if not action_id or raw_generation is None:
-        raise ExecutionReadinessError("Executor 环境 binding 不完整")
+        raise ExecutionReadinessError(error_message('cli.error.executor_binding'))
     try:
         generation = int(raw_generation)
     except ValueError as error:
-        raise ExecutionReadinessError("Executor generation 无效") from error
+        raise ExecutionReadinessError(error_message('cli.error.executor_generation')) from error
     if generation <= 0:
-        raise ExecutionReadinessError("Executor generation 无效")
+        raise ExecutionReadinessError(error_message('cli.error.executor_generation'))
     return action_id, generation
 
 
@@ -1219,51 +1274,49 @@ def _print_lifecycle_result(
 ) -> None:
     """Render the ordinary mutation result without machine-only identities."""
 
+    language = str(state.get("language", "zh"))
+    def message(key: str, **values: object) -> str:
+        return text(f"cli.{key}", language=language, **values)
+
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
-    print(f"Repository: {state.get('repository')}")
-    print(f"Parent Issue: #{parent_number}")
+    print(cli_message("cli.repository", language=str(state.get("language", "zh")), repository=state.get("repository")))
+    print(cli_message("cli.parent_issue", language=str(state.get("language", "zh")), parent=parent_number))
     if state.get("_control_no_active_executor") is True:
-        print("Agent: 当前没有正在运行的 Agent；未创建 Action")
+        print(message("no_active_agent"))
     if receipt is not None:
         final_approval = is_final_approval_action({"kind": receipt.kind}, state)
-        print(f"操作: {receipt.kind}")
+        print(message("operation", operation=receipt.kind))
         if (
             receipt.resume_intent is not None
             and receipt.resume_intent.get("authorization") == "new_budget_window"
         ):
-            print("恢复授权: 本次操作授权开启一个新的预算窗口；重复附着不会再次授权")
-        print("提交结果: 已附着到原操作" if receipt.attached else "提交结果: 已接受新操作")
+            print(message("resume_authorized"))
+        print(message("attached" if receipt.attached else "accepted"))
         if receipt.status == "failed":
-            print("动作状态: 最终批准未完成" if final_approval else "动作状态: 应用失败")
+            print(message("approval_failed" if final_approval else "application_failed"))
             if receipt.failure:
-                print(f"失败原因: {receipt.failure}")
+                print(message("failure_reason", reason=receipt.failure))
         elif receipt.status in {"completed", "executor_active"}:
-            print("动作状态: 最终交付已完成" if final_approval else "动作状态: 已应用")
+            print(message("delivery_completed_action" if final_approval else "applied"))
         else:
-            print("动作状态: 最终批准正在执行" if final_approval else "动作状态: 正在应用")
+            print(message("approval_running" if final_approval else "applying"))
         if receipt.executor_status in {"exited", "absent"}:
-            print("Agent: 原操作已收口，无活动 Executor")
+            print(message("executor_absent"))
         elif receipt.attached:
-            print("Agent: 原有 Executor 正在处理")
+            print(message("executor_existing"))
         else:
-            print("Agent: Executor 已正确开始")
+            print(message("executor_started"))
     status = state.get("status")
     if status == "completed":
-        print("交付状态: 代码已合并，仍有清理待完成" if final_approval_cleanup_pending(state)
-              else "交付状态: 整个交付已完成")
+        print(message("cleanup_pending" if final_approval_cleanup_pending(state)
+                      else "delivery_completed"))
     elif status == "abandoned":
-        print("交付状态: 整个交付已放弃")
+        print(message("delivery_abandoned"))
     else:
-        print(
-            "交付状态: "
-            f"{cli_presentation.human_delivery_status(status)}"
-            "（动作完成不等于整个交付完成）"
-        )
-    print(
-        "下一步: "
-        + str(cli_presentation.human_next_action_for_state(state))
-    )
+        print(message("delivery_incomplete", status=cli_presentation.human_delivery_status(
+            status, language=language)))
+    print(message("next_action", action=cli_presentation.human_next_action_for_state(state)))
 
 
 def _print_interruption_result(
@@ -1271,28 +1324,33 @@ def _print_interruption_result(
 ) -> None:
     """Render an interrupted observation without exposing machine identities."""
 
+    language = str(state.get("language", "zh")) if state is not None else personal_language()
+    def message(key: str, **values: object) -> str:
+        return text(f"cli.{key}", language=language, **values)
+
     if isinstance(state, Mapping):
         parent = state.get("parent")
         parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
-        print(f"Repository: {state.get('repository')}")
-        print(f"Parent Issue: #{parent_number}")
-    diagnostic = output.get("diagnostics")
-    first = diagnostic[0] if isinstance(diagnostic, list) and diagnostic else None
-    message = first.get("message") if isinstance(first, Mapping) else "操作观察已中断"
-    print(f"操作状态: 已中断（{message}）")
+        print(cli_message("cli.repository", language=str(state.get("language", "zh")), repository=state.get("repository")))
+        print(cli_message("cli.parent_issue", language=str(state.get("language", "zh")), parent=parent_number))
+    # The structured diagnostic remains the original audit fact. Human copy is
+    # selected from the same interruption cause without rewriting that record.
+    diagnostics = output.get("diagnostics")
+    first = diagnostics[0] if isinstance(diagnostics, list) and diagnostics else None
+    code = first.get("code") if isinstance(first, Mapping) else None
+    print(message("interrupted"))
+    if code in {"executor_agent_interrupted", "observation_interrupted", "controller_interrupted"}:
+        print(message("interruption." + str(code)))
     if isinstance(state, Mapping) and has_final_approval(state):
-        print("本次仅停止观察，不取消已经接受的最终批准；请用 status 查看后台结果")
-    print(
-        "交付状态: "
-        f"{cli_presentation.human_delivery_status(output.get('status'))}"
-        "（中断观察不会改写交付状态）"
-    )
+        print(message("approval_observation_stopped"))
+    print(message("interrupted_delivery", status=cli_presentation.human_delivery_status(
+        output.get("status"), language=language)))
     next_action = (
         cli_presentation.human_next_action_for_state(state)
         if isinstance(state, Mapping)
-        else "执行 agent-run status 查看当前交付状态"
+        else message("query_status")
     )
-    print("下一步: " + str(next_action))
+    print(message("next_action", action=next_action))
 
 
 def _action_audit(receipt: ActionReceipt) -> dict[str, object]:
@@ -1338,7 +1396,7 @@ def _read_only_stop_result(
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else None
     if not isinstance(repository, str) or type(parent_number) is not int:
-        raise TaskControlError("Delivery Run 缺少准确 Delivery Task identity")
+        raise TaskControlError(error_message('cli.error.task_identity'))
     task = TaskKey(git.root, repository, parent_number)
     control = TaskControlStore(workspace_state_root(git.root))
     try:
@@ -1364,7 +1422,7 @@ def _reject_conflicting_stop_action(
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else None
     if not isinstance(repository, str) or type(parent_number) is not int:
-        raise TaskControlError("Delivery Run 缺少准确 Delivery Task identity")
+        raise TaskControlError(error_message('cli.error.task_identity'))
     task = TaskKey(git.root, repository, parent_number)
     try:
         record = TaskControlStore(workspace_state_root(git.root)).load(task)
@@ -1444,7 +1502,7 @@ def _require_managed_locator(task: TaskKey, requested_root: Path) -> None:
         if entry.get("parent_number") not in (None, task.parent_number):
             continue
         if Path(entry["state_dir"]).resolve() != requested_root:
-            raise TaskControlError("任务索引指向非统一状态目录；不会恢复或写入旧任务目录")
+            raise TaskControlError(error_message('cli.error.task_index_directory'))
 
 
 def _run_action_payload(
@@ -1545,7 +1603,7 @@ def _mutation_action_payload(
     run_id = current.get("run_id")
     if not isinstance(run_id, str) or run_id != parsed.run_id:
         raise TaskControlError(
-            f"{parsed.command} selector 与当前 Delivery Run 不匹配"
+            error_message('cli.error.selector_mismatch' ,value0=parsed.command)
         )
     payload: dict[str, Any] = {
         "parent": parsed.parent,
@@ -1587,14 +1645,14 @@ def _run_control_action(
         raise TaskControlError("unsupported control action")
     if host is None:
         raise ExecutionReadinessError(
-            "Runner Execution Readiness 不满足：未提供 Executor Host"
+            error_message('cli.error.execution_readiness')
         )
     current = states.load_current_run(parsed.run_id)
     if current is None:
-        raise TaskControlError(f"{kind} 找不到 Delivery Run")
+        raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=kind))
     run_id = current.get("run_id")
     if not isinstance(run_id, str) or run_id != parsed.run_id:
-        raise TaskControlError(f"{kind} selector 与当前 Delivery Run 不匹配")
+        raise TaskControlError(error_message('cli.error.selector_mismatch' ,value0=kind))
     task = _task_for_parent(parsed, github, git)
     control = TaskControlStore(workspace_state_root(git.root))
     try:
@@ -1824,10 +1882,11 @@ def _run_lifecycle(
     lifecycle_arguments: tuple[str, ...] = (),
     executor_binding: tuple[str, int] | None = None,
     prepare_executor_session: Callable[[], None] | None = None,
+    resume_feedback: ResumeFeedback | None = None,
 ) -> tuple[dict[str, Any], bool, ActionReceipt | None]:
     if host is None:
         raise ExecutionReadinessError(
-            "Runner Execution Readiness 不满足：未提供 Executor Host"
+            error_message('cli.error.execution_readiness')
         )
     action_kind = parsed.command
     if action_kind not in {"run", "resume", "approve", "revise", "requeue"}:
@@ -1841,7 +1900,7 @@ def _run_lifecycle(
         else states.load_current_run(parsed.run_id)
     )
     if action_kind != "run" and current is None:
-        raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
+        raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
     if current is not None:
         controller._require_current_checkout(current)
     try:
@@ -1976,7 +2035,7 @@ def _run_lifecycle(
     ):
         if action_kind == "resume":
             if current is None:
-                raise TaskControlError("resume Action 找不到 Delivery Run")
+                raise TaskControlError(error_message('cli.error.resume_run_missing'))
             payload = _resume_payload_for_existing_action(
                 parsed, existing_action["payload"], current
             )
@@ -1989,14 +2048,14 @@ def _run_lifecycle(
             )
         else:
             if current is None:  # pragma: no cover - guarded above
-                raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
+                raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
             payload = _mutation_payload_for_existing_action(
                 parsed, existing_action["payload"], current
             )
     else:
         if action_kind == "resume":
             if current is None or current.get("run_id") != parsed.run_id:
-                raise TaskControlError("resume selector 与当前 Delivery Run 不匹配")
+                raise TaskControlError(error_message('cli.error.resume_selector_mismatch'))
             payload = _resume_action_payload(parsed, current)
         elif action_kind == "run":
             if current is None:
@@ -2011,6 +2070,7 @@ def _run_lifecycle(
                     preset=preset, overrides=overrides, document=document,
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
+                payload["language"] = defaults.language(document)
                 payload["notifications"] = notification_snapshot(
                     document.get("notifications"), disabled=parsed.no_notifications, mode=parsed.notification_mode,
                 )
@@ -2025,14 +2085,14 @@ def _run_lifecycle(
                     payload = _run_action_payload(parsed, policy, creation_profile)
         else:
             if current is None:  # pragma: no cover - guarded above
-                raise TaskControlError(f"{action_kind} 找不到 Delivery Run")
+                raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
             payload = _mutation_action_payload(parsed, current)
 
 
     def current_executor_binding() -> tuple[str, int, str | None]:
         record = control.load(task)
         if not isinstance(record, Mapping):
-            raise TaskControlError("Executor ownership record 不存在")
+            raise TaskControlError(error_message('cli.error.executor_record_missing'))
         action_id: str | None
         generation: int | None
         if executor_binding is not None:
@@ -2051,7 +2111,7 @@ def _run_lifecycle(
                 else None
             )
         if not isinstance(action_id, str) or type(generation) is not int:
-            raise TaskControlError("Executor ownership/generation 不完整")
+            raise TaskControlError(error_message('cli.error.executor_ownership'))
         executor = record.get("executor")
         run_id = (
             executor.get("run_id")
@@ -2141,7 +2201,7 @@ def _run_lifecycle(
         if action_kind == "resume":
             policy_snapshot = payload.get("policy")
             if not isinstance(policy_snapshot, Mapping):
-                raise TaskControlError("resume Action 缺少 Policy Snapshot")
+                raise TaskControlError(error_message('cli.error.resume_policy_missing'))
             resume_policy = parse_policy_snapshot(policy_snapshot)
             retry_intent = payload.get("resume_intent")
 
@@ -2181,7 +2241,7 @@ def _run_lifecycle(
             def worker_started(pid: int) -> None:
                 token = _process_start_token(pid)
                 if token is None:
-                    raise TaskControlError("Worker process binding 无法确认")
+                    raise TaskControlError(error_message('cli.error.worker_binding'))
                 worker_tokens[pid] = token
                 control.mark_worker_started(
                     task,
@@ -2208,7 +2268,7 @@ def _run_lifecycle(
                     # Executor.  The old Worker must not overwrite that fence.
                     return
 
-        return _run_driver(
+        driver = _run_driver(
             parsed,
             run_states,
             run_controller,
@@ -2221,6 +2281,9 @@ def _run_lifecycle(
             on_worker_started=worker_started,
             on_worker_finished=worker_finished,
         )
+        if resume_feedback is not None:
+            driver.on_outcome = resume_feedback.progressed
+        return driver
 
     def record_lifecycle_failure(
         run_states: StateStore,
@@ -2232,6 +2295,7 @@ def _run_lifecycle(
         return run_controller.record_execution_failure(run_id, message)
 
     delivery_executor = DeliveryExecutor(
+        resume_feedback=resume_feedback,
         states=states,
         state_store_factory=lifecycle_state_store,
         driver_factory=lifecycle_driver_factory,
@@ -2242,18 +2306,18 @@ def _run_lifecycle(
         if action_kind == "resume":
             action_payload = action.get("payload")
             if not isinstance(action_payload, Mapping):
-                raise TaskControlError("resume Action 缺少语义 payload")
+                raise TaskControlError(error_message('cli.error.resume_payload_missing'))
             policy_snapshot = action_payload.get("policy")
             if not isinstance(policy_snapshot, Mapping):
-                raise TaskControlError("resume Action 缺少 Policy Snapshot")
+                raise TaskControlError(error_message('cli.error.resume_policy_missing'))
             run_id = action_payload.get("run_id")
             if not isinstance(run_id, str) or run_id != parsed.run_id:
-                raise TaskControlError("resume Action 的 Delivery Run binding 不匹配")
+                raise TaskControlError(error_message('cli.error.resume_run_binding'))
             budget_checkpoint_resume = action_payload.get(
                 "resume_budget_checkpoint"
             )
             if not isinstance(budget_checkpoint_resume, bool):
-                raise TaskControlError("resume Action 的 Budget Window binding 无效")
+                raise TaskControlError(error_message('cli.error.resume_budget_binding'))
             bound_intent = action_payload.get("resume_intent")
             return controller.resume(
                 run_id,
@@ -2285,11 +2349,11 @@ def _run_lifecycle(
         if action_kind in {"approve", "revise", "requeue"}:
             action_payload = action.get("payload")
             if not isinstance(action_payload, Mapping):
-                raise TaskControlError(f"{action_kind} Action 缺少语义 payload")
+                raise TaskControlError(error_message('cli.error.action_payload_missing' ,value0=action_kind))
             run_id = action_payload.get("run_id")
             if not isinstance(run_id, str) or run_id != parsed.run_id:
                 raise TaskControlError(
-                    f"{action_kind} Action 的 Delivery Run binding 不匹配"
+                    error_message('cli.error.action_run_binding' ,value0=action_kind)
                 )
             driver = lifecycle_driver_factory(states, None)
             prepare_state = lambda state: prepare_action_application_receipt(
@@ -2304,7 +2368,7 @@ def _run_lifecycle(
                 if action_kind == "revise":
                     message = action_payload.get("message")
                     if not isinstance(message, str) or not message:
-                        raise TaskControlError("revise Action 缺少修订反馈")
+                        raise TaskControlError(error_message('cli.error.revise_feedback_missing'))
                     return driver.operations.revise(
                         run_id, message, prepare_state=prepare_state
                     )
@@ -2327,7 +2391,7 @@ def _run_lifecycle(
                     contradicted = states.load_current_run(run_id)
                     if contradicted is None:  # pragma: no cover - just persisted
                         raise TaskControlError(
-                            f"{action_kind} deterministic contradiction 未持久化"
+                            error_message('cli.error.contradiction_not_saved' ,value0=action_kind)
                         )
                     prepare_action_application_receipt(contradicted, action)
                     states.save_run(run_id, contradicted)
@@ -2366,7 +2430,7 @@ def _run_lifecycle(
                     return state, True
                 if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
                     raise TaskControlError(
-                        f"{action_kind} intent 未形成可验证的 Application Receipt"
+                        error_message('cli.error.receipt_missing' ,value0=action_kind)
                     )
                 driver.supervisor.observe(state)
                 if not driver.supervisor.before_retry(
@@ -2375,14 +2439,15 @@ def _run_lifecycle(
                 ):
                     states.save_run(run_id, state)
                     raise TaskControlError(
-                        f"{action_kind} intent 在外部状态收敛前超时，尚未应用"
+                        error_message('cli.error.intent_timeout' ,value0=action_kind)
                     )
                 states.save_run(run_id, state)
         run_payload = action.get("payload")
         if not isinstance(run_payload, Mapping):
-            raise TaskControlError("run Action 缺少配置 payload")
+            raise TaskControlError(error_message('cli.error.run_payload_missing'))
         frozen_policy = parse_policy_snapshot(run_payload.get("policy"))
         controller.delivery_policy_provider = lambda: frozen_policy
+        controller.creation_language = str(run_payload.get("language", "zh"))
         def prepare_creation(state: dict[str, Any]) -> None:
             # Keep the initial configuration beside the creation receipt so a
             # lost Task Control can be reconciled without reading user defaults.
@@ -2503,7 +2568,7 @@ def _require_managed_state(
     if states.root.resolve() != canonical_root or (
         bound_root is not None and bound_root != canonical_root
     ):
-        raise TaskControlError("任务指向非统一状态目录；不会恢复或写入旧任务目录")
+        raise TaskControlError(error_message('cli.error.task_directory'))
 
 
 def _control_state_root(control_record: Mapping[str, Any] | None) -> Path | None:
@@ -2531,6 +2596,8 @@ def _run_payload_for_existing_action(
         elif getattr(parsed, "notification_mode", None):
             notifications = notification_snapshot(notifications, mode=parsed.notification_mode)
     notification_payload = {"notifications": dict(notifications)} if isinstance(notifications, Mapping) else {}
+    if "language" in existing_payload:
+        notification_payload["language"] = existing_payload["language"]
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")
     if isinstance(stored_policy, Mapping):
@@ -2643,13 +2710,13 @@ def _reconcile_resume_exit(
         observation.status not in {"exited", "absent"}
         or observation.generation not in {None, spec.generation}
     ):
-        raise ExecutorStartUnknownError(observation.reason or "原 Executor 退出状态无法确认")
+        raise ExecutorStartUnknownError(observation.reason or error_message('cli.error.executor_exit_unknown'))
     validate_executor_exit(executor)
     latest = states.load_current_run(str(current["run_id"]))
     if latest is None or not (
         action_receipt_matches(latest, action) or _unbound_action_matches_run_receipt(latest, action)
     ):
-        raise ExecutorStartUnknownError("Run 与原 Executor 的关联已变化；请重新查询")
+        raise ExecutorStartUnknownError(error_message('cli.error.executor_changed'))
     current = latest
     if current.get("status") in {"completed", "abandoned"} and not is_final_approval_action(action, current):
         return current
@@ -2817,8 +2884,7 @@ def _reject_if_task_action_pending(
     )
     if control.load(task) is None and isinstance(receipt, Mapping):
         raise TaskControlError(
-            "Task Control Record 缺失；已有 Delivery Run Action Receipt，"
-            "无法确认当前 Action/Executor ownership"
+            error_message('cli.error.control_record_missing')
         )
     control.require_mutation_available(task)
 
@@ -2900,7 +2966,7 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
         if parent is not None:
             raise _selector_error(
                 "run_selector_invalid",
-                "不能同时提供完整 Run ID 和 --parent；请只选择一种定位方式。",
+                error_message('cli.error.selector_exclusive'),
                 [],
             )
         return _load_exact_read_only_run(parsed, run_id)
@@ -2908,8 +2974,7 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
     if parent is None and parsed.repo:
         raise _selector_error(
             "run_selector_requires_parent",
-            "使用 --repo 选择 status/history 时必须同时提供 --parent；"
-            "否则请从目标仓库运行无参数命令。",
+            error_message('cli.error.selector_parent_required'),
             [],
         )
     selector_root = selected_repository_root(parsed.repo, parsed.github_fixture)
@@ -2948,7 +3013,7 @@ def _resolve_mutation_selection(
 
     raw_selector = parsed.run_id
     if not isinstance(raw_selector, str):
-        raise RunLocatorError("run_selector_invalid", "缺少 Delivery Run selector。")
+        raise RunLocatorError("run_selector_invalid", error_message('cli.error.selector_required'))
     if parsed.command == "resume" and raw_selector.isdecimal():
         _resolve_resume_selection(parsed, git)
         return
@@ -2956,7 +3021,7 @@ def _resolve_mutation_selection(
         parent_number = int(raw_selector)
         if parent_number <= 0:
             raise RunLocatorError(
-                "run_selector_invalid", "Parent Issue 编号必须是正整数。"
+                "run_selector_invalid", error_message('cli.error.parent_positive')
             )
         parsed.run_id = None
         parsed.parent = parent_number
@@ -3007,7 +3072,7 @@ def _resolve_mutation_selection(
     if state is None:
         raise _selector_error(
             "run_selector_not_found",
-            f"{parsed.command} 找不到指定的 Delivery Run；不会猜测目标。",
+            error_message('cli.error.selected_run_missing' ,value0=parsed.command),
             [],
         )
     _validate_repository_selector(parsed, state, raw_selector)
@@ -3042,8 +3107,7 @@ def _reject_local_repository_mismatch(
     if mismatches:
         raise _selector_error(
             "run_selector_repository_mismatch",
-            f"Parent Issue #{parent_number} 的本地 Delivery Run 不属于指定 "
-            f"repository {repository!r}。",
+            error_message('cli.error.parent_repository_mismatch' ,value0=parent_number, value1=repository),
             mismatches,
         )
 
@@ -3128,7 +3192,7 @@ def _resolve_resume_selection(
     parent_number = int(raw_selector)
     if parent_number <= 0:
         raise RunLocatorError(
-            "run_selector_invalid", "Parent Issue 编号必须是正整数。"
+            "run_selector_invalid", error_message('cli.error.parent_positive')
         )
 
     # The original argument is a Parent Issue, not a Run ID.  Clearing it
@@ -3206,8 +3270,7 @@ def _selected_local_run_id(
     ):
         raise _selector_error(
             "run_selector_requires_checkout",
-            f"{command} 选择到的 Run 不属于此仓库的 Runner 工作区；"
-            "请使用 --repo 指定正确的仓库。",
+            error_message('cli.error.workspace_mismatch' ,value0=command),
             [selected],
         )
     selected_state_dir = selected.get("state_dir")
@@ -3222,8 +3285,7 @@ def _selected_local_run_id(
     ):
         raise _selector_error(
             "run_selector_requires_state_dir",
-            f"{command} 选择到的 Run 不在 Runner 的统一状态目录中；"
-            "不支持继续执行旧目录中的任务。",
+            error_message('cli.error.state_directory_mismatch' ,value0=command),
             [selected],
         )
     return selected_run_id
@@ -3263,8 +3325,7 @@ def _load_exact_read_only_run(
             if state is None or state.get("run_id") != run_id:
                 raise RunLocatorError(
                     "run_locator_stale",
-                    f"无法定位 Delivery Run {run_id!r}：定位索引指向的状态文件无效；"
-                    "请显式提供 --state-dir <状态目录>。",
+                    error_message('cli.error.locator_invalid_state' ,value0=run_id),
                 )
             roots = {
                 Path(entry["repository_root"]).resolve()
@@ -3509,7 +3570,7 @@ def _selector_records(
         if current_root is None and repository is None:
             raise _selector_error(
                 "run_selector_context",
-                "无法从当前目录确定仓库；请使用 --repo <owner/name> --parent <issue>。",
+                error_message('cli.error.repository_required'),
                 [],
             )
 
@@ -3615,8 +3676,7 @@ def _read_state_directory(
         if len(paths) > MAX_LOCATOR_ENTRIES:
             raise RunLocatorError(
                 "run_locator_invalid",
-                f"状态目录包含超过 {MAX_LOCATOR_ENTRIES} 个 Run，无法安全作为 Human Run Selector；"
-                "请显式提供完整 Run ID。",
+                error_message('cli.error.too_many_runs' ,value0=MAX_LOCATOR_ENTRIES),
             )
     paths.sort(key=lambda path: path.name)
     repository_root_value = (
@@ -3647,13 +3707,13 @@ def _read_locator_entry(
 ) -> tuple[dict[str, object], dict[str, Any] | None]:
     run_id = entry["run_id"]
     if Path(run_id).name != run_id:
-        return _candidate(entry, error="定位索引中的 Run ID 不是安全文件名"), None
+        return _candidate(entry, error=error_message("cli.error.unsafe_run_id")), None
     state_dir = Path(entry["state_dir"])
     state_path = state_dir / "runs" / f"{run_id}.json"
     state: dict[str, Any] | None = None
     state_error: str | None = None
     if not state_path.is_file():
-        state_error = "定位索引记录的状态文件不存在"
+        state_error = error_message("cli.error.state_missing")
     else:
         try:
             # Identity must be checked before validating the lifecycle payload:
@@ -3663,11 +3723,11 @@ def _read_locator_entry(
             state_error = bounded_error(str(error))
         if state is None:
             if state_error is None:
-                state_error = "状态文件中的 Run ID 与定位索引不一致"
+                state_error = error_message("cli.error.run_id_mismatch")
         elif state.get("run_id") != run_id:
             return _candidate(
                 entry,
-                error="状态文件中的 Run ID 与定位索引不一致",
+                error=error_message("cli.error.run_id_mismatch"),
                 identity_conflict=True,
             ), None
         if state is not None:
@@ -3691,11 +3751,11 @@ def _read_locator_entry(
             ):
                 return _candidate(
                     entry,
-                    error="状态文件中的 Repository/Parent 定位身份格式无效",
+                    error=error_message("cli.error.identity_format"),
                     identity_conflict=True,
                 ), None
             if repository is None or parent_number is None:
-                state_error = "状态文件缺少 Repository/Parent 定位身份；请使用完整 Run ID 消歧"
+                state_error = error_message("cli.error.identity_missing")
         if state is not None and "repository" in entry:
             parent = state.get("parent")
             if (
@@ -3705,7 +3765,7 @@ def _read_locator_entry(
             ):
                 return _candidate(
                     entry,
-                    error="状态文件中的 Repository/Parent 与定位索引不一致",
+                    error=error_message("cli.error.identity_mismatch"),
                     identity_conflict=True,
                 ), None
         if state is not None:
@@ -3725,7 +3785,7 @@ def _read_locator_entry(
             return (
                 _candidate(
                     unavailable,
-                    error=f"定位索引记录的 checkout 不可用：{bounded_error(str(error))}",
+                    error=error_message("cli.error.checkout_unavailable", reason=bounded_error(str(error))),
                 ),
                 None,
             )
@@ -3734,13 +3794,13 @@ def _read_locator_entry(
             if "repository" in entry and not same_repository(entry["repository"], checkout_repository):
                 return _candidate(
                     entry,
-                    error="checkout repository 与定位索引不一致",
+                    error=error_message("cli.error.checkout_repository"),
                     identity_conflict=True,
                 ), None
             candidate["repository"] = checkout_repository
         return candidate, None
     if state is None:  # pragma: no cover - state errors return above
-        return _candidate(entry, error="无法读取定位索引记录的状态"), None
+        return _candidate(entry, error=error_message("cli.error.state_unreadable")), None
     if verify_checkout:
         try:
             checkout, checkout_repository = _verified_locator_checkout(entry)
@@ -3751,7 +3811,7 @@ def _read_locator_entry(
                 _candidate(
                     unavailable,
                     state=state,
-                    error=f"定位索引记录的 checkout 不可用：{bounded_error(str(error))}",
+                    error=error_message("cli.error.checkout_unavailable", reason=bounded_error(str(error))),
                 ),
                 None,
             )
@@ -3760,7 +3820,7 @@ def _read_locator_entry(
             return _candidate(
                 entry,
                 state=state,
-                error="定位索引记录的 checkout repository 与 Run 不一致",
+                error=error_message("cli.error.checkout_run"),
                 identity_conflict=True,
             ), None
         checkout_identity = checkout.checkout_identity()
@@ -3776,7 +3836,7 @@ def _read_locator_entry(
                 _candidate(
                     unavailable,
                     state=state,
-                    error="定位索引记录的 checkout identity 不一致或不可用",
+                    error=error_message("cli.error.checkout_identity"),
                     identity_conflict=state_identity is not None,
                 ),
                 None,
@@ -3841,8 +3901,7 @@ def _select_one_record(
     if invalid:
         raise _selector_error(
             "run_locator_stale",
-            f"{purpose} 的候选包含失效或无法读取的定位记录；"
-            "不会猜测目标，请修复索引或使用 --state-dir。",
+            error_message('cli.error.invalid_candidates' ,value0=purpose),
             public_records,
         )
 
@@ -3880,14 +3939,14 @@ def _select_one_record(
             if other_matches:
                 raise _selector_error(
                     "run_selector_ambiguous",
-                    f"{purpose} 匹配多个 checkout 中的 Delivery Run；不会猜测，请显式消歧。",
+                    error_message('cli.error.multiple_checkouts' ,value0=purpose),
                     [public for public, _state in matches],
                 )
             matches = local_matches
         elif other_matches:
             raise _selector_error(
                 "run_selector_requires_checkout",
-                f"{purpose} 找到的 Delivery Run 不属于当前 checkout；不会跨 clone 猜测。",
+                error_message('cli.error.other_checkout' ,value0=purpose),
                 [public for public, _state in other_matches],
             )
 
@@ -3895,7 +3954,7 @@ def _select_one_record(
         if len(matches) > 1:
             raise _selector_error(
                 "run_selector_ambiguous",
-                f"{purpose} 匹配多个 Delivery Run；不会按最近时间猜测，请显式消歧。",
+                error_message('cli.error.multiple_runs' ,value0=purpose),
                 [public for public, _state in matches],
             )
         if len(matches) == 1:
@@ -3908,8 +3967,7 @@ def _select_one_record(
                 return public, state
             raise _selector_error(
                 "run_selector_not_recoverable",
-                "resume 找到一个现有 Run，但它当前没有可恢复的边界；"
-                "不会创建新 Run。",
+                error_message('cli.error.not_recoverable'),
                 [public],
             )
     elif len(matches) == 1:
@@ -3917,12 +3975,12 @@ def _select_one_record(
     elif len(matches) > 1:
         raise _selector_error(
             "run_selector_ambiguous",
-            f"{purpose} 匹配多个 Delivery Run；不会按最近时间猜测，请显式消歧。",
+            error_message('cli.error.multiple_runs' ,value0=purpose),
             [public for public, _state in matches],
         )
     raise _selector_error(
         "run_selector_not_found",
-        f"{purpose} 没有唯一匹配的 Delivery Run；不会创建或猜测 Run。",
+        error_message('cli.error.no_unique_run' ,value0=purpose),
         public_records,
     )
 
@@ -3932,9 +3990,9 @@ def _selector_error(
 ) -> RunLocatorError:
     details = message
     if candidates:
-        details += "\n候选：\n" + "\n".join(
+        details = error_message("cli.error.candidates", reason=message, candidates="\n".join(
             _candidate_line(candidate) for candidate in candidates
-        )
+        ))
     return RunLocatorError(code, details, candidates=candidates)
 
 
@@ -3974,31 +4032,34 @@ def _validate_repository_selector(
             }
             raise _selector_error(
                 "run_selector_repository_mismatch",
-                f"Run {run_id!r} 不属于指定 repository {repository!r}。",
+                error_message('cli.error.repository_mismatch' ,value0=run_id, value1=repository),
                 [candidate],
             )
 
 
-def _human_failure_reason(error: Exception, fallback: str) -> str:
+def _human_failure_reason(error: Exception, fallback: str, *, language: str = "zh") -> str:
     """Render selector failures without machine-only locator identities."""
 
+    def message(key: str) -> str:
+        return text(f"cli.error.{key}", language=language, reason=fallback)
+
     if isinstance(error, ExecutorLostError):
-        return "Executor 已退出；已保留当前交付状态，不会自动重放未知工作。"
+        return message("executor_lost")
     if isinstance(error, ActionBusyError):
-        return f"当前交付已有未完成操作；{fallback}"
+        return message("action_busy")
     if isinstance(error, ExecutorStartUnknownError):
-        return f"运行进程归属暂时无法确认；{fallback}"
+        return message("executor_unknown")
     if isinstance(error, TaskControlError):
-        return f"交付控制检查未通过；{fallback}"
+        return message("control_failed")
     if str(error).startswith("multiple unfinished Delivery Runs"):
-        return "同一 Parent Issue 存在多个未完成交付；请先人工消歧。"
+        return message("unfinished_runs")
     if not isinstance(error, RunLocatorError):
         return fallback
-    return {
-        "run_selector_repository_mismatch": "所选交付不属于指定 Repository。",
-        "run_selector_not_found": "没有找到唯一匹配的交付；不会猜测目标。",
-        "run_locator_stale": "交付定位记录已失效；请显式提供状态目录后重试。",
-    }.get(error.code, "无法唯一定位交付；不会猜测目标。")
+    return message({
+        "run_selector_repository_mismatch": "wrong_repository",
+        "run_selector_not_found": "no_delivery",
+        "run_locator_stale": "stale_locator",
+    }.get(error.code, "ambiguous_delivery"))
 
 
 def _validate_repository_name(repository: str) -> None:
@@ -4006,7 +4067,7 @@ def _validate_repository_name(repository: str) -> None:
     if not separator or not owner or not name or "/" in name:
         raise RunLocatorError(
             "run_selector_invalid_repository",
-            "repository 必须是 owner/name。",
+            error_message('cli.error.repository_format'),
         )
 
 
@@ -4036,24 +4097,36 @@ def _list_runs(parsed: argparse.Namespace) -> int:
     if parsed.as_json:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return 0
-    print(f"repository: {repository or 'unknown'}")
+    print(cli_message("cli.repository", repository=repository or "unknown"))
     if not candidates:
-        print("未找到已登记的 Delivery Run。")
+        print(cli_message("cli.no_runs"))
         return 0
-    print("候选 Delivery Run：")
-    for candidate in candidates:
-        print(_candidate_line(candidate))
+    print(cli_message("cli.run_candidates"))
+    for candidate, state in records:
+        language = (str(state["language"]) if isinstance(state, dict)
+                    and state.get("language") in {"zh", "en"} else personal_language())
+        print(cli_message(
+            "cli.run_candidate", language=language,
+            repository=candidate.get("repository") or "unknown",
+            parent=candidate.get("parent") or "unknown",
+            status=cli_presentation.human_delivery_status(
+                candidate.get("status") or "unknown", language=language),
+            started_at=candidate.get("started_at") or "unknown",
+            worktree=candidate.get("repository_root"), state_dir=candidate.get("state_dir"),
+        ))
+        if candidate.get("error"):
+            print(cli_message("cli.reason", language=language, reason=error_detail(ValueError(candidate["error"]), language)))
     return 0
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--repo",
-        help="GitHub owner/name；默认由当前 Git remote 推断",
+        help=cli_message('cli.repo_help'),
     )
     parser.add_argument(
         "--state-dir",
-        help="显式读取状态目录；变更命令仅允许使用 Runner 的统一状态目录",
+        help=cli_message('cli.state_dir_help'),
     )
     parser.add_argument(
         "--github-fixture",
@@ -4071,40 +4144,40 @@ def _add_profile_options(parser: argparse.ArgumentParser) -> None:
         "--preset",
         "--profile-preset",
         dest="profile_preset",
-        help="Agent Execution Preset（默认 economy）",
+        help=cli_message('cli.preset_help'),
     )
     parser.add_argument(
         "--development-model",
         "--dev-model",
         dest="development_model",
-        help="Development 顶层 Codex 的 model",
+        help=cli_message('cli.dev_model_help'),
     )
     parser.add_argument(
         "--development-effort",
         "--development-reasoning-effort",
         "--dev-effort",
         dest="development_effort",
-        help="Development 顶层 Codex 的 reasoning effort",
+        help=cli_message('cli.dev_effort_help'),
     )
     parser.add_argument(
-        "--review-model", dest="review_model", help="Review 顶层 Codex 的 model"
+        "--review-model", dest="review_model", help=cli_message('cli.review_model_help')
     )
     parser.add_argument(
         "--review-effort",
         "--review-reasoning-effort",
         dest="review_effort",
-        help="Review 顶层 Codex 的 reasoning effort",
+        help=cli_message('cli.review_effort_help'),
     )
     parser.add_argument(
         "--publication-model",
         dest="publication_model",
-        help="Publication 顶层 Codex 的 model",
+        help=cli_message('cli.publication_model_help'),
     )
     parser.add_argument(
         "--publication-effort",
         "--publication-reasoning-effort",
         dest="publication_effort",
-        help="Publication 顶层 Codex 的 reasoning effort",
+        help=cli_message('cli.publication_effort_help'),
     )
     parser.add_argument(
         "--publication-from-development",
@@ -4113,7 +4186,7 @@ def _add_profile_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=None,
         dest="publication_from_development",
-        help="让 Publication 恢复引用 Development Profile",
+        help=cli_message('cli.publication_reference_help'),
     )
     parser.add_argument(
         "--publication-reference",
@@ -4132,28 +4205,28 @@ def _add_policy_options(
             "--development-thread-policy",
             choices=("reuse", "new-per-attempt"),
             dest=f"{dest_prefix}development_thread_policy",
-            help="开发 Thread 策略：跨轮复用或每新开发轮新建，仅新 Run 生效",
+            help=cli_message('cli.thread_policy_help'),
         )
     parser.add_argument(
         "--parent-only-paired-rounds",
         "--parent-only-paired-round",
         dest=f"{dest_prefix}parent_only_paired_rounds",
         type=_positive_integer,
-        help="Parent-only Development/Review 配对轮数（推导 D=N/R=N）",
+        help=cli_message('cli.parent_rounds_help'),
     )
     parser.add_argument(
         "--run-repair-rounds",
         "--run-repair-round",
         dest=f"{dest_prefix}run_repair_rounds",
         type=_positive_integer,
-        help="Run Repair 轮数（推导 Development=N、Reviewer=N+1）",
+        help=cli_message('cli.repair_rounds_help'),
     )
     parser.add_argument(
         "--ticket-review-rounds",
         "--ticket-review-round",
         dest=f"{dest_prefix}ticket_review_rounds",
         type=_positive_integer,
-        help="Ticket Review 语义轮数（推导 Development=N+1）",
+        help=cli_message('cli.ticket_rounds_help'),
     )
     for role, label in (
         ("development", "Development"),
@@ -4166,7 +4239,7 @@ def _add_policy_options(
             f"--{role}-timeout",
             dest=f"{dest_prefix}{role}_deadline",
             type=_positive_duration_argument,
-            help=f"{label} Invocation 正 duration（可用秒或 s/m/h/d）",
+            help=cli_message("cli.deadline_help", role=label),
         )
 
 
@@ -4289,10 +4362,10 @@ def _configure_profile(parsed: argparse.Namespace) -> int:
     else:
         parent = state.get("parent")
         parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
-        print(f"Repository: {state.get('repository')}")
-        print(f"Parent Issue: #{parent_number}")
-        print(f"配置状态: 已保存 Agent Profile Revision {document['profile_revision']}")
-        print("运行状态: 未启动、停止或推进 Delivery Run；已有 Thread binding 不变")
+        print(cli_message("cli.repository", language=str(state.get("language", "zh")), repository=state.get("repository")))
+        print(cli_message("cli.parent_issue", language=str(state.get("language", "zh")), parent=parent_number))
+        print(cli_message("cli.profile_saved", language=str(state.get("language", "zh")), revision=document["profile_revision"]))
+        print(cli_message("cli.profile_no_execution", language=str(state.get("language", "zh"))))
     return 0
 
 
@@ -4336,7 +4409,7 @@ def _auth_command(parsed: argparse.Namespace) -> int:
                 )
             )
             return 0
-        raise ValueError("未知 GitHub auth 命令")
+        raise ValueError(error_message('cli.error.unknown_auth'))
     except GitHubAuthProfileError as error:
         print(
             json.dumps(
@@ -4375,15 +4448,15 @@ def _positive_integer(value: str) -> int:
     try:
         number = int(value)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("必须是正整数") from error
+        raise argparse.ArgumentTypeError(cli_message("cli.positive_integer")) from error
     if number <= 0:
-        raise argparse.ArgumentTypeError("必须是正整数")
+        raise argparse.ArgumentTypeError(cli_message("cli.positive_integer"))
     return number
 
 
 def _positive_duration_argument(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise argparse.ArgumentTypeError("duration 必须为正数，可带 s/m/h/d 后缀")
+        raise argparse.ArgumentTypeError(cli_message("cli.positive_duration"))
     return value
 
 

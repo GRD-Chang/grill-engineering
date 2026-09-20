@@ -338,6 +338,7 @@ class RunPublicationFlow(RunPublicationShared):
                 head_sha=self.git.resolve(str(state["run_branch"])), checkout=checkout
             )
             request = self._publication_request(state, checkout)
+            request["_prompt_resources"] = state["prompt_resources"]
             request["_invocation_event"] = self._invocation_events(
                 state, request, semantic_attempt
             )

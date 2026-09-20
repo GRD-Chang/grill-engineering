@@ -42,3 +42,6 @@ code-failure-steps = [
   "CI::quality::Run tests",
   "CI::quality::Run type checks",
 ]
+
+[tool.setuptools.package-data]
+agent_run = ["resources/**/*.md", "resources/**/*.json"]

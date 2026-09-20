@@ -763,9 +763,14 @@ def _timeline_result(state: dict[str, Any]) -> object:
 def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
     """Build an isolated durable copy while bounding and redacting payloads."""
 
+    # Static instructions are intentional user content, not diagnostic payloads.
+    # Preserve them verbatim across restart; dynamic output remains sanitized.
+    resources = value.get("prompt_resources")
     sanitized = _sanitize_error_value(value)
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
         raise ValueError("durable Run state must be a mapping")
+    if resources is not None:
+        sanitized["prompt_resources"] = deepcopy(resources)
     diagnostics = sanitized.get("diagnostics")
     if isinstance(diagnostics, list):
         sanitized["diagnostics"] = [

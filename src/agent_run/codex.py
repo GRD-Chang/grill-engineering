@@ -31,6 +31,7 @@ from agent_run.artifacts import (
 )
 from agent_run.development_prompts import development_prompt
 from agent_run.prompt_context import structured_output_repair_prompt
+from agent_run.prompt_resources import resource
 from agent_run.publication_prompts import (
     publication_continuation_prompt,
     publication_prompt,
@@ -162,11 +163,7 @@ class CodexCliBackend:
         """Exercise the production Publication schema boundary once, read-only."""
 
         return self._invoke(
-            prompt=(
-                "你是负责提交说明输出格式检查的工程师。本次不读取或修改仓库，不调用工具。"
-                "仅返回 result_kind 为 human_blocker，commit_message、pr_title 和 "
-                "pr_body_markdown 为 null，human_blockers 为只含一条非空中文字符串的数组。"
-            ),
+            prompt=resource({}, "publication/handshake"),
             checkout=checkout,
             thread_id=None,
             schema=publication_or_human_blocker_schema(),
@@ -377,7 +374,7 @@ class CodexCliBackend:
             attempt_prompt = role_prompt
             if validation_error:
                 attempt_prompt = structured_output_repair_prompt(
-                    output_name, validation_error[:2000]
+                    output_name, validation_error[:2000], request=request
                 )
             try:
                 execution_binding = request.get("_execution_binding")

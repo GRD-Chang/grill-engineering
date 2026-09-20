@@ -590,6 +590,7 @@ class RunAcceptanceEngine:
     ) -> dict[str, Any]:
         request = {
             "acceptance_scope": "run",
+            "_prompt_resources": state["prompt_resources"],
             "parent_issue_url": self._issue_url(
                 state, int(self._mapping(state, "parent")["number"])
             ),

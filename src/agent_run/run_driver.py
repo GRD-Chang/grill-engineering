@@ -646,6 +646,7 @@ class RunDriver:
         self.operations = operations
         self.states = states
         self.supervisor = supervisor
+        self.on_outcome: Callable[[dict[str, Any], str], None] | None = None
 
     def advance(
         self,
@@ -702,6 +703,8 @@ class RunDriver:
                     if failed is None:  # pragma: no cover - Controller just wrote it
                         return state
                     return failed
+                if self.on_outcome is not None:
+                    self.on_outcome(state, outcome.kind.value)
                 if outcome.kind is not RunOutcomeKind.EXTERNAL_WAIT:
                     if clear_supervision_window(state):
                         self.states.save_run(run_id, state)

@@ -4,6 +4,21 @@
 
 Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务。
 
+## 静态 Prompt 资源与个人方法
+
+新 Delivery Run 在首次持久化前一次读取并固定语言、四份角色正文及代码定义的对应语言内部静态文案。
+个人配置的 `language` 仅接受 `zh`/`en`，默认中文，不跟随宿主 locale。
+个人方法按语言分别位于个人配置目录的 `prompts/zh/` 与 `prompts/en/`，跨项目共用；四份完整文件 `development.md`、`repair.md`、`acceptance.md`、`publishing.md` 分别用于开发、修复、验收和发布文案准备。
+同线程新修复与新线程修复均使用固定的完整修复正文；同轮 Resume 使用固定内部短指令，输出格式修复仍只读且只重发结构化结果。
+每次调用的任务、Revision、证据及最新人工回复仍来自当前事实，不保存逐次完整动态 Prompt 或对话。
+资源固定不改变 Thread Execution Binding、Controller/Worker/Publisher 权限或 Development Brief 的需求读取边界。
+缺少固定语言或必需静态资源快照的旧 Run 明确不兼容，不自动补齐或迁移。无 Run 的安装探针使用个人语言与候选安装包的内部资源。
+短界面文案通过 `messages.text` 统一选择，`messages.selected_language` 区分个人配置与固定 Run 语言；用户方法按角色组织为 Markdown；内部指令按职责在代码中以中英文配对的完整用途块维护，共用场景组装逻辑。
+Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与详情）及飞书卡片共用中英文资源。
+无 Run 的界面使用个人语言，已有 Run 的展示使用固定语言；机器 JSON、审计事实和通知选择不随展示语言变化。
+原始标题、日志、用户反馈、Agent 摘要、Findings 与证据保持原文；查询不写入 Run 或通知记录，也不发送通知。
+初始化、只读差异与真实组装预览见[个人运行配置](docs/user-defaults.md)；升级不覆盖个人方法，定制正文不会自动继承默认更新。
+
 ## Language
 
 **Codex Worker（Codex 工作器）**:
@@ -51,7 +66,7 @@ _Avoid_: Ticket Contract、Parent-only Delivery 范围、Run Acceptance 范围
 _Avoid_: 最少代码行、顺手重构、未来扩展点、假想复用、为拆分而拆分
 
 **Prompt 用语约定（Prompt Language Convention）**:
-面向 Codex Worker 的角色、任务、范围与完成条件采用清楚直接的中文工作语言，不预设它理解本项目的领域术语；内部领域定义继续保留，Prompt 用具体责任与动作表达对应含义。必须与程序、JSON、命令或 Skill 精确匹配的名称保留原文。
+面向 Codex Worker 的角色、任务、范围与完成条件采用所选语言的清楚直接工作用语（默认中文，支持英文），不预设它理解本项目的领域术语；内部领域定义继续保留，Prompt 用具体责任与动作表达对应含义。必须与程序、JSON、命令或 Skill 精确匹配的名称保留原文。自然语言输出只由 Prompt 引导，不做语言识别、比例验收、纠正、翻译或额外调用；合法另一语言输出、原始标题、用户反馈及技术证据原样保留。
 _Avoid_: 用 Ticket 或 Review Boundary 等名称代替任务说明、要求 Worker 理解 Delivery Run 的全局流转、翻译机器字段
 
 **验收 Lane 状态（Acceptance Lane Status）**:
@@ -619,8 +634,13 @@ _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的�
 `status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
 _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
 
+**Notification Facts（通知事实）**:
+通知只读消费 History 已关联的 Semantic Attempt、Invocation、Acceptance Artifact 和当前交付事实。History 的 `status_code` 是与 `status_text` 同源的稳定结果分类；通知不比较展示后的状态、标题或角色文案，当前动作与 Status 共用原有动作判定。事件身份仅包含业务身份与结构化结果，不包含语言或翻译文本；恢复筛选使用稳定 Attempt 身份。卡片使用 Run 固定语言及统一短文案入口，原始标题、摘要、Findings 和证据不翻译。关键节点采用下述精简规则，详细过程对同一事实只描述一次。异步发送、有限重试、unknown 保守处理和只读查询边界保持不变。
+子任务完成仍以完成并进入集成成果为准。其卡片从 History 的 Semantic Attempt 身份与关联 Invocation 汇总开发（包括修复）和验收投入：同轮续接、Output Repair 与 Thread 更换不增加轮数，预算窗口 ordinal 重置不替代累计身份计数。执行时间只累计实际执行段，排除暂停及人工／CI 等待；原有包含 Publication 的全部 Agent 执行总时间保留，分项之和不冒充全部总计或任务历时。模型和推理强度取真实 Invocation／Thread Binding，角色内一致时简洁展示，多组合按参与轮数和执行段汇总，同轮跨配置明确标记参与数不可相加。缺失或裁剪时省略无法证明的累计项，独立可靠字段保留，不补零或猜测。仅统计顶层角色，不推断内部 subagent、Token 或费用；卡片不列逐轮时间表，不增加模型调用或平行统计存储，明细继续由 History 追溯。
+_Avoid_: 反向解析翻译文案、通知独立状态机、按发送时个人默认选择语言、语言变化重发
+
 **精简通知**:
-面向任务发起人的重要进展通知，保留子任务完成、需要人工介入或批准及最终结果，省略每轮开发、验收和自动修复的常规启动与结束。Agent 角色在相关消息中保留，阶段使用可理解的工作动作。
+面向任务发起人的重要进展通知。有子任务时保留任务启动、每个子任务首次实际开发开始及完成、首次整体验收开始和转入整体修复、正式整体验收通过、独立待批准及最终完成；Parent-only 只保留任务启动、完整需求正式验收通过、独立待批准及完成。通过只依据当前有效的正式对应验收结论，不把局部修复或未提升候选当成整体通过。人工 Resume 反馈实际启动、Controller 推进、失败或立即人工待办，已运行只终端提示；自动续接不算人工恢复。失败与对应故障去重。保留人工待办、预算暂停、停止、放弃和合并后待清理。首次节点使用稳定身份，返工、Resume、换线程不重复开始，后续修复和重验保持安静。规则统一适用于新版 Runner，不增加旧策略迁移。Agent 角色在相关消息中保留，阶段使用可理解的工作动作。
 _Avoid_: 仅成功时通知、隐藏人工待办
 
 **Operator Action View（操作者动作视图）**:
@@ -659,7 +679,7 @@ _Avoid_: 每次命令重新读取默认值、普通恢复中途改预算、追�
 Controller 对一次阶段级 Codex 调用的持久记录。Ticket、Parent-only 和 Run Repair 的
 Development、Fresh Acceptance 与 Publication Invocation 都在首个 Output Attempt 前成为 active，
 并绑定 Work Subject、Generation、输入指纹、机械 Currentness Boundary、当前 Semantic Agent Attempt 与实际 Thread Execution Binding；记录只保存输入指纹、有界边界事实、model、reasoning effort 与 Agent Profile Revision，
-不保存 Prompt、transcript 或 Acceptance Artifact。`thread.started` 在进程运行中
+不保存逐次完整动态 Prompt、transcript 或 Acceptance Artifact；Run 根状态只保存一次静态 Prompt 资源。`thread.started` 在进程运行中
 立即保存。零退出但不符合完整阶段 contract 的输出可在同一 Thread 中最多修复两次；repair
 checkout 只读，使用按角色区分的短格式 Prompt，且不增加领域 Development Attempt、Reviewer Invocation 或 Publication Attempt。一个 Invocation 只有一个覆盖初始 Output Attempt 与其 Output Repair 的按角色总 Deadline；Development 默认五小时，Review 默认两小时，Publication 默认一小时，均可由 Run Policy Snapshot 中的角色覆盖值替代。successor Invocation 获得新的完整角色 Deadline，但仍可属于同一个 Semantic Agent Attempt。进程失败、缺失或
 不匹配的 Thread 结束当前 Invocation；只有符合 Automatic Invocation Recovery 边界的异常才允许自动同 Thread 恢复，普通异常最多一次，准确容量不足可持续恢复，不自动创建替代 Thread。自动或人工同 Thread 续接均按当前角色使用短 Prompt；操作者可用 `--new-thread` 明确以相应角色和任务模式的完整标准 Prompt 新开 Thread。

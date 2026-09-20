@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from test_codex_prompt_contract import _capture_public_prompt
+from support.worker_sigint_probe import cleanup_probe_controller
 from support.worker_process_timing import (
     AdvancingClock,
     run_worker_expecting_early_failure,
@@ -437,6 +438,10 @@ def test_run_publication_marks_exhausted_empty_output_as_failed(
 def test_development_repairs_invalid_output_in_same_thread_without_second_write(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    resources = resolve_resources()
+    resources["development/output-repair"] += "\n固定格式修复资源"
     attempts: list[list[str]] = []
     prompts: list[str] = []
 
@@ -467,11 +472,13 @@ def test_development_repairs_invalid_output_in_same_thread_without_second_write(
 
     monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
     result = CodexCliBackend(credential_provider=lambda: "reader-secret").develop(
-        {"checkout": str(tmp_path)}
+        {"checkout": str(tmp_path), "_prompt_resources": resources}
     )
 
     assert result.thread_id == "development-thread"
     assert len(attempts) == 2
+    assert "固定格式修复资源" in prompts[1]
+    assert "固定格式修复资源" not in prompts[0]
     assert "resume" in attempts[1]
     assert "你已完成本次开发或修复" in prompts[1]
     assert "开发结果 JSON" in prompts[1]
@@ -4220,21 +4227,28 @@ def test_sigint_terminates_worker_process_group(
 ) -> None:
     project_root = Path(__file__).parents[1]
     child_path = tmp_path / "child.pid"
-    # Reap the child in its owning shell, including on group termination. A
-    # runner's init/subreaper need not reap orphans before our exit assertion.
+    reaped_path = tmp_path / "child-reaped"
+    group_path = tmp_path / "worker.pgid"
+    # Group cleanup may kill the shell before it can reap its child. Own orphan
+    # reaping in this isolated controller; kill(pid, 0) alone also sees zombies.
     code = f"""
 from pathlib import Path
 from agent_run.worker_sandbox import run_worker_process
-run_worker_process(
-    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; wait"],
-    cwd=Path({str(tmp_path)!r}),
-    prompt="",
-    environment={{"PATH": "/usr/bin:/bin"}},
-    timeout=120,
-)
+from support.worker_sigint_probe import expect_sigint_cleanup
+with expect_sigint_cleanup(Path("child.pid"), Path("child-reaped")):
+    run_worker_process(
+        ["sh", "-c", "sleep 60 & echo $! > child.pid; wait"],
+        cwd=Path({str(tmp_path)!r}),
+        prompt="",
+        environment={{"PATH": "/usr/bin:/bin"}},
+        timeout=120,
+        on_process_started=lambda pid: Path("worker.pgid").write_text(str(pid)),
+    )
 """
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(project_root / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(project_root / "src"), str(project_root / "tests")]
+    )
     controller = subprocess.Popen(
         [sys.executable, "-c", code],
         cwd=tmp_path,
@@ -4244,7 +4258,6 @@ run_worker_process(
         stderr=subprocess.PIPE,
     )
     child_pid: int | None = None
-    child_gone = False
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -4257,38 +4270,20 @@ run_worker_process(
         os.kill(controller.pid, signal.SIGINT)
         controller.wait(timeout=5)
 
-        assert controller.returncode not in {None, 0}
+        stdout, stderr = controller.communicate(timeout=5)
+        assert controller.returncode == 130, (stdout, stderr)
+        assert reaped_path.read_text() == "SIGINT cleanup passed"
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             try:
                 os.kill(child_pid, 0)
             except ProcessLookupError:
-                child_gone = True
                 break
             time.sleep(0.02)
         else:
             pytest.fail("background Worker process survived SIGINT cleanup")
     finally:
-        if controller.poll() is None:
-            controller.send_signal(signal.SIGINT)
-            try:
-                controller.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                controller.kill()
-                controller.wait(timeout=5)
-        if not child_gone and child_pid is None and child_path.exists():
-            recorded_pid = child_path.read_text().strip()
-            if recorded_pid:
-                child_pid = int(recorded_pid)
-        if not child_gone and child_pid is not None:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if controller.stdout is not None:
-            controller.stdout.close()
-        if controller.stderr is not None:
-            controller.stderr.close()
+        cleanup_probe_controller(controller, group_path)
 
 
 @pytest.mark.parametrize(
@@ -4307,6 +4302,8 @@ def test_sigint_cleans_worker_during_thread_startup_and_wait(
     project_root = Path(__file__).parents[1]
     child_path = tmp_path / "child.pid"
     marker_path = tmp_path / "thread-start.marker"
+    reaped_path = tmp_path / "child-reaped"
+    group_path = tmp_path / "worker.pgid"
     target_start = {"before_start": 1, "partial_start": 2}.get(sigint_phase)
     code = f"""
 import os
@@ -4314,6 +4311,7 @@ import signal
 import threading
 from pathlib import Path
 from agent_run.worker_sandbox import run_worker_process
+from support.worker_sigint_probe import expect_sigint_cleanup
 
 phase = {sigint_phase!r}
 marker = Path({str(marker_path)!r})
@@ -4347,17 +4345,21 @@ def interrupt_when_ready(line):
     if line == "ready":
         os.kill(os.getpid(), signal.SIGINT)
 
-run_worker_process(
-    ["sh", "-c", "trap 'wait; exit' TERM; sleep 60 & echo $! > child.pid; echo ready; wait"],
-    cwd=Path({str(tmp_path)!r}),
-    prompt="",
-    environment={{"PATH": "/usr/bin:/bin"}},
-    timeout=120,
-    on_stdout_line=interrupt_when_ready if phase == "normal_wait" else None,
-)
+with expect_sigint_cleanup(Path("child.pid"), Path("child-reaped")):
+    run_worker_process(
+        ["sh", "-c", "sleep 60 & echo $! > child.pid; echo ready; wait"],
+        cwd=Path({str(tmp_path)!r}),
+        prompt="",
+        environment={{"PATH": "/usr/bin:/bin"}},
+        timeout=120,
+        on_process_started=lambda pid: Path("worker.pgid").write_text(str(pid)),
+        on_stdout_line=interrupt_when_ready if phase == "normal_wait" else None,
+    )
 """
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(project_root / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(project_root / "src"), str(project_root / "tests")]
+    )
     controller = subprocess.Popen(
         [sys.executable, "-c", code],
         cwd=tmp_path,
@@ -4367,31 +4369,35 @@ run_worker_process(
     )
     try:
         deadline = time.monotonic() + 5
-        while not child_path.exists() and time.monotonic() < deadline:
+        # Redirection creates the file before echo writes the child PID.
+        # Interrupting that gap prevents both the assertion and orphan reaping.
+        while time.monotonic() < deadline:
+            if child_path.exists() and child_path.read_text().strip():
+                break
             time.sleep(0.02)
-        assert child_path.exists()
+        assert child_path.exists() and child_path.read_text().strip()
         if sigint_phase != "normal_wait":
             while not marker_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert marker_path.exists()
             os.kill(controller.pid, signal.SIGINT)
         controller.wait(timeout=5)
-    finally:
-        if controller.poll() is None:
-            controller.kill()
-            controller.wait(timeout=5)
 
-    assert controller.returncode not in {None, 0}
-    child_pid = int(child_path.read_text(encoding="utf-8").strip())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail(f"background Worker process survived {sigint_phase} cleanup")
+        stdout, stderr = controller.communicate(timeout=5)
+        assert controller.returncode == 130, (stdout, stderr)
+        assert reaped_path.read_text() == "SIGINT cleanup passed"
+        child_pid = int(child_path.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"background Worker process survived {sigint_phase} cleanup")
+    finally:
+        cleanup_probe_controller(controller, group_path)
 
 
 def test_successful_worker_cleans_background_processes(
@@ -4890,3 +4896,90 @@ def test_worker_descendant_inherits_hidden_control_and_runner_paths(
         "systemd_private": False,
         "user_bus": False,
     }
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("output_repair", [False, True], ids=["valid-first", "format-repair"])
+@pytest.mark.parametrize("method", ["develop", "review", "publication", "run_publication"])
+def test_language_does_not_rewrite_or_retry_valid_agent_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    language: str, output_repair: bool, method: str,
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    # Both opposite-language and mixed-language prose are valid wire content.
+    prose = "Verified without changes." if language == "zh" else "已验证，无需改动。"
+    mixed = "原始 evidence: pytest exited 0，保持原文。"
+    if method == "develop":
+        artifact: dict[str, Any] = {
+            "result_kind": "development", "summary": prose + mixed, "human_blockers": None,
+        }
+        role = "development"
+    elif method == "review":
+        artifact = failed_acceptance_artifact(mixed)
+        artifact["checks"]["e2e"]["findings"] = [prose + mixed]
+        artifact["checks"]["standards"]["evidence"] = prose
+        role = "review"
+    else:
+        artifact = {
+            "result_kind": "publication", "commit_message": prose,
+            "pr_title": mixed, "pr_body_markdown": prose + "\n\n" + mixed,
+            "human_blockers": None,
+        }
+        role = "publication"
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((arguments, str(options["prompt"])))
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text(json.dumps(
+            {"invalid": True} if output_repair and len(calls) == 1 else artifact,
+            ensure_ascii=False,
+        ), encoding="utf-8")
+        return subprocess.CompletedProcess(
+            arguments, 0, '{"type":"thread.started","thread_id":"language-test"}\n', "",
+        )
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", fake_run)
+    resources = resolve_resources(language=language)
+    backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
+    result = getattr(backend, method)({
+        "checkout": str(tmp_path), "acceptance_artifact": {}, "_prompt_resources": resources,
+    })
+    assert len(calls) == (2 if output_repair else 1)
+    if method == "develop":
+        assert result.summary == artifact["summary"]
+    elif method == "run_publication":
+        assert result == {**artifact, "_thread_id": "language-test"}
+    else:
+        assert result.artifact == artifact
+    if output_repair:
+        assert "resume" in calls[1][0]
+        for static_part in resources[f"{role}/output-repair"].strip().split("{0}"):
+            assert static_part in calls[1][1]
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_no_run_publication_probe_uses_personal_language(
+    tmp_path: Path, monkeypatch: Any, language: str,
+) -> None:
+    from agent_run.prompt_resources import read_builtin_resource
+    from agent_run.user_defaults import UserDefaultsStore
+
+    UserDefaultsStore().configure(language=language)
+    prompts: list[str] = []
+    wire = {"result_kind": "human_blocker", "commit_message": None,
+            "pr_title": None, "pr_body_markdown": None,
+            "human_blockers": ["原始 mixed language probe result"]}
+
+    def worker(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        prompts.append(options["prompt"])
+        Path(arguments[arguments.index("--output-last-message") + 1]).write_text(json.dumps(wire))
+        return subprocess.CompletedProcess(arguments, 0,
+            '{"type":"thread.started","thread_id":"probe-thread"}\n', "")
+
+    monkeypatch.setattr("agent_run.codex.run_worker_process", worker)
+    output, thread = CodexCliBackend(credential_provider=lambda: "isolated-reader").publication_schema_handshake(tmp_path)
+    assert prompts == [read_builtin_resource("publication/handshake", language=language).rstrip("\n")]
+    assert json.loads(output) == wire
+    assert thread == "probe-thread"

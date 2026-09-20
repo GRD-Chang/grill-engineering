@@ -1,6 +1,8 @@
 """Human status actions derived from existing controller and delivery facts."""
 from __future__ import annotations
 
+from agent_run.messages import display_text
+
 from typing import Any
 
 from agent_run.final_approval_operation import final_approval_cleanup_pending
@@ -17,24 +19,24 @@ def controller_work(state: dict[str, Any], audit: dict[str, Any]) -> str | None:
     current = current_work_subject(state)
     phase = current[1].get("phase") if current else None
     return {
-        "committing_candidate": "程序正在自动保存代码；无需操作。",
-        "candidate": "程序正在准备验收；无需操作。",
-        "publishing": "程序正在准备创建 PR；无需操作。",
-        "publication_pending": "程序正在创建 PR；无需操作。",
-        "creating_pr": "程序正在创建 PR；无需操作。",
+        "committing_candidate": display_text('presentation.status.saving_code_automatically_no_action_required'),
+        "candidate": display_text('presentation.status.preparing_acceptance_no_action_required'),
+        "publishing": display_text('presentation.status.preparing_to_create_a_pr_no_action_required'),
+        "publication_pending": display_text('presentation.status.creating_a_pr_no_action_required'),
+        "creating_pr": display_text('presentation.status.creating_a_pr_no_action_required'),
     }.get(str(phase))
 
 
 def status_heading(state: dict[str, Any], view: dict[str, Any], fallback: object) -> object:
     if state.get("status") == "completed":
-        return "已合并，待清理" if final_approval_cleanup_pending(state) else "任务已完成"
+        return display_text('presentation.status.merged_cleanup_pending') if final_approval_cleanup_pending(state) else display_text('presentation.status.task_completed')
     current = current_work_subject(state)
     if current and current[0] == "run_acceptance" and view.get("execution_activity") == "running":
-        return "正在验收整体需求"
+        return display_text('presentation.status.accepting_the_overall_requirement')
     if state.get("status") in {"run_approval_pending", "parent_approval_pending"}:
         subject = current[1] if current else {}
         number = subject.get("pr_number")
-        return f"请批准合并 PR #{number}" if type(number) is int else "等待批准合并"
+        return display_text('presentation.status.please_approve_merge_of_pr_v1', v1=number) if type(number) is int else display_text('presentation.status.awaiting_merge_approval')
     return fallback
 
 
@@ -48,11 +50,11 @@ def delivery_result_lines(state: dict[str, Any]) -> list[str]:
     if subject.get("phase") in {"merged", "completed"}:
         number = subject.get("pr_number")
         if type(number) is int:
-            lines.append(f"PR #{number} 已合并")
+            lines.append(display_text('presentation.status.pr_v1_merged', v1=number))
     if subject.get("parent_closed") is True or (state.get("delivery_type") == "parent_only" and subject.get("phase") == "completed"):
-        lines.append("整体需求已关闭")
+        lines.append(display_text('presentation.status.parent_issue_closed'))
     elif state.get("delivery_type") != "parent_only":
-        lines.append("整体需求关闭尚未确认")
+        lines.append(display_text('presentation.status.parent_issue_closure_not_yet_confirmed'))
     return lines
 
 

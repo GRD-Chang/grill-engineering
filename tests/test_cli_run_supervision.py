@@ -528,6 +528,8 @@ def test_public_run_supervises_non_repairable_final_check_failure(
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
+        # Keep repeated supervision without replaying the entire backoff window.
+        supervision_clock_multiplier=40,
         delivery={
             "required_checks": ["none", "fail"],
             "required_check_evidence": {"pr_number": 1, "checks": [check]},
@@ -554,6 +556,7 @@ def test_public_run_supervises_non_repairable_final_check_failure(
         invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"]), "--json")
     )
     assert status["supervision"]["kind"] == "github_convergence"
+    assert status["supervision"]["retry_count"] >= 2
     status_view = invoke_cli_inprocess(git_repo, fixture, "status", str(state["run_id"])).stdout
     assert "类型: 自动等待已超时" in status_view
     assert "对象: 整体交付" in status_view

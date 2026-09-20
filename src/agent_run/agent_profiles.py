@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+
+from agent_run.messages import error_message
 from typing import Any, Callable, Iterator, Mapping
 
 from agent_run.execution_binding import emit_execution_binding
@@ -50,7 +52,7 @@ def validate_profile_options(
     if preset is not None and preset not in PRESETS:
         available = ", ".join(sorted(PRESETS))
         raise AgentProfileError(
-            f"unknown Agent Execution Preset {preset!r}; choose one of: {available}"
+            error_message('profile.error.unknown_preset', audit=f"unknown Agent Execution Preset {preset!r}; choose one of: {available}", preset=preset, available=available)
         )
     for key, value in (overrides or {}).items():
         if value is None:
@@ -58,27 +60,27 @@ def validate_profile_options(
         if key == "publication_from_development":
             if not isinstance(value, bool):
                 raise AgentProfileError(
-                    "publication_from_development must be a boolean"
+                    error_message('profile.error.reference_boolean', audit="publication_from_development must be a boolean")
                 )
             continue
         if key.endswith("_model"):
             if not isinstance(value, str) or not value.strip():
-                raise AgentProfileError(f"{key} must be a non-empty model identifier")
+                raise AgentProfileError(error_message('profile.error.model_identifier', audit=f"{key} must be a non-empty model identifier", field=key))
         elif key.endswith("_effort"):
             if not isinstance(value, str) or value not in REASONING_EFFORTS:
                 available = ", ".join(sorted(REASONING_EFFORTS))
                 raise AgentProfileError(
-                    f"{key} must be one of: {available}"
+                    error_message('profile.error.effort_choice', audit=f"{key} must be one of: {available}", field=key, available=available)
                 )
         else:
-            raise AgentProfileError(f"unknown Agent Execution Profile option: {key}")
+            raise AgentProfileError(error_message('profile.error.unknown_option', audit=f"unknown Agent Execution Profile option: {key}", field=key))
     supplied = overrides or {}
     if supplied.get("publication_from_development") is True and any(
         supplied.get(key) is not None
         for key in ("publication_model", "publication_effort")
     ):
         raise AgentProfileError(
-            "publication_from_development cannot be combined with Publication overrides"
+            error_message('profile.error.reference_conflict', audit="publication_from_development cannot be combined with Publication overrides")
         )
 
 
@@ -127,19 +129,19 @@ def resolve_profiles(
     if current is not None:
         loaded_profiles = current.get("profiles")
         if not isinstance(loaded_profiles, Mapping):
-            raise AgentProfileError("current Agent Profile Revision is malformed")
+            raise AgentProfileError(error_message('profile.error.current_revision', audit="current Agent Profile Revision is malformed"))
         current_profiles = loaded_profiles
     if current is not None and preset is None:
         for role in ROLE_NAMES:
             existing = current_profiles.get(role)
             if not isinstance(existing, Mapping):
-                raise AgentProfileError(f"current {role} profile is malformed")
+                raise AgentProfileError(error_message('profile.error.current_profile', audit=f"current {role} profile is malformed", role=role))
             model = existing.get("model")
             effort = existing.get("reasoning_effort")
             if not isinstance(model, str) or not model:
-                raise AgentProfileError(f"current {role} model is malformed")
+                raise AgentProfileError(error_message('profile.error.current_model', audit=f"current {role} model is malformed", role=role))
             if not isinstance(effort, str) or effort not in REASONING_EFFORTS:
-                raise AgentProfileError(f"current {role} reasoning effort is malformed")
+                raise AgentProfileError(error_message('profile.error.current_effort', audit=f"current {role} reasoning effort is malformed", role=role))
             if role == "publication" and existing.get("reference") is None:
                 preserve_independent_publication_provenance = True
             if role == "publication" and existing.get("reference") == "development":
@@ -165,16 +167,16 @@ def resolve_profiles(
     elif current is not None and not publication_from_development:
         existing = current_profiles.get("publication")
         if not isinstance(existing, Mapping):
-            raise AgentProfileError("current publication profile is malformed")
+            raise AgentProfileError(error_message('profile.error.publication_profile', audit="current publication profile is malformed"))
         if existing.get("reference") is None:
             preserve_independent_publication_provenance = True
             model = existing.get("model")
             effort = existing.get("reasoning_effort")
             if not isinstance(model, str) or not model:
-                raise AgentProfileError("current publication model is malformed")
+                raise AgentProfileError(error_message('profile.error.publication_model', audit="current publication model is malformed"))
             if not isinstance(effort, str) or effort not in REASONING_EFFORTS:
                 raise AgentProfileError(
-                    "current publication reasoning effort is malformed"
+                    error_message('profile.error.publication_effort', audit="current publication reasoning effort is malformed")
                 )
             roles["publication"] = {
                 "model": model,
@@ -291,7 +293,7 @@ class AgentProfileStore:
                     return current
                 if preset is not None or profile_options_present(overrides):
                     raise AgentProfileError(
-                        "Agent Execution Profile already exists; use configure to create a new Revision"
+                        error_message('profile.error.already_exists', audit="Agent Execution Profile already exists; use configure to create a new Revision")
                     )
             snapshot = self._new_document(
                 run_id,
@@ -311,12 +313,12 @@ class AgentProfileStore:
     ) -> dict[str, Any]:
         validate_profile_options(preset=preset, overrides=overrides)
         if preset is None and not profile_options_present(overrides):
-            raise AgentProfileError("configure requires a preset or an explicit role override")
+            raise AgentProfileError(error_message('profile.error.option_required', audit="configure requires a preset or an explicit role override"))
         with self._locked(run_id):
             current = self._load_unlocked(run_id)
             if current is None:
                 raise AgentProfileError(
-                    f"unknown Agent Execution Profile for Run {run_id}"
+                    error_message('profile.error.run_profile_missing', audit=f"unknown Agent Execution Profile for Run {run_id}", run_id=run_id)
                 )
             resolved = resolve_profiles(
                 preset=preset,
@@ -332,7 +334,7 @@ class AgentProfileStore:
             }
             revisions = current.get("revisions", [])
             if not isinstance(revisions, list):
-                raise AgentProfileError("Agent Profile revisions are malformed")
+                raise AgentProfileError(error_message('profile.error.revisions', audit="Agent Profile revisions are malformed"))
             document = dict(current)
             document.update(entry)
             document["revisions"] = [*revisions, deepcopy(entry)]
@@ -454,13 +456,13 @@ class AgentProfileStore:
             return None
         value: object = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
-            raise AgentProfileError(f"Invalid Agent Profile document: {path}")
+            raise AgentProfileError(error_message('profile.error.invalid_document', audit=f"Invalid Agent Profile document: {path}", path=path))
         return value
 
     def _require_document(self, run_id: str) -> dict[str, Any]:
         document = self._load_unlocked(run_id)
         if document is None:
-            raise AgentProfileError(f"unknown Agent Execution Profile for Run {run_id}")
+            raise AgentProfileError(error_message('profile.error.run_profile_missing', audit=f"unknown Agent Execution Profile for Run {run_id}", run_id=run_id))
         return document
 
     def _write_unlocked(self, run_id: str, document: Mapping[str, Any]) -> None:

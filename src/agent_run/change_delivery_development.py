@@ -103,6 +103,7 @@ def develop(
         }
     stage.save(state)
     request = stage.adapter.development_request(state, job, checkout)
+    request["_prompt_resources"] = state["prompt_resources"]
     if request.get("repair_source") is not None:
         request["review_budget_context"] = repair_budget_context(
             job, stage.review_budget_policy()

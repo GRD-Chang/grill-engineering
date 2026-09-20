@@ -192,3 +192,46 @@ def test_control_rejects_a_record_bound_to_external_state(
     assert result.returncode == 2, result.stderr
     assert "统一状态目录" in result.stdout
     assert all(_files(path) == before for path, before in snapshots.items())
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("scenario,zh,en", [
+    ("data_in_repository", "数据目录必须位于用户仓库之外", "data directory must be outside user repositories"),
+    ("unowned", "已有目录不属于 Runner 工作区", "existing directory is not a Runner workspace"),
+    ("identity", "工作区标记与仓库身份不一致", "marker does not match the repository identity"),
+    ("unreadable", "无法读取 Runner 工作区", "Cannot read the Runner workspace"),
+    ("path", "不是独立目录", "not an independent directory"),
+])
+def test_workspace_cli_errors_follow_language_without_changing_audit_or_files(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    language: str, scenario: str, zh: str, en: str,
+) -> None:
+    from agent_run.cli import main
+
+    monkeypatch.chdir(git_repo)
+    assert main(["settings", "configure", "--language", language]) == 0
+    capsys.readouterr()
+    if scenario == "data_in_repository":
+        monkeypatch.setenv("XDG_DATA_HOME", str(git_repo))
+    workspace = ManagedWorkspace.for_repository("example/project")
+    if scenario in {"unowned", "identity", "unreadable"}:
+        workspace.root.mkdir(parents=True)
+        if scenario != "unowned":
+            (workspace.root / ".agent-run-workspace.json").write_text(
+                '{}' if scenario == "identity" else 'invalid json', encoding="utf-8",
+            )
+    elif scenario == "path":
+        workspace.root.parent.mkdir(parents=True)
+        workspace.root.write_text("user-owned file", encoding="utf-8")
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    before = _files(git_repo.parent)
+    arguments = ["run", "262", "--repo", "example/project", "--github-fixture", str(fixture)]
+    assert main(arguments) == 2
+    output = capsys.readouterr().out
+    assert (zh if language == "zh" else en) in output
+    assert ("原因:" if language == "zh" else "Reason:") in output
+    assert main([*arguments, "--json"]) == 2
+    diagnostic = json.loads(capsys.readouterr().out)
+    assert diagnostic["result"] == "error"
+    assert zh in diagnostic["diagnostics"][0]["message"]
+    assert _files(git_repo.parent) == before

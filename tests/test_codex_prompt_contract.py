@@ -12,15 +12,6 @@ from agent_run.codex import CodexCliBackend, CodexProcessError
 from agent_run.delivery_loop import TicketDeliveryAdapter
 
 
-PUBLICATION_BLOCKER_SHAPE = (
-    '{"result_kind":"human_blocker","commit_message":null,'
-    '"pr_title":null,"pr_body_markdown":null,'
-    '"human_blockers":["发生了什么；已尝试什么；人必须做什么"]}'
-)
-DEVELOPMENT_BLOCKER_SHAPE = (
-    '{"result_kind":"human_blocker","summary":null,'
-    '"human_blockers":["发生了什么；已尝试什么；人必须做什么"]}'
-)
 PASS_EVIDENCE = {
     "e2e": "操作或命令：运行候选公开流程；退出码：0；结果：候选通过端到端复验。",
     "standards": "审查范围或基线：仓库编码规范与候选 diff；结论：未发现违反项。",
@@ -75,6 +66,10 @@ def _capture_public_prompt(
         arguments: list[str], **options: Any
     ) -> subprocess.CompletedProcess[str]:
         captured.append(str(options["prompt"]))
+        schema_index = arguments.index("--output-schema") + 1
+        options["captured_schema"] = json.loads(
+            Path(arguments[schema_index]).read_text(encoding="utf-8")
+        )
         if worker_calls is not None:
             worker_calls.append((arguments, options))
         output_index = arguments.index("--output-last-message") + 1
@@ -99,7 +94,7 @@ def _capture_public_prompt(
     return captured[0]
 
 
-def test_publication_prompts_use_flat_human_blocker_wire_shape(
+def test_publication_prompts_keep_human_blocker_semantics(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ticket = _capture_public_prompt(
@@ -125,8 +120,10 @@ def test_publication_prompts_use_flat_human_blocker_wire_shape(
     )
 
     for prompt in (ticket, run_repair, final_run):
-        assert PUBLICATION_BLOCKER_SHAPE in prompt
-        assert DEVELOPMENT_BLOCKER_SHAPE not in prompt
+        assert "human_blocker" in prompt
+        assert "commit_message" in prompt
+        assert "pr_body_markdown" in prompt
+        assert "summary" not in prompt
 
 
 def test_reviewer_prompt_uses_role_specific_current_and_previous_identity(
@@ -348,7 +345,7 @@ def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
     assert "读取最终子任务及依赖" in run_repair
 
 
-def test_non_publication_prompt_keeps_exact_human_blocker_result(
+def test_development_prompt_keeps_role_specific_human_blocker_semantics(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     development = _capture_public_prompt(
@@ -359,8 +356,9 @@ def test_non_publication_prompt_keeps_exact_human_blocker_result(
         name="development",
     )
 
-    assert DEVELOPMENT_BLOCKER_SHAPE in development
-    assert PUBLICATION_BLOCKER_SHAPE not in development
+    assert "human_blocker" in development
+    assert "summary" in development
+    assert "pr_body_markdown" not in development
 
 
 def test_development_prompt_keeps_git_authority_local_to_the_role(
@@ -1273,7 +1271,7 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
                 assert "OLD_RESPONSE_SENTINEL" not in prompt
             else:
                 assert "PRIOR_BLOCKER_SENTINEL" not in prompt
-            assert ("PRIVATE_CHECKOUT_SENTINEL" in prompt) is (method == "develop")
+            assert "PRIVATE_CHECKOUT_SENTINEL" in prompt
             for marker in forbidden:
                 assert marker not in prompt, (active_case, marker)
             if method == "develop":
@@ -1889,3 +1887,209 @@ def test_human_blocker_resume_rejects_a_different_reported_thread(
                 "prior_human_blockers": ["Grant Issue read access."],
             }
         )
+
+
+@pytest.mark.parametrize("scope", ["ticket", "parent_only", "run"])
+@pytest.mark.parametrize("source", [None, "acceptance", "git_integrity", "required_checks", "human_revision", "merge_conflict"])
+@pytest.mark.parametrize("thread", [None, "development-thread"])
+def test_custom_methods_reach_actual_development_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str,
+    source: str | None, thread: str | None,
+) -> None:
+    from agent_run.prompt_resources import personal_method_directory, resolve_resources
+
+    directory = personal_method_directory()
+    directory.mkdir(parents=True)
+    for name, text in (("development", "个人开发正文：检查真实边界，实现本次需求。"),
+                       ("repair", "个人修复正文：定位根因。")):
+        (directory / f"{name}.md").write_text(text, encoding="utf-8")
+    resources = resolve_resources()
+    request: dict[str, Any] = {
+        "_prompt_resources": resources, "acceptance_scope": scope,
+        "thread_id": thread, "parent_issue_url": "https://github.com/example/project/issues/1",
+        "task_issue_url": "https://github.com/example/project/issues/2",
+    }
+    if source:
+        request["repair_source"] = source
+        field = {"acceptance": "acceptance_artifact", "git_integrity": "git_integrity_evidence",
+                 "required_checks": "ci_evidence", "human_revision": "human_feedback",
+                 "merge_conflict": "merge_conflict_evidence"}[source]
+        request[field] = "当前原始失败证据" if source in {"human_revision", "merge_conflict"} else {"raw": "当前原始失败证据"}
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="custom")
+    selected = "methods/repair" if source else "methods/development"
+    assert resources[selected] in prompt
+    other = "methods/development" if source else "methods/repair"
+    assert resources[other] not in prompt
+    if source:
+        assert "当前原始失败证据" in prompt
+    assert "human_blocker" in prompt
+    assert "summary" in prompt
+    assert "只整理当前工作树，不暂存、commit、改写 Git 历史或执行 GitHub 写入" in prompt
+    assert request["parent_issue_url"] in prompt
+    assert str(tmp_path / "custom") in prompt
+
+
+@pytest.mark.parametrize("method,scope", [("review", "ticket"), ("review", "parent_only"), ("review", "run"), ("publication", "ticket"), ("publication", "parent_only"), ("publication", "run"), ("run_publication", "run")])
+def test_custom_review_and_publication_methods_reach_actual_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, scope: str,
+) -> None:
+    from agent_run.prompt_resources import personal_method_directory, resolve_resources
+
+    directory = personal_method_directory()
+    directory.mkdir(parents=True)
+    for name, text in (("acceptance", "个人验收正文：核对当前真实对象。"),
+                       ("publishing", "个人发布正文：说明实际用户变化。")):
+        (directory / f"{name}.md").write_text(text, encoding="utf-8")
+    resources = resolve_resources()
+    prompt = _capture_public_prompt(tmp_path, monkeypatch, method, {
+        "_prompt_resources": resources, "acceptance_scope": scope,
+        "parent_issue_url": "https://github.com/example/project/issues/1",
+        "task_issue_url": "https://github.com/example/project/issues/2",
+        "current_review_identity": {"reviewed_candidate_sha": "CURRENT_CANDIDATE"},
+        "acceptance_artifact": {"raw": "当前原始验收证据"},
+    }, name="custom")
+    key = "methods/acceptance" if method == "review" else "methods/publishing"
+    other = "methods/publishing" if method == "review" else "methods/acceptance"
+    assert resources[key] in prompt
+    assert resources[other] not in prompt
+    assert "https://github.com/example/project/issues/1" in prompt
+    assert str(tmp_path / "custom") in prompt
+    if method == "review":
+        assert "CURRENT_CANDIDATE" in prompt
+        assert "整个工作区保持只读" in prompt
+        assert all(field in prompt for field in ("e2e", "standards", "spec", "findings"))
+    else:
+        assert "当前原始验收证据" in prompt
+        assert "不修改文件、重新验收或执行 Git/GitHub 写入" in prompt
+        assert "human_blocker" in prompt
+        assert "commit_message" in prompt
+        assert "pr_body_markdown" in prompt
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_persisted_resources_ignore_builtin_changes_but_use_current_task_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str,
+) -> None:
+    import shutil
+    from agent_run import prompt_resources, prompt_text_context
+    from agent_run.state import StateStore
+
+    root = tmp_path / "builtin"
+    shutil.copytree(prompt_resources.RESOURCE_ROOT.parent, root)
+    monkeypatch.setattr(prompt_resources, "RESOURCE_ROOT", root / "zh")
+    store = StateStore(tmp_path / "state")
+    resources = prompt_resources.resolve_resources(language=language)
+    store.save_run("frozen", {"prompt_resources": resources, "language": language})
+    role = root / language / "methods/development.md"
+    role.write_text("新版内置开发角色", encoding="utf-8")
+    monkeypatch.setitem(
+        prompt_text_context.TEXTS["context/task-url"], language,
+        "NEW INTERNAL TASK LABEL: {0}",
+    )
+    saved = store.load_run("frozen")
+    assert saved is not None
+    request = {"_prompt_resources": saved["prompt_resources"], "language": saved["language"],
+               "task_issue_url": "https://github.com/example/project/issues/999"}
+    old = _capture_public_prompt(tmp_path, monkeypatch, "develop", request, name="old")
+    fresh = _capture_public_prompt(tmp_path, monkeypatch, "develop", {
+        "task_issue_url": request["task_issue_url"], "language": language,
+    }, name="new")
+    assert "新版内置开发角色" not in old
+    assert "新版内置开发角色" in fresh
+    assert "NEW INTERNAL TASK LABEL" not in old
+    assert "NEW INTERNAL TASK LABEL" in fresh
+    assert request["task_issue_url"] in old and request["task_issue_url"] in fresh
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("continuation", [False, True], ids=["fresh", "resume"])
+@pytest.mark.parametrize(
+    ("method", "facts", "role_key", "method_keys"),
+    [
+        ("develop", {}, "development", ("development",)),
+        (
+            "develop",
+            {"repair_source": "required_checks", "ci_evidence": {"log": "原始 raw failure"}},
+            "repair", ("repair",),
+        ),
+        ("review", {"acceptance_scope": "ticket"}, "review", ("acceptance",)),
+        ("review", {"acceptance_scope": "run"}, "review", ("acceptance",)),
+        (
+            "review", {"acceptance_scope": "run", "candidate_acceptance": True,
+                       "repair_scope": "run_repair"}, "review", ("acceptance",),
+        ),
+        ("publication", {"acceptance_scope": "ticket", "acceptance_artifact": {}},
+         "publication", ("publishing",)),
+        ("publication", {"acceptance_scope": "run", "acceptance_artifact": {}},
+         "publication", ("publishing",)),
+        ("run_publication", {"acceptance_artifact": {}}, "publication", ("publishing",)),
+    ],
+)
+def test_selected_language_resources_reach_actual_role_calls(
+    tmp_path: Path, monkeypatch: Any, language: str, continuation: bool,
+    method: str, facts: dict[str, Any], role_key: str, method_keys: tuple[str, ...],
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    resources = resolve_resources(language=language)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    request = {**facts, "_prompt_resources": resources,
+               "parent_issue_url": "https://github.com/example/project/issues/1",
+               "task_issue_url": "https://github.com/example/project/issues/2"}
+    if continuation:
+        request.update(thread_id="fixed-thread", _invocation_mode="resume")
+        if method == "review":
+            request["current_review_identity"] = {"reviewed_candidate_sha": "CURRENT_CANDIDATE"}
+    prompt = _capture_public_prompt(
+        tmp_path, monkeypatch, method, request, name="selected-language", worker_calls=calls,
+    )
+
+    assert len(calls) == 1
+    if continuation:
+        resume_key = "development/repair-resume" if role_key == "repair" else f"{role_key}/resume"
+        assert resources[resume_key].strip() in prompt
+        assert "resume" in calls[0][0]
+    else:
+        for key in method_keys:
+            assert resources[f"methods/{key}"].strip() in prompt
+    if "ci_evidence" in facts:
+        assert "原始 raw failure" in prompt
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("method", ["develop", "review", "publication"])
+def test_worker_output_schema_is_separate_from_prompt_examples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str, method: str,
+) -> None:
+    from agent_run.prompt_resources import resolve_resources
+
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    prompt = _capture_public_prompt(
+        tmp_path, monkeypatch, method,
+        {"_prompt_resources": resolve_resources(language=language),
+         "acceptance_scope": "ticket", "acceptance_artifact": {}},
+        name="schema-contract", worker_calls=calls,
+    )
+    schema = calls[0][1]["captured_schema"]
+    required = schema["required"]
+    assert ("checks" if method == "review" else "result_kind") in required
+    if method != "review":
+        properties = schema["properties"]
+        assert properties["result_kind"]["enum"] == [
+            "development" if method == "develop" else "publication", "human_blocker"
+        ]
+        assert properties["human_blockers"]["type"] == ["array", "null"]
+        assert "human_blockers" in required
+        assert "human_blocker" not in properties
+        if method == "publication":
+            assert {"commit_message", "pr_title", "pr_body_markdown"} <= set(required)
+    # Dynamic evidence may contain JSON, but static output examples must not
+    # duplicate the separately supplied machine contract.
+    assert '{"result_kind":' not in prompt
+    assert '{"checks":{"e2e":' not in prompt
+    if method == "review":
+        for meaning in ("pass", "fail", "blocked", "findings", "evidence"):
+            assert meaning in prompt
+    else:
+        assert "human_blocker" in prompt
+        assert "human_blockers" in prompt

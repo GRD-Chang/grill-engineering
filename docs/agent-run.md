@@ -37,6 +37,37 @@ agent-run runs --repo OWNER/REPO
 `--repo OWNER/REPO` 时必须同时提供 `--parent <parent-issue>`。多个候选时命令会列出工作目录、
 Parent、状态和开始时间并停止，不按最近时间猜测。
 
+### 语言与只读查询
+
+```bash
+agent-run settings configure --language en
+agent-run --help
+agent-run run <parent-issue> --repo OWNER/REPO
+agent-run status <run-id> --plain
+agent-run history <run-id> --details --plain
+agent-run settings configure --language zh
+agent-run status <run-id>
+```
+
+个人语言默认中文，只接受 `zh` 和 `en`，不跟随系统 locale。帮助和无 Run 的配置操作
+使用个人语言。上例创建的 Run 固定为英文，切换回中文后，其状态、历史与适用操作回执
+仍使用英文；后续新 Run 使用中文。
+
+交互终端默认使用 Rich 排版，`--plain`、管道、`NO_COLOR` 或 `TERM=dumb` 使用朴素输出。
+两种排版使用同一语言；`history --details` 展开逐轮执行配置、问题及原始证据。
+角色、阶段、状态、人工待办、下一步、计数和时间等程序标签随 Run 语言展示；
+Issue 标题、日志、用户反馈、Agent 摘要、Findings 和证据原样保留，可以混合语言。
+`--json` 的机器字段、枚举、ID 与审计事实保持稳定，命令文本不翻译。
+
+查询不会改变任务、历史或通知记录，也不会发送飞书。操作回执区分请求受理、正在应用、
+已应用和失败；请求受理不表示开发、验收或交付成功。恢复后以实际状态和下一步为准：
+
+```bash
+agent-run resume <run-id>
+agent-run status <run-id> --plain
+agent-run history <run-id> --details
+```
+
 ### Delivery Policy
 
 Delivery Policy 的取值优先级是内置默认值、用户级默认值、单次命令覆盖；仓库内容不能覆盖

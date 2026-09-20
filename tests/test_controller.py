@@ -162,8 +162,9 @@ def test_wrong_repository_cannot_mutate_existing_run_state(
         wrong.resume(str(state["run_id"]))
 
 
+@pytest.mark.parametrize("incompatibility", ["legacy", "missing_prompts", "partial_prompts", "missing_language", "invalid_language"])
 def test_legacy_state_fails_closed_before_controller_mutates_it(
-    git_repo: Path,
+    git_repo: Path, incompatibility: str,
 ) -> None:
     store = StateStore(git_repo / ".agent-run")
     fixture = write_fixture(
@@ -173,11 +174,20 @@ def test_legacy_state_fails_closed_before_controller_mutates_it(
         FixtureGitHubReader(fixture), GitRepository(git_repo), store
     )
     state, _ = controller.start(1)
-    state["schema_version"] = 1
+    if incompatibility == "legacy":
+        state["schema_version"] = 1
+    elif incompatibility == "missing_prompts":
+        state.pop("prompt_resources")
+    elif incompatibility == "missing_language":
+        state.pop("language")
+    elif incompatibility == "invalid_language":
+        state["language"] = "fr"
+    else:
+        state["prompt_resources"].pop("methods/acceptance")
     store.save_run(str(state["run_id"]), state)
     before = deepcopy(store.load_run(str(state["run_id"])))
 
-    with pytest.raises(IncompatibleRunStateError, match="legacy state"):
+    with pytest.raises(IncompatibleRunStateError, match="legacy state|Prompt"):
         controller.resume(str(state["run_id"]))
 
     assert store.load_run(str(state["run_id"])) == before

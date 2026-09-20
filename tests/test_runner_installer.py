@@ -24,6 +24,89 @@ from support.offline_install import offline_pip_environment, prepare_offline_whe
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "expected"),
+    [
+        ("No space left on device", "磁盘空间不足"),
+        ("No matching distribution found for private-package", "没有匹配"),
+        ("CERTIFICATE_VERIFY_FAILED", "证书"),
+        ("unexpected backend error", "构建后端拒绝安装"),
+    ],
+)
+def test_build_diagnostic_is_bounded_and_does_not_echo_credentials(
+    tmp_path: Path, diagnostic: str, expected: str,
+) -> None:
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "sys.stdout.write('x' * 200000)\n"
+        "sys.stderr.write('https://user:private-password@example.test token=private-token\\n')\n"
+        f"sys.stderr.write({diagnostic!r})\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    with pytest.raises(runner_installer.InstallerError) as caught:
+        runner_installer._run_pip_install(fake_python, tmp_path)
+    message = str(caught.value)
+    assert expected in message
+    assert "退出码 7" in message
+    assert "新版未激活" in message
+    assert "重试" in message
+    assert "private-password" not in message
+    assert "private-token" not in message
+    assert len(message) < 400
+
+
+def test_build_output_timeout_cleans_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        f"#!{sys.executable}\nimport time\ntime.sleep(60)\n", encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    monkeypatch.setattr(runner_installer, "_BUILD_TIMEOUT_SECONDS", 0.1)
+    started: list[subprocess.Popen[Any]] = []
+    original = subprocess.Popen
+
+    def record_process(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        process = original(*args, **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(runner_installer.subprocess, "Popen", record_process)
+    with pytest.raises(runner_installer.InstallerError, match="包构建/安装阶段超时"):
+        runner_installer._run_pip_install(fake_python, tmp_path)
+    assert started[0].poll() is not None
+    assert started[0].stdout is not None and started[0].stdout.closed
+
+
+@pytest.mark.parametrize("child_code", [
+    "import time; time.sleep(60)",
+    "import os\nwhile True: os.write(1, b'backend progress' * 512)",
+])
+def test_build_completed_with_child_holding_output_is_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child_code: str,
+) -> None:
+    monkeypatch.setattr(runner_installer, "_BUILD_TIMEOUT_SECONDS", 2)
+    fake_python = tmp_path / "python"
+    child_pid = tmp_path / "child-pid"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"Path({str(child_pid)!r}).write_text(str(child.pid))\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    with runner_installer.child_subreaper():
+        assert runner_installer._run_pip_install(fake_python, tmp_path) == 0
+    _assert_process_gone(child_pid)
+
+
 @pytest.fixture(scope="session")
 def installer_build_wheels(tmp_path_factory: pytest.TempPathFactory) -> Path:
     source = Path(os.environ.get("AGENT_RUN_TEST_WHEELHOUSE", PROJECT_ROOT / ".test-wheels"))
@@ -436,14 +519,31 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
+    probe = source / "src/agent_run/prompt_text_context.py"
+    probe.write_text(
+        probe.read_text() + '\nTEXTS["context/probe"]["en"] += "\\n候选包探针独有内容"\n',
+        encoding="utf-8",
+    )
+    captured_prompt = tmp_path / "probe-prompt"
+    executable = fake_bin / "codex"
+    executable.write_text(executable.read_text().replace(
+        "import time\n", "import time\n" + f"pathlib.Path({str(captured_prompt)!r}).write_text(sys.stdin.read())\n",
+    ), encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir()
+    defaults = home / "config/agent-run/user-defaults.json"
+    defaults.parent.mkdir(parents=True)
+    defaults.write_text('{"language":"en"}', encoding="utf-8")
 
     first = _run(source, home, fake_bin)
     assert first.returncode == 0, first.stderr
+    assert "候选包探针独有内容" in captured_prompt.read_text()
     first_snapshot = _active_snapshot(home)
     first_manifest = _manifest(first_snapshot)
     first_identity = first_manifest["content_identity"]
+    package = runner_installer.find_runtime_package(first_snapshot)
+    default_method = package / "resources/en/methods/development.md"
+    old_method = default_method.read_text(encoding="utf-8")
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
     assert int(count.read_text()) == 1
     assert (home / ".local" / "bin" / "agent-run").is_symlink()
@@ -461,15 +561,16 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     assert command.returncode == 0
     assert "agent-run" in command.stdout
 
-    (source / "src" / "agent_run" / "__init__.py").write_text(
-        "\"\"\"changed source after install\"\"\"\n__version__ = 'changed'\n",
-        encoding="utf-8",
+    (source / "src/agent_run/resources/en/methods/development.md").write_text(
+        "新版内置方法\n", encoding="utf-8",
     )
     second = _run(source, home, fake_bin)
     assert second.returncode == 0, second.stderr
     assert int(count.read_text()) == 2
     assert _manifest(first_snapshot)["content_identity"] == first_identity
     second_identity = _manifest(_active_snapshot(home))["content_identity"]
+    assert second_identity != first_identity
+    assert default_method.read_text(encoding="utf-8") == old_method
 
     repeat = _run(source, home, fake_bin)
     assert repeat.returncode == 0, repeat.stderr
@@ -547,6 +648,8 @@ def test_probe_timeout_terminates_its_process_group(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
+        shutil.copyfile(module, candidate / module.name)
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/python3\nimport time\ntime.sleep(10)\n", encoding="utf-8"
@@ -564,6 +667,8 @@ def test_probe_success_terminates_descendants_after_codex_exits(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
+        shutil.copyfile(module, candidate / module.name)
     child_pid_file = tmp_path / "child.pid"
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
@@ -1429,6 +1534,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     offline_install_environment: dict[str, str],
 ) -> None:
     source = _source_tree(tmp_path, real_install=True)
+    source = source.rename(tmp_path / "源码 archive with spaces")
     fake_bin, count, _status_file = _fake_codex(tmp_path, behavior="fork-setsid")
     isolated_environment, tool_directory, markers = (
         _isolated_quickstart_environment(tmp_path, fake_bin)
@@ -1499,6 +1605,48 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     packaged_licenses = list(_active_snapshot(home).glob("lib/python*/site-packages/agent_run-*.dist-info/licenses/LICENSE"))
     assert len(packaged_licenses) == 1
     assert packaged_licenses[0].read_bytes() == (PROJECT_ROOT / "LICENSE").read_bytes()
+    package = runner_installer.find_runtime_package(_active_snapshot(home))
+    request_path = tmp_path / "preview-request.json"
+    source_resources = source / "src/agent_run/resources"
+    hidden_resources = source / "resources-hidden-for-installed-check"
+    source_resources.rename(hidden_resources)
+    try:
+        # Reuse this real installed snapshot for both languages and every body;
+        # source-only tests cannot detect a wheel omitting Markdown or JSON.
+        assert "PYTHONPATH" not in isolated_environment
+        for language in ("zh", "en"):
+            configured = subprocess.run(
+                [str(stable_entry), "settings", "configure", "--language", language, "--json"],
+                env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
+            )
+            assert configured.returncode == 0, configured.stdout + configured.stderr
+            for body, role, context in (
+                ("development", "development", {}),
+                ("repair", "development", {
+                    "repair_source": "acceptance", "acceptance_artifact": {"verdict": "reject"},
+                }),
+                ("acceptance", "review", {}),
+                ("publishing", "publication", {"acceptance_artifact": {"verdict": "accept"}}),
+            ):
+                request_path.write_text(json.dumps({
+                    "acceptance_scope": "parent_only", **context,
+                }), encoding="utf-8")
+                preview = subprocess.run(
+                    [str(stable_entry), "prompts", "preview", "--role", role,
+                     "--request", str(request_path)],
+                    env=isolated_environment, cwd=tmp_path, capture_output=True,
+                    text=True, timeout=15,
+                )
+                assert preview.returncode == 0, preview.stdout + preview.stderr
+                builtin = (package / f"resources/{language}/methods/{body}.md").read_text(
+                    encoding="utf-8",
+                ).strip()
+                assert builtin and builtin in preview.stdout
+                language_instruction = "Use English" if language == "en" else "中文"
+                assert language_instruction in preview.stdout
+    finally:
+        hidden_resources.rename(source_resources)
+
     _assert_clean_installer_source(source, isolated_environment)
 
     delivery = tmp_path / "delivery"
@@ -1621,6 +1769,38 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert profile.count("# >>> agent-run managed PATH >>>") == 1
     assert profile.count("# <<< agent-run managed PATH <<<") == 1
     assert len(list((_data_root(home) / "snapshots").iterdir())) == 1
+
+    # Reuse this isolated real build boundary for archive update, failed build
+    # preservation and rollback. Other lifecycle combinations stay lightweight.
+    first_snapshot = _active_snapshot(home)
+    shutil.rmtree(source / ".git")
+    version_file = source / "src/agent_run/__init__.py"
+    version_file.write_text(version_file.read_text() + "\n# archive update\n")
+    updated = _run(source, home, fake_bin, cwd=tmp_path,
+                   path=isolated_path, environment=isolated_environment)
+    assert updated.returncode == 0, updated.stderr
+    second_snapshot = _active_snapshot(home)
+    assert second_snapshot != first_snapshot
+    assert _manifest(second_snapshot)["source_provenance"] == {"kind": "source-directory"}
+    assert (_data_root(home) / "active/previous").resolve() == first_snapshot
+    build_config = source / "pyproject.toml"
+    original_config = build_config.read_text()
+    build_config.write_text(original_config.replace("setuptools.build_meta", "missing_backend"))
+    failed = _run(source, home, fake_bin, cwd=tmp_path,
+                  path=isolated_path, environment=isolated_environment)
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert _active_snapshot(home) == second_snapshot
+    assert (_data_root(home) / "active/previous").resolve() == first_snapshot
+    assert not list((_data_root(home) / "staging").iterdir())
+    still_usable = subprocess.run([str(stable_entry), "--help"], cwd=tmp_path,
+                                 env=isolated_environment, capture_output=True, timeout=15)
+    assert still_usable.returncode == 0
+    build_config.write_text(original_config)
+    rolled_back = _run(source, home, fake_bin, "--rollback", cwd=tmp_path,
+                      path=isolated_path, environment=isolated_environment)
+    assert rolled_back.returncode == 0, rolled_back.stderr
+    assert _active_snapshot(home) == first_snapshot
+    assert (_data_root(home) / "active/previous").resolve() == second_snapshot
 
     uninstalled = _run(
         source,
@@ -2592,3 +2772,32 @@ def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatib
         path.relative_to(state_root)
         for path in (state_root).rglob("*")
     ) == target_paths_before
+
+
+def test_probe_missing_candidate_package_fails_before_codex(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    fake_bin, count, _status = _fake_codex(tmp_path)
+    with pytest.raises(RunnerProbeError):
+        RunnerProbeBackend(executable=str(fake_bin / "codex")).check(candidate)
+    assert not count.exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "syntax", "translation"])
+def test_probe_invalid_candidate_text_fails_before_codex(tmp_path: Path, failure: str) -> None:
+    candidate = tmp_path / "candidate"
+    package = candidate / "lib/python3.11/site-packages/agent_run"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
+    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
+        shutil.copyfile(module, package / module.name)
+    context = package / "prompt_text_context.py"
+    if failure == "missing":
+        context.unlink()
+    elif failure == "syntax":
+        context.write_text("TEXTS = {\n", encoding="utf-8")
+    else:
+        context.write_text("TEXTS = {'context/probe': {'zh': '仅中文'}}\n", encoding="utf-8")
+    fake_bin, count, _status = _fake_codex(tmp_path)
+    with pytest.raises(RunnerProbeError, match="Cannot read internal prompt"):
+        RunnerProbeBackend(executable=str(fake_bin / "codex")).check(candidate)
+    assert not count.exists()

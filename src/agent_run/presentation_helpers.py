@@ -1,9 +1,128 @@
 from __future__ import annotations
 
+from agent_run.messages import display_text, display_language
+
 import re
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_run.messages import text
+
+
+_STATUS_TERMS = {
+    'abandoned',
+    'abandonment_pending',
+    'acceptance_artifact',
+    'accepted',
+    'action_required',
+    'active',
+    'blocked',
+    'cancel',
+    'canceled',
+    'cancelled',
+    'candidate',
+    'cleanup_pending',
+    'closed',
+    'committing_candidate',
+    'completed',
+    'currentness_invalidated',
+    'deterministic_contradiction',
+    'developing',
+    'execution_failed',
+    'fail',
+    'failed',
+    'failure',
+    'git_integrity_repair',
+    'github_convergence',
+    'in_progress',
+    'incompatible_run_state',
+    'interrupted',
+    'merged',
+    'neutral',
+    'no_code_changes',
+    'none',
+    'not_running',
+    'open',
+    'operator_stopped',
+    'parent_approval_pending',
+    'parent_closeout_pending',
+    'parent_delivery_pending',
+    'parent_phase',
+    'pass',
+    'pending',
+    'progress_exhausted',
+    'publication_artifact',
+    'publication_pending',
+    'publishing',
+    'queued',
+    'ready_for_approval',
+    'ready_for_human',
+    'repairing',
+    'requeue_required',
+    'required_checks',
+    'review_blocked',
+    'review_failed',
+    'review_passed',
+    'reviewing',
+    'run_acceptance',
+    'run_acceptance_pending',
+    'run_approval_pending',
+    'run_publication',
+    'run_publication_pending',
+    'run_status',
+    'running',
+    'skipped',
+    'skipping',
+    'stale',
+    'stale_result',
+    'starting',
+    'startup_failure',
+    'success',
+    'supervision_timeout',
+    'ticket_completed',
+    'ticket_phase',
+    'timed_out',
+    'timeline_capacity',
+    'unavailable',
+    'unknown',
+    'unreviewed',
+    'unsupported_scope_change',
+    'validating',
+    'waiting_checks',
+    'waiting_external',
+    'waiting_merge',
+    '当前有效通过',
+}
+_PAUSE_REASONS = {
+    'Change PR changed outside the current Generation',
+    'Parent Issue requires explicit human intervention',
+    'Run abandonment recovery is incomplete.',
+    'acceptance_record_mismatch',
+    'agent_requires_human',
+    'candidate_or_acceptance_inconsistent',
+    'initial Worker read credential is temporarily unavailable',
+    'merged_result_mismatch',
+    'modification_budget_exhausted',
+    'published_head_mismatch',
+    'review_budget_exhausted',
+    'reviewer_requires_human',
+    'unexpected_external_merge',
+    '外部状态在本次监督窗口内未收敛',
+}
+_PAUSE_STATUS_TERMS = {
+    'abandonment_pending',
+    'deterministic_contradiction',
+    'execution_failed',
+    'operator_stopped',
+    'parent_approval_pending',
+    'progress_exhausted',
+    'publication_pending',
+    'ready_for_human',
+    'requeue_required',
+    'run_approval_pending',
+    'supervision_timeout',
+    'unsupported_scope_change',
+}
 
 _TERMINAL_CHANGE_JOB_PHASES = {"completed", "merged", "abandoned"}
 _TERMINAL_RUN_ACCEPTANCE_PHASES = {"accepted", "completed"}
@@ -28,80 +147,51 @@ def terminal_safe(value: object) -> str:
 def human_ci_fix_usage(used: object, limit: object) -> str:
     """Describe the extra CI allowance without exposing its boolean encoding."""
     if limit == 0:
-        return "不适用"
+        return display_text('presentation.status.not_applicable')
     count = int(used) if isinstance(used, bool) else used
-    return f"已用 {count if count is not None else '未知'} / {limit if limit is not None else '未知'} 次"
+    return display_text('presentation.status.used_v1_v3_times', v1=count if count is not None else display_text('presentation.status.unknown'), v3=limit if limit is not None else display_text('presentation.status.unknown'))
 
 
 def human_delivery_object(value: object) -> str:
     """Translate a display label, leaving machine work-subject identities intact."""
     text = str(value or "Delivery Run")
     labels = {
-        "Delivery Run": "整体交付", "Run Acceptance": "整体验收",
-        "Run Publication": "整体交付", "Run Repair": "整体修复",
+        "Delivery Run": display_text('presentation.status.overall_delivery'), "Run Acceptance": display_text('presentation.status.run_acceptance'),
+        "Run Publication": display_text('presentation.status.overall_delivery'), "Run Repair": display_text('presentation.status.run_repair'),
     }
     if text in labels:
         return labels[text]
     match = re.fullmatch(r"Ticket (#\S+)", text)
     if match:
-        return f"子任务 {match[1]}"
+        return display_text('presentation.status.ticket_v1', v1=match[1])
     match = re.fullmatch(r"Parent Issue (#\S+)", text)
     if match:
-        return f"整体需求 {match[1]}"
+        return display_text('presentation.status.parent_issue_v1', v1=match[1])
     match = re.fullmatch(r"Delivery Run（Parent Issue (#\S+)）", text)
     if match:
-        return f"整体交付（需求 {match[1]}）"
+        return display_text('presentation.status.overall_delivery_requirement_v1', v1=match[1])
     return text
 
 
 def human_agent_role(value: object) -> str:
     raw = str(value or "Agent")
     if "开发" in raw or raw in {"development", "Development Agent"}:
-        return "开发 Agent"
+        return display_text('presentation.status.development_agent')
     if "验收" in raw or raw in {"review", "reviewer", "fresh_acceptance", "Review Agent"}:
-        return "验收 Agent"
+        return display_text('presentation.status.review_agent')
     if "发布" in raw or raw in {"publication", "final_publication", "Publication Agent"}:
-        return "发布 Agent"
+        return display_text('presentation.status.publication_agent')
     return "Agent" if raw != "Agent" else raw
 
 
-def human_status_term(value: object) -> object:
-    """One human vocabulary shared by plain/Rich status and history rendering."""
+def human_status_term(value: object, *, language: str | None = None) -> object:
+    """One human vocabulary shared by status, history and notifications."""
     if not isinstance(value, str):
         return value
-    return {
-        "active": "进行中", "starting": "正在初始化", "ticket_completed": "子任务已完成",
-        "waiting_checks": "等待合并前检查", "required_checks": "合并前检查",
-        "waiting_merge": "等待合并确认", "waiting_external": "等待 GitHub 操作结果",
-        "github_convergence": "等待 GitHub 操作结果", "publication_pending": "发布待继续",
-        "parent_delivery_pending": "准备交付整体需求", "parent_approval_pending": "等待人工批准",
-        "parent_closeout_pending": "代码已合并，正在关闭整体需求 Issue",
-        "run_acceptance_pending": "等待整体验收", "run_publication_pending": "等待整体发布",
-        "run_approval_pending": "等待人工批准", "requeue_required": "需要按更新后的需求重新开始",
-        "ready_for_human": "等待人工处理", "unsupported_scope_change": "需求或依赖发生了无法自动处理的变化",
-        "deterministic_contradiction": "交付记录与实际结果不一致，需人工处理",
-        "abandonment_pending": "正在完成放弃操作", "progress_exhausted": "暂无可继续的子任务",
-        "execution_failed": "执行失败，可恢复", "operator_stopped": "已手动停止，可恢复",
-        "supervision_timeout": "自动等待已超时，可恢复", "pending": "待处理", "blocked": "已受阻",
-        "incompatible_run_state": "保存的任务记录不兼容", "unreviewed": "未验收",
-        "pass": "已通过", "fail": "未通过", "stale": "已失效", "completed": "已完成",
-        "abandoned": "已放弃", "developing": "开发中", "repairing": "修复中",
-        "reviewing": "验收中", "validating": "验证中", "publishing": "发布中",
-        "ready_for_approval": "等待人工批准", "merged": "已合并", "accepted": "验收通过",
-        "candidate": "代码已准备，等待验收", "committing_candidate": "正在保存代码修改",
-        "ticket_phase": "子任务阶段", "parent_phase": "整体需求阶段", "run_acceptance": "整体验收",
-        "run_publication": "整体发布", "run_status": "任务状态", "timeline_capacity": "历史记录已达上限",
-        "cleanup_pending": "等待清理", "当前有效通过": "当前版本已通过验收",
-        "success": "已通过", "failure": "未通过", "failed": "执行失败",
-        "open": "未关闭", "closed": "已关闭", "none": "未配置合并前检查",
-        "unknown": "暂时无法确认", "unavailable": "暂时无法获取",
-        "cancel": "已取消", "cancelled": "已取消", "canceled": "已取消",
-        "skipping": "已跳过", "skipped": "已跳过", "in_progress": "进行中",
-        "queued": "等待执行", "running": "执行中", "not_running": "未运行",
-        "neutral": "无通过或失败结论", "timed_out": "已超时",
-        "action_required": "需要人工处理", "startup_failure": "启动失败",
-        "stale_result": "结果已过期",
-    }.get(value.lower(), "状态未知，详见 --json 诊断")
+    key = value.lower()
+    if key not in _STATUS_TERMS:
+        key = "fallback"
+    return text(f"guidance.status.{key}", language=language or display_language())
 
 
 def status_diagnostic_command(state: dict[str, Any]) -> str:
@@ -115,52 +205,33 @@ def status_diagnostic_command(state: dict[str, Any]) -> str:
 
 def unknown_execution_guidance(state: dict[str, Any], *, include_command: bool = True) -> str:
     diagnostic = (
-        f"\n诊断命令: {status_diagnostic_command(state)}" if include_command else ""
+        display_text('presentation.status.ndiagnostic_command_v1', v1=status_diagnostic_command(state)) if include_command else ""
     )
     return (
-        "运行状态无法确认；请先查看后台诊断。"
-        "继续操作时程序会先核验原执行的归属和退出状态，确认安全后才恢复。"
-        f"{diagnostic}"
+        display_text('presentation.status.execution_status_cannot_be_confirmed_inspect_background_diagnosti', v1=diagnostic)
     )
 
 
-def human_pause_reason(value: object) -> str:
-    """Translate exact controller reasons without rewriting user evidence."""
+def human_pause_reason(value: object, *, language: str | None = None) -> str:
+    """Render controller reasons without rewriting user evidence."""
     raw = str(value)
-    if raw in {
-        "execution_failed", "ready_for_human", "run_approval_pending", "parent_approval_pending",
-        "abandonment_pending", "supervision_timeout", "operator_stopped", "unsupported_scope_change",
-        "publication_pending", "progress_exhausted", "requeue_required", "deterministic_contradiction",
-    }:
-        return str(human_status_term(raw))
-    return {
-        "modification_budget_exhausted": "本次授权的开发次数已用尽",
-        "review_budget_exhausted": "本次授权的验收次数已用尽",
-        "agent_requires_human": "工作需要人工处理",
-        "reviewer_requires_human": "验收需要人工处理",
-        "acceptance_record_mismatch": "验收记录与当前代码版本不一致",
-        "candidate_or_acceptance_inconsistent": "代码版本与验收结果不一致",
-        "merged_result_mismatch": "实际合并结果与交付记录不一致",
-        "published_head_mismatch": "远端代码版本与发布记录不一致",
-        "unexpected_external_merge": "发现了未记录的外部合并",
-        "Run abandonment recovery is incomplete.": "放弃操作尚未完成",
-        "Parent Issue requires explicit human intervention": "整体需求需要你处理后才能继续",
-        "Change PR changed outside the current Generation": "PR 已被外部修改，与当前交付记录不一致",
-        "外部状态在本次监督窗口内未收敛": "在本次等待时限内仍未确认 GitHub 操作结果",
-        "initial Worker read credential is temporarily unavailable": "暂时无法取得 GitHub 工作凭据",
-    }.get(raw, raw)
+    if raw in _PAUSE_STATUS_TERMS:
+        return str(human_status_term(raw, language=language or display_language()))
+    if raw in _PAUSE_REASONS:
+        return text(f"guidance.pause.{raw}", language=language or display_language())
+    return raw
 
 
 def local_timestamp(value: object) -> str:
     """Render persisted UTC timestamps in the querying device's local timezone."""
     if not isinstance(value, str):
-        return "未知"
+        return display_text('presentation.status.unknown')
     try:
         instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if instant.tzinfo is None:
             instant = instant.replace(tzinfo=UTC)
     except ValueError:
-        return "未知"
+        return display_text('presentation.status.unknown')
     fallback = False
     try:
         local = instant.astimezone()
@@ -168,7 +239,7 @@ def local_timestamp(value: object) -> str:
         local, fallback = instant.astimezone(UTC), True
     offset = local.strftime("%z")
     zone = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC"
-    suffix = "（本地时区不可用，已回退 UTC）" if fallback else ""
+    suffix = display_text('presentation.status.local_timezone_unavailable_using_utc') if fallback else ""
     return f"{local:%Y-%m-%d %H:%M:%S} {zone}{suffix}"
 
 
@@ -278,11 +349,11 @@ def delivery_object_label(
 def execution_duration(seconds: object) -> str:
     """Format trusted execution seconds without dropping minute remainders."""
     if type(seconds) is not int or seconds < 0:
-        return "未知"
+        return display_text('presentation.status.unknown')
     minutes, remainder = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
-        return f"{hours} 小时 {minutes} 分 {remainder} 秒"
+        return display_text('presentation.status.v0_hours_v2_minutes_v4_seconds', v0=hours, v2=minutes, v4=remainder)
     if minutes:
-        return f"{minutes} 分 {remainder} 秒"
-    return f"{seconds} 秒"
+        return display_text('presentation.status.v0_minutes_v2_seconds', v0=minutes, v2=remainder)
+    return display_text('presentation.status.v0_seconds', v0=seconds)

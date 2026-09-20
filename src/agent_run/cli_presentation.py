@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from collections.abc import Mapping
 from typing import Any
 
+from agent_run.messages import text, display_language, presentation_language, selected_language
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
     run_repair_budget_policy_for_job,
     ticket_budget_policy_for_job,
 )
-from agent_run.final_approval_operation import (
-    final_approval_cleanup_pending, has_final_approval,
-)
+from agent_run.guidance_actions import next_action_fact, render_next_action
 from agent_run.delivery_progress import (
     history_progress_view,
     print_history_progress,
@@ -31,11 +29,9 @@ from agent_run.operator_action_presentation import (
     print_operator_action as _print_operator_action,
 )
 from agent_run.presentation_helpers import current_work_subject, human_next_action, human_status_term
-from agent_run.state_contract import human_blocker_subject_count
 from agent_run.resume_audit import latest_resume_audit
 from agent_run.run_lifecycle import ActionReceipt
 from agent_run.semantic_attempt import semantic_attempt_subjects
-from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 
 
 def public_action_receipt(
@@ -106,104 +102,106 @@ def _print_precondition_failure(
         )
         return
 
+    language = selected_language(state)
     parent = state.get("parent")
     parent_number = parent.get("number") if isinstance(parent, Mapping) else "?"
-    print(f"Repository: {state.get('repository')}")
-    print(f"Parent Issue: #{parent_number}")
-    print(f"交付状态: {human_delivery_status(state.get('status'))}")
-    print(f"命令状态: 未应用（{diagnostic['message']}）")
-    print("下一步: " + str(human_next_action_for_state(state)))
+    print(text("presentation.precondition.repository", language=language, value=state.get("repository")))
+    print(text("presentation.precondition.parent", language=language, value=parent_number))
+    print(text("presentation.precondition.status", language=language, value=human_delivery_status(state.get("status"), language=language)))
+    print(text("presentation.precondition.rejected", language=language))
+    print(text("presentation.precondition.next", language=language, value=human_next_action_for_state(state)))
 
 
 def _print_status(
     state: dict[str, object], *, as_json: bool, plain: bool = False
 ) -> None:
-    _print_notification_warning(state, as_json=as_json)
-    active = _active_ticket_job(state)
-    active_ticket = active.get("ticket_number") if active else None
-    worker = _current_worker(state)
-    run_repair = _run_repair_status(state)
-    review_budget = _public_review_budget(state)
-    current_identity = _current_delivery_identity(state)
-    invocation = state.get("active_agent_invocation")
-    active_invocation = (
-        invocation
-        if isinstance(invocation, dict)
-        and invocation.get("status") in {"running", "failed", "resuming"}
-        else None
-    )
-    semantic_attempt = _current_semantic_attempt(state, active_invocation)
-    delivery_cleanup = _public_delivery_cleanup(state)
-    latest_resume = latest_resume_audit(state)
-    operator_action = _operator_action_view(state)
-    output = {
-        "notifications": state.get("_notifications", {}),
-        "run_id": state.get("run_id"),
-        "repository": state.get("repository"),
-        "parent": state.get("parent"),
-        "status": state.get("status"),
-        "active_ticket": active_ticket,
-        "phase": _current_phase(state),
-        "worker": worker,
-        "run_repair": run_repair,
-        "candidate_sha": current_identity.get("candidate_sha"),
-        "pr_number": current_identity.get("pr_number"),
-        "review_budget": review_budget,
-        "elapsed_seconds": run_elapsed_seconds(state),
-        "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
-        "next_action": (
-            operator_action["next_action"]
-            if operator_action is not None
-            else _next_action(state)
-        ),
-        "operator_action": operator_action,
-        "diagnostics": state.get("diagnostics", []),
-        "scope_change": state.get("unsupported_scope_change"),
-        "abandonment": state.get("run_abandonment"),
-        "agent_invocation": _public_invocation_view(active_invocation),
-        "semantic_agent_attempt": (
-            _history_attempt_view(semantic_attempt, include_history_facts=False)
-            if isinstance(semantic_attempt, dict)
+    with presentation_language("zh" if as_json else selected_language(state)):
+        _print_notification_warning(state, as_json=as_json)
+        active = _active_ticket_job(state)
+        active_ticket = active.get("ticket_number") if active else None
+        worker = _current_worker(state)
+        run_repair = _run_repair_status(state)
+        review_budget = _public_review_budget(state)
+        current_identity = _current_delivery_identity(state)
+        invocation = state.get("active_agent_invocation")
+        active_invocation = (
+            invocation
+            if isinstance(invocation, dict)
+            and invocation.get("status") in {"running", "failed", "resuming"}
             else None
-        ),
-        "output_attempt": _output_attempt(active_invocation),
-        "budget_window": (
-            semantic_attempt.get("budget_window")
-            if isinstance(semantic_attempt, dict)
-            else (
-                review_budget.get("window") if isinstance(review_budget, dict) else None
-            )
-        ),
-        "publication_operation_retry": _current_publication_operation_retry(state),
-        "delivery_cleanup": delivery_cleanup,
-        "latest_resume": latest_resume,
-        "supervision": public_supervision_snapshot(state),
-        "executor_control": state.get("_executor_control"),
-    }
-    progress_source = output
-    if not as_json:
-        progress_source = {
-            **output,
-            "next_action": human_next_action_for_state(state),
-        }
-    progress = status_progress_view(state, progress_source)
-    output["progress"] = progress
-    if as_json:
-        output["lifecycle_action"] = state.get("action_application_receipt")
-        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-        return
-    if _use_rich_status(plain):
-        print_rich_status_progress(state, output, progress)
-    else:
-        print_status_progress(
-            state,
-            output,
-            progress,
-            display_term=_display_term,
-            print_operator_action=lambda action: _print_human_operator_action(
-                state, action
-            ),
         )
+        semantic_attempt = _current_semantic_attempt(state, active_invocation)
+        delivery_cleanup = _public_delivery_cleanup(state)
+        latest_resume = latest_resume_audit(state)
+        operator_action = _operator_action_view(state)
+        output = {
+            "notifications": state.get("_notifications", {}),
+            "run_id": state.get("run_id"),
+            "repository": state.get("repository"),
+            "parent": state.get("parent"),
+            "status": state.get("status"),
+            "active_ticket": active_ticket,
+            "phase": _current_phase(state),
+            "worker": worker,
+            "run_repair": run_repair,
+            "candidate_sha": current_identity.get("candidate_sha"),
+            "pr_number": current_identity.get("pr_number"),
+            "review_budget": review_budget,
+            "elapsed_seconds": run_elapsed_seconds(state),
+            "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
+            "next_action": (
+                operator_action["next_action"]
+                if operator_action is not None
+                else _next_action(state)
+            ),
+            "operator_action": operator_action,
+            "diagnostics": state.get("diagnostics", []),
+            "scope_change": state.get("unsupported_scope_change"),
+            "abandonment": state.get("run_abandonment"),
+            "agent_invocation": _public_invocation_view(active_invocation),
+            "semantic_agent_attempt": (
+                _history_attempt_view(semantic_attempt, include_history_facts=False)
+                if isinstance(semantic_attempt, dict)
+                else None
+            ),
+            "output_attempt": _output_attempt(active_invocation),
+            "budget_window": (
+                semantic_attempt.get("budget_window")
+                if isinstance(semantic_attempt, dict)
+                else (
+                    review_budget.get("window") if isinstance(review_budget, dict) else None
+                )
+            ),
+            "publication_operation_retry": _current_publication_operation_retry(state),
+            "delivery_cleanup": delivery_cleanup,
+            "latest_resume": latest_resume,
+            "supervision": public_supervision_snapshot(state),
+            "executor_control": state.get("_executor_control"),
+        }
+        progress_source = output
+        if not as_json:
+            progress_source = {
+                **output,
+                "next_action": human_next_action_for_state(state),
+            }
+        progress = status_progress_view(state, progress_source)
+        output["progress"] = progress
+        if as_json:
+            output["lifecycle_action"] = state.get("action_application_receipt")
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            return
+        if _use_rich_status(plain):
+            print_rich_status_progress(state, output, progress)
+        else:
+            print_status_progress(
+                state,
+                output,
+                progress,
+                display_term=_display_term,
+                print_operator_action=lambda action: _print_human_operator_action(
+                    state, action
+                ),
+            )
 
 
 def _print_history(
@@ -213,91 +211,92 @@ def _print_history(
     plain: bool = False,
     details: bool = False,
 ) -> None:
-    _print_notification_warning(state, as_json=as_json)
-    timeline = state.get("timeline", [])
-    if not isinstance(timeline, list):
-        raise ValueError("timeline must be an array")
-    timeline_continuation = state.get("timeline_continuation", [])
-    if not isinstance(timeline_continuation, list):
-        raise ValueError("timeline_continuation must be an array")
-    invocations = state.get("agent_invocation_history", [])
-    if not isinstance(invocations, list):
-        raise ValueError("agent_invocation_history must be an array")
-    semantic_attempts = _semantic_attempt_history(state)
-    human_semantic_attempts = _semantic_attempt_history(
-        state, include_history_facts=True
-    )
-    operation_retries = _publication_operation_retries(state)
-    resume_audit = state.get("resume_audit")
-    public_resume_audit = resume_audit if isinstance(resume_audit, dict) else {}
-    agent_resumes = public_resume_audit.get("history", [])
-    if not isinstance(agent_resumes, list):
-        raise ValueError("resume_audit.history must be an array")
-    operator_action = _operator_action_view(state)
-    output = {
-        "notifications": state.get("_notifications", {}),
-        "run_id": state.get("run_id"),
-        "timeline": timeline,
-        "timeline_continuation": timeline_continuation,
-        "next_action": (
-            operator_action["next_action"]
-            if operator_action is not None
-            else _next_action(state)
-        ),
-        "operator_action": operator_action,
-        "abandonment": state.get("run_abandonment"),
-        "agent_invocations": [
-            _public_invocation_view(invocation)
-            if isinstance(invocation, dict)
-            else invocation
-            for invocation in invocations
-        ],
-        "semantic_agent_attempts": semantic_attempts,
-        "output_attempts": [
-            {
-                "invocation_started_at": invocation.get("started_at"),
-                "work_subject": invocation.get("work_subject"),
-                "attempt_count": invocation.get("attempt_count"),
-            }
-            for invocation in invocations
-            if isinstance(invocation, dict)
-        ],
-        "budget_windows": _budget_windows(semantic_attempts),
-        "publication_operation_retries": operation_retries,
-        "resume_audit": {
-            "total": public_resume_audit.get("total", 0),
-            "compacted": public_resume_audit.get("compacted", 0),
-            "rolling_digest": public_resume_audit.get("rolling_digest"),
-        },
-        "agent_resumes": agent_resumes,
-        "supervision": public_supervision_snapshot(state),
-        "executor_control": state.get("_executor_control"),
-    }
-    progress_source = output
-    if not as_json:
-        progress_source = {
-            **output,
-            "next_action": human_next_action_for_state(state),
-            "semantic_agent_attempts": human_semantic_attempts,
-        }
-    progress = history_progress_view(state, progress_source)
-    output.update(progress)
-    if as_json:
-        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-        return
-    if _use_rich_status(plain):
-        print_rich_history_progress(state, progress_source, progress, details=details)
-    else:
-        print_history_progress(
-            state,
-            progress_source,
-            progress,
-            display_term=_display_term,
-            print_operator_action=lambda action: _print_human_operator_action(
-                state, action
-            ),
-            details=details,
+    with presentation_language("zh" if as_json else selected_language(state)):
+        _print_notification_warning(state, as_json=as_json)
+        timeline = state.get("timeline", [])
+        if not isinstance(timeline, list):
+            raise ValueError("timeline must be an array")
+        timeline_continuation = state.get("timeline_continuation", [])
+        if not isinstance(timeline_continuation, list):
+            raise ValueError("timeline_continuation must be an array")
+        invocations = state.get("agent_invocation_history", [])
+        if not isinstance(invocations, list):
+            raise ValueError("agent_invocation_history must be an array")
+        semantic_attempts = _semantic_attempt_history(state)
+        human_semantic_attempts = _semantic_attempt_history(
+            state, include_history_facts=True
         )
+        operation_retries = _publication_operation_retries(state)
+        resume_audit = state.get("resume_audit")
+        public_resume_audit = resume_audit if isinstance(resume_audit, dict) else {}
+        agent_resumes = public_resume_audit.get("history", [])
+        if not isinstance(agent_resumes, list):
+            raise ValueError("resume_audit.history must be an array")
+        operator_action = _operator_action_view(state)
+        output = {
+            "notifications": state.get("_notifications", {}),
+            "run_id": state.get("run_id"),
+            "timeline": timeline,
+            "timeline_continuation": timeline_continuation,
+            "next_action": (
+                operator_action["next_action"]
+                if operator_action is not None
+                else _next_action(state)
+            ),
+            "operator_action": operator_action,
+            "abandonment": state.get("run_abandonment"),
+            "agent_invocations": [
+                _public_invocation_view(invocation)
+                if isinstance(invocation, dict)
+                else invocation
+                for invocation in invocations
+            ],
+            "semantic_agent_attempts": semantic_attempts,
+            "output_attempts": [
+                {
+                    "invocation_started_at": invocation.get("started_at"),
+                    "work_subject": invocation.get("work_subject"),
+                    "attempt_count": invocation.get("attempt_count"),
+                }
+                for invocation in invocations
+                if isinstance(invocation, dict)
+            ],
+            "budget_windows": _budget_windows(semantic_attempts),
+            "publication_operation_retries": operation_retries,
+            "resume_audit": {
+                "total": public_resume_audit.get("total", 0),
+                "compacted": public_resume_audit.get("compacted", 0),
+                "rolling_digest": public_resume_audit.get("rolling_digest"),
+            },
+            "agent_resumes": agent_resumes,
+            "supervision": public_supervision_snapshot(state),
+            "executor_control": state.get("_executor_control"),
+        }
+        progress_source = output
+        if not as_json:
+            progress_source = {
+                **output,
+                "next_action": human_next_action_for_state(state),
+                "semantic_agent_attempts": human_semantic_attempts,
+            }
+        progress = history_progress_view(state, progress_source)
+        output.update(progress)
+        if as_json:
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+            return
+        if _use_rich_status(plain):
+            print_rich_history_progress(state, progress_source, progress, details=details)
+        else:
+            print_history_progress(
+                state,
+                progress_source,
+                progress,
+                display_term=_display_term,
+                print_operator_action=lambda action: _print_human_operator_action(
+                    state, action
+                ),
+                details=details,
+            )
 
 
 def _use_rich_status(plain: bool) -> bool:
@@ -565,89 +564,7 @@ def _public_delivery_cleanup(
 
 
 def _next_action(state: dict[str, Any]) -> str:
-    status = str(state.get("status"))
-    run_id = state.get("run_id")
-    parent = state.get("parent")
-    parent_number = parent.get("number", "?") if isinstance(parent, dict) else "?"
-    cleanup = state.get("delivery_cleanup")
-    if status == "completed" and final_approval_cleanup_pending(state) and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if (
-        isinstance(cleanup, dict)
-        and cleanup.get("status") == "cleanup_pending"
-        and isinstance(run_id, str)
-    ):
-        items = cleanup.get("items")
-        if isinstance(items, dict) and any(
-            isinstance(item, dict)
-            and item.get("status") != "completed"
-            and item.get("recovery_kind") == "stale_dirty_checkout"
-            for item in items.values()
-        ):
-                return (
-                "先检查并把 stale Managed Development Checkout 的成果转存到安全位置，"
-                "再使旧 checkout 恢复 clean；"
-                f"随后用 agent-run run {parent_number} 退休旧 checkout 并继续 fresh Run Acceptance，"
-                f"或用 agent-run abandon {run_id} --discard-worktree 明确丢弃"
-            )
-        return f"agent-run resume {run_id}"
-    if has_final_approval(state) and isinstance(run_id, str) and status in {
-        "run_approval_pending", "parent_approval_pending", "waiting_checks",
-        "waiting_external", "parent_closeout_pending", "execution_failed", "supervision_timeout",
-    }:
-        return f"agent-run resume {run_id}"
-    if status in {"run_approval_pending", "parent_approval_pending"} and isinstance(
-        run_id, str
-    ):
-        return f"agent-run approve {run_id}"
-    if status == "unsupported_scope_change":
-        return "查看变化摘要后执行 agent-run abandon，或在 GitHub 恢复原 Ticket Graph"
-    if status == "deterministic_contradiction":
-        return "处理诊断中的确定性矛盾；如需终止执行 agent-run abandon"
-    if status == "abandonment_pending" and isinstance(run_id, str):
-        return f"agent-run abandon {run_id}"
-    if status == "operator_stopped" and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if status == "requeue_required" and isinstance(run_id, str):
-        return f"agent-run requeue {run_id}"
-    if invocation_is_explicitly_resumable(state) and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if (
-        status == "waiting_external"
-        and isinstance(state.get("requeue_transition"), dict)
-    ):
-        return f"agent-run run {parent_number}"
-    if status == "waiting_external":
-        return f"agent-run run {parent_number}"
-    if status == "supervision_timeout" and isinstance(run_id, str):
-        return f"agent-run resume {run_id}"
-    if (
-        status in {"ready_for_human", "progress_exhausted"}
-        and human_blocker_subject_count(state) == 1
-        and isinstance(run_id, str)
-    ):
-        return f"agent-run resume {run_id}"
-    if status in {"ready_for_human", "progress_exhausted", "blocked"}:
-        return "处理诊断中的人工事项"
-    if status == "publication_pending":
-        return (
-            "检查已耗尽的 Publication Operation Retry；无法恢复时执行 agent-run abandon"
-        )
-    if status in {
-        "active",
-        "starting",
-        "ticket_completed",
-        "parent_delivery_pending",
-        "run_acceptance_pending",
-        "run_publication_pending",
-        "waiting_checks",
-        "waiting_merge",
-        "parent_closeout_pending",
-        "execution_failed",
-        "supervision_timeout",
-    }:
-        return f"agent-run run {parent_number}"
-    return "无"
+    return render_next_action(next_action_fact(state), state)
 
 
 def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -658,67 +575,24 @@ def _operator_action_view(state: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
-def human_delivery_status(value: object) -> object:
+def human_delivery_status(value: object, *, language: str = "zh") -> object:
     """Render the same delivery terminology used by status and history."""
 
-    return _display_term(value)
+    return human_status_term(value, language=language)
 
 
-def human_next_action_for_state(state: Mapping[str, Any]) -> object:
-    """Project an ordinary recovery command through the Parent selector."""
-
+def human_next_action_for_state(state: Mapping[str, Any], *, language: str | None = None) -> object:
+    """Render the shared recovery decision using the public Parent selector."""
     public_state = state if isinstance(state, dict) else dict(state)
-    operator_action = _operator_action_view(public_state)
-    value: object = _next_action(public_state)
-    if isinstance(operator_action, Mapping):
-        next_action = operator_action.get("next_action")
-        if isinstance(next_action, str):
-            value = next_action
-    if not isinstance(value, str):
-        return value
-    for internal, human in (
-        ("stale Managed Development Checkout", "旧开发工作区"),
-        ("再使旧 checkout 恢复 clean", "再清理旧工作区中的未提交文件"),
-        ("退休旧 checkout 并继续 fresh Run Acceptance", "移除旧工作区并重新整体验收"),
-        ("检查已耗尽的 Publication Operation Retry", "检查发布重试失败的原因"),
-        ("原 Ticket Graph", "原任务与依赖关系"),
-        ("处理诊断中的确定性矛盾", "处理诊断中交付记录与实际结果不一致的问题"),
-        ("确定性外部矛盾", "交付记录与实际结果不一致的问题"),
-    ):
-        value = value.replace(internal, human)
-    repository = state.get("repository")
-    parent = state.get("parent")
-    parent_number = parent.get("number") if isinstance(parent, Mapping) else None
-    run_id = state.get("run_id")
-    if isinstance(repository, str) and type(parent_number) is int:
-        value = re.sub(
-            r"agent-run abandon(?=[，；。]|$)",
-            f"agent-run abandon {parent_number} --repo {repository}",
-            value,
-        )
-    if (
-        isinstance(repository, str)
-        and isinstance(parent_number, int)
-        and isinstance(run_id, str)
-        and f"agent-run abandon {run_id} --discard-worktree" in value
-    ):
-        return value.replace(
-            f"agent-run run {parent_number}",
-            f"agent-run run {parent_number} --repo {repository}",
-        ).replace(
-            f"agent-run abandon {run_id} --discard-worktree",
-            f"agent-run abandon {parent_number} --repo {repository} --discard-worktree",
-        )
-    parts = value.split()
-    if (
-        len(parts) == 3
-        and parts[0] == "agent-run"
-        and parts[1] in {"run", "resume", "approve", "requeue", "abandon"}
-        and isinstance(repository, str)
-        and isinstance(parent_number, int)
-    ):
-        return f"agent-run {parts[1]} {parent_number} --repo {repository}"
-    return human_next_action(value, run_id=run_id)
+    language = selected_language(public_state) if language is None else language
+    fallback = render_next_action(
+        next_action_fact(public_state), public_state, language=language, human=True,
+    )
+    operator_action = operator_action_view(
+        public_state, current_identity=_current_delivery_identity(public_state),
+        fallback_next_action=fallback, language=language, human=True,
+    )
+    return operator_action["next_action"] if operator_action is not None else fallback
 
 
 def _print_human_operator_action(
@@ -967,7 +841,7 @@ def _candidate_validation_status(job: dict[str, object]) -> str:
 
 
 def _display_term(value: object) -> object:
-    return human_status_term(value)
+    return human_status_term(value, language=display_language())
 
 
 def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> None:
@@ -979,6 +853,6 @@ def _print_notification_warning(state: dict[str, object], *, as_json: bool) -> N
     reason = notifications.get("unavailable_reason")
     pending = notifications.get("pending", [])
     if reason:
-        print(f"飞书通知不可用: {reason}")
+        print(text("presentation.notification.unavailable", language=selected_language(state), reason=reason))
     if pending:
-        print(f"飞书通知未确认送达: {len(pending)} 条；原因见同命令 --json 的 notifications。")
+        print(text("presentation.notification.pending", language=selected_language(state), count=len(pending)))

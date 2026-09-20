@@ -73,7 +73,7 @@ def test_status_renders_controller_work_without_resume_command(capsys, monkeypat
     from agent_run.delivery_status import print_rich_status_progress, print_status_progress, status_progress_view
     from agent_run.presentation_helpers import human_status_term
 
-    state = {"run_id": "r1", "repository": "example/project", "parent": {"number": 1},
+    state = {"language": "zh", "run_id": "r1", "repository": "example/project", "parent": {"number": 1},
              "status": "active", "parent_job": {"phase": "committing_candidate"}}
     audit = {"status": "active", "phase": "committing_candidate",
              "executor_control": {"activity": "running"}, "next_action": "agent-run run 1"}
@@ -98,7 +98,7 @@ def test_history_single_result_and_exact_round_time(capsys, details: bool) -> No
     invocation = {"semantic_attempt": attempt, "work_subject": "parent:1", "role": "development",
                   "status": "completed", "started_at": "2026-09-15T01:00:00+00:00",
                   "ended_at": "2026-09-15T01:07:55+00:00", "model": "test-model", "reasoning_effort": "high"}
-    state = {"run_id": "r", "status": "completed", "parent": {"number": 1},
+    state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},
              "agent_invocation_history": [invocation]}
     _print_history(state, as_json=False, plain=True, details=details)
     output = capsys.readouterr().out
@@ -114,7 +114,7 @@ def test_history_omits_terminal_elapsed_without_end(capsys, monkeypatch, plain: 
     from agent_run.delivery_history import run_elapsed_seconds
 
     monkeypatch.setenv("COLUMNS", "160")
-    state = {"run_id": "r", "status": "completed", "parent": {"number": 1},
+    state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},
              "created_at": "2026-09-15T01:00:00+00:00"}
     assert run_elapsed_seconds(state) is None
     state["timeline"] = [{"at": "2026-09-15T01:01:00+00:00", "status": "active"}]
@@ -128,7 +128,7 @@ def test_status_omits_terminal_elapsed_without_end(capsys, rich: bool) -> None:
     from agent_run.delivery_status import print_rich_status_progress, print_status_progress, status_progress_view
     from agent_run.presentation_helpers import human_status_term
 
-    state = {"run_id": "r", "status": "completed", "parent": {"number": 1},
+    state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},
              "created_at": "2026-09-15T01:00:00+00:00"}
     audit = {"status": "completed"}
     view = status_progress_view(state, audit)

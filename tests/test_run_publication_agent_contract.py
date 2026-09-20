@@ -680,6 +680,7 @@ def test_final_run_publication_receives_only_role_required_facts(
         state["ticket_jobs"]["2"],
         state["ticket_jobs"]["2"]["deterministic_integration_record"],
     )
+    state["prompt_resources"]["methods/publishing"] = "Run 创建时固定的发布方法"
     states.save_run(str(state["run_id"]), state)
     agents = RunPublicationAgents()
 
@@ -695,7 +696,9 @@ def test_final_run_publication_receives_only_role_required_facts(
     request = agents.requests[0]
     assert callable(request.pop("_invocation_event"))
     assert callable(request.pop("_currentness_check"))
+    assert request["_prompt_resources"] == state["prompt_resources"]
     assert set(request) == {
+        "_prompt_resources",
         "acceptance_artifact",
         "checkout",
         "parent_issue_url",

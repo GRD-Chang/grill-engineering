@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 from pathlib import Path
 import sys
 from typing import Any
@@ -16,33 +15,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_run.development_prompts import development_prompt
 from agent_run.prompt_context import structured_output_repair_prompt
+from agent_run.prompt_resources import resource, resolve_resources
 from agent_run.publication_prompts import publication_prompt
 from agent_run.reviewer_prompts import review_prompt
-
-
-def inline_probe(filename: str, method_name: str) -> str:
-    """只读取两处内联字面量，不导入或执行会启动 Codex 的 Backend。"""
-    source = ROOT / "src" / "agent_run" / filename
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    method, = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == method_name
-    ]
-    values: list[ast.expr] = []
-    for node in ast.walk(method):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "prompt"
-            for target in node.targets
-        ):
-            values.append(node.value)
-        elif isinstance(node, ast.keyword) and node.arg == "prompt":
-            values.append(node.value)
-    if len(values) != 1 or not isinstance(values[0], ast.Constant):
-        raise ValueError(f"{filename}:{method_name} 的 Prompt 已非单个字面量，请更新预览入口")
-    value = values[0].value
-    if not isinstance(value, str):
-        raise ValueError(f"{filename}:{method_name} 的 Prompt 不是字符串")
-    return value
 
 
 def scenarios(parent_url: str, task_url: str) -> dict[str, tuple[str, str]]:
@@ -51,13 +26,15 @@ def scenarios(parent_url: str, task_url: str) -> dict[str, tuple[str, str]]:
     def add(name: str, title: str, text: str) -> None:
         previews[name] = (title, text)
 
+    resources = resolve_resources()
     task = {
+        "_prompt_resources": resources,
         "acceptance_scope": "ticket",
         "parent_issue_url": parent_url,
         "task_issue_url": task_url,
     }
-    parent = {"acceptance_scope": "parent_only", "parent_issue_url": parent_url}
-    overall = {"acceptance_scope": "run", "parent_issue_url": parent_url}
+    parent = {"_prompt_resources": resources, "acceptance_scope": "parent_only", "parent_issue_url": parent_url}
+    overall = {"_prompt_resources": resources, "acceptance_scope": "run", "parent_issue_url": parent_url}
     passed = {"checks": {
         lane: {"status": "pass", "evidence": "【示例】此处为本轮实际验证证据。", "findings": []}
         for lane in ("e2e", "standards", "spec")
@@ -182,10 +159,10 @@ def scenarios(parent_url: str, task_url: str) -> dict[str, tuple[str, str]]:
         ("publication", "Publication Artifact", "文案结果"),
     ):
         add(f"output-repair-{name}", f"仅修复输出格式：{title}",
-            structured_output_repair_prompt(role, "【示例】输出缺少必填字段。"))
-    add("runner-probe", "安装器结构化输出兼容性检查", inline_probe("runner_probe.py", "_check"))
+            structured_output_repair_prompt(role, "【示例】输出缺少必填字段。", request=task))
+    add("runner-probe", "安装器结构化输出兼容性检查", resource(task, "context/probe"))
     add("publication-probe", "文案输出格式握手检查",
-        inline_probe("codex.py", "publication_schema_handshake"))
+        resource(task, "publication/handshake"))
     return previews
 
 
@@ -209,7 +186,7 @@ def main() -> int:
             blocks = [
                 "# 当前源码的 Prompt 预览",
                 f"源码目录：{ROOT}",
-                "正文来自当前运行时生成函数；两处静态探针从源码字面量读取。",
+                "正文来自统一资源读取与实际运行时组装；探针使用当前包的内部资源。",
                 "任务链接、SHA、次数和证据均为示例，不代表真实任务关系或验收结论。",
                 "这里只展示项目角色 Prompt；不启动 Codex，不加载它的系统指令、AGENTS.md 或 Skill 内容。",
                 "## 阶段目录\n\n" + "\n".join(f"- {name}：{previews[name][0]}" for name in names),

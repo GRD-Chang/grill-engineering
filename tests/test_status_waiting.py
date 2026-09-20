@@ -283,7 +283,7 @@ def test_completed_cleanup_pending_never_says_no_action_needed(
     fixture = write_fixture(git_repo / "github.json", issues={})
     prepare_workspace(git_repo)
     StateStore(managed_state(git_repo)).save_run("run-1", {
-        "schema_version": 1, "run_id": "run-1", "status": "completed",
+        "schema_version": 1, "language": "zh", "run_id": "run-1", "status": "completed",
         "repository": "example/project", "parent": {"number": 1},
         "diagnostics": [], "delivery_cleanup": {
             "status": "cleanup_pending", "last_error": "source head changed",
