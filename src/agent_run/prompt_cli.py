@@ -9,8 +9,8 @@ import sys
 from typing import Any
 
 from agent_run import prompt_resources
+from agent_run.cli_messages import personal_language
 from agent_run.messages import text
-from agent_run.user_defaults import UserDefaultsError
 from agent_run.development_prompts import development_prompt
 from agent_run.prompt_context import structured_output_repair_prompt
 from agent_run.publication_prompts import publication_continuation_prompt, publication_prompt
@@ -47,10 +47,7 @@ def _legacy_notice(details: dict[str, Any], language: str) -> str:
 
 
 def add_parser(commands: Any) -> None:
-    try:
-        language = prompt_resources.selected_language()
-    except (UserDefaultsError, OSError):
-        language = "zh"
+    language = personal_language()
     def message(key: str) -> str:
         return text(f"prompts.{key}", language=language)
     parser = commands.add_parser("prompts", help=message("help"))
@@ -76,7 +73,7 @@ def execute(parsed: argparse.Namespace) -> int:
         language = prompt_resources.selected_language(request.get("language"))
         details = _configuration_details(language)
         if not frozen:
-            request["_prompt_resources"] = prompt_resources.resolve_resources(request.get("language"))
+            request["_prompt_resources"] = prompt_resources.resolve_resources(language)
         prompt_resources.validate_resources(request["_prompt_resources"])
         prompt = _preview(request, parsed.role, parsed.continuation)
         result: dict[str, Any] = {"result": "prompt_preview", "role": parsed.role, "prompt": prompt}
