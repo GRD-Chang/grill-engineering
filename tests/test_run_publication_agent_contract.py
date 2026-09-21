@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_scenarios import _accepted_run
+from support.run_artifacts import _passing_artifact
+
 import subprocess
 import json
 from copy import deepcopy
@@ -20,132 +23,11 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.run_repair_requests import RunRepairRequests
 
-from run_acceptance_test_support import _completed_run, _passing_artifact
-from conftest import seed_idle_control
-from test_cli import run_internal_stage, run_cli, stdout_json
-from test_codex_prompt_contract import _capture_public_prompt
+from support.seeding import seed_idle_control
+from support.cli import run_internal_stage, run_cli, stdout_json
+from support.prompt_capture import _capture_public_prompt
 
-from run_publication_test_support import (
-    InterruptedRunPublisher,
-    InvocationRunPublicationAgents,
-    PassingRunReviewer,
-    RunPublicationAgents,
-    _accepted_run,
-)
-
-
-def _accepted_run_with_integration(
-    git_repo: Path,
-) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
-    state, states, git = _completed_run(git_repo)
-    tree = git.resolve(f"{state['run_branch']}^{{tree}}")
-    integrated = subprocess.run(
-        [
-            "git",
-            "commit-tree",
-            tree,
-            "-p",
-            str(state["run_branch"]),
-            "-m",
-            "feat(ticket): integrate accepted ticket for publication contract",
-        ],
-        cwd=git_repo,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.strip()
-    subprocess.run(
-        ["git", "update-ref", f"refs/heads/{state['run_branch']}", integrated],
-        cwd=git_repo,
-        check=True,
-    )
-    state["ticket_jobs"]["2"].update(
-        {
-            "integrated_sha": integrated,
-            "deterministic_integration_record": {
-                "source": "accepted",
-                "base_sha": git.commit_parents(integrated)[0],
-                "candidate_sha": integrated,
-                "candidate_tree": tree,
-                "publication_sha": integrated,
-                "integrated_sha": integrated,
-                "integrated_publication_sha": integrated,
-                "integrated_tree": tree,
-                "integrated_message": "feat(ticket): integrate accepted ticket for publication contract",
-                "integrated_parents": [git.commit_parents(integrated)[0]],
-                "window": 1,
-                "final_ci_fix_used": False,
-                "pr_number": 11,
-                "required_checks_mode": "configured",
-                "required_checks": "pass",
-                "required_checks_evidence": {
-                    "pr_number": 11,
-                    "head_sha": integrated,
-                    "result": "pass",
-                    "checks": [{"name": "quality", "bucket": "pass"}],
-                },
-                "pr": {
-                    "number": 11,
-                    "state": "MERGED",
-                    "head_sha": integrated,
-                    "base_sha": git.commit_parents(integrated)[0],
-                    "merge_commit_sha": integrated,
-                },
-                "effective_revision": state["ticket_graph"]["tickets"]["2"][
-                    "content_revision"
-                ],
-                "acceptance_record": {
-                    "acceptance_scope": "change_job",
-                    "reviewed_base_sha": git.commit_parents(integrated)[0],
-                    "reviewed_candidate_sha": integrated,
-                    "reviewed_candidate_tree": tree,
-                    "effective_revision": state["ticket_graph"]["tickets"]["2"][
-                        "content_revision"
-                    ],
-                    "reviewer_thread_id": "ticket-reviewer",
-                    "artifact": _passing_artifact(),
-                },
-            },
-        }
-    )
-    completed_job = state["ticket_jobs"]["2"]
-    completed_record = completed_job["deterministic_integration_record"]
-    completed_acceptance = completed_record["acceptance_record"]
-    review_artifact = {
-        "reviewer_thread_id": completed_acceptance["reviewer_thread_id"],
-        "candidate_sha": completed_acceptance["reviewed_candidate_sha"],
-        "reviewed_base_sha": completed_acceptance["reviewed_base_sha"],
-        "review_identity": {
-            "reviewed_base_sha": completed_acceptance["reviewed_base_sha"],
-            "reviewed_candidate_sha": completed_acceptance[
-                "reviewed_candidate_sha"
-            ],
-            "reviewed_candidate_tree": completed_acceptance[
-                "reviewed_candidate_tree"
-            ],
-        },
-        "artifact": completed_acceptance["artifact"],
-    }
-    completed_job["review_budget"] = {
-        "window": 1,
-        "development_attempts": 1,
-        "reviewer_invocations": 1,
-        "final_ci_fix_used": False,
-        "review_artifacts": [review_artifact],
-        "checkpoint_reason": None,
-    }
-    completed_job["review_budget_history"] = []
-    completed_record["review_budget"] = deepcopy(completed_job["review_budget"])
-    states.save_run(str(state["run_id"]), state)
-    publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
-    accepted = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=PassingRunReviewer(),
-        github=publisher,
-        default_head_sha=git.resolve("main"),
-    ).accept(str(state["run_id"]))
-    return accepted, states, git, publisher
+from support.run_publication import InterruptedRunPublisher, InvocationRunPublicationAgents, RunPublicationAgents
 
 
 def _bind_ticket_review_budget(
@@ -634,7 +516,7 @@ def test_remote_checks_cannot_reopen_exhausted_publication_operation_retry(
 def test_final_run_publication_receives_only_role_required_facts(
     git_repo: Path,
 ) -> None:
-    state, states, git, publisher = _accepted_run_with_integration(git_repo)
+    state, states, git, publisher = _accepted_run(git_repo)
     state["ticket_jobs"]["2"]["deterministic_integration_record"] = {
         "source": "accepted",
         "base_sha": "run-base",
@@ -711,7 +593,7 @@ def test_final_run_publication_receives_only_role_required_facts(
 def test_publication_prompts_and_run_repair_requests_keep_integration_records_with_reviewers(
     git_repo: Path, tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    state, states, git, publisher = _accepted_run_with_integration(git_repo)
+    state, states, git, publisher = _accepted_run(git_repo)
     fallback_ticket_records = [
         {"sentinel": "fallback-ticket-record-publication-leak"}
     ]

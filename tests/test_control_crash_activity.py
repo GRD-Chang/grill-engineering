@@ -10,9 +10,9 @@ from support.workspace import managed_state
 from agent_run import cli
 from agent_run.executor_host import FakeExecutorHost, HostObservation
 from agent_run.state import StateStore
-from conftest import seed_run, write_fixture
-from test_run_lifecycle import _file_snapshot
-from test_ticket_194_stop_abandon import _bind_running_executor
+from support.seeding import seed_run, write_fixture
+from support.lifecycle import _file_snapshot
+from support.control import _bind_running_executor
 
 
 @pytest.mark.parametrize('kind', ['stop', 'abandon'])

@@ -20,10 +20,10 @@ from agent_run.systemd_executor_host import (
     SystemdUserExecutorHost,
 )
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import write_fixture
-from test_cli import PROJECT_ROOT
-from test_run_lifecycle import _file_snapshot, _isolated_environment
-from test_ticket_191_resume import _fail_parent_run
+from support.seeding import write_fixture
+from support.cli import PROJECT_ROOT
+from support.lifecycle import _file_snapshot, _isolated_environment
+from support.resume import _fail_parent_run
 
 
 _OBSERVE = """

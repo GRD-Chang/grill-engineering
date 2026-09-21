@@ -11,17 +11,17 @@ import pytest
 from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.managed_workspace import ManagedWorkspace
 from agent_run.git import GitRepository
-from cli_fixtures import run_agents as _run_agents
-from conftest import seed_run, write_fixture
+from support.cli_fixtures import run_agents as _run_agents
+from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state
-from test_cli import (
+from support.cli import (
     git_fetch_failure_wrapper,
     load_only_run_state,
     run_cli,
     stdout_json,
 )
-from test_cli_delivery import passing_acceptance, publication, repair_acceptance, ticket
+from support.cli_payloads import passing_acceptance, publication, repair_acceptance, ticket
 
 
 def _assert_credential_wait_is_not_public(

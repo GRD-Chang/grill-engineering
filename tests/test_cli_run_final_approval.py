@@ -10,12 +10,12 @@ from support.published_run import prepare_published_run
 from support.workspace import managed_state
 
 
-from cli_fixtures import run_agents
-from conftest import seed_run, write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import ticket
+from support.cli_fixtures import run_agents
+from support.seeding import seed_run, write_fixture
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import ticket
 
-from cli_run_supervision_support import (
+from support.cli_supervision import (
     _assert_public_wait_projection,
     _interrupt_run,
     _parent_only_agents,

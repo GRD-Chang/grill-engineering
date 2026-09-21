@@ -16,7 +16,7 @@ from agent_run.run_lifecycle import (
 )
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 
 
 @pytest.mark.parametrize("action_completed", [True, False])

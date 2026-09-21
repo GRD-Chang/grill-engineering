@@ -8,14 +8,14 @@ import pytest
 
 from support.workspace import managed_repo, managed_state
 
-from conftest import seed_idle_control, seed_run, write_fixture
-from test_ticket_194_stop_abandon import (
+from support.seeding import seed_idle_control, seed_run, write_fixture
+from support.control import (
     _bind_running_executor,
     _running_executor,
     _control_lifecycle,
 )
-from test_receipt_successors import _install_host
-from test_run_lifecycle import _isolated_environment
+from support.receipt_host import _install_host
+from support.lifecycle import _isolated_environment
 from agent_run import cli as cli_module
 from agent_run.executor_host import ExecutorSpec
 from agent_run.github_fixture import FixtureGitHubReader

@@ -9,10 +9,10 @@ import pytest
 from support.workspace import managed_state
 
 from agent_run.state import StateStore
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
-from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import passing_acceptance
+from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import passing_acceptance
 
 
 def _ticket(

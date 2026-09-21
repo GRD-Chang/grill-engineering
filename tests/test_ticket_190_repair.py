@@ -18,10 +18,10 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from cli_run_supervision_support import _parent_only_agents
-from conftest import write_fixture
+from support.cli_supervision import _parent_only_agents
+from support.seeding import write_fixture
 from support.workspace import managed_workspace
-from test_cli_delivery import ticket
+from support.cli_payloads import ticket
 
 
 def _isolated_environment(root: Path) -> dict[str, str]:

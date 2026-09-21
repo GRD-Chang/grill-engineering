@@ -21,10 +21,10 @@ from agent_run.notification_events import events, recovery_event
 from agent_run.notifications import read_notifications
 from agent_run.presentation_helpers import human_status_term
 from agent_run.user_defaults import UserDefaultsStore
-from cli_fixtures import run_agents
-from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_publication, passing_acceptance, repair_acceptance, ticket
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import parent_publication, passing_acceptance, repair_acceptance, ticket
 
 
 @pytest.mark.parametrize("language,drain,scope,mode", [

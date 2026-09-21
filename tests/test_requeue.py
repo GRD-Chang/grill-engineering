@@ -21,9 +21,9 @@ from agent_run.requeue import close_superseded_pull_request, remove_superseded_w
 from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import seed_idle_control, seed_run, write_fixture
+from support.seeding import seed_idle_control, seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
-from test_cli import issue, run_cli, stdout_json
+from support.cli import issue, run_cli, stdout_json
 
 
 def _canonical_budget() -> dict[str, Any]:

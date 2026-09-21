@@ -9,8 +9,8 @@ import pytest
 from agent_run.executor_host import ExecutorSpec, FakeExecutorHost
 from agent_run.run_lifecycle import LifecycleRequest, RunLifecycle
 from agent_run.task_control import ActionBusyError, TaskControlStore
-from conftest import seed_idle_control
-from test_run_lifecycle import _InMemoryRunState, _task
+from support.seeding import seed_idle_control
+from support.lifecycle import _InMemoryRunState, _task
 
 
 @pytest.mark.parametrize("kind", ["approve", "resume"])

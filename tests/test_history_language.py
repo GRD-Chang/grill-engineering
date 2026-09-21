@@ -12,7 +12,7 @@ from rich.text import Text
 from support.workspace import managed_state
 
 from agent_run.cli import main
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 
 
 class Terminal(StringIO):

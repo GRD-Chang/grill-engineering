@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.run_scenarios import _completed_run
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,6 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_lifecycle import LifecycleRequest, RunLifecycle, prepare_action_application_receipt
 from agent_run.state_contract import require_current_run_state
 from agent_run.task_control import TaskControlStore, TaskKey
-from run_acceptance_test_support import _completed_run
 
 
 def test_completed_ticket_survives_exited_executor_and_can_continue(git_repo: Path) -> None:

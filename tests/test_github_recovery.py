@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import write_fixture
+from support.seeding import write_fixture
 from agent_run.controller import Controller
 from agent_run.git import GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError

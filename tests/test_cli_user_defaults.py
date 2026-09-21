@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from support.user_defaults import (
+    settings,
+)
+
 import json
 import re
 import subprocess
@@ -15,16 +19,9 @@ from support.workspace import managed_state, prepare_workspace
 from agent_run import cli
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.user_defaults import UserDefaultsStore
-from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import human_blocker_step
-
-
-def settings(*arguments: str) -> tuple[int, dict[str, Any]]:
-    output = StringIO()
-    with redirect_stdout(output):
-        code = cli.main(["settings", *arguments, "--json"])
-    return code, json.loads(output.getvalue())
+from support.seeding import write_fixture
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import human_blocker_step
 
 
 @pytest.mark.parametrize("case", ["initializing", "missing", "starting_only", "applied", "corrupt"])
@@ -32,7 +29,7 @@ def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profi
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, case: str,
 ) -> None:
     from agent_run.state import StateStore
-    from test_run_lifecycle import _file_snapshot
+    from support.lifecycle import _file_snapshot
 
     monkeypatch.chdir(git_repo)
     prepare_workspace(git_repo)
@@ -542,9 +539,9 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
 def test_run_configuration_receipt_keeps_frozen_language_after_personal_change(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], language: str,
 ) -> None:
-    from conftest import seed_run
+    from support.seeding import seed_run
     from support.inprocess_cli import invoke_cli_inprocess
-    from test_run_lifecycle import _file_snapshot
+    from support.lifecycle import _file_snapshot
 
     monkeypatch.chdir(git_repo)
     UserDefaultsStore().configure(language=language)

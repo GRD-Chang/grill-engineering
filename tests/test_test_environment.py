@@ -11,6 +11,8 @@ import sys
 
 import pytest
 
+from support.environment import _assert_python_and_git_environment
+
 
 _GIT_LOCATION_VARIABLES = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
@@ -38,22 +40,6 @@ def test_importing_installer_build_seam_preserves_interpreter_policy(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _assert_python_and_git_environment() -> None:
-    python_directory = Path(sys.executable).parent
-    assert Path(os.environ["PATH"].split(os.pathsep)[0]) == python_directory
-    executable, prefix, version = json.loads(subprocess.check_output(
-        ["env", "python3", "-c",
-         "import json, sys; print(json.dumps([sys.executable, sys.prefix, list(sys.version_info)]))"],
-        text=True,
-    ))
-    assert Path(executable).parent == python_directory
-    assert prefix == sys.prefix
-    assert version == list(sys.version_info)
-    assert not set(_GIT_LOCATION_VARIABLES).intersection(os.environ)
-    assert {
-        key: value for key, value in os.environ.items() if key.startswith("GIT_CONFIG")
-    } == {"GIT_CONFIG_NOSYSTEM": "1"}
-
 
 def test_pytest_isolates_each_case_and_cli_from_host_state(tmp_path: Path) -> None:
     _assert_python_and_git_environment()
@@ -67,9 +53,9 @@ import subprocess
 from pathlib import Path
 import pytest
 from agent_run.run_locator import RunLocatorIndex
-from conftest import seed_run, write_fixture
-from test_cli import run_cli, stdout_json
-from test_test_environment import _assert_python_and_git_environment
+from support.seeding import seed_run, write_fixture
+from support.cli import run_cli, stdout_json
+from support.environment import _assert_python_and_git_environment
 
 @pytest.mark.parametrize("case", ["first", "second"])
 def test_case(git_repo, tmp_path, monkeypatch, case):

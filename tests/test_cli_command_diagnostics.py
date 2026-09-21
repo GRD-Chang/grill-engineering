@@ -14,7 +14,7 @@ from agent_run.cli import main
 from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.state import StateStore
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 
 
 def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path) -> None:

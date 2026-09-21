@@ -19,7 +19,7 @@ from agent_run.systemd_executor_host import (
     SystemdUserExecutorHost,
 )
 from agent_run.task_control import TaskControlStore, TaskKey
-from test_run_lifecycle import _InMemoryRunState
+from support.lifecycle import _InMemoryRunState
 
 
 @pytest.mark.parametrize("conflict", ["runner", "run", "generation", "state"])

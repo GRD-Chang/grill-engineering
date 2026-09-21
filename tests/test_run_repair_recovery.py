@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from support.repairing_run import prepare_run_repair
+
+from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
+from support.run_scenarios import _completed_run
+
 import subprocess
 import json
 from pathlib import Path
@@ -14,14 +19,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.run_repair_currentness import RunRepairObservationPending
 
 
-from run_acceptance_test_support import (
-    ScriptedRunAgents,
-    _canonical_run_budget,
-    _candidate_finding_artifact,
-    _completed_run,
-    _passing_artifact,
-    _repair_artifact,
-)
+from support.run_agents import ScriptedRunAgents
 
 def test_run_repair_promotion_rejects_final_pr_trigger_drift(
     git_repo: Path,
@@ -42,24 +40,14 @@ def test_run_repair_promotion_rejects_final_pr_trigger_drift(
         body="Original final Run narrative.",
     )
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
-    state["run_acceptance"] = {
-        "phase": "repairing",
-        "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "reviewer_thread_ids": [],
-        "development_thread_history": [],
-        "acceptance_artifact": _repair_artifact(),
-        "repair_request": {
+    prepare_run_repair(
+        state, states, repair_request={
             "repair_source": "required_checks",
             "ci_evidence": publisher.required_check_evidence(
                 final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
             ),
         },
-    }
-    states.save_run(str(state["run_id"]), state)
+    )
 
     class TriggerDriftingPublisher(FixtureGitHubPublisher):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -112,24 +100,14 @@ def test_run_repair_trigger_creation_supervises_recoverable_pr_reads(
         body="Original final Run narrative.",
     )
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
-    state["run_acceptance"] = {
-        "phase": "repairing",
-        "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "reviewer_thread_ids": [],
-        "development_thread_history": [],
-        "acceptance_artifact": _repair_artifact(),
-        "repair_request": {
+    prepare_run_repair(
+        state, states, repair_request={
             "repair_source": "required_checks",
             "ci_evidence": publisher.required_check_evidence(
                 final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
             ),
         },
-    }
-    states.save_run(str(state["run_id"]), state)
+    )
 
     class FailingTriggerPublisher(FixtureGitHubPublisher):
         def live_pull_request(self, pr_number: int) -> dict[str, Any]:
@@ -263,24 +241,14 @@ def test_run_repair_resumes_returned_candidate_review_after_currentness_read_fai
         body="Original final Run narrative.",
     )
     state["run_publication"] = {"phase": "ready_for_approval", "pr_number": final_pr}
-    state["run_acceptance"] = {
-        "phase": "repairing",
-        "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "reviewer_thread_ids": [],
-        "development_thread_history": [],
-        "acceptance_artifact": _repair_artifact(),
-        "repair_request": {
+    prepare_run_repair(
+        state, states, repair_request={
             "repair_source": "required_checks",
             "ci_evidence": publisher.required_check_evidence(
                 final_pr, expected_head_sha=git.resolve(str(state["run_branch"]))
             ),
         },
-    }
-    states.save_run(str(state["run_id"]), state)
+    )
 
     class FailingAfterCandidateReviewPublisher(FixtureGitHubPublisher):
         fail_currentness = False
@@ -341,19 +309,9 @@ def test_run_repair_publication_default_drift_revalidates_in_same_cycle(
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
     publisher = FixtureGitHubPublisher(fixture, git)
-    state["run_acceptance"] = {
-        "phase": "repairing",
-        "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "reviewer_thread_ids": [],
-        "development_thread_history": [],
-        "acceptance_artifact": _repair_artifact(),
-        "repair_request": {"repair_source": "acceptance"},
-    }
-    states.save_run(str(state["run_id"]), state)
+    prepare_run_repair(
+        state, states, repair_request={"repair_source": "acceptance"},
+    )
 
     class DriftingPublicationAgents(ScriptedRunAgents):
         def __init__(self) -> None:
@@ -408,19 +366,9 @@ def test_run_repair_development_uses_latest_candidate_finding(
 ) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"
-    state["run_acceptance"] = {
-        "phase": "repairing",
-        "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
-        "review_budget_history": [],
-        "modification_attempts": 0,
-        "validation_attempts": 0,
-        "reviewer_thread_ids": [],
-        "development_thread_history": [],
-        "acceptance_artifact": _repair_artifact(),
-        "repair_request": {"repair_source": "acceptance"},
-    }
-    states.save_run(str(state["run_id"]), state)
+    prepare_run_repair(
+        state, states, repair_request={"repair_source": "acceptance"},
+    )
 
     class IterativeRepairAgents(ScriptedRunAgents):
         def __init__(self) -> None:

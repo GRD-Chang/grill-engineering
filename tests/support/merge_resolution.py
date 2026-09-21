@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
+from support.run_scenarios import _completed_run, _sync_completed_ticket_integrated_sha
+
 import json
 import subprocess
 from pathlib import Path
@@ -10,13 +13,6 @@ from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
-
-from run_acceptance_test_support import (
-    _candidate_finding_artifact,
-    _completed_run,
-    _passing_artifact,
-    _sync_completed_ticket_integrated_sha,
-)
 
 
 class MergeResolutionAgents:

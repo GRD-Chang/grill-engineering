@@ -5,20 +5,20 @@ from pathlib import Path
 
 import pytest
 
-from cli_fixtures import run_agents
-from conftest import write_fixture
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_state
 from support.published_run import prepare_accepted_run, prepare_published_run
-from test_cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
-from test_cli_delivery import (
+from support.cli import load_only_run_state, run_cli, run_internal_stage, stdout_json
+from support.cli_payloads import (
     HUMAN_BLOCKER,
     passing_acceptance,
     publication,
     repair_acceptance,
     ticket,
 )
-from cli_run_supervision_support import (
+from support.cli_supervision import (
     _assert_credential_wait_is_not_public,
     _repair_agents,
     _resume_repair_agents,

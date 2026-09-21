@@ -9,8 +9,8 @@ import pytest
 
 from agent_run.managed_workspace import ManagedWorkspace
 from agent_run.task_control import TaskControlStore, TaskKey
-from conftest import seed_idle_control, seed_run, write_fixture
-from test_cli import run_cli, issue, stdout_json
+from support.seeding import seed_idle_control, seed_run, write_fixture
+from support.cli import run_cli, issue, stdout_json
 
 
 def _files(root: Path) -> dict[str, bytes]:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.run_artifacts import _passing_artifact
+
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +24,7 @@ from agent_run.revisions import effective_revision
 from agent_run.state import StateStore
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.semantic_attempt import allocate_semantic_attempt
-from conftest import write_fixture
-from run_acceptance_test_support import _passing_artifact
+from support.seeding import write_fixture
 
 
 def _canonical_budget() -> dict[str, Any]:

@@ -14,7 +14,7 @@ from agent_run import cli
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
 from support.workspace import prepare_workspace
-from test_run_lifecycle import _file_snapshot
+from support.lifecycle import _file_snapshot
 
 
 class TerminalOutput(StringIO):

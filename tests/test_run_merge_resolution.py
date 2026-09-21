@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.run_artifacts import _passing_artifact
+
 import json
 from pathlib import Path
 import subprocess
@@ -10,21 +12,20 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.git import GitError
 from agent_run.github_fixture import FixtureGitHubPublisher
 
-from run_merge_resolution_faults import (
+from support.merge_faults import (
     CandidateSaveCrashGit,
     CleanReprepareCrashGit,
     FindingSnapshotCrashGit,
     FindingReplayCrashGit,
     FindingReplaySaveCrashGit,
 )
-from run_merge_resolution_fixture import (
+from support.merge_resolution import (
     MergeResolutionFixture,
     _git_output,
 )
 from support.workspace import prepare_workspace
-from conftest import seed_idle_control
-from test_cli import run_cli
-from run_acceptance_test_support import _passing_artifact
+from support.seeding import seed_idle_control
+from support.cli import run_cli
 
 
 def test_merge_resolution_creates_exact_two_parent_candidate(git_repo: Path) -> None:

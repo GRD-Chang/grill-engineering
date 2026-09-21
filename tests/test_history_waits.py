@@ -195,7 +195,7 @@ def test_public_history_outputs_share_compact_facts_and_preserve_raw_audit(
 
     from rich.text import Text
     from agent_run.cli import main
-    from conftest import seed_run, write_fixture
+    from support.seeding import seed_run, write_fixture
 
     class Terminal(StringIO):
         def isatty(self) -> bool:

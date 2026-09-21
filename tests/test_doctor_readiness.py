@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.runner_installer import _runtime_identity
-from test_run_lifecycle import _file_snapshot, _isolated_environment
+from support.lifecycle import _file_snapshot, _isolated_environment
 
 
 @pytest.mark.parametrize(

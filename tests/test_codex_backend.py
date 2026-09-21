@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_codex_prompt_contract import _capture_public_prompt
+from support.prompt_capture import _capture_public_prompt
 from support.worker_sigint_probe import cleanup_probe_controller
 from support.worker_process_timing import (
     AdvancingClock,

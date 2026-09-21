@@ -9,8 +9,8 @@ import pytest
 
 from agent_run.cli import main
 from agent_run.run_locator import RunLocatorIndex
-from conftest import seed_run, write_fixture
-from test_cli import run_cli, stdout_json
+from support.seeding import seed_run, write_fixture
+from support.cli import run_cli, stdout_json
 from support.workspace import managed_repo, managed_state
 
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from support.resume_intent import (
+    _checkpoint,
+)
+
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -11,21 +14,8 @@ from support.workspace import managed_state
 from agent_run import cli
 from agent_run.controller import Controller
 from agent_run.executor_host import FakeExecutorHost
-from conftest import write_fixture
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_round_agents
-
-
-def _checkpoint(repo: Path) -> tuple[Path, Path, dict[str, Any]]:
-    fixture = write_fixture(repo / "github.json", issues={})
-    agents = repo / "agents.json"
-    agents.write_text(json.dumps(parent_round_agents(1, passing_last=False)))
-    result = run_cli(
-        repo, fixture, "run", "1", "--parent-only-paired-rounds", "1",
-        "--agent-fixture", str(agents),
-    )
-    assert result.returncode == 2, result.stdout
-    return fixture, agents, load_only_run_state(repo)
+from support.seeding import write_fixture
+from support.cli import load_only_run_state, run_cli, stdout_json
 
 
 def test_budget_resume_receipt_records_explicit_window_authority(git_repo: Path) -> None:

@@ -13,9 +13,9 @@ from agent_run.cli import main
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from cli_run_supervision_support import _parent_only_agents
-from conftest import seed_idle_control, seed_run, write_fixture
-from test_ticket_194_stop_abandon import _run_cli
+from support.cli_supervision import _parent_only_agents
+from support.seeding import seed_idle_control, seed_run, write_fixture
+from support.control import _run_cli
 
 
 def test_stop_idle_delivery_persists_operator_pause(git_repo: Path) -> None:

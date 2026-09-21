@@ -12,11 +12,11 @@ from pathlib import Path
 import pytest
 
 from agent_run.executor_host import _process_start_token
-from cli_fixtures import run_agents
+from support.cli_fixtures import run_agents
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_state
-from test_cli import PROJECT_ROOT, load_only_run_state, stdout_json
-from test_cli_delivery import parent_publication, passing_acceptance, publication
+from support.cli import PROJECT_ROOT, load_only_run_state, stdout_json
+from support.cli_payloads import parent_publication, passing_acceptance, publication
 
 _WAIT_FIELDS = {
     "kind",

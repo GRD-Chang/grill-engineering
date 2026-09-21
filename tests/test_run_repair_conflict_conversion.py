@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_scenarios import _completed_run
+from support.run_artifacts import _passing_artifact, _repair_artifact
+
 import json
 from pathlib import Path
 import subprocess
@@ -11,11 +14,6 @@ from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
-from run_acceptance_test_support import (
-    _completed_run,
-    _passing_artifact,
-    _repair_artifact,
-)
 
 
 @pytest.mark.parametrize(

@@ -9,20 +9,20 @@ from pathlib import Path
 
 import pytest
 
-from cli_fixtures import run_agents
-from conftest import write_fixture
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.published_run import prepare_accepted_run
 from support.workspace import managed_state
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import (
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import (
     parent_publication,
     passing_acceptance,
     publication,
     ticket,
 )
 
-from cli_run_supervision_support import (
+from support.cli_supervision import (
     _assert_credential_wait_is_not_public,
     _interrupt_run,
     _parent_only_agents,
@@ -193,16 +193,17 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
         state_files = {
             path: path.read_bytes() for path in (managed_state(git_repo)).rglob("*.json")
         }
+        # 活动 Executor 的真实 CLI 查询已在上方验证；退出后的展示组合复用进程内入口。
         for host_exit, activity in ((4, "not_running"), (1, "unknown")):
             # systemctl exit 4 confirms an absent unit; exit 1 cannot establish
             # whether it is running, even after our fixture process has exited.
             systemctl.write_text(f"#!/bin/sh\nexit {host_exit}\n", encoding="utf-8")
             for command in ("status", "history"):
-                audit = stdout_json(run_cli(git_repo, fixture, command, run_id, "--json"))
+                audit = stdout_json(invoke_cli_inprocess(git_repo, fixture, command, run_id, "--json"))
                 assert audit["executor_control"]["activity"] == activity
                 if activity == "unknown":
                     assert audit["executor_control"]["reason"] == "executor_host_unknown"
-                human = run_cli(git_repo, fixture, command, run_id)
+                human = invoke_cli_inprocess(git_repo, fixture, command, run_id)
                 assert human.returncode == 0, human.stderr
                 text = human.stdout
                 assert "等待 PR #1 的合并前检查" in text

@@ -12,7 +12,7 @@ from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.state import StateStore
-from run_publication_test_support import RunPublicationAgents
+from support.run_publication import RunPublicationAgents
 
 
 class EvidencePublisher(FixtureGitHubPublisher):

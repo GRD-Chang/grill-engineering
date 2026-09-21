@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
+
 from typing import Any
 
 
-from agent_run.agents import ReviewResult
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.github import GitHubReadError
-from agent_run.run_acceptance import RunAcceptanceEngine
 
-from run_acceptance_test_support import _completed_run, _passing_artifact
 
 class RunPublicationAgents:
     def __init__(self) -> None:
@@ -49,10 +45,6 @@ class InvocationRunPublicationAgents(RunPublicationAgents):
         result["_thread_id"] = "final-publication-thread"
         return result
 
-class PassingRunReviewer:
-    def review(self, request: dict[str, Any]) -> ReviewResult:
-        del request
-        return ReviewResult("run-reviewer", _passing_artifact())
 
 class InterruptedRunPublisher(FixtureGitHubPublisher):
     def ensure_run_pr(
@@ -212,53 +204,3 @@ class HumanThenRunPublicationAgents:
             "_thread_id": "blocked-publication-thread",
         }
 
-def _accepted_run(
-    git_repo: Path, *, ticket_number: int = 2, state_root: Path | None = None,
-) -> tuple[dict[str, Any], Any, Any, FixtureGitHubPublisher]:
-    state, states, git = _completed_run(
-        git_repo, ticket_number=ticket_number, state_root=state_root,
-    )
-    tree = git.resolve(f"{state['run_branch']}^{{tree}}")
-    integrated = subprocess.run(
-        [
-            "git",
-            "commit-tree",
-            tree,
-            "-p",
-            str(state["run_branch"]),
-            "-m",
-            "feat(ticket): integrated accepted ticket",
-        ],
-        cwd=git_repo,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.strip()
-    subprocess.run(
-        ["git", "update-ref", f"refs/heads/{state['run_branch']}", integrated],
-        cwd=git_repo,
-        check=True,
-    )
-    state["ticket_jobs"][str(ticket_number)]["integrated_sha"] = integrated
-    integration = state["ticket_jobs"][str(ticket_number)]["deterministic_integration_record"]
-    integration.update(
-        {
-            "integrated_sha": integrated,
-            "integrated_tree": tree,
-            "integrated_message": git.commit_subject(integrated),
-            "integrated_parents": git.commit_parents(integrated),
-        }
-    )
-    integration["pr"].update(
-        {"state": "MERGED", "merge_commit_sha": integrated}
-    )
-    states.save_run(str(state["run_id"]), state)
-    publisher = FixtureGitHubPublisher(git_repo / "github.json", git)
-    accepted = RunAcceptanceEngine(
-        git=git,
-        states=states,
-        agents=PassingRunReviewer(),
-        github=publisher,
-        default_head_sha=git.resolve("main"),
-    ).accept(str(state["run_id"]))
-    return accepted, states, git, publisher

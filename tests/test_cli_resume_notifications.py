@@ -13,13 +13,13 @@ import pytest
 from agent_run.notifications import Notifications, read_notifications
 from agent_run.messages import text
 from agent_run.user_defaults import UserDefaultsStore
-from cli_fixtures import run_agents
-from conftest import write_fixture
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_state
-from test_cli import load_only_run_state, run_cli
-from test_cli_delivery import parent_publication
-from test_run_existing_executor import _GATED_ACTION
+from support.cli import load_only_run_state, run_cli
+from support.cli_payloads import parent_publication
+from support.executor import _GATED_ACTION
 
 
 @pytest.mark.parametrize("outcome", ["preflight", "launch_failure", "human_action", "started", "controller", "running", "preflight_human"])

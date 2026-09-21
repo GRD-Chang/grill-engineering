@@ -12,7 +12,7 @@ from agent_run.graph import state_from_graph
 from agent_run.revisions import ticket_graph_revision
 from agent_run.run_currentness import refresh_run_currentness
 from agent_run.state import StateStore
-from conftest import write_fixture
+from support.seeding import write_fixture
 
 
 def _ticket(number: int) -> dict[str, Any]:

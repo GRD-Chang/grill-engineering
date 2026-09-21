@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from support.run_artifacts import _passing_artifact
+from support.run_scenarios import _accepted_run
+
 import subprocess
 import json
 from copy import deepcopy
@@ -20,21 +23,11 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 
-from run_acceptance_test_support import _passing_artifact
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import prepare_workspace
-from test_cli import run_internal_stage, run_cli, stdout_json
+from support.cli import run_internal_stage, run_cli, stdout_json
 
-from run_publication_test_support import (
-    CountingNarrativeRefreshPublisher,
-    DelayedChecksRunPublisher,
-    HumanThenRunPublicationAgents,
-    InterruptedFinalRefPublisher,
-    RunPublicationAgents,
-    UnknownNarrativeWritePublisher,
-    WaitingThenInterruptedChecksPublisher,
-    _accepted_run,
-)
+from support.run_publication import CountingNarrativeRefreshPublisher, DelayedChecksRunPublisher, HumanThenRunPublicationAgents, InterruptedFinalRefPublisher, RunPublicationAgents, UnknownNarrativeWritePublisher, WaitingThenInterruptedChecksPublisher
 
 def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     git_repo: Path,

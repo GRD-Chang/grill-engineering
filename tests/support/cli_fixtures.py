@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from test_cli_delivery import passing_acceptance, publication
+from support.cli_payloads import passing_acceptance, publication
 
 
 def run_agents(path: Path) -> Path:

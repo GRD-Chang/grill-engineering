@@ -31,11 +31,11 @@ from agent_run.run_driver import DirectRunOperations
 from agent_run.state import StateStore
 from agent_run.semantic_attempt import allocate_semantic_attempt
 from agent_run.review_budget import new_budget
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state, prepare_workspace
-from test_cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import parent_round_agents, passing_acceptance
+from support.cli import run_internal_stage, load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import parent_round_agents, passing_acceptance
 
 
 def _ticket(

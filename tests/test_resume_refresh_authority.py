@@ -18,7 +18,7 @@ from agent_run.resume_intent import (
     validate_resume_intent,
 )
 from agent_run.state import StateStore
-from conftest import write_fixture
+from support.seeding import write_fixture
 
 
 @pytest.mark.parametrize("pause", ["operator_stopped", "supervision_timeout"])

@@ -10,11 +10,11 @@ from support.workspace import managed_repo, managed_state
 from agent_run import cli
 from agent_run.executor_host import HostObservation
 
-from cli_fixtures import run_agents
-from conftest import write_fixture
-from test_cli import run_cli, stdout_json
-from test_cli_delivery import ticket
-from test_run_lifecycle import _file_snapshot, _isolated_environment
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
+from support.cli import run_cli, stdout_json
+from support.cli_payloads import ticket
+from support.lifecycle import _file_snapshot, _isolated_environment
 
 
 def _workspace_snapshot(
@@ -135,7 +135,7 @@ def test_normal_approval_gate_is_not_reported_as_interrupted(
 
 
 def test_budget_checkpoint_explains_new_window_authorization(git_repo: Path) -> None:
-    from test_resume_intent import _checkpoint
+    from support.resume_intent import _checkpoint
 
     fixture, _, state = _checkpoint(git_repo)
     before = _workspace_snapshot(git_repo)

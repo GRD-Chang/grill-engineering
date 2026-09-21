@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from support.lifecycle import (
+    _InMemoryRunState,
+    _file_snapshot,
+    _isolated_environment,
+    _task,
+)
+
 import fcntl
 import json
 import os
@@ -8,8 +15,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -45,29 +52,11 @@ from agent_run.task_control import (
     TaskControlStore,
     TaskKey,
 )
-from conftest import _user_environment, seed_idle_control, seed_run, write_fixture
-from cli_fixtures import run_agents
-from cli_run_supervision_support import _parent_only_agents
-from test_cli import load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import ticket
-
-
-def _task(tmp_path: Path) -> TaskKey:
-    return TaskKey(tmp_path / "checkout", "example/project", 156)
-
-
-def _isolated_environment(root: Path) -> dict[str, str]:
-    return _user_environment(root)
-
-
-def _file_snapshot(root: Path) -> dict[str, bytes]:
-    if not root.exists():
-        return {}
-    return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
+from support.seeding import seed_idle_control, seed_run, write_fixture
+from support.cli_fixtures import run_agents
+from support.cli_supervision import _parent_only_agents
+from support.cli import load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import ticket
 
 
 def _assert_public_action_receipt(
@@ -103,25 +92,6 @@ def _assert_public_action_receipt(
         "executor_generation",
         "executor",
     }.intersection(action)
-
-
-class _InMemoryRunState:
-    def __init__(self) -> None:
-        self.value: dict[str, object] = {"run_id": "run-1", "status": "active"}
-
-    @contextmanager
-    def locked(self) -> Iterator[None]:
-        yield
-
-    def load_current_run(self, run_id: str) -> dict[str, object] | None:
-        if self.value.get("run_id") != run_id:
-            return None
-        return dict(self.value)
-
-    def save_run(self, run_id: str, state: dict[str, object]) -> None:
-        if self.value.get("run_id") != run_id:
-            raise AssertionError("unexpected Run ID")
-        self.value = dict(state)
 
 
 class _FaultInjectingTaskControlStore(TaskControlStore):

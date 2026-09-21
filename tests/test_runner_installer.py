@@ -16,7 +16,7 @@ import pytest
 
 from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
 from agent_run import runner_installer
-from conftest import seed_run, write_fixture
+from support.seeding import seed_run, write_fixture
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
 

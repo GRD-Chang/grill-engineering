@@ -14,7 +14,7 @@ from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state_contract import IncompatibleRunStateError
 from agent_run.state import StateStore
-from conftest import write_fixture
+from support.seeding import write_fixture
 
 
 def _issue(number: int) -> dict[str, Any]:

@@ -15,8 +15,8 @@ from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
-from conftest import write_fixture
-from test_delivery import ScriptedAgents, issue
+from support.seeding import write_fixture
+from support.delivery_agents import ScriptedAgents, issue
 
 
 COMMIT_MESSAGE = "fix: 恢复完整交付\n\n问题：合并完成后继续收尾。\n\n证据：保留多段正文与中文引号‘验收’。"
@@ -147,7 +147,8 @@ def test_run_repair_recovers_merge_without_a_saved_integrated_sha(
     git_repo: Path, tmp_path: Path,
 ) -> None:
     from agent_run.run_acceptance import RunAcceptanceEngine
-    from run_acceptance_test_support import ScriptedRunAgents, _completed_run
+    from support.run_agents import ScriptedRunAgents
+    from support.run_scenarios import _completed_run
 
     state, states, git = _completed_run(git_repo)
     run_id = str(state["run_id"])

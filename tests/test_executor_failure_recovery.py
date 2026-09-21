@@ -11,10 +11,10 @@ import pytest
 
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.task_control import ActionReconciliationError, TaskControlStore, TaskKey
-from cli_fixtures import run_agents
-from conftest import write_fixture
-from test_cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
-from test_cli_delivery import ticket
+from support.cli_fixtures import run_agents
+from support.seeding import write_fixture
+from support.cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
+from support.cli_payloads import ticket
 
 
 @pytest.mark.parametrize("case", ["exited", "unknown_executor", "foreign_receipt"])

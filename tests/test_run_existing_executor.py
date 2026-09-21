@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from support.executor import (
+    _GATED_ACTION,
+)
+
 import json
 import os
 import select
@@ -13,48 +17,12 @@ from support.workspace import managed_repo, managed_state
 
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
-from cli_run_supervision_support import _parent_only_agents
-from conftest import write_fixture
-from test_cli import PROJECT_ROOT, run_cli, stdout_json
-from test_run_lifecycle import _file_snapshot, _isolated_environment
-from test_ticket_191_resume import _fail_parent_run, _resumed_parent_agents
+from support.cli_supervision import _parent_only_agents
+from support.seeding import write_fixture
+from support.cli import PROJECT_ROOT, run_cli, stdout_json
+from support.lifecycle import _file_snapshot, _isolated_environment
+from support.resume import _fail_parent_run, _resumed_parent_agents
 
-
-_GATED_ACTION = """
-import os, sys
-from agent_run.cli import main
-from agent_run.run_driver import RunDriver
-from agent_run.task_control import TaskControlStore
-ready, release = int(sys.argv[1]), int(sys.argv[2])
-def barrier():
-    os.write(ready, b'1')
-    os.close(ready)
-    assert os.read(release, 1) == b'1'
-    os.close(release)
-if sys.argv[4] == 'approve':
-    original = TaskControlStore.complete_action
-    def complete(self, *args, **kwargs):
-        if sys.argv[3] == 'unresolved':
-            barrier()
-        result = original(self, *args, **kwargs)
-        if sys.argv[3] != 'unresolved':
-            barrier()
-        return result
-    TaskControlStore.complete_action = complete
-elif sys.argv[3] == 'unresolved':
-    original = TaskControlStore.complete_action
-    def complete(self, *args, **kwargs):
-        barrier()
-        return original(self, *args, **kwargs)
-    TaskControlStore.complete_action = complete
-else:
-    original = RunDriver.advance
-    def advance(self, *args, **kwargs):
-        barrier()
-        return original(self, *args, **kwargs)
-    RunDriver.advance = advance
-raise SystemExit(main(sys.argv[4:]))
-"""
 
 _OBSERVE_RUN = """
 import json, os, select, sys
