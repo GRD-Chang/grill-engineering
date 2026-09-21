@@ -39,7 +39,7 @@ from agent_run.delivery_policy import (
     policy_snapshot_for_state,
     resolve_delivery_policy,
 )
-from agent_run.managed_workspace import workspace_for_root, workspace_state_root, validate_data_root
+from agent_run.managed_workspace import workspace_state_root, validate_data_root
 from agent_run.workspace_cli import open_workspace, selected_repository_root
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
@@ -111,9 +111,11 @@ from agent_run.resume_intent import (
     bind_resume_intent,
     validate_resume_intent,
 )
+from agent_run.run_selection import (
+    load_exact_run, load_selected_state, read_state_directory, selector_records,
+    selector_error, validate_repository_name, selected_local_run_id,
+)
 from agent_run.run_locator import (
-    MAX_LOCATOR_ENTRIES,
-    LocatorEntry,
     RunLocatorError,
     RunLocatorIndex,
 )
@@ -129,7 +131,6 @@ from agent_run.state_contract import (
 )
 from agent_run.task_control import (
     ActionBusyError,
-    TASK_CONTROL_PROTOCOL,
     TaskControlError,
     TaskControlStore,
     TaskKey,
@@ -2965,21 +2966,30 @@ def _load_read_only_run(parsed: argparse.Namespace) -> dict[str, object]:
     parent = getattr(parsed, "parent", None)
     if run_id is not None:
         if parent is not None:
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_invalid",
                 error_message('cli.error.selector_exclusive'),
                 [],
             )
-        return _load_exact_read_only_run(parsed, run_id)
+        state, exact_root, exact_state_root = load_exact_run(
+            run_id, repository=parsed.repo, state_dir=parsed.state_dir,
+            fixture=parsed.github_fixture,
+        )
+        return _with_executor_control(
+            state, repository_root=exact_root, state_root=exact_state_root
+        )
 
     if parent is None and parsed.repo:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_requires_parent",
             error_message('cli.error.selector_parent_required'),
             [],
         )
     selector_root = selected_repository_root(parsed.repo, parsed.github_fixture)
-    records = _selector_records(parsed, read_only=True)
+    records = selector_records(
+        repository=parsed.repo, state_dir=parsed.state_dir,
+        fixture=parsed.github_fixture, read_only=True,
+    )
     public, state = _select_one_record(
         records,
         parent_number=parent,
@@ -3015,19 +3025,24 @@ def _resolve_mutation_selection(
     raw_selector = parsed.run_id
     if not isinstance(raw_selector, str):
         raise RunLocatorError("run_selector_invalid", error_message('cli.error.selector_required'))
-    if parsed.command == "resume" and raw_selector.isdecimal():
-        _resolve_resume_selection(parsed, git)
-        return
     if raw_selector.isdecimal():
         parent_number = int(raw_selector)
         if parent_number <= 0:
             raise RunLocatorError(
                 "run_selector_invalid", error_message('cli.error.parent_positive')
             )
+        # A failed Parent selector must never become a numeric Run ID in the
+        # outer error handler or authorize recording an execution failure.
         parsed.run_id = None
         parsed.parent = parent_number
+        if parsed.command == "resume":
+            _resolve_resume_selection(parsed, git, parent_number)
+            return
         _reject_local_repository_mismatch(parsed, git, parent_number)
-        records = _selector_records(parsed, current_root=git.root, local_only=True)
+        records = selector_records(
+            repository=parsed.repo, state_dir=parsed.state_dir,
+            fixture=parsed.github_fixture, current_root=git.root, local_only=True,
+        )
         ready_command = (
             parsed.command
             if parsed.command in {"approve", "revise", "requeue"}
@@ -3064,19 +3079,19 @@ def _resolve_mutation_selection(
                     parent_number=parent_number,
                     selection_error=selection_error,
                 )
-        parsed.run_id = _selected_local_run_id(
-            parsed, git, selected, command=parsed.command
+        parsed.run_id = selected_local_run_id(
+            selected, repository_root=git.root, state_dir=parsed.state_dir,
+            command=parsed.command,
         )
         return
 
-    state = states.load_current_run(raw_selector)
+    state = load_selected_state(states, raw_selector, repository=parsed.repo)
     if state is None:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_not_found",
             error_message('cli.error.selected_run_missing' ,value0=parsed.command),
             [],
         )
-    _validate_repository_selector(parsed, state, raw_selector)
     parent = state.get("parent")
     exact_parent_number = (
         parent.get("number") if isinstance(parent, Mapping) else None
@@ -3096,8 +3111,8 @@ def _reject_local_repository_mismatch(
     repository = parsed.repo
     if repository is None:
         return
-    _validate_repository_name(repository)
-    local_records = _read_state_directory(workspace_state_root(git.root), git.root)
+    validate_repository_name(repository)
+    local_records = read_state_directory(workspace_state_root(git.root), git.root)
     mismatches = [
         public
         for public, state in local_records
@@ -3106,7 +3121,7 @@ def _reject_local_repository_mismatch(
         and not same_repository(public.get("repository"), repository)
     ]
     if mismatches:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_repository_mismatch",
             error_message('cli.error.parent_repository_mismatch' ,value0=parent_number, value1=repository),
             mismatches,
@@ -3184,25 +3199,14 @@ def _select_attached_action_run(
 def _resolve_resume_selection(
     parsed: argparse.Namespace,
     git: GitRepository,
+    parent_number: int,
 ) -> None:
     """Resolve the Parent form of ``resume`` before any controller mutation."""
 
-    raw_selector = parsed.run_id
-    if not isinstance(raw_selector, str) or not raw_selector.isdecimal():
-        return
-    parent_number = int(raw_selector)
-    if parent_number <= 0:
-        raise RunLocatorError(
-            "run_selector_invalid", error_message('cli.error.parent_positive')
-        )
-
-    # The original argument is a Parent Issue, not a Run ID.  Clearing it
-    # while selecting is also important: the outer error path must not treat a
-    # failed selector as permission to mutate a Run whose ID happens to be
-    # numeric.
-    parsed.run_id = None
-    parsed.parent = parent_number
-    records = _selector_records(parsed, current_root=git.root, local_only=True)
+    records = selector_records(
+        repository=parsed.repo, state_dir=parsed.state_dir,
+        fixture=parsed.github_fixture, current_root=git.root, local_only=True,
+    )
     try:
         selected, _state = _select_one_record(
             records,
@@ -3251,96 +3255,8 @@ def _resolve_resume_selection(
             )
         ):
             raise selection_error
-    parsed.run_id = _selected_local_run_id(parsed, git, selected, command="resume")
-
-
-def _selected_local_run_id(
-    parsed: argparse.Namespace,
-    git: GitRepository,
-    selected: dict[str, object],
-    *,
-    command: str,
-) -> str:
-    selected_run_id = selected.get("run_id")
-    if not isinstance(selected_run_id, str):  # pragma: no cover - candidate contract
-        raise ValueError("selected Delivery Run is missing its Run ID")
-    selected_root = selected.get("repository_root")
-    if (
-        not isinstance(selected_root, str)
-        or Path(selected_root).resolve() != git.root.resolve()
-    ):
-        raise _selector_error(
-            "run_selector_requires_checkout",
-            error_message('cli.error.workspace_mismatch' ,value0=command),
-            [selected],
-        )
-    selected_state_dir = selected.get("state_dir")
-    expected_state_dir = (
-        Path(parsed.state_dir).resolve()
-        if parsed.state_dir
-        else (workspace_state_root(git.root)).resolve()
-    )
-    if (
-        not isinstance(selected_state_dir, str)
-        or Path(selected_state_dir).resolve() != expected_state_dir
-    ):
-        raise _selector_error(
-            "run_selector_requires_state_dir",
-            error_message('cli.error.state_directory_mismatch' ,value0=command),
-            [selected],
-        )
-    return selected_run_id
-
-
-def _load_exact_read_only_run(
-    parsed: argparse.Namespace, run_id: str
-) -> dict[str, object]:
-    repository_root: Path | None = None
-    state_root: Path | None = None
-    if parsed.state_dir:
-        state_dir = Path(parsed.state_dir).resolve()
-        state_root = state_dir
-        states = StateStore(state_dir)
-        repository_root = _repository_root_for_state_dir(state_dir)
-        state = _load_read_only_state(states, run_id)
-        if state is not None and state.get("run_id") != run_id:
-            state = None
-    else:
-        try:
-            git = open_workspace(parsed.repo, parsed.github_fixture, create=False)
-        except (GitError, RunLocatorError):
-            git = None
-        state = None
-        if git is not None:
-            state = _load_read_only_state(StateStore(workspace_state_root(git.root)), run_id)
-            if state is not None and state.get("run_id") != run_id:
-                state = None
-            elif state is not None:
-                repository_root = git.root
-                state_root = workspace_state_root(git.root)
-        if state is None:
-            locator = RunLocatorIndex.default()
-            state_dir = locator.resolve_state_dir(run_id)
-            state_root = state_dir
-            state = _load_read_only_state(StateStore(state_dir), run_id)
-            if state is None or state.get("run_id") != run_id:
-                raise RunLocatorError(
-                    "run_locator_stale",
-                    error_message('cli.error.locator_invalid_state' ,value0=run_id),
-                )
-            roots = {
-                Path(entry["repository_root"]).resolve()
-                for entry in locator.entries()
-                if entry["run_id"] == run_id
-                and Path(entry["state_dir"]).resolve() == state_dir.resolve()
-            }
-            if len(roots) == 1:
-                repository_root = next(iter(roots))
-    if state is None:  # pragma: no cover - exact loader raises before this point
-        raise ValueError(f"unknown Delivery Run: {run_id}")
-    _validate_repository_selector(parsed, state, run_id)
-    return _with_executor_control(
-        state, repository_root=repository_root, state_root=state_root
+    parsed.run_id = selected_local_run_id(
+        selected, repository_root=git.root, state_dir=parsed.state_dir, command="resume"
     )
 
 
@@ -3520,367 +3436,6 @@ def _with_executor_control(
     return projected
 
 
-def _load_read_only_state(states: StateStore, run_id: str) -> dict[str, Any] | None:
-    state = states.load_run(run_id)
-    if state is None:
-        return None
-    try:
-        require_current_run_state(state)
-    except IncompatibleRunStateError:
-        if _is_legacy_run_state(state):
-            return state
-        raise
-    return state
-
-
-def _is_legacy_run_state(state: Mapping[str, Any]) -> bool:
-    return (
-        "schema_version" in state
-        or state.get("lifecycle_action_protocol") != TASK_CONTROL_PROTOCOL
-    )
-
-
-def _selector_records(
-    parsed: argparse.Namespace,
-    *,
-    current_root: Path | None = None,
-    read_only: bool = False,
-    local_only: bool = False,
-) -> list[tuple[dict[str, object], dict[str, Any] | None]]:
-    """Load selector candidates from the bounded index or an explicit state dir."""
-
-    repository = parsed.repo
-    if repository is not None:
-        _validate_repository_name(repository)
-
-    if parsed.state_dir:
-        state_dir = Path(parsed.state_dir).resolve()
-        root = _repository_root_for_state_dir(state_dir)
-        records = _read_state_directory(state_dir, root, read_only=read_only)
-        if repository is not None:
-            records = [
-                record
-                for record in records
-                if same_repository(record[0].get("repository"), repository)
-                or record[0].get("repository") is None
-            ]
-        return records
-
-    if current_root is None:
-        current_root = selected_repository_root(repository, parsed.github_fixture)
-        if current_root is None and repository is None:
-            raise _selector_error(
-                "run_selector_context",
-                error_message('cli.error.repository_required'),
-                [],
-            )
-
-    locator = RunLocatorIndex.default()
-    entries = locator.entries()
-    if local_only and current_root is not None:
-        expected_root = current_root.resolve()
-        entries = [
-            entry
-            for entry in entries
-            if Path(entry["repository_root"]).resolve() == expected_root
-        ]
-    records = [_read_locator_entry(entry, read_only=read_only) for entry in entries]
-
-    # A current checkout is an already-known, bounded location.  It remains a
-    # useful fallback when an older/newly interrupted Run has not completed its
-    # locator registration, but it never replaces an indexed entry.
-    if current_root is not None and current_root.is_dir():
-        local_root = workspace_state_root(current_root.resolve())
-        indexed_runs = {
-            (entry["run_id"], Path(entry["state_dir"]).resolve())
-            for entry in entries
-        }
-        local_records = _read_state_directory(
-            local_root, current_root.resolve(), read_only=read_only
-        )
-        records.extend(
-            record
-            for record in local_records
-            if (
-                str(record[0]["run_id"]),
-                Path(str(record[0]["state_dir"])).resolve(),
-            )
-            not in indexed_runs
-        )
-        # Resolve local identity only after the bounded fallback is included.
-        # Otherwise an unregistered local Run can silently lose other clones.
-        if repository is None:
-            repository = workspace_for_root(current_root.resolve()).repository
-    if repository is not None:
-        records = [
-            record
-            for record in records
-            if (record[0].get("repository") is None or same_repository(record[0].get("repository"), repository))
-        ]
-    elif current_root is not None:
-        # With no Repository identity, only this checkout is a known target.
-        # Unreadable identities still need explicit disambiguation.
-        records = [
-            record for record in records
-            if record[0].get("repository_root") == str(current_root.resolve())
-            or record[1] is None
-        ]
-    return records
-
-
-def _repository_root_for_state_dir(state_dir: Path) -> Path | None:
-    """Resolve a state directory to a verified checkout when possible."""
-
-    if state_dir.name == "state":
-        root = state_dir.parent / "repository"
-        try:
-            if workspace_state_root(root) == state_dir:
-                return root
-        except (GitError, OSError):
-            pass
-
-    try:
-        entries = RunLocatorIndex.default().entries()
-    except RunLocatorError:
-        return None
-    roots = {
-        Path(entry["repository_root"]).resolve()
-        for entry in entries
-        if Path(entry["state_dir"]).resolve() == state_dir
-    }
-    if len(roots) != 1:
-        return None
-    recorded_root = next(iter(roots))
-    try:
-        root = GitRepository.discover(recorded_root).root
-    except (GitError, OSError):
-        return None
-    return root if root == recorded_root else None
-
-
-def _verified_locator_checkout(
-    entry: LocatorEntry,
-) -> tuple[GitRepository, str | None]:
-    workspace = workspace_for_root(Path(entry["repository_root"]).resolve())
-    return workspace.open(), workspace.repository
-
-
-def _read_state_directory(
-    state_dir: Path, repository_root: Path | None, *, read_only: bool = False
-) -> list[tuple[dict[str, object], dict[str, Any] | None]]:
-    runs_directory = state_dir / "runs"
-    if not runs_directory.is_dir():
-        return []
-    paths: list[Path] = []
-    for path in runs_directory.glob("*.json"):
-        paths.append(path)
-        if len(paths) > MAX_LOCATOR_ENTRIES:
-            raise RunLocatorError(
-                "run_locator_invalid",
-                error_message('cli.error.too_many_runs' ,value0=MAX_LOCATOR_ENTRIES),
-            )
-    paths.sort(key=lambda path: path.name)
-    repository_root_value = (
-        str(repository_root.resolve()) if repository_root is not None else "unavailable"
-    )
-    records: list[tuple[dict[str, object], dict[str, Any] | None]] = []
-    for path in paths:
-        entry: LocatorEntry = {
-            "run_id": path.stem,
-            "repository_root": repository_root_value,
-            "state_dir": str(state_dir.resolve()),
-            "updated_at": "",
-        }
-        public, state = _read_locator_entry(
-            entry,
-            verify_checkout=repository_root is not None,
-            read_only=read_only,
-        )
-        records.append((public, state if repository_root is not None else None))
-    return records
-
-
-def _read_locator_entry(
-    entry: LocatorEntry,
-    *,
-    verify_checkout: bool = True,
-    read_only: bool = False,
-) -> tuple[dict[str, object], dict[str, Any] | None]:
-    run_id = entry["run_id"]
-    if Path(run_id).name != run_id:
-        return _candidate(entry, error=error_message("cli.error.unsafe_run_id")), None
-    state_dir = Path(entry["state_dir"])
-    state_path = state_dir / "runs" / f"{run_id}.json"
-    state: dict[str, Any] | None = None
-    state_error: str | None = None
-    if not state_path.is_file():
-        state_error = error_message("cli.error.state_missing")
-    else:
-        try:
-            # Identity must be checked before validating the lifecycle payload:
-            # a broken payload cannot hide a contradictory routing identity.
-            state = StateStore(state_dir).load_run(run_id)
-        except (OSError, ValueError) as error:
-            state_error = bounded_error(str(error))
-        if state is None:
-            if state_error is None:
-                state_error = error_message("cli.error.run_id_mismatch")
-        elif state.get("run_id") != run_id:
-            return _candidate(
-                entry,
-                error=error_message("cli.error.run_id_mismatch"),
-                identity_conflict=True,
-            ), None
-        if state is not None:
-            repository = state.get("repository")
-            parent = state.get("parent")
-            parent_number = parent.get("number") if isinstance(parent, dict) else None
-            if (
-                (
-                    repository is not None
-                    and (
-                        not isinstance(repository, str)
-                        or len(repository.split("/")) != 2
-                        or not all(repository.split("/"))
-                        or any(character.isspace() for character in repository)
-                    )
-                )
-                or (
-                    parent_number is not None
-                    and (type(parent_number) is not int or parent_number <= 0)
-                )
-            ):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.identity_format"),
-                    identity_conflict=True,
-                ), None
-            if repository is None or parent_number is None:
-                state_error = error_message("cli.error.identity_missing")
-        if state is not None and "repository" in entry:
-            parent = state.get("parent")
-            if (
-                not same_repository(state.get("repository"), entry["repository"])
-                or not isinstance(parent, dict)
-                or parent.get("number") != entry["parent_number"]
-            ):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.identity_mismatch"),
-                    identity_conflict=True,
-                ), None
-        if state is not None:
-            try:
-                require_current_run_state(state)
-            except IncompatibleRunStateError as error:
-                if not (read_only and _is_legacy_run_state(state)):
-                    state_error = bounded_error(str(error))
-    if state is None and state_error is not None:
-        if not verify_checkout:
-            return _candidate(entry, error=state_error), None
-        try:
-            _checkout, checkout_repository = _verified_locator_checkout(entry)
-        except (GitError, OSError) as error:
-            unavailable = entry.copy()
-            unavailable["repository_root"] = "unavailable"
-            return (
-                _candidate(
-                    unavailable,
-                    error=error_message("cli.error.checkout_unavailable", reason=bounded_error(str(error))),
-                ),
-                None,
-            )
-        candidate = _candidate(entry, error=state_error)
-        if checkout_repository is not None:
-            if "repository" in entry and not same_repository(entry["repository"], checkout_repository):
-                return _candidate(
-                    entry,
-                    error=error_message("cli.error.checkout_repository"),
-                    identity_conflict=True,
-                ), None
-            candidate["repository"] = checkout_repository
-        return candidate, None
-    if state is None:  # pragma: no cover - state errors return above
-        return _candidate(entry, error=error_message("cli.error.state_unreadable")), None
-    if verify_checkout:
-        try:
-            checkout, checkout_repository = _verified_locator_checkout(entry)
-        except (GitError, OSError) as error:
-            unavailable = entry.copy()
-            unavailable["repository_root"] = "unavailable"
-            return (
-                _candidate(
-                    unavailable,
-                    state=state,
-                    error=error_message("cli.error.checkout_unavailable", reason=bounded_error(str(error))),
-                ),
-                None,
-            )
-        state_repository = state.get("repository")
-        if checkout_repository is not None and not same_repository(state_repository, checkout_repository):
-            return _candidate(
-                entry,
-                state=state,
-                error=error_message("cli.error.checkout_run"),
-                identity_conflict=True,
-            ), None
-        checkout_identity = checkout.checkout_identity()
-        state_identity = state.get("checkout_identity")
-        if (
-            not isinstance(state_identity, str)
-            or checkout_identity is None
-            or checkout_identity != state_identity
-        ):
-            unavailable = entry.copy()
-            unavailable["repository_root"] = "unavailable"
-            return (
-                _candidate(
-                    unavailable,
-                    state=state,
-                    error=error_message("cli.error.checkout_identity"),
-                    identity_conflict=state_identity is not None,
-                ),
-                None,
-            )
-    return _candidate(entry, state=state, error=state_error), (
-        state if state_error is None else None
-    )
-
-
-def _candidate(
-    entry: LocatorEntry,
-    *,
-    state: dict[str, Any] | None = None,
-    error: str | None = None,
-    identity_conflict: bool = False,
-) -> dict[str, object]:
-    parent: object = entry.get("parent_number")
-    repository: object = entry.get("repository")
-    status: object = "unavailable"
-    started_at: object = None
-    if state is not None:
-        raw_parent = state.get("parent")
-        if isinstance(raw_parent, dict) and isinstance(raw_parent.get("number"), int):
-            parent = raw_parent["number"]
-        repository = state.get("repository")
-        status = state.get("status")
-        started_at = state.get("created_at", state.get("started_at"))
-    candidate: dict[str, object] = {
-        "parent": parent,
-        "repository": repository,
-        "repository_root": entry["repository_root"],
-        "run_id": entry["run_id"],
-        "started_at": started_at,
-        "state_dir": entry["state_dir"],
-        "status": status,
-    }
-    if error is not None:
-        candidate["error"] = error
-    if identity_conflict:
-        candidate.update(repository=None, parent=None, repository_root="unavailable")
-    return candidate
-
-
 def _select_one_record(
     records: list[tuple[dict[str, object], dict[str, Any] | None]],
     *,
@@ -3900,7 +3455,7 @@ def _select_one_record(
     public_records = [record[0] for record in records]
     invalid = [public for public, state in records if state is None]
     if invalid:
-        raise _selector_error(
+        raise selector_error(
             "run_locator_stale",
             error_message('cli.error.invalid_candidates' ,value0=purpose),
             public_records,
@@ -3938,14 +3493,14 @@ def _select_one_record(
         other_matches = [match for match in matches if match not in local_matches]
         if local_matches:
             if other_matches:
-                raise _selector_error(
+                raise selector_error(
                     "run_selector_ambiguous",
                     error_message('cli.error.multiple_checkouts' ,value0=purpose),
                     [public for public, _state in matches],
                 )
             matches = local_matches
         elif other_matches:
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_requires_checkout",
                 error_message('cli.error.other_checkout' ,value0=purpose),
                 [public for public, _state in other_matches],
@@ -3953,7 +3508,7 @@ def _select_one_record(
 
     if recoverable_only:
         if len(matches) > 1:
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_ambiguous",
                 error_message('cli.error.multiple_runs' ,value0=purpose),
                 [public for public, _state in matches],
@@ -3966,7 +3521,7 @@ def _select_one_record(
                 and has_unfinished_final_receipt(state, current_root)
             ):
                 return public, state
-            raise _selector_error(
+            raise selector_error(
                 "run_selector_not_recoverable",
                 error_message('cli.error.not_recoverable'),
                 [public],
@@ -3974,68 +3529,16 @@ def _select_one_record(
     elif len(matches) == 1:
         return matches[0]
     elif len(matches) > 1:
-        raise _selector_error(
+        raise selector_error(
             "run_selector_ambiguous",
             error_message('cli.error.multiple_runs' ,value0=purpose),
             [public for public, _state in matches],
         )
-    raise _selector_error(
+    raise selector_error(
         "run_selector_not_found",
         error_message('cli.error.no_unique_run' ,value0=purpose),
         public_records,
     )
-
-
-def _selector_error(
-    code: str, message: str, candidates: list[dict[str, object]]
-) -> RunLocatorError:
-    details = message
-    if candidates:
-        details = error_message("cli.error.candidates", reason=message, candidates="\n".join(
-            _candidate_line(candidate) for candidate in candidates
-        ))
-    return RunLocatorError(code, details, candidates=candidates)
-
-
-def _candidate_line(candidate: dict[str, object]) -> str:
-    error = candidate.get("error")
-    error_detail = f" error={error}" if isinstance(error, str) else ""
-    return (
-        f"- repository={candidate.get('repository') or 'unknown'} "
-        f"Parent=#{candidate.get('parent') or 'unknown'} "
-        f"status={candidate.get('status') or 'unknown'} "
-        f"started_at={candidate.get('started_at') or 'unknown'} "
-        f"worktree={candidate.get('repository_root')} "
-        f"state_dir={candidate.get('state_dir')}{error_detail}"
-    )
-
-
-def _validate_repository_selector(
-    parsed: argparse.Namespace, state: dict[str, object], run_id: str
-) -> None:
-    repository = parsed.repo
-    if repository is not None:
-        _validate_repository_name(repository)
-        if not same_repository(state.get("repository"), repository):
-            parent = state.get("parent")
-            candidate = {
-                "parent": (
-                    parent.get("number")
-                    if isinstance(parent, Mapping)
-                    else None
-                ),
-                "repository": state.get("repository"),
-                "repository_root": "当前 checkout",
-                "run_id": run_id,
-                "started_at": state.get("created_at"),
-                "state_dir": parsed.state_dir or "Runner 统一状态目录",
-                "status": state.get("status"),
-            }
-            raise _selector_error(
-                "run_selector_repository_mismatch",
-                error_message('cli.error.repository_mismatch' ,value0=run_id, value1=repository),
-                [candidate],
-            )
 
 
 def _human_failure_reason(error: Exception, fallback: str, *, language: str = "zh") -> str:
@@ -4063,17 +3566,10 @@ def _human_failure_reason(error: Exception, fallback: str, *, language: str = "z
     }.get(error.code, "ambiguous_delivery"))
 
 
-def _validate_repository_name(repository: str) -> None:
-    owner, separator, name = repository.partition("/")
-    if not separator or not owner or not name or "/" in name:
-        raise RunLocatorError(
-            "run_selector_invalid_repository",
-            error_message('cli.error.repository_format'),
-        )
-
-
 def _list_runs(parsed: argparse.Namespace) -> int:
-    records = _selector_records(parsed)
+    records = selector_records(
+        repository=parsed.repo, state_dir=parsed.state_dir, fixture=parsed.github_fixture,
+    )
     parent = getattr(parsed, "parent", None)
     if parent is not None:
         records = [
@@ -4432,17 +3928,12 @@ def _auth_command(parsed: argparse.Namespace) -> int:
 
 
 def _profile_state_root(parsed: argparse.Namespace) -> Path:
-    if parsed.state_dir:
-        return Path(parsed.state_dir).resolve()
-    try:
-        git = open_workspace(parsed.repo, parsed.github_fixture, create=False)
-    except (GitError, RunLocatorError):
-        git = None
-    if git is not None:
-        local_root = workspace_state_root(git.root)
-        if StateStore(local_root).load_run(parsed.run_id) is not None:
-            return local_root
-    return RunLocatorIndex.default().resolve_state_dir(parsed.run_id)
+    _state, _repository_root, state_root = load_exact_run(
+        parsed.run_id, repository=parsed.repo, state_dir=parsed.state_dir,
+        fixture=parsed.github_fixture,
+    )
+    assert state_root is not None  # An exact Run always has a persisted location.
+    return state_root
 
 
 def _positive_integer(value: str) -> int:

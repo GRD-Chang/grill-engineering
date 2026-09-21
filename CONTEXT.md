@@ -83,6 +83,8 @@ Development 与 Repair 在当前 checkout 中承担完整交付整理责任，�
 Fresh Acceptance 与 Run Acceptance 优先使用项目支持的外部缓存和运行目录；确实无法在只读 checkout 运行时，允许创建仓库外的临时运行副本。副本必须对应当前实际待验收内容，包括未提交修改与未跟踪交付文件；运行前后核对原始交付文件一致，不得修复或改写副本中的源码、测试、配置及依赖声明后将其通过用于原交付。Reviewer 在 evidence 中说明对应对象及一致性核验情况，并关闭本轮进程、清理副本和运行产物。该能力沿用受信任 Prompt 合同，不增加副本状态机或 Controller 自动复制流程。
 _Avoid_: 用 `.gitignore` 隐藏交付、验证者修改交付、只复制 HEAD 遗漏当前验收内容、修改运行副本后宣称原交付通过、留下不应交付的中间产物、Codex 自行提交
 
+准确 Run 的身份读取、目录定位与命令准入分工见[Run 选择与定位](docs/agents/run-selection.md)。
+
 **Managed Development Checkout（受管开发工作区）**:
 Controller 为一个 Change Job 创建并在 Development Attempt、Repair 与 Resume 间复用的专属 worktree。它与主工作区、其他 Change Job 和一次性 Validation Checkout 隔离；系统只允许该 Job 的 Codex 整理其未提交内容，并在 Candidate 创建后交由 Publisher 写入 Git 历史。系统运行约束禁止向其中人工混入无关改动。普通 `run`、`resume` 或自动 cleanup 发现其中存在 tracked modifications 或 untracked files 时必须 fail closed，保留工作区并给出路径、保留原因与可执行恢复动作，不得因 `execution_failed`、`blocked`、预算检查点或状态合同错误自动强制删除。
 _Avoid_: 主工作区、共享 scratch worktree、Validation Checkout、以终态名称代替 dirty check、自动强制删除未提交交付成果

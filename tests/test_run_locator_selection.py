@@ -289,3 +289,26 @@ def test_explicit_state_directory_does_not_disambiguate_multiple_matching_runs(
         assert diagnostic["code"] == "run_selector_ambiguous"
         assert {item["run_id"] for item in diagnostic["candidates"]} == {first, second}
     assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
+
+
+def test_exact_mutations_reject_a_state_file_for_another_run_without_writes(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    target = stdout_json(seed_run(git_repo, fixture))["run_id"]
+    state_dir = managed_state(git_repo)
+    # The payload is valid, but its persisted filename selects a different Run.
+    alias = "wrong-run"
+    (state_dir / "runs" / f"{alias}.json").write_bytes(
+        (state_dir / "runs" / f"{target}.json").read_bytes()
+    )
+    before = _snapshot(state_dir, RunLocatorIndex.default().path.parent)
+    monkeypatch.chdir(git_repo)
+
+    for command in ("resume", "stop", "abandon"):
+        assert main([
+            command, alias, "--github-fixture", str(fixture), "--json",
+        ]) == 2
+        diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
+        assert diagnostic["code"] == "run_selector_not_found"
+        assert _snapshot(state_dir, RunLocatorIndex.default().path.parent) == before
