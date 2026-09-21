@@ -17,6 +17,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与详情）及飞书卡片共用中英文资源。
 无 Run 的界面使用个人语言，已有 Run 的展示使用固定语言；机器 JSON、审计事实和通知选择不随展示语言变化。
 原始标题、日志、用户反馈、Agent 摘要、Findings 与证据保持原文；查询不写入 Run 或通知记录，也不发送通知。
+只读事实的维护归属与展示依赖见[展示事实](docs/agents/display-facts.md)。
 初始化、只读差异与真实组装预览见[个人运行配置](docs/user-defaults.md)；升级不覆盖个人方法，定制正文不会自动继承默认更新。
 
 ## Language

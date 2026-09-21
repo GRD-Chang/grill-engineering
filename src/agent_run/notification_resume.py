@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_run.messages import selected_language, text
 from agent_run.notification_presentation import next_action
+from agent_run.notification_event_facts import event_envelope
 
 
 def apply_resume_result(
@@ -23,7 +24,6 @@ def apply_resume_result(
         "worker_started", "controller_progress", "controller_check",
     }:
         return projected
-    from agent_run.notification_events import _base
 
     language = selected_language(state)
     title = text("notification.event.resume_" + str(outcome), language=language)
@@ -52,7 +52,7 @@ def apply_resume_result(
                      "resume_id": result["id"], "resume_outcome": outcome,
                      "supersedes": superseded}
                     if event is boundary else event for event in projected]
-    return [*projected, _base(
+    return [*projected, event_envelope(
         state, "resume", [result["id"], outcome], title, color,
         summary=summary, next_step=next_action(state) if outcome != "started" else "",
         resume_id=result["id"], resume_outcome=outcome,

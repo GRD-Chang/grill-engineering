@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from agent_run.messages import display_text, display_language
-
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
+
+from agent_run.acceptance_facts import (
+    current_findings,
+    current_artifact,
+    completed_acceptance_artifact,
+    acceptance_subject,
+    has_prior_acceptance_failure,
+)
+from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, role_family
+from agent_run.execution_timing import invocation_execution_seconds, invocation_activity, parse_optional_timestamp
+
+from agent_run.messages import display_text, display_language
 
 if TYPE_CHECKING:
     from rich.text import Text
@@ -18,8 +28,6 @@ from agent_run.operator_action_presentation import (
     human_preserved_results,
 )
 from agent_run.presentation_helpers import (
-    current_work_subject,
-    delivery_object_label,
     human_ci_fix_usage,
     human_delivery_object,
     human_agent_role,
@@ -56,7 +64,7 @@ def status_progress_view(
         and current[1].get("phase") in {"committing_candidate", "creating_pr"}
         and (not isinstance(control, dict) or control.get("activity") == "unknown")):
         activity = "unknown"
-    findings = _current_findings(state)
+    findings = current_findings(state)
     if current_agent is not None:
         current_agent["activity"] = activity
         if activity != "running":
@@ -80,7 +88,7 @@ def status_progress_view(
         "status": audit.get("status"),
         "phase": audit.get("phase"),
         "current_object": current_object,
-        "ticket_progress": _ticket_progress(state),
+        "ticket_progress": ticket_progress(state),
         "round_progress": _round_progress(
             state, current, audit.get("review_budget"), invocation
         ),
@@ -105,111 +113,6 @@ def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
     if type(capacity_count) is int and capacity_count > 0:
         details.append(display_text('presentation.status.recovery_this_round_capacity_wait_triggered_v1_times_resume_autom', v1=capacity_count))
     return details
-
-
-def invocation_execution_seconds(
-    invocation: dict[str, Any], *, allow_open: bool = False
-) -> int | None:
-    """Return trusted active execution time, excluding persisted recovery waits."""
-
-    started = _parse_optional_timestamp(invocation.get("started_at"))
-    ended = _parse_optional_timestamp(invocation.get("ended_at"))
-    if started is None:
-        return None
-    if ended is None:
-        if not allow_open:
-            return None
-        ended = datetime.now(UTC)
-    if ended < started:
-        return None
-
-    waits = _recovery_wait_intervals(invocation, started=started, ended=ended)
-    if waits is None:
-        return None
-    wait_seconds = 0.0
-    previous_end = started
-    for wait_start, wait_end in sorted(waits):
-        if wait_start < started or wait_end > ended or wait_start < previous_end:
-            return None
-        wait_seconds += (wait_end - wait_start).total_seconds()
-        previous_end = wait_end
-    return max(0, int((ended - started).total_seconds() - wait_seconds))
-
-
-def _recovery_wait_intervals(
-    invocation: dict[str, Any], *, started: datetime, ended: datetime
-) -> list[tuple[datetime, datetime]] | None:
-    raw_intervals = invocation.get("recovery_wait_intervals")
-    if isinstance(raw_intervals, list) and not raw_intervals:
-        # An explicitly persisted empty list belongs to this Invocation. In
-        # particular, a successor may retain the semantic Attempt's cumulative
-        # recovery count while having no waits of its own.
-        if not invocation.get("recovery_waiting") and not any(
-            invocation.get(key)
-            for key in ("last_failure_at", "last_recovery_started_at")
-        ):
-            return []
-        # A legacy/current waiting record can have an empty list because its
-        # interval was not persisted. Fall through to the conservative legacy
-        # reconstruction below rather than claiming all elapsed time ran.
-        raw_intervals = None
-    if raw_intervals is None:
-        # Older records only have enough evidence for one capacity wait. More
-        # than one unversioned wait cannot be reconstructed safely.
-        count = invocation.get("capacity_recovery_count")
-        if count in (None, 0) and not any(
-            invocation.get(key)
-            for key in ("last_failure_at", "last_recovery_started_at")
-        ):
-            return []
-        if count not in (None, 0, 1):
-            return None
-        raw_intervals = [
-            {
-                "started_at": invocation.get("last_failure_at"),
-                "ended_at": invocation.get("last_recovery_started_at"),
-            }
-        ]
-    if not isinstance(raw_intervals, list):
-        return None
-
-    intervals: list[tuple[datetime, datetime]] = []
-    for raw in raw_intervals:
-        if not isinstance(raw, dict):
-            return None
-        wait_start = _parse_optional_timestamp(raw.get("started_at"))
-        wait_end = _parse_optional_timestamp(raw.get("ended_at"))
-        if wait_start is None:
-            return None
-        if wait_end is None:
-            if not invocation.get("recovery_waiting"):
-                return None
-            wait_end = ended
-        if wait_end < wait_start:
-            return None
-        intervals.append((wait_start, wait_end))
-    return intervals
-
-
-def invocation_activity(
-    invocation: dict[str, Any] | None, audit: dict[str, Any]
-) -> str:
-    """Project execution evidence separately from persisted Invocation status."""
-    if not invocation or invocation.get("status") not in {"running", "resuming"}:
-        return "not_running"
-    control = audit.get("executor_control")
-    activity = control.get("activity") if isinstance(control, dict) else "unknown"
-    if activity == "not_running":
-        return "interrupted"
-    if activity != "running":
-        return "unknown"
-    if invocation.get("recovery_waiting") is True:
-        return (
-            "capacity_wait"
-            if invocation.get("recovery_kind") == "capacity"
-            else "recovery_wait"
-        )
-    return "running"
 
 
 def execution_guidance(
@@ -819,26 +722,6 @@ def _ticket_progress_text(state: dict[str, Any], view: dict[str, Any]) -> str:
     return text
 
 
-def _ticket_progress(state: dict[str, Any]) -> dict[str, int]:
-    graph = state.get("ticket_graph")
-    tickets = graph.get("tickets") if isinstance(graph, dict) else None
-    total = len(tickets) if isinstance(tickets, dict) else 0
-    jobs = state.get("ticket_jobs")
-    graph_numbers = set(tickets) if isinstance(tickets, dict) else set()
-    completed = (
-        sum(
-            1
-            for number, job in jobs.items()
-            if (not graph_numbers or str(number) in graph_numbers)
-            if isinstance(job, dict)
-            and job.get("phase") in {"completed", "merged"}
-        )
-        if isinstance(jobs, dict)
-        else 0
-    )
-    return {"completed": completed, "total": total}
-
-
 def _round_progress(
     state: dict[str, Any],
     current: tuple[str, dict[str, Any]] | None,
@@ -945,282 +828,6 @@ def _current_object(
     return "Delivery Run"
 
 
-def _current_findings(state: dict[str, Any]) -> list[str]:
-    current = current_work_subject(state)
-    if current is None:
-        return []
-    subject = _acceptance_subject(state, current)
-    artifact = _current_artifact(subject)
-    if artifact is not None:
-        return _artifact_findings(artifact)
-    if subject.get("phase") in {
-        "developing",
-        "repairing",
-        "committing_candidate",
-        "candidate",
-        "reviewing",
-    }:
-        unresolved = _unresolved_acceptance_artifact(state, current, subject)
-        if unresolved is not None:
-            return _artifact_findings(unresolved)
-    return []
-
-
-def _unresolved_acceptance_artifact(
-    state: dict[str, Any],
-    current: tuple[str, dict[str, Any]],
-    subject: dict[str, Any],
-) -> dict[str, Any] | None:
-    candidates: list[dict[str, Any]] = [subject]
-    if current[0] in {"run_acceptance", "run_repair"}:
-        acceptance = state.get("run_acceptance")
-        repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
-        if isinstance(repair, dict) and repair is not subject:
-            candidates.append(repair)
-        if isinstance(acceptance, dict) and acceptance is not subject:
-            candidates.append(acceptance)
-    for candidate in candidates:
-        if candidate.get("repair_source") != "acceptance":
-            continue
-        unresolved = candidate.get("unresolved_acceptance_artifact")
-        if isinstance(unresolved, dict):
-            return unresolved
-        record = candidate.get("acceptance_record")
-        if not isinstance(record, dict):
-            continue
-        artifact = record.get("artifact")
-        reviewed = record.get("reviewed_candidate_sha")
-        if reviewed is None:
-            reviewed = record.get("reviewed_head_sha")
-        candidate_sha = _subject_candidate_identity(candidate)
-        if (
-            isinstance(artifact, dict)
-            and isinstance(reviewed, str)
-            and isinstance(candidate_sha, str)
-            and reviewed != candidate_sha
-            and _artifact_has_failures(artifact)
-        ):
-            return artifact
-    return None
-
-
-def _artifact_has_failures(artifact: dict[str, Any]) -> bool:
-    checks = artifact.get("checks")
-    if not isinstance(checks, dict):
-        return False
-    return bool(_artifact_findings(artifact)) or any(
-        isinstance(check, dict) and check.get("status") == "fail"
-        for check in checks.values()
-    )
-
-
-def _current_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
-    """Return only an artifact proven to belong to the current candidate."""
-
-    candidate = _subject_candidate_identity(subject)
-    if not isinstance(candidate, str) or not candidate:
-        return None
-    record = subject.get("acceptance_record")
-    if isinstance(record, dict):
-        reviewed = record.get("reviewed_candidate_sha")
-        if reviewed is None:
-            reviewed = record.get("reviewed_head_sha")
-        artifact = record.get("artifact")
-        if isinstance(artifact, dict) and reviewed == candidate:
-            return artifact
-        return None
-
-    budget = subject.get("review_budget")
-    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
-    if isinstance(artifacts, list):
-        for review in reversed(artifacts):
-            if not isinstance(review, dict):
-                continue
-            review_candidate = review.get("candidate_sha")
-            if review_candidate is None:
-                identity = review.get("review_identity")
-                if isinstance(identity, dict):
-                    review_candidate = identity.get("run_head_sha")
-            if review_candidate != candidate:
-                continue
-            artifact = review.get("artifact")
-            if isinstance(artifact, dict):
-                return artifact
-
-    return None
-
-
-def current_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Read the verdict bound to the current work and candidate, without mutation."""
-    current = current_work_subject(state)
-    if current is None:
-        return _completed_acceptance_artifact(state)
-    return _current_artifact(_acceptance_subject(state, current))
-
-
-def _completed_acceptance_artifact(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Return a terminal acceptance artifact only when its candidate matches."""
-
-    for key in ("parent_job", "active_ticket_job", "run_acceptance"):
-        subject = state.get(key)
-        if not isinstance(subject, dict) or subject.get("phase") not in {
-            "accepted",
-            "completed",
-            "merged",
-        }:
-            continue
-        artifact = _current_artifact(subject)
-        if not isinstance(artifact, dict):
-            continue
-        checks = artifact.get("checks")
-        if not isinstance(checks, dict):
-            continue
-        statuses = {
-            check.get("status")
-            for check in checks.values()
-            if isinstance(check, dict)
-        }
-        if statuses == {"pass"}:
-            return artifact
-    return None
-
-
-def _acceptance_subject(
-    state: dict[str, Any], current: tuple[str, dict[str, Any]]
-) -> dict[str, Any]:
-    """Use Run Acceptance evidence while publication is waiting on its gate."""
-
-    location, subject = current
-    if location == "run_publication":
-        acceptance = state.get("run_acceptance")
-        publication_head = _publication_boundary_head(subject) or _invocation_publication_head(state, subject)
-        acceptance_head = (
-            _acceptance_publication_boundary_head(acceptance)
-            if isinstance(acceptance, dict)
-            else None
-        )
-        if (
-            isinstance(acceptance, dict)
-            and isinstance(publication_head, str)
-            and publication_head == acceptance_head
-        ):
-            return acceptance
-        return {}
-    return subject
-
-
-def _invocation_publication_head(state: dict[str, Any], subject: dict[str, Any]) -> object:
-    """Resolve the real invocation boundary, authenticated by its semantic attempt."""
-    from agent_run.agent_invocation import canonical_fingerprint
-
-    attempt = subject.get("pending_semantic_attempt")
-    invocation = state.get("active_agent_invocation")
-    if not isinstance(invocation, dict):
-        history = state.get("agent_invocation_history")
-        invocation = next((item for item in reversed(history) if isinstance(item, dict)
-                           and isinstance(item.get("semantic_attempt"), dict)
-                           and isinstance(attempt, dict)
-                           and item["semantic_attempt"].get("attempt_id") == attempt.get("attempt_id")), None) if isinstance(history, list) else None
-    if not isinstance(attempt, dict) or not isinstance(invocation, dict):
-        return None
-    identity = invocation.get("semantic_attempt")
-    boundary = invocation.get("currentness_boundary")
-    if (
-        not isinstance(identity, dict) or not isinstance(boundary, dict)
-        or not attempt.get("attempt_id")
-        or identity.get("attempt_id") != attempt.get("attempt_id")
-        or invocation.get("generation") != attempt.get("generation")
-        or identity.get("generation") != attempt.get("generation")
-        or invocation.get("work_subject") != f"run-publication:{state.get('run_id')}"
-        or canonical_fingerprint(boundary) != attempt.get("currentness_boundary_fingerprint")
-    ):
-        return None
-    for key, owner_key in (("parent_revision", "parent"), ("ticket_graph_revision", "ticket_graph")):
-        owner = state.get(owner_key)
-        if isinstance(owner, dict) and boundary.get(key) != owner.get("revision"):
-            return None
-    acceptance = state.get("run_acceptance")
-    if not isinstance(acceptance, dict) or attempt.get("generation") != acceptance.get("acceptance_generation"):
-        return None
-    record = acceptance.get("acceptance_record")
-    if not isinstance(record, dict):
-        return None
-    for key in ("reviewed_default_base_sha", "expected_merge_tree", "parent_revision", "ticket_graph_revision", "ticket_completion_records_fingerprint"):
-        if key in record and boundary.get(key) != record[key]:
-            return None
-    return boundary.get("reviewed_head_sha")
-
-
-def _acceptance_publication_boundary_head(
-    acceptance: dict[str, Any],
-) -> object:
-    """Return the explicitly promoted Run head, when its proof is intact."""
-
-    record = acceptance.get("acceptance_record")
-    if not isinstance(record, dict) or record.get("acceptance_state") != "integrated":
-        return _subject_candidate_identity(acceptance)
-
-    candidate = acceptance.get("candidate_sha")
-    reviewed_candidate = record.get("reviewed_candidate_sha")
-    reviewed_head = record.get("reviewed_head_sha")
-    if (
-        not isinstance(candidate, str)
-        or not candidate
-        or not isinstance(reviewed_candidate, str)
-        or reviewed_candidate != candidate
-        or not isinstance(reviewed_head, str)
-        or not reviewed_head
-    ):
-        return None
-
-    for key in ("reviewed_head_sha", "integrated_sha"):
-        value = acceptance.get(key)
-        if value is not None and value != reviewed_head:
-            return None
-    record_run_head = record.get("run_head_sha")
-    if record_run_head is not None and record_run_head != reviewed_head:
-        return None
-    return reviewed_head
-
-
-def _publication_boundary_head(subject: dict[str, Any]) -> object:
-    record = subject.get("record")
-    if isinstance(record, dict) and isinstance(record.get("run_head_sha"), str):
-        return record["run_head_sha"]
-    for key in ("head_sha", "run_head_sha"):
-        value = subject.get(key)
-        if isinstance(value, str) and value:
-            return value
-    pending = subject.get("pending_semantic_attempt")
-    history = subject.get("semantic_attempt_history")
-    attempts: list[object] = []
-    if isinstance(pending, dict):
-        attempts.append(pending)
-    if isinstance(history, list):
-        attempts.extend(reversed(history))
-    for attempt in attempts:
-        if not isinstance(attempt, dict) or attempt.get("role") != "publication":
-            continue
-        boundary = attempt.get("currentness_boundary")
-        if not isinstance(boundary, dict):
-            continue
-        for key in ("reviewed_head_sha", "run_head_sha"):
-            value = boundary.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return None
-
-
-def _subject_candidate_identity(subject: dict[str, Any]) -> object:
-    """Read the current version key used by each delivery subject shape."""
-
-    for key in ("candidate_sha", "reviewed_head_sha", "head_sha", "run_head_sha"):
-        value = subject.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
 def _current_conclusion(
     state: dict[str, Any],
     current: tuple[str, dict[str, Any]] | None,
@@ -1229,11 +836,11 @@ def _current_conclusion(
     activity: str,
 ) -> str:
     if current is None:
-        if _completed_acceptance_artifact(state) is not None:
+        if completed_acceptance_artifact(state) is not None:
             return "当前有效通过"
         return "尚无有效验收结论"
     location, public_subject = current
-    subject = _acceptance_subject(state, current)
+    subject = acceptance_subject(state, current)
     phase = subject.get("phase")
     if phase == "reviewing":
         if activity == "interrupted":
@@ -1242,7 +849,7 @@ def _current_conclusion(
             return "验收状态无法确认"
         if activity == "not_running":
             return "验收等待执行"
-        review_kind = "复验" if _has_prior_acceptance_failure(subject) else "首次验收"
+        review_kind = "复验" if has_prior_acceptance_failure(subject) else "首次验收"
         if activity == "capacity_wait":
             return f"模型容量不足，等待自动续接{review_kind}"
         if activity == "recovery_wait":
@@ -1265,7 +872,7 @@ def _current_conclusion(
         and subject.get("repair_source") == "acceptance"
     ):
         return "修复完成，待复验"
-    artifact = _current_artifact(subject)
+    artifact = current_artifact(subject)
     if artifact is not None:
         checks = artifact.get("checks")
         if isinstance(checks, dict):
@@ -1286,78 +893,6 @@ def _current_conclusion(
                     return "验收通过，等待发布"
                 return "当前有效通过"
     return "尚无有效验收结论"
-
-
-def _has_prior_acceptance_failure(subject: dict[str, Any]) -> bool:
-    if isinstance(subject.get("unresolved_acceptance_artifact"), dict):
-        return True
-    record = subject.get("acceptance_record")
-    if isinstance(record, dict):
-        artifact = record.get("artifact")
-        reviewed = record.get("reviewed_candidate_sha")
-        if reviewed is None:
-            reviewed = record.get("reviewed_head_sha")
-        candidate = _subject_candidate_identity(subject)
-        if (
-            isinstance(artifact, dict)
-            and isinstance(reviewed, str)
-            and isinstance(candidate, str)
-            and reviewed != candidate
-            and _artifact_has_failures(artifact)
-        ):
-            return True
-    budget = subject.get("review_budget")
-    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
-    if not isinstance(artifacts, list):
-        return False
-    for review in artifacts:
-        if not isinstance(review, dict):
-            continue
-        artifact = review.get("artifact")
-        if not isinstance(artifact, dict):
-            continue
-        checks = artifact.get("checks")
-        if not isinstance(checks, dict):
-            continue
-        if any(
-            isinstance(check, dict)
-            and (check.get("status") == "fail" or _artifact_findings(artifact))
-            for check in checks.values()
-        ):
-            return True
-    return False
-
-
-def _latest_artifact(subject: dict[str, Any]) -> dict[str, Any] | None:
-    record = subject.get("acceptance_record")
-    record_artifact = record.get("artifact") if isinstance(record, dict) else None
-    if isinstance(record_artifact, dict):
-        return record_artifact
-    artifact = subject.get("acceptance_artifact")
-    if isinstance(artifact, dict):
-        return artifact
-    budget = subject.get("review_budget")
-    artifacts = budget.get("review_artifacts") if isinstance(budget, dict) else None
-    if isinstance(artifacts, list) and artifacts:
-        latest = artifacts[-1]
-        latest_artifact = latest.get("artifact") if isinstance(latest, dict) else None
-        if isinstance(latest_artifact, dict):
-            return latest_artifact
-    return None
-
-
-def _artifact_findings(artifact: dict[str, Any]) -> list[str]:
-    checks = artifact.get("checks")
-    if not isinstance(checks, dict):
-        return []
-    return [
-        finding
-        for lane in ("e2e", "standards", "spec")
-        if isinstance((check := checks.get(lane)), dict)
-        and isinstance((lane_findings := check.get("findings")), list)
-        for finding in lane_findings
-        if isinstance(finding, str)
-    ]
 
 
 _FINDING_PARTS = re.compile(
@@ -1392,18 +927,8 @@ def _subject_label(state: dict[str, Any], subject: str) -> str:
     return delivery_object_label(state, subject)
 
 
-def _role_family(role: str) -> str | None:
-    if role == "development":
-        return "development"
-    if role in {"review", "reviewer", "fresh_acceptance"}:
-        return "review"
-    if role in {"publication", "final_publication"}:
-        return "publication"
-    return None
-
-
 def _role_label(role: str) -> str:
-    family = _role_family(role)
+    family = role_family(role)
     if family is None:
         return role
     return {
@@ -1420,22 +945,8 @@ def _invocation_duration(
 
 
 def _remaining_until(value: object) -> int | None:
-    deadline = _parse_optional_timestamp(value)
+    deadline = parse_optional_timestamp(value)
     return max(0, int((deadline - datetime.now(UTC)).total_seconds())) if deadline else None
-
-
-def _parse_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
-
-
-def _parse_optional_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return _parse_timestamp(value).astimezone(UTC)
-    except ValueError:
-        return None
 
 
 def _duration(seconds: object) -> str:

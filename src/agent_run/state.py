@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.delivery_facts import current_work_subject
+
 import fcntl
 import json
 import os
@@ -18,7 +20,6 @@ from agent_run.error_safety import bounded_error, redact_credentials
 from agent_run.semantic_attempt import semantic_attempt_subjects
 from agent_run.history_check_facts import CHECKS_HISTORY_FIELDS, checks_timeline_facts
 from agent_run.resume_audit import latest_resume_audit
-from agent_run.presentation_helpers import current_work_subject
 from agent_run.task_control import TaskControlBusyError
 
 

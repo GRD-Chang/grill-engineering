@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 
 from agent_run.agent_invocation import canonical_fingerprint
-from agent_run.delivery_status import current_acceptance_artifact
+from agent_run.acceptance_facts import current_acceptance_artifact
 from agent_run.presentation_helpers import execution_duration
 from agent_run.status_actions import controller_work, status_heading
 
@@ -111,7 +111,7 @@ def test_history_single_result_and_exact_round_time(capsys, details: bool) -> No
 @pytest.mark.parametrize("plain, details", [(True, False), (False, False), (True, True), (False, True)])
 def test_history_omits_terminal_elapsed_without_end(capsys, monkeypatch, plain: bool, details: bool) -> None:
     from agent_run.cli_presentation import _print_history
-    from agent_run.delivery_history import run_elapsed_seconds
+    from agent_run.execution_timing import run_elapsed_seconds
 
     monkeypatch.setenv("COLUMNS", "160")
     state = {"language": "zh", "run_id": "r", "status": "completed", "parent": {"number": 1},

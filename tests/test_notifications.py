@@ -273,7 +273,7 @@ def test_resume_request_and_unproven_success_never_send_success(
 def test_first_ticket_start_is_not_replayed_after_history_rolls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from test_notification_events import state_with_round
+    from support.notification import state_with_round
 
     calls: list[dict[str, Any]] = []
     def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:
@@ -304,7 +304,7 @@ def test_first_ticket_start_is_not_replayed_after_history_rolls(
 def test_resume_fault_does_not_reappear_as_detailed_round_result_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from test_notification_events import state_with_round
+    from support.notification import state_with_round
 
     calls: list[dict[str, Any]] = []
     def sent(config: Any, rendered: Any, identity: Any, cancel: Any) -> dict[str, Any]:

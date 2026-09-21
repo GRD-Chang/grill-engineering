@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.cli_presentation import human_next_action_for_state
+from agent_run.operator_action_presentation import human_next_action_for_state
 from agent_run.messages import selected_language
 from agent_run.presentation_helpers import human_pause_reason, human_status_term
 

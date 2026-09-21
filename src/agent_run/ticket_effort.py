@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.delivery_history import _role_family
-from agent_run.delivery_status import invocation_execution_seconds
+from agent_run.delivery_facts import role_family
+from agent_run.execution_timing import invocation_execution_seconds
 from agent_run.execution_timing import invocation_links_complete
 
 
@@ -34,7 +34,7 @@ def ticket_effort(
     # Timeline truncation does not truncate either durable Attempt owners or
     # Invocation history. Their independently provable aggregates survive.
     for role in ("development", "review"):
-        selected = [record for record in subject_records if _role_family(str(record.get("role"))) == role]
+        selected = [record for record in subject_records if role_family(str(record.get("role"))) == role]
         if not selected:
             continue
         known = [invocation for record in selected for invocation in record.get("invocations", [])]
@@ -42,7 +42,7 @@ def ticket_effort(
         # Publication uses a Development binding too, so classify by semantic
         # role rather than the thread's binding_role.
         missing = [invocation for invocation in raw if invocation not in known
-                   and _role_family(str((invocation.get("semantic_attempt") or {}).get("role")
+                   and role_family(str((invocation.get("semantic_attempt") or {}).get("role")
                                         or invocation.get("role") or invocation.get("invocation_role"))) == role]
         ids = [record.get("attempt_id") for record in selected]
         if unclassified or missing or any(not isinstance(identity, str) or not identity for identity in ids):

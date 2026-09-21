@@ -21,7 +21,8 @@ from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
 from agent_run.codex import CodexProcessError
 from agent_run.delivery_history import history_records
-from agent_run.delivery_status import _status_style, invocation_execution_seconds
+from agent_run.delivery_status import _status_style
+from agent_run.execution_timing import invocation_execution_seconds
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader, GitHubReadError
 from agent_run.operator_action_presentation import print_operator_action

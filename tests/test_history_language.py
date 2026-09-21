@@ -145,3 +145,32 @@ def test_abandoned_history_does_not_claim_successful_delivery(
     output = render(run_id, "--plain")
     assert "交付已放弃" in output
     assert "整体交付完成" not in output
+
+
+@pytest.mark.parametrize("prefix", ["新增 Ticket", "移除 Ticket"])
+def test_scope_change_localizes_generated_labels_without_rewriting_original_text(
+    prefix: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from copy import deepcopy
+    from agent_run.cli_presentation import _print_history
+
+    summary = f"{prefix} 是本次要求的原始说明"
+    blocker = f"{prefix} 是原始人工阻塞"
+    state = {
+        "language": "en", "run_id": "scope-run", "status": "unsupported_scope_change",
+        "timeline": [{
+            "at": "2026-09-21T00:00:00+00:00", "kind": "unsupported_scope_change",
+            "status": "unsupported_scope_change", "human_blockers": [blocker],
+            "graph_change_summary": {
+                "summary": summary, "added_tickets": [5], "removed_tickets": [6],
+            },
+        }],
+    }
+    before = deepcopy(state)
+    _print_history(state, as_json=False, plain=True, details=True)
+    output = capsys.readouterr().out
+    assert summary in output
+    assert blocker in output
+    assert "Added subtasks [5]" in output
+    assert "Removed subtasks [6]" in output
+    assert state == before

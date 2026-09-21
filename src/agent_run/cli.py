@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.operator_action_presentation import human_next_action_for_state
+
 import argparse
 import json
 import os
@@ -1315,7 +1317,7 @@ def _print_lifecycle_result(
     else:
         print(message("delivery_incomplete", status=cli_presentation.human_delivery_status(
             status, language=language)))
-    print(message("next_action", action=cli_presentation.human_next_action_for_state(state)))
+    print(message("next_action", action=human_next_action_for_state(state)))
 
 
 def _print_interruption_result(
@@ -1345,7 +1347,7 @@ def _print_interruption_result(
     print(message("interrupted_delivery", status=cli_presentation.human_delivery_status(
         output.get("status"), language=language)))
     next_action = (
-        cli_presentation.human_next_action_for_state(state)
+        human_next_action_for_state(state)
         if isinstance(state, Mapping)
         else message("query_status")
     )

@@ -1,19 +1,22 @@
 from __future__ import annotations
 
-from agent_run.messages import display_text
+from agent_run.delivery_facts import delivery_object_label
+
+from agent_run.messages import display_text, selected_language
+from collections.abc import Mapping
+from agent_run.delivery_facts import current_delivery_identity
 
 from datetime import datetime
 from itertools import chain
 from typing import Any
 
-from agent_run.guidance_actions import action_command
+from agent_run.guidance_actions import action_command, next_action_fact, render_next_action
 from agent_run.messages import text
 from agent_run.operator_gate import (
     operator_gate_evidence,
     operator_gate_subjects,
 )
 from agent_run.presentation_helpers import (
-    delivery_object_label,
     human_agent_role,
     human_delivery_object,
     human_next_action,
@@ -346,3 +349,17 @@ def _operator_next_action(
                 run=f"agent-run run {parent_number} --repo {repository}",
             )
     return fallback_next_action
+
+
+def human_next_action_for_state(state: Mapping[str, Any], *, language: str | None = None) -> object:
+    """Render the shared recovery decision using the public Parent selector."""
+    public_state = state if isinstance(state, dict) else dict(state)
+    language = selected_language(public_state) if language is None else language
+    fallback = render_next_action(
+        next_action_fact(public_state), public_state, language=language, human=True,
+    )
+    operator_action = operator_action_view(
+        public_state, current_identity=current_delivery_identity(public_state),
+        fallback_next_action=fallback, language=language, human=True,
+    )
+    return operator_action["next_action"] if operator_action is not None else fallback

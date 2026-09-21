@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.delivery_facts import current_work_subject
+
 from agent_run.messages import display_text
 
 from dataclasses import dataclass
@@ -7,7 +9,10 @@ from math import isfinite
 from typing import Any, TypeGuard
 
 from agent_run.final_approval_operation import final_approval_cleanup_pending
-from agent_run.presentation_helpers import current_work_subject, human_pause_reason, unknown_execution_guidance
+from agent_run.presentation_helpers import (
+    human_pause_reason,
+    unknown_execution_guidance,
+)
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.messages import display_language, text
 
 
 def group_final_pr_creation(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -27,8 +26,8 @@ def group_final_pr_creation(events: list[dict[str, Any]]) -> list[dict[str, Any]
                     "at": confirmed["at"], "wait_started_at": branch["at"],
                     "wait_observed_until": confirmed["at"],
                     "creation_steps": [
-                        {"at": branch["at"], "action": text("presentation.history.prepare_remote_branch", language=display_language())},
-                        {"at": create["at"], "action": text("presentation.history.create_pr", language=display_language())},
+                        {"at": branch["at"], "action": "ensure_final_run_ref"},
+                        {"at": create["at"], "action": "create_final_pr"},
                     ],
                 })
                 index += 2

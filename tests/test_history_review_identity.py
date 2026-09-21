@@ -12,6 +12,9 @@ from agent_run.delivery_history import (
 )
 
 
+from agent_run.history_facts import history_records as semantic_history_records
+
+
 OLD_FINDING = "旧候选仍泄漏内部状态，必须修复。"
 
 
@@ -171,10 +174,10 @@ def test_repair_history_does_not_borrow_unproven_review_results(
         )
         budget["review_artifacts"].append(conflicting)
 
-    record = history_records(state, audit)[-1]
+    record = semantic_history_records(state, audit)[-1]
     assert record["acceptance_artifact"] is None
     assert record["findings"] == []
-    assert record["status_text"] not in ("验收通过", "验收未通过")
+    assert record["status_code"] not in ("review_passed", "review_failed")
     event = history_progress_view(state, audit)["events"][-1]
     assert event["details"] == []
     assert event["status"] == "completed"
