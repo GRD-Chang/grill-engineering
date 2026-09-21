@@ -155,6 +155,13 @@ def test_run_repair_trigger_creation_supervises_recoverable_pr_reads(
     assert job["phase"] == "developing"
     assert job["development_thread_id"] is None
     assert job["repair_trigger_pending"] is True
+    assert "candidate_sha" not in job
+    persisted = states.load_current_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["status"] == "waiting_external"
+    assert persisted["run_acceptance"] == run
+    assert persisted["supervision_window"]["kind"] == "github_convergence"
+    assert persisted["diagnostics"][0]["code"] == "github_pull_request_observation_pending"
 
     agents = ScriptedRunAgents()
     agents._reviews = [_passing_artifact()]

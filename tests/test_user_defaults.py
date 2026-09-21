@@ -14,18 +14,28 @@ def test_read_only_builtin_and_legacy_migration(tmp_path: Path) -> None:
     assert store.describe()["source"] == "builtin"
     assert not store.path.parent.exists()
     store.path.parent.mkdir()
-    store.legacy_path.write_text('{"ticket_review_rounds": 7}')
+    legacy = {
+        "ticket_review_rounds": 7,
+        "parent_only_paired_rounds": 4,
+        "run_repair_rounds": 2,
+        "development_thread_policy": "new-per-attempt",
+        "invocation_deadlines": {"development": "11m", "review": "3h"},
+    }
+    store.legacy_path.write_text(json.dumps(legacy))
+    original = store.legacy_path.read_bytes()
     assert store.describe()["source"] == "legacy-delivery-policy"
     assert not store.path.exists()
     result = store.configure(profile={"preset": "premium"})
     assert result["policy"]["ticket_review_rounds"] == 7
     assert result["legacy_ignored"] is True
+    assert json.loads(store.path.read_text())["policy"] == legacy
+    assert store.legacy_path.read_bytes() == original
     store.legacy_path.write_text("broken")
     assert store.describe()["source"] == "user-defaults"
 
 
 @pytest.mark.parametrize("raw,diagnostic", [
-    ('{"surprise":1}', "surprise"), ('{"profile":null}', "profile"),
+    ('{"surprise":1}', "surprise"), ('{"policy":{"surprise":1}}', "surprise"), ('{"profile":null}', "profile"),
     ('{"policy":{"ticket_review_rounds":null}}', "ticket_review_rounds"),
     ('{"profile":{"development_model":null}}', "development_model"),
     ('{"profile":{"other_model":"x"}}', "other_model"),
@@ -48,6 +58,7 @@ def test_sparse_updates_priorities_and_references(tmp_path: Path) -> None:
     store.configure(policy={"review_deadline": "3h"}, profile={"development_model": "custom"})
     store.configure(policy={"ticket_review_rounds": 8}, profile={"review_effort": "high"})
     document = json.loads(store.path.read_text())
+    assert store.path.stat().st_mode & 0o777 == 0o600
     assert document["policy"] == {"invocation_deadlines": {"review": "3h"}, "ticket_review_rounds": 8}
     preset, overrides = store.resolve_creation()
     resolved = resolve_profiles(preset=preset, overrides=overrides)["profiles"]
@@ -81,24 +92,27 @@ def test_validation_and_atomic_replace_failure_preserve_file(tmp_path: Path, mon
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_concurrent_updates_preserve_both_sections(tmp_path: Path) -> None:
+def test_concurrent_updates_preserve_policy_fields_and_other_sections(tmp_path: Path) -> None:
     path = tmp_path / "user-defaults.json"
-    barrier = Barrier(3, timeout=5)
+    barrier = Barrier(4, timeout=5)
     def update(section: str) -> None:
         barrier.wait()
         store = UserDefaultsStore(path)
         if section == "policy":
             store.configure(policy={"ticket_review_rounds": 9})
+        elif section == "deadline":
+            store.configure(policy={"review_deadline": "90m"})
         elif section == "profile":
             store.configure(profile={"review_model": "custom-review"})
         else:
             store.configure(language="en")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(update, section) for section in ("policy", "profile", "language")]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(update, section) for section in ("policy", "deadline", "profile", "language")]
         for future in futures:
             future.result(timeout=10)
     document = UserDefaultsStore(path).load()
     assert document["policy"]["ticket_review_rounds"] == 9
+    assert document["policy"]["invocation_deadlines"] == {"review": "90m"}
     assert document["profile"]["review_model"] == "custom-review"
     assert document["language"] == "en"
 

@@ -14,15 +14,13 @@ import pytest
 from agent_run.agent_profiles import AgentProfileStore
 from agent_run.cli_presentation import _next_action
 from agent_run.controller import Controller
-from agent_run.delivery_policy import (
-    DeliveryPolicyStore,
-    resolve_delivery_policy,
-)
+from agent_run.delivery_policy import resolve_delivery_policy
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.run_locator import RunLocatorIndex
 from agent_run.state import StateStore
 from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlStore, TaskKey
+from agent_run.user_defaults import UserDefaultsStore
 from support.workspace import prepare_workspace
 
 
@@ -245,14 +243,8 @@ def _seed_run(
         if state_dir_value is not None
         else workspace.state_root
     )
-    config_home = Path(
-        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
-    ).expanduser().resolve()
-    policy_store = DeliveryPolicyStore(
-        config_home / "agent-run" / "delivery-policy.json"
-    )
     policy = resolve_delivery_policy(
-        user_defaults=policy_store.load(),
+        user_defaults=UserDefaultsStore().load().get("policy"),
         command_overrides=policy_overrides,
     )
     profiles = AgentProfileStore(state_root)

@@ -367,13 +367,16 @@ def test_public_run_repair_human_blocker_currentness_drift_retires_attempt(
 def test_run_repair_resume_preserves_partial_worker_edits_and_thread(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "pending", "fail", "pass", "pass"]},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
+        delivery={"required_checks": ["pending", "fail", "pass", "pass"]},
     )
     agents = run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
+    # Ticket execution and initial Run Acceptance are historical setup.
+    for completed_role in ("developments", "publications", "run_reviews"):
+        del data[completed_role][0]
+    data["reviews"] = []
     data["developments"].append(
         {
             "expected_thread_id": None,
@@ -461,7 +464,13 @@ def _repair_agents_after_acceptance(path: Path, *, repair_generations: int) -> P
     return agents
 
 
-@pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
+# Exception combinations remain covered at their durable production read seams:
+# test_run_repair_recovery: trigger creation and same-generation recovery;
+# test_delivery: failed-check evidence and same-thread recovery;
+# test_run_acceptance_currentness: trigger fingerprint and same-cycle recovery;
+# test_run_publication_evidence_wait: Final evidence before/after approval.
+# Keep each distinct CLI timeout/recovery route and all its assertions here.
+@pytest.mark.parametrize("error_type", ["github"])
 def test_run_supervises_repair_trigger_live_pr_readback(
     git_repo: Path, error_type: str
 ) -> None:
@@ -535,7 +544,7 @@ def test_run_supervises_repair_trigger_live_pr_readback(
     assert completed_run["repair_cycle"]["status"] == "promoted"
     assert completed_run["repair_cycle"]["code_modification_attempts"] == 1
 
-@pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
+@pytest.mark.parametrize("error_type", ["github"])
 def test_run_supervises_repair_pr_failed_check_evidence_reads(
     git_repo: Path, error_type: str
 ) -> None:
@@ -601,7 +610,7 @@ def test_run_supervises_repair_pr_failed_check_evidence_reads(
         "run-repair-developer-1",
     ]
 
-@pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
+@pytest.mark.parametrize("error_type", ["github"])
 def test_run_supervises_required_check_trigger_fingerprint_reads(
     git_repo: Path, error_type: str
 ) -> None:
@@ -658,7 +667,7 @@ def test_run_supervises_required_check_trigger_fingerprint_reads(
     assert completed["run_acceptance"]["repair_generation"] == 1
     assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
 
-@pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
+@pytest.mark.parametrize("error_type", ["github"])
 def test_run_supervises_initial_final_check_evidence_reads(
     git_repo: Path, error_type: str
 ) -> None:
@@ -717,7 +726,7 @@ def test_run_supervises_initial_final_check_evidence_reads(
     assert completed["run_acceptance"]["repair_generation"] == 1
     assert completed["run_acceptance"]["repair_cycle"]["code_modification_attempts"] == 1
 
-@pytest.mark.parametrize("error_type", ["github", "os", "timeout"])
+@pytest.mark.parametrize("error_type", ["github"])
 def test_run_supervises_post_approval_final_check_evidence_reads(
     git_repo: Path, error_type: str
 ) -> None:
@@ -809,13 +818,16 @@ def test_run_supervises_post_approval_final_check_evidence_reads(
 def test_run_retries_initial_credential_before_starting_each_run_repair_worker(
     git_repo: Path, fixture_role: str, invocation_role: str, phase: str
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "pending", "fail", "pass", "pass"]},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
+        delivery={"required_checks": ["pending", "fail", "pass", "pass"]},
     )
     agents = run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
+    # Ticket execution and initial Run Acceptance are historical setup.
+    for completed_role in ("developments", "publications", "run_reviews"):
+        del data[completed_role][0]
+    data["reviews"] = []
     data["developments"].append(
         {
             "expected_thread_id": None,

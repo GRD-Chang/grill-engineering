@@ -14,12 +14,15 @@ import venv
 from pathlib import Path
 
 
-sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent
 PACKAGE_SOURCE = SOURCE / "src"
 if not PACKAGE_SOURCE.is_dir():
     PACKAGE_SOURCE = SOURCE.parents[1] / "src"
-sys.path.insert(0, str(PACKAGE_SOURCE))
+if __name__ == "__main__":
+    # Direct copies locate their package and keep that source tree untouched.
+    # Importing the build seam must not change the pytest worker's policy.
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(PACKAGE_SOURCE))
 
 from agent_run import runner_installer  # noqa: E402
 

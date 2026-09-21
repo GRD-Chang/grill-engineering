@@ -78,6 +78,76 @@ def test_state_save_preserves_shared_input_while_redacting_its_durable_copy(
     }
 
 
+@pytest.mark.parametrize("diagnostic_first", [False, True])
+def test_repeated_text_keeps_contextual_redaction_and_resource_isolation(
+    tmp_path: Path, diagnostic_first: bool,
+) -> None:
+    store = StateStore(tmp_path)
+    message = "prefix " + "中文" * 3000 + " token=private-value"
+    resource = {"method": "token=personal-instruction", "environment": "keep"}
+    diagnostic = {"message": message, "token": "private-value"}
+    fields = [("ordinary", message), ("diagnostics", [diagnostic])]
+    state = dict(reversed(fields) if diagnostic_first else fields)
+    state.update({
+        "repeated": ["token=private-value"] * 300,
+        "unique": [f"label-{number}" for number in range(300)],
+        "after_unique": "token=another-private-value",
+        "many_keys": {**{f"label-{n}": "ok" for n in range(300)},
+                      "AUTHORIZATION": "private-value", "environ ment": "ephemeral"},
+        "prompt_resources": resource,
+        "nested": {"prompt_resources": resource},
+        "candidate_commit_intent": {"token": "same-value"},
+        "untrusted": {"token": "same-value"},
+    })
+    before = deepcopy(state)
+
+    store.save_run("run-1", state)
+
+    assert state == before
+    saved = store.load_run("run-1")
+    assert saved is not None
+    assert saved["ordinary"] == "prefix " + "中文" * 3000 + " token=[REDACTED]"
+    assert len(saved["diagnostics"][0]["message"].encode()) <= 8192
+    assert saved["diagnostics"][0]["token"] == "[REDACTED]"
+    assert saved["repeated"] == ["token=[REDACTED]"] * 300
+    assert saved["unique"] == state["unique"]
+    assert saved["after_unique"] == "token=[REDACTED]"
+    assert saved["many_keys"] == {**{f"label-{n}": "ok" for n in range(300)},
+                                  "AUTHORIZATION": "[REDACTED]"}
+    assert saved["prompt_resources"] == resource
+    assert saved["nested"]["prompt_resources"] == {"method": "token=[REDACTED]"}
+    assert saved["candidate_commit_intent"]["token"] == "same-value"
+    assert saved["untrusted"]["token"] == "[REDACTED]"
+    resource["method"] = "updated instruction"
+    state["repeated"][0] = "token=changed-private-value"
+    store.save_run("run-1", state)
+    assert saved["prompt_resources"]["method"] == "token=personal-instruction"
+    updated = store.load_run("run-1")
+    assert updated is not None
+    assert updated["prompt_resources"]["method"] == "updated instruction"
+    assert updated["repeated"] == ["token=[REDACTED]"] * 300
+
+
+def test_scalar_leaves_keep_redaction_bounds_and_json_types(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    message = "中文" * 3000
+    leaves = {"empty": "", "null": None, "boolean": False, "integer": 2, "float": 1.5}
+    state = {
+        "leaves": leaves,
+        "list": [leaves, "", "token=private", None, False, 2, 1.5],
+        "ordinary": message,
+        "nested": {"diagnostics": message, "failure_error": message},
+    }
+    store.save_run("leaves", state)
+    saved = store.load_run("leaves")
+    assert saved is not None
+    assert saved["leaves"] == leaves
+    assert saved["list"] == [leaves, "", "token=[REDACTED]", None, False, 2, 1.5]
+    assert saved["ordinary"] == message
+    for field in ("diagnostics", "failure_error"):
+        assert saved["nested"][field] == message.encode()[:8192].decode(errors="ignore")
+
+
 @pytest.mark.parametrize("container", [list, tuple])
 def test_saved_history_does_not_share_nested_values_with_the_callers_payload(
     tmp_path: Path, container: type[list] | type[tuple],

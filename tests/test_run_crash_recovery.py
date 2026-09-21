@@ -101,7 +101,6 @@ def _assert_exactly_once_delivery(repo: Path, fixture: Path) -> None:
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
     assert len(delivery["pull_requests"]) == 2
-    assert delivery["acceptance_records"] == []
     assert len(delivery["agent_run_status"]) == 2
     assert delivery["closed_issues"] == [2]
     assert [

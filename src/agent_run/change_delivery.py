@@ -10,7 +10,6 @@ neither layer gets a shortcut from development to a Run Branch write.
 """
 
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,8 +42,6 @@ from agent_run.review_budget import (
     policy_for_subject,
 )
 
-MAX_MODIFICATION_ATTEMPTS = 10
-_DEFAULT_MAX_MODIFICATION_ATTEMPTS = 10
 MAX_PUBLICATION_CONTEXT_ATTEMPTS = 4
 
 
@@ -472,17 +469,9 @@ class ChangeDeliveryEngine:
             job.pop("last_publication_error", None)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
-        policy = self.contract.review_budget_policy or policy_for_subject(
+        return self.contract.review_budget_policy or policy_for_subject(
             self.contract.label
         )
-        if policy.fallback and MAX_MODIFICATION_ATTEMPTS != _DEFAULT_MAX_MODIFICATION_ATTEMPTS:
-            return replace(
-                policy,
-                development_limit=min(
-                    policy.development_limit, MAX_MODIFICATION_ATTEMPTS
-                ),
-            )
-        return policy
 
     def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool:
         return not can_start_review(job, self.review_budget_policy())

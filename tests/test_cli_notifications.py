@@ -107,11 +107,14 @@ from agent_run.cli import main
 original_close = notifications.Notifications.close
 original_send = notifications.send
 original_observe = notifications.Notifications.observe
+real_delivery_titles = set()
 # Synchronize only the isolated fast transport. This makes selected business
 # events inspectable without assuming production exit drains every message.
 def observe(self, *args, **kwargs):
     state = args[0]
     for event in notifications.events(state):
+        if event['kind'] in {'run_start', 'ticket_completed', 'boundary'}:
+            real_delivery_titles.add(event['title'])
         if not kwargs.get('recovering') and event['kind'] == 'ticket_started' and event['id'] not in self.document.get('seen', []):
             active = state.get('active_agent_invocation') or {}
             assert active.get('reported_thread_id') and active.get('status') == 'running', active
@@ -120,6 +123,16 @@ def observe(self, *args, **kwargs):
         with self.condition:
             assert self.condition.wait_for(lambda: not self.document['pending'], timeout=15), self.document
 notifications.Notifications.observe = observe
+# Detailed-stage combinations are asserted against persisted lifecycle facts.
+# Keep the start, completed-ticket effort and approval/completion cards on the
+# real executable transport; concise mode still delivers every card for its
+# sequence/deduplication assertions, and cancellation keeps its real sender.
+if os.environ.get('NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT'):
+    def representative_send(config, card, *args):
+        if card['header']['title']['content'] in real_delivery_titles:
+            return original_send(config, card, *args)
+        return {'outcome': 'success', 'reason': None}
+    notifications.send = representative_send
 release_sender = threading.Event()
 port = os.environ.get('NOTIFICATION_TEST_PORT')
 if port:
@@ -158,6 +171,8 @@ raise SystemExit(main(sys.argv[1:]))
             )
 
         if drain:
+            if mode == "detailed":
+                environment["NOTIFICATION_TEST_REPRESENTATIVE_TRANSPORT"] = "1"
             return execute()
         # Business preparation is outside the cancellation window. Both the
         # close boundary and the real CLI must report ready before we release

@@ -765,12 +765,14 @@ def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
 
     # Static instructions are intentional user content, not diagnostic payloads.
     # Preserve them verbatim across restart; dynamic output remains sanitized.
-    resources = value.get("prompt_resources")
-    sanitized = _sanitize_error_value(value)
+    sanitized = _sanitize_error_value(
+        {key: item for key, item in value.items() if key != "prompt_resources"},
+        redacted={}, key_kinds={},
+    )
     if not isinstance(sanitized, dict):  # pragma: no cover - typed input is a mapping
         raise ValueError("durable Run state must be a mapping")
-    if resources is not None:
-        sanitized["prompt_resources"] = deepcopy(resources)
+    if "prompt_resources" in value:
+        sanitized["prompt_resources"] = deepcopy(value["prompt_resources"])
     diagnostics = sanitized.get("diagnostics")
     if isinstance(diagnostics, list):
         sanitized["diagnostics"] = [
@@ -782,53 +784,85 @@ def _sanitize_durable_errors(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sanitize_error_value(
-    value: object, *, diagnostic: bool = False, path: tuple[str, ...] = ()
+    value: object, *, redacted: dict[str, str],
+    key_kinds: dict[str, tuple[bool, bool, bool]],
+    diagnostic: bool = False, path: tuple[str, ...] = ()
 ) -> object:
     if isinstance(value, list):
         return [
-            _sanitize_error_value(item, diagnostic=diagnostic, path=path)
+            _sanitize_error_value(
+                item, redacted=redacted, key_kinds=key_kinds, diagnostic=diagnostic, path=path,
+            )
             for item in value
         ]
     if isinstance(value, str):
-        return bounded_error(value) if diagnostic else redact_credentials(value)
+        if diagnostic:
+            return bounded_error(value)
+        cached = redacted.get(value)
+        return cached if cached is not None else _redact_uncached_text(value, redacted)
     if not isinstance(value, dict):
         # JSON scalars are immutable. Extensions such as tuples may contain
         # mutable values, so retain their previous deepcopy isolation.
         return value if value is None or type(value) in (bool, int, float) else deepcopy(value)
     sanitized: dict[object, object] = {}
     for key, item in value.items():
-        if isinstance(key, str) and _is_ephemeral_payload_key(key):
+        ephemeral = credential = error_field = False
+        if isinstance(key, str):
+            kinds = key_kinds.get(key)
+            if kinds is None:
+                normalized = key.casefold().replace("_", "").replace("-", "").replace(" ", "")
+                kinds = (
+                    _is_ephemeral_payload_key(normalized),
+                    _is_credential_key(normalized),
+                    key == "error" or key.endswith("_error"),
+                )
+                if len(key_kinds) < 256 and len(key) <= 128:
+                    key_kinds[key] = kinds
+            ephemeral, credential, error_field = kinds
+        if ephemeral:
             continue
-        item_path = (*path, key) if isinstance(key, str) else path
         if (
-            isinstance(key, str)
-            and _is_credential_key(key)
-            and not _is_durable_protocol_identity(item_path)
+            credential and isinstance(key, str)
+            and not _is_durable_protocol_identity((*path, key))
         ):
             sanitized[key] = "[REDACTED]"
             continue
         is_diagnostic = key == "diagnostics"
-        if diagnostic and isinstance(item, str):
-            sanitized[key] = bounded_error(item)
-        elif isinstance(key, str) and (
-            key == "error" or key.endswith("_error")
-        ) and isinstance(item, str):
-            sanitized[key] = bounded_error(item)
-        else:
+        # Leaf values need neither a recursive container dispatch nor a path.
+        # Credential-key exceptions above still use the full current path.
+        if isinstance(item, str):
+            if diagnostic or is_diagnostic or error_field:
+                sanitized[key] = bounded_error(item)
+            else:
+                cached = redacted.get(item)
+                sanitized[key] = (
+                    cached if cached is not None else _redact_uncached_text(item, redacted)
+                )
+        elif isinstance(item, (dict, list)):
             sanitized[key] = _sanitize_error_value(
                 item,
+                redacted=redacted,
+                key_kinds=key_kinds,
                 diagnostic=diagnostic or is_diagnostic,
-                path=item_path,
+                path=(*path, key) if isinstance(key, str) else path,
+            )
+        else:
+            sanitized[key] = (
+                item if item is None or type(item) in (bool, int, float) else deepcopy(item)
             )
     return sanitized
 
 
-def _normalized_key(value: str) -> str:
-    return value.casefold().replace("_", "").replace("-", "").replace(" ", "")
+def _redact_uncached_text(value: str, redacted: dict[str, str]) -> str:
+    result = redact_credentials(value)
+    # Repeated history labels/identities need one scan per save. Keep raw
+    # text only within this traversal, with bounded entries and key size.
+    if len(redacted) < 256 and len(value) <= 1024:
+        redacted[value] = result
+    return result
 
 
-def _is_ephemeral_payload_key(value: str) -> bool:
-    normalized = _normalized_key(value)
+def _is_ephemeral_payload_key(normalized: str) -> bool:
     return (
         normalized in {"env", "stdout", "stderr"}
         or "environment" in normalized
@@ -837,8 +871,7 @@ def _is_ephemeral_payload_key(value: str) -> bool:
     )
 
 
-def _is_credential_key(value: str) -> bool:
-    normalized = _normalized_key(value)
+def _is_credential_key(normalized: str) -> bool:
     return "credential" in normalized or normalized.endswith(
         (
             "authorization",

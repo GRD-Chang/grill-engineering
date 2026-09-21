@@ -18,7 +18,6 @@ from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.revisions import effective_revision_from_graph
 from agent_run.required_checks import annotate_configured_code_failures
 
-_ACCEPTANCE_MARKER = "<!-- agent-run:acceptance-record -->"
 _RUN_PUBLICATION_MARKER = "<!-- agent-run:run-publication-record -->"
 _AGENT_RUN_STATUS_MARKER = "<!-- agent-run:agent-run-status -->"
 
@@ -1125,21 +1124,6 @@ class GhGitHubPublisher:
         )
         data = _mapping(value)
         return data.get("title") == title and data.get("body") == body
-
-    def record_acceptance(self, pr_number: int, record: dict[str, Any]) -> None:
-        body = (
-            f"{_ACCEPTANCE_MARKER}\n"
-            "## Fresh Acceptance Record\n\n"
-            "```json\n"
-            f"{json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True)}\n"
-            "```"
-        )
-        self._record_marker_comment(
-            pr_number=pr_number,
-            marker=_ACCEPTANCE_MARKER,
-            body=body,
-            label="Acceptance record",
-        )
 
     def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         body = _render_agent_run_status(status)

@@ -9,7 +9,6 @@ from agent_run.commit_messages import commit_messages_match
 from agent_run.agents import AgentBackend
 from agent_run.agent_invocation import select_publication_thread
 from agent_run.change_delivery import (
-    MAX_MODIFICATION_ATTEMPTS,
     ChangeDeliveryAdapter,
     ChangeDeliveryEngine,
     ChangeDeliveryPublisher,

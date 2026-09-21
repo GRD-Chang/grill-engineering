@@ -622,6 +622,12 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
     assert job["development_thread_id"] is None
     assert checkout.exists()
     assert agents.development_requests == []
+    persisted = states.load_current_run(str(state["run_id"]))
+    assert persisted is not None
+    assert persisted["status"] == "waiting_external"
+    assert persisted["run_acceptance"] == run
+    assert persisted["supervision_window"] == waiting["supervision_window"]
+    assert persisted["diagnostics"][0]["code"] == "github_check_evidence_fingerprint_pending"
 
     completed = engine.accept(str(state["run_id"]))
 

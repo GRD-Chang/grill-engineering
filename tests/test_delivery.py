@@ -4,15 +4,13 @@ import json
 import subprocess
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
-import agent_run.change_delivery as change_delivery_module
 
 from agent_run.agents import (
     DevelopmentResult,
@@ -494,7 +492,6 @@ class ScriptedPublisher:
         self.pr_bodies: list[str] = []
         self.pr_titles: list[str] = []
         self.closed_issues: list[int] = []
-        self.acceptance_records: list[dict[str, Any]] = []
         self.agent_run_statuses: list[dict[str, Any]] = []
         self.live_head: str | None = None
         self.branch: str | None = None
@@ -689,9 +686,6 @@ class ScriptedPublisher:
                 }
             )
         return result
-
-    def record_acceptance(self, pr_number: int, record: dict[str, Any]) -> None:
-        self.acceptance_records.append(record)
 
     def record_agent_run_status(self, pr_number: int, status: dict[str, Any]) -> None:
         self.agent_run_statuses[:] = [
@@ -1891,7 +1885,6 @@ def test_ticket_delivery_repairs_then_squash_merges_and_closes_primary(
         "## Evidence\n\nThe scripted end-to-end scenario passed."
     ]
     assert github.closed_issues == [3]
-    assert github.acceptance_records == []
     assert github.agent_run_statuses == [
         {
             "pr_number": 11,
@@ -3065,7 +3058,11 @@ def test_ticket_required_check_head_drift_blocks_before_failed_evidence(
 def test_ticket_non_repairable_required_check_failure_is_supervised(
     git_repo: Path, checks: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    monkeypatch.setattr(
+        ChangeDeliveryEngine,
+        "review_budget_policy",
+        lambda self: replace(TICKET_POLICY, development_limit=1),
+    )
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
     state, _ = Controller(
@@ -3101,7 +3098,11 @@ def test_ticket_non_repairable_required_check_failure_is_supervised(
 def test_ticket_mixed_pending_required_checks_are_supervised(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    monkeypatch.setattr(
+        ChangeDeliveryEngine,
+        "review_budget_policy",
+        lambda self: replace(TICKET_POLICY, development_limit=1),
+    )
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
     state, _ = Controller(
@@ -3168,7 +3169,11 @@ def test_ticket_conflicting_failure_evidence_is_supervised(
     field: str,
     value: object,
 ) -> None:
-    monkeypatch.setattr(change_delivery_module, "MAX_MODIFICATION_ATTEMPTS", 1)
+    monkeypatch.setattr(
+        ChangeDeliveryEngine,
+        "review_budget_policy",
+        lambda self: replace(TICKET_POLICY, development_limit=1),
+    )
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     states = StateStore(git_repo / ".agent-run")
     state, _ = Controller(

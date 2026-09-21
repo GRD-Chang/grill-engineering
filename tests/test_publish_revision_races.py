@@ -198,7 +198,6 @@ def test_content_change_at_publish_boundary_requires_explicit_requeue(
         assert pull_states == ["MERGED", "OPEN"]
     else:
         assert pull_states == ["CLOSED", "MERGED", "OPEN"]
-    assert live["delivery"]["acceptance_records"] == []
     statuses = live["delivery"]["agent_run_status"]
     if action == "publish_branch":
         assert len(statuses) == 2
@@ -251,7 +250,6 @@ def test_ticket_removal_at_publish_boundary_pauses_same_command(
     ] == [2]
     live = json.loads(fixture.read_text(encoding="utf-8"))
     delivery = live["delivery"]
-    assert delivery.get("acceptance_records", []) == []
     assert delivery.get("closed_issues", []) == []
     assert delivery.get("mutations", []) == []
     assert not any(
@@ -695,7 +693,6 @@ def test_aba_revision_after_crash_requires_explicit_requeue(
         assert pull_states == ["MERGED", "OPEN"]
     else:
         assert pull_states == ["CLOSED", "MERGED", "OPEN"]
-    assert delivery["acceptance_records"] == []
     statuses = delivery["agent_run_status"]
     if action == "publish_branch":
         assert len(statuses) == 2

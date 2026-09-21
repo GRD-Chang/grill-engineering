@@ -9,11 +9,33 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 
 _GIT_LOCATION_VARIABLES = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_TEMPLATE_DIR",
 )
+
+
+@pytest.mark.parametrize("dont_write_bytecode", [False, True])
+def test_importing_installer_build_seam_preserves_interpreter_policy(
+    dont_write_bytecode: bool,
+) -> None:
+    project = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(project / "src"), str(project / "tests")]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c",
+         f"import sys; sys.dont_write_bytecode = {dont_write_bytecode!r}; "
+         "before = (sys.dont_write_bytecode, sys.path.copy()); "
+         "from support.fast_runner_installer import build_candidate; "
+         "assert (sys.dont_write_bytecode, sys.path) == before"],
+        env=environment, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _assert_python_and_git_environment() -> None:

@@ -2,15 +2,10 @@ from __future__ import annotations
 
 """User-level Delivery Policy resolution and immutable Run snapshots."""
 
-import fcntl
-import json
 import math
-import os
 import re
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from agent_run.messages import error_message
 from typing import Any
@@ -352,114 +347,6 @@ def run_repair_budget_policy_for_job(
         return run_repair_budget_policy(parse_policy_snapshot(raw))
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Run Policy Snapshot: {error}") from error
-
-
-class DeliveryPolicyStore:
-    """Atomically persist sparse user defaults outside repository state."""
-
-    _DIRECTORY_NAME = "agent-run"
-    _FILE_NAME = "delivery-policy.json"
-    _LOCK_FILE_NAME = ".delivery-policy.lock"
-
-    def __init__(self, path: Path | None = None) -> None:
-        self._unified_defaults = path is None
-        self.path = path or self.default_path()
-
-    @classmethod
-    def default_path(cls) -> Path:
-        config_home = os.environ.get("XDG_CONFIG_HOME")
-        if config_home:
-            root = Path(config_home).expanduser()
-            if not root.is_absolute():
-                raise DeliveryPolicyError(error_message('policy.error.config_directory', audit="XDG_CONFIG_HOME 必须是绝对路径"))
-        else:
-            root = Path.home() / ".config"
-        return root / cls._DIRECTORY_NAME / cls._FILE_NAME
-
-    def load(self) -> dict[str, Any] | None:
-        if self._unified_defaults:
-            from agent_run.user_defaults import UserDefaultsStore
-
-            return UserDefaultsStore().load().get("policy")
-        if not self.path.exists():
-            return None
-        try:
-            value: object = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise DeliveryPolicyError(error_message('policy.error.parse_file', audit="用户级 Delivery Policy 无法解析")) from error
-        if not isinstance(value, Mapping):
-            raise DeliveryPolicyError(error_message('policy.error.file_object', audit="用户级 Delivery Policy 必须是对象"))
-        return normalize_policy_overrides(value)
-
-    def configure(self, overrides: Mapping[str, Any]) -> DeliveryPolicy:
-        if self._unified_defaults:
-            from agent_run.user_defaults import UserDefaultsStore
-
-            result = UserDefaultsStore().configure(policy=overrides)
-            return parse_policy_snapshot(result["policy"])
-        supplied = normalize_policy_overrides(overrides)
-        if not supplied:
-            raise DeliveryPolicyError(error_message('policy.error.option_required', audit="policy configure requires an explicit option"))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self.path.parent / self._LOCK_FILE_NAME
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
-            os.fchmod(lock_file.fileno(), 0o600)
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                current = self.load() or {}
-                merged = dict(current)
-                current_deadlines = current.get("invocation_deadlines", {})
-                supplied_deadlines = supplied.get("invocation_deadlines", {})
-                if current_deadlines or supplied_deadlines:
-                    merged["invocation_deadlines"] = {
-                        **(
-                            dict(current_deadlines)
-                            if isinstance(current_deadlines, Mapping)
-                            else {}
-                        ),
-                        **(
-                            dict(supplied_deadlines)
-                            if isinstance(supplied_deadlines, Mapping)
-                            else {}
-                        ),
-                    }
-                for key, value in supplied.items():
-                    if key != "invocation_deadlines":
-                        merged[key] = value
-                policy = resolve_delivery_policy(user_defaults=merged)
-                self._write(normalize_policy_overrides(merged))
-                return policy
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-    def _write(self, document: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.path.parent,
-            prefix=".delivery-policy.",
-            suffix=".tmp",
-            text=True,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-                descriptor = -1
-                json.dump(document, temporary_file, ensure_ascii=False, sort_keys=True)
-                temporary_file.write("\n")
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            os.replace(temporary_path, self.path)
-            directory_descriptor = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        except BaseException:
-            if descriptor != -1:
-                os.close(descriptor)
-            temporary_path.unlink(missing_ok=True)
-            raise
 
 
 def _merge_policy_values(

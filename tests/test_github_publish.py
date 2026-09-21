@@ -321,9 +321,9 @@ def test_marker_comment_lost_response_is_reconciled_without_second_write(
 
 
 @pytest.mark.parametrize(
-    "existing_body", [None, "<!-- agent-run:acceptance-record -->\nstale"]
+    "existing_body", [None, "<!-- agent-run:agent-run-status -->\nstale"]
 )
-def test_acceptance_comment_lost_response_is_reconciled_without_second_write(
+def test_agent_run_status_lost_response_is_reconciled_without_second_write(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing_body: str | None,
@@ -343,21 +343,30 @@ def test_acceptance_comment_lost_response_is_reconciled_without_second_write(
         mutations.append(arguments)
         body_argument = next(value for value in arguments if value.startswith("body="))
         recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
-        raise OSError("lost response after acceptance write")
+        raise OSError("lost response after status write")
 
     monkeypatch.setattr(publisher, "_json", fake_json)
-    record = {"status": "pass", "candidate_sha": "abc123"}
+    record = {
+        "scope": "ticket-3",
+        "base_sha": "base123",
+        "candidate_sha": "abc123",
+        "validation_outcome": "pass",
+        "lane_statuses": {"e2e": "pass", "standards": "pass", "spec": "pass"},
+        "required_checks": "pass",
+        "next_action": "merge",
+    }
 
     with pytest.raises(OSError, match="lost response"):
-        publisher.record_acceptance(12, record)
-    publisher.record_acceptance(12, record)
+        publisher.record_agent_run_status(12, record)
+    publisher.record_agent_run_status(12, record)
 
     assert writes == 1
     assert ("--method" in mutations[0]) is (existing_body is not None)
     if existing_body is not None:
         assert mutations[0][mutations[0].index("--method") + 1] == "PATCH"
     assert recorded is not None
-    assert '"candidate_sha": "abc123"' in str(recorded["body"])
+    assert "Candidate/Base: `abc123` / `base123`" in str(recorded["body"])
+    assert "```json" not in str(recorded["body"])
 
 
 def test_publish_branch_refuses_remote_drift(

@@ -155,7 +155,6 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert repair_prs[0]["body"].startswith(
         "Parent Issue: #1\nDelivery Type: Run Repair\n\n"
     )
-    assert fixture_data["delivery"]["acceptance_records"] == []
     repair_statuses = fixture_data["delivery"]["agent_run_status"]
     assert repair_statuses[0]["scope"] == "run-repair-1"
     assert repair_statuses[0]["candidate_sha"] == run["candidate_sha"]

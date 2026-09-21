@@ -7,14 +7,14 @@ from typing import Any
 
 import pytest
 
-from agent_run.delivery_policy import DeliveryPolicyStore
+from agent_run.user_defaults import UserDefaultsStore
 from agent_run.git import GitRepository
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from conftest import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
-from support.workspace import managed_repo, managed_state, prepare_workspace
-from support.published_run import prepare_published_run
+from support.workspace import managed_repo, managed_state
+from support.published_run import prepare_accepted_run, prepare_published_run
 from test_cli import (
     load_only_run_state,
     run_internal_stage,
@@ -497,11 +497,11 @@ def test_user_policy_snapshot_is_frozen_across_human_blocker_resume(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     config_home = git_repo / "user-config"
-    policy_store = DeliveryPolicyStore(
-        config_home / "agent-run" / "delivery-policy.json"
+    policy_store = UserDefaultsStore(
+        config_home / "agent-run" / "user-defaults.json"
     )
     policy_store.configure(
-        {
+        policy={
             "ticket_review_rounds": 1,
             "invocation_deadlines": {"development": "11m"},
         }
@@ -605,10 +605,10 @@ def test_existing_run_ignores_invalid_user_policy_on_normal_run(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
     config_home = git_repo / "user-config-normal-run"
-    policy_store = DeliveryPolicyStore(
-        config_home / "agent-run" / "delivery-policy.json"
+    policy_store = UserDefaultsStore(
+        config_home / "agent-run" / "user-defaults.json"
     )
-    policy_store.configure({"ticket_review_rounds": 1})
+    policy_store.configure(policy={"ticket_review_rounds": 1})
     isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
     agents = git_repo / "normal-run-agents.json"
     agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
@@ -1011,10 +1011,10 @@ def test_public_run_does_not_open_a_budget_window_at_true_checkpoint(
 ) -> None:
     config_home = git_repo / "checkpoint-policy-config"
     isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
-    policy_store = DeliveryPolicyStore(
-        config_home / "agent-run" / "delivery-policy.json"
+    policy_store = UserDefaultsStore(
+        config_home / "agent-run" / "user-defaults.json"
     )
-    policy_store.configure({"ticket_review_rounds": 3})
+    policy_store.configure(policy={"ticket_review_rounds": 3})
     fixture = write_fixture(
         git_repo / "github.json",
         issues={"3": ticket()},
@@ -1887,10 +1887,10 @@ def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
 ) -> None:
     config_home = git_repo / "checkpoint-user-config"
     isolated_env = {"XDG_CONFIG_HOME": str(config_home)}
-    policy_store = DeliveryPolicyStore(
-        config_home / "agent-run" / "delivery-policy.json"
+    policy_store = UserDefaultsStore(
+        config_home / "agent-run" / "user-defaults.json"
     )
-    policy_store.configure({"invocation_deadlines": {"development": "11m"}})
+    policy_store.configure(policy={"invocation_deadlines": {"development": "11m"}})
     fixture = write_fixture(git_repo / "github.json", issues={})
     initial_agents = git_repo / "parent-checkpoint-agents.json"
     initial_agents.write_text(
@@ -1914,7 +1914,7 @@ def test_parent_only_budget_checkpoint_resumes_with_a_new_paired_window(
     assert blocked_state["parent_job"]["review_budget"]["window"] == 1
 
     policy_store.configure(
-        {
+        policy={
             "parent_only_paired_rounds": 9,
             "invocation_deadlines": {"development": "19m"},
         }
@@ -3933,14 +3933,13 @@ def test_forward_candidate_repair_removes_prior_out_of_scope_file(
 def test_run_cli_records_one_final_parent_linked_branch_display(
     git_repo: Path, display_outcome: str, expected_status: str
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"linked_branch_display_outcomes": display_outcome},
+    fixture, _ = prepare_accepted_run(
+        git_repo, delivery={"linked_branch_display_outcomes": display_outcome},
     )
     agents = git_repo / "final-run-agents.json"
-    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
-    prepare_workspace(git_repo)
+    agents.write_text(
+        json.dumps({"run_publications": [final_run_publication()]}), encoding="utf-8",
+    )
     before_config = subprocess.run(
         ["git", "config", "--local", "--list"],
         cwd=managed_repo(git_repo),
@@ -3985,13 +3984,13 @@ def test_run_cli_records_one_final_parent_linked_branch_display(
 def test_run_cli_recovers_post_display_crash_without_replaying_parent_display(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"crash_after_final_link_issue_branch_display_once": True},
+    fixture, _ = prepare_accepted_run(
+        git_repo, delivery={"crash_after_final_link_issue_branch_display_once": True},
     )
     agents = git_repo / "final-run-display-crash-agents.json"
-    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+    agents.write_text(
+        json.dumps({"run_publications": [final_run_publication()]}), encoding="utf-8",
+    )
 
     delivered = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -4047,13 +4046,13 @@ def test_run_cli_fails_closed_when_run_ref_expected_absent_cas_loses_race(
 def test_run_cli_fails_closed_before_final_pr_on_final_run_ref_authority_error(
     git_repo: Path, outcome: str
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"final_run_ref_outcomes": [outcome]},
+    fixture, _ = prepare_accepted_run(
+        git_repo, delivery={"final_run_ref_outcomes": [outcome]},
     )
     agents = git_repo / "final-run-ref-authority-agents.json"
-    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+    agents.write_text(
+        json.dumps({"run_publications": [final_run_publication()]}), encoding="utf-8",
+    )
 
     failed = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -4071,13 +4070,13 @@ def test_run_cli_fails_closed_before_final_pr_on_final_run_ref_authority_error(
 def test_run_cli_recovers_lost_final_run_ref_response_by_exact_readback(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"final_run_ref_outcomes": ["lost_response"]},
+    fixture, _ = prepare_accepted_run(
+        git_repo, delivery={"final_run_ref_outcomes": ["lost_response"]},
     )
     agents = git_repo / "lost-final-run-ref-agents.json"
-    agents.write_text(json.dumps(final_run_agents()), encoding="utf-8")
+    agents.write_text(
+        json.dumps({"run_publications": [final_run_publication()]}), encoding="utf-8",
+    )
 
     waiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -4107,43 +4106,10 @@ def test_final_run_pr_drift_returns_to_fresh_acceptance_without_rewriting_pr(
     head_sha: str | None,
     identity_error: dict[str, str],
 ) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"3": ticket()})
-    ticket_agents = git_repo / "ticket-agents.json"
-    ticket_agents.write_text(
-        json.dumps(
-            {
-                "developments": [
-                    {
-                        "expected_thread_id": None,
-                        "thread_id": "ticket-developer",
-                        "summary": "Delivered the Ticket.",
-                        "write_files": {"feature.txt": "done\n"},
-                    }
-                ],
-                "publications": [publication()],
-                "reviews": [passing_acceptance("ticket-reviewer", "Ticket passed.")],
-            }
-        ),
-        encoding="utf-8",
-    )
-    run_id = stdout_json(seed_run(git_repo, fixture, "1"))["run_id"]
-    delivered = run_internal_stage(
-        git_repo, fixture, "deliver", run_id, "--agent-fixture", str(ticket_agents)
-    )
-    assert stdout_json(delivered)["status"] == "run_acceptance_pending"
-    run_agents = git_repo / "run-agents.json"
-    run_agents.write_text(
-        json.dumps(
-            {"reviews": [passing_acceptance("run-reviewer", "Run passed.")]}
-        ),
-        encoding="utf-8",
-    )
-    accepted = run_internal_stage(
-        git_repo, fixture, "accept-run", run_id, "--agent-fixture", str(run_agents)
-    )
-    assert stdout_json(accepted)["status"] == "run_publication_pending"
-
-    state = load_only_run_state(git_repo)
+    # Ticket delivery is historical setup; this test exercises Final PR publication.
+    fixture, state = prepare_accepted_run(git_repo)
+    run_id = str(state["run_id"])
+    assert state["status"] == "run_publication_pending"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     actual_head = state["run_acceptance"]["acceptance_record"]["reviewed_head_sha"]
     if base_branch != "main":

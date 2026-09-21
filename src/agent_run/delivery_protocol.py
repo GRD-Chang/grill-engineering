@@ -183,10 +183,6 @@ class GitHubPublisher(Protocol):
         self, pr_number: int, *, title: str, body: str
     ) -> bool: ...
 
-    def record_acceptance(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None: ...
-
     def record_agent_run_status(
         self, pr_number: int, status: dict[str, Any]
     ) -> None: ...

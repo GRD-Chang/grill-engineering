@@ -33,7 +33,6 @@ from agent_run.delivery_cleanup import require_clean_run_worktrees
 from agent_run.delivery_policy import (
     DeliveryPolicy,
     DeliveryPolicyError,
-    DeliveryPolicyStore,
     parse_policy_snapshot,
     policy_snapshot_for_state,
     resolve_delivery_policy,
@@ -4269,9 +4268,9 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
 
 
 def _resolve_delivery_policy(parsed: argparse.Namespace) -> DeliveryPolicy:
-    store = DeliveryPolicyStore()
+    store = UserDefaultsStore()
     return resolve_delivery_policy(
-        user_defaults=store.load(),
+        user_defaults=store.load().get("policy"),
         command_overrides=_policy_overrides(parsed),
     )
 

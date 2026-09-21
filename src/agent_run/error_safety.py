@@ -40,6 +40,7 @@ _MULTILINE_PRIVATE_KEY = re.compile(
 _MAX_ERROR_BYTES = 8 * 1024
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f]")
 _JSON_CONTAINER_START = re.compile(r"[\[{]")
+_NON_JSON_NUMBER = re.compile(r"[^0-9eE+.\- \t\r\n]")
 # Every labelled pattern contains one of these words; matching remains below.
 _CREDENTIAL_LABEL = re.compile(
     r"(?i)authorization|token|secret|key|password"
@@ -64,6 +65,10 @@ def redact_credentials(value: str) -> str:
 
 
 def _redact_text(value: str) -> str:
+    # Credential forms and control characters all require non-alphanumeric text.
+    # Keep this after JSON normalization (for example, 1e2 becomes 100.0).
+    if value.isalnum():
+        return value
     # Every labelled credential pattern requires one of these separators.
     # Keep the regexes themselves authoritative, including Unicode IGNORECASE.
     has_separator = ":" in value or "=" in value
@@ -101,6 +106,12 @@ def _redact_json_credentials(value: str) -> object | None:
     leading = value.lstrip(" \t\n\r")
     if not leading or leading[0] not in '{["-0123456789tfnNI':
         return None
+    if leading[0] in "tfnNI":
+        if leading.rstrip(" \t\n\r") not in {"true", "false", "null", "NaN", "Infinity"}:
+            return None
+    elif leading[0] in "-0123456789":
+        if leading.rstrip(" \t\n\r") != "-Infinity" and _NON_JSON_NUMBER.search(leading):
+            return None
     try:
         decoded: object = json.loads(value)
     except json.JSONDecodeError:

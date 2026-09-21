@@ -14,7 +14,7 @@ from support.workspace import managed_repo, managed_state
 
 import agent_run.cli as cli_module
 from agent_run.agent_invocation import record_operator_stop
-from agent_run.delivery_policy import DeliveryPolicyStore
+from agent_run.user_defaults import UserDefaultsStore
 from agent_run.executor_host import ExecutorSpec, HostObservation
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.publication_operation_retry import record_publication_operation_failure
@@ -367,10 +367,10 @@ def test_duplicate_budget_window_resume_keeps_first_explicit_policy_identity(
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={})
     config_home = git_repo / "config"
-    policy_store = DeliveryPolicyStore(
-        config_home / "agent-run" / "delivery-policy.json"
+    policy_store = UserDefaultsStore(
+        config_home / "agent-run" / "user-defaults.json"
     )
-    policy_store.configure({"ticket_review_rounds": 3})
+    policy_store.configure(policy={"ticket_review_rounds": 3})
     policy_environment = {"XDG_CONFIG_HOME": str(config_home)}
     initial_agents = git_repo / "budget-checkpoint-agents.json"
     initial_agents.write_text(
@@ -426,7 +426,7 @@ def test_duplicate_budget_window_resume_keeps_first_explicit_policy_identity(
     )
     try:
         _wait_for_agent_barrier(first, started)
-        policy_store.configure({"ticket_review_rounds": 4})
+        policy_store.configure(policy={"ticket_review_rounds": 4})
 
         duplicate = run_cli(
             git_repo,

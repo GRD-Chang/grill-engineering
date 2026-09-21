@@ -12,6 +12,7 @@ import pytest
 from cli_fixtures import run_agents
 from conftest import write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
+from support.published_run import prepare_accepted_run
 from support.workspace import managed_state
 from test_cli import load_only_run_state, run_cli, stdout_json
 from test_cli_delivery import (
@@ -275,7 +276,7 @@ def test_parent_only_approval_grant_is_revoked_when_parent_revision_changes(
     assert stdout_json(approval)["status"] == "supervision_timeout"
     assert "approval_grant" in load_only_run_state(git_repo)["parent_job"]
     wait = load_only_run_state(git_repo)["supervision_wait"]
-    assert wait["deadline"] - wait["started_at"] == 45 * 60
+    assert wait["deadline"] == wait["started_at"] + 45 * 60
     assert wait["elapsed_seconds"] >= 45 * 60
     assert wait["retry_count"] > 1
 
@@ -525,17 +526,24 @@ def test_run_routes_pending_final_run_check_failure_through_repair(
 def test_public_run_supervises_non_repairable_final_check_failure(
     git_repo: Path, check: dict[str, Any]
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
         # Keep repeated supervision without replaying the entire backoff window.
-        supervision_clock_multiplier=40,
         delivery={
-            "required_checks": ["none", "fail"],
+            "required_checks": ["fail"],
             "required_check_evidence": {"pr_number": 1, "checks": [check]},
         },
     )
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["supervision_clock_multiplier"] = 40
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     agents = run_agents(git_repo / "agents.json")
+    data = json.loads(agents.read_text(encoding="utf-8"))
+    # Ticket execution and initial Run Acceptance are historical setup.
+    for role in ("developments", "publications", "run_reviews"):
+        del data[role][0]
+    data["reviews"] = []
+    agents.write_text(json.dumps(data), encoding="utf-8")
 
     waiting = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -630,11 +638,10 @@ def test_run_resumes_repair_promotion_after_merged_pr_readback_lags(
 def test_run_supervises_repair_promotion_live_pr_readback(
     git_repo: Path, error_type: str
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
         delivery={
-            "required_checks": ["none", "pending", "fail", "pass", "pass"],
+            "required_checks": ["pending", "fail", "pass", "pass"],
             "merged_live_pull_request_failures": [
                 {
                     "scope": "run_repair",
@@ -645,9 +652,17 @@ def test_run_supervises_repair_promotion_live_pr_readback(
                 for _ in range(3)
             ],
         },
-        supervision_clock_multiplier=120,
     )
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["supervision_clock_multiplier"] = 120
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     agents = _repair_agents(git_repo / "agents.json", repair_generations=1)
+    data = json.loads(agents.read_text(encoding="utf-8"))
+    # Ticket execution and initial Run Acceptance are historical setup.
+    for role in ("developments", "publications", "run_reviews"):
+        del data[role][0]
+    data["reviews"] = []
+    agents.write_text(json.dumps(data), encoding="utf-8")
 
     paused = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(agents))
 
@@ -686,15 +701,20 @@ def test_run_supervises_repair_promotion_live_pr_readback(
 def test_run_bounds_persistent_unknown_repair_checks_without_new_candidate(
     git_repo: Path,
 ) -> None:
-    fixture = write_fixture(
-        git_repo / "github.json",
-        issues={"3": ticket()},
-        delivery={"required_checks": ["none", "fail", "unknown"]},
+    fixture, _ = prepare_accepted_run(
+        git_repo,
+        delivery={"required_checks": ["fail", "unknown"]},
         # Exercise multiple retries before the final sleep exhausts the window.
-        supervision_clock_multiplier=40,
     )
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["supervision_clock_multiplier"] = 40
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     agents = run_agents(git_repo / "agents.json")
     data = json.loads(agents.read_text(encoding="utf-8"))
+    # Ticket execution and initial Run Acceptance are historical setup.
+    for role in ("developments", "publications", "run_reviews"):
+        del data[role][0]
+    data["reviews"] = []
     data["developments"].append(
         {
             "expected_thread_id": None,

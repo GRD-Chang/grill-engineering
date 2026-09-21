@@ -560,7 +560,7 @@ def test_run_recovers_a_persisted_check_deadline_without_duplicate_delivery(
     assert paused_state["status"] == "supervision_timeout"
     wait = paused_state["supervision_wait"]
     assert wait["kind"] == "required_checks"
-    assert wait["deadline"] - wait["started_at"] == 45 * 60
+    assert wait["deadline"] == wait["started_at"] + 45 * 60
     assert wait["identity"] == paused_state["supervision_window"]["identity"]
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     assert fixture_data["supervision_clock"] == 45 * 60

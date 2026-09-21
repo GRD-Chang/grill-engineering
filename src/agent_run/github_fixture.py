@@ -217,7 +217,6 @@ class FixtureGitHubPublisher:
         delivery.setdefault("published_branches", {})
         delivery.setdefault("pull_requests", [])
         delivery.setdefault("closed_issues", [])
-        delivery.setdefault("acceptance_records", [])
         delivery.setdefault("agent_run_status", [])
         delivery.setdefault("run_publication_records", [])
         delivery.setdefault("mutations", [])
@@ -1216,20 +1215,6 @@ class FixtureGitHubPublisher:
     ) -> bool:
         pull = self._pull(pr_number)
         return pull.get("title") == title and pull.get("body") == body
-
-    def record_acceptance(
-        self, pr_number: int, record: dict[str, Any]
-    ) -> None:
-        records = _mutable_list(self._delivery(), "acceptance_records")
-        replacement = {"pr_number": pr_number, **record}
-        for position, existing in enumerate(records):
-            if isinstance(existing, dict) and existing.get("pr_number") == pr_number:
-                records[position] = replacement
-                break
-        else:
-            records.append(replacement)
-        self._save()
-        self._crash_once("record_acceptance")
 
     def record_agent_run_status(
         self, pr_number: int, status: dict[str, Any]
