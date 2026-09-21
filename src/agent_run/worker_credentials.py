@@ -359,8 +359,168 @@ class _ParsedReadArguments:
     repository_selectors: tuple[str, ...]
 
 
-class WorkerCredentialChannel:
-    """Serve renewable read tokens over a temporary per-Worker Unix socket."""
+class _GitHubReadChannel:
+    """Own the shared request socket and every gh process it starts."""
+
+    _thread_name = "agent-run-worker-credential-channel"
+    _read_label = "Worker GitHub read"
+
+    def __init__(
+        self,
+        *,
+        gh_executable: str,
+        gh_environment: dict[str, str],
+        repository: str | None,
+    ) -> None:
+        self._gh_executable = gh_executable
+        self._gh_environment = dict(gh_environment)
+        self._repository = repository
+        self._condition = threading.Condition()
+        self._closed = False
+        self._socket: socket.socket | None = None
+        self._socket_path: Path | None = None
+        self._server_thread: threading.Thread | None = None
+        self._active_connection: socket.socket | None = None
+        self._active_gh_processes: set[subprocess.Popen[str]] = set()
+
+    def start(self, socket_path: Path) -> None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(os.fspath(socket_path))
+        listener.listen()
+        listener.settimeout(0.2)
+        self._socket = listener
+        self._socket_path = socket_path
+        self._server_thread = threading.Thread(
+            target=self._serve,
+            daemon=True,
+            name=self._thread_name,
+        )
+        self._server_thread.start()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            connection = self._active_connection
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if self._socket is not None:
+            self._socket.close()
+        self._terminate_active_gh_processes()
+        if self._server_thread is not None:
+            self._server_thread.join(timeout=1.0)
+        if self._socket_path is not None:
+            self._socket_path.unlink(missing_ok=True)
+
+    def _serve(self) -> None:
+        assert self._socket is not None
+        while True:
+            with self._condition:
+                if self._closed:
+                    return
+            try:
+                connection, _address = self._socket.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection:
+                with self._condition:
+                    if self._closed:
+                        return
+                    self._active_connection = connection
+                try:
+                    self._serve_request(connection)
+                finally:
+                    with self._condition:
+                        self._active_connection = None
+
+    def _serve_request(self, connection: socket.socket) -> None:
+        connection.settimeout(CHANNEL_SOCKET_TIMEOUT_SECONDS)
+        try:
+            request = _receive_message(connection)
+            response = self._request(request)
+        except (
+            WorkerCredentialError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+            TimeoutError,
+        ) as error:
+            response = {"error": bounded_error(str(error))}
+        try:
+            _send_message(connection, response)
+        except WorkerCredentialError as error:
+            try:
+                _send_message(connection, {"error": bounded_error(str(error))})
+            except OSError:
+                return
+        except OSError:
+            return
+
+    def _request(self, request: object) -> dict[str, object]:
+        arguments = _read_arguments(request, self._repository)
+        result = self._run_gh(arguments)
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+
+    def _run_gh(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        raise NotImplementedError
+
+    def _run_gh_once(
+        self, arguments: list[str], environment: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            process = subprocess.Popen(
+                [self._gh_executable, *arguments],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise WorkerCredentialError(f"Could not start {self._read_label}") from error
+        with self._condition:
+            self._active_gh_processes.add(process)
+            closed = self._closed
+        if closed:
+            _terminate_gh_process(process)
+        try:
+            stdout, stderr = _communicate_with_limit(
+                process, timeout=WORKER_GH_READ_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as error:
+            _terminate_gh_process(process)
+            raise WorkerCredentialError(f"{self._read_label} timed out") from error
+        except WorkerCredentialError:
+            _terminate_gh_process(process)
+            raise
+        except OSError as error:
+            _terminate_gh_process(process)
+            raise WorkerCredentialError(f"{self._read_label} failed") from error
+        finally:
+            with self._condition:
+                self._active_gh_processes.discard(process)
+        return subprocess.CompletedProcess(
+            [self._gh_executable, *arguments], process.returncode, stdout, stderr
+        )
+
+    def _terminate_active_gh_processes(self) -> None:
+        with self._condition:
+            processes = tuple(self._active_gh_processes)
+        for process in processes:
+            _terminate_gh_process(process)
+
+
+class WorkerCredentialChannel(_GitHubReadChannel):
+    """Serve read results using Controller-owned renewable credentials."""
 
     def __init__(
         self,
@@ -384,17 +544,13 @@ class WorkerCredentialChannel:
         self._retry_count = 0
         self._next_retry_at = 0.0
         self._retry_delay = 1.0
-        self._gh_executable = gh_executable
-        self._gh_environment = dict(gh_environment or {})
-        self._repository = repository
+        super().__init__(
+            gh_executable=gh_executable,
+            gh_environment=gh_environment or {},
+            repository=repository,
+        )
         self._on_exhausted = on_exhausted
-        self._condition = threading.Condition()
-        self._closed = False
-        self._socket: socket.socket | None = None
-        self._socket_path: Path | None = None
-        self._server_thread: threading.Thread | None = None
         self._renewal_thread: threading.Thread | None = None
-        self._active_gh_processes: set[subprocess.Popen[str]] = set()
         self._renewing = False
 
     def start(self, socket_path: Path) -> None:
@@ -402,23 +558,12 @@ class WorkerCredentialChannel:
 
         with self._condition:
             self._renew_locked(require_credential=True)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(os.fspath(socket_path))
-        listener.listen()
-        listener.settimeout(0.2)
-        self._socket = listener
-        self._socket_path = socket_path
-        self._server_thread = threading.Thread(
-            target=self._serve,
-            daemon=True,
-            name="agent-run-worker-credential-channel",
-        )
+        super().start(socket_path)
         self._renewal_thread = threading.Thread(
             target=self._renew_proactively,
             daemon=True,
             name="agent-run-worker-credential-renewal",
         )
-        self._server_thread.start()
         self._renewal_thread.start()
 
     def close(self) -> None:
@@ -427,20 +572,9 @@ class WorkerCredentialChannel:
             self._credential = None
             self._condition.notify_all()
         provider_cancellable = self._cancel_provider()
-        if self._socket is not None:
-            self._socket.close()
-        self._terminate_active_gh_processes()
-        for thread in (self._server_thread, self._renewal_thread):
-            if thread is not None:
-                thread.join(
-                    timeout=(
-                        1.0
-                        if provider_cancellable and thread is self._renewal_thread
-                        else 0.1
-                    )
-                )
-        if self._socket_path is not None:
-            self._socket_path.unlink(missing_ok=True)
+        super().close()
+        if self._renewal_thread is not None:
+            self._renewal_thread.join(timeout=1.0 if provider_cancellable else 0.1)
 
     def _cancel_provider(self) -> bool:
         cancel = getattr(self._provider, "cancel", None)
@@ -458,46 +592,6 @@ class WorkerCredentialChannel:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _serve(self) -> None:
-        assert self._socket is not None
-        while True:
-            with self._condition:
-                if self._closed:
-                    return
-            try:
-                connection, _address = self._socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            with connection:
-                connection.settimeout(CHANNEL_SOCKET_TIMEOUT_SECONDS)
-                try:
-                    request = _receive_message(connection)
-                    response = self._request(request)
-                except (
-                    WorkerCredentialError,
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                    OSError,
-                    TimeoutError,
-                ) as error:
-                    response = {"error": bounded_error(str(error))}
-                try:
-                    _send_message(connection, response)
-                except WorkerCredentialError as error:
-                    try:
-                        _send_message(connection, {"error": bounded_error(str(error))})
-                    except OSError:
-                        continue
-                except OSError:
-                    continue
-
-    def _request(self, request: object) -> dict[str, object]:
-        arguments = _read_arguments(request, self._repository)
-        result = self._run_gh(arguments)
-        return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
-
     def _run_gh(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         _validate_github_host(self._gh_environment)
         environment = dict(self._gh_environment)
@@ -512,51 +606,6 @@ class WorkerCredentialChannel:
             environment["GH_ENTERPRISE_TOKEN"] = environment["GH_TOKEN"]
             result = self._run_gh_once(arguments, environment)
         return result
-
-    def _run_gh_once(
-        self, arguments: list[str], environment: dict[str, str]
-    ) -> subprocess.CompletedProcess[str]:
-        try:
-            process = subprocess.Popen(
-                [self._gh_executable, *arguments],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as error:
-            raise WorkerCredentialError("Could not start Worker GitHub read") from error
-        with self._condition:
-            self._active_gh_processes.add(process)
-            closed = self._closed
-        if closed:
-            _terminate_gh_process(process)
-        try:
-            stdout, stderr = _communicate_with_limit(
-                process, timeout=WORKER_GH_READ_TIMEOUT_SECONDS
-            )
-        except subprocess.TimeoutExpired as error:
-            _terminate_gh_process(process)
-            raise WorkerCredentialError("Worker GitHub read timed out") from error
-        except WorkerCredentialError:
-            _terminate_gh_process(process)
-            raise
-        except OSError as error:
-            _terminate_gh_process(process)
-            raise WorkerCredentialError("Worker GitHub read failed") from error
-        finally:
-            with self._condition:
-                self._active_gh_processes.discard(process)
-        return subprocess.CompletedProcess(
-            [self._gh_executable, *arguments], process.returncode, stdout, stderr
-        )
-
-    def _terminate_active_gh_processes(self) -> None:
-        with self._condition:
-            processes = tuple(self._active_gh_processes)
-        for process in processes:
-            _terminate_gh_process(process)
 
     def _renew_proactively(self) -> None:
         delay = 1.0
@@ -704,8 +753,11 @@ class WorkerCredentialChannel:
             self._on_exhausted(self._renewal_pause_message())
 
 
-class HostGitHubReadChannel:
+class HostGitHubReadChannel(_GitHubReadChannel):
     """Relay allowlisted reads to the host ``gh`` without exporting a token."""
+
+    _thread_name = "agent-run-worker-host-gh-channel"
+    _read_label = "host GitHub read"
 
     def __init__(
         self,
@@ -714,40 +766,11 @@ class HostGitHubReadChannel:
         gh_environment: dict[str, str] | None = None,
         repository: str | None = None,
     ) -> None:
-        self._gh_executable = gh_executable
-        self._gh_environment = dict(gh_environment or os.environ)
-        self._repository = repository
-        self._condition = threading.Condition()
-        self._closed = False
-        self._socket: socket.socket | None = None
-        self._socket_path: Path | None = None
-        self._server_thread: threading.Thread | None = None
-        self._active_gh_processes: set[subprocess.Popen[str]] = set()
-
-    def start(self, socket_path: Path) -> None:
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(os.fspath(socket_path))
-        listener.listen()
-        listener.settimeout(0.2)
-        self._socket = listener
-        self._socket_path = socket_path
-        self._server_thread = threading.Thread(
-            target=self._serve,
-            daemon=True,
-            name="agent-run-worker-host-gh-channel",
+        super().__init__(
+            gh_executable=gh_executable,
+            gh_environment=gh_environment or dict(os.environ),
+            repository=repository,
         )
-        self._server_thread.start()
-
-    def close(self) -> None:
-        with self._condition:
-            self._closed = True
-        if self._socket is not None:
-            self._socket.close()
-        self._terminate_active_gh_processes()
-        if self._server_thread is not None:
-            self._server_thread.join(timeout=1.0)
-        if self._socket_path is not None:
-            self._socket_path.unlink(missing_ok=True)
 
     def __enter__(self) -> HostGitHubReadChannel:
         return self
@@ -755,53 +778,13 @@ class HostGitHubReadChannel:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _serve(self) -> None:
-        assert self._socket is not None
-        while True:
-            with self._condition:
-                if self._closed:
-                    return
-            try:
-                connection, _address = self._socket.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            with connection:
-                connection.settimeout(CHANNEL_SOCKET_TIMEOUT_SECONDS)
-                try:
-                    request = _receive_message(connection)
-                    response = self._request(request)
-                except (
-                    WorkerCredentialError,
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                    OSError,
-                    TimeoutError,
-                ) as error:
-                    response = {"error": bounded_error(str(error))}
-                try:
-                    _send_message(connection, response)
-                except WorkerCredentialError as error:
-                    try:
-                        _send_message(connection, {"error": bounded_error(str(error))})
-                    except OSError:
-                        continue
-                except OSError:
-                    continue
-
-    def _request(self, request: object) -> dict[str, object]:
-        arguments = _read_arguments(request, self._repository)
-        result = self._run_gh(arguments)
-        return {
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-
     def _run_gh(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         _validate_github_host(self._gh_environment)
-        result = self._run_gh_once(arguments)
+        environment = dict(self._gh_environment)
+        environment.setdefault("GH_PROMPT_DISABLED", "1")
+        if self._repository is not None:
+            environment["GH_REPO"] = self._repository
+        result = self._run_gh_once(arguments, environment)
         if result.returncode == 0:
             return result
         stderr = bounded_error(result.stderr.strip())
@@ -813,54 +796,6 @@ class HostGitHubReadChannel:
             "",
             stderr,
         )
-
-    def _run_gh_once(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        environment = dict(self._gh_environment)
-        _validate_github_host(environment)
-        environment.setdefault("GH_PROMPT_DISABLED", "1")
-        if self._repository is not None:
-            environment["GH_REPO"] = self._repository
-        try:
-            process = subprocess.Popen(
-                [self._gh_executable, *arguments],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as error:
-            raise WorkerCredentialError("Could not start host GitHub read") from error
-        with self._condition:
-            self._active_gh_processes.add(process)
-            closed = self._closed
-        if closed:
-            _terminate_gh_process(process)
-        try:
-            stdout, stderr = _communicate_with_limit(
-                process, timeout=WORKER_GH_READ_TIMEOUT_SECONDS
-            )
-        except subprocess.TimeoutExpired as error:
-            _terminate_gh_process(process)
-            raise WorkerCredentialError("host GitHub read timed out") from error
-        except WorkerCredentialError:
-            _terminate_gh_process(process)
-            raise
-        except OSError as error:
-            _terminate_gh_process(process)
-            raise WorkerCredentialError("host GitHub read failed") from error
-        finally:
-            with self._condition:
-                self._active_gh_processes.discard(process)
-        return subprocess.CompletedProcess(
-            [self._gh_executable, *arguments], process.returncode, stdout, stderr
-        )
-
-    def _terminate_active_gh_processes(self) -> None:
-        with self._condition:
-            processes = tuple(self._active_gh_processes)
-        for process in processes:
-            _terminate_gh_process(process)
 
 
 def _coerce_credential(value: ReadCredential | str, now: float) -> ReadCredential:

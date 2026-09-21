@@ -16,6 +16,8 @@ from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.git import MergeConflictError
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.run_repair_delivery import RunRepairPublisher
+from agent_run.run_repair_promotion import RunRepairPromotion
 from agent_run.run_currentness import run_currentness_boundary
 from agent_run.run_currentness import (
     ticket_completion_records,
@@ -1751,7 +1753,7 @@ def test_stale_run_repair_publication_returns_to_fresh_run_acceptance(
     }
     run["repair_job"] = job
 
-    engine._invalidate_stale_repair(
+    RunRepairPublisher(engine, RunRepairPromotion(engine)).invalidate_stale(
         state, job, git_repo / "unused-checkout"
     )
 

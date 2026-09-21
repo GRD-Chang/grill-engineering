@@ -48,15 +48,15 @@ def test_github_command_capture_has_a_direct_byte_bound() -> None:
             "-c",
             (
                 "import sys; "
-                f"sys.stdout.write('x' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096)); "
-                f"sys.stderr.write('y' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096))"
+                f"sys.stdout.write('x' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096) + 'out-tail'); "
+                f"sys.stderr.write('y' * ({MAX_COMMAND_OUTPUT_BYTES} + 4096) + 'err-tail')"
             ),
         ]
     )
 
     assert result.returncode == 0
-    assert len(result.stdout.encode("utf-8")) <= MAX_COMMAND_OUTPUT_BYTES
-    assert len(result.stderr.encode("utf-8")) <= MAX_COMMAND_OUTPUT_BYTES
+    assert result.stdout == "x" * (MAX_COMMAND_OUTPUT_BYTES - 8) + "out-tail"
+    assert result.stderr == "y" * (MAX_COMMAND_OUTPUT_BYTES - 8) + "err-tail"
 
 
 @pytest.mark.parametrize("stderr", ["permission denied", "unexpected response"])

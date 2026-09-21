@@ -40,13 +40,17 @@ from agent_run.semantic_attempt import (
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
+    from agent_run.run_repair_promotion import RunRepairPromotion
 
 
 class RunRepairLifecycle:
     """Own one Run Repair Job lifecycle while the engine remains its façade."""
 
-    def __init__(self, owner: RunAcceptanceEngine) -> None:
+    def __init__(
+        self, owner: RunAcceptanceEngine, promotion: RunRepairPromotion
+    ) -> None:
         self.owner = owner
+        self.promotion = promotion
 
     def _repair(self, state: dict[str, Any], run: dict[str, Any]) -> str:
         """Deliver a Run Repair through the same Change Job lifecycle as Tickets.
@@ -90,7 +94,7 @@ class RunRepairLifecycle:
                     )
                     self.owner._save(state)
                 if job.get("integration_reprepare_required") is True:
-                    self.owner._complete_integration_reprepare(state, job, checkout)
+                    self.promotion.complete_integration_reprepare(state, job, checkout)
                 elif job.get("integration_squash_conversion_required") is True:
                     self._complete_squash_repair_conflict_conversion(
                         state, job, checkout
@@ -295,7 +299,7 @@ class RunRepairLifecycle:
                 currentness_reader=self.owner.currentness_reader,
                 default_head_sha=self.owner.default_head_sha,
             ),
-            publisher=RunRepairPublisher(self.owner),
+            publisher=RunRepairPublisher(self.owner, self.promotion),
             state_store=ChangeDeliveryStateStore(self.owner.states, str(state["run_id"])),
         )
 
@@ -504,7 +508,7 @@ class RunRepairLifecycle:
         publication_sha = sources[0].get("publication_sha")
         if not isinstance(publication_sha, str) or not publication_sha:
             raise ValueError("repair rotation is missing the completed Publication head")
-        RunRepairPublisher(self.owner).rotate_job_checkout(
+        RunRepairPublisher(self.owner, self.promotion).rotate_job_checkout(
             checkout=checkout,
             current_branch=current_branch,
             current_publication_sha=publication_sha,

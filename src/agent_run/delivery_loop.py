@@ -31,7 +31,7 @@ from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 from agent_run.review_budget import previous_review_context
 from agent_run.delivery_policy import ticket_budget_policy_for_job
-from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.delivery_evidence import clear_stale_delivery_evidence
 
 
 def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> None:
@@ -413,28 +413,7 @@ class TicketDeliveryLoop:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         self.git.reset_checkout_to_base(checkout, str(state["run_branch"]))
-        clear_required_checks_observation(job)
-        for key in (
-            "candidate_sha",
-            "publication",
-            "publication_sha",
-            "acceptance_artifact",
-            "acceptance_record",
-            "publication_attempts",
-            "publication_thread_id",
-            "publication_operation_retry",
-            "last_publication_error",
-            "repair_source",
-            "ci_evidence",
-            "required_checks_origin",
-            "publication_authority",
-            "fallback_publication_receipt",
-            "deterministic_integration_record",
-            "next_attempt_kind",
-            "last_review_candidate_sha",
-            "final_ci_fix_failure_head",
-        ):
-            job.pop(key, None)
+        clear_stale_delivery_evidence(job)
         job.update(
             {
                 "base_sha": self.git.resolve(str(state["run_branch"])),

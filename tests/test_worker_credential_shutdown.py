@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import socket
 import threading
 import time
 from pathlib import Path
 
-from agent_run.worker_credentials import ReadCredential, WorkerCredentialChannel
+import pytest
+
+import agent_run.worker_credentials as worker_credentials
+from agent_run.worker_credentials import (
+    HostGitHubReadChannel,
+    ReadCredential,
+    WorkerCredentialChannel,
+)
 
 
 def test_close_during_retry_joins_renewal_without_another_backoff(
@@ -57,3 +65,39 @@ def test_close_during_retry_joins_renewal_without_another_backoff(
         credentials.close()
         if renewal_thread is not None:
             renewal_thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("provider", ["host", "app"])
+def test_close_reclaims_connection_waiting_for_an_incomplete_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    receiving = threading.Event()
+    original_receive = worker_credentials._receive_message
+
+    def receive(connection: socket.socket) -> object:
+        receiving.set()
+        return original_receive(connection)
+
+    monkeypatch.setattr(worker_credentials, "_receive_message", receive)
+    channel = (
+        HostGitHubReadChannel()
+        if provider == "host"
+        else WorkerCredentialChannel(lambda: "reader")
+    )
+    socket_path = tmp_path / "read.sock"
+    try:
+        channel.start(socket_path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(socket_path))
+            client.sendall(b"\x00")
+            assert receiving.wait(timeout=5)
+            server = channel._server_thread
+            channel.close()
+            assert server is not None and not server.is_alive()
+            assert client.recv(1) == b""
+        assert not socket_path.exists()
+    finally:
+        channel.close()

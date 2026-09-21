@@ -23,6 +23,7 @@ from agent_run.run_thread_identity import prior_thread_identities
 
 if TYPE_CHECKING:
     from agent_run.run_acceptance import RunAcceptanceEngine
+    from agent_run.run_repair_promotion import RunRepairPromotion
 
 
 class RunRepairJobRotationRequired(Exception):
@@ -172,8 +173,11 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
 class RunRepairPublisher(ChangeDeliveryPublisher):
     """Run Repair mutations behind the shared Publisher seam."""
 
-    def __init__(self, owner: RunAcceptanceEngine) -> None:
+    def __init__(
+        self, owner: RunAcceptanceEngine, promotion: RunRepairPromotion
+    ) -> None:
         self.owner = owner
+        self.promotion = promotion
 
     def commit_candidate(
         self, checkout: Path, job: dict[str, Any], attempt: int
@@ -318,12 +322,12 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
     def invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
-        self.owner._invalidate_stale_repair(state, job, checkout)
+        self.promotion.invalidate_stale(state, job, checkout)
 
     def after_merge(
         self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
     ) -> bool:
-        return self.owner._after_repair_merge(state, job, live)
+        return self.promotion.after_merge(state, job, live)
 
     def merge(
         self, state: dict[str, Any], job: dict[str, Any], publication: dict[str, Any]

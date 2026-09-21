@@ -33,7 +33,7 @@ class RunRepairPromotion:
     def __init__(self, owner: RunAcceptanceEngine) -> None:
         self.owner = owner
 
-    def _invalidate_stale_repair(
+    def invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         current_default = (
@@ -245,7 +245,7 @@ class RunRepairPromotion:
         job.pop("pending_attempt", None)
         self.owner._sync_repair_cycle_counters(self.owner._run_state(state), job)
 
-    def _complete_integration_reprepare(
+    def complete_integration_reprepare(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         superseded_candidate = job.get("integration_reprepare_candidate_sha")
@@ -333,7 +333,7 @@ class RunRepairPromotion:
             state, job, default_head_sha=self.owner._default_head(state)
         )
 
-    def _after_repair_merge(
+    def after_merge(
         self,
         state: dict[str, Any],
         job: dict[str, Any],
@@ -417,19 +417,19 @@ class RunRepairPromotion:
                 )
             )
         ):
-            self._invalidate_stale_repair(state, job, self.owner._repair_checkout(state))
+            self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
         if not self.owner._refresh_run_currentness(state):
             return False
         if not self._repair_trigger_is_current(state, job):
-            self._invalidate_stale_repair(state, job, self.owner._repair_checkout(state))
+            self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
         promoted = self.owner._candidate_promotion_record(state, job, integrated)
         if promoted is None:
             # A merged Candidate is not automatically an accepted Run.  Any
             # mismatch at this seam discards the Candidate and starts a fresh
             # Run Acceptance generation against the live authorities.
-            self._invalidate_stale_repair(state, job, self.owner._repair_checkout(state))
+            self.invalidate_stale(state, job, self.owner._repair_checkout(state))
             return False
         run = self.owner._run_state(state)
         prior = set(self.owner._string_list(job, "prior_reviewer_thread_ids"))

@@ -27,7 +27,7 @@ from agent_run.github import MergeOutcomeUnknownError
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.review_budget import ensure_budget, previous_review_context
-from agent_run.required_checks_observation import clear_required_checks_observation
+from agent_run.delivery_evidence import clear_stale_delivery_evidence
 
 
 class ParentDeliveryAdapter(ChangeDeliveryAdapter):
@@ -387,29 +387,8 @@ class ParentDeliveryLoop:
         base_branch = str(_mapping(state, "base")["branch"])
         base_sha = self.git.resolve(base_branch)
         self.git.reset_checkout_to_base(checkout, base_branch)
-        clear_required_checks_observation(job)
-        for key in (
-            "candidate_sha",
-            "publication",
-            "publication_sha",
-            "acceptance_artifact",
-            "acceptance_record",
-            "publication_attempts",
-            "publication_thread_id",
-            "publication_operation_retry",
-            "last_publication_error",
-            "approval_grant",
-            "repair_source",
-            "ci_evidence",
-            "required_checks_origin",
-            "publication_authority",
-            "fallback_publication_receipt",
-            "deterministic_integration_record",
-            "next_attempt_kind",
-            "last_review_candidate_sha",
-            "final_ci_fix_failure_head",
-        ):
-            job.pop(key, None)
+        clear_stale_delivery_evidence(job)
+        job.pop("approval_grant", None)
         job.update(
             {
                 "base_sha": base_sha,

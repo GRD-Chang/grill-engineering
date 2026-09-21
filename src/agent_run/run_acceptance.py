@@ -101,8 +101,8 @@ class RunAcceptanceEngine:
             if github is not None
             else None
         )
-        self._repair_lifecycle = RunRepairLifecycle(self)
         self._repair_promotion = RunRepairPromotion(self)
+        self._repair_lifecycle = RunRepairLifecycle(self, self._repair_promotion)
 
     def accept(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
@@ -490,16 +490,6 @@ class RunAcceptanceEngine:
     def _repair(self, state: dict[str, Any], run: dict[str, Any]) -> str:
         return self._repair_lifecycle._repair(state, run)
 
-    def _invalidate_stale_repair(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        self._repair_promotion._invalidate_stale_repair(state, job, checkout)
-
-    def _complete_integration_reprepare(
-        self, state: dict[str, Any], job: dict[str, Any], checkout: Path
-    ) -> None:
-        self._repair_promotion._complete_integration_reprepare(state, job, checkout)
-
     def _render_run_repair_pr_body(
         self, state: dict[str, Any], publication: dict[str, Any]
     ) -> str:
@@ -509,11 +499,6 @@ class RunAcceptanceEngine:
         self, checkout: Path, job: dict[str, Any], validation: Path
     ) -> None:
         self._repair_lifecycle._prepare_repair_validation(checkout, job, validation)
-
-    def _after_repair_merge(
-        self, state: dict[str, Any], job: dict[str, Any], live: dict[str, Any]
-    ) -> bool:
-        return self._repair_promotion._after_repair_merge(state, job, live)
 
     def _escalate_repair(
         self, state: dict[str, Any], job: dict[str, Any], code: str

@@ -5,15 +5,14 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
-import signal
 import shutil
 import subprocess
 import threading
-import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Mapping, Protocol, Sequence
 
+from agent_run.bounded_command import capture_command
 from agent_run.error_safety import bounded_error
 from agent_run.executor_environment import (
     DEFAULT_CARRIER_TTL_SECONDS,
@@ -1004,75 +1003,11 @@ def _run_bounded(arguments: list[str], *, max_output: int) -> _BoundedResult:
     except OSError as error:
         return _BoundedResult(1, "", bounded_error(str(error)))
 
-    stdout = bytearray()
-    stderr = bytearray()
-
-    stop_readers = threading.Event()
-
-    def drain(stream: object, destination: bytearray) -> None:
-        fileno = getattr(stream, "fileno", None)
-        if not callable(fileno):
-            return
-        try:
-            descriptor = fileno()
-            os.set_blocking(descriptor, False)
-            deadline: float | None = None
-            while True:
-                if stop_readers.is_set():
-                    # Drain buffered output, but escaped pipe holders cannot
-                    # extend cleanup indefinitely by keeping the pipe open.
-                    if deadline is None:
-                        deadline = time.monotonic() + 0.1
-                    if time.monotonic() >= deadline:
-                        return
-                try:
-                    chunk = os.read(descriptor, 64 * 1024)
-                except BlockingIOError:
-                    if deadline is not None:
-                        return
-                    stop_readers.wait(0.05)
-                    continue
-                if not chunk:
-                    return
-                destination.extend(chunk)
-                if len(destination) > max_output:
-                    del destination[:-max_output]
-        except OSError:
-            return
-
-    assert process.stdout is not None
-    assert process.stderr is not None
-    readers = (
-        threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
-    )
-    timed_out = False
-    try:
-        for reader in readers:
-            reader.start()
-        returncode = process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-    finally:
-        # Reap the owned group even when its leader exited successfully;
-        # descendants can otherwise keep the pipe readers alive indefinitely.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        cleanup_returncode = process.wait()
-        if timed_out:
-            returncode = cleanup_returncode
-        stop_readers.set()
-        for reader in readers:
-            if reader.ident is not None:
-                reader.join()
-        process.stdout.close()
-        process.stderr.close()
-    decoded_stdout = bytes(stdout).decode("utf-8", errors="replace")
-    decoded_stderr = bytes(stderr).decode("utf-8", errors="replace")
-    if timed_out:
+    result = capture_command(process, timeout=10, max_output=max_output)
+    decoded_stdout = result.stdout.decode("utf-8", errors="replace")
+    decoded_stderr = result.stderr.decode("utf-8", errors="replace")
+    if result.timed_out:
         decoded_stderr = bounded_error(
             decoded_stderr + "; systemd helper timed out"
         )
-    return _BoundedResult(returncode, decoded_stdout, decoded_stderr)
+    return _BoundedResult(result.returncode, decoded_stdout, decoded_stderr)

@@ -57,6 +57,7 @@ from agent_run.worker_sandbox import (
     _BoundedJsonlStream,
 )
 from agent_run.worker_credentials import (
+    HostGitHubReadChannel,
     InitialCredentialUnavailable,
     ReadCredential,
     WorkerCredentialChannel,
@@ -3507,8 +3508,9 @@ def test_worker_credential_channel_keeps_serving_after_a_bad_framed_request(
     assert result == {"returncode": 0, "stdout": "", "stderr": ""}
 
 
+@pytest.mark.parametrize("provider", ["host", "app"])
 def test_closing_credential_channel_terminates_active_gh_read(
-    tmp_path: Path,
+    tmp_path: Path, provider: str,
 ) -> None:
     executable = tmp_path / "hanging-gh"
     process_id_path = tmp_path / "gh.pid"
@@ -3522,10 +3524,16 @@ def test_closing_credential_channel_terminates_active_gh_read(
         encoding="utf-8",
     )
     executable.chmod(0o700)
-    credentials = WorkerCredentialChannel(
-        lambda: ReadCredential("reader", time.time() + 3600),
-        gh_executable=str(executable),
-        gh_environment={"GH_TEST_PID_PATH": str(process_id_path), "PATH": os.environ["PATH"]},
+    environment = {"GH_TEST_PID_PATH": str(process_id_path), "PATH": os.environ["PATH"]}
+    credentials = (
+        HostGitHubReadChannel(
+            gh_executable=str(executable), gh_environment=environment,
+        )
+        if provider == "host"
+        else WorkerCredentialChannel(
+            lambda: ReadCredential("reader", time.time() + 3600),
+            gh_executable=str(executable), gh_environment=environment,
+        )
     )
     worker = threading.Thread(
         target=lambda: credentials._request(  # noqa: SLF001 - lifecycle seam
