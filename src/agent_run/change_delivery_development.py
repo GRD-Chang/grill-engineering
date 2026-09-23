@@ -9,6 +9,10 @@ from uuid import uuid4
 from agent_run.agents import HumanBlockerResult
 from agent_run.artifacts import clear_current_human_blocker
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.ci_recovery_budget import (
+    ci_limits_for_job,
+    ci_repair_budget_context,
+)
 from agent_run.change_delivery_fallback import (
     preserve_required_checks_publication_authorization,
 )
@@ -105,9 +109,17 @@ def develop(
     request = stage.adapter.development_request(state, job, checkout)
     request["_prompt_resources"] = state["prompt_resources"]
     if request.get("repair_source") is not None:
-        request["review_budget_context"] = repair_budget_context(
-            job, stage.review_budget_policy()
-        )
+        if attempt_kind == "ci_repair":
+            _, inner_limit = ci_limits_for_job(job)
+            request["review_budget_context"] = ci_repair_budget_context(
+                job,
+                inner_limit=inner_limit,
+                is_ticket=stage.contract.label.startswith("ticket-"),
+            )
+        else:
+            request["review_budget_context"] = repair_budget_context(
+                job, stage.review_budget_policy()
+            )
     request["_invocation_event"] = stage._invocation_events(
         state,
         job,

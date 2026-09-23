@@ -105,6 +105,8 @@ _PAUSE_REASONS = {
     'modification_budget_exhausted',
     'published_head_mismatch',
     'review_budget_exhausted',
+    'ci_inner_budget_exhausted',
+    'ci_outer_budget_exhausted',
     'reviewer_requires_human',
     'unexpected_external_merge',
     '外部状态在本次监督窗口内未收敛',

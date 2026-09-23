@@ -12,6 +12,11 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
 )
 from agent_run.change_delivery_stage import ChangeDeliveryStage
+from agent_run.ci_recovery_budget import (
+    checkpoint_after_reviewer_failure,
+    ci_limits_for_job,
+    ci_reviewer_budget_context,
+)
 from agent_run.change_delivery_state import require_mapping as _mapping
 from agent_run.change_delivery_threads import record_reviewer as _record_reviewer
 from agent_run.credential_availability import clear_initial_credential_wait
@@ -62,12 +67,28 @@ def review(
     try:
         stage.publisher.prepare_validation(checkout, job, validation)
         request = stage.adapter.review_request(state, job, validation)
+        if job.get("attempt_kind") == "ci_repair":
+            recovery = job.get("ci_recovery")
+            records = recovery.get("review_artifacts") if isinstance(recovery, dict) else None
+            if isinstance(records, list) and records:
+                previous = records[-1]
+                if isinstance(previous, dict):
+                    request["previous_acceptance_artifact"] = previous.get("artifact")
+                    request["previous_review_identity"] = previous.get("review_identity")
         request["_prompt_resources"] = state["prompt_resources"]
-        request["review_budget_context"] = reviewer_budget_context(
-            job,
-            stage.review_budget_policy(),
-            current_attempt_consumed=semantic_attempt.get("budget_consumed") is True,
-        )
+        if job.get("attempt_kind") == "ci_repair":
+            _, inner_limit = ci_limits_for_job(job)
+            request["review_budget_context"] = ci_reviewer_budget_context(
+                job,
+                inner_limit=inner_limit,
+                is_ticket=stage.contract.label.startswith("ticket-"),
+            )
+        else:
+            request["review_budget_context"] = reviewer_budget_context(
+                job,
+                stage.review_budget_policy(),
+                current_attempt_consumed=semantic_attempt.get("budget_consumed") is True,
+            )
         if semantic_attempt.get("budget_consumed") is True:
             request.pop("previous_acceptance_artifact", None)
             request.pop("previous_review_identity", None)
@@ -148,7 +169,11 @@ def complete_review(
         job.pop("ci_evidence", None)
         job.pop("final_ci_fix_failure_head", None)
     clear_required_checks_observation(job)
-    budget = job.get("review_budget")
+    budget = (
+        job.get("ci_recovery")
+        if job.get("attempt_kind") == "ci_repair"
+        else job.get("review_budget")
+    )
     review_facts: dict[str, Any] = {}
     if isinstance(budget, dict):
         candidate_sha = str(job["candidate_sha"])
@@ -201,11 +226,17 @@ def complete_review(
             # against the same Candidate.  Its new Artifact supersedes the
             # blocked result; the raw blocker remains in human_blocker_history.
             budget["review_artifacts"][matching_index] = review_record
+        # Keep the recent full artifacts used as Reviewer context. The durable
+        # invocation count and semantic attempt history retain older audit facts.
         del budget["review_artifacts"][: -stage.review_budget_policy().review_limit]
     job["last_review_candidate_sha"] = str(job["candidate_sha"])
     job["acceptance_record"] = stage.adapter.acceptance_record(
         state, job, reviewer_thread_id, artifact.raw
     )
+    if artifact.is_accepted and job.get("attempt_kind") == "ci_repair":
+        job["publication_authority"] = "accepted"
+        job.pop("fallback_publication_receipt", None)
+        job.pop("ci_repair_publication_receipt", None)
     if not artifact.is_accepted:
         job["repair_source"] = "acceptance"
     job.pop("pending_review_result", None)
@@ -249,6 +280,19 @@ def complete_review(
         )
     if artifact.is_accepted:
         job["phase"] = "accepted"
+    elif job.get("attempt_kind") == "ci_repair":
+        outer_limit, inner_limit = ci_limits_for_job(job)
+        if checkpoint_after_reviewer_failure(
+            job,
+            outer_limit=outer_limit,
+            inner_limit=inner_limit,
+            is_ticket=stage.contract.label.startswith("ticket-"),
+        ):
+            job["phase"] = "escalating"
+            job["escalation_code"] = "ci_inner_budget_exhausted"
+        else:
+            job["phase"] = "repairing"
+            job["next_attempt_kind"] = "ci_repair"
     elif (
         not stage.review_budget_policy().fallback
         and stage.review_budget_exhausted_for_review(job)

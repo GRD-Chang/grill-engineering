@@ -9,6 +9,9 @@ from agent_run.ticket_acceptance_contract import (
 from agent_run.ticket_fallback_contract import (
     _require_fallback_integration_authorization,
 )
+from agent_run.ticket_ci_repair_contract import (
+    require_ci_repair_publication_authorization,
+)
 from agent_run.required_checks_observation import (
     require_required_checks_observation,
     validate_legacy_required_checks_projection,
@@ -56,6 +59,24 @@ def require_active_ticket_publication_authorization(
                 f"incompatible_run_state: {location}.{key} is invalid before publication"
             )
     authority = job.get("publication_authority")
+    if authority == "ci_repair":
+        require_ci_repair_publication_authorization(
+            job.get("ci_repair_publication_receipt"),
+            job,
+            location=location,
+            candidate_tree=candidate_tree,
+            require_publication_facts=phase in _PUBLISHED_TICKET_AUTHORITY_PHASES,
+        )
+        validate_legacy_required_checks_projection(
+            job,
+            location=location,
+            observation=job.get("required_checks_evidence"),
+        )
+        return
+    if job.get("ci_repair_publication_receipt") is not None:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location} mixes CI repair with another publication authority"
+        )
     if authority == "fallback":
         if job.get("acceptance_record") is not None:
             raise IncompatibleRunStateError(

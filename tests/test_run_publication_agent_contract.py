@@ -824,7 +824,7 @@ def test_retries_publication_operation_without_a_fresh_narrative_agent(
     assert retried["run_publication"]["publication_attempts"] == 1
     assert retried["run_publication"]["publication_operation_retry"]["attempts"] == 1
 
-def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> None:
+def test_closed_final_pr_stays_blocked_after_fresh_acceptance(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)
     publisher.data["delivery"]["crash_after_ensure_run_pr_once"] = True
     engine = RunPublicationEngine(
@@ -863,32 +863,27 @@ def test_closed_final_pr_is_replaced_after_fresh_acceptance(git_repo: Path) -> N
         github=publisher,
         default_head_sha=git.resolve("main"),
     ).accept(str(state["run_id"]))
-    recovered = RunPublicationEngine(
+    resumed_agents = RunPublicationAgents()
+    resumed_engine = RunPublicationEngine(
         git=git,
         states=states,
-        agents=RunPublicationAgents(),
+        agents=resumed_agents,
         github=publisher,
         default_branch="main",
         default_head_sha=git.resolve("main"),
-    ).publish(str(state["run_id"]))
+    )
+    recovered = resumed_engine.publish(str(state["run_id"]))
 
     assert fresh["run_acceptance"]["phase"] == "accepted"
-    attempts = recovered["run_publication"]["semantic_attempt_history"]
-    assert [attempt["ordinal"] for attempt in attempts] == [1, 2]
-    assert attempts[0]["attempt_id"] == prior_attempt["attempt_id"]
-    assert attempts[0]["publication_operation_retry"] == {
-        "attempts": 1,
-        "limit": 5,
-    }
-    assert attempts[1]["attempt_id"] != attempts[0]["attempt_id"]
-    assert (
-        recovered["run_publication"]["pr_number"]
-        != published["run_publication"]["pr_number"]
-    )
-    assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == [
-        "CLOSED",
-        "OPEN",
-    ]
+    assert recovered["status"] == "ready_for_human"
+    assert recovered["diagnostics"][0]["code"] == "final_run_pr_closed"
+    assert recovered["run_publication"]["phase"] == "ready_for_human"
+    assert recovered["run_publication"]["pr_number"] == published["run_publication"]["pr_number"]
+    assert recovered["run_publication"]["semantic_attempt_history"][0]["attempt_id"] == prior_attempt["attempt_id"]
+    assert resumed_agents.requests == []
+    assert [pull["state"] for pull in publisher.data["delivery"]["pull_requests"]] == ["CLOSED"]
+    assert resumed_engine.publish(str(state["run_id"]))["status"] == "ready_for_human"
+    assert len(publisher.data["delivery"]["pull_requests"]) == 1
 
 def test_revise_is_rejected_outside_a_human_gate(git_repo: Path) -> None:
     state, states, git, publisher = _accepted_run(git_repo)

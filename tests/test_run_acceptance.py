@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from support.run_artifacts import _canonical_run_budget, _BLOCKED_EVIDENCE, _candidate_finding_artifact, _failed_invocation, _human_artifact, _passing_artifact, _repair_artifact
-from support.run_scenarios import _completed_run
+from support.run_scenarios import _completed_run, save_run_with_ci_fixture
 
 import json
 import subprocess
@@ -228,7 +228,7 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
         integration_record["review_budget"]
     )
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     class InvocationReviewer:
         def __init__(self) -> None:
@@ -285,7 +285,7 @@ def test_run_repair_review_budget_stops_at_r_n_plus_one_without_development_n_pl
     state, states, git = _completed_run(git_repo)
     policy = DeliveryPolicy(run_repair_rounds=1)
     state["policy_snapshot"] = policy.snapshot()
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     agents = ScriptedRunAgents()
     agents._reviews = [_repair_artifact(), _candidate_finding_artifact()]
@@ -325,7 +325,7 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
         "reviewer_thread_ids": [],
     }
     state["run_acceptance"] = run
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     agents = ScriptedRunAgents()
     agents._reviews = [_passing_artifact()]
     engine = RunAcceptanceEngine(
@@ -361,7 +361,7 @@ def test_merge_preflight_conflict_does_not_consume_a_reviewer_ordinal(
             "diagnostics": [],
         }
     )
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     assert engine._review(state, run)
     assert run["validation_attempts"] == 3
@@ -374,7 +374,7 @@ def test_run_acceptance_rejects_completed_ticket_without_integration_record(
 ) -> None:
     state, states, _git = _completed_run(git_repo)
     state["ticket_jobs"]["2"].pop("deterministic_integration_record")
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     state_before = deepcopy(states.load_run(str(state["run_id"])))
 
     with pytest.raises(
@@ -397,7 +397,7 @@ def test_run_acceptance_cli_reports_incompatible_missing_integration_record(
     repo = workspace.repository_root
     state, states, _git = _completed_run(repo, state_root=workspace.state_root)
     state["ticket_jobs"]["2"].pop("deterministic_integration_record")
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     state_before = deepcopy(states.load_run(str(state["run_id"])))
 
     result = run_cli(
@@ -467,7 +467,7 @@ def test_completed_ticket_integration_record_rejects_source_evidence_drift(
         record["pr"]["head_sha"] = "different-head"
     else:
         record["required_checks_evidence"]["result"] = "pass"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(
         IncompatibleRunStateError, match="deterministic_integration_record"
@@ -499,7 +499,7 @@ def test_completed_ticket_integration_record_rejects_empty_nested_authorization(
         state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
             record["review_budget"]
         )
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(
         IncompatibleRunStateError,
@@ -524,7 +524,7 @@ def test_completed_ticket_integration_record_rejects_nested_boundary_drift(
     record["acceptance_record"]["reviewed_candidate_sha"] = "foreign-candidate"
     _set_integration_record(state["ticket_jobs"]["2"], record)
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(record["review_budget"])
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(
         IncompatibleRunStateError, match="acceptance_record boundary"
@@ -548,7 +548,7 @@ def test_completed_ticket_acceptance_authorization_requires_a_passing_artifact(
     )
     _set_integration_record(state["ticket_jobs"]["2"], record)
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(record["review_budget"])
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="artifact must be pass"):
         RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
@@ -577,7 +577,7 @@ def test_completed_accepted_ticket_binds_review_budget_authorization(
     else:
         record["review_budget"] = {}
         expected = "review budget is not bound"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match=expected):
         RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
@@ -797,7 +797,7 @@ def test_completed_ticket_fallback_receipt_requires_complete_audit_facts(
     )
     record["fallback_receipt"][field] = value
     _set_integration_record(state["ticket_jobs"]["2"], record)
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="fallback_receipt"):
         RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
@@ -816,7 +816,7 @@ def test_completed_ticket_integration_record_binds_the_real_integrated_sha(
         ] = "foreign-integrated-sha"
     else:
         state["ticket_jobs"]["2"]["integrated_sha"] = "foreign-integrated-sha"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="integrated_sha"):
         RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
@@ -851,7 +851,7 @@ def test_completed_ticket_integration_record_rejects_nested_role_drift(
         state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
             record["review_budget"]
         )
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="scope|kind"):
         RunAcceptanceEngine(git=git, states=states, agents=object()).accept(
@@ -882,7 +882,7 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
     thread_id = "run-repair-development-thread"
     thread_history = ["run-repair-development-thread-old-turn"]
     exhausted_budget = _canonical_run_budget()
-    exhausted_budget["reviewer_invocations"] = 11
+    exhausted_budget["reviewer_invocations"] = 4
     state["run_acceptance"] = {
         "phase": "ready_for_human",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
@@ -910,7 +910,7 @@ def test_run_repair_resume_reuses_the_repair_development_thread(
         },
     }
     state["status"] = "ready_for_human"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     assert _resume_review_budget_window(state)
     run = state["run_acceptance"]
@@ -974,7 +974,7 @@ def test_run_acceptance_execution_failure_resumes_selected_thread(
         "active_agent_invocation"
     ]["semantic_attempt"]
     state["status"] = "execution_failed"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
@@ -1018,7 +1018,7 @@ def test_second_reviewer_attempt_keeps_the_run_acceptance_generation(
         "active_agent_invocation"
     ]["semantic_attempt"]
     state["status"] = "execution_failed"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
@@ -1073,7 +1073,7 @@ def test_resume_rejects_stale_run_invocation_before_agent_start(
         "semantic_attempt"
     ]
     state["status"] = "execution_failed"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
@@ -1258,7 +1258,7 @@ def test_parent_drift_immediately_stales_completed_run_acceptance(
         }
     )
     accepted["run_publication"] = {"phase": "pending"}
-    states.save_run(str(state["run_id"]), accepted)
+    save_run_with_ci_fixture(states, str(state["run_id"]), accepted)
     fixture = git_repo / "github.json"
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["body"] = "Updated after all Tickets completed."
@@ -1339,7 +1339,7 @@ def test_run_acceptance_new_thread_resume_omits_failed_reviewer_thread(
         "active_agent_invocation"
     ]["semantic_attempt"]
     state["status"] = "execution_failed"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     resumed, _ = Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
@@ -1679,7 +1679,7 @@ def test_run_acceptance_human_resume_uses_selected_thread_and_clears_current_blo
     assert "previous_review_identity" not in agents.requests[1]
     assert agents.requests[1]["review_budget_context"] == {
         "current_review_attempt": 1,
-        "remaining_review_attempts": 10,
+            "remaining_review_attempts": 3,
     }
     run = accepted["run_acceptance"]
     assert run["reviewer_thread_ids"] == (
@@ -1726,7 +1726,7 @@ def test_run_acceptance_human_resume_rejects_an_older_reviewer_thread(
     blocked = engine.accept(str(state["run_id"]))
     run = blocked["run_acceptance"]
     run["reviewer_thread_ids"].insert(0, "older-reviewer")
-    states.save_run(str(state["run_id"]), blocked)
+    save_run_with_ci_fixture(states, str(state["run_id"]), blocked)
     Controller(
         FixtureGitHubReader(git_repo / "github.json"), git, states
     ).resume(str(state["run_id"]), resume_human_blocker=True)

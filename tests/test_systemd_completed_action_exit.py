@@ -13,6 +13,7 @@ import pytest
 from support.workspace import managed_repo, managed_state
 
 from agent_run.executor_host import ExecutorSpec, ExecutorStartUnknownError
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.cli_presentation import human_next_action_for_state
 from agent_run.git import GitRepository
 from agent_run.review_budget import new_budget
@@ -62,6 +63,7 @@ def completed_action(
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": {**new_budget(), "development_attempts": 1},
         "review_budget_history": [],
+        "ci_recovery": new_ci_recovery_budget(),
     }
     checkout = states.root / "worktrees" / run_id / "parent"
     GitRepository(managed_repo(git_repo)).prepare_ticket_checkout(

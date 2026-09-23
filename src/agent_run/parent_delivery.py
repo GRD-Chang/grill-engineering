@@ -2,13 +2,15 @@ from __future__ import annotations
 
 """Parent-only delivery using the shared candidate-first change lifecycle."""
 
-from pathlib import Path
+import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.approval_grant import create_grant, grant_matches
 from agent_run.change_delivery import ensure_change_branch_authority
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_cleanup import (
     DeliveryCleanupEngine,
     remove_run_worktrees,
@@ -67,14 +69,7 @@ class ParentDeliveryEngine:
             checkout, str(job["parent_branch"])
         )
         try:
-            ensure_change_branch_authority(
-                github=self.github,
-                state=state,
-                job=job,
-                branch=str(job["parent_branch"]),
-                base_branch=str(_mapping(state, "base")["branch"]),
-                save=self._save,
-            )
+            self._ensure_branch_for_fixed_baseline(state, job)
             self.git.prepare_ticket_checkout(
                 branch=str(job["parent_branch"]),
                 base_sha=str(job["base_sha"]),
@@ -247,6 +242,40 @@ class ParentDeliveryEngine:
             raise ValueError("Delivery Run is not Parent-only")
         return state
 
+    def _ensure_branch_for_fixed_baseline(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        branch = str(job["parent_branch"])
+        base_branch = str(_mapping(state, "base")["branch"])
+        source, _target = self.github.live_branch_heads(branch, base_branch)
+        expected = str(job.get("published_sha") or job["base_sha"])
+        pending = job.get("ticket_write_intent")
+        if (
+            source is not None
+            and source != expected
+            and re.fullmatch(r"[0-9a-f]{40,64}", source) is not None
+            and (pending is None or (
+                isinstance(pending, dict)
+                and pending.get("action") == "ensure_change_branch"
+            ))
+        ):
+            self.git.fetch_remote_commit(branch, source)
+            if self.git.is_ancestor(str(job["base_sha"]), source):
+                # The original ref creation is already visible. Ordinary
+                # collaborator commits belong to the post-demand integration.
+                if isinstance(pending, dict):
+                    job.pop("ticket_write_intent", None)
+                    self._save(state)
+                return
+        ensure_change_branch_authority(
+            github=self.github,
+            state=state,
+            job=job,
+            branch=branch,
+            base_branch=base_branch,
+            save=self._save,
+        )
+
     def _job(self, state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("parent_job")
         parent = _mapping(state, "parent")
@@ -278,6 +307,7 @@ class ParentDeliveryEngine:
             "policy_snapshot": policy_snapshot_for_state(state),
             "review_budget": new_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
         state["parent_job"] = job
         self._save(state)
@@ -322,6 +352,12 @@ class ParentDeliveryEngine:
             "next_attempt_kind",
             "last_review_candidate_sha",
             "final_ci_fix_failure_head",
+            "parent_integration",
+            "parent_integration_history",
+            "parent_integration_conflict",
+            "parent_integration_history_rewrite",
+            "parent_integration_stage",
+            "previous_parent_acceptance_record",
         ):
             job.pop(key, None)
         job.update(

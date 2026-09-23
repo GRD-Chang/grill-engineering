@@ -17,6 +17,7 @@ from agent_run.semantic_attempt import semantic_attempt_subjects
 
 from agent_run.messages import text, display_language, presentation_language, selected_language
 from agent_run.artifacts import AcceptanceArtifact
+from agent_run.ci_recovery_budget import ci_limits_for_job
 from agent_run.delivery_policy import (
     parent_only_budget_policy_for_job,
     run_repair_budget_policy_for_job,
@@ -160,6 +161,7 @@ def _print_status(
             "pr_number": current_identity.get("pr_number"),
             "review_budget": review_budget,
             "integration_resync": _public_integration_resync(state),
+            "ci_recovery": _public_ci_recovery(state),
             "elapsed_seconds": run_elapsed_seconds(state),
             "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
             "next_action": (
@@ -631,6 +633,35 @@ def _public_integration_resync(state: dict[str, object]) -> dict[str, object] | 
     if not isinstance(budget, dict):
         return None
     return {key: budget.get(key) for key in ("generation", "window", "used", "limit", "open")}
+
+
+def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    location, subject = current
+    if location == "run_publication":
+        acceptance = state.get("run_acceptance")
+        if not isinstance(acceptance, dict):
+            return None
+        subject = acceptance
+    budget = subject.get("ci_recovery")
+    if not isinstance(budget, dict):
+        return None
+    outer_limit, inner_limit = ci_limits_for_job(subject)
+    return {
+        "outer_window": budget.get("outer_window"),
+        "rounds_used": budget.get("rounds_used"),
+        "rounds_limit": outer_limit,
+        "inner_window": budget.get("inner_window"),
+        "repairs_used": budget.get("repairs_used"),
+        "repairs_limit": (
+            1 if location.startswith("ticket:") and budget.get("review_required") is False
+            else inner_limit
+        ),
+        "review_required": budget.get("review_required"),
+        "checkpoint_reason": budget.get("checkpoint_reason"),
+    }
 
 
 def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:

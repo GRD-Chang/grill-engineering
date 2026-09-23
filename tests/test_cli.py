@@ -21,6 +21,7 @@ import agent_run.doctor as doctor
 from agent_run.agent_invocation import invocation_event_recorder
 from agent_run.cli import build_parser, main
 from agent_run.controller import Controller
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_history import history_records
 from agent_run.delivery_status import _status_style
 from agent_run.execution_timing import invocation_execution_seconds
@@ -5432,6 +5433,7 @@ def test_completed_invocation_remains_a_readable_audit_snapshot(
                 "validation_attempts": 1,
                 "review_budget": _canonical_run_budget(),
                 "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
             },
             "active_agent_invocation": {
                 **failed_invocation(
@@ -5555,6 +5557,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "human_blockers": ["Need maintainer input."],
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "ci_recovery": new_ci_recovery_budget(),
+                    "policy_snapshot": deepcopy(current["policy_snapshot"]),
                 },
             },
             "agent-run resume 1 --repo example/project",
@@ -5585,6 +5589,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "phase": "developing",
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "ci_recovery": new_ci_recovery_budget(),
+                    "policy_snapshot": deepcopy(state["policy_snapshot"]),
                     "pending_semantic_attempt": deepcopy(
                         invocation["semantic_attempt"]
                     ),
@@ -5598,6 +5604,8 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
                     "phase": "developing",
                     "review_budget": _canonical_run_budget(),
                     "review_budget_history": [],
+                    "ci_recovery": new_ci_recovery_budget(),
+                    "policy_snapshot": deepcopy(state["policy_snapshot"]),
                 }
             )
             state["active_ticket_job"] = deepcopy(state["ticket_jobs"]["2"])
@@ -5612,7 +5620,7 @@ def test_status_prints_the_recovery_command_for_manual_boundaries(
 
         result = invoke_cli_inprocess(git_repo, fixture, "status", run_id, "--json")
 
-        assert result.returncode == 0
+        assert result.returncode == 0, result.stdout
         assert stdout_json(result)["next_action"] == expected_action
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from support.run_artifacts import _canonical_run_budget, _candidate_finding_artifact, _passing_artifact, _repair_artifact
-from support.run_scenarios import _completed_run, _accepted_run
+from support.run_scenarios import _completed_run, _accepted_run, save_run_with_ci_fixture
 
 import subprocess
 import json
@@ -433,16 +433,19 @@ def test_run_repair_default_drift_during_development_preserves_next_attempt(
     assert not checkout.exists()
 
 @pytest.mark.parametrize(
-    ("candidate_requires_more_repair", "thread_policy"),
-    [(False, "reuse"), (True, "reuse"), (True, "new-per-attempt")],
+    ("candidate_requires_more_repair", "thread_policy", "resync_limit"),
+    [(False, "reuse", 0), (False, "reuse", 1),
+     (True, "reuse", 1), (True, "new-per-attempt", 1)],
 )
 def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
-    git_repo: Path, candidate_requires_more_repair: bool, thread_policy: str
+    git_repo: Path, candidate_requires_more_repair: bool,
+    thread_policy: str, resync_limit: int,
 ) -> None:
     workspace = prepare_workspace(git_repo)
     repo = workspace.repository_root
     state, states, git = _completed_run(repo, state_root=workspace.state_root)
     state.setdefault("policy_snapshot", {})["development_thread_policy"] = thread_policy
+    state["policy_snapshot"]["integration_resync_limit"] = resync_limit
     states.save_run(str(state["run_id"]), state)
     successor_thread = (
         "run-repair-successor" if thread_policy == "new-per-attempt"
@@ -521,6 +524,18 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
 
     run = first["run_acceptance"]
     repair_checkout = states.root / "worktrees" / str(state["run_id"]) / "run-repair"
+    if resync_limit == 0:
+        assert first["status"] == "ready_for_human"
+        assert run["blocked_reason"] == "integration_resync_exhausted"
+        assert run["integration_resync"]["window"] == 1
+        assert run["integration_resync"]["used"] == 0
+        assert run["repair_job"]["default_base_sha"] == initial_default
+        assert run["repair_job"]["integrated_sha"] == git.resolve(str(state["run_branch"]))
+        assert run["repair_job"]["modification_attempts"] == 1
+        assert run["ci_recovery"]["rounds_used"] == 0
+        assert len(first_agents.review_requests) == 2
+        assert states.load_current_run(str(state["run_id"])) == first
+        return
     assert first["status"] == "run_acceptance_pending", first
     job = run["repair_job"]
     generation = run["repair_generation"]
@@ -532,7 +547,13 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     merged_publication_sha = job["publication_sha"]
     assert run["repair_cycle"]["status"] == "active"
     assert run["repair_cycle"]["code_modification_attempts"] == 1
+    assert run["repair_cycle"]["generation"] == generation
+    assert job["review_budget"]["window"] == run["review_budget"]["window"] == 2
+    assert job["review_budget"]["reviewer_invocations"] == 0
+    assert job["review_budget_history"][-1]["modification_attempts"] == 1
     assert repair_checkout.exists()
+
+    first_ci_budget = deepcopy(run["ci_recovery"])
 
     first_agents._reviews = (
         [_repair_artifact(), _passing_artifact()]
@@ -547,6 +568,11 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
         default_head_sha=git.resolve("main"),
         currentness_reader=FixtureGitHubReader(fixture),
     ).accept(str(state["run_id"]))
+
+    assert second["run_acceptance"]["integration_resync"]["used"] == 1
+    assert second["run_acceptance"]["integration_resync"]["window"] == 2
+    assert second["run_acceptance"]["integration_resync"]["open"] is False
+    assert second["run_acceptance"]["ci_recovery"] == first_ci_budget
 
     assert second["status"] == "run_publication_pending"
     assert second["run_acceptance"]["phase"] == "accepted"
@@ -650,6 +676,95 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     ):
         assert internal_field not in history.stdout
 
+def test_exhausted_run_repair_budget_gets_new_review_after_external_resync(
+    git_repo: Path,
+) -> None:
+    workspace = prepare_workspace(git_repo)
+    repo = workspace.repository_root
+    state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    fixture = repo / "github.json"
+    original_default = git.resolve("main")
+
+    class AdvancingDefaultPublisher(FixtureGitHubPublisher):
+        def sync_run_branch(self, *, run_branch: str, integrated_sha: str) -> None:
+            super().sync_run_branch(run_branch=run_branch, integrated_sha=integrated_sha)
+            (repo / "advanced-main.txt").write_text("new default\n", encoding="utf-8")
+            subprocess.run(["git", "add", "advanced-main.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "advance main after repair"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            data = json.loads(fixture.read_text(encoding="utf-8"))
+            data["default_head_sha"] = git.resolve("main")
+            fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    class ExhaustingAgents(ScriptedRunAgents):
+        def __init__(self) -> None:
+            super().__init__()
+            self._reviews = [
+                _repair_artifact(), _candidate_finding_artifact(),
+                _candidate_finding_artifact(), _passing_artifact(),
+                _passing_artifact(),
+            ]
+
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            self.development_requests.append(request)
+            (Path(str(request["checkout"])) / "run-repair.txt").write_text(
+                f"repair {len(self.development_requests)}\n", encoding="utf-8"
+            )
+            return DevelopmentResult(
+                thread_id="run-repair-developer", summary="Updated the Run repair."
+            )
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            self.review_requests.append(request)
+            return ReviewResult(
+                thread_id=f"run-reviewer-{len(self.review_requests)}",
+                artifact=self._reviews.pop(0),
+            )
+
+    agents = ExhaustingAgents()
+    first = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
+        github=AdvancingDefaultPublisher(fixture, git),
+        default_head_sha=original_default,
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    run = first["run_acceptance"]
+    job = run["repair_job"]
+    assert first["status"] == "run_acceptance_pending"
+    assert len(agents.review_requests) == 4
+    assert len(agents.development_requests) == 3
+    assert run["integration_resync"]["window"] == 2
+    assert run["integration_resync"]["used"] == 1
+    assert run["review_budget"]["window"] == job["review_budget"]["window"] == 2
+    assert run["review_budget"]["reviewer_invocations"] == 0
+    assert job["review_budget"]["reviewer_invocations"] == 0
+    assert run["review_budget_history"][-1]["review_budget"]["reviewer_invocations"] == 4
+    assert job["review_budget_history"][-1]["review_budget"]["development_attempts"] == 3
+    assert job["candidate_sha"]
+    assert run["repair_cycle"]["status"] == "active"
+    ci_before = deepcopy(run["ci_recovery"])
+    assert states.load_current_run(str(state["run_id"])) == first
+
+    second = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+        default_head_sha=git.resolve("main"),
+        currentness_reader=FixtureGitHubReader(fixture),
+    ).accept(str(state["run_id"]))
+
+    assert second["status"] == "run_publication_pending"
+    assert second["run_acceptance"]["phase"] == "accepted"
+    assert len(agents.review_requests) == 5
+    assert second["run_acceptance"]["review_budget"]["window"] == 2
+    assert second["run_acceptance"]["review_budget"]["reviewer_invocations"] == 1
+    assert second["run_acceptance"]["integration_resync"]["used"] == 1
+    assert second["run_acceptance"]["ci_recovery"] == ci_before
+    assert states.load_current_run(str(state["run_id"])) == second
+
+
 def test_run_repair_required_check_default_drift_revalidates_same_cycle(
     git_repo: Path,
 ) -> None:
@@ -694,7 +809,7 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
             ),
         },
     }
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     initial_default = git.resolve("main")
 
     class DefaultDriftingAfterMergePublisher(FixtureGitHubPublisher):
@@ -737,8 +852,8 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
             status = stdout_json(json_status)
             assert status["phase"] == "developing"
             assert status["worker"]["role"] == "运行修复开发工作代理"
-            assert status["review_budget"]["development_limit"] == 10
-            assert status["review_budget"]["reviewer_limit"] == 11
+            assert status["review_budget"]["development_limit"] == 3
+            assert status["review_budget"]["reviewer_limit"] == 4
             assert status["progress"]["phase"] == "developing"
             assert status["progress"]["current_object"] == "Run Acceptance"
             assert status["progress"]["round_progress"]["development_label"] == (
@@ -750,8 +865,9 @@ def test_run_repair_required_check_default_drift_revalidates_same_cycle(
                 "最近 Agent: 开发 Agent · 整体验收"
                 in text_status.stdout
             )
-            assert "本次授权已用：开发 1 / 10 次" in text_status.stdout
-            assert "验收 0 / 11 次" in text_status.stdout
+            assert "本次授权已用：开发 0 / 3 次" in text_status.stdout
+            assert "验收 0 / 4 次" in text_status.stdout
+            assert "CI 外层窗口 1：轮数 1/3；内层窗口 1：修复 1/3" in text_status.stdout
             assert "等待人工批准" not in text_status.stdout
             assert "当前对象:   整体交付" not in text_status.stdout
 
@@ -929,7 +1045,7 @@ def test_required_check_repair_promotion_clears_old_observation_and_archives_pro
             "ci_evidence": failure_evidence,
         },
     }
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     repair_agents = ScriptedRunAgents()
     repair_agents._reviews = [_passing_artifact()]

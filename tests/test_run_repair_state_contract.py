@@ -17,9 +17,26 @@ from agent_run.state_contract import (
     IncompatibleRunStateError,
     require_current_run_state,
 )
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from support.environment import _apply_test_environment
 from support.seeding import seed_run, write_fixture
 from support.cli import issue, load_only_run_state, run_cli, stdout_json
+
+
+def _with_canonical_ci_budget(state: dict[str, Any]) -> dict[str, Any]:
+    """Keep these repair-mode fixtures valid under the independent CI contract."""
+
+    run = state.get("run_acceptance")
+    if isinstance(run, dict):
+        run.setdefault("ci_recovery", new_ci_recovery_budget())
+        repair = run.get("repair_job")
+        if isinstance(repair, dict):
+            repair.setdefault("ci_recovery", deepcopy(run["ci_recovery"]))
+    return state
+
+
+def _require_repair_state(state: dict[str, Any]) -> None:
+    require_current_run_state(_with_canonical_ci_budget(state))
 
 
 @pytest.fixture(scope="module")
@@ -35,7 +52,7 @@ def _valid_run_state_template(
         fixture = write_fixture(repo / "github.json", issues={"2": issue(2)})
         seed_run(repo, fixture, "1")
         state = load_only_run_state(repo)
-        require_current_run_state(state)
+        _require_repair_state(state)
     return state
 
 
@@ -77,6 +94,7 @@ def test_resume_rejects_noncanonical_run_repair_mode_before_mutation(
         "repair_job": repair_job,
     }
     state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+    _with_canonical_ci_budget(state)
     state_path.write_text(json.dumps(state), encoding="utf-8")
     state_before = deepcopy(state)
     fixture_before = fixture.read_text(encoding="utf-8")
@@ -123,7 +141,7 @@ def test_canonical_run_repair_modes_pass_state_validation(
         },
     }
 
-    require_current_run_state(state)
+    _require_repair_state(state)
 
 
 @pytest.mark.parametrize("missing", ["run_acceptance", "repair_job"])
@@ -152,7 +170,7 @@ def test_run_repair_snapshot_is_required_for_materialized_projections(
         del state["run_acceptance"]["repair_job"]["policy_snapshot"]
 
     with pytest.raises(IncompatibleRunStateError, match="invalid .*policy_snapshot"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_old_run_policy_snapshot_is_incompatible_without_inference(
@@ -164,7 +182,7 @@ def test_old_run_policy_snapshot_is_incompatible_without_inference(
     state["policy_snapshot"] = old_snapshot
 
     with pytest.raises(IncompatibleRunStateError, match="invalid Policy Snapshot"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_old_run_review_history_without_policy_snapshot_is_incompatible(
@@ -192,7 +210,7 @@ def test_old_run_review_history_without_policy_snapshot_is_incompatible(
     with pytest.raises(
         IncompatibleRunStateError, match="invalid canonical run_acceptance.review_budget"
     ):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_run_repair_budget_window_must_match_run_acceptance(
@@ -217,7 +235,7 @@ def test_run_repair_budget_window_must_match_run_acceptance(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="Budget Windows"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_run_repair_cannot_use_ticket_fallback_authority(
@@ -240,7 +258,7 @@ def test_run_repair_cannot_use_ticket_fallback_authority(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="fallback Publication Authority"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_direct_state_validation_rejects_missing_active_run_repair_mode(
@@ -261,7 +279,7 @@ def test_direct_state_validation_rejects_missing_active_run_repair_mode(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="repair_mode"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_waiting_run_repair_requires_an_exact_head_observation(
@@ -285,7 +303,7 @@ def test_waiting_run_repair_requires_an_exact_head_observation(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="required_checks_evidence"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_legacy_projection_conflict_is_rejected_by_state_validation(
@@ -315,7 +333,7 @@ def test_legacy_projection_conflict_is_rejected_by_state_validation(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="conflicts with Observation"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 @pytest.mark.parametrize(
@@ -356,7 +374,7 @@ def test_state_contract_rejects_required_checks_result_bucket_contradictions(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="result conflicts"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def test_fallback_receipt_observation_without_job_observation_is_incompatible(
@@ -378,7 +396,7 @@ def test_fallback_receipt_observation_without_job_observation_is_incompatible(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="without the Job Observation"):
-        require_current_run_state(state)
+        _require_repair_state(state)
 
 
 def _integrated_revalidation_merge() -> dict[str, str]:
@@ -483,7 +501,7 @@ def test_canonical_integrated_revalidation_merge_passes_state_validation(
         },
     }
 
-    require_current_run_state(state)
+    _require_repair_state(state)
 
 
 def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
@@ -506,4 +524,4 @@ def test_integrated_revalidation_merge_rejects_a_non_lifecycle_phase(
     }
 
     with pytest.raises(IncompatibleRunStateError, match="phase"):
-        require_current_run_state(state)
+        _require_repair_state(state)

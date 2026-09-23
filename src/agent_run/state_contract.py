@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from agent_run.prompt_resources import validate_resources
+from agent_run.ci_recovery_budget import ci_limits_for_job, ensure_ci_recovery_budget
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     parent_only_budget_policy_for_job,
@@ -204,7 +205,9 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_required_checks_observations(state)
     _require_branch_publication_observations(state)
     _require_review_budget_windows(state)
+    _require_ci_recovery_budgets(state)
     _require_integration_resync_budgets(state)
+    _require_parent_integration_records(state)
     active_ticket = state.get("active_ticket_job")
     if isinstance(active_ticket, dict):
         require_active_ticket_publication_authorization(active_ticket)
@@ -429,7 +432,28 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
         if required_checks_origin is not None:
             origin_pr_number = pr_number
             repair_trigger = owner.get("repair_trigger")
-            if isinstance(repair_trigger, dict) and type(
+            ci_budget = owner.get("ci_recovery")
+            ci_evidence = owner.get("ci_evidence")
+            current_ci_failure = (
+                isinstance(ci_budget, dict)
+                and isinstance(ci_evidence, dict)
+                and isinstance(required_checks_origin, dict)
+                and type(ci_budget.get("rounds_used")) is int
+                and ci_budget["rounds_used"] > 1
+                and isinstance(ci_budget.get("failure_head"), str)
+                and required_checks_origin.get("head_sha") == ci_budget.get("failure_head")
+                and ci_evidence.get("pr_number") == required_checks_origin.get("pr_number")
+                and isinstance(ci_evidence.get("checks"), list)
+                and bool(ci_evidence["checks"])
+                and all(
+                    isinstance(check, dict)
+                    and check.get("repairability") == "code_failure"
+                    for check in ci_evidence["checks"]
+                )
+            )
+            if current_ci_failure:
+                origin_pr_number = required_checks_origin["pr_number"]
+            elif isinstance(repair_trigger, dict) and type(
                 repair_trigger.get("pr_number")
             ) is int:
                 origin_pr_number = repair_trigger["pr_number"]
@@ -438,6 +462,11 @@ def _require_required_checks_observations(state: dict[str, Any]) -> None:
                 location=f"{location}.required_checks_origin",
                 expected_pr_number=(
                     origin_pr_number if type(origin_pr_number) is int else None
+                ),
+                expected_head_sha=(
+                    str(ci_budget["failure_head"])
+                    if current_ci_failure and isinstance(ci_budget, dict)
+                    else None
                 ),
                 allowed_results=frozenset({"fail"}),
             )
@@ -644,6 +673,71 @@ def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"incompatible_run_state: {location}.integration_resync is invalid"
             ) from error
+
+
+def _require_ci_recovery_budgets(state: dict[str, Any]) -> None:
+    subjects: list[tuple[str, dict[str, Any], bool]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        subjects.extend(
+            (f"ticket_jobs[{key}]", job, True)
+            for key, job in jobs.items()
+            if isinstance(job, dict) and _looks_like_materialized_job(job)
+        )
+    for key in ("parent_job", "run_acceptance"):
+        job = state.get(key)
+        if isinstance(job, dict):
+            subjects.append((key, job, False))
+    run = state.get("run_acceptance")
+    if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
+        if run.get("ci_recovery") != run["repair_job"].get("ci_recovery"):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: Run Acceptance and Run Repair CI recovery differ"
+            )
+        subjects.append(("run_acceptance.repair_job", run["repair_job"], False))
+    for location, job, is_ticket in subjects:
+        try:
+            outer_limit, inner_limit = ci_limits_for_job(
+                job, state_snapshot=state.get("policy_snapshot")
+            )
+            ensure_ci_recovery_budget(
+                job, outer_limit=outer_limit, inner_limit=inner_limit,
+                is_ticket=is_ticket,
+            )
+        except (TypeError, ValueError) as error:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.ci_recovery is invalid"
+            ) from error
+
+
+def _require_parent_integration_records(state: dict[str, Any]) -> None:
+    for subject_key, record_key in (
+        ("parent_job", "parent_integration"),
+        ("run_acceptance", "run_integration"),
+    ):
+        subject = state.get(subject_key)
+        if not isinstance(subject, dict):
+            continue
+        record = subject.get(record_key)
+        if record is None:
+            continue
+        if not isinstance(record, dict) or set(record) != {
+            "candidate_sha", "candidate_tree", "source_sha", "target_sha",
+            "head_sha", "head_tree", "conflict_paths",
+        }:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {subject_key}.{record_key} is invalid"
+            )
+        if any(
+            not isinstance(record[key], str) or not record[key]
+            for key in record if key != "conflict_paths"
+        ) or not isinstance(record["conflict_paths"], list) or any(
+            not isinstance(path, str) or not path
+            for path in record["conflict_paths"]
+        ):
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {subject_key}.{record_key} is invalid"
+            )
 
 
 def _require_review_budget_windows(state: dict[str, Any]) -> None:
@@ -1164,7 +1258,7 @@ def _require_invocation(
     phase = invocation["phase"]
     work_subject = invocation["work_subject"]
     allowed_phases = {
-        "development": {"developing", "repairing"},
+        "development": {"developing", "repairing", "run_integration_conflict"},
         "fresh_acceptance": {"reviewing"},
         "publication": {"publication"},
         "reviewer": {"run_acceptance"},
@@ -1209,7 +1303,12 @@ def _require_invocation(
     )
     if (
         role in {"development", "fresh_acceptance", "publication"}
-        and not change_subject
+        and not (
+            change_subject
+            or role == "development"
+            and phase == "run_integration_conflict"
+            and work_subject == f"run-integration:{run_id}"
+        )
     ) or (
         role == "reviewer" and work_subject != f"run-acceptance:{run_id}"
     ) or (
@@ -1319,6 +1418,12 @@ def _require_active_invocation_identity(
     elif subject == f"run-acceptance:{run_id}":
         acceptance = state.get("run_acceptance")
         current_generation = _reviewer_generation(acceptance, invocation["status"])
+    elif subject == f"run-integration:{run_id}":
+        acceptance = state.get("run_acceptance")
+        current_generation = (
+            acceptance.get("acceptance_generation")
+            if isinstance(acceptance, dict) else None
+        )
     elif subject == f"run-publication:{run_id}":
         acceptance = state.get("run_acceptance")
         publication = state.get("run_publication")
@@ -1336,7 +1441,7 @@ def _require_active_invocation_identity(
         and not _change_owner_phase_is_current(invocation, job)
     ):
         raise IncompatibleRunStateError("legacy state has a stale active Invocation")
-    if subject == f"run-acceptance:{run_id}":
+    if subject in {f"run-acceptance:{run_id}", f"run-integration:{run_id}"}:
         owner = state.get("run_acceptance")
     elif subject == f"run-publication:{run_id}":
         owner = state.get("run_publication")
@@ -1349,7 +1454,7 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
     """Reject owner-local Attempt contradictions even without an active pointer."""
 
     run_id = str(state["run_id"])
-    owners: list[tuple[str, dict[str, Any], set[str], str, int]] = []
+    owners: list[tuple[str, dict[str, Any], set[str], str | dict[str, str], int]] = []
     jobs = state.get("ticket_jobs")
     if isinstance(jobs, dict):
         for key, value in jobs.items():
@@ -1394,8 +1499,11 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
             (
                 "run_acceptance",
                 acceptance,
-                {"reviewer"},
-                f"run-acceptance:{run_id}",
+                {"reviewer", "development"},
+                {
+                    "reviewer": f"run-acceptance:{run_id}",
+                    "development": f"run-integration:{run_id}",
+                },
                 int(acceptance.get("acceptance_generation", 1)),
             )
         )
@@ -1550,7 +1658,7 @@ def _require_owner_attempt(
     location: str,
     status: str,
     roles: set[str],
-    work_subject: str,
+    work_subject: str | dict[str, str],
     maximum_generation: int,
     owner: dict[str, Any],
     require_current: bool,
@@ -1579,7 +1687,10 @@ def _require_owner_attempt(
     generation = int(attempt["generation"])
     if (
         attempt["role"] not in roles
-        or attempt["work_subject"] != work_subject
+        or attempt["work_subject"] != (
+            work_subject.get(str(attempt["role"]))
+            if isinstance(work_subject, dict) else work_subject
+        )
         or generation > maximum_generation
         or (require_current and generation != maximum_generation)
     ):

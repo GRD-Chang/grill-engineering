@@ -83,6 +83,7 @@ from agent_run.task_control import TASK_CONTROL_PROTOCOL
 from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
 from agent_run.ticket_phase import sync_active_ticket_job
 from agent_run.integration_resync_budget import renew_resync_budget
+from agent_run.ci_recovery_budget import ci_limits_for_job, reset_exhausted_ci_budget
 
 
 class GitHubReader(Protocol):
@@ -492,6 +493,8 @@ class Controller:
             else False
         )
         if explicit_resume and not budget_resumed:
+            budget_resumed = _resume_ci_recovery_window(state)
+        if explicit_resume and not budget_resumed:
             active_ticket = state.get("active_ticket_job")
             if not isinstance(active_ticket, dict):
                 ticket_jobs = state.get("ticket_jobs")
@@ -517,6 +520,34 @@ class Controller:
                 state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
                 sync_active_ticket_job(state)
                 budget_resumed = True
+            if not budget_resumed:
+                for key, resume_phase, resume_status in (
+                    ("parent_job", "accepted", "parent_delivery_pending"),
+                    ("run_acceptance", "pending", "run_acceptance_pending"),
+                ):
+                    subject = state.get(key)
+                    if not isinstance(subject, dict) or subject.get("blocked_reason") != "integration_resync_exhausted":
+                        continue
+                    if subject.get("phase") not in {"blocked", "ready_for_human"}:
+                        continue
+                    renew_resync_budget(
+                        subject,
+                        policy_snapshot=subject.get("policy_snapshot") or state["policy_snapshot"],
+                    )
+                    subject["phase"] = (
+                        "repairing"
+                        if key == "run_acceptance"
+                        and isinstance(subject.get("repair_job"), dict)
+                        else resume_phase
+                    )
+                    subject.pop("blocked_reason", None)
+                    state.update({
+                        "status": resume_status,
+                        "terminal_kind": None,
+                        "diagnostics": [],
+                    })
+                    budget_resumed = True
+                    break
         if budget_resumed and human_response is not None:
             raise ValueError("Review Budget resume does not accept a Human Blocker response")
         if budget_resumed:
@@ -1760,6 +1791,78 @@ def _is_ready_human_blocker(value: object) -> bool:
     )
 
 
+def _resume_ci_recovery_window(state: dict[str, Any]) -> bool:
+    """Renew only one exhausted CI layer and preserve all other budgets."""
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    active = state.get("active_ticket_job")
+    if isinstance(active, dict):
+        candidates.append(("ticket", active))
+    else:
+        jobs = state.get("ticket_jobs")
+        if isinstance(jobs, dict):
+            candidates.extend(
+                ("ticket", job) for job in jobs.values() if isinstance(job, dict)
+            )
+    for key in ("parent_job", "run_acceptance"):
+        job = state.get(key)
+        if isinstance(job, dict):
+            candidates.append((key, job))
+    exhausted = [
+        (kind, job) for kind, job in candidates
+        if job.get("blocked_reason") in {
+            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+        }
+    ]
+    if not exhausted:
+        return False
+    if len(exhausted) != 1:
+        raise ValueError("multiple CI recovery checkpoints require an unambiguous resume target")
+    kind, job = exhausted[0]
+    outer_limit, inner_limit = ci_limits_for_job(job)
+    repair_job = job.get("repair_job") if kind == "run_acceptance" else None
+    if repair_job is not None:
+        if not isinstance(repair_job, dict) or repair_job.get("ci_recovery") != job.get("ci_recovery"):
+            raise ValueError("Run and Run Repair CI recovery state differ")
+    reset_exhausted_ci_budget(
+        job, outer_limit=outer_limit, inner_limit=inner_limit,
+        is_ticket=kind == "ticket",
+    )
+    job.pop("blocked_reason", None)
+    job.pop("escalation_code", None)
+    job["phase"] = "repairing"
+    if kind == "run_acceptance":
+        if isinstance(repair_job, dict):
+            repair_job["ci_recovery"] = job["ci_recovery"]
+            repair_job.pop("blocked_reason", None)
+            repair_job.pop("escalation_code", None)
+            repair_job["phase"] = "repairing"
+            repair_job["next_attempt_kind"] = "ci_repair"
+        evidence = job.get("ci_failed_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError("Run CI recovery requires its failed check evidence")
+        job["repair_request"] = {
+            "repair_source": "required_checks", "ci_evidence": evidence
+        }
+        publication = state.get("run_publication")
+        if isinstance(publication, dict):
+            publication["phase"] = "stale"
+        state.update({
+            "status": "run_acceptance_pending", "terminal_kind": "run_repair_pending",
+            "diagnostics": [],
+        })
+    else:
+        job["next_attempt_kind"] = "ci_repair"
+        if kind == "ticket":
+            state["active_ticket_job"] = job
+            sync_active_ticket_job(state)
+        state.update({
+            "status": "active" if kind == "ticket" else "parent_delivery_pending",
+            "terminal_kind": None, "diagnostics": [],
+        })
+    return True
+
+
 def _resume_review_budget_window(
     state: dict[str, Any], delivery_policy: DeliveryPolicy | None = None
 ) -> bool:
@@ -2231,6 +2334,14 @@ def _change_job_for_invocation(
             raise ValueError("current Run Repair Change Job is missing")
         _require_invocation_generation(generation, job.get("repair_generation"))
         return job
+    if subject == f"run-integration:{run_id}" and invocation.get("role") == "development":
+        acceptance = state.get("run_acceptance")
+        if not isinstance(acceptance, dict):
+            raise ValueError("current Run Acceptance job is missing")
+        _require_invocation_generation(
+            generation, acceptance.get("acceptance_generation")
+        )
+        return acceptance
     raise ValueError("Change Job Invocation work_subject is invalid")
 
 

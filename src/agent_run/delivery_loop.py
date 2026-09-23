@@ -136,6 +136,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             request["fallback_publication_context"] = fallback_publication_context(
                 _mapping(job, "fallback_publication_receipt")
             )
+        elif job.get("publication_authority") == "ci_repair":
+            from agent_run.change_delivery_fallback import ci_repair_publication_context
+
+            request["ci_repair_publication_context"] = ci_repair_publication_context(
+                _mapping(job, "ci_repair_publication_receipt")
+            )
         else:
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         if job.get("prior_human_blockers"):
@@ -150,12 +156,12 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         if isinstance(existing_pr, int):
             request["existing_pr"] = self.github.publication_context(existing_pr)
         if (
-            job.get("publication_authority") != "fallback"
+            job.get("publication_authority") not in {"fallback", "ci_repair"}
             and job.get("repair_source") == "acceptance"
         ):
             request["acceptance_artifact"] = _mapping(job, "acceptance_artifact")
         elif (
-            job.get("publication_authority") != "fallback"
+            job.get("publication_authority") not in {"fallback", "ci_repair"}
             and job.get("repair_source") == "required_checks"
         ):
             request["ci_evidence"] = _mapping(job, "ci_evidence")

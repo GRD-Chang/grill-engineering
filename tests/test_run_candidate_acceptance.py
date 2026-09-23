@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from support.run_artifacts import _BLOCKED_EVIDENCE, _canonical_run_budget, _candidate_finding_artifact, _human_artifact, _passing_artifact, _repair_artifact
-from support.run_scenarios import _completed_run
+from support.run_scenarios import _completed_run, save_run_with_ci_fixture
 
 import subprocess
 import json
@@ -14,6 +14,8 @@ from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, HumanBlockerResult, ReviewResult
 from agent_run.agent_invocation import canonical_fingerprint
 from agent_run.change_currentness import unknown_pr_mutation
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -97,17 +99,17 @@ def test_run_acceptance_repairs_then_rechecks_the_whole_run(
     assert agents.development_requests[0]["acceptance_artifact"] == _repair_artifact()
     assert agents.development_requests[0]["review_budget_context"] == {
         "completed_review_attempts": 1,
-        "remaining_review_attempts": 10,
+        "remaining_review_attempts": 3,
     }
     assert len(agents.review_requests) == 2
     assert agents.review_requests[0]["review_budget_context"] == {
         "current_review_attempt": 1,
-        "remaining_review_attempts": 10,
+        "remaining_review_attempts": 3,
     }
     candidate_request = agents.review_requests[1]
     assert candidate_request["review_budget_context"] == {
         "current_review_attempt": 2,
-        "remaining_review_attempts": 9,
+        "remaining_review_attempts": 2,
     }
     assert candidate_request["candidate_acceptance"] is True
     assert candidate_request["repair_scope"] == "run_repair"
@@ -192,8 +194,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "review_budget_history": [],
         "acceptance_generation": 4,
         "repair_generation": 2,
-        "modification_attempts": 10,
-        "validation_attempts": 10,
+        "modification_attempts": 3,
+        "validation_attempts": 3,
         "development_thread_id": "run-repair-developer",
         "development_thread_history": [],
         "reviewer_thread_ids": [],
@@ -201,8 +203,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "repair_cycle": {
             "generation": 2,
             "status": "active",
-            "code_modification_attempts": 10,
-            "validation_attempts": 10,
+            "code_modification_attempts": 3,
+            "validation_attempts": 3,
         },
     }
     run["repair_job"] = {
@@ -224,9 +226,9 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "repair_mode": "squash",
         "repair_input_artifact": artifact,
         "acceptance_artifact": artifact,
-        "modification_attempts": 10,
-        "code_modification_attempts": 10,
-        "validation_attempts": 10,
+        "modification_attempts": 3,
+        "code_modification_attempts": 3,
+        "validation_attempts": 3,
         "acceptance_generation": 1,
         "candidate_acceptance_history": [],
         "repair_checkout": str(
@@ -236,7 +238,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     }
     state["run_acceptance"] = run
     state["status"] = "run_acceptance_pending"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     agent_fixture = repo / "agents.json"
     agent_fixture.write_text(json.dumps({}), encoding="utf-8")
 
@@ -267,10 +269,10 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     assert status["run_repair"]["repair_cycle_generation"] == 2
     assert status["run_repair"]["candidate_validation_phase"] == "blocked"
     assert status["run_repair"]["cycle_status"] == "budget_exhausted"
-    assert status["run_repair"]["code_modification_attempts"] == 10
+    assert status["run_repair"]["code_modification_attempts"] == 3
     assert "整体修复" in text_status_result.stdout
     assert "当前版本验收 已受阻" in text_status_result.stdout
-    assert "代码修改 10 / 10" in text_status_result.stdout
+    assert "代码修改 3 / 3" in text_status_result.stdout
     assert "本次开发或验收额度已用尽" in text_status_result.stdout
     assert "下一步: agent-run resume 1 --repo example/project" in text_status_result.stdout
     assert "Generation" not in text_status_result.stdout
@@ -278,8 +280,8 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     persisted = states.load_run(str(state["run_id"]))
     assert persisted is not None
     persisted_run = persisted["run_acceptance"]
-    assert persisted_run["repair_job"]["modification_attempts"] == 10
-    assert persisted_run["repair_job"]["validation_attempts"] == 10
+    assert persisted_run["repair_job"]["modification_attempts"] == 3
+    assert persisted_run["repair_job"]["validation_attempts"] == 3
     assert "candidate_sha" not in persisted_run["repair_job"]
     assert persisted_run["repair_job"]["phase"] == "blocked"
     assert persisted_run["repair_job"]["blocked_reason"] == (
@@ -322,7 +324,7 @@ def test_status_distinguishes_stale_acceptance_generation_from_repair_cycle(
         }
     )
     state["status"] = "run_acceptance_pending"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     class BlockedRepairAgents:
         def develop(self, _request: dict[str, Any]) -> HumanBlockerResult:
@@ -420,7 +422,7 @@ def test_status_keeps_passed_candidate_validation_separate_from_delivery_phase(
         },
         "repair_job": repair_job,
     }
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     json_status = invoke_cli_inprocess(
         repo, repo / "github.json", "status", str(state["run_id"]), "--json"
@@ -517,6 +519,8 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
     git_repo: Path,
 ) -> None:
     state, states, git = _completed_run(git_repo)
+    # This audit stress case needs five Candidate reviews in each Cycle.
+    state["policy_snapshot"] = DeliveryPolicy(run_repair_rounds=10).snapshot()
     fixture = git_repo / "github.json"
 
     class AuditAgents:
@@ -585,7 +589,7 @@ def test_candidate_acceptance_history_keeps_every_candidate_across_cycles_and_re
         state["status"] = "run_acceptance_pending"
         state["terminal_kind"] = "run_repair_pending"
         state.pop("run_publication", None)
-        states.save_run(str(state["run_id"]), state)
+        save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
         promoted = RunAcceptanceEngine(
             git=git,
@@ -667,6 +671,8 @@ def test_candidate_acceptance_history_preserves_each_artifact_outcome(
         "candidate_acceptance_history": [],
         "repair_job": job,
     }
+    state["run_acceptance"]["ci_recovery"] = new_ci_recovery_budget()
+    job["ci_recovery"] = state["run_acceptance"]["ci_recovery"]
     require_current_run_state(state)
 
 @pytest.mark.parametrize(

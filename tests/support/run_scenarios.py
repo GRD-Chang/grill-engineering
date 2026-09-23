@@ -8,12 +8,56 @@ from typing import Any
 
 from agent_run.agents import ReviewResult
 from agent_run.controller import Controller
+from agent_run.ci_recovery_budget import (
+    new_ci_recovery_budget, observe_repairable_ci_failure,
+)
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader, FixtureGitHubPublisher
 from agent_run.run_acceptance import RunAcceptanceEngine
 from agent_run.state import StateStore
 from support.seeding import write_fixture
 from support.run_artifacts import _passing_artifact
+
+
+def save_run_with_ci_fixture(
+    states: StateStore, run_id: str, state: dict[str, Any]
+) -> None:
+    """Complete hand-built test Jobs with the canonical independent CI budget."""
+
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if isinstance(job, dict) and "phase" in job:
+                job.setdefault("ci_recovery", new_ci_recovery_budget())
+    for key in ("parent_job", "run_acceptance"):
+        subject = state.get(key)
+        if isinstance(subject, dict):
+            subject.setdefault("ci_recovery", new_ci_recovery_budget())
+    run = state.get("run_acceptance")
+    if isinstance(run, dict):
+        request = run.get("repair_request")
+        ci_budget = run.get("ci_recovery")
+        if (
+            isinstance(request, dict)
+            and request.get("repair_source") == "required_checks"
+            and isinstance(ci_budget, dict)
+            and ci_budget.get("rounds_used") == 0
+        ):
+            evidence = request.get("ci_evidence")
+            checks = evidence.get("checks") if isinstance(evidence, dict) else None
+            first_check = checks[0] if isinstance(checks, list) and checks else None
+            check_job = first_check.get("job") if isinstance(first_check, dict) else None
+            head_sha = (
+                evidence.get("head_sha") if isinstance(evidence, dict) else None
+            ) or (check_job.get("head_sha") if isinstance(check_job, dict) else None)
+            if isinstance(head_sha, str):
+                observe_repairable_ci_failure(
+                    run, head_sha=head_sha,
+                    outer_limit=3, inner_limit=3, is_ticket=False,
+                )
+    if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
+        run["repair_job"].setdefault("ci_recovery", deepcopy(run["ci_recovery"]))
+    states.save_run(run_id, state)
 
 
 def _completed_run(
@@ -82,6 +126,7 @@ def _completed_run(
             ],
             "integrated_sha": integrated,
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
     }
     integrated_sha = str(state["ticket_jobs"][ticket_key]["integrated_sha"])

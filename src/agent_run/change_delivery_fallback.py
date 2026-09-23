@@ -3,8 +3,12 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Protocol
 
-from agent_run.git import GitRepository
+from agent_run.git import GitError, GitRepository
 from agent_run.review_budget import ReviewBudgetPolicy, ensure_budget
+from agent_run.state_errors import IncompatibleRunStateError
+from agent_run.ticket_ci_repair_contract import (
+    require_ci_repair_publication_authorization,
+)
 
 
 class FallbackStage(Protocol):
@@ -13,6 +17,110 @@ class FallbackStage(Protocol):
     def review_budget_policy(self) -> ReviewBudgetPolicy: ...
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]: ...
+
+
+def ci_repair_publication_context(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Tell Publication what changed without suggesting a Reviewer passed."""
+
+    return {
+        "previous_published_head": receipt["failure_head"],
+        "current_candidate_sha": receipt["candidate_sha"],
+        "current_candidate_tree": receipt["candidate_tree"],
+        "failed_required_checks": deepcopy(receipt["failure_evidence"]),
+        "repair_delta": deepcopy(receipt["repair_delta"]),
+        "current_candidate_has_additional_review": False,
+    }
+
+
+def prepare_ticket_ci_first_round_authorization(
+    stage: FallbackStage, state: dict[str, Any], job: dict[str, Any]
+) -> bool:
+    """Authorize exactly one reviewed-head CI repair for a Ticket.
+
+    The caller must route every later CI recovery round through Reviewer.
+    This function does not create Acceptance and never alters Review budget.
+    """
+
+    recovery = job.get("ci_recovery")
+    if not isinstance(recovery, dict):
+        return False
+    previous = recovery.get("previous_publication_authorization")
+    candidate = job.get("candidate_sha")
+    base = job.get("base_sha")
+    failure_head = recovery.get("failure_head")
+    if (
+        not isinstance(previous, dict)
+        or not isinstance(candidate, str) or not candidate
+        or not isinstance(base, str) or not base
+        or not isinstance(failure_head, str) or not failure_head
+        or job.get("repair_source") != "required_checks"
+        or job.get("attempt_kind") != "ci_repair"
+        or not isinstance(job.get("required_checks_origin"), dict)
+        or not isinstance(job.get("ci_evidence"), dict)
+        or not isinstance(job.get("review_budget"), dict)
+        or not isinstance(job.get("review_budget_history"), list)
+        or not isinstance(job.get("development_summary"), str)
+    ):
+        return False
+    recovery_identity = {
+        key: recovery.get(key)
+        for key in ("outer_window", "rounds_used", "inner_window", "repairs_used", "failure_head", "repair_pending", "review_required")
+    }
+    if (
+        recovery_identity["rounds_used"] != 1
+        or recovery_identity["repairs_used"] != 1
+        or recovery_identity["repair_pending"] is not True
+        or recovery_identity["review_required"] is not False
+        or previous.get("publication_sha") != failure_head
+    ):
+        return False
+    try:
+        integrity = stage.git.verify_candidate_integrity(base, candidate)
+        candidate_tree = stage.git.resolve(f"{candidate}^{{tree}}")
+        if not stage.git.is_ancestor(failure_head, candidate):
+            return False
+        delta = stage.git.diff_name_status(failure_head, candidate)
+    except (GitError, OSError, ValueError):
+        return False
+    if not delta:
+        return False
+    integrity["failed_head_is_ancestor"] = "true"
+    receipt = {
+        "kind": "ticket_ci_repair_publication_receipt",
+        "policy_snapshot": deepcopy(job.get("policy_snapshot")),
+        "base_sha": base,
+        "candidate_sha": candidate,
+        "candidate_tree": candidate_tree,
+        "effective_revision": job.get("effective_revision"),
+        "ci_recovery_identity": recovery_identity,
+        "failure_head": failure_head,
+        "failure_observation": deepcopy(job["required_checks_origin"]),
+        "failure_evidence": deepcopy(job["ci_evidence"]),
+        "previous_publication_authorization": deepcopy(previous),
+        "previous_review_budget": deepcopy(job["review_budget"]),
+        "git_integrity": integrity,
+        "repair_delta_base_sha": failure_head,
+        "repair_delta": delta,
+        "development_summary": job["development_summary"],
+    }
+    proposed = {**job, "publication_authority": "ci_repair",
+                "ci_repair_publication_receipt": receipt}
+    proposed.pop("acceptance_record", None)
+    proposed.pop("fallback_publication_receipt", None)
+    try:
+        require_ci_repair_publication_authorization(
+            receipt, proposed, location="active_ticket_job",
+            candidate_tree=candidate_tree,
+        )
+    except (IncompatibleRunStateError, KeyError, TypeError, ValueError):
+        return False
+    job.update(proposed)
+    job.pop("acceptance_record", None)
+    job.pop("acceptance_artifact", None)
+    job.pop("fallback_publication_receipt", None)
+    job["phase"] = "accepted"
+    stage.save(state)
+    return True
 
 
 def fallback_publication_context(receipt: dict[str, Any]) -> dict[str, Any]:

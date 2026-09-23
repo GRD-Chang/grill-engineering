@@ -29,6 +29,7 @@ def clear_stale_delivery_evidence(job: dict[str, Any]) -> None:
         "required_checks_origin",
         "publication_authority",
         "fallback_publication_receipt",
+        "ci_repair_publication_receipt",
         "deterministic_integration_record",
         "next_attempt_kind",
         "last_review_candidate_sha",

@@ -94,6 +94,7 @@ def status_progress_view(
         ),
         "run_repair": _run_repair_progress(audit.get("run_repair")),
         "integration_resync": audit.get("integration_resync"),
+        "ci_recovery": audit.get("ci_recovery"),
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
         "execution_activity": activity,
@@ -184,6 +185,15 @@ def print_status_progress(
         print(display_text('presentation.status.integration_resync_usage',
                            used=resync.get('used'), limit=resync.get('limit'),
                            window=resync.get('window')))
+    ci_recovery = view.get("ci_recovery")
+    if isinstance(ci_recovery, dict):
+        print(display_text('presentation.status.ci_recovery_usage',
+                           outer_window=ci_recovery.get('outer_window'),
+                           rounds_used=ci_recovery.get('rounds_used'),
+                           rounds_limit=ci_recovery.get('rounds_limit'),
+                           inner_window=ci_recovery.get('inner_window'),
+                           repairs_used=ci_recovery.get('repairs_used'),
+                           repairs_limit=ci_recovery.get('repairs_limit')))
     if view["elapsed_seconds"] is not None:
         print(display_text('presentation.status.task_elapsed_time_v1', v1=_duration(view['elapsed_seconds'])))
 
@@ -368,6 +378,16 @@ def print_rich_status_progress(
                      display_text('presentation.status.integration_resync_values',
                                   used=resync.get('used'), limit=resync.get('limit'),
                                   window=resync.get('window')))
+    ci_recovery = view.get("ci_recovery")
+    if isinstance(ci_recovery, dict):
+        add_identity(display_text('presentation.status.ci_recovery_label'),
+                     display_text('presentation.status.ci_recovery_usage',
+                                  outer_window=ci_recovery.get('outer_window'),
+                                  rounds_used=ci_recovery.get('rounds_used'),
+                                  rounds_limit=ci_recovery.get('rounds_limit'),
+                                  inner_window=ci_recovery.get('inner_window'),
+                                  repairs_used=ci_recovery.get('repairs_used'),
+                                  repairs_limit=ci_recovery.get('repairs_limit')))
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (

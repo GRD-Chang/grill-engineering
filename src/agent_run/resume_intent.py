@@ -39,13 +39,24 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
         for location, subject in gates
         if subject.get("blocked_reason") == "integration_resync_exhausted"
     ]
+    ci_recovery = [
+        (location, subject)
+        for location, subject in gates
+        if subject.get("blocked_reason") in {
+            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+        }
+    ]
     human = [
         (location, subject)
         for location, subject in gates
         if subject.get("blocked_reason")
         in {"agent_requires_human", "reviewer_requires_human"}
     ]
-    if len(checkpoints) > 1 or len(human) > 1 or len(resync) > 1 or (checkpoints and human) or (resync and (checkpoints or human)):
+    if (
+        len(checkpoints) > 1 or len(human) > 1 or len(resync) > 1
+        or len(ci_recovery) > 1
+        or sum(bool(group) for group in (checkpoints, human, resync, ci_recovery)) > 1
+    ):
         raise ResumeIntentError("resume 暂停对象不唯一；拒绝推断恢复授权")
     if checkpoints:
         reason, authorization = "budget_checkpoint", "new_budget_window"
@@ -56,6 +67,9 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
     elif resync:
         reason, authorization = "integration_resync", "renew_integration_resync"
         subjects = resync
+    elif ci_recovery:
+        reason, authorization = "ci_recovery", "renew_ci_recovery"
+        subjects = ci_recovery
     else:
         reason = str(state.get("status"))
         parent_job = state.get("parent_job")
@@ -93,6 +107,7 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
                         "ticket_number", "generation", "acceptance_generation",
                         "candidate_sha", "phase", "blocked_reason", "human_blockers",
                         "pending_semantic_attempt", "review_budget", "integration_resync",
+                        "ci_recovery",
                     )
                 },
             }

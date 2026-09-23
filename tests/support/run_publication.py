@@ -115,6 +115,13 @@ class InterruptedFinalRefPublisher(FixtureGitHubPublisher):
         self.ref_calls += 1
         raise OSError("final ref write response was lost")
 
+    def publish_branch(
+        self, branch: str, head_sha: str, *, expected_remote_sha: str
+    ) -> Any:
+        del branch, head_sha, expected_remote_sha
+        self.ref_calls += 1
+        raise OSError("final ref write response was lost")
+
     def final_run_ref_matches(self, *, branch: str, expected_head_sha: str) -> bool:
         del branch, expected_head_sha
         self.ref_calls += 1
@@ -203,4 +210,3 @@ class HumanThenRunPublicationAgents:
             "human_blockers": None,
             "_thread_id": "blocked-publication-thread",
         }
-

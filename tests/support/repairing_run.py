@@ -4,6 +4,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from agent_run.ci_recovery_budget import (
+    ci_limits_for_job,
+    new_ci_recovery_budget,
+    observe_repairable_ci_failure,
+)
 from agent_run.state import StateStore
 from support.run_artifacts import _canonical_run_budget, _repair_artifact
 
@@ -16,11 +21,12 @@ def prepare_run_repair(
     不接受任意字段 overrides，也不修复缺损状态。非法输入测试直接写原始状态。
     Candidate 创建、refs、触发 currentness 检查由被测 Engine 正常执行。
     """
-    state["run_acceptance"] = {
+    run: dict[str, Any] = {
         "phase": "repairing",
         "policy_snapshot": deepcopy(state["policy_snapshot"]),
         "review_budget": _canonical_run_budget(),
         "review_budget_history": [],
+        "ci_recovery": new_ci_recovery_budget(),
         "modification_attempts": 0,
         "validation_attempts": 0,
         "reviewer_thread_ids": [],
@@ -28,6 +34,16 @@ def prepare_run_repair(
         "acceptance_artifact": _repair_artifact(),
         "repair_request": deepcopy(repair_request),
     }
+    if repair_request["repair_source"] == "required_checks":
+        evidence = repair_request["ci_evidence"]
+        failed_head = evidence["checks"][0]["job"]["head_sha"]
+        outer_limit, inner_limit = ci_limits_for_job(run)
+        assert observe_repairable_ci_failure(
+            run, head_sha=failed_head, outer_limit=outer_limit,
+            inner_limit=inner_limit, is_ticket=False,
+        ) == "repair"
+        run["ci_failed_evidence"] = deepcopy(evidence)
+    state["run_acceptance"] = run
     state.update({
         "status": "run_acceptance_pending",
         "terminal_kind": "run_repair_pending",

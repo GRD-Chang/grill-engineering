@@ -235,6 +235,33 @@ def test_fallback_publication_prompt_receives_only_minimal_projection(
     assert "后续修改" in prompt
 
 
+def test_first_ticket_ci_repair_prompt_does_not_claim_new_review_or_ci(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    prompt = _capture_public_prompt(
+        tmp_path,
+        monkeypatch,
+        "publication",
+        {
+            "acceptance_scope": "ticket",
+            "ci_repair_publication_context": {
+                "previous_published_head": "FAILED_HEAD",
+                "current_candidate_sha": "REPAIRED_CANDIDATE",
+                "failed_required_checks": {"summary": "CODE_FAILURE"},
+                "repair_delta": [{"path": "repair.py", "status": "modified"}],
+            },
+            "ci_repair_publication_receipt": {"secret": "PRIVATE_RECEIPT"},
+        },
+        name="ticket-ci-first-repair",
+    )
+    assert "FAILED_HEAD" in prompt
+    assert "REPAIRED_CANDIDATE" in prompt
+    assert "CODE_FAILURE" in prompt
+    assert "PRIVATE_RECEIPT" not in prompt
+    assert "尚未获得独立 Reviewer 验收" in prompt
+    assert "尚未取得新版本 CI 结果" in prompt
+
+
 def test_prompt_roles_distinguish_ticket_parent_and_run_repair_publication(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

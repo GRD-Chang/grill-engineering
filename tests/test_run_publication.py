@@ -29,6 +29,54 @@ from support.cli import run_internal_stage, run_cli, stdout_json
 
 from support.run_publication import CountingNarrativeRefreshPublisher, DelayedChecksRunPublisher, HumanThenRunPublicationAgents, InterruptedFinalRefPublisher, RunPublicationAgents, UnknownNarrativeWritePublisher, WaitingThenInterruptedChecksPublisher
 
+
+def test_repairable_final_run_ci_failure_opens_independent_recovery_round(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["fail"]
+    publisher._save()
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    )
+
+    failed = engine.publish(str(state["run_id"]))
+
+    run = failed["run_acceptance"]
+    assert failed["status"] == "run_acceptance_pending"
+    assert run["phase"] == "repairing"
+    assert run["repair_request"]["repair_source"] == "required_checks"
+    assert run["ci_recovery"]["rounds_used"] == 1
+    assert run["ci_recovery"]["repairs_used"] == 0
+    assert run["review_budget"]["development_attempts"] == 0
+
+
+def test_repairable_final_run_ci_failure_after_approval_opens_recovery_round(
+    git_repo: Path,
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    engine = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    published = engine.publish(str(state["run_id"]))
+    assert published["status"] == "run_approval_pending"
+    publisher.data["delivery"]["required_checks"] = ["fail"]
+    publisher.data["delivery"]["check_position"] = 0
+    publisher._save()
+
+    failed = engine.approve(str(state["run_id"]))
+
+    assert failed["status"] == "run_acceptance_pending"
+    run = failed["run_acceptance"]
+    assert run["repair_request"]["repair_source"] == "required_checks"
+    assert run["ci_recovery"]["rounds_used"] == 1
+    assert run["ci_recovery"]["failure_head"] == git.resolve(str(state["run_branch"]))
+    assert run["ci_recovery"]["repairs_used"] == 0
+    assert states.load_current_run(str(state["run_id"])) == failed
+
+
 def test_publish_then_explicit_approve_creates_one_normal_merge_commit(
     git_repo: Path,
 ) -> None:

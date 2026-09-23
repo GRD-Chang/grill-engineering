@@ -40,6 +40,10 @@ from agent_run.ticket_integration import (
     integration_record_is_valid,
     reconcile_ticket_integration,
 )
+from agent_run.parent_integration import (
+    parent_integration_record_is_valid,
+)
+from agent_run.parent_only_integration import reconcile_parent_integration
 
 
 class PublishedHeadStage(ChangeDeliveryStage, Protocol):
@@ -106,12 +110,21 @@ def publish_and_merge(
     checkout: Path,
 ) -> bool:
     ticket = stage.contract.label.startswith("ticket-")
-    publication_base = delivery_base_sha(job) if ticket else str(job["base_sha"])
+    parent_only = stage.contract.label == "parent-only"
+    parent_record = job.get("parent_integration") if parent_only else None
+    publication_base = delivery_base_sha(job) if ticket else (
+        str(parent_record["target_sha"])
+        if isinstance(parent_record, dict) else str(job["base_sha"])
+    )
     publication_candidate = delivery_candidate_sha(job) if ticket else str(job["candidate_sha"])
     publication_source = (
         str(job["ticket_integration"]["source_sha"])
         if ticket and isinstance(job.get("ticket_integration"), dict)
-        else str(job.get("published_sha", job["base_sha"]))
+        else (
+            str(parent_record["source_sha"])
+            if isinstance(parent_record, dict)
+            else str(job.get("published_sha", job["base_sha"]))
+        )
     )
     if (
         stage.contract.label.startswith("ticket-")
@@ -232,6 +245,10 @@ def publish_and_merge(
             state["status"] = "waiting_merge"
             stage.save(state)
             return True
+        if ticket and not reconcile_ticket_integration(stage, state, job):
+            return False
+        if parent_only and not reconcile_parent_integration(stage, state, job):
+            return False
         observed_published = (
             existing_live.get("head_sha") == job["publication_sha"]
             and (
@@ -239,12 +256,26 @@ def publish_and_merge(
                 or job.get("ticket_write_intent") == publish_intent
             )
         )
+        if (
+            existing_live.get("head_sha") not in {
+                publication_source, job["publication_sha"]
+            }
+            or existing_live.get("base_sha") != publication_base
+            or existing_live.get("base_branch") != stage.contract.base_branch
+        ):
+            return stage._block(
+                state, job, "published_head_mismatch",
+                "Published-Head Gate rejected live PR state",
+            )
     stage._reject_stale(
         state, job, checkout, "Published-Head Gate rejected stale requirements"
     )
-    if ticket and not reconcile_ticket_integration(stage, state, job):
-        return False
-    if ticket and not isinstance(existing_pr, int):
+    if not isinstance(existing_pr, int):
+        if ticket and not reconcile_ticket_integration(stage, state, job):
+            return False
+        if parent_only and not reconcile_parent_integration(stage, state, job):
+            return False
+    if (ticket or parent_only) and not isinstance(existing_pr, int):
         # A PR creation response may be lost after the source commit was
         # published. Its durable publication SHA and exact live ref prove
         # whether a second push is needed before recovering the original PR.
@@ -254,7 +285,11 @@ def publish_and_merge(
         if live_target != publication_base or live_source not in {
             publication_source, str(job["publication_sha"]),
         }:
-            if not reconcile_ticket_integration(stage, state, job):
+            current = (
+                reconcile_ticket_integration(stage, state, job)
+                if ticket else reconcile_parent_integration(stage, state, job)
+            )
+            if not current:
                 return False
         observed_published = (
             live_source == job["publication_sha"]
@@ -281,6 +316,8 @@ def publish_and_merge(
     except GitHubReadError:
         if ticket and not reconcile_ticket_integration(stage, state, job):
             return False
+        if parent_only and not reconcile_parent_integration(stage, state, job):
+            return False
         raise
     if exhausted:
         return True
@@ -302,6 +339,8 @@ def publish_and_merge(
         except RemoteBranchChanged as error:
             job["branch_publication_observation"] = asdict(error.observation)
             if ticket and not reconcile_ticket_integration(stage, state, job):
+                return False
+            if parent_only and not reconcile_parent_integration(stage, state, job):
                 return False
             return stage._block(
                 state, job, "remote_source_changed",
@@ -423,8 +462,10 @@ def publish_and_merge(
     if exhausted:
         return True
     fallback = job.get("publication_authority") == "fallback"
+    ci_repair = job.get("publication_authority") == "ci_repair"
     acceptance = job.get("acceptance_record")
     receipt = job.get("fallback_publication_receipt")
+    ci_receipt = job.get("ci_repair_publication_receipt")
     candidate_tree = stage.git.resolve(f"{job['candidate_sha']}^{{tree}}")
     if fallback:
         boundary_current = (
@@ -437,12 +478,23 @@ def publish_and_merge(
         )
         reviewed_base_sha = publication_base
         candidate_current = boundary_current
+    elif ci_repair:
+        candidate_current = (
+            isinstance(ci_receipt, dict)
+            and ci_receipt.get("base_sha") == job.get("base_sha")
+            and ci_receipt.get("candidate_sha") == job.get("candidate_sha")
+            and ci_receipt.get("candidate_tree") == candidate_tree
+            and ci_receipt.get("effective_revision") == job.get("effective_revision")
+            and ci_receipt.get("failure_head") == job.get("ci_recovery", {}).get("failure_head")
+            and acceptance is None
+        )
+        reviewed_base_sha = publication_base
     else:
         if not isinstance(acceptance, dict):
             candidate_current = False
             reviewed_base_sha = publication_base
         else:
-            reviewed_base_sha = publication_base if ticket else str(acceptance.get("reviewed_base_sha"))
+            reviewed_base_sha = publication_base if (ticket or parent_only) else str(acceptance.get("reviewed_base_sha"))
             candidate_current = (
                 acceptance.get("reviewed_candidate_sha") == job["candidate_sha"]
                 and acceptance.get("reviewed_candidate_tree") == candidate_tree
@@ -452,6 +504,13 @@ def publish_and_merge(
         candidate_current = (
             candidate_current
             and integration_record_is_valid(stage.git, job)
+            and stage.git.resolve(f"{publication_candidate}^{{tree}}")
+            == stage.git.resolve(f"{job['publication_sha']}^{{tree}}")
+        )
+    if parent_only:
+        candidate_current = (
+            candidate_current
+            and parent_integration_record_is_valid(stage.git, job)
             and stage.git.resolve(f"{publication_candidate}^{{tree}}")
             == stage.git.resolve(f"{job['publication_sha']}^{{tree}}")
         )
@@ -476,6 +535,8 @@ def publish_and_merge(
         )
     if ticket and not reconcile_ticket_integration(stage, state, job):
         return False
+    if parent_only and not reconcile_parent_integration(stage, state, job):
+        return False
     required_checks_evidence = deepcopy(required_checks_evidence)
     required_checks_evidence.update({"pr_number": pr_number})
     if fallback and isinstance(receipt, dict):
@@ -486,9 +547,17 @@ def publish_and_merge(
                 "required_checks_evidence": deepcopy(required_checks_evidence),
             }
         )
+    if ci_repair and isinstance(ci_receipt, dict):
+        ci_receipt.update(
+            {
+                "pr_number": pr_number,
+                "publication_sha": str(job["publication_sha"]),
+                "required_checks_evidence": deepcopy(required_checks_evidence),
+            }
+        )
     merge_intent = job.get("merge_intent")
     integration_record = {
-        "source": "fallback" if fallback else "accepted",
+        "source": "fallback" if fallback else "ci_repair" if ci_repair else "accepted",
         "policy_snapshot": deepcopy(job.get("policy_snapshot")),
         "pr_number": pr_number,
         "base_sha": publication_base,
@@ -529,6 +598,10 @@ def publish_and_merge(
         if not isinstance(receipt, dict):
             raise ValueError("fallback publication is missing its receipt")
         integration_record["fallback_receipt"] = dict(receipt)
+    elif ci_repair:
+        if not isinstance(ci_receipt, dict):
+            raise ValueError("CI repair publication is missing its receipt")
+        integration_record["ci_repair_publication_receipt"] = deepcopy(ci_receipt)
     else:
         if not isinstance(acceptance, dict):
             raise ValueError("accepted publication is missing its Acceptance Record")

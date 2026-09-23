@@ -234,11 +234,16 @@ def failure_evidence_matches_observation(
 def sync_fallback_receipt_observation(
     job: dict[str, Any], pr_number: int
 ) -> None:
-    """Copy one Observation into the active fallback publication receipt."""
+    """Copy one Observation into the active review-free publication receipt."""
 
-    if job.get("publication_authority") != "fallback":
+    authority = job.get("publication_authority")
+    if authority not in {"fallback", "ci_repair"}:
         return
-    receipt = job.get("fallback_publication_receipt")
+    receipt = job.get(
+        "fallback_publication_receipt"
+        if authority == "fallback"
+        else "ci_repair_publication_receipt"
+    )
     evidence = job.get("required_checks_evidence")
     publication_sha = job.get("publication_sha")
     if (
@@ -273,11 +278,12 @@ def bind_new_publication_head(job: dict[str, Any], publication_sha: str) -> None
     """Clear the old Observation while retaining CI failure provenance."""
 
     clear_required_checks_observation(job)
-    receipt = job.get("fallback_publication_receipt")
-    if isinstance(receipt, dict):
-        receipt["publication_sha"] = publication_sha
-        if isinstance(job.get("pr_number"), int):
-            receipt["pr_number"] = job["pr_number"]
+    for key in ("fallback_publication_receipt", "ci_repair_publication_receipt"):
+        receipt = job.get(key)
+        if isinstance(receipt, dict):
+            receipt["publication_sha"] = publication_sha
+            if isinstance(job.get("pr_number"), int):
+                receipt["pr_number"] = job["pr_number"]
 
 
 def clear_required_checks_observation(job: dict[str, Any]) -> None:
@@ -291,6 +297,7 @@ def clear_required_checks_observation(job: dict[str, Any]) -> None:
         "required_checks_mode",
     ):
         job.pop(key, None)
-    receipt = job.get("fallback_publication_receipt")
-    if isinstance(receipt, dict):
-        receipt.pop("required_checks_evidence", None)
+    for key in ("fallback_publication_receipt", "ci_repair_publication_receipt"):
+        receipt = job.get(key)
+        if isinstance(receipt, dict):
+            receipt.pop("required_checks_evidence", None)

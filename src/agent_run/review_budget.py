@@ -18,7 +18,7 @@ from agent_run.required_checks_observation import clear_required_checks_observat
 TICKET_DEVELOPMENT_LIMIT = 4
 TICKET_REVIEW_LIMIT = 3
 FINAL_CI_FIX_LIMIT = 1
-RUN_REVIEW_LIMIT = 11
+RUN_REVIEW_LIMIT = 4
 MAX_REVIEW_ARTIFACTS = RUN_REVIEW_LIMIT
 _REVIEW_BUDGET_KEYS = frozenset(
     {
@@ -81,7 +81,7 @@ TICKET_POLICY = ReviewBudgetPolicy(
     budget_scope="ticket",
 )
 RUN_POLICY = ReviewBudgetPolicy(
-    development_limit=10,
+    development_limit=3,
     review_limit=RUN_REVIEW_LIMIT,
     budget_scope="run",
 )
@@ -233,6 +233,7 @@ def _validate_budget_history(
             # round limit.
             from agent_run.delivery_policy import (
                 parent_only_budget_policy,
+                parent_integration_budget_policy,
                 parse_policy_snapshot,
                 run_repair_budget_policy,
                 ticket_review_budget_policy,
@@ -244,7 +245,11 @@ def _validate_budget_history(
                     ticket_review_budget_policy(parsed_snapshot)
                     if policy.budget_scope == "ticket"
                     else (
-                        parent_only_budget_policy(parsed_snapshot)
+                        (
+                            parent_integration_budget_policy(parsed_snapshot)
+                            if snapshot.get("parent_integration_stage") is True
+                            else parent_only_budget_policy(parsed_snapshot)
+                        )
                         if policy.budget_scope == "parent-only"
                         else run_repair_budget_policy(parsed_snapshot)
                     )

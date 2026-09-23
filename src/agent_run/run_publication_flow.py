@@ -13,6 +13,11 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.change_delivery import ensure_linked_branch_display
+from agent_run.ci_recovery_budget import (
+    ci_limits_for_job,
+    observe_repairable_ci_failure,
+)
+from agent_run.branch_publication import RemoteBranchChanged
 from agent_run.delivery_policy import invocation_deadline_for_state
 from agent_run.credential_availability import (
     clear_initial_credential_wait,
@@ -71,6 +76,23 @@ class RunPublicationFlow(RunPublicationShared):
         if publication["phase"] == "ready_for_human":
             return state
         if publication["phase"] == "stale":
+            existing_pr_number = publication.get("pr_number")
+            if isinstance(existing_pr_number, int):
+                live = self.github.live_pull_request(existing_pr_number)
+                if live.get("state") == "CLOSED":
+                    publication.update({
+                        "phase": "ready_for_human",
+                        "blocked_reason": "final_run_pr_closed",
+                    })
+                    state.update({
+                        "status": "ready_for_human",
+                        "terminal_kind": "waiting_human",
+                        "diagnostics": [{
+                            "code": "final_run_pr_closed",
+                            "message": f"Final Run PR #{existing_pr_number} was closed; the existing PR cannot be replaced automatically",
+                        }],
+                    })
+                    return self._save(state)
             attempt_audit = {
                 key: publication[key]
                 for key in (
@@ -83,6 +105,8 @@ class RunPublicationFlow(RunPublicationShared):
             }
             publication.clear()
             publication.update(attempt_audit)
+            if isinstance(existing_pr_number, int):
+                publication["pr_number"] = existing_pr_number
             publication["phase"] = "pending"
         if publication["phase"] == "publication_pending":
             return state
@@ -163,6 +187,8 @@ class RunPublicationFlow(RunPublicationShared):
     ) -> dict[str, Any] | None:
         try:
             return self._publish_accepted_run(state, run, publication)
+        except RemoteBranchChanged:
+            return self._invalidate_for_fresh_acceptance(state)
         except (GitError, GitHubReadError, OSError) as error:
             if isinstance(error, GitHubReadError):
                 return self._handle_github_error(state, publication, error)
@@ -480,9 +506,17 @@ class RunPublicationFlow(RunPublicationShared):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")
         run_head = self.git.resolve(str(state["run_branch"]))
+        integration = run.get("run_integration")
+        observed_source = (
+            str(integration["source_sha"])
+            if isinstance(integration, dict)
+            else run_head
+        )
         narrative = self._render_final_run_pr_body(state, artifact.pr_body_markdown)
         known_pr = publication.get("pr_number")
-        if not self._known_final_pr_is_authorized(state, publication, run_head):
+        if not self._known_final_pr_is_authorized(
+            state, publication, run_head, prior_head=observed_source
+        ):
             return self._invalidate_for_fresh_acceptance(state)
         initial_existing = (
             known_pr
@@ -498,8 +532,10 @@ class RunPublicationFlow(RunPublicationShared):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")
         run_head = self.git.resolve(str(state["run_branch"]))
-        if initial_existing is not None and not self._final_pr_is_current(
-            initial_existing, run_head, str(state["run_branch"]), str(state["repository"])
+        if initial_existing is not None and not any(
+            self._final_pr_is_current(
+                initial_existing, head, str(state["run_branch"]), str(state["repository"])
+            ) for head in {observed_source, run_head}
         ):
             return self._invalidate_for_fresh_acceptance(state)
         ref_authority = {
@@ -507,6 +543,7 @@ class RunPublicationFlow(RunPublicationShared):
             "base_branch": self.default_branch,
             "head_sha": run_head,
             "base_sha": self.default_head_sha,
+            "source_sha": observed_source,
         }
         pending_intent = publication.get("write_intent")
         if self._final_run_ref_write_is_pending(publication):
@@ -518,15 +555,23 @@ class RunPublicationFlow(RunPublicationShared):
             ):
                 raise GitError("Final Run ref recovery did not match durable intent")
             publication.pop("write_intent", None)
+            publication["published_head_sha"] = run_head
             self._save(state)
         elif not isinstance(pending_intent, dict):
             self._persist_write_intent(
                 state, publication, "ensure_final_run_ref", ref_authority
             )
-            self.github.ensure_final_run_ref(
-                branch=ref_authority["branch"], expected_head_sha=run_head
-            )
+            if isinstance(integration, dict):
+                self.github.publish_branch(
+                    ref_authority["branch"], run_head,
+                    expected_remote_sha=observed_source,
+                )
+            else:
+                self.github.ensure_final_run_ref(
+                    branch=ref_authority["branch"], expected_head_sha=run_head
+                )
             publication.pop("write_intent", None)
+            publication["published_head_sha"] = run_head
             self._save(state)
         elif pending_intent.get("action") == "create_final_pr":
             if pending_intent.get("authority") != ref_authority:
@@ -640,11 +685,27 @@ class RunPublicationFlow(RunPublicationShared):
                 pr_number=pr_number,
                 head_sha=run_head,
             ) and is_explicitly_repairable_code_failure(evidence):
-                self._queue_repair(
-                    state,
-                    repair_source="required_checks",
-                    ci_evidence=evidence,
+                outer_limit, inner_limit = ci_limits_for_job(run)
+                decision = observe_repairable_ci_failure(
+                    run, head_sha=run_head, outer_limit=outer_limit,
+                    inner_limit=inner_limit, is_ticket=False,
                 )
+                run["ci_failed_evidence"] = evidence
+                if decision == "repair":
+                    self._queue_repair(
+                        state,
+                        repair_source="required_checks",
+                        ci_evidence=evidence,
+                    )
+                else:
+                    reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
+                    run.update({"phase": "ready_for_human", "blocked_reason": reason})
+                    publication["phase"] = "stale"
+                    state.update({
+                        "status": "ready_for_human",
+                        "terminal_kind": "waiting_human",
+                        "diagnostics": [{"code": reason, "message": "Run CI recovery budget is exhausted; resume is required"}],
+                    })
             else:
                 supervise_unrepairable_check_failure(
                     state,
@@ -682,7 +743,8 @@ class RunPublicationFlow(RunPublicationShared):
         )
 
     def _known_final_pr_is_authorized(
-        self, state: dict[str, Any], publication: dict[str, Any], run_head: str
+        self, state: dict[str, Any], publication: dict[str, Any], run_head: str,
+        *, prior_head: str | None = None,
     ) -> bool:
         """Validate a persisted Final Run PR before any recovery write.
 
@@ -703,6 +765,20 @@ class RunPublicationFlow(RunPublicationShared):
                 expected_base_sha=self.default_head_sha,
             )
         except GitHubReadError as error:
+            if (
+                error.code == "foreign_run_pr"
+                and prior_head is not None
+                and prior_head != run_head
+                and not isinstance(publication.get("approval_grant"), dict)
+            ):
+                self._require_final_pr_identity(
+                    live=self.github.live_pull_request(known_pr),
+                    run_head=prior_head,
+                    branch=str(state["run_branch"]),
+                    repository=str(state["repository"]),
+                    expected_base_sha=self.default_head_sha,
+                )
+                return True
             if error.code == "foreign_run_pr" and isinstance(
                 publication.get("approval_grant"), dict
             ):

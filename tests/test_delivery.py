@@ -32,6 +32,7 @@ from agent_run.change_delivery import (
     ChangeJobContract,
     fallback_publication_context,
 )
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.delivery_policy import DeliveryPolicy
@@ -1709,29 +1710,29 @@ def test_fallback_pending_observation_is_one_contract_valid_commit(
     require_current_run_state(states.observation_commits[0])
 
 
-def test_final_ci_fix_candidate_save_clears_receipt_observation_before_resume(
+def test_first_ci_repair_candidate_save_clears_receipt_observation_before_resume(
     git_repo: Path,
 ) -> None:
-    class CrashAfterFinalCiFixCandidateSave(StateStore):
+    class CrashAfterCiRepairCandidateSave(StateStore):
         crashed = False
 
         def save_run(self, run_id: str, state: dict[str, Any]) -> None:
             job = state.get("active_ticket_job")
-            is_final_ci_fix_candidate = (
+            is_ci_repair_candidate = (
                 not self.crashed
                 and isinstance(job, dict)
                 and job.get("phase") == "candidate"
-                and job.get("attempt_kind") == "final_ci_fix"
+                and job.get("attempt_kind") == "ci_repair"
             )
             super().save_run(run_id, state)
-            if is_final_ci_fix_candidate:
+            if is_ci_repair_candidate:
                 self.crashed = True
                 raise SimulatedProcessCrash(
-                    "simulated crash after Final CI-fix Candidate save"
+                    "simulated crash after CI repair Candidate save"
                 )
 
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
-    states = CrashAfterFinalCiFixCandidateSave(git_repo / ".agent-run")
+    states = CrashAfterCiRepairCandidateSave(git_repo / ".agent-run")
     state, _ = Controller(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).start(1)
@@ -1743,25 +1744,25 @@ def test_final_ci_fix_candidate_save_clears_receipt_observation_before_resume(
         git=GitRepository(git_repo), states=states, github=publisher, agents=agents
     )
 
-    with pytest.raises(SimulatedProcessCrash, match="Final CI-fix Candidate"):
+    with pytest.raises(SimulatedProcessCrash, match="CI repair Candidate"):
         engine.deliver(state["run_id"])
 
     interrupted = states.load_current_run(state["run_id"])
     assert interrupted is not None
     interrupted_job = interrupted["active_ticket_job"]
     assert interrupted_job["phase"] == "candidate"
-    assert interrupted_job["attempt_kind"] == "final_ci_fix"
+    assert interrupted_job["attempt_kind"] == "ci_repair"
     assert "required_checks_evidence" not in interrupted_job
     receipt = interrupted_job["fallback_publication_receipt"]
     assert "required_checks_evidence" not in receipt
     assert interrupted_job["ci_evidence"]["result"] == "fail"
-    assert interrupted_job["final_ci_fix_failure_head"] == interrupted_job[
+    assert interrupted_job["ci_recovery"]["failure_head"] == interrupted_job[
         "ci_evidence"
     ]["head_sha"]
-    previous = receipt["previous_publication_authorization"]
-    assert previous["publication_sha"] == interrupted_job["final_ci_fix_failure_head"]
+    previous = interrupted_job["ci_recovery"]["previous_publication_authorization"]
+    assert previous["publication_sha"] == interrupted_job["ci_recovery"]["failure_head"]
     assert previous["fallback_receipt"]["required_checks_evidence"]["head_sha"] == (
-        interrupted_job["final_ci_fix_failure_head"]
+        interrupted_job["ci_recovery"]["failure_head"]
     )
     require_current_run_state(interrupted)
 
@@ -1772,9 +1773,11 @@ def test_final_ci_fix_candidate_save_clears_receipt_observation_before_resume(
     assert completed_job["required_checks_evidence"]["head_sha"] == completed_job[
         "publication_sha"
     ]
-    assert completed_job["fallback_publication_receipt"][
+    assert completed_job["ci_repair_publication_receipt"][
         "required_checks_evidence"
     ]["head_sha"] == completed_job["publication_sha"]
+    assert completed_job["publication_authority"] == "ci_repair"
+    assert completed_job["review_budget"]["development_attempts"] == 4
 
 
 @pytest.mark.parametrize("crash_timing", ["before", "after"])
@@ -2313,10 +2316,13 @@ def test_failed_required_check_evidence_reaches_development_thread(
         "head_sha": repaired_head,
         "disposition": "published",
     }
-    assert result["active_ticket_job"]["required_checks_origin"] == ci_evidence
+    origin = result["active_ticket_job"]["required_checks_origin"]
+    assert origin["head_sha"] == ci_evidence["head_sha"]
+    assert origin["result"] == "fail"
+    assert [check["bucket"] for check in origin["checks"]] == ["fail", "pass"]
     assert result["active_ticket_job"]["deterministic_integration_record"][
         "required_checks_origin"
-    ] == ci_evidence
+    ] == origin
     assert agents.development_requests[1]["repair_source"] == ("required_checks")
     assert len(agents.publication_requests) == 2
     assert agents.publication_requests[1]["existing_pr"] == {
@@ -2328,7 +2334,49 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert publisher.created_prs == 2
     assert len(publisher.pr_bodies) == 2
     assert len(publisher.agent_run_statuses) == 1
-    assert publisher.agent_run_statuses[0]["validation_outcome"] == "pass"
+    assert publisher.agent_run_statuses[0]["validation_outcome"] == "ci_repair_unreviewed"
+    assert agents.review_count == 1
+    assert result["active_ticket_job"]["publication_authority"] == "ci_repair"
+    assert result["active_ticket_job"]["deterministic_integration_record"]["source"] == "ci_repair"
+
+
+def test_ticket_outer_ci_resume_reviews_and_publishes_new_repair(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    states = StateStore(git_repo / ".agent-run")
+    controller = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states,
+        delivery_policy=DeliveryPolicy(ci_recovery_rounds=2),
+    )
+    state, _ = controller.start(1)
+    checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["fail", "fail", "fail", "pass"]
+    agents = CheckRepairAgents(checkout)
+    engine = TicketDeliveryEngine(
+        git=GitRepository(git_repo), states=states, github=publisher, agents=agents,
+    )
+
+    blocked = engine.deliver(state["run_id"])
+    budget = blocked["active_ticket_job"]["ci_recovery"]
+    assert blocked["status"] == "blocked"
+    assert blocked["active_ticket_job"]["blocked_reason"] == "ci_outer_budget_exhausted"
+    assert (budget["outer_window"], budget["rounds_used"], budget["review_required"]) == (1, 2, True)
+    assert agents.review_count == 2  # Demand and second CI round.
+
+    resumed, _ = controller.resume(state["run_id"], explicit_resume=True)
+    renewed = resumed["active_ticket_job"]["ci_recovery"]
+    assert resumed["active_ticket_job"]["phase"] == "repairing"
+    assert (renewed["outer_window"], renewed["rounds_used"], renewed["review_required"]) == (2, 1, True)
+
+    completed = engine.deliver(state["run_id"])
+    job = completed["active_ticket_job"]
+    assert completed["status"] == "ticket_completed"
+    assert agents.review_count == 3
+    assert job["ci_recovery"]["review_artifacts"][-1]["candidate_sha"] == job["candidate_sha"]
+    assert job["publication_authority"] == "accepted"
+    assert job["ci_recovery"]["outer_window"] == 2
 
 
 def test_required_check_origin_survives_acceptance_repair_and_final_record(
@@ -2341,7 +2389,7 @@ def test_required_check_origin_survives_acceptance_repair_and_final_record(
     ).start(1)
     checkout = git_repo / ".agent-run" / "worktrees" / state["run_id"] / "ticket-3"
     publisher = ScriptedPublisher(git_repo)
-    publisher.checks = ["fail", "pass"]
+    publisher.checks = ["fail", "fail", "pass"]
     agents = RequiredCheckThenAcceptanceFindingAgents(checkout)
 
     completed = TicketDeliveryEngine(
@@ -2354,10 +2402,18 @@ def test_required_check_origin_survives_acceptance_repair_and_final_record(
     assert origin["pr_number"] == job["pr_number"]
     assert origin["head_sha"] != job["publication_sha"]
     assert origin["result"] == "fail"
-    assert origin["checks"] == publisher.failed_check_evidence["checks"]
+    assert [check["bucket"] for check in origin["checks"]] == ["fail"]
+    assert "repairability" not in origin["checks"][0]
     assert "ci_evidence" not in job
     assert job["deterministic_integration_record"]["required_checks_origin"] == origin
     assert agents.review_count == 3
+    assert job["ci_recovery"]["rounds_used"] == 2
+    assert job["ci_recovery"]["repairs_used"] == 2
+    assert job["ci_recovery"]["reviewer_invocations"] == 2
+    assert job["review_budget"]["reviewer_invocations"] == 1
+    assert job["review_budget"]["development_attempts"] == 1
+    assert job["publication_authority"] == "accepted"
+    assert job["deterministic_integration_record"]["source"] == "accepted"
 
 
 def test_ticket_required_check_failure_uses_exact_head_repair_evidence(
@@ -4522,9 +4578,10 @@ def test_resume_preserves_frontier_while_an_operator_gate_is_current(
                 "review_artifacts": [],
                 "checkpoint_reason": None,
             },
-            "review_budget_history": [],
-        }
-    )
+                "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
+            }
+        )
     state.update(
         {
             "status": "ready_for_human",
@@ -4603,8 +4660,9 @@ def test_resume_preserves_frontier_while_an_operator_gate_is_current(
             "review_artifacts": [],
             "checkpoint_reason": None,
         },
-        "review_budget_history": [],
-    }
+            "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
+        }
     completed_ticket = state["ticket_jobs"]["4"]
     completed_record = completed_ticket["deterministic_integration_record"]
     completed_ticket["ticket_integration"] = {

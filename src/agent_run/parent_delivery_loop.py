@@ -28,6 +28,7 @@ from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.review_budget import ensure_budget, previous_review_context
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
+from agent_run.parent_integration import parent_integration_record_is_valid
 
 
 class ParentDeliveryAdapter(ChangeDeliveryAdapter):
@@ -46,6 +47,8 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         return True
 
     def base_is_current(self, current_base: str, job: dict[str, Any]) -> bool:
+        if "parent_integration" in job:
+            return parent_integration_record_is_valid(self.git, job)
         return current_base == job.get("base_sha")
 
     def development_request(
@@ -115,6 +118,8 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
             request["existing_pr"] = self.github.publication_context(existing_pr)
         if job.get("repair_source") == "required_checks":
             request["ci_evidence"] = _mapping(job, "ci_evidence")
+        if isinstance(job.get("parent_integration"), dict):
+            request["integration_record"] = job["parent_integration"]
         return request
 
     def review_request(
@@ -159,6 +164,16 @@ class ParentDeliveryAdapter(ChangeDeliveryAdapter):
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]
+        elif isinstance(job.get("previous_parent_acceptance_record"), dict):
+            previous_record = job["previous_parent_acceptance_record"]
+            request["previous_acceptance_artifact"] = previous_record["artifact"]
+            request["previous_review_identity"] = {
+                "reviewed_base_sha": previous_record["reviewed_base_sha"],
+                "reviewed_candidate_sha": previous_record["reviewed_candidate_sha"],
+                "reviewed_candidate_tree": previous_record["reviewed_candidate_tree"],
+            }
+        if isinstance(job.get("parent_integration"), dict):
+            request["integration_record"] = job["parent_integration"]
         return request
 
     def acceptance_record(
@@ -255,11 +270,18 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
     def create_publication_commit(
         self, checkout: Path, job: dict[str, Any], message: str
     ) -> str:
+        record = job.get("parent_integration")
+        source = str(record["source_sha"]) if isinstance(record, dict) else None
+        published = job.get("published_sha")
+        if isinstance(published, str) and (
+            source is None or self.owner.git.is_ancestor(source, published)
+        ):
+            source = published
         return self.owner.git.create_publication_commit(
             checkout,
             candidate_sha=str(job["candidate_sha"]),
             base_sha=str(job["base_sha"]),
-            published_sha=job.get("published_sha"),
+            published_sha=source,
             message=message,
         )
 

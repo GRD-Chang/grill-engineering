@@ -14,6 +14,7 @@ from agent_run.artifacts import (
     clear_current_human_blocker,
 )
 from agent_run.change_delivery import latest_reviewer_thread
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_policy import (
     invocation_deadline_for_state,
     run_repair_budget_policy_for_job,
@@ -33,7 +34,13 @@ from agent_run.run_currentness import (
     run_currentness_boundary,
     ticket_completion_records,
     ticket_fallback_records,
+    ticket_ci_repair_records,
     ticket_integration_records,
+)
+from agent_run.run_parent_integration import (
+    prepare_run_parent_integration,
+    run_integration_record_is_valid,
+    run_integration_remote_is_current,
 )
 from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_repair_lifecycle import RunRepairLifecycle
@@ -115,6 +122,8 @@ class RunAcceptanceEngine:
         run = self._run_state(state)
         budget_policy = self._run_budget_policy(state, run)
         ensure_budget(run, budget_policy)
+        if not prepare_run_parent_integration(self, state, run):
+            return self._save(state)
         self._invalidate_stale_acceptance(state, run)
         while True:
             phase = str(run["phase"])
@@ -202,6 +211,8 @@ class RunAcceptanceEngine:
 
     def _review(self, state: dict[str, Any], run: dict[str, Any]) -> bool:
         budget_policy = self._run_budget_policy(state, run)
+        if isinstance(run.get("run_integration"), dict) and not run_integration_record_is_valid(self, state):
+            raise ValueError("Run Acceptance requires the current integrated Run Branch")
         resume_initial_credential_wait(
             state, work_subject=_RUN_ACCEPTANCE_CREDENTIAL_SUBJECT
         )
@@ -291,6 +302,8 @@ class RunAcceptanceEngine:
             )
             request["_currentness_check"] = lambda: (
                 self._refresh_run_currentness(state)
+                and
+                (not isinstance(run.get("run_integration"), dict) or run_integration_remote_is_current(self, state))
                 and
                 self.git.resolve(str(state["run_branch"])) == run_head
                 and self._default_head(state) == default_head
@@ -525,6 +538,7 @@ class RunAcceptanceEngine:
             "candidate_acceptance_history": [],
             "review_budget": new_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
         if isinstance(state.get("policy_snapshot"), dict):
             run["policy_snapshot"] = dict(state["policy_snapshot"])
@@ -626,10 +640,20 @@ class RunAcceptanceEngine:
         fallbacks = ticket_fallback_records(state)
         if fallbacks:
             request["fallback_ticket_records"] = fallbacks
+        ci_repairs = ticket_ci_repair_records(state)
+        if ci_repairs:
+            request["ci_repair_ticket_records"] = ci_repairs
         integrations = ticket_integration_records(state)
         if integrations:
             request["ticket_integration_records"] = integrations
+        run_integration = run.get("run_integration")
+        if isinstance(run_integration, dict):
+            request["run_integration_record"] = dict(run_integration)
         previous = previous_review_context(run)
+        if previous is None:
+            history = run.get("review_budget_history")
+            if isinstance(history, list) and history and isinstance(history[-1], dict):
+                previous = previous_review_context(history[-1])
         if previous is not None:
             request["previous_acceptance_artifact"] = previous["artifact"]
             request["previous_review_identity"] = previous["identity"]

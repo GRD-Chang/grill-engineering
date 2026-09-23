@@ -7,6 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 from agent_run.agents import DevelopmentResult, ReviewResult
@@ -14,6 +15,19 @@ from agent_run.branch_publication import BranchPublicationResult
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
+
+
+class _LateMergeRepairEngine(RunAcceptanceEngine):
+    """Isolate the existing Run Repair merge lifecycle in these scenarios.
+
+    Initial Parent integration now owns the first conflict and is tested
+    separately. These cases preserve the later repair lifecycle's Git and
+    interruption checks without routing this fixture through that first gate.
+    """
+
+    def accept(self, run_id: str) -> dict[str, Any]:
+        with patch("agent_run.run_acceptance.prepare_run_parent_integration", return_value=True):
+            return super().accept(run_id)
 
 
 class MergeResolutionAgents:
@@ -397,7 +411,7 @@ class MergeResolutionFixture:
         publisher: FixtureGitHubPublisher,
         default_head: str,
     ) -> RunAcceptanceEngine:
-        return RunAcceptanceEngine(
+        return _LateMergeRepairEngine(
             git=git,
             states=self.states,
             agents=self.agents,

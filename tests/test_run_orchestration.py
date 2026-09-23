@@ -11,6 +11,7 @@ import pytest
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agents import DevelopmentResult, ReviewResult
 from agent_run.controller import Controller
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.cli_presentation import _operator_action_view
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.state_contract import (
@@ -1127,6 +1128,7 @@ def test_requeue_gate_generation_must_match_the_current_change_job(
             "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "review_budget": new_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
     )
     state.update(
@@ -1181,6 +1183,7 @@ def test_pending_semantic_attempt_owner_mismatch_is_rejected_without_invocation(
     job = state["ticket_jobs"]["2"]
     job["review_budget"] = new_budget()
     job["review_budget_history"] = []
+    job["ci_recovery"] = new_ci_recovery_budget()
     allocate_semantic_attempt(
         job,
         role="development",
@@ -1843,6 +1846,7 @@ def test_deterministic_ticket_conflict_gates_independent_frontier(
                 "checkpoint_reason": None,
             },
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
     )
     state.update(

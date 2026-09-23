@@ -14,7 +14,10 @@ from agent_run.state_contract import (
     require_current_run_state,
 )
 from agent_run.cli_presentation import _print_precondition_failure
-from agent_run.operator_gate import has_non_invocation_execution_failure
+from agent_run.operator_gate import (
+    has_non_invocation_execution_failure,
+    operator_gate_subjects,
+)
 from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.semantic_attempt import (
     invocation_is_explicitly_resumable,
@@ -70,6 +73,7 @@ def _resume_is_ready(state: dict[str, object]) -> bool:
     return (
         human_blocker_subject_count(state) == 1
         or _review_budget_checkpoint_count(state) == 1
+        or _ci_recovery_checkpoint_is_ready(state)
     )
 
 
@@ -101,6 +105,18 @@ def _resume_is_publication_recovery(state: dict[str, object]) -> bool:
 
 def _review_budget_checkpoint_count(state: dict[str, object]) -> int:
     return len(budget_checkpoint_subjects(state))
+
+
+def _ci_recovery_checkpoint_is_ready(state: dict[str, object]) -> bool:
+    gates = operator_gate_subjects(state)
+    return (
+        len(gates) == 1
+        and gates[0][1].get("blocked_reason") in {
+            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+        }
+        and not budget_checkpoint_subjects(state)
+        and human_blocker_subject_count(state) == 0
+    )
 
 
 def _command_is_ready(state: dict[str, object], command: str) -> bool:

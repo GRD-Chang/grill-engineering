@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 from agent_run.commit_messages import commit_messages_match
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.integration_resync_budget import complete_integration_window
 from agent_run.required_checks_observation import (
     bind_new_publication_head,
     clear_required_checks_observation,
 )
 from agent_run.run_currentness import invalidate_stale_run_repair
+from agent_run.run_parent_integration import observe_run_repair_snapshot
 from agent_run.run_repair_cycle import escalate_repair, uses_merge_resolution
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -49,6 +51,16 @@ class RunRepairPromotion:
             )
         ):
             self._preserve_stale_acceptance_repair(state, job, checkout)
+            if (
+                job.get("phase") == "committing_candidate"
+                and pending_semantic_attempt(job) is None
+            ):
+                job["controller_candidate_reprepare"] = controller_reprepare_intent(job)
+            if not observe_run_repair_snapshot(
+                self.owner, state, self.owner._run_state(state)
+            ):
+                return
+            job.pop("controller_candidate_reprepare", None)
             self._rebind_repair_to_default(state, job, current_default)
             return
         dirty_reason = self.owner.git.managed_checkout_dirty_reason(checkout)
@@ -516,6 +528,11 @@ class RunRepairPromotion:
                 "phase": "accepted",
             }
         )
+        resync = run.get("integration_resync")
+        if isinstance(resync, dict) and resync["open"]:
+            # The promoted Candidate was reviewed against this live default
+            # snapshot. Later external drift belongs to a new window.
+            complete_integration_window(run)
         cycle = run.get("repair_cycle")
         if isinstance(cycle, dict):
             cycle.update(

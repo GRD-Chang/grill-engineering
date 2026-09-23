@@ -1,6 +1,18 @@
 """发布文案的双语证据边界、续接与输出语义。"""
 
 TEXTS: dict[str, dict[str, str]] = {
+    'publication/ci-repair-evidence': {
+        'zh': """本次可使用的验证事实：
+当前 CI 修复候选尚未获得独立 Reviewer 验收，也尚未取得新版本 CI 结果。以下事实来自受控的首轮 Ticket CI 修复凭据（ci_repair_publication_context JSON）：
+{}
+
+上次已授权的发布版本出现明确可修复的代码检查失败；本次候选修复了该问题。只描述已有修复与实际验证，不把旧版本的审核结论归给当前候选，不宣称新版本 CI 通过或允许合并。""",
+        'en': """Validation facts available for this task:
+The current CI repair candidate has not received an independent Reviewer acceptance, and its new-version CI result is not yet known. The following facts come from the controlled first-round Ticket CI repair receipt (ci_repair_publication_context JSON):
+{}
+
+The previously authorized published version had an explicitly repairable code-check failure. This candidate addresses that failure. Describe only the repair and validation actually completed. Do not attribute the old review to this candidate or claim that new-version CI passed or merging is authorized.""",
+    },
     'publication/fallback-evidence': {
         'zh': """本次可使用的验证事实：
 当前修改没有独立验收通过的结论；最近一次审查针对的是修改前的代码。

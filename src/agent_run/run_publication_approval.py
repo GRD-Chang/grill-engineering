@@ -9,6 +9,10 @@ from agent_run.approval_grant import (
     grant_authority,
     grant_matches,
 )
+from agent_run.ci_recovery_budget import (
+    ci_limits_for_job,
+    observe_repairable_ci_failure,
+)
 from agent_run.delivery_cleanup import (
     DeliveryCleanupEngine,
     remove_run_worktrees,
@@ -198,6 +202,25 @@ class RunPublicationApproval(RunPublicationShared):
                         f"Run PR #{pr_number} Required Check repairability"
                     ),
                 )
+                return self._save(state)
+            outer_limit, inner_limit = ci_limits_for_job(run)
+            decision = observe_repairable_ci_failure(
+                run, head_sha=run_head, outer_limit=outer_limit,
+                inner_limit=inner_limit, is_ticket=False,
+            )
+            run["ci_failed_evidence"] = evidence
+            if decision != "repair":
+                reason = f"ci_{decision.replace('_exhausted', '')}_budget_exhausted"
+                run.update({"phase": "ready_for_human", "blocked_reason": reason})
+                publication["phase"] = "stale"
+                state.update({
+                    "status": "ready_for_human",
+                    "terminal_kind": "waiting_human",
+                    "diagnostics": [{
+                        "code": reason,
+                        "message": "Run CI recovery budget is exhausted; resume is required",
+                    }],
+                })
                 return self._save(state)
             return self._save(
                 self._queue_repair(

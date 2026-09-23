@@ -18,13 +18,15 @@ from agent_run.review_budget import (
 )
 
 
-DELIVERY_POLICY_PROTOCOL = 4
+DELIVERY_POLICY_PROTOCOL = 5
 _POLICY_KEYS = frozenset(
     {
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
         "integration_resync_limit",
+        "ci_recovery_rounds",
+        "ci_repairs_per_round",
         "development_thread_policy",
         "invocation_deadlines",
     }
@@ -46,8 +48,10 @@ class DeliveryPolicy:
 
     ticket_review_rounds: int = 3
     integration_resync_limit: int = 3
+    ci_recovery_rounds: int = 3
+    ci_repairs_per_round: int = 3
     parent_only_paired_rounds: int = 10
-    run_repair_rounds: int = 10
+    run_repair_rounds: int = 3
     development_deadline_seconds: float = 5 * 60 * 60
     review_deadline_seconds: float = 2 * 60 * 60
     publication_deadline_seconds: float = 60 * 60
@@ -66,6 +70,8 @@ class DeliveryPolicy:
             "integration_resync_limit",
             _nonnegative_integer(self.integration_resync_limit, "integration_resync_limit"),
         )
+        for field in ("ci_recovery_rounds", "ci_repairs_per_round"):
+            object.__setattr__(self, field, _positive_integer(getattr(self, field), field))
         object.__setattr__(
             self,
             "parent_only_paired_rounds",
@@ -95,6 +101,8 @@ class DeliveryPolicy:
             "run_repair_rounds": self.run_repair_rounds,
             "ticket_review_rounds": self.ticket_review_rounds,
             "integration_resync_limit": self.integration_resync_limit,
+            "ci_recovery_rounds": self.ci_recovery_rounds,
+            "ci_repairs_per_round": self.ci_repairs_per_round,
             "development_thread_policy": self.development_thread_policy,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
@@ -174,6 +182,8 @@ def normalize_policy_overrides(
         "ticket_review_rounds": "ticket_review_rounds",
         "ticket_review_round": "ticket_review_rounds",
         "integration_resync_limit": "integration_resync_limit",
+        "ci_recovery_rounds": "ci_recovery_rounds",
+        "ci_repairs_per_round": "ci_repairs_per_round",
     }
     flat_deadline_aliases = {
         role: {
@@ -233,6 +243,8 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
             "run_repair_rounds": value.get("run_repair_rounds"),
             "ticket_review_rounds": value.get("ticket_review_rounds"),
             "integration_resync_limit": value.get("integration_resync_limit"),
+            "ci_recovery_rounds": value.get("ci_recovery_rounds"),
+            "ci_repairs_per_round": value.get("ci_repairs_per_round"),
             "development_thread_policy": value.get("development_thread_policy", "reuse"),
             "invocation_deadlines": dict(deadlines),
         }
@@ -295,6 +307,17 @@ def parent_only_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
     )
 
 
+def parent_integration_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
+    """Review-first Parent delivery window, independent of demand development."""
+
+    return ReviewBudgetPolicy(
+        development_limit=policy.run_repair_rounds,
+        review_limit=policy.run_repair_rounds + 1,
+        fallback=False,
+        budget_scope="parent-only",
+    )
+
+
 def run_repair_budget_policy(policy: DeliveryPolicy) -> ReviewBudgetPolicy:
     """Derive the Run D(N)/R(N+1) review-first topology."""
 
@@ -334,9 +357,18 @@ def parent_only_budget_policy_for_job(
     if raw is None:
         # Keep the direct engine seam usable for legacy unit callers; the
         # persisted State contract rejects a missing Run Policy Snapshot.
-        return PARENT_ONLY_POLICY
+        return (
+            ReviewBudgetPolicy(3, 4, budget_scope="parent-only")
+            if job.get("parent_integration_stage") is True
+            else PARENT_ONLY_POLICY
+        )
     try:
-        return parent_only_budget_policy(parse_policy_snapshot(raw))
+        policy = parse_policy_snapshot(raw)
+        return (
+            parent_integration_budget_policy(policy)
+            if job.get("parent_integration_stage") is True
+            else parent_only_budget_policy(policy)
+        )
     except DeliveryPolicyError as error:
         raise ValueError(f"invalid Parent-only Policy Snapshot: {error}") from error
 
@@ -397,6 +429,12 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
         ),
         integration_resync_limit=_nonnegative_integer(
             values.get("integration_resync_limit"), "integration_resync_limit"
+        ),
+        ci_recovery_rounds=_positive_integer(
+            values.get("ci_recovery_rounds"), "ci_recovery_rounds"
+        ),
+        ci_repairs_per_round=_positive_integer(
+            values.get("ci_repairs_per_round"), "ci_repairs_per_round"
         ),
         development_deadline_seconds=_positive_duration(
             deadlines["development"], "development deadline"

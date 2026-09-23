@@ -14,6 +14,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_run.agents import AgentBackend
+from agent_run.delivery_policy import parent_only_budget_policy_for_job
+from agent_run.ci_recovery_budget import (
+    can_start_ci_repair,
+    ci_limits_for_job,
+    ci_review_required,
+    mark_ci_repair,
+    mark_ci_review_invocation,
+    refund_unstarted_ci_repair,
+)
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
 from agent_run.git import GitError, GitRepository
@@ -97,6 +106,10 @@ from agent_run.ticket_integration import (
     integration_record_is_valid,
     prepare_ticket_integration,
 )
+from agent_run.parent_integration import (
+    parent_integration_record_is_valid,
+)
+from agent_run.parent_only_integration import prepare_parent_integration
 
 
 class ChangeDeliveryEngine:
@@ -125,6 +138,7 @@ class ChangeDeliveryEngine:
         self.adapter = adapter
         self.publisher = publisher
         self.state_store = state_store
+        self._current_job: dict[str, Any] | None = None
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         return self.state_store.save(state)
@@ -144,6 +158,7 @@ class ChangeDeliveryEngine:
     def run(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
+        self._current_job = job
         try:
             ensure_budget(job, self.review_budget_policy())
             while True:
@@ -178,6 +193,28 @@ class ChangeDeliveryEngine:
                     if not self._commit_candidate(state, job, checkout):
                         return state
                 if job["phase"] == "candidate":
+                    if (
+                        self.contract.label == "parent-only"
+                        # A no-change first integration reuses demand acceptance
+                        # and does not open the separate integration review budget.
+                        # Its record still makes every later CI Candidate cross
+                        # the live snapshot boundary before Reviewer starts.
+                        and isinstance(job.get("parent_integration"), dict)
+                        and not prepare_parent_integration(self, state, job, checkout)
+                    ):
+                        continue
+                    if (
+                        job.get("attempt_kind") == "ci_repair"
+                        and job.get("repair_source") == "required_checks"
+                        and not ci_review_required(
+                            job, is_ticket=self.contract.label.startswith("ticket-")
+                        )
+                    ):
+                        if not self._prepare_ticket_ci_first_round_authorization(
+                            state, job
+                        ):
+                            raise ValueError("Ticket CI repair has no valid first-round publication authority")
+                        continue
                     if pending_semantic_attempt(
                         job, role="reviewer"
                     ) is None and self.review_budget_exhausted_for_review(job):
@@ -216,10 +253,12 @@ class ChangeDeliveryEngine:
                         job["phase"] = "merged"
                         self.save(state)
                         continue
-                    if self.contract.label.startswith("ticket-") and not prepare_ticket_integration(
-                        self, state, job, checkout
-                    ):
-                        continue
+                    if self.contract.label.startswith("ticket-"):
+                        if not prepare_ticket_integration(self, state, job, checkout):
+                            continue
+                    elif self.contract.label == "parent-only":
+                        if not prepare_parent_integration(self, state, job, checkout):
+                            continue
                     self._publication(state, job, checkout)
                     # Publication can discover a moving base and let the
                     # consumer's stale boundary choose the next phase.
@@ -299,20 +338,29 @@ class ChangeDeliveryEngine:
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
         attempt_kind = str(job.get("next_attempt_kind", "ordinary"))
-        if attempt_kind not in {"ordinary", "final_ci_fix"}:
+        if attempt_kind not in {"ordinary", "ci_repair"}:
             raise ValueError(f"unknown Development attempt kind: {attempt_kind}")
-        if pending_semantic_attempt(
-            job, role="development"
-        ) is None and not can_start_development(
-            job, self.review_budget_policy(), attempt_kind=attempt_kind
-        ):
-            self._checkpoint_budget(
-                state,
-                job,
-                "modification_budget_exhausted",
-                "Development budget is exhausted for the current Review Budget Window",
-            )
-            return
+        if pending_semantic_attempt(job, role="development") is None:
+            if attempt_kind == "ci_repair":
+                outer_limit, inner_limit = ci_limits_for_job(job)
+                if not can_start_ci_repair(
+                    job,
+                    outer_limit=outer_limit,
+                    inner_limit=inner_limit,
+                    is_ticket=self.contract.label.startswith("ticket-"),
+                ):
+                    self._checkpoint_ci_budget(state, job, "ci_inner_budget_exhausted")
+                    return
+            elif not can_start_development(
+                job, self.review_budget_policy(), attempt_kind=attempt_kind
+            ):
+                self._checkpoint_budget(
+                    state,
+                    job,
+                    "modification_budget_exhausted",
+                    "Development budget is exhausted for the current Review Budget Window",
+                )
+                return
         develop(self, state, job, checkout)
 
     def _wait_for_initial_credential(
@@ -455,8 +503,14 @@ class ChangeDeliveryEngine:
             and isinstance(job.get("pending_attempt"), int)
             and job["pending_attempt"] > int(job.get("modification_attempts", 0))
         ):
-            if job.get("pending_attempt_kind") == "final_ci_fix":
-                budget["final_ci_fix_used"] = False
+            if job.get("pending_attempt_kind") == "ci_repair":
+                outer_limit, inner_limit = ci_limits_for_job(job)
+                refund_unstarted_ci_repair(
+                    job,
+                    outer_limit=outer_limit,
+                    inner_limit=inner_limit,
+                    is_ticket=self.contract.label.startswith("ticket-"),
+                )
             elif budget["development_attempts"] > 0:
                 budget["development_attempts"] -= 1
             job.pop("pending_attempt", None)
@@ -477,22 +531,52 @@ class ChangeDeliveryEngine:
             job.pop("last_publication_error", None)
 
     def review_budget_policy(self) -> ReviewBudgetPolicy:
+        if self.contract.label == "parent-only" and self._current_job is not None:
+            return parent_only_budget_policy_for_job(self._current_job)
         return self.contract.review_budget_policy or policy_for_subject(
             self.contract.label
         )
 
     def review_budget_exhausted_for_review(self, job: dict[str, Any]) -> bool:
+        if job.get("attempt_kind") == "ci_repair":
+            return False
         return not can_start_review(job, self.review_budget_policy())
 
     def mark_development_attempt(
         self, job: dict[str, Any], *, attempt_kind: str
     ) -> int:
+        if attempt_kind == "ci_repair":
+            outer_limit, inner_limit = ci_limits_for_job(job)
+            return mark_ci_repair(
+                job,
+                outer_limit=outer_limit,
+                inner_limit=inner_limit,
+                is_ticket=self.contract.label.startswith("ticket-"),
+            )
         return mark_development(
             job, self.review_budget_policy(), attempt_kind=attempt_kind
         )
 
     def mark_review_invocation(self, job: dict[str, Any]) -> int:
+        if job.get("attempt_kind") == "ci_repair":
+            return mark_ci_review_invocation(job)
         return mark_review(job, self.review_budget_policy())
+
+    def _checkpoint_ci_budget(
+        self, state: dict[str, Any], job: dict[str, Any], code: str
+    ) -> None:
+        job.update({"phase": "escalating", "escalation_code": code})
+        job["ci_recovery"]["checkpoint_reason"] = code
+        self.save(state)
+
+    def _prepare_ticket_ci_first_round_authorization(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool:
+        from agent_run.change_delivery_fallback import (
+            prepare_ticket_ci_first_round_authorization,
+        )
+
+        return prepare_ticket_ci_first_round_authorization(self, state, job)
 
     def _checkpoint_budget(
         self,
@@ -576,8 +660,12 @@ class ChangeDeliveryEngine:
         *,
         next_action: str | None = None,
     ) -> None:
-        if job.get("publication_authority") == "fallback":
-            validation_outcome = "fallback"
+        if job.get("publication_authority") in {"fallback", "ci_repair"}:
+            validation_outcome = (
+                "ci_repair_unreviewed"
+                if job.get("publication_authority") == "ci_repair"
+                else "fallback"
+            )
             lane_statuses = {
                 lane: "not_run" for lane in ("e2e", "standards", "spec")
             }
@@ -622,6 +710,14 @@ class ChangeDeliveryEngine:
                 integration_record_is_valid(self.git, job)
                 and not self.adapter.revision_changed(state, job)
             )
+        if self.contract.label == "parent-only":
+            acceptance = job.get("acceptance_record")
+            return (
+                parent_integration_record_is_valid(self.git, job)
+                and isinstance(acceptance, dict)
+                and self.adapter.acceptance_is_current(state, job, acceptance)
+                and not self.adapter.revision_changed(state, job)
+            )
         if job.get("publication_authority") == "fallback":
             receipt = job.get("fallback_publication_receipt")
             if not isinstance(receipt, dict):
@@ -657,7 +753,7 @@ class ChangeDeliveryEngine:
         # Ticket Development and its original Review intentionally use their
         # fixed checkout. Remote source/target additions belong to the later
         # integration boundary, never to an in-flight semantic attempt.
-        if self.contract.label.startswith("ticket-"):
+        if self.contract.label.startswith("ticket-") or self.contract.label == "parent-only":
             return not self.adapter.revision_changed(state, job)
         current_base = self.git.resolve(self.contract.base_branch)
         return self.adapter.base_is_current(

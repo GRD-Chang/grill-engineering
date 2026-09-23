@@ -15,6 +15,7 @@ import pytest
 from support.workspace import managed_repo, managed_state
 
 import agent_run.cli as cli_module
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.run_lifecycle import prepare_action_application_receipt
 from agent_run.state_contract import require_current_run_state
 from agent_run.state import StateStore
@@ -76,6 +77,7 @@ def test_dedicated_actions_reconcile_exact_receipt_at_cli_boundary(
                 "phase": "pending",
                 "review_budget": _canonical_run_budget(),
                 "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
             }
             state["requeue_required"] = {
                 "work_subject": f"parent-only:{run_id}",

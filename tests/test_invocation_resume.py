@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agent_run.change_delivery import ChangeDeliveryEngine
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.controller import (
     Controller,
     _change_job_for_invocation,
@@ -36,6 +37,21 @@ def _canonical_budget() -> dict[str, Any]:
         "review_artifacts": [],
         "checkpoint_reason": None,
     }
+
+
+def _with_canonical_ci_budgets(state: dict[str, Any]) -> None:
+    """Materialize the CI fields alongside hand-built invocation subjects."""
+
+    for owner in (*state.get("ticket_jobs", {}).values(), state.get("active_ticket_job"),
+                  state.get("parent_job")):
+        if isinstance(owner, dict):
+            owner.setdefault("ci_recovery", new_ci_recovery_budget())
+    run = state.get("run_acceptance")
+    if isinstance(run, dict):
+        run.setdefault("ci_recovery", new_ci_recovery_budget())
+        repair = run.get("repair_job")
+        if isinstance(repair, dict):
+            repair.setdefault("ci_recovery", dict(run["ci_recovery"]))
 
 
 def test_human_response_history_keeps_ordered_immutable_entries() -> None:
@@ -327,6 +343,7 @@ def _prepared_resume(
     state["agent_invocation_history"] = []
     state["status"] = "execution_failed"
     state["terminal_kind"] = "execution_failed"
+    _with_canonical_ci_budgets(state)
     store.save_run(run_id, state)
     return controller, store, run_id
 
@@ -444,6 +461,7 @@ def test_resume_reopens_a_development_invocation_after_credential_failure(
             },
         }
     )
+    _with_canonical_ci_budgets(state)
     store.save_run(run_id, state)
 
     resumed, reused = controller.resume(run_id)

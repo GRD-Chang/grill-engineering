@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from agent_run.change_currentness import stale_change_job_reason, unknown_pr_mutation
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.cli_presentation import _next_action
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
@@ -179,6 +180,7 @@ def _ticket_state() -> dict[str, Any]:
         "reviewer_thread_ids": ["reviewer-old"],
         "review_budget": _canonical_budget(),
         "review_budget_history": [],
+        "ci_recovery": new_ci_recovery_budget(),
     }
     return {
         "run_id": "run-1",
@@ -243,6 +245,7 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
             "parent_branch": "agent-run/run-1/parent-generation-2",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         },
     }
     parent_retired = requeue_change_job(parent_state)
@@ -257,6 +260,7 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
         "phase": "developing",
         "review_budget": _canonical_budget(),
         "review_budget_history": [],
+        "ci_recovery": new_ci_recovery_budget(),
         "repair_branch": "agent-run-repair/run-1/2-generation-3",
         "ticket_completion_records": [{"ticket_number": 7}],
     }
@@ -267,6 +271,7 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
             "phase": "repairing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "repair_job": repair,
         },
     }
@@ -276,6 +281,7 @@ def test_requeue_parent_and_run_repair_create_next_generation_inputs() -> None:
         "phase": "pending",
         "review_budget": _canonical_budget(),
         "review_budget_history": [],
+        "ci_recovery": new_ci_recovery_budget(),
     }
     assert repair_state["active_agent_invocation"] is None
     assert repair_state["status"] == "run_acceptance_pending"
@@ -367,6 +373,7 @@ def test_controller_requeues_a_ticket_from_the_latest_issue_revision(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
         }
@@ -423,6 +430,7 @@ def test_requeue_waits_for_unparseable_transition_facts_before_closing_old_pr(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
         }
@@ -478,6 +486,7 @@ def test_requeue_transition_restores_its_exact_gate_after_graph_read_recovers(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
         }
@@ -555,6 +564,7 @@ def test_requeue_rechecks_an_externally_closed_pr_before_retiring_it(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
             "pr_number": pr_number,
@@ -635,6 +645,7 @@ def test_requeue_blocks_an_external_close_during_retirement(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
             "pr_number": pr_number,
@@ -684,7 +695,7 @@ def test_requeue_blocks_an_external_reopen_after_its_close_receipt(
     base_sha = git.resolve(str(state["run_branch"]))
     publisher.ensure_ticket_branch(branch=branch, base_branch=str(state["run_branch"]), ticket_number=7, expected_base_sha=base_sha, expected_remote_sha=base_sha, recovery_remote_sha=base_sha)
     pr_number = publisher.ensure_ticket_pr(branch=branch, base_branch=str(state["run_branch"]), title="old", body="old", primary_ticket=7, expected_head_sha=base_sha, expected_base_sha=base_sha)
-    job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "review_budget": _canonical_budget(), "review_budget_history": [], "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
+    job.update({"ticket_branch_generation": 1, "ticket_branch": branch, "phase": "developing", "review_budget": _canonical_budget(), "review_budget_history": [], "ci_recovery": new_ci_recovery_budget(), "effective_revision": "stale", "base_sha": git.resolve(str(state["run_branch"])), "pr_number": pr_number, "publication_sha": git.resolve(str(state["run_branch"]))})
     state["ticket_jobs"] = {"7": job}
     states.save_run(run_id, state)
     assert stdout_json(run_cli(git_repo, fixture, "run", "1"))["status"] == "requeue_required"
@@ -720,6 +731,7 @@ def test_requeue_supervises_an_unreadable_persisted_pr(git_repo: Path) -> None:
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": git.resolve(str(state["run_branch"])),
             "pr_number": 99,
@@ -774,6 +786,7 @@ def test_requeue_supervises_a_repository_binding_read_failure(git_repo: Path) ->
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "stale",
             "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }
@@ -830,6 +843,7 @@ def test_deliver_cannot_restart_a_stale_generation_without_requeue(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "effective_revision": "old-revision",
             "base_sha": GitRepository(managed_repo(git_repo)).resolve(str(state["run_branch"])),
         }
@@ -865,6 +879,7 @@ def test_stale_human_blocker_cannot_resume_the_old_generation(git_repo: Path) ->
             "phase": "blocked",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
             "blocked_reason": "reviewer_requires_human",
             "human_blocker_phase": "candidate",
             "human_blockers": ["need decision"],
@@ -949,6 +964,8 @@ def test_public_views_keep_currentness_contradiction_bound_to_ticket(
             "phase": "developing",
             "review_budget": _canonical_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
+            "policy_snapshot": deepcopy(state["policy_snapshot"]),
             "effective_revision": effective_revision(
                 ticket_revision=graph["tickets"]["7"]["content_revision"],
                 parent_revision=parent["revision"],

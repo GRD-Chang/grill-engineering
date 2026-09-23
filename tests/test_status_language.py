@@ -91,7 +91,8 @@ def test_delivery_progress_preserves_audit(
     progress = json.loads(audit_output.getvalue())["progress"]
     assert set(progress) == {
         "repository", "parent", "status", "phase", "current_object",
-        "ticket_progress", "round_progress", "integration_resync", "run_repair", "elapsed_seconds",
+        "ticket_progress", "round_progress", "integration_resync", "ci_recovery",
+        "run_repair", "elapsed_seconds",
         "current_agent", "execution_activity", "findings", "conclusion", "next_action",
     }
     assert progress["ticket_progress"] == {
@@ -268,7 +269,7 @@ def test_repair_blocker_shows_action_and_work_facts_without_control_identifiers(
     human = Text.from_ansi(output.getvalue()).plain
     readable = " ".join(human.replace("│", " ").split())
     expected_terms = (
-        "整体修复", "代码修改 2 / 10", "当前版本验收", "需要人工处理", "验收中",
+        "整体修复", "代码修改 2 / 3", "当前版本验收", "需要人工处理", "验收中",
         "review-model", "high", "等待人工处理 / 原始 evidence",
         "当前代码版本已保存", "开发工作区已保留", "整项任务已暂停，其他子任务也不会继续",
         "agent-run resume 1 --repo example/project",

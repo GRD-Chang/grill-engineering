@@ -310,6 +310,9 @@ class RunRepairLifecycle:
     ) -> dict[str, Any]:
         existing = run.get("repair_job")
         if isinstance(existing, dict):
+            if existing.get("ci_recovery") != run.get("ci_recovery"):
+                raise ValueError("Run and Run Repair CI recovery state differ")
+            existing["ci_recovery"] = run["ci_recovery"]
             self._complete_pending_repair_trigger(state, existing)
             return existing
         base_sha = self.owner.git.resolve(str(state["run_branch"]))
@@ -423,6 +426,7 @@ class RunRepairLifecycle:
                 review_artifacts=prior_review_artifacts,
             ),
             "review_budget_history": deepcopy(run_budget_history),
+            "ci_recovery": run["ci_recovery"],
             "repair_checkout": str(self.owner._repair_checkout(state)),
         }
         for key in (
@@ -458,6 +462,7 @@ class RunRepairLifecycle:
             origin["head_sha"] = base_sha
             origin["result"] = "fail"
             job["required_checks_origin"] = origin
+            job["next_attempt_kind"] = "ci_repair"
         if repair_source == "merge_conflict":
             evidence = repair_request.get("merge_conflict_evidence")
             if not isinstance(evidence, str) or not evidence.strip():

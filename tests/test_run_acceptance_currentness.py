@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from support.run_artifacts import _canonical_run_budget, _human_artifact, _passing_artifact, _repair_artifact
-from support.run_scenarios import _completed_run
+from support.run_scenarios import _completed_run, save_run_with_ci_fixture
 
 from copy import deepcopy
 import subprocess
@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.agent_invocation import record_session_interruption
 from agent_run.change_currentness import candidate_or_acceptance_is_inconsistent
 from agent_run.controller import Controller
 from agent_run.github import GitHubReadError
@@ -25,7 +26,7 @@ from support.seeding import seed_idle_control, seed_run, write_fixture
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.cli import failed_invocation, run_internal_stage, run_cli, stdout_json
 
-from support.run_agents import ScriptedRunAgents
+from support.run_agents import FreshCycleRunAgents, ScriptedRunAgents
 
 
 def test_prior_rejection_is_history_not_new_candidate_authority() -> None:
@@ -170,7 +171,7 @@ def test_run_repair_drift_discards_repair_before_fresh_acceptance(
     }
     state["run_acceptance"] = run
     state["status"] = "run_acceptance_pending"
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
         str(state["run_id"])
     )
@@ -280,7 +281,7 @@ def test_public_resume_retires_stale_run_repair_before_preserving_dirty_checkout
             "active_agent_invocation": invocation,
         }
     )
-    states.save_run(run_id, state)
+    save_run_with_ci_fixture(states, run_id, state)
     delivery_before = deepcopy(
         json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     )
@@ -498,7 +499,7 @@ def test_run_repair_preserves_dirty_inflight_development_after_final_pr_drift(
             ),
         },
     }
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
 
     class DriftingRepairDeveloper(ScriptedRunAgents):
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
@@ -591,7 +592,7 @@ def test_required_check_trigger_fingerprint_read_is_supervised_in_same_cycle(
             "ci_evidence": evidence,
         },
     }
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     agents = ScriptedRunAgents()
     agents._reviews = [_passing_artifact()]
     engine = RunAcceptanceEngine(
@@ -744,7 +745,7 @@ def test_interrupted_run_review_restarts_with_a_fresh_attempt(
         "development_thread_history": [],
         "reviewer_thread_ids": [],
     }
-    states.save_run(str(state["run_id"]), state)
+    save_run_with_ci_fixture(states, str(state["run_id"]), state)
     agents = ScriptedRunAgents()
     agents._reviews = [_passing_artifact()]
 
@@ -781,6 +782,10 @@ def test_default_branch_drift_invalidates_run_acceptance_and_rechecks_merge_prev
         check=True,
         capture_output=True,
     )
+    fixture = git_repo / "github.json"
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["default_head_sha"] = git.resolve("main")
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     second = ScriptedRunAgents()
     second._reviews = [_passing_artifact()]
     second.review_requests = [{}]
@@ -794,8 +799,187 @@ def test_default_branch_drift_invalidates_run_acceptance_and_rechecks_merge_prev
     ).accept(str(state["run_id"]))
 
     assert result["status"] == "run_publication_pending"
-    assert result["run_acceptance"]["validation_attempts"] == 2
+    assert result["run_acceptance"]["validation_attempts"] == 1
+    assert result["run_acceptance"]["integration_resync"]["window"] == 2
     assert result["run_acceptance"]["acceptance_record"]["reviewed_default_base_sha"] == git.resolve("main")
+
+
+def test_promoted_run_repair_readback_preserves_integration_and_review_window(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    agents = ScriptedRunAgents()
+    first = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+
+    assert first["status"] == "run_publication_pending"
+    run = first["run_acceptance"]
+    assert run["completed_repair_jobs"][-1]["acceptance_state"] == "promoted"
+    promoted_head = run["completed_repair_jobs"][-1]["integrated_sha"]
+    assert git.resolve(str(state["run_branch"])) == promoted_head
+    budget = deepcopy(run["integration_resync"])
+    review_window = run["review_budget"]["window"]
+    acceptance = deepcopy(run["acceptance_record"])
+
+    reloaded = RunAcceptanceEngine(
+        git=git, states=states, agents=ScriptedRunAgents(),
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+
+    assert reloaded["status"] == "run_publication_pending"
+    resync = reloaded["run_acceptance"]["integration_resync"]
+    assert resync["used"] == budget["used"]
+    assert resync["window"] == budget["window"]
+    assert resync["history"] == budget["history"]
+    assert resync["source_sha"] == promoted_head
+    assert reloaded["run_acceptance"]["review_budget"]["window"] == review_window
+    assert reloaded["run_acceptance"]["acceptance_record"] == acceptance
+    assert reloaded["run_acceptance"]["run_integration"]["source_sha"] == promoted_head
+
+    external_head = subprocess.run(
+        [
+            "git", "commit-tree", git.resolve(f"{promoted_head}^{{tree}}"),
+            "-p", promoted_head, "-m", "External Run source append",
+        ],
+        cwd=git_repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    FixtureGitHubPublisher(fixture, git).sync_run_branch(
+        run_branch=str(state["run_branch"]), integrated_sha=external_head,
+    )
+    fresh_agents = FreshCycleRunAgents()
+    fresh_agents._reviews = [_passing_artifact()]
+    refreshed = RunAcceptanceEngine(
+        git=git, states=states, agents=fresh_agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+    assert refreshed["run_acceptance"]["integration_resync"]["used"] == budget["used"] + 1
+    assert refreshed["run_acceptance"]["review_budget"]["window"] == review_window + 1
+    assert len(fresh_agents.review_requests) == 1
+
+
+@pytest.mark.parametrize("new_thread", [False, True])
+def test_run_integration_conflict_attempt_survives_interruption_and_reload(
+    git_repo: Path, tmp_path: Path, new_thread: bool,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    fixture = git_repo / "github.json"
+    branch = str(state["run_branch"])
+    source_checkout = tmp_path / "run-source"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(source_checkout), branch],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    try:
+        (source_checkout / "README.md").write_text("run source\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=source_checkout, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Run source change"], cwd=source_checkout,
+            check=True, capture_output=True,
+        )
+        source = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=source_checkout,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(source_checkout)],
+            cwd=git_repo, check=True, capture_output=True,
+        )
+    FixtureGitHubPublisher(fixture, git).sync_run_branch(
+        run_branch=branch, integrated_sha=source,
+    )
+    (git_repo / "README.md").write_text("default target\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Default target change"], cwd=git_repo,
+        check=True, capture_output=True,
+    )
+    target = git.resolve("main")
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["default_head_sha"] = target
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    class InterruptedConflictAgent:
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            request["_invocation_event"]("started", requested_thread_id=None, attempt_count=0)
+            request["_invocation_event"](
+                "thread_started", reported_thread_id="run-conflict-developer", attempt_count=1,
+            )
+            raise RuntimeError("controller interrupted conflict resolution")
+
+    with pytest.raises(RuntimeError, match="controller interrupted"):
+        RunAcceptanceEngine(
+            git=git, states=states, agents=InterruptedConflictAgent(),
+            github=FixtureGitHubPublisher(fixture, git),
+        ).accept(str(state["run_id"]))
+
+    persisted = states.load_current_run(str(state["run_id"]))
+    assert persisted is not None
+    attempt = persisted["run_acceptance"]["pending_semantic_attempt"]
+    assert attempt["role"] == "development"
+    assert attempt["work_subject"] == f"run-integration:{state['run_id']}"
+    assert persisted["active_agent_invocation"]["phase"] == "run_integration_conflict"
+    attempt_id = attempt["attempt_id"]
+    ordinal = persisted["run_acceptance"]["integration_conflict_agent_ordinal"]
+    record_session_interruption(
+        persisted, save=lambda current: states.save_run(str(state["run_id"]), current),
+    )
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        str(state["run_id"]), explicit_resume=True, new_thread=new_thread,
+    )
+    assert resumed["active_agent_invocation"]["status"] == "resuming"
+    if new_thread:
+        assert "development_thread_id" not in resumed["run_acceptance"]
+        assert resumed["run_acceptance"]["development_new_thread"] is True
+        assert resumed["run_acceptance"]["development_thread_history"] == [
+            "run-conflict-developer"
+        ]
+    else:
+        assert resumed["run_acceptance"]["development_thread_id"] == "run-conflict-developer"
+    assert resumed["run_acceptance"]["pending_semantic_attempt"]["attempt_id"] == attempt_id
+    assert resumed["run_acceptance"]["integration_conflict_agent_ordinal"] == ordinal
+
+    class ResumedConflictAgent:
+        def develop(self, request: dict[str, Any]) -> DevelopmentResult:
+            old_thread = None if new_thread else "run-conflict-developer"
+            next_thread = "run-conflict-new-developer" if new_thread else "run-conflict-developer"
+            assert request["thread_id"] == old_thread
+            event = request["_invocation_event"]
+            event("started", requested_thread_id=old_thread, attempt_count=0)
+            event("thread_started", reported_thread_id=next_thread, attempt_count=1)
+            (Path(str(request["checkout"])) / "README.md").write_text(
+                "resolved source and target\n", encoding="utf-8",
+            )
+            event("completed", reported_thread_id=next_thread, attempt_count=1)
+            return DevelopmentResult(
+                thread_id=next_thread, summary="Resolved the Run integration conflict.",
+            )
+
+        def review(self, request: dict[str, Any]) -> ReviewResult:
+            return ReviewResult(thread_id="run-reviewer", artifact=_passing_artifact())
+
+    completed = RunAcceptanceEngine(
+        git=git, states=states, agents=ResumedConflictAgent(),
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
+    assert completed["status"] == "run_publication_pending"
+    record = completed["run_acceptance"]["run_integration"]
+    assert record["conflict_paths"] == ["README.md"]
+    assert git.is_ancestor(source, record["head_sha"])
+    assert git.is_ancestor(target, record["head_sha"])
+    reloaded = states.load_current_run(str(state["run_id"]))
+    assert reloaded is not None
+    assert reloaded["status"] == "run_publication_pending"
+    assert reloaded["run_acceptance"]["integration_conflict_agent_ordinal"] == ordinal
+    development_attempts = [
+        item for item in reloaded["run_acceptance"]["semantic_attempt_history"]
+        if item["role"] == "development"
+    ]
+    assert len(development_attempts) == 1
+    assert development_attempts[0]["attempt_id"] == attempt_id
 
 def test_controller_default_branch_drift_stales_accepted_run(
     git_repo: Path,

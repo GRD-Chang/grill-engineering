@@ -78,17 +78,17 @@ Delivery Policy 的取值优先级是内置默认值、用户级默认值、单�
 
 ```bash
 agent-run policy show
-agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 10 --review-deadline 2h
+agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 3 --ci-recovery-rounds 3 --ci-repairs-per-round 3 --review-deadline 2h
 agent-run run <parent-issue> --ticket-review-rounds 1 --development-deadline 30m
 ```
 
 Ticket 的语义 Review 轮数为 `N` 时，普通 Development 为 `N+1` 次、Reviewer 为 `N` 次；默认
-为 `4/3`，最后一次普通 Development 不再进入 Review，并保留有条件的一次 Final CI-fix。
+为 `4/3`，最后一次普通 Development 不再进入 Review。可修复 CI 失败使用独立额度。
 Parent-only 的配对轮数为 `N` 时，Development 与 Reviewer 都最多执行 `N` 次并严格配对；默认
 为 `10/10`，Reviewer 失败不会转入 Ticket Fallback，而是在当前窗口耗尽后等待显式 Resume。
 Run Repair 的修复轮数为 `N` 时，首次整体 Reviewer 加最多 `N` 次 Development 和 `N+1` 次
-Reviewer；默认准确执行 `D10/R11`。第 `N+1` 次 Reviewer 仍有 Finding 时进入 Review Budget
-Checkpoint，不使用 Final CI-fix 或未经 Reviewer 验收的 Publication Authority。
+Reviewer；普通 Parent 集成窗口默认为 `D3/R4`。第 `N+1` 次 Reviewer 仍有 Finding 时进入 Review Budget
+Checkpoint，不使用未经 Reviewer 验收的 Publication Authority。
 正整数轮数和正 duration 在创建 Worker、PR 或部分状态之前校验。每个新 Run 以及显式开启的
 新 Budget Window 都把实际生效的完整策略保存为 Policy Snapshot；之后修改用户级默认值不会
 改变已有 Run，包括之后获准开启的新预算窗口；只有检查点 Resume 的显式覆盖可修改新窗口策略。缺少或不完整 Snapshot 的旧状态会 fail closed。
@@ -475,12 +475,10 @@ Publisher 是唯一 Git/GitHub Mutation Authority，负责：
 - 显式关闭 Primary Ticket并记录 Run、PR 与 integrated commit。
 
 每个 Ticket Review Budget Window 默认最多允许四次普通 Development Attempt 和三次 Reviewer
-Invocation；具体上限由该窗口冻结的 `N+1/N` Policy Snapshot 决定。普通 Development 耗尽后，
-只有已发布 Ticket PR 首次出现由准确 CI Evidence 证明可修复的 Required Checks 失败时，才额外允许一次
-Final CI-fix。Development Attempt 在首次
+Invocation；具体上限由该窗口冻结的 `N+1/N` Policy Snapshot 决定。可修复的 Required Checks 失败使用独立 CI 恢复额度：默认最多三轮、每轮最多三次开发修复；Ticket 首轮仅一次修复并以绑定旧发布授权与失败证据的窄收据更新原 PR，从第二轮开始须经 Reviewer。Development Attempt 在首次
 分配时占用预算；进程失败、Output Repair、Human Blocker Resume 和 `--new-thread` 只继续同一
-Semantic Agent Attempt，不重复计数。普通预算与 Final CI-fix 均耗尽且仍需修改时进入
-`modification_budget_exhausted`，维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
+Semantic Agent Attempt，不重复计数。普通需求预算耗尽且仍需修改时进入
+`modification_budget_exhausted`；CI 恢复内层或外层耗尽时只续期对应 CI 窗口。维护者显式 `resume` 开启新的编号 Budget Window。Reviewer
 额度耗尽后的 Candidate 则继续按 Fallback Publication Receipt 和实际 Required Checks 规则处理。
 
 ## Source Runner 安装

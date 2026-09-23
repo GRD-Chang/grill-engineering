@@ -4,6 +4,10 @@ status: accepted
 
 # Ticket Review 预算耗尽后按仓库 Required Checks 策略确定性集成
 
+## 后续取代：Issue #307 Parent 集成与独立 CI 恢复
+
+本 ADR 的 Ticket 确定性兜底条件仍适用。关于可修复 Required Checks 失败使用普通 Development/Review 额度及条件式 Final CI-fix、Run 默认 D10/R11 的段落，已由 [ADR 0016](0016-parent-integration-delivery.md) 取代：CI 恢复使用独立外层/内层额度，Ticket 首轮仅一次修复并用窄发布收据，之后轮次与 Parent 修复经 Reviewer；普通 Parent 集成窗口默认 D3/R4。以下保留原决策文本作为历史记录。
+
 Ticket 不是最终产品交付边界，完整 Parent 的自动完成权威属于 Run Acceptance。为在信任 Agent 的 thin harness 中限制重复 Reviewer Token，每组配对的 Ticket Development 与 Review Budget Window 最多执行四次普通 Development Attempt 与三次 Reviewer Invocation：Development 1 后 Review 1，Development 2 后 Review 2，Development 3 后 Review 3；第三次仍失败且仍有普通 Development 名额时允许最后一次 Development 4。Finding、Git Integrity 与可修复 Required Check 失败复用这两项统一预算；每个新 Candidate 只要还有 Reviewer 名额就必须审查，三次名额用尽后才跳过。如果这些失败已提前耗尽四次 Development，Reviewer 失败后的 Candidate 不得未经修复进入兜底，而是等待人工 `resume`。唯一 Development 预算例外是四次普通 Development 耗尽后任一已发布 Ticket PR 首次出现经 CI Failure Evidence 分类确认的可修复 Required Checks 失败：允许同一 Development Thread 额外执行一次 Final CI-fix；新 Candidate 仍有 Reviewer 名额时使用下一次 Fresh Acceptance，没有名额时才直接重新发布，准确新 head 再次出现可修复 CI 失败则等待人工 `resume`。
 
 Review 预算耗尽后的 Candidate 不运行 Controller 本地代码 Validation、changed-surface 命令或 `git diff --check` 代码门禁。Controller 只执行 Git Integrity Check，并以绑定准确 base/tree、已用 Reviewer Artifacts、最后一次 Reviewer Artifact 之后的 Development Summary 和代码 delta 的 Fallback Publication Receipt 复用现有 Publication 阶段创建或更新普通 Ticket PR；Controller 不判断 Findings 是否关闭。它不增加 provisional PR 类型，也不把该凭据伪装成 Acceptance Record。Controller 随后读取准确 PR head 的实际 Required Checks：存在时必须全部通过，未配置时 Required Checks Observation 的 `result=none` 允许继续；两种结果都形成不冒充 Acceptance Record 的 Deterministic Integration Record，再由 Published-Head Gate 决定是否将 Ticket 合入临时 Run Branch。最终 Run Acceptance 仍检查完整 Parent、跨 Ticket 交互及所有确定性兜底记录。

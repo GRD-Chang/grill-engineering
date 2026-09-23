@@ -235,7 +235,10 @@ class FixtureGitHubPublisher:
         current: object = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(current, dict):
             raise GitHubReadError("invalid_fixture", "fixture root must be an object")
-        published = _mapping(_mapping(current, "delivery"), "published_branches")
+        delivery = current.get("delivery", {})
+        if not isinstance(delivery, dict):
+            raise GitHubReadError("invalid_fixture", "fixture delivery must be an object")
+        published = _mapping(delivery, "published_branches") if "published_branches" in delivery else {}
         source = published.get(source_branch)
         target = published.get(target_branch)
         if target is None and target_branch == current.get("default_branch"):
@@ -775,6 +778,16 @@ class FixtureGitHubPublisher:
         observation = RemoteBranchObservation(
             branch, expected_remote_sha, published.get(branch)
         )
+        outcomes = self._delivery().get("publish_branch_outcomes")
+        outcome = outcomes.pop(0) if isinstance(outcomes, list) and outcomes else None
+        if outcome in {"foreign", "cas_race"}:
+            published[branch] = "foreign"
+            self._save()
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, "foreign")
+            )
+        if outcome not in {None, "lost_response"}:
+            raise ValueError("fixture publish_branch outcome is invalid")
         if not self.git.is_ancestor(expected_remote_sha, head_sha):
             raise GitError("publication head does not descend from the observed source head")
         if observation.observed_sha == head_sha:
@@ -790,6 +803,8 @@ class FixtureGitHubPublisher:
             ):
                 pull["head_sha"] = head_sha
         self._save()
+        if outcome == "lost_response":
+            raise OSError("fixture lost branch publication response")
         self._inject_revision_drift("publish_branch")
         self._crash_once("publish_branch")
         return BranchPublicationResult(observation, head_sha, "published")

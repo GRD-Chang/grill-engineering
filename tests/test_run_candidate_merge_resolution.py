@@ -13,6 +13,7 @@ import pytest
 
 from agent_run.task_control import TaskControlStore, TaskKey
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitError, GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -20,6 +21,7 @@ from agent_run.run_acceptance import RunAcceptanceEngine
 from support.workspace import prepare_workspace
 from support.seeding import seed_idle_control
 from support.cli import run_cli
+from support.merge_resolution import _LateMergeRepairEngine
 
 
 @pytest.mark.parametrize(
@@ -34,6 +36,8 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
     workspace = prepare_workspace(git_repo)
     repo = workspace.repository_root
     state, states, git = _completed_run(repo, state_root=workspace.state_root)
+    # Keep this near-ceiling repair-cycle regression at its original D10/R11 policy.
+    state["policy_snapshot"] = DeliveryPolicy(run_repair_rounds=10).snapshot()
     if not latest_combination_has_finding:
         seed_idle_control(
             TaskControlStore(states.root),
@@ -142,7 +146,7 @@ def test_merged_conflict_candidate_default_drift_stays_in_same_repair_cycle(
             fixture.write_text(json.dumps(data), encoding="utf-8")
 
     agents = ConflictThenFreshAgents()
-    first = RunAcceptanceEngine(
+    first = _LateMergeRepairEngine(
         git=git,
         states=states,
         agents=agents,

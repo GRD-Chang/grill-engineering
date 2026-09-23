@@ -14,6 +14,7 @@ from support.workspace import managed_repo, managed_state
 
 from agent_run import cli as cli_module
 from agent_run.delivery_policy import policy_snapshot_for_state
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.executor_host import ExecutorSpec, HostObservation
 from agent_run.github_fixture import FixtureGitHubReader
 from agent_run.git import Publisher
@@ -100,6 +101,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                 "phase": "pending",
                 "review_budget": _canonical_run_budget(),
                 "review_budget_history": [],
+                "ci_recovery": new_ci_recovery_budget(),
             }
             state["requeue_required"] = {
                 "work_subject": f"parent-only:{run_id}",

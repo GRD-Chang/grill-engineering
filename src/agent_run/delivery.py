@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery import ensure_change_branch_authority
+from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.delivery_loop import (
     TicketDeliveryLoop,
@@ -344,6 +345,7 @@ class TicketDeliveryEngine:
             "policy_snapshot": policy_snapshot_for_state(state),
             "review_budget": new_budget(),
             "review_budget_history": [],
+            "ci_recovery": new_ci_recovery_budget(),
         }
 
     @staticmethod

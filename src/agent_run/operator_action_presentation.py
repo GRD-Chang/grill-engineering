@@ -162,7 +162,10 @@ def _operator_action_kind(
 ) -> str:
     if is_human_blocker:
         return "human_blocker"
-    if reason in {"modification_budget_exhausted", "review_budget_exhausted"}:
+    if reason in {
+        "modification_budget_exhausted", "review_budget_exhausted",
+        "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+    }:
         return "review_budget_checkpoint"
     if reason in {
         "acceptance_record_mismatch",

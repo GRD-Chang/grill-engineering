@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.controller import _resume_review_budget_window
+from agent_run.ci_recovery_budget import (
+    mark_ci_repair,
+    new_ci_recovery_budget,
+    observe_repairable_ci_failure,
+)
 from agent_run.delivery_policy import (
     DeliveryPolicy,
     parent_only_budget_policy,
@@ -136,10 +141,10 @@ def test_reset_budget_opens_numbered_window_without_old_attempts() -> None:
     assert "fallback_publication_receipt" not in job
 
 
-def test_run_policy_allows_ten_developments_and_eleven_reviews() -> None:
+def test_run_policy_allows_three_developments_and_four_reviews() -> None:
     job = _job_with_budget()
 
-    for _ in range(11):
+    for _ in range(4):
         mark_review(job, RUN_POLICY)
     assert not can_start_review(job, RUN_POLICY)
     assert can_start_development(job, RUN_POLICY)
@@ -386,7 +391,7 @@ def test_run_repair_review_counts_share_the_run_window() -> None:
         "review_budget": {
             "window": 1,
             "development_attempts": 0,
-            "reviewer_invocations": 4,
+            "reviewer_invocations": 3,
             "final_ci_fix_used": False,
             "review_artifacts": [],
             "checkpoint_reason": None,
@@ -401,7 +406,7 @@ def test_run_repair_review_counts_share_the_run_window() -> None:
         "review_budget": {
             "window": 1,
             "development_attempts": 0,
-            "reviewer_invocations": 4,
+            "reviewer_invocations": 3,
             "final_ci_fix_used": False,
             "review_artifacts": [],
             "checkpoint_reason": None,
@@ -410,7 +415,7 @@ def test_run_repair_review_counts_share_the_run_window() -> None:
     }
     mark_review(job, RUN_POLICY)
     sync_repair_cycle_counters(run, job)
-    assert run["review_budget"]["reviewer_invocations"] == 5
+    assert run["review_budget"]["reviewer_invocations"] == 4
 
 
 def test_run_repair_sync_uses_frozen_limits_for_both_budget_projections() -> None:
@@ -460,115 +465,28 @@ def test_run_repair_sync_uses_frozen_limits_for_both_budget_projections() -> Non
     assert run["review_budget"]["checkpoint_reason"] == "review_budget_exhausted"
 
 
-def test_exhausted_ticket_development_allows_one_exact_head_final_ci_fix() -> None:
-    evidence = {
-        "pr_number": 11,
-        "checks": [
-            {
-                "bucket": "fail",
-                "state": "FAILURE",
-                "name": "tests",
-                "workflow": "ci",
-                "link": "https://example.invalid/check",
-                "repairability": "code_failure",
-            }
-        ],
-    }
-    job: dict[str, object] = {
-        "phase": "waiting_checks",
-        "base_sha": "base-head",
-        "publication_sha": "candidate-head",
-        "acceptance_record": {"reviewed_base_sha": "base-head"},
-        "modification_attempts": 4,
-        "validation_attempts": 2,
-        "review_budget": {
-            "window": 1,
-            "development_attempts": 4,
-            "reviewer_invocations": 2,
-            "final_ci_fix_used": False,
-            "review_artifacts": [],
-            "checkpoint_reason": None,
-        },
-        "review_budget_history": [],
-    }
-    repair_resumes: list[tuple[dict[str, object], dict[str, object]]] = []
-
-    def resume_after_required_checks_failure(
-        state: dict[str, object], repair_job: dict[str, object]
-    ) -> bool:
-        repair_resumes.append((state, repair_job))
-        state.update(
-            {"status": "adapter_resumed", "terminal_kind": None, "diagnostics": []}
-        )
-        return False
-
-    stage = SimpleNamespace(
-        contract=SimpleNamespace(
-            label="ticket-1", branch="ticket-1", base_branch="run-1"
-        ),
-        github=SimpleNamespace(
-            required_checks_snapshot=lambda _pr, expected_head_sha: {
-                "pr_number": 11,
-                "head_sha": expected_head_sha,
-                "result": "fail",
-                "checks": [dict(check) for check in evidence["checks"]],
-            },
-            required_check_evidence=lambda _pr, expected_head_sha: evidence,
-        ),
-        publisher=SimpleNamespace(
-            live_pull_request=lambda _state, _job, _pr: {
-                "state": "OPEN",
-                "head_branch": "ticket-1",
-                "head_sha": "candidate-head",
-                "head_repository": "example/project",
-                "base_branch": "run-1",
-                "base_sha": "base-head",
-                "base_repository": "example/project",
-            }
-        ),
-        adapter=SimpleNamespace(
-            classify_required_check_failures=True,
-            resume_after_required_checks_failure=(
-                resume_after_required_checks_failure
-            ),
-        ),
-        modification_budget_exhausted=lambda _job: True,
-        review_budget_policy=lambda: TICKET_POLICY,
-        _record_agent_run_status=lambda *_args, **_kwargs: None,
-        _record_publication_operation_failure_in_memory=(
-            lambda _state, owner, failure: record_publication_operation_failure(
-                owner, failure
-            )
-        ),
-        _reject_stale=lambda *_args, **_kwargs: None,
-        commit_required_checks_observation=lambda state, _job, _pr: state,
-        save=lambda state: state,
+def test_exhausted_ticket_demand_budget_keeps_independent_ci_repair_capacity() -> None:
+    job = _job_with_budget(
+        policy_snapshot=DeliveryPolicy().snapshot(),
+        ci_recovery=new_ci_recovery_budget(),
     )
+    budget = job["review_budget"]
+    budget["development_attempts"] = TICKET_POLICY.development_limit
+    budget["reviewer_invocations"] = TICKET_POLICY.review_limit
+    assert not can_start_development(job, TICKET_POLICY)
+    assert not can_start_review(job, TICKET_POLICY)
 
-    state: dict[str, object] = {
-        "status": "active",
-        "repository": "example/project",
-    }
-    outcome, checks = observe_required_checks(
-        stage,
-        state,
-        job,
-        Path("."),
-        11,
-    )
-
-    assert outcome is False
-    assert checks == "fail"
-    assert job["phase"] == "repairing"
-    assert job["next_attempt_kind"] == "final_ci_fix"
-    assert job["final_ci_fix_failure_head"] == "candidate-head"
-    assert repair_resumes == [(state, job)]
-    assert state == {
-        "status": "adapter_resumed",
-        "repository": "example/project",
-        "terminal_kind": None,
-        "diagnostics": [],
-    }
+    assert observe_repairable_ci_failure(
+        job, head_sha="candidate-head", outer_limit=3, inner_limit=3,
+        is_ticket=True,
+    ) == "repair"
+    assert mark_ci_repair(
+        job, outer_limit=3, inner_limit=3, is_ticket=True,
+    ) == 1
+    assert job["ci_recovery"]["rounds_used"] == 1
+    assert job["ci_recovery"]["repairs_used"] == 1
+    assert budget["development_attempts"] == TICKET_POLICY.development_limit
+    assert budget["reviewer_invocations"] == TICKET_POLICY.review_limit
 
 
 @pytest.mark.parametrize(
