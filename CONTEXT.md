@@ -612,6 +612,10 @@ _Avoid_: Reviewer 直接修复、创建新 Ticket Job、复用旧验收结论
 Publisher 推送 Publication Commit 后，Controller 确定性验证目标 PR 的 live head、base、有效 Revision、Required Checks、mergeability 与正常路径的 Acceptance Record 或兜底路径的 Deterministic Integration Record 完全一致。Fallback Publication Receipt 只能授权推送 PR，不能单独通过本门禁。它不进行第二次 Codex 语义审查；任何 head、base 或 Revision 漂移都会使旧门禁证据失效，最终合并使用 `--match-head-commit` 绑定准确 SHA，并在完成 Ticket 前验证 integrated commit 的 parent、tree 和完整提交说明（标题与正文）。若远端已合并但本地同步中断，恢复必须先对齐本地 Run Branch，再完成 Ticket。
 _Avoid_: Fresh Acceptance、GitHub PR Exact-Head Review Loop、智能代码判断
 
+**Ticket Remote Integration（Ticket 远端集成）**:
+Ticket 的 Development、暂停续接和 Fresh Acceptance 固定在当前 Job 的原始 base 与 Candidate；普通远端源分支或 Run Branch 追加不作废这些语义轮次。原 Candidate 获得 Acceptance Record 或 Fallback Publication Receipt 后，Controller 读取 live 源与目标 SHA，先机械集成双方成果，再以集成后的准确 tree 发布或更新原 PR；初始源 ref 与原 base 相同，不作为独立开发成果。集成记录同时保存原 base/Candidate/tree、远端源/目标、集成 head/tree 和冲突路径，供 Parent 验收区分原 Ticket 审查对象与后续组合。远端新快照使已发布 head 的检查和合并权限失效，但不自动恢复已暂停的 Job，也不凭机械组合伪造新的 Ticket Acceptance。只有真实 Git 冲突交给 Development Agent 在受管 checkout 解决并自测，不消耗需求 Development、Review 或 CI 修复额度；冲突仍未解决或有业务歧义时有界暂停。远端非追加历史改写保留现场并暂停；网络和执行错误与真实冲突分开处理。首次集成免费，其后默认最多自动同步三个外部新快照，额度随有效 Run Policy 固定；自己的发布、回读和重复操作不计数。额度耗尽仅由显式 `resume` 续期该额度。实际合入前复核 live 版本与集成记录，服务端最后瞬时竞争仍以准确 head 约束为准。
+_Avoid_: 把远端推进变成 Ticket Reviewer 重审、把机械集成当语义验收、自动解除人工暂停、以旧 PR head 的检查授权新 head
+
 **Git Integrity Check（Git 完整性检查）**:
 Publisher 在创建、压缩、推送和合并候选时执行的确定性 Git 校验，包括 clean tree、预期 HEAD、base 绑定、压缩前后 tree equality、远端 lease 和 live head equality。它不运行仓库测试，也不判断实现是否正确。任何失败都不创建独立 Git-fix 阶段、专用 Agent 或独立预算，而是将原始失败证据以 `repair_source=git_integrity` 返回同一 Change Job 的现有 Development Thread，开始一次普通 Development Attempt；该 Agent 仍不得 commit、push、force-push、rebase 或 merge。Development 产出新 Candidate 后重新执行完整检查；普通 Development 预算耗尽则进入人工 Checkpoint，维护者可用 `resume` 开启新预算窗口后继续。失败检查本身不消耗 Development 或 Reviewer 预算，只有实际恢复的 Development Attempt 按普通规则计数；检查通过前不得继续 Publication、PR 更新、合并或 Ticket Completion。
 _Avoid_: Hosted CI Gate、Fresh Acceptance、本地代码 Validation、独立 Git-fix 状态机、Git-fix 专用预算、授予 Development 发布权限
@@ -775,7 +779,7 @@ _Avoid_: Job Generation、CI 等待窗口、隐式自动续期
 `modification_budget_exhausted` 边界，该显式命令会同时新建有编号的 Ticket Review Budget Window 与 Ticket Development Budget Window，并重置该新窗口的 Final CI-fix Allowance。Ticket 用尽有效 Run Policy Snapshot 的 `N` 次 Reviewer Invocation 本身不产生 `review_budget_exhausted`；最后 Findings 已由后续 Development 处理出新 Candidate 时自动进入 Deterministic Ticket Fallback，没有普通 Development 名额处理 Findings 时则产生 `modification_budget_exhausted`。
 若该边界保存了 Reviewer Finding、Git Integrity 或 Required Checks 失败证据，新窗口先启动普通 Development Attempt，并将准确原始证据交给按 Development Thread Policy 选择的开发会话；只有产出新 Candidate 后才由新窗口 Reviewer 1 建立基线。Final CI-fix 后准确新 head CI 再失败也遵循此顺序，不审查未修改的失败 Candidate。
 若 preflight
-发现 Ticket Content Revision、Parent Revision 或适用 base 已变化，Controller 不启动 Codex，也不
+发现 Ticket Content Revision、Parent Revision 或其他需求身份已变化，Controller 不启动 Codex，也不
 复用原 Ticket Job、Ticket Branch 或 Development Thread；它停在 `requeue_required`，维护者需执行
 `agent-run requeue <parent-issue>` 创建新的 generation。内容未变化时 Resume 仍可复用当前 Invocation 的
 Thread；它不重置既有窗口的消耗记录。

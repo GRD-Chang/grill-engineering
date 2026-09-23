@@ -148,11 +148,19 @@ class TicketDeliveryEngine:
     def _ensure_ticket_branch(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> None:
+        # Once the initial baseline ref has been confirmed, collaborators may
+        # append to it while this Ticket develops on its fixed checkout.
+        # Subsequent live ref reconciliation belongs to Ticket integration.
+        if job.get("ticket_branch_initialized") is True and job.get("ticket_write_intent") is None:
+            return
         ensure_change_branch_authority(
             github=self.github, state=state, job=job,
             branch=str(job["ticket_branch"]), base_branch=str(state["run_branch"]),
             save=self._save, ticket_number=int(job["ticket_number"]),
         )
+        if job.get("phase") != "blocked":
+            job["ticket_branch_initialized"] = True
+            self._save(state)
 
     def _job(self, state: dict[str, Any]) -> dict[str, Any]:
         active = _mapping(state, "active_ticket_job")

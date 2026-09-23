@@ -34,6 +34,12 @@ from agent_run.required_checks_observation import (
     sync_fallback_receipt_observation,
     validate_legacy_required_checks_projection,
 )
+from agent_run.ticket_integration import (
+    delivery_base_sha,
+    delivery_candidate_sha,
+    integration_record_is_valid,
+    reconcile_ticket_integration,
+)
 
 
 class PublishedHeadStage(ChangeDeliveryStage, Protocol):
@@ -99,6 +105,14 @@ def publish_and_merge(
     job: dict[str, Any],
     checkout: Path,
 ) -> bool:
+    ticket = stage.contract.label.startswith("ticket-")
+    publication_base = delivery_base_sha(job) if ticket else str(job["base_sha"])
+    publication_candidate = delivery_candidate_sha(job) if ticket else str(job["candidate_sha"])
+    publication_source = (
+        str(job["ticket_integration"]["source_sha"])
+        if ticket and isinstance(job.get("ticket_integration"), dict)
+        else str(job.get("published_sha", job["base_sha"]))
+    )
     if (
         stage.contract.label.startswith("ticket-")
         and job.get("phase") in {
@@ -131,7 +145,7 @@ def publish_and_merge(
     publish_intent = {
         "action": "publish_ticket_ref",
         "branch": branch,
-        "expected_remote_sha": str(job.get("published_sha", job["base_sha"])),
+        "expected_remote_sha": publication_source,
         "head_sha": str(job["publication_sha"]),
     }
     observed_published = False
@@ -228,20 +242,46 @@ def publish_and_merge(
     stage._reject_stale(
         state, job, checkout, "Published-Head Gate rejected stale requirements"
     )
-    exhausted, _ = _publication_operation(
-        stage,
-        state,
-        job,
-        lambda: stage.github.verify_ticket_pr_before_publish(
-            branch=branch,
-            base_branch=stage.contract.base_branch,
-            expected_head_sha=str(
-                job["publication_sha"] if observed_published
-                else job.get("published_sha", job["base_sha"])
+    if ticket and not reconcile_ticket_integration(stage, state, job):
+        return False
+    if ticket and not isinstance(existing_pr, int):
+        # A PR creation response may be lost after the source commit was
+        # published. Its durable publication SHA and exact live ref prove
+        # whether a second push is needed before recovering the original PR.
+        live_source, live_target = stage.github.live_branch_heads(
+            branch, stage.contract.base_branch
+        )
+        if live_target != publication_base or live_source not in {
+            publication_source, str(job["publication_sha"]),
+        }:
+            if not reconcile_ticket_integration(stage, state, job):
+                return False
+        observed_published = (
+            live_source == job["publication_sha"]
+            and (
+                job.get("published_sha") == job["publication_sha"]
+                or job.get("ticket_write_intent") == publish_intent
+            )
+        )
+    try:
+        exhausted, _ = _publication_operation(
+            stage,
+            state,
+            job,
+            lambda: stage.github.verify_ticket_pr_before_publish(
+                branch=branch,
+                base_branch=stage.contract.base_branch,
+                expected_head_sha=str(
+                    job["publication_sha"] if observed_published
+                    else publication_source
+                ),
+                expected_base_sha=publication_base,
             ),
-            expected_base_sha=str(job["base_sha"]),
-        ),
-    )
+        )
+    except GitHubReadError:
+        if ticket and not reconcile_ticket_integration(stage, state, job):
+            return False
+        raise
     if exhausted:
         return True
     if not observed_published and job.get("ticket_write_intent") != publish_intent:
@@ -256,11 +296,13 @@ def publish_and_merge(
                 lambda: stage.github.publish_branch(
                     branch,
                     str(job["publication_sha"]),
-                    expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
+                    expected_remote_sha=publication_source,
                 ),
             )
         except RemoteBranchChanged as error:
             job["branch_publication_observation"] = asdict(error.observation)
+            if ticket and not reconcile_ticket_integration(stage, state, job):
+                return False
             return stage._block(
                 state, job, "remote_source_changed",
                 "Remote source branch changed after publication preparation; local Candidate preserved",
@@ -285,7 +327,7 @@ def publish_and_merge(
         "action": "ensure_ticket_pr",
         "branch": branch,
         "base_branch": stage.contract.base_branch,
-        "base_sha": str(job["base_sha"]),
+        "base_sha": publication_base,
         "head_sha": str(job["publication_sha"]),
     }
     if job.get("ticket_write_intent") != pr_intent:
@@ -393,19 +435,26 @@ def publish_and_merge(
             and receipt.get("effective_revision") == job.get("effective_revision")
             and acceptance is None
         )
-        reviewed_base_sha = str(job["base_sha"])
+        reviewed_base_sha = publication_base
         candidate_current = boundary_current
     else:
         if not isinstance(acceptance, dict):
             candidate_current = False
-            reviewed_base_sha = str(job["base_sha"])
+            reviewed_base_sha = publication_base
         else:
-            reviewed_base_sha = str(acceptance.get("reviewed_base_sha"))
+            reviewed_base_sha = publication_base if ticket else str(acceptance.get("reviewed_base_sha"))
             candidate_current = (
                 acceptance.get("reviewed_candidate_sha") == job["candidate_sha"]
                 and acceptance.get("reviewed_candidate_tree") == candidate_tree
                 and stage.adapter.acceptance_is_current(state, job, acceptance)
             )
+    if ticket:
+        candidate_current = (
+            candidate_current
+            and integration_record_is_valid(stage.git, job)
+            and stage.git.resolve(f"{publication_candidate}^{{tree}}")
+            == stage.git.resolve(f"{job['publication_sha']}^{{tree}}")
+        )
     if (
         live.get("head_sha") != job["publication_sha"]
         or live.get("base_branch") != stage.contract.base_branch
@@ -425,6 +474,8 @@ def publish_and_merge(
             "published_head_mismatch",
             "Published-Head Gate rejected live PR state",
         )
+    if ticket and not reconcile_ticket_integration(stage, state, job):
+        return False
     required_checks_evidence = deepcopy(required_checks_evidence)
     required_checks_evidence.update({"pr_number": pr_number})
     if fallback and isinstance(receipt, dict):
@@ -440,7 +491,7 @@ def publish_and_merge(
         "source": "fallback" if fallback else "accepted",
         "policy_snapshot": deepcopy(job.get("policy_snapshot")),
         "pr_number": pr_number,
-        "base_sha": str(job["base_sha"]),
+        "base_sha": publication_base,
         "candidate_sha": str(job["candidate_sha"]),
         "candidate_tree": candidate_tree,
         "publication_sha": str(job["publication_sha"]),
@@ -482,6 +533,8 @@ def publish_and_merge(
         if not isinstance(acceptance, dict):
             raise ValueError("accepted publication is missing its Acceptance Record")
         integration_record["acceptance_record"] = dict(acceptance)
+    if ticket:
+        integration_record["ticket_integration"] = deepcopy(job["ticket_integration"])
     job["deterministic_integration_record"] = integration_record
     expected_intent = {
         "head_sha": str(job["publication_sha"]),

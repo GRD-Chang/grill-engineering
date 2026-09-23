@@ -1534,7 +1534,7 @@ def test_receipt_only_control_closes_once_after_exact_host_exit_proof(
         "--agent-fixture",
         str(agents),
         "--crash-after-save",
-        "9",
+        "11",
         extra_env=environment,
     )
     assert interrupted.returncode == 2
@@ -2215,7 +2215,7 @@ def test_run_can_replace_a_terminal_receipt_with_a_successor_action(
         "expected_development_invocations",
         "initial_invocation_status",
     ),
-    [(3, 0, None), (9, 1, "running"), (11, 1, "completed")],
+    [(3, 0, None), (11, 1, "running"), (13, 1, "completed")],
 )
 def test_repeated_run_reconciles_proven_executor_crash_without_replay(
     git_repo: Path,
@@ -2354,7 +2354,7 @@ def test_repeated_run_reconciles_proven_executor_crash_without_replay(
 
 @pytest.mark.parametrize(
     ("crash_after_save", "expected_invocation_status"),
-    [(3, None), (9, "running"), (11, "completed")],
+    [(3, None), (11, "running"), (13, "completed")],
 )
 def test_session_closeout_retries_only_the_control_commit(
     git_repo: Path,

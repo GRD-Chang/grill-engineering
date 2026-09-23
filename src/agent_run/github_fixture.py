@@ -227,6 +227,27 @@ class FixtureGitHubPublisher:
         delivery.setdefault("mutations", [])
         delivery.setdefault("check_position", 0)
 
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]:
+        if source_branch == target_branch:
+            raise GitError("source and target branch must differ")
+        current: object = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            raise GitHubReadError("invalid_fixture", "fixture root must be an object")
+        published = _mapping(_mapping(current, "delivery"), "published_branches")
+        source = published.get(source_branch)
+        target = published.get(target_branch)
+        if target is None and target_branch == current.get("default_branch"):
+            target = current.get("default_head_sha")
+        if source is not None and not isinstance(source, str):
+            raise GitHubReadError("invalid_fixture", "source branch head must be a SHA")
+        if not isinstance(target, str):
+            raise GitHubReadError(
+                "missing_target_branch", f"target branch {target_branch!r} is missing"
+            )
+        return source, target
+
     def ensure_run_branch(self, branch: str, base_sha: str) -> None:
         self.git.ensure_run_branch(branch, base_sha)
         self._crash_once("ensure_run_branch")
@@ -271,6 +292,10 @@ class FixtureGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
+        if is_managed_delivery_branch(base_branch):
+            self._ensure_managed_base_ref(
+                base_branch, expected_base_sha, allow_append=True
+            )
         published = _mutable_mapping(self._delivery(), "published_branches")
         current = published.get(branch)
         if current is None:
@@ -278,9 +303,12 @@ class FixtureGitHubPublisher:
                 raise ValueError("fixture Ticket ref is missing after publication")
             published[branch] = expected_base_sha
         elif current not in {expected_remote_sha, recovery_remote_sha}:
-            raise RemoteBranchChanged(
-                RemoteBranchObservation(branch, expected_remote_sha, current)
-            )
+            if not isinstance(current, str) or not self.git.is_ancestor(
+                expected_remote_sha, current
+            ):
+                raise RemoteBranchChanged(
+                    RemoteBranchObservation(branch, expected_remote_sha, current)
+                )
         self._save()
         self._crash_once("ensure_ticket_branch")
 
@@ -430,13 +458,19 @@ class FixtureGitHubPublisher:
             == expected_head_sha
         )
 
-    def _ensure_managed_base_ref(self, branch: str, expected_sha: str) -> None:
+    def _ensure_managed_base_ref(
+        self, branch: str, expected_sha: str, *, allow_append: bool = False
+    ) -> None:
         """Fixture equivalent of expected-absent Run/Parent ref authority."""
         published = _mutable_mapping(self._delivery(), "published_branches")
         remote_sha = published.get(branch)
         if remote_sha == expected_sha:
             return
         if remote_sha is not None:
+            if allow_append and isinstance(remote_sha, str) and self.git.is_ancestor(
+                expected_sha, remote_sha
+            ):
+                return
             raise ValueError("fixture Run ref has a foreign identity")
         races = self._delivery().get("expected_absent_ref_races")
         if isinstance(races, list) and (branch in races or "*" in races):

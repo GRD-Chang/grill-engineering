@@ -30,9 +30,8 @@ def stale_change_job_reason(
         )
         if job.get("effective_revision") != expected:
             return "ticket_requirements_changed"
-        run_branch = state.get("run_branch")
-        if isinstance(run_branch, str) and job.get("base_sha") != git.resolve(run_branch):
-            return "ticket_base_changed"
+        # Ticket Development and original Review keep their fixed base.
+        # A newer Run Branch is integrated at the delivery boundary.
         return None
     if subject.startswith("parent-only:"):
         if job.get("effective_revision") != parent.get("revision"):
@@ -132,7 +131,7 @@ def unknown_pr_mutation(
         "reviewing", "accepted", "publication_pending", "publishing",
     } and isinstance(job.get("published_sha"), str):
         known_heads.add(job["published_sha"])
-    if live.get("head_sha") not in known_heads:
+    if not subject.startswith("ticket:") and live.get("head_sha") not in known_heads:
         return "change_pr_head_changed_externally"
     expected_base_branch = (
         state.get("run_branch")
@@ -143,7 +142,7 @@ def unknown_pr_mutation(
         return "change_pr_base_unknown"
     if live.get("base_branch") != expected_base_branch:
         return "change_pr_base_changed_externally"
-    if live.get("base_sha") != git.resolve(expected_base_branch):
+    if not subject.startswith("ticket:") and live.get("base_sha") != git.resolve(expected_base_branch):
         return "change_pr_base_changed_externally"
     return None
 

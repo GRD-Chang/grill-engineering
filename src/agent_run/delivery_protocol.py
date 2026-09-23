@@ -7,6 +7,10 @@ from agent_run.branch_publication import BranchPublicationResult
 
 
 class GitHubPublisher(Protocol):
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]: ...
+
     def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None: ...
 
     def ensure_change_branch(

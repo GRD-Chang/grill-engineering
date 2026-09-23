@@ -149,11 +149,33 @@ def _require_deterministic_integration_record(
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.{evidence_key} is invalid"
         )
+    ticket_integration = record.get("ticket_integration")
+    if not isinstance(ticket_integration, dict) or set(ticket_integration) != {
+        "base_sha", "candidate_sha", "candidate_tree", "source_sha", "target_sha",
+        "head_sha", "head_tree", "conflict_paths",
+    }:
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.ticket_integration is invalid"
+        )
+    if (
+        ticket_integration != completed_job.get("ticket_integration")
+        or ticket_integration["candidate_sha"] != record["candidate_sha"]
+        or ticket_integration["candidate_tree"] != record["candidate_tree"]
+        or ticket_integration["target_sha"] != record["base_sha"]
+        or ticket_integration["head_tree"] != record["integrated_tree"]
+        or not isinstance(ticket_integration["conflict_paths"], list)
+        or not all(isinstance(path, str) and path for path in ticket_integration["conflict_paths"])
+    ):
+        raise IncompatibleRunStateError(
+            f"incompatible_run_state: {location}.ticket_integration does not match delivery"
+        )
+    original_record = dict(record)
+    original_record["base_sha"] = ticket_integration["base_sha"]
     if source == "accepted":
         require_completed_accepted_ticket_authorization(
-            completed_job, authorization, record, location
+            completed_job, authorization, original_record, location
         )
     else:
         _require_fallback_integration_authorization(
-            authorization, record, location
+            authorization, original_record, location
         )

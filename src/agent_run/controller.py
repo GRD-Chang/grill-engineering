@@ -81,6 +81,8 @@ from agent_run.state_contract import (
 )
 from agent_run.task_control import TASK_CONTROL_PROTOCOL
 from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
+from agent_run.ticket_phase import sync_active_ticket_job
+from agent_run.integration_resync_budget import renew_resync_budget
 
 
 class GitHubReader(Protocol):
@@ -489,6 +491,32 @@ class Controller:
             if resume_budget_checkpoint
             else False
         )
+        if explicit_resume and not budget_resumed:
+            active_ticket = state.get("active_ticket_job")
+            if not isinstance(active_ticket, dict):
+                ticket_jobs = state.get("ticket_jobs")
+                matches = [
+                    value for value in ticket_jobs.values()
+                    if isinstance(value, dict)
+                    and value.get("phase") == "blocked"
+                    and value.get("blocked_reason") == "integration_resync_exhausted"
+                ] if isinstance(ticket_jobs, dict) else []
+                active_ticket = matches[0] if len(matches) == 1 else None
+            if (
+                isinstance(active_ticket, dict)
+                and active_ticket.get("phase") == "blocked"
+                and active_ticket.get("blocked_reason") == "integration_resync_exhausted"
+            ):
+                renew_resync_budget(
+                    active_ticket,
+                    policy_snapshot=active_ticket["policy_snapshot"],
+                )
+                active_ticket["phase"] = "accepted"
+                active_ticket.pop("blocked_reason", None)
+                state["active_ticket_job"] = active_ticket
+                state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
+                sync_active_ticket_job(state)
+                budget_resumed = True
         if budget_resumed and human_response is not None:
             raise ValueError("Review Budget resume does not accept a Human Blocker response")
         if budget_resumed:

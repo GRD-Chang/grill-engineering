@@ -23,6 +23,7 @@ import pytest
 
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run.git import GitRepository
+from agent_run.semantic_attempt import canonical_fingerprint
 from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import seed_run, write_fixture
@@ -4622,6 +4623,9 @@ def test_malformed_publication_is_execution_failed_and_resumes_without_revalidat
         "candidate_sha": completed_job["candidate_sha"],
         "candidate_tree": acceptance["reviewed_candidate_tree"],
         "effective_revision": completed_job["effective_revision"],
+        "ticket_integration_fingerprint": canonical_fingerprint(
+            completed_job["ticket_integration"]
+        ),
     }
     assert successor in completed_state["agent_invocation_history"]
     assert any(

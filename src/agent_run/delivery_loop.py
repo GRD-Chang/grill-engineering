@@ -32,6 +32,7 @@ from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
 from agent_run.review_budget import previous_review_context
 from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
+from agent_run.ticket_integration import delivery_base_sha, delivery_candidate_sha
 
 
 def _record_superseded_integration(job: dict[str, Any], integrated_sha: str) -> None:
@@ -123,8 +124,9 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "parent": _parent(state),
             "ticket": _ticket(state, job),
             "effective_revision": job["effective_revision"],
-            "base_sha": job["base_sha"],
-            "candidate_sha": job["candidate_sha"],
+            "base_sha": delivery_base_sha(job),
+            "candidate_sha": delivery_candidate_sha(job),
+            "ticket_integration": job.get("ticket_integration"),
             "checkout": str(checkout),
             "thread_id": select_publication_thread(
                 job, max_context_attempts=MAX_PUBLICATION_CONTEXT_ATTEMPTS
@@ -301,9 +303,13 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
     ) -> str:
         return self.owner.git.create_publication_commit(
             checkout,
-            candidate_sha=str(job["candidate_sha"]),
-            base_sha=str(job["base_sha"]),
-            published_sha=job.get("published_sha"),
+            candidate_sha=delivery_candidate_sha(job),
+            base_sha=delivery_base_sha(job),
+            published_sha=(
+                job["ticket_integration"]["source_sha"]
+                if isinstance(job.get("ticket_integration"), dict)
+                else job.get("published_sha")
+            ),
             message=message,
         )
 
@@ -327,7 +333,7 @@ class TicketDeliveryPublisher(ChangeDeliveryPublisher):
             body=self.owner._render_ticket_pr_body(state, job, publication),
             primary_ticket=int(job["ticket_number"]),
             expected_head_sha=str(job["publication_sha"]),
-            expected_base_sha=str(job["base_sha"]),
+            expected_base_sha=delivery_base_sha(job),
         )
 
     def live_pull_request(
@@ -444,7 +450,7 @@ class TicketDeliveryLoop:
             or not commit_messages_match(
                 live.get("integrated_message"), publication.get("commit_message")
             )
-            or live.get("integrated_parents") != [job.get("base_sha")]
+            or live.get("integrated_parents") != [delivery_base_sha(job)]
         ):
             return self._block(
                 state,

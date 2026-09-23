@@ -118,6 +118,17 @@ def _completed_run(
         "review_artifacts": [review_artifact],
         "checkpoint_reason": None,
     }
+    ticket_integration = {
+        "base_sha": str(state["base"]["sha"]),
+        "candidate_sha": integrated_sha,
+        "candidate_tree": candidate_tree,
+        "source_sha": str(state["base"]["sha"]),
+        "target_sha": str(state["base"]["sha"]),
+        "head_sha": integrated_sha,
+        "head_tree": candidate_tree,
+        "conflict_paths": [],
+    }
+    state["ticket_jobs"][ticket_key]["ticket_integration"] = ticket_integration
     state["ticket_jobs"][ticket_key]["deterministic_integration_record"] = {
         "source": "accepted",
         "base_sha": str(state["base"]["sha"]),
@@ -150,6 +161,7 @@ def _completed_run(
             "merge_commit_sha": integrated_sha,
         },
         "acceptance_record": acceptance_record,
+        "ticket_integration": deepcopy(ticket_integration),
     }
     states.save_run(str(state["run_id"]), state)
     return state, states, git
@@ -175,6 +187,13 @@ def _sync_completed_ticket_integrated_sha(
         }
     )
     record["pr"].update({"base_sha": base_sha, "merge_commit_sha": integrated_sha})
+    integration = job["ticket_integration"]
+    integration.update({
+        "base_sha": base_sha,
+        "target_sha": base_sha,
+        "head_tree": git.resolve(f"{integrated_sha}^{{tree}}"),
+    })
+    record["ticket_integration"] = deepcopy(integration)
     authorization = record.get("acceptance_record")
     if isinstance(authorization, dict):
         authorization["reviewed_base_sha"] = base_sha

@@ -90,6 +90,16 @@ def _integration_record(
             "base_sha": base_sha,
             "merge_commit_sha": integrated,
         },
+        "ticket_integration": {
+            "base_sha": base_sha,
+            "candidate_sha": candidate_sha,
+            "candidate_tree": candidate_tree,
+            "source_sha": base_sha,
+            "target_sha": base_sha,
+            "head_sha": candidate_sha,
+            "head_tree": candidate_tree,
+            "conflict_paths": [],
+        },
     }
     if source == "accepted":
         authorization = dict(acceptance_record or {})
@@ -201,6 +211,11 @@ def _integration_record(
     return record
 
 
+def _set_integration_record(job: dict[str, Any], record: dict[str, Any]) -> None:
+    job["deterministic_integration_record"] = record
+    job["ticket_integration"] = deepcopy(record["ticket_integration"])
+
+
 def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
     git_repo: Path,
 ) -> None:
@@ -209,9 +224,7 @@ def test_run_acceptance_invocation_binds_the_reviewed_run_identity(
         publication_sha="published-2",
         integrated_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
     )
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = (
-        integration_record
-    )
+    _set_integration_record(state["ticket_jobs"]["2"], integration_record)
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
         integration_record["review_budget"]
     )
@@ -445,7 +458,7 @@ def test_completed_ticket_integration_record_rejects_source_evidence_drift(
         acceptance_record={"artifact": _passing_artifact()},
         fallback_receipt={"candidate_sha": "fallback-candidate"},
     )
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    _set_integration_record(state["ticket_jobs"]["2"], record)
     if source == "accepted":
         state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
             record["review_budget"]
@@ -481,7 +494,7 @@ def test_completed_ticket_integration_record_rejects_empty_nested_authorization(
         integrated_sha=str(state["ticket_jobs"]["2"]["integrated_sha"]),
     )
     record["acceptance_record" if source == "accepted" else "fallback_receipt"] = {}
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    _set_integration_record(state["ticket_jobs"]["2"], record)
     if source == "accepted":
         state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
             record["review_budget"]
@@ -509,7 +522,7 @@ def test_completed_ticket_integration_record_rejects_nested_boundary_drift(
         integrated_sha=integrated,
     )
     record["acceptance_record"]["reviewed_candidate_sha"] = "foreign-candidate"
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    _set_integration_record(state["ticket_jobs"]["2"], record)
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(record["review_budget"])
     states.save_run(str(state["run_id"]), state)
 
@@ -533,7 +546,7 @@ def test_completed_ticket_acceptance_authorization_requires_a_passing_artifact(
         integrated_sha=integrated,
         acceptance_record={"artifact": _candidate_finding_artifact()},
     )
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    _set_integration_record(state["ticket_jobs"]["2"], record)
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(record["review_budget"])
     states.save_run(str(state["run_id"]), state)
 
@@ -744,6 +757,7 @@ def test_required_checks_fallback_must_bind_previous_publication_authority() -> 
                 "phase": "completed",
                 "integrated_sha": record["integrated_sha"],
                 "deterministic_integration_record": record,
+                "ticket_integration": deepcopy(record["ticket_integration"]),
             }
         }
     }
@@ -782,7 +796,7 @@ def test_completed_ticket_fallback_receipt_requires_complete_audit_facts(
         integrated_sha=integrated,
     )
     record["fallback_receipt"][field] = value
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    _set_integration_record(state["ticket_jobs"]["2"], record)
     states.save_run(str(state["run_id"]), state)
 
     with pytest.raises(IncompatibleRunStateError, match="fallback_receipt"):
@@ -832,7 +846,7 @@ def test_completed_ticket_integration_record_rejects_nested_role_drift(
     record["acceptance_record" if source == "accepted" else "fallback_receipt"][
         field
     ] = "foreign-role"
-    state["ticket_jobs"]["2"]["deterministic_integration_record"] = record
+    _set_integration_record(state["ticket_jobs"]["2"], record)
     if source == "accepted":
         state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
             record["review_budget"]
@@ -1099,6 +1113,9 @@ def test_ticket_completion_records_are_minimal_and_sorted_numerically(
             acceptance_record={"artifact": _passing_artifact()},
         ),
     }
+    state["ticket_jobs"]["10"]["ticket_integration"] = deepcopy(
+        state["ticket_jobs"]["10"]["deterministic_integration_record"]["ticket_integration"]
+    )
     state["ticket_jobs"]["10"]["review_budget"] = deepcopy(
         state["ticket_jobs"]["10"]["deterministic_integration_record"][
             "review_budget"
@@ -1158,6 +1175,9 @@ def test_ticket_integration_records_preserve_exact_pr_and_checks_evidence(
             ),
         }
     )
+    state["ticket_jobs"]["2"]["ticket_integration"] = deepcopy(
+        state["ticket_jobs"]["2"]["deterministic_integration_record"]["ticket_integration"]
+    )
     state["ticket_jobs"]["2"]["review_budget"] = deepcopy(
         state["ticket_jobs"]["2"]["deterministic_integration_record"][
             "review_budget"
@@ -1182,6 +1202,9 @@ def test_ticket_integration_records_preserve_exact_pr_and_checks_evidence(
         ),
     }
 
+    state["ticket_jobs"]["10"]["ticket_integration"] = deepcopy(
+        state["ticket_jobs"]["10"]["deterministic_integration_record"]["ticket_integration"]
+    )
     records = ticket_integration_records(state)
 
     assert [record["ticket_number"] for record in records] == [2, 10]

@@ -93,6 +93,7 @@ def status_progress_view(
             state, current, audit.get("review_budget"), invocation
         ),
         "run_repair": _run_repair_progress(audit.get("run_repair")),
+        "integration_resync": audit.get("integration_resync"),
         "elapsed_seconds": audit.get("elapsed_seconds"),
         "current_agent": current_agent,
         "execution_activity": activity,
@@ -178,6 +179,11 @@ def print_status_progress(
         print(display_text('presentation.status.nexecution_allowance'))
         for line in _round_details(rounds):
             print(f"  {_terminal_safe(line)}")
+    resync = view.get("integration_resync")
+    if isinstance(resync, dict):
+        print(display_text('presentation.status.integration_resync_usage',
+                           used=resync.get('used'), limit=resync.get('limit'),
+                           window=resync.get('window')))
     if view["elapsed_seconds"] is not None:
         print(display_text('presentation.status.task_elapsed_time_v1', v1=_duration(view['elapsed_seconds'])))
 
@@ -356,6 +362,12 @@ def print_rich_status_progress(
     rounds = view.get("round_progress")
     if isinstance(rounds, dict) and state.get("status") != "completed":
         add_identity(display_text('presentation.status.execution_allowance'), "；".join(_round_details(rounds)))
+    resync = view.get("integration_resync")
+    if isinstance(resync, dict):
+        add_identity(display_text('presentation.status.integration_resync_label'),
+                     display_text('presentation.status.integration_resync_values',
+                                  used=resync.get('used'), limit=resync.get('limit'),
+                                  window=resync.get('window')))
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (

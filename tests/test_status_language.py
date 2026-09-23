@@ -91,7 +91,7 @@ def test_delivery_progress_preserves_audit(
     progress = json.loads(audit_output.getvalue())["progress"]
     assert set(progress) == {
         "repository", "parent", "status", "phase", "current_object",
-        "ticket_progress", "round_progress", "run_repair", "elapsed_seconds",
+        "ticket_progress", "round_progress", "integration_resync", "run_repair", "elapsed_seconds",
         "current_agent", "execution_activity", "findings", "conclusion", "next_action",
     }
     assert progress["ticket_progress"] == {

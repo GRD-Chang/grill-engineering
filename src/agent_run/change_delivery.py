@@ -93,6 +93,10 @@ from agent_run.required_checks_observation import (
     sync_fallback_receipt_observation,
 )
 from agent_run.state_contract import require_current_run_state
+from agent_run.ticket_integration import (
+    integration_record_is_valid,
+    prepare_ticket_integration,
+)
 
 
 class ChangeDeliveryEngine:
@@ -211,6 +215,10 @@ class ChangeDeliveryEngine:
                     if self._can_resume_integrated_publication(job):
                         job["phase"] = "merged"
                         self.save(state)
+                        continue
+                    if self.contract.label.startswith("ticket-") and not prepare_ticket_integration(
+                        self, state, job, checkout
+                    ):
                         continue
                     self._publication(state, job, checkout)
                     # Publication can discover a moving base and let the
@@ -606,6 +614,14 @@ class ChangeDeliveryEngine:
     def _publication_is_current(
         self, state: dict[str, Any], job: dict[str, Any]
     ) -> bool:
+        if self.contract.label.startswith("ticket-"):
+            # The original Review/fallback remains bound to the fixed
+            # development Candidate. A separate deterministic integration
+            # record binds the delivery tree and live target before publish.
+            return (
+                integration_record_is_valid(self.git, job)
+                and not self.adapter.revision_changed(state, job)
+            )
         if job.get("publication_authority") == "fallback":
             receipt = job.get("fallback_publication_receipt")
             if not isinstance(receipt, dict):
@@ -638,6 +654,11 @@ class ChangeDeliveryEngine:
         )
 
     def _agent_is_current(self, state: dict[str, Any], job: dict[str, Any]) -> bool:
+        # Ticket Development and its original Review intentionally use their
+        # fixed checkout. Remote source/target additions belong to the later
+        # integration boundary, never to an in-flight semantic attempt.
+        if self.contract.label.startswith("ticket-"):
+            return not self.adapter.revision_changed(state, job)
         current_base = self.git.resolve(self.contract.base_branch)
         return self.adapter.base_is_current(
             current_base, job

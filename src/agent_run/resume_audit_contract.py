@@ -16,6 +16,7 @@ RESUME_AUDIT_KINDS = frozenset(
         "human_blocker",
         "operator_stopped",
         "supervision_timeout",
+        "integration_resync",
     }
 )
 RESUME_AUDIT_EVENT_KEYS = frozenset(

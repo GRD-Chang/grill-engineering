@@ -10,6 +10,22 @@ from agent_run.presentation_helpers import execution_duration
 from agent_run.status_actions import controller_work, status_heading
 
 
+def test_status_exposes_current_ticket_resync_usage() -> None:
+    from agent_run.cli_presentation import _public_integration_resync
+
+    budget = {
+        "generation": 2, "window": 5, "used": 1, "limit": 3, "open": False,
+        "source_sha": "source", "target_sha": "target", "history": [],
+    }
+    state = {
+        "delivery_type": "ticket_run",
+        "active_ticket_job": {"ticket_number": 12, "phase": "publishing", "integration_resync": budget},
+    }
+    assert _public_integration_resync(state) == {
+        "generation": 2, "window": 5, "used": 1, "limit": 3, "open": False,
+    }
+
+
 def publication_state() -> dict:
     boundary = {"reviewed_head_sha": "head", "parent_revision": "p1", "ticket_graph_revision": "g1"}
     attempt = {"attempt_id": "a1", "role": "publication", "generation": 1,

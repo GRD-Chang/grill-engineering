@@ -1212,7 +1212,7 @@ def test_status_and_history_show_started_development_attempt(
         "--agent-fixture",
         str(agents),
         "--crash-after-save",
-        "6",
+        "8",
     )
 
     assert interrupted.returncode == 2
@@ -1589,6 +1589,7 @@ def test_run_reconciles_an_already_created_ticket_pr_after_response_loss(
         if attempt["role"] == "publication"
     )
     assert recovered_job["publication_attempts"] == 1
+    assert recovered_job["integration_resync"]["used"] == 0
     assert recovered_publication["attempt_id"] == publication_attempt["attempt_id"]
     assert recovered_publication["publication_operation_retry"] == interrupted_retry
 

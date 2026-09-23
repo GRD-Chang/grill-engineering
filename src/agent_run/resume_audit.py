@@ -169,6 +169,7 @@ def bind_resume_to_successor(
         "github_refresh_retry",
         "human_blocker",
         "operator_stopped",
+        "integration_resync",
     }:
         return None
     if event.get("successor_invocation_started_at") is not None:
@@ -205,6 +206,13 @@ def _resume_kind(
         return "github_refresh_retry"
     if len(budget_checkpoint_subjects(state)) == 1:
         return "budget_checkpoint"
+    active_ticket = state.get("active_ticket_job")
+    if (
+        isinstance(active_ticket, dict)
+        and active_ticket.get("phase") == "blocked"
+        and active_ticket.get("blocked_reason") == "integration_resync_exhausted"
+    ):
+        return "integration_resync"
     if human_blocker_subject_count(state) == 1:
         return "human_blocker"
     if has_non_invocation_execution_failure(state):

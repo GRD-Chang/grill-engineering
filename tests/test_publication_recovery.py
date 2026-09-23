@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from support.delivery_agents import PassAgents, issue
 from support.delivery_publisher import ScriptedPublisher
 
 
-@pytest.mark.parametrize("remote", ["previous", "target", "unknown", "wrong_base"])
+@pytest.mark.parametrize("remote", ["previous", "target", "rewrite", "wrong_base"])
 def test_resume_reconciles_known_publication_heads_and_rejects_external_changes(
     git_repo: Path, remote: str,
 ) -> None:
@@ -45,22 +46,27 @@ def test_resume_reconciles_known_publication_heads_and_rejects_external_changes(
     publisher.live_head = job["base_sha"]
     if remote == "target":
         publisher.live_head = job["publication_sha"]
-    elif remote == "unknown":
-        publisher.live_head = "unknown-external-head"
+    elif remote == "rewrite":
+        publisher.live_head = subprocess.run(
+            ["git", "commit-tree", f"{job['base_sha']}^{{tree}}", "-m", "unrelated source history"],
+            cwd=git_repo, text=True, capture_output=True, check=True,
+        ).stdout.strip()
     elif remote == "wrong_base":
         publisher.base_branch = "main"
     states.save_run(run_id, waiting)
 
     resumed, _ = controller.resume(run_id)
 
-    if remote in {"unknown", "wrong_base"}:
+    if remote == "wrong_base":
         assert resumed["status"] == "blocked"
-        assert resumed["diagnostics"][0]["code"] == (
-            "change_pr_head_changed_externally" if remote == "unknown"
-            else "change_pr_base_changed_externally"
-        )
+        assert resumed["diagnostics"][0]["code"] == "change_pr_base_changed_externally"
     else:
         assert resumed["status"] != "blocked"
+    if remote == "rewrite":
+        rewritten = publisher.live_head
+        blocked = engine.deliver(run_id)
+        assert blocked["active_ticket_job"]["blocked_reason"] == "integration_history_rewritten"
+        assert publisher.live_head == rewritten
     assert resumed["active_ticket_job"]["publication_sha"] == job["publication_sha"]
     assert len(agents.publication_requests) == 1
     if remote == "previous":
@@ -114,15 +120,47 @@ def test_publication_reconciles_completed_push_only_with_matching_write_intent(
         job["ticket_write_intent"]["branch"] = "foreign-branch"
     states.save_run(run_id, waiting)
 
-    if intent != "matching":
+    if intent == "foreign":
         with pytest.raises(ValueError, match="remote PR identity mismatch"):
             engine.deliver(run_id)
         assert publisher.writes == 1
         assert len(agents.publication_requests) == 1
+        return
+    if intent == "missing":
+        recovered = engine.deliver(run_id)
+        assert recovered["status"] == "waiting_checks"
+        assert recovered["active_ticket_job"]["integration_resync"]["used"] == 1
+        assert publisher.writes == 2
+        assert agents.review_count == 1
         return
     recovered = engine.deliver(run_id)
 
     assert recovered["active_ticket_job"]["published_sha"] == job["publication_sha"]
     assert "ticket_write_intent" not in recovered["active_ticket_job"]
     assert publisher.writes == 1
+    assert len(agents.publication_requests) == 1
+
+
+def test_published_source_rewind_is_not_reused_as_an_unpublished_base(
+    git_repo: Path,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
+    run_id = state["run_id"]
+    agents = PassAgents(states.root / "worktrees" / run_id / "ticket-3")
+    publisher = ScriptedPublisher(git_repo)
+    publisher.checks = ["pending"]
+    engine = TicketDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
+    waiting = engine.deliver(run_id)
+    job = waiting["active_ticket_job"]
+    assert job["published_sha"] == job["publication_sha"]
+    publisher.live_head = job["ticket_integration"]["source_sha"]
+    states.save_run(run_id, waiting)
+
+    blocked = engine.deliver(run_id)
+
+    assert blocked["active_ticket_job"]["blocked_reason"] == "integration_history_rewritten"
+    assert publisher.live_head == job["ticket_integration"]["source_sha"]
     assert len(agents.publication_requests) == 1

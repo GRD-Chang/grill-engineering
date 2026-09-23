@@ -159,6 +159,7 @@ def _print_status(
             "candidate_sha": current_identity.get("candidate_sha"),
             "pr_number": current_identity.get("pr_number"),
             "review_budget": review_budget,
+            "integration_resync": _public_integration_resync(state),
             "elapsed_seconds": run_elapsed_seconds(state),
             "gate": "required_checks" if state.get("status") == "waiting_checks" else None,
             "next_action": (
@@ -620,6 +621,16 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "development_thread_id": cycle.get("development_thread_id"),
         "worktree": cycle.get("worktree"),
     }
+
+
+def _public_integration_resync(state: dict[str, object]) -> dict[str, object] | None:
+    current = current_work_subject(state)
+    if current is None:
+        return None
+    budget = current[1].get("integration_resync")
+    if not isinstance(budget, dict):
+        return None
+    return {key: budget.get(key) for key in ("generation", "window", "used", "limit", "open")}
 
 
 def _public_review_budget(state: dict[str, object]) -> dict[str, object] | None:

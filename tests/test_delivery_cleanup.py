@@ -372,6 +372,17 @@ def test_abandoned_run_never_schedules_or_retries_cleanup(git_repo: Path) -> Non
     )
     cleanup_job = state["ticket_jobs"]["2"]
     cleanup_record = cleanup_job["deterministic_integration_record"]
+    cleanup_record["ticket_integration"] = {
+        "base_sha": "base",
+        "candidate_sha": "integrated",
+        "candidate_tree": "tree",
+        "source_sha": "base",
+        "target_sha": "base",
+        "head_sha": "integrated",
+        "head_tree": "tree",
+        "conflict_paths": [],
+    }
+    cleanup_job["ticket_integration"] = deepcopy(cleanup_record["ticket_integration"])
     cleanup_acceptance = cleanup_record["acceptance_record"]
     cleanup_review_artifact = {
         "reviewer_thread_id": cleanup_acceptance["reviewer_thread_id"],

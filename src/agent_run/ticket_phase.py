@@ -33,6 +33,12 @@ BLOCKED_MESSAGES = {
     "ticket_close_external_conflict": (
         "Ticket close evidence conflicts with the Publisher intent"
     ),
+    "integration_resync_exhausted": "Ticket integration resync allowance requires explicit resume",
+    "integration_history_rewritten": "Remote branch history was rewritten; Ticket integration paused",
+    "integration_conflict_unresolved": "Ticket integration conflict requires intervention",
+    "integration_snapshot_changed_during_conflict": "Remote branches changed during conflict resolution",
+    "integration_record_invalid": "Ticket integration record is invalid",
+    "remote_source_missing": "Ticket source ref is missing",
 }
 
 

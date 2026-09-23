@@ -27,6 +27,7 @@ from agent_run.required_checks_observation import (
     failure_evidence_matches_observation,
     read_required_checks_observation,
 )
+from agent_run.ticket_integration import delivery_base_sha
 
 
 def _clear_required_checks_read_retry(job: dict[str, Any]) -> None:
@@ -58,6 +59,8 @@ def _resume_change_delivery_after_evidence(
 
 
 def _expected_publication_base_sha(job: dict[str, Any]) -> str | None:
+    if isinstance(job.get("ticket_integration"), dict):
+        return delivery_base_sha(job)
     if job.get("publication_authority") == "fallback":
         value = job.get("base_sha")
     else:

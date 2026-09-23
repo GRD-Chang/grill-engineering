@@ -24,6 +24,17 @@ from support.cli import load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import human_blocker_step
 
 
+def test_resync_limit_configures_future_runs() -> None:
+    code, saved = settings("configure", "--integration-resync-limit", "0")
+    assert code == 0
+    assert saved["policy"]["integration_resync_limit"] == 0
+    assert UserDefaultsStore().load()["policy"]["integration_resync_limit"] == 0
+    code, shown = settings("show")
+    assert code == 0
+    assert shown["policy_sources"]["integration_resync_limit"] == "user-defaults"
+
+
+
 @pytest.mark.parametrize("case", ["initializing", "missing", "starting_only", "applied", "corrupt"])
 def test_run_settings_distinguishes_initialization_from_missing_or_corrupt_profile(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, case: str,

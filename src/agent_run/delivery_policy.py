@@ -18,12 +18,13 @@ from agent_run.review_budget import (
 )
 
 
-DELIVERY_POLICY_PROTOCOL = 3
+DELIVERY_POLICY_PROTOCOL = 4
 _POLICY_KEYS = frozenset(
     {
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "integration_resync_limit",
         "development_thread_policy",
         "invocation_deadlines",
     }
@@ -44,6 +45,7 @@ class DeliveryPolicy:
     """Complete policy values captured by one Delivery Run/window."""
 
     ticket_review_rounds: int = 3
+    integration_resync_limit: int = 3
     parent_only_paired_rounds: int = 10
     run_repair_rounds: int = 10
     development_deadline_seconds: float = 5 * 60 * 60
@@ -58,6 +60,11 @@ class DeliveryPolicy:
             self,
             "ticket_review_rounds",
             _positive_integer(self.ticket_review_rounds, "ticket_review_rounds"),
+        )
+        object.__setattr__(
+            self,
+            "integration_resync_limit",
+            _nonnegative_integer(self.integration_resync_limit, "integration_resync_limit"),
         )
         object.__setattr__(
             self,
@@ -87,6 +94,7 @@ class DeliveryPolicy:
             "parent_only_paired_rounds": self.parent_only_paired_rounds,
             "run_repair_rounds": self.run_repair_rounds,
             "ticket_review_rounds": self.ticket_review_rounds,
+            "integration_resync_limit": self.integration_resync_limit,
             "development_thread_policy": self.development_thread_policy,
             "invocation_deadlines": {
                 "development": _canonical_number(self.development_deadline_seconds),
@@ -165,6 +173,7 @@ def normalize_policy_overrides(
         "run_repair_rounds": "run_repair_rounds",
         "ticket_review_rounds": "ticket_review_rounds",
         "ticket_review_round": "ticket_review_rounds",
+        "integration_resync_limit": "integration_resync_limit",
     }
     flat_deadline_aliases = {
         role: {
@@ -223,6 +232,7 @@ def parse_policy_snapshot(value: object) -> DeliveryPolicy:
             "parent_only_paired_rounds": value.get("parent_only_paired_rounds"),
             "run_repair_rounds": value.get("run_repair_rounds"),
             "ticket_review_rounds": value.get("ticket_review_rounds"),
+            "integration_resync_limit": value.get("integration_resync_limit"),
             "development_thread_policy": value.get("development_thread_policy", "reuse"),
             "invocation_deadlines": dict(deadlines),
         }
@@ -385,6 +395,9 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
         ticket_review_rounds=_positive_integer(
             values.get("ticket_review_rounds"), "ticket_review_rounds"
         ),
+        integration_resync_limit=_nonnegative_integer(
+            values.get("integration_resync_limit"), "integration_resync_limit"
+        ),
         development_deadline_seconds=_positive_duration(
             deadlines["development"], "development deadline"
         ),
@@ -400,6 +413,12 @@ def _policy_from_values(values: Mapping[str, Any]) -> DeliveryPolicy:
 def _positive_integer(value: Any, name: str) -> int:
     if type(value) is not int or value <= 0:
         raise DeliveryPolicyError(error_message('policy.error.positive_integer', audit=f"{name} must be a positive integer", name=name))
+    return value
+
+
+def _nonnegative_integer(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise DeliveryPolicyError(f"{name} must be a non-negative integer")
     return value
 
 

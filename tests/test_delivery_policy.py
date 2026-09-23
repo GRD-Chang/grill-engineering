@@ -28,6 +28,7 @@ def test_policy_resolution_uses_builtin_user_then_command_precedence() -> None:
     )
 
     assert policy.ticket_review_rounds == 1
+    assert policy.integration_resync_limit == 3
     assert policy.review_deadline_seconds == 30
     assert policy.development_deadline_seconds == 5 * 60 * 60
     assert policy.publication_deadline_seconds == 60 * 60
@@ -106,6 +107,8 @@ def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
         {"parent_only_paired_rounds": True},
         {"run_repair_rounds": 0},
         {"run_repair_rounds": True},
+        {"integration_resync_limit": -1},
+        {"integration_resync_limit": True},
         {"invocation_deadlines": {"review": "0s"}},
         {"invocation_deadlines": {"review": "not-a-duration"}},
         {"invocation_deadlines": {"review": 10**400}},
@@ -122,6 +125,10 @@ def test_policy_snapshot_is_complete_and_does_not_reapply_defaults() -> None:
     snapshot = policy.snapshot()
 
     assert parse_policy_snapshot(snapshot).snapshot() == snapshot
+    missing_resync = dict(snapshot)
+    missing_resync.pop("integration_resync_limit")
+    with pytest.raises(DeliveryPolicyError):
+        parse_policy_snapshot(missing_resync)
     with pytest.raises(DeliveryPolicyError):
         parse_policy_snapshot({"ticket_review_rounds": 4})
 

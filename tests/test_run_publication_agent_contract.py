@@ -58,6 +58,20 @@ def _bind_ticket_review_budget(
     record["review_budget"] = deepcopy(budget)
 
 
+def _bind_ticket_integration(job: dict[str, Any], record: dict[str, Any]) -> None:
+    record["ticket_integration"] = {
+        "base_sha": record["base_sha"],
+        "candidate_sha": record["candidate_sha"],
+        "candidate_tree": record["candidate_tree"],
+        "source_sha": record["base_sha"],
+        "target_sha": record["base_sha"],
+        "head_sha": record["candidate_sha"],
+        "head_tree": record["candidate_tree"],
+        "conflict_paths": [],
+    }
+    job["ticket_integration"] = deepcopy(record["ticket_integration"])
+
+
 def test_worker_failure_before_publication_artifact_is_not_retried(
     git_repo: Path,
 ) -> None:
@@ -562,6 +576,10 @@ def test_final_run_publication_receives_only_role_required_facts(
         state["ticket_jobs"]["2"],
         state["ticket_jobs"]["2"]["deterministic_integration_record"],
     )
+    _bind_ticket_integration(
+        state["ticket_jobs"]["2"],
+        state["ticket_jobs"]["2"]["deterministic_integration_record"],
+    )
     state["prompt_resources"]["methods/publishing"] = "Run 创建时固定的发布方法"
     states.save_run(str(state["run_id"]), state)
     agents = RunPublicationAgents()
@@ -651,6 +669,10 @@ def test_publication_prompts_and_run_repair_requests_keep_integration_records_wi
         integration_records[0]["integration_record"]
     )
     _bind_ticket_review_budget(
+        state["ticket_jobs"]["2"],
+        integration_records[0]["integration_record"],
+    )
+    _bind_ticket_integration(
         state["ticket_jobs"]["2"],
         integration_records[0]["integration_record"],
     )

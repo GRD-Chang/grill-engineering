@@ -81,6 +81,13 @@ class ScriptedPublisher:
         self.live_head = head_sha
         return BranchPublicationResult(observation, head_sha, "published")
 
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]:
+        del source_branch
+        target = GitRepository(self.repo).resolve(target_branch)
+        return self.live_head or target, target
+
     def verify_ticket_pr_before_publish(
         self,
         *,

@@ -19,6 +19,7 @@ from agent_run.review_budget import (
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records as require_completed_ticket_integration_records,
 )
+from agent_run.integration_resync_budget import require_resync_budget
 from agent_run.operator_gate import (
     active_ticket_gate_mirror_is_consistent,
     operator_gate_identity_is_consistent,
@@ -203,6 +204,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_required_checks_observations(state)
     _require_branch_publication_observations(state)
     _require_review_budget_windows(state)
+    _require_integration_resync_budgets(state)
     active_ticket = state.get("active_ticket_job")
     if isinstance(active_ticket, dict):
         require_active_ticket_publication_authorization(active_ticket)
@@ -618,6 +620,30 @@ def _require_integrated_revalidation_merge(state: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(
                 f"legacy state has an invalid {location}.{key}"
             )
+
+
+def _require_integration_resync_budgets(state: dict[str, Any]) -> None:
+    subjects: list[tuple[str, dict[str, Any]]] = []
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        subjects.extend((f"ticket_jobs[{key}]", job) for key, job in jobs.items() if isinstance(job, dict))
+    for key in ("active_ticket_job", "parent_job", "run_acceptance"):
+        job = state.get(key)
+        if isinstance(job, dict):
+            subjects.append((key, job))
+    for location, job in subjects:
+        budget = job.get("integration_resync")
+        if budget is None:
+            continue
+        try:
+            require_resync_budget(
+                budget,
+                policy_snapshot=job.get("policy_snapshot") or state.get("policy_snapshot"),
+            )
+        except (TypeError, ValueError) as error:
+            raise IncompatibleRunStateError(
+                f"incompatible_run_state: {location}.integration_resync is invalid"
+            ) from error
 
 
 def _require_review_budget_windows(state: dict[str, Any]) -> None:

@@ -3725,6 +3725,12 @@ def _add_policy_options(
         type=_positive_integer,
         help=cli_message('cli.ticket_rounds_help'),
     )
+    parser.add_argument(
+        "--integration-resync-limit",
+        dest=f"{dest_prefix}integration_resync_limit",
+        type=_nonnegative_integer,
+        help=cli_message('cli.integration_resync_limit_help'),
+    )
     for role, label in (
         ("development", "Development"),
         ("review", "Review"),
@@ -3746,6 +3752,7 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "integration_resync_limit",
         "development_thread_policy",
     ):
         value = getattr(parsed, f"policy_{key}", None)
@@ -3943,6 +3950,16 @@ def _positive_integer(value: str) -> int:
         raise argparse.ArgumentTypeError(cli_message("cli.positive_integer")) from error
     if number <= 0:
         raise argparse.ArgumentTypeError(cli_message("cli.positive_integer"))
+    return number
+
+
+def _nonnegative_integer(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(cli_message("cli.nonnegative_integer")) from error
+    if number < 0:
+        raise argparse.ArgumentTypeError(cli_message("cli.nonnegative_integer"))
     return number
 
 

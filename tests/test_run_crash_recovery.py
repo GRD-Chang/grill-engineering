@@ -222,7 +222,7 @@ def test_public_resume_recovers_completed_invocation_with_pending_attempt(
         "--agent-fixture",
         str(first_agents),
         "--crash-after-save",
-        "8",
+        "10",
     )
 
     assert interrupted.returncode == 2
@@ -479,6 +479,8 @@ def test_public_cli_recovers_after_external_response_loss(
 
     assert recovered.returncode == 0, recovered.stdout
     _assert_exactly_once_delivery(git_repo, fixture)
+    if action == "ensure_ticket_pr":
+        assert load_only_run_state(git_repo)["ticket_jobs"]["2"]["integration_resync"]["used"] == 0
 
 
 def test_abandon_recovers_ticket_after_close_response_loss(
@@ -655,7 +657,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         encoding="utf-8"
     ) == "survives worker error\n"
     live = json.loads(fixture.read_text(encoding="utf-8"))
-    live["delivery"]["crash_after_ensure_ticket_branch_once"] = True
+    live["delivery"]["crash_after_publish_branch_once"] = True
     fixture.write_text(json.dumps(live), encoding="utf-8")
     recovery_agents = git_repo / "agents-recovery.json"
     recovery_agents.write_text(
@@ -679,6 +681,12 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
                         "Fresh review covered the preserved work.",
                     )
                 ],
+                "run_reviews": [
+                    passing_acceptance(
+                        "run-reviewer-recovered", "The complete Run passed."
+                    )
+                ],
+                "run_publications": [_publication()],
             }
         ),
         encoding="utf-8",
@@ -699,10 +707,10 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
         encoding="utf-8"
     ) == "survives worker error\n"
 
-    recovered = run_internal_stage(
+    recovered = run_cli(
         git_repo,
         fixture,
-        "deliver",
+        "resume",
         run_id,
         "--agent-fixture",
         str(recovery_agents),
@@ -710,7 +718,7 @@ def test_public_cli_preserves_uncommitted_work_after_worker_error(
 
     assert recovered.returncode == 0, recovered.stdout
     state = load_only_run_state(git_repo)
-    assert state["status"] == "run_acceptance_pending"
+    assert state["status"] == "run_approval_pending"
     assert state["ticket_jobs"]["2"]["reviewer_thread_ids"] == [
         "reviewer-recovered"
     ]

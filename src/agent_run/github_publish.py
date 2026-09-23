@@ -49,8 +49,29 @@ class GhGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
+        self._ensure_change_branch(
+            branch=branch,
+            base_branch=base_branch,
+            expected_base_sha=expected_base_sha,
+            expected_remote_sha=expected_remote_sha,
+            recovery_remote_sha=recovery_remote_sha,
+            allow_managed_base_append=False,
+        )
+
+    def _ensure_change_branch(
+        self,
+        *,
+        branch: str,
+        base_branch: str,
+        expected_base_sha: str,
+        expected_remote_sha: str,
+        recovery_remote_sha: str,
+        allow_managed_base_append: bool,
+    ) -> None:
         if is_managed_delivery_branch(base_branch):
-            self._ensure_remote_run_branch(base_branch, expected_base_sha)
+            self._ensure_remote_run_branch(
+                base_branch, expected_base_sha, allow_append=allow_managed_base_append
+            )
         remote_sha = self._remote_branch_sha(branch)
         if remote_sha in {expected_remote_sha, recovery_remote_sha}:
             return
@@ -118,13 +139,22 @@ class GhGitHubPublisher:
         recovery_remote_sha: str,
     ) -> None:
         del ticket_number
-        self.ensure_change_branch(
-            branch=branch,
-            base_branch=base_branch,
-            expected_base_sha=expected_base_sha,
-            expected_remote_sha=expected_remote_sha,
-            recovery_remote_sha=recovery_remote_sha,
-        )
+        try:
+            self._ensure_change_branch(
+                branch=branch,
+                base_branch=base_branch,
+                expected_base_sha=expected_base_sha,
+                expected_remote_sha=expected_remote_sha,
+                recovery_remote_sha=recovery_remote_sha,
+                allow_managed_base_append=True,
+            )
+        except RemoteBranchChanged as error:
+            observed = error.observation.observed_sha
+            if observed is None:
+                raise
+            self.git.fetch_remote_commit(branch, observed)
+            if not self.git.is_ancestor(expected_remote_sha, observed):
+                raise
 
     def link_issue_branch_display(
         self, *, issue_number: int, branch: str, head_sha: str
@@ -475,7 +505,9 @@ class GhGitHubPublisher:
         self._require("pr", "close", str(pr_number), "--repo", self.repository)
         return True
 
-    def _ensure_remote_run_branch(self, branch: str, expected_sha: str) -> None:
+    def _ensure_remote_run_branch(
+        self, branch: str, expected_sha: str, *, allow_append: bool = False
+    ) -> None:
         """Create or recover one Run/Parent ref by its durable exact SHA.
 
         A same-named ref is not ownership evidence: it is usable only when its
@@ -485,6 +517,10 @@ class GhGitHubPublisher:
         if remote_sha == expected_sha:
             return
         if remote_sha is not None:
+            if allow_append:
+                self.git.fetch_remote_commit(branch, remote_sha)
+                if self.git.is_ancestor(expected_sha, remote_sha):
+                    return
             raise GitError("Run ref has a foreign identity")
         pushed = self._write_command(
             [
@@ -704,6 +740,47 @@ class GhGitHubPublisher:
                 "github_read_failed", remote.stderr.strip() or "could not read Ticket ref"
             )
         return remote.stdout.split()[0] if remote.stdout.strip() else None
+
+    def live_branch_heads(
+        self, source_branch: str, target_branch: str
+    ) -> tuple[str | None, str]:
+        """Observe source and target refs in one live remote read.
+
+        The source may not exist before first publication. The target must
+        exist. Exact ref names are checked because ls-remote accepts patterns.
+        """
+        if source_branch == target_branch:
+            raise GitError("source and target branch must differ")
+        refs: dict[str, str | None] = {
+            f"refs/heads/{source_branch}": None,
+            f"refs/heads/{target_branch}": None,
+        }
+        remote = run_read_command(
+            ["git", "ls-remote", "--heads", "origin", *refs],
+            cwd=self.git.root,
+        )
+        if remote.returncode != 0:
+            raise GitHubReadError(
+                "github_read_failed",
+                remote.stderr.strip() or "could not read live branch heads",
+            )
+        for line in remote.stdout.splitlines():
+            sha, separator, ref = line.partition("\t")
+            if (
+                separator
+                and ref in refs
+                and refs[ref] is None
+                and re.fullmatch(r"[0-9a-f]{40,64}", sha)
+            ):
+                refs[ref] = sha
+            else:
+                raise GitHubReadError("github_invalid_response", "invalid live branch head")
+        target = refs[f"refs/heads/{target_branch}"]
+        if target is None:
+            raise GitHubReadError(
+                "missing_target_branch", f"target branch {target_branch!r} is missing"
+            )
+        return refs[f"refs/heads/{source_branch}"], target
 
     def _change_prs(self, branch: str, *, state: str = "open") -> list[object]:
         owner = self.repository.split("/", 1)[0]

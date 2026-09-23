@@ -26,6 +26,41 @@ def _candidate(root: Path, name: str, contents: str) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def test_ticket_ref_recovery_accepts_remote_source_and_target_appends(
+    git_repo: Path, tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
+    _git(git_repo, "remote", "add", "origin", str(remote))
+    base = _git(git_repo, "rev-parse", "HEAD")
+    source_branch = "agent-run/test/ticket"
+    target_branch = "agent-run/test/run"
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    authority = {
+        "ticket_number": 1,
+        "branch": source_branch,
+        "base_branch": target_branch,
+        "expected_base_sha": base,
+        "expected_remote_sha": base,
+        "recovery_remote_sha": base,
+    }
+    publisher.ensure_ticket_branch(**authority)
+    collaborator = tmp_path / "collaborator"
+    _git(tmp_path, "clone", str(remote), str(collaborator))
+    _git(collaborator, "config", "user.name", "Collaborator")
+    _git(collaborator, "config", "user.email", "collaborator@example.invalid")
+    _git(collaborator, "checkout", "--detach", base)
+    source = _candidate(collaborator, "source.txt", "source contribution\n")
+    _git(collaborator, "push", "origin", f"{source}:refs/heads/{source_branch}")
+    _git(collaborator, "reset", "--hard", base)
+    target = _candidate(collaborator, "target.txt", "target contribution\n")
+    _git(collaborator, "push", "origin", f"{target}:refs/heads/{target_branch}")
+
+    publisher.ensure_ticket_branch(**authority)
+
+    assert publisher.live_branch_heads(source_branch, target_branch) == (source, target)
+
+
 def test_later_publication_is_fast_forward_and_failed_rewrite_preserves_remote(
     git_repo: Path, tmp_path: Path
 ) -> None:

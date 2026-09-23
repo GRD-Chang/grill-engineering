@@ -393,6 +393,10 @@ def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
         "acceptance_record_mismatch",
         "merged_result_mismatch",
         "no_code_changes",
+        "integration_resync_exhausted",
+        "integration_conflict_unresolved",
+        "integration_conflict_requires_human",
+        "integration_history_rewritten",
     }
     if any(item.get("reason") in human_reasons for item in remaining):
         return "waiting_human"
