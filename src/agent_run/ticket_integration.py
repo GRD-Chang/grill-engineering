@@ -45,7 +45,13 @@ def delivery_candidate_sha(job: dict[str, Any]) -> str:
 
 def delivery_base_sha(job: dict[str, Any]) -> str:
     record = job.get("ticket_integration")
-    if isinstance(record, dict) and record.get("candidate_sha") == job.get("candidate_sha"):
+    if isinstance(record, dict) and (
+        record.get("candidate_sha") == job.get("candidate_sha")
+        or (
+            job.get("attempt_kind") == "ci_repair"
+            and record.get("head_sha") == job.get("candidate_sha")
+        )
+    ):
         return str(record["target_sha"])
     return str(job["base_sha"])
 
@@ -64,11 +70,23 @@ def integration_record_is_valid(git: Any, job: dict[str, Any]) -> bool:
     ):
         return False
     try:
+        promoted_ci_candidate = (
+            job.get("attempt_kind") == "ci_repair"
+            and record.get("head_sha") == job.get("candidate_sha")
+            and record.get("head_tree") == git.resolve(f"{job['candidate_sha']}^{{tree}}")
+        )
         return (
             record.get("base_sha") == job.get("base_sha")
-            and record.get("candidate_sha") == job.get("candidate_sha")
-            and record.get("candidate_tree") == git.resolve(f"{job['candidate_sha']}^{{tree}}")
+            and (
+                promoted_ci_candidate
+                or (
+                    record.get("candidate_sha") == job.get("candidate_sha")
+                    and record.get("candidate_tree") == git.resolve(f"{job['candidate_sha']}^{{tree}}")
+                )
+            )
+            and record.get("candidate_tree") == git.resolve(f"{record['candidate_sha']}^{{tree}}")
             and record.get("head_tree") == git.resolve(f"{record['head_sha']}^{{tree}}")
+            and git.is_ancestor(str(record["candidate_sha"]), str(record["head_sha"]))
             and git.is_ancestor(str(job["candidate_sha"]), str(record["head_sha"]))
             and git.is_ancestor(str(record["source_sha"]), str(record["head_sha"]))
             and git.is_ancestor(str(record["target_sha"]), str(record["head_sha"]))
@@ -121,7 +139,21 @@ def _invalidate_ticket_publication(
     if pending is not None:
         close_semantic_attempt(job, pending, outcome="currentness_invalidated")
         detach_active_invocation(state, pending)
-    job["phase"] = "accepted"
+    ci_repair = job.get("attempt_kind") == "ci_repair"
+    job["phase"] = "candidate" if ci_repair else "accepted"
+    if ci_repair:
+        pending_review = pending_semantic_attempt(job, role="reviewer")
+        if pending_review is not None:
+            close_semantic_attempt(
+                job, pending_review, outcome="currentness_invalidated"
+            )
+            detach_active_invocation(state, pending_review)
+        for key in (
+            "acceptance_record", "acceptance_artifact", "publication_authority",
+            "ci_repair_publication_receipt", "fallback_publication_receipt",
+            "pending_review_result",
+        ):
+            job.pop(key, None)
     for key in (
         "publication", "publication_sha", "publication_parent_sha", "publication_prior_published_sha",
         "pending_publication_result", "merge_intent", "deterministic_integration_record",
@@ -193,12 +225,21 @@ def prepare_ticket_integration(
     own_source_write = _own_source_write(job, source)
     if (
         isinstance(prior, dict)
-        and prior.get("candidate_sha") == job.get("candidate_sha")
+        and (
+            prior.get("candidate_sha") == job.get("candidate_sha")
+            or (
+                job.get("attempt_kind") == "ci_repair"
+                and prior.get("head_sha") == job.get("candidate_sha")
+            )
+        )
         and (prior.get("source_sha") == source or (
             own_source_write and source == job.get("publication_sha")
         ))
         and prior.get("target_sha") == target
     ):
+        if not integration_record_is_valid(stage.git, job):
+            _pause(stage, state, job, "integration_record_invalid", "Ticket integration boundary is invalid")
+            return False
         return True
     if isinstance(prior, dict):
         _invalidate_ticket_publication(stage, state, job)
@@ -348,7 +389,9 @@ def _resolve_conflict(stage: ChangeDeliveryStage, state: dict[str, Any], job: di
         job.pop("development_failure_resume", None)
         if isinstance(result, HumanBlockerResult):
             stage._wait_for_human(
-                state, job, phase="accepted", blockers=result.human_blockers,
+                state, job,
+                phase="candidate" if job.get("attempt_kind") == "ci_repair" else "accepted",
+                blockers=result.human_blockers,
                 code="agent_requires_human",
             )
             return False

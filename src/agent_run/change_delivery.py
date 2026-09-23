@@ -21,7 +21,7 @@ from agent_run.ci_recovery_budget import (
     ci_review_required,
     mark_ci_repair,
     mark_ci_review_invocation,
-    refund_unstarted_ci_repair,
+    refund_ci_repair_without_candidate,
 )
 from agent_run.artifacts import AcceptanceArtifact
 from agent_run.delivery_protocol import GitHubPublisher
@@ -194,6 +194,13 @@ class ChangeDeliveryEngine:
                         return state
                 if job["phase"] == "candidate":
                     if (
+                        self.contract.label.startswith("ticket-")
+                        and job.get("attempt_kind") == "ci_repair"
+                    ):
+                        if not prepare_ticket_integration(self, state, job, checkout):
+                            continue
+                        self._bind_ticket_ci_integration(state, job)
+                    if (
                         self.contract.label == "parent-only"
                         # A no-change first integration reuses demand acceptance
                         # and does not open the separate integration review budget.
@@ -256,6 +263,27 @@ class ChangeDeliveryEngine:
                     if self.contract.label.startswith("ticket-"):
                         if not prepare_ticket_integration(self, state, job, checkout):
                             continue
+                        if job.get("attempt_kind") == "ci_repair":
+                            if job["phase"] == "candidate":
+                                self._bind_ticket_ci_integration(state, job)
+                                continue
+                            record = job["ticket_integration"]
+                            review_needed = ci_review_required(job, is_ticket=True)
+                            current_review = (
+                                isinstance(job.get("acceptance_record"), dict)
+                                and self.adapter.acceptance_is_current(
+                                    state, job, job["acceptance_record"]
+                                )
+                            )
+                            if (
+                                job.get("candidate_sha") != record["head_sha"]
+                                or (review_needed and not current_review)
+                            ):
+                                self._bind_ticket_ci_integration(
+                                    state, job,
+                                    invalidate_review=review_needed and not current_review,
+                                )
+                                continue
                     elif self.contract.label == "parent-only":
                         if not prepare_parent_integration(self, state, job, checkout):
                             continue
@@ -384,6 +412,31 @@ class ChangeDeliveryEngine:
     ) -> bool:
         return commit_candidate(self, state, job, checkout)
 
+    def _bind_ticket_ci_integration(
+        self, state: dict[str, Any], job: dict[str, Any], *,
+        invalidate_review: bool = False,
+    ) -> None:
+        """Make the exact integrated head the CI repair authorization boundary."""
+
+        record = _mapping(job, "ticket_integration")
+        if job.get("candidate_sha") == record["head_sha"] and not invalidate_review:
+            return
+        pending_review = pending_semantic_attempt(job, role="reviewer")
+        if pending_review is not None:
+            close_semantic_attempt(
+                job, pending_review, outcome="currentness_invalidated"
+            )
+            detach_active_invocation(state, pending_review)
+        job["candidate_sha"] = record["head_sha"]
+        job["phase"] = "candidate"
+        for key in (
+            "acceptance_record", "acceptance_artifact", "publication_authority",
+            "ci_repair_publication_receipt", "fallback_publication_receipt",
+            "pending_review_result",
+        ):
+            job.pop(key, None)
+        self.save(state)
+
     def _publication(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
@@ -505,7 +558,7 @@ class ChangeDeliveryEngine:
         ):
             if job.get("pending_attempt_kind") == "ci_repair":
                 outer_limit, inner_limit = ci_limits_for_job(job)
-                refund_unstarted_ci_repair(
+                refund_ci_repair_without_candidate(
                     job,
                     outer_limit=outer_limit,
                     inner_limit=inner_limit,

@@ -243,6 +243,8 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
         "outer_window": 1, "rounds_used": 1, "rounds_limit": 3,
         "inner_window": 2, "repairs_used": 0, "repairs_limit": 3,
         "review_required": True, "checkpoint_reason": None,
+        "failure_head": resumed_run["ci_recovery"]["failure_head"],
+        "failed_checks": [],
     }
     persisted = states.load_current_run(str(state["run_id"]))
     assert persisted is not None

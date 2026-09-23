@@ -162,10 +162,19 @@ def _require_deterministic_integration_record(
         raise IncompatibleRunStateError(
             f"incompatible_run_state: {location}.ticket_integration is invalid"
         )
+    promoted_ci_integration = (
+        source in {"accepted", "ci_repair"}
+        and completed_job.get("attempt_kind") == "ci_repair"
+        and ticket_integration.get("head_sha") == record["candidate_sha"]
+        and ticket_integration.get("head_tree") == record["candidate_tree"]
+        and record["candidate_sha"] == completed_job.get("candidate_sha")
+    )
     if (
         ticket_integration != completed_job.get("ticket_integration")
-        or ticket_integration["candidate_sha"] != record["candidate_sha"]
-        or ticket_integration["candidate_tree"] != record["candidate_tree"]
+        or not (promoted_ci_integration or (
+            ticket_integration["candidate_sha"] == record["candidate_sha"]
+            and ticket_integration["candidate_tree"] == record["candidate_tree"]
+        ))
         or ticket_integration["target_sha"] != record["base_sha"]
         or ticket_integration["head_tree"] != record["integrated_tree"]
         or not isinstance(ticket_integration["conflict_paths"], list)
@@ -175,7 +184,11 @@ def _require_deterministic_integration_record(
             f"incompatible_run_state: {location}.ticket_integration does not match delivery"
         )
     original_record = dict(record)
-    original_record["base_sha"] = ticket_integration["base_sha"]
+    original_record["base_sha"] = (
+        ticket_integration["target_sha"]
+        if source == "accepted" and promoted_ci_integration
+        else ticket_integration["base_sha"]
+    )
     if source == "accepted":
         require_completed_accepted_ticket_authorization(
             completed_job, authorization, original_record, location

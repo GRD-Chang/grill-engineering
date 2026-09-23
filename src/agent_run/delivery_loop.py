@@ -170,6 +170,11 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def review_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> dict[str, Any]:
+        review_base = (
+            delivery_base_sha(job)
+            if job.get("attempt_kind") == "ci_repair"
+            else str(job["base_sha"])
+        )
         request = {
             "acceptance_scope": "ticket",
             "parent_issue_url": _parent(state)["url"],
@@ -178,10 +183,10 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
             "repository": str(state["repository"]),
             "parent": _parent(state),
             "ticket": _ticket(state, job),
-            "base_sha": job["base_sha"],
+            "base_sha": review_base,
             "candidate_sha": job["candidate_sha"],
             "current_review_identity": {
-                "reviewed_base_sha": str(job["base_sha"]),
+                "reviewed_base_sha": review_base,
                 "reviewed_candidate_sha": str(job["candidate_sha"]),
                 "reviewed_candidate_tree": self.git.resolve(
                     f"{job['candidate_sha']}^{{tree}}"
@@ -220,9 +225,14 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
         reviewer_thread_id: str,
         artifact: dict[str, Any],
     ) -> dict[str, Any]:
+        reviewed_base = (
+            delivery_base_sha(job)
+            if job.get("attempt_kind") == "ci_repair"
+            else str(job["base_sha"])
+        )
         return {
             "acceptance_scope": "change_job",
-            "reviewed_base_sha": str(job["base_sha"]),
+            "reviewed_base_sha": reviewed_base,
             "reviewed_candidate_sha": str(job["candidate_sha"]),
             "reviewed_candidate_tree": self.git.resolve(
                 f"{job['candidate_sha']}^{{tree}}"
@@ -235,8 +245,13 @@ class TicketDeliveryAdapter(ChangeDeliveryAdapter):
     def acceptance_is_current(
         self, state: dict[str, Any], job: dict[str, Any], acceptance: dict[str, Any]
     ) -> bool:
+        reviewed_base = (
+            delivery_base_sha(job)
+            if job.get("attempt_kind") == "ci_repair"
+            else job.get("base_sha")
+        )
         return (
-            acceptance.get("reviewed_base_sha") == job.get("base_sha")
+            acceptance.get("reviewed_base_sha") == reviewed_base
             and acceptance.get("reviewed_candidate_sha") == job.get("candidate_sha")
             and acceptance.get("reviewed_candidate_tree")
             == self.git.resolve(f"{job['candidate_sha']}^{{tree}}")

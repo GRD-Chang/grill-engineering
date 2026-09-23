@@ -11,7 +11,7 @@ from agent_run.ci_recovery_budget import (
     mark_ci_repair,
     new_ci_recovery_budget,
     observe_repairable_ci_failure,
-    refund_unstarted_ci_repair,
+    refund_ci_repair_without_candidate,
     reset_exhausted_ci_budget,
 )
 
@@ -136,7 +136,7 @@ def test_same_head_replay_and_unstarted_refund_do_not_spend_a_round() -> None:
         job, head_sha="first", outer_limit=3, inner_limit=3, is_ticket=False
     )
     mark_ci_repair(job, outer_limit=3, inner_limit=3, is_ticket=False)
-    refund_unstarted_ci_repair(
+    refund_ci_repair_without_candidate(
         job, outer_limit=3, inner_limit=3, is_ticket=False
     )
     assert job["ci_recovery"]["repairs_used"] == 0

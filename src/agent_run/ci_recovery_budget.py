@@ -214,9 +214,10 @@ def mark_ci_repair(
     return budget["repairs_used"]
 
 
-def refund_unstarted_ci_repair(
+def refund_ci_repair_without_candidate(
     job: dict[str, Any], *, outer_limit: int, inner_limit: int, is_ticket: bool
 ) -> None:
+    """Return a reserved repair slot when no code Candidate was produced."""
     budget = ensure_ci_recovery_budget(
         job, outer_limit=outer_limit, inner_limit=inner_limit, is_ticket=is_ticket
     )

@@ -41,6 +41,32 @@ from agent_run.presentation_helpers import (
 )
 
 
+def _ci_recovery_details(recovery: dict[str, Any]) -> list[str]:
+    if not recovery.get("rounds_used"):
+        return []
+    details = [display_text(
+        'presentation.status.ci_review_required'
+        if recovery.get('review_required') else 'presentation.status.ci_review_exempt'
+    )]
+    head = recovery.get('failure_head')
+    if isinstance(head, str) and head:
+        details.append(display_text('presentation.status.ci_failure_head', head=head))
+    checks = recovery.get('failed_checks')
+    if isinstance(checks, list):
+        names = [
+            f"{check['workflow']} / {check['name']}"
+            for check in checks
+            if isinstance(check, dict)
+            and isinstance(check.get('workflow'), str)
+            and isinstance(check.get('name'), str)
+        ]
+        if names:
+            details.append(display_text(
+                'presentation.status.ci_failed_checks', checks=', '.join(names)
+            ))
+    return details
+
+
 def status_progress_view(
     state: dict[str, Any], audit: dict[str, Any]
 ) -> dict[str, Any]:
@@ -194,6 +220,8 @@ def print_status_progress(
                            inner_window=ci_recovery.get('inner_window'),
                            repairs_used=ci_recovery.get('repairs_used'),
                            repairs_limit=ci_recovery.get('repairs_limit')))
+        for detail in _ci_recovery_details(ci_recovery):
+            print(detail)
     if view["elapsed_seconds"] is not None:
         print(display_text('presentation.status.task_elapsed_time_v1', v1=_duration(view['elapsed_seconds'])))
 
@@ -388,6 +416,8 @@ def print_rich_status_progress(
                                   inner_window=ci_recovery.get('inner_window'),
                                   repairs_used=ci_recovery.get('repairs_used'),
                                   repairs_limit=ci_recovery.get('repairs_limit')))
+        for detail in _ci_recovery_details(ci_recovery):
+            add_identity(display_text('presentation.status.ci_recovery_label'), detail)
     repair = view.get("run_repair")
     if isinstance(repair, dict):
         progress_text += (

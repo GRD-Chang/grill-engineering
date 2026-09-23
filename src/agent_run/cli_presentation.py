@@ -649,6 +649,26 @@ def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
     if not isinstance(budget, dict):
         return None
     outer_limit, inner_limit = ci_limits_for_job(subject)
+    failure_head = budget.get("failure_head")
+    evidence = subject.get("ci_evidence") or subject.get("ci_failed_evidence")
+    if not isinstance(evidence, dict) or evidence.get("head_sha") != failure_head:
+        evidence = subject.get("required_checks_origin")
+    raw_checks = (
+        evidence.get("checks")
+        if isinstance(evidence, dict) and evidence.get("head_sha") == failure_head
+        else None
+    )
+    failed_checks = []
+    if isinstance(raw_checks, list):
+        failed_checks = [
+            {
+                key: check[key]
+                for key in ("workflow", "name", "link", "repairability")
+                if check.get(key) is not None
+            }
+            for check in raw_checks
+            if isinstance(check, dict) and check.get("bucket") == "fail"
+        ]
     return {
         "outer_window": budget.get("outer_window"),
         "rounds_used": budget.get("rounds_used"),
@@ -661,6 +681,8 @@ def _public_ci_recovery(state: dict[str, object]) -> dict[str, object] | None:
         ),
         "review_required": budget.get("review_required"),
         "checkpoint_reason": budget.get("checkpoint_reason"),
+        "failure_head": failure_head,
+        "failed_checks": failed_checks,
     }
 
 

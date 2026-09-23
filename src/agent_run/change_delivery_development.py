@@ -12,6 +12,7 @@ from agent_run.change_delivery_stage import ChangeDeliveryStage
 from agent_run.ci_recovery_budget import (
     ci_limits_for_job,
     ci_repair_budget_context,
+    refund_ci_repair_without_candidate,
 )
 from agent_run.change_delivery_fallback import (
     preserve_required_checks_publication_authorization,
@@ -260,8 +261,17 @@ def commit_candidate(
                 outcome="no_code_changes",
                 result=_development_attempt_result(job),
             )
+        if job.get("pending_attempt_kind") == "ci_repair":
+            outer_limit, inner_limit = ci_limits_for_job(job)
+            refund_ci_repair_without_candidate(
+                job,
+                outer_limit=outer_limit,
+                inner_limit=inner_limit,
+                is_ticket=stage.contract.label.startswith("ticket-"),
+            )
         job.pop("controller_candidate_reprepare", None)
         job.pop("pending_attempt", None)
+        job.pop("pending_attempt_kind", None)
         job.pop("candidate_commit_intent", None)
         return stage._block(
             state,

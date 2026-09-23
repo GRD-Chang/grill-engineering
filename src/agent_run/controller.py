@@ -514,7 +514,11 @@ class Controller:
                     active_ticket,
                     policy_snapshot=active_ticket["policy_snapshot"],
                 )
-                active_ticket["phase"] = "accepted"
+                active_ticket["phase"] = (
+                    "candidate"
+                    if active_ticket.get("attempt_kind") == "ci_repair"
+                    else "accepted"
+                )
                 active_ticket.pop("blocked_reason", None)
                 state["active_ticket_job"] = active_ticket
                 state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
@@ -2388,9 +2392,17 @@ def _resume_change_job_owner(
         human_response,
         generation=_subject_generation(value),
     )
+    resume_phase = str(value.get("human_blocker_phase", "developing"))
+    if (
+        value.get("attempt_kind") == "ci_repair"
+        and isinstance(value.get("integration_conflict"), dict)
+        and value.get("blocked_reason") == "agent_requires_human"
+    ):
+        # Older paused CI conflicts recorded the pre-review phase as accepted.
+        resume_phase = "candidate"
     value.update(
         {
-            "phase": str(value.get("human_blocker_phase", "developing")),
+            "phase": resume_phase,
             "prior_human_blockers": blockers,
         }
     )

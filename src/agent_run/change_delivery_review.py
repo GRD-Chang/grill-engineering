@@ -27,6 +27,7 @@ from agent_run.semantic_attempt import (
     close_semantic_attempt,
     pending_semantic_attempt,
 )
+from agent_run.ticket_integration import delivery_base_sha
 
 
 def review(
@@ -177,6 +178,12 @@ def complete_review(
     review_facts: dict[str, Any] = {}
     if isinstance(budget, dict):
         candidate_sha = str(job["candidate_sha"])
+        reviewed_base_sha = (
+            delivery_base_sha(job)
+            if stage.contract.label.startswith("ticket-")
+            and job.get("attempt_kind") == "ci_repair"
+            else str(job["base_sha"])
+        )
         if isinstance(job.get("default_base_sha"), str):
             review_identity = {
                 "run_base_sha": str(job["base_sha"]),
@@ -188,7 +195,7 @@ def complete_review(
             }
         else:
             review_identity = {
-                "reviewed_base_sha": str(job["base_sha"]),
+                "reviewed_base_sha": reviewed_base_sha,
                 "reviewed_candidate_sha": candidate_sha,
                 "reviewed_candidate_tree": stage.git.resolve(
                     f"{candidate_sha}^{{tree}}"
@@ -197,7 +204,7 @@ def complete_review(
         review_record = {
             "reviewer_thread_id": reviewer_thread_id,
             "candidate_sha": candidate_sha,
-            "reviewed_base_sha": str(job["base_sha"]),
+            "reviewed_base_sha": reviewed_base_sha,
             "review_identity": review_identity,
             "artifact": artifact.raw,
         }

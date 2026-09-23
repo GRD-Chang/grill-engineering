@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_run.final_approval_operation import final_approval_cleanup_pending, has_final_approval
+from agent_run.delivery_facts import current_work_subject
 from agent_run.messages import text
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 from agent_run.state_contract import human_blocker_subject_count
@@ -100,6 +101,16 @@ def next_action_fact(state: dict[str, Any]) -> NextAction:
         return NextAction("command", "run", parent_number)
     if status == "supervision_timeout" and isinstance(run_id, str):
         return NextAction("command", "resume", run_id)
+    current = current_work_subject(state)
+    if (
+        status in {"blocked", "ready_for_human"}
+        and isinstance(run_id, str)
+        and current is not None
+        and current[1].get("blocked_reason") in {
+            "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+        }
+    ):
+        return NextAction("command", "resume", run_id)
     if (
         status in {"ready_for_human", "progress_exhausted"}
         and human_blocker_subject_count(state) == 1
@@ -125,4 +136,3 @@ def next_action_fact(state: dict[str, Any]) -> NextAction:
     }:
         return NextAction("command", "run", parent_number)
     return NextAction("none")
-

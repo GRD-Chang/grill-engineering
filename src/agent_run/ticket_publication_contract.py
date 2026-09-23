@@ -186,7 +186,13 @@ def require_active_ticket_publication_authorization(
         acceptance,
         job,
         {
-            "base_sha": job["base_sha"],
+            "base_sha": (
+                job["ticket_integration"]["target_sha"]
+                if job.get("attempt_kind") == "ci_repair"
+                and isinstance(job.get("ticket_integration"), dict)
+                and job["ticket_integration"].get("head_sha") == job.get("candidate_sha")
+                else job["base_sha"]
+            ),
             "candidate_sha": job["candidate_sha"],
             "candidate_tree": persisted_tree,
             "effective_revision": job["effective_revision"],
