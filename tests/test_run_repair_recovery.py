@@ -468,14 +468,17 @@ def test_run_repair_rejects_a_same_named_foreign_ref_before_development(
     fixture.write_text(json.dumps(data), encoding="utf-8")
     agents = ScriptedRunAgents()
 
-    with pytest.raises(ValueError, match="foreign identity"):
-        RunAcceptanceEngine(
-            git=git,
-            states=states,
-            agents=agents,
-            github=FixtureGitHubPublisher(fixture, git),
-        ).accept(str(state["run_id"]))
+    result = RunAcceptanceEngine(
+        git=git,
+        states=states,
+        agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(str(state["run_id"]))
 
+    assert result["status"] == "ready_for_human"
+    job = result["run_acceptance"]["repair_job"]
+    assert job["blocked_reason"] == "remote_source_changed"
+    assert job["branch_publication_observation"]["observed_sha"] == "foreign"
     assert agents.development_requests == []
 
 @pytest.mark.parametrize(

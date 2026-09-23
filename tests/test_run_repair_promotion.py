@@ -527,7 +527,8 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     thread_id = job["development_thread_id"]
     assert run["phase"] == "repairing"
     assert job["phase"] == "candidate"
-    assert job["integrated_sha"] == git.resolve(str(state["run_branch"]))
+    merged_integrated_sha = job["integrated_sha"]
+    assert merged_integrated_sha == git.resolve(str(state["run_branch"]))
     merged_publication_sha = job["publication_sha"]
     assert run["repair_cycle"]["status"] == "active"
     assert run["repair_cycle"]["code_modification_attempts"] == 1
@@ -562,6 +563,13 @@ def test_run_repair_default_drift_after_merge_revalidates_same_cycle(
     assert second["run_acceptance"]["development_thread_history"] == expected_threads
     if candidate_requires_more_repair:
         assert second["run_acceptance"]["publication_sha"] != merged_publication_sha
+        assert git.is_ancestor(
+            merged_integrated_sha,
+            second["run_acceptance"]["publication_sha"],
+        )
+        assert git.resolve(
+            f'{second["run_acceptance"]["publication_sha"]}:run-repair.txt'
+        ) == git.resolve(f"{merged_integrated_sha}:run-repair.txt")
     else:
         assert second["run_acceptance"]["publication_sha"] == merged_publication_sha
     expected_additional_attempts = 1 if candidate_requires_more_repair else 0

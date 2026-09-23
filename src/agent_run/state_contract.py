@@ -201,6 +201,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         )
     require_completed_ticket_integration_records(state)
     _require_required_checks_observations(state)
+    _require_branch_publication_observations(state)
     _require_review_budget_windows(state)
     active_ticket = state.get("active_ticket_job")
     if isinstance(active_ticket, dict):
@@ -322,6 +323,60 @@ def _operator_gate_identity_waits_for_subject_validation(
         if retry["attempts"] != retry["limit"]:
             return True
     return False
+
+
+def _require_branch_publication_observations(state: dict[str, Any]) -> None:
+    jobs = [
+        job for job in state.get("ticket_jobs", {}).values() if isinstance(job, dict)
+    ]
+    parent = state.get("parent_job")
+    if isinstance(parent, dict):
+        jobs.append(parent)
+    run = state.get("run_acceptance")
+    if isinstance(run, dict) and isinstance(run.get("repair_job"), dict):
+        jobs.append(run["repair_job"])
+    for job in jobs:
+        parent_sha = job.get("publication_parent_sha")
+        if parent_sha is not None and (not isinstance(parent_sha, str) or not parent_sha):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid publication parent SHA"
+            )
+        prior_published_sha = job.get("publication_prior_published_sha")
+        if prior_published_sha is not None and (
+            not isinstance(prior_published_sha, str) or not prior_published_sha
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid prior published SHA"
+            )
+        observation = job.get("branch_publication_observation")
+        if observation is None:
+            continue
+        if not isinstance(observation, dict) or set(observation) not in (
+            {"branch", "expected_sha", "observed_sha"},
+            {"branch", "expected_sha", "observed_sha", "head_sha", "disposition"},
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid branch publication observation"
+            )
+        valid_identity = all(
+            isinstance(observation.get(key), str) and observation[key]
+            for key in ("branch", "expected_sha")
+        )
+        observed_sha = observation.get("observed_sha")
+        if not valid_identity or (
+            observed_sha is not None and not isinstance(observed_sha, str)
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid branch publication observation"
+            )
+        if "disposition" in observation and (
+            observation["disposition"] not in {"published", "already_published"}
+            or not isinstance(observation.get("head_sha"), str)
+            or not observation["head_sha"]
+        ):
+            raise IncompatibleRunStateError(
+                "incompatible_run_state: invalid branch publication result"
+            )
 
 
 def _require_required_checks_observations(state: dict[str, Any]) -> None:

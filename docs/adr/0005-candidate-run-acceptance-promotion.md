@@ -2,7 +2,7 @@
 
 <!-- status: accepted -->
 
-Run Acceptance 的对象固定为默认分支准确 head `D` 与 Run Branch 准确 head `R` 的预期合并结果，并覆盖完整 Parent Spec。Run Repair 先对 repair Candidate `C` 执行同范围的 Candidate Run Acceptance；仅当 Candidate、实际合入后的 Run tree、`D`、Parent、Graph 与 Ticket Completion 都严格一致时，Controller 才将该结论提升为正式 Run Acceptance。这样不对同一代码树重复派 Reviewer；任何边界漂移则重新验收。
+Run Acceptance 的对象固定为默认分支准确 head `D` 与 Run Branch 准确 head `R` 的预期合并结果，并覆盖完整 Parent Spec。Run Repair 先对 repair Candidate `C` 执行同范围的 Candidate Run Acceptance；仅当记录的 Repair base 与默认分支是必要祖先、Candidate 与发布及实际合入后的 Run tree、`D`、Parent、Graph 与 Ticket Completion 都严格一致时，Controller 才将该结论提升为正式 Run Acceptance。追加发布提交允许改变 Candidate 和 publication 的直接父列表；提升仍核验已记录的发布父节点与实际合并结果。这样不对同一代码树重复派 Reviewer；任何边界漂移则重新验收。
 
 ## Considered Options
 

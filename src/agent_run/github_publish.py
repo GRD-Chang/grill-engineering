@@ -8,6 +8,11 @@ from typing import Any
 from urllib.parse import quote
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
+from agent_run.branch_publication import (
+    BranchPublicationResult,
+    RemoteBranchChanged,
+    RemoteBranchObservation,
+)
 from agent_run.github import (
     GhGitHubReader,
     GitHubReadError,
@@ -50,7 +55,9 @@ class GhGitHubPublisher:
         if remote_sha in {expected_remote_sha, recovery_remote_sha}:
             return
         if remote_sha is not None:
-            raise GitError("Change ref has a foreign identity")
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, remote_sha)
+            )
         if expected_remote_sha != expected_base_sha:
             raise GitError("Change ref is missing after publication")
         created = self._write_command(
@@ -67,7 +74,9 @@ class GhGitHubPublisher:
             if observed == expected_base_sha:
                 return
             if observed is not None:
-                raise GitError("Change ref has a foreign identity")
+                raise RemoteBranchChanged(
+                    RemoteBranchObservation(branch, expected_remote_sha, observed)
+                )
             raise GitHubReadError(
                 "github_write_failed", created.stderr.strip() or "could not create Change ref"
             )
@@ -504,12 +513,17 @@ class GhGitHubPublisher:
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None:
-        current_remote_sha = self._remote_branch_sha(branch)
+    ) -> BranchPublicationResult:
+        observation = RemoteBranchObservation(
+            branch, expected_remote_sha, self._remote_branch_sha(branch)
+        )
+        current_remote_sha = observation.observed_sha
+        if not self.git.is_ancestor(expected_remote_sha, head_sha):
+            raise GitError("publication head does not descend from the observed source head")
         if current_remote_sha == head_sha:
-            return
-        if current_remote_sha != expected_remote_sha:
-            raise GitError("remote ticket branch drifted")
+            return BranchPublicationResult(observation, head_sha, "already_published")
+        if not observation.matches_expected:
+            raise RemoteBranchChanged(observation)
         arguments = [
             "git",
             "push",
@@ -521,15 +535,21 @@ class GhGitHubPublisher:
         if pushed.returncode != 0:
             observed = self._remote_branch_sha(branch)
             if observed == head_sha:
-                return
+                return BranchPublicationResult(observation, head_sha, "already_published")
             if observed != expected_remote_sha:
-                raise GitError("remote ticket branch drifted")
+                raise RemoteBranchChanged(
+                    RemoteBranchObservation(branch, expected_remote_sha, observed)
+                )
             raise GitHubReadError(
                 "github_write_failed",
                 pushed.stderr.strip() or "could not publish ticket branch",
             )
-        if self._remote_branch_sha(branch) != head_sha:
-            raise GitError("Ticket ref publication readback did not match intent")
+        observed = self._remote_branch_sha(branch)
+        if observed != head_sha:
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, head_sha, observed)
+            )
+        return BranchPublicationResult(observation, head_sha, "published")
 
     def verify_change_pr_before_publish(
         self,
@@ -540,6 +560,11 @@ class GhGitHubPublisher:
         expected_base_sha: str,
     ) -> None:
         pulls = self._change_prs(branch)
+        if not pulls and self._change_prs(branch, state="all"):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if len(pulls) > 1:
             raise GitHubReadError(
                 "ambiguous_change_pr", "more than one open Change PR exists"
@@ -579,6 +604,11 @@ class GhGitHubPublisher:
         expected_base_sha: str,
     ) -> int:
         pulls = self._change_prs(branch)
+        if not pulls and self._change_prs(branch, state="all"):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if len(pulls) > 1:
             raise GitHubReadError(
                 "ambiguous_change_pr", "more than one open Change PR exists"
@@ -675,7 +705,7 @@ class GhGitHubPublisher:
             )
         return remote.stdout.split()[0] if remote.stdout.strip() else None
 
-    def _change_prs(self, branch: str) -> list[object]:
+    def _change_prs(self, branch: str, *, state: str = "open") -> list[object]:
         owner = self.repository.split("/", 1)[0]
         pulls = self._json(
             "api",
@@ -683,11 +713,11 @@ class GhGitHubPublisher:
             "--method",
             "GET",
             "-f",
-            "state=open",
+            f"state={state}",
             "-f",
             f"head={owner}:{branch}",
             "-f",
-            "per_page=2",
+            "per_page=100" if state == "all" else "per_page=2",
         )
         if not isinstance(pulls, list):
             raise GitHubReadError("github_invalid_response", "PR list must be an array")

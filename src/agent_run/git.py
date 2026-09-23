@@ -576,6 +576,7 @@ class GitRepository:
         run_head_sha: str,
         default_head_sha: str,
         attempt: int,
+        published_sha: str | None = None,
         squash_candidate_sha: str | None = None,
         candidate_intent: dict[str, object] | None = None,
         expected_conflict_paths: tuple[str, ...] = (),
@@ -585,6 +586,7 @@ class GitRepository:
             run_head_sha=run_head_sha,
             default_head_sha=default_head_sha,
             attempt=attempt,
+            published_sha=published_sha,
             squash_candidate_sha=squash_candidate_sha,
             candidate_intent=candidate_intent,
             expected_conflict_paths=expected_conflict_paths,
@@ -612,13 +614,24 @@ class GitRepository:
         *,
         candidate_sha: str,
         base_sha: str,
+        published_sha: str | None = None,
         message: str,
     ) -> str:
         tree = self._resolve_in(checkout, f"{candidate_sha}^{{tree}}")
+        parents = [published_sha or base_sha]
+        if published_sha is not None and not self.is_ancestor(base_sha, published_sha):
+            parents = (
+                [base_sha]
+                if self.is_ancestor(published_sha, base_sha)
+                else [published_sha, base_sha]
+            )
+        # Candidate authority is checked by the Change Delivery acceptance
+        # record. Revalidation can produce the same accepted tree from a
+        # detached repair scene whose history does not contain the new base.
         current = self._resolve_in(checkout, "HEAD")
         if (
             self._resolve_in(checkout, "HEAD^{tree}") == tree
-            and self.commit_parents(current) == [base_sha]
+            and self.commit_parents(current) == parents
         ):
             current_message = self._run_in(
                 checkout, "cat-file", "commit", current
@@ -630,14 +643,11 @@ class GitRepository:
                 )
             ):
                 return current
+        parent_arguments = [
+            argument for parent in parents for argument in ("-p", parent)
+        ]
         created = self._run_in(
-            checkout,
-            "commit-tree",
-            tree,
-            "-p",
-            base_sha,
-            "-m",
-            message,
+            checkout, "commit-tree", tree, *parent_arguments, "-m", message
         )
         if created.returncode != 0:
             raise GitError(created.stderr.strip() or "could not create publication commit")
@@ -659,6 +669,7 @@ class GitRepository:
         candidate_sha: str,
         run_head_sha: str,
         default_head_sha: str,
+        published_sha: str | None = None,
         message: str,
     ) -> str:
         return self._integration_commit.create_merge_resolution_publication_commit(
@@ -666,6 +677,7 @@ class GitRepository:
             candidate_sha=candidate_sha,
             run_head_sha=run_head_sha,
             default_head_sha=default_head_sha,
+            published_sha=published_sha,
             message=message,
         )
 

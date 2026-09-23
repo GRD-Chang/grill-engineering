@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from agent_run.controller import Controller
+from agent_run.branch_publication import BranchPublicationResult
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader
@@ -84,9 +85,9 @@ def test_publication_reconciles_completed_push_only_with_matching_write_intent(
 
         def publish_branch(
             self, branch: str, head_sha: str, *, expected_remote_sha: str
-        ) -> None:
+        ) -> BranchPublicationResult:
             self.writes += 1
-            super().publish_branch(branch, head_sha, expected_remote_sha=expected_remote_sha)
+            return super().publish_branch(branch, head_sha, expected_remote_sha=expected_remote_sha)
 
     fixture = write_fixture(git_repo / "github.json", issues={"3": issue(3)})
     git = GitRepository(git_repo)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from agent_run.branch_publication import BranchPublicationResult
+
 
 class GitHubPublisher(Protocol):
     def delete_managed_branch(self, branch: str, *, expected_head_sha: str) -> None: ...
@@ -108,7 +110,7 @@ class GitHubPublisher(Protocol):
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None: ...
+    ) -> BranchPublicationResult: ...
 
     def verify_change_pr_before_publish(
         self,

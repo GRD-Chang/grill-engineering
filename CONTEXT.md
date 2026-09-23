@@ -536,7 +536,7 @@ _Avoid_: Publication Commit、远端 PR head、Agent 自行提交
 _Avoid_: 改写 Candidate 历史、为同一边界的每条 Finding 新开 worktree、复用旧 Validation Checkout、要求人工先还原文件、把可自动修复的 diff 收缩误报为 Human Blocker
 
 **Publication Commit（发布提交）**:
-Publisher 根据 Publication Artifact 保持候选 tree 不变，以 Run Branch 的有效 base 为父提交并使用 Agent 编写的语义 commit message 创建待发布提交。正常模式的发布权威输入是 Fresh Acceptance；Ticket 确定性兜底模式在 CI 尚未运行时由 Fallback Publication Receipt 只授权创建或更新 PR，不授权合入 Run Branch。Publisher 必须验证 Publication Commit 与对应记录绑定的 Candidate Commit tree 相同；随后 Hosted CI Gate 与 Published-Head Gate 将远端 PR head 绑定其准确 SHA。
+Publisher 根据 Publication Artifact 保持候选 tree 不变，并使用 Agent 编写的语义 commit message 创建待发布提交。首次发布以准确 base 为父；已发布源分支的后继提交以已记录的远端发布 head 为父，冲突 Run Repair 还保留默认分支祖先。Publisher 只用普通快进推送更新同一有效 PR；远端 head 意外变化时记录实际观测、保留本地 Candidate 并阻止覆盖。正常模式的发布权威输入是 Fresh Acceptance；Ticket 确定性兜底模式在 CI 尚未运行时由 Fallback Publication Receipt 只授权创建或更新 PR，不授权合入 Run Branch。Publisher 必须验证 Publication Commit 与对应记录绑定的 Candidate Commit tree 相同；随后 Hosted CI Gate 与 Published-Head Gate 将远端 PR head 绑定其准确 SHA，新 head 的 CI 与批准不能继承旧 SHA 结果。
 _Avoid_: Candidate Commit、机械 checkpoint、远端 PR head
 
 **Development Summary（开发摘要）**:

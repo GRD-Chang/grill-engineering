@@ -2298,6 +2298,20 @@ def test_failed_required_check_evidence_reaches_development_thread(
     assert ci_evidence["pr_number"] == publisher.pr_number
     assert ci_evidence["head_sha"]
     assert ci_evidence["result"] == "fail"
+    repaired_head = result["active_ticket_job"]["publication_sha"]
+    git = GitRepository(git_repo)
+    assert git.commit_parents(repaired_head) == [ci_evidence["head_sha"]]
+    assert git.is_ancestor(ci_evidence["head_sha"], repaired_head)
+    assert result["active_ticket_job"]["publication_parent_sha"] == ci_evidence["head_sha"]
+    assert result["active_ticket_job"]["publication_prior_published_sha"] == ci_evidence["head_sha"]
+    assert result["active_ticket_job"]["pr_number"] == publisher.pr_number
+    assert result["active_ticket_job"]["branch_publication_observation"] == {
+        "branch": result["active_ticket_job"]["ticket_branch"],
+        "expected_sha": ci_evidence["head_sha"],
+        "observed_sha": ci_evidence["head_sha"],
+        "head_sha": repaired_head,
+        "disposition": "published",
+    }
     assert result["active_ticket_job"]["required_checks_origin"] == ci_evidence
     assert result["active_ticket_job"]["deterministic_integration_record"][
         "required_checks_origin"
@@ -3883,6 +3897,9 @@ def test_publication_context_outage_waits_and_rechecks_base_before_resuming(
     assert completed["status"] == "ticket_completed"
     assert completed["active_ticket_job"]["pr_number"] == publisher.pr_number
     assert publisher.live_head != old_published_sha
+    assert GitRepository(git_repo).is_ancestor(
+        old_published_sha, completed["active_ticket_job"]["publication_sha"]
+    )
 
 
 def test_acceptance_repair_base_drift_rebuilds_without_stale_repair_input(

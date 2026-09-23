@@ -10,6 +10,7 @@ from typing import Any
 
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.branch_publication import BranchPublicationResult
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -272,6 +273,7 @@ class MergeResolutionFixture:
             "candidate_finding_default_drift_clean_replay_modify_conflict",
         }
         self.publication_default_drift = scenario == "publication_default_drift"
+        self.published_before_default_drift: str | None = None
         self.development_default_drift = scenario in {
             "development_default_drift",
             "development_default_drift_clean",
@@ -533,10 +535,16 @@ class MergeResolutionFixture:
             else self.default_head
         )
         assert self.git.commit_parents(candidate) == [self.run_head, accepted_default]
+        previous_publication = self.published_before_default_drift
         assert self.git.commit_parents(publication) == [
-            self.run_head,
+            previous_publication or self.run_head,
             accepted_default,
         ]
+        if self.publication_default_drift:
+            assert previous_publication is not None
+            assert self.git.is_ancestor(self.run_head, previous_publication)
+            assert self.git.is_ancestor(self.default_head, previous_publication)
+            assert self.git.is_ancestor(previous_publication, publication)
         assert self.git.commit_parents(integrated) == [self.run_head, publication]
         assert self.git.resolve(f"{candidate}^{{tree}}") == self.git.resolve(
             f"{integrated}^{{tree}}"
@@ -610,14 +618,16 @@ class PublicationDefaultDriftPublisher(FixtureGitHubPublisher):
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None:
-        super().publish_branch(
+    ) -> BranchPublicationResult:
+        result = super().publish_branch(
             branch,
             head_sha,
             expected_remote_sha=expected_remote_sha,
         )
         if not self.scenario.advanced_default_heads:
+            self.scenario.published_before_default_drift = head_sha
             self.scenario.advance_default()
+        return result
 
 def _git_output(checkout: Path, *args: str) -> str:
     return subprocess.run(

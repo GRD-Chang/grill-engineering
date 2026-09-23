@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Protocol
 
+from agent_run.commit_messages import commit_messages_match
 from agent_run.git_errors import GitError, GitIntegrityError
 
 
@@ -13,6 +14,8 @@ class GitCommitOperations(Protocol):
     def commit_parents(self, sha: str) -> list[str]: ...
 
     def commit_subject(self, sha: str) -> str: ...
+
+    def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool: ...
 
     def _resolve_in(self, directory: Path, reference: str) -> str: ...
 
@@ -34,6 +37,7 @@ class IntegrationRepairCommitGit:
         run_head_sha: str,
         default_head_sha: str,
         attempt: int,
+        published_sha: str | None = None,
         squash_candidate_sha: str | None = None,
         candidate_intent: dict[str, object] | None = None,
         expected_conflict_paths: tuple[str, ...] = (),
@@ -49,6 +53,13 @@ class IntegrationRepairCommitGit:
             )
         merge_head = self._git._resolve_in_optional(checkout, "MERGE_HEAD")
         allowed_boundary_heads = {run_head_sha}
+        if published_sha is not None:
+            # A previous publication may predate a default-branch advance. Its
+            # Run ancestry is stable; the new Candidate and publication below
+            # must instead carry the current default boundary.
+            if not self._git.is_ancestor(run_head_sha, published_sha):
+                raise GitError("published Repair head lacks the Run boundary ancestor")
+            allowed_boundary_heads.add(published_sha)
         if isinstance(squash_candidate_sha, str):
             allowed_boundary_heads.add(squash_candidate_sha)
         has_managed_merge_candidate = self._git.commit_parents(checkout_head) == [
@@ -111,7 +122,10 @@ class IntegrationRepairCommitGit:
             self._require_repaired_unmerged_paths(
                 checkout, expected_conflict_paths=expected_conflict_paths
             )
-        elif self._git.commit_parents(checkout_head) != [run_head_sha, default_head_sha]:
+        elif (
+            self._git.commit_parents(checkout_head) != [run_head_sha, default_head_sha]
+            and checkout_head != published_sha
+        ):
             raise GitError("Merge-resolution follow-up has a stale parent boundary")
         added = self._git._run_in(checkout, "add", "--all")
         if added.returncode != 0:
@@ -243,19 +257,35 @@ class IntegrationRepairCommitGit:
         candidate_sha: str,
         run_head_sha: str,
         default_head_sha: str,
+        published_sha: str | None = None,
         message: str,
     ) -> str:
-        """Rewrite only metadata while retaining the accepted tree and parents."""
+        """Keep the accepted tree while appending to the published source history."""
 
         if self._git.commit_parents(candidate_sha) != [run_head_sha, default_head_sha]:
             raise GitError("Merge-resolution Candidate parents do not match its boundary")
         tree = self._git._resolve_in(checkout, f"{candidate_sha}^{{tree}}")
+        parent = published_sha or run_head_sha
+        if not self._git.is_ancestor(run_head_sha, parent):
+            raise GitError("published Repair head no longer descends from the Run boundary")
+        current = self._git._resolve_in(checkout, "HEAD")
+        if (
+            self._git._resolve_in(checkout, "HEAD^{tree}") == tree
+            and self._git.commit_parents(current) == [parent, default_head_sha]
+        ):
+            current_message = self._git._run_in(
+                checkout, "cat-file", "commit", current
+            )
+            if current_message.returncode == 0 and commit_messages_match(
+                current_message.stdout.partition("\n\n")[2], message
+            ):
+                return current
         created = self._git._run_in(
             checkout,
             "commit-tree",
             tree,
             "-p",
-            run_head_sha,
+            parent,
             "-p",
             default_head_sha,
             "-m",
@@ -275,7 +305,7 @@ class IntegrationRepairCommitGit:
             )
         if (
             self._git._resolve_in(checkout, f"{publication}^{{tree}}") != tree
-            or self._git.commit_parents(publication) != [run_head_sha, default_head_sha]
+            or self._git.commit_parents(publication) != [parent, default_head_sha]
         ):
             raise GitError("Merge-resolution publication changed the accepted boundary")
         return publication

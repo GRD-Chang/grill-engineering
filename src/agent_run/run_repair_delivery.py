@@ -205,6 +205,7 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
                 run_head_sha=str(job["base_sha"]),
                 default_head_sha=str(job["default_base_sha"]),
                 attempt=attempt,
+                published_sha=job.get("published_sha"),
                 **commit_options,
             )
         else:
@@ -258,12 +259,14 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
                 candidate_sha=str(job["candidate_sha"]),
                 run_head_sha=str(job["base_sha"]),
                 default_head_sha=str(job["default_base_sha"]),
+                published_sha=job.get("published_sha"),
                 message=message,
             )
         return self.owner.git.create_publication_commit(
             checkout,
             candidate_sha=str(job["candidate_sha"]),
             base_sha=str(job["base_sha"]),
+            published_sha=job.get("published_sha"),
             message=message,
         )
 

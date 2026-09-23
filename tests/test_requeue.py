@@ -15,6 +15,7 @@ from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
 from agent_run.cli_surface import _command_is_ready
 from agent_run.git import GitRepository
+from agent_run.github import GitHubReadError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.requeue import RequeueError, requeue_change_job
 from agent_run.requeue import close_superseded_pull_request, remove_superseded_worktree
@@ -76,7 +77,7 @@ def test_fixture_ticket_pr_rejects_same_sha_on_wrong_base_branch(
         )
 
 
-def test_fixture_closed_ticket_pr_does_not_block_new_publication(
+def test_fixture_closed_ticket_pr_blocks_new_publication(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(git_repo / "github.json", issues={"7": issue(7)})
@@ -102,30 +103,26 @@ def test_fixture_closed_ticket_pr_does_not_block_new_publication(
         expected_base_sha=base_sha,
     )
     publisher.data["delivery"]["pull_requests"][0]["state"] = "CLOSED"
-    publisher.verify_ticket_pr_before_publish(
-        branch=branch,
-        base_branch="main",
-        expected_head_sha=base_sha,
-        expected_base_sha=base_sha,
-    )
-    publisher.publish_branch(
-        branch, "new-publication-sha", expected_remote_sha=base_sha
-    )
-    publisher.ensure_ticket_pr(
-        branch=branch,
-        base_branch="main",
-        title="new title",
-        body="new body",
-        primary_ticket=7,
-        expected_head_sha="new-publication-sha",
-        expected_base_sha=base_sha,
-    )
-
+    with pytest.raises(GitHubReadError, match="Existing Change PR is no longer open"):
+        publisher.verify_ticket_pr_before_publish(
+            branch=branch,
+            base_branch="main",
+            expected_head_sha=base_sha,
+            expected_base_sha=base_sha,
+        )
+    with pytest.raises(GitHubReadError, match="Existing Change PR is no longer open"):
+        publisher.ensure_ticket_pr(
+            branch=branch,
+            base_branch="main",
+            title="new title",
+            body="new body",
+            primary_ticket=7,
+            expected_head_sha=base_sha,
+            expected_base_sha=base_sha,
+        )
     pulls = publisher.data["delivery"]["pull_requests"]
-    assert [(pull["state"], pull["head_sha"]) for pull in pulls] == [
-        ("CLOSED", base_sha),
-        ("OPEN", "new-publication-sha"),
-    ]
+    assert [(pull["state"], pull["head_sha"]) for pull in pulls] == [("CLOSED", base_sha)]
+    assert publisher.data["delivery"]["published_branches"][branch] == base_sha
 
 
 def test_ticket_ref_recovery_preserves_a_publish_intent_before_its_push(

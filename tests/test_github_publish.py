@@ -2280,7 +2280,7 @@ def test_ticket_pr_recovery_only_reuses_open_prs(
 
     def fake_json(*arguments: str) -> object:
         reads.append(arguments)
-        return [] if len(reads) == 1 else [exact_pull]
+        return [exact_pull] if writes else []
 
     def fake_require(*arguments: str) -> None:
         writes.append(arguments)
@@ -2300,8 +2300,33 @@ def test_ticket_pr_recovery_only_reuses_open_prs(
 
     assert reads[0][:2] == ("api", "repos/example/project/pulls")
     assert "state=open" in reads[0]
+    assert any("state=all" in read for read in reads)
     assert writes[0][:2] == ("pr", "create")
     assert number == 12
+
+
+def test_closed_change_pr_is_not_replaced(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    writes: list[tuple[str, ...]] = []
+
+    def fake_json(*arguments: str) -> object:
+        return [{"number": 12, "state": "closed"}] if "state=all" in arguments else []
+
+    monkeypatch.setattr(publisher, "_json", fake_json)
+    monkeypatch.setattr(publisher, "_require", lambda *args: writes.append(args))
+    authority = {
+        "branch": "ticket-3",
+        "base_branch": "agent-run/run-1",
+        "expected_head_sha": "a" * 40,
+        "expected_base_sha": "b" * 40,
+    }
+    with pytest.raises(GitHubReadError, match="no longer open"):
+        publisher.verify_change_pr_before_publish(**authority)
+    with pytest.raises(GitHubReadError, match="no longer open"):
+        publisher.ensure_change_pr(**authority, title="update", body="update")
+    assert writes == []
 
 
 def test_agent_run_status_comment_is_updated_in_place(

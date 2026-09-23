@@ -392,6 +392,29 @@ class RunRepairPromotion:
             if published_as_merge_resolution
             else [published_base]
         )
+        publication_sha = str(published_publication)
+        publication_parent = (
+            job.get("publication_parent_sha")
+            if not isinstance(revalidation_merge, dict)
+            else None
+        )
+        publication_parents = self.owner.git.commit_parents(publication_sha)
+        publication_boundary_valid = (
+            self.owner.git.is_ancestor(str(published_base), publication_sha)
+            and self.owner.git.is_ancestor(
+                str(job.get("publication_prior_published_sha", published_base)),
+                publication_sha,
+            )
+            and self.owner.git.resolve(f"{publication_sha}^{{tree}}")
+            == self.owner.git.resolve(f"{published_candidate}^{{tree}}")
+            and (
+                publication_parent is None
+                or (
+                    bool(publication_parents)
+                    and publication_parents[0] == publication_parent
+                )
+            )
+        )
         if (
             live.get("state") != "MERGED"
             or not isinstance(integrated, str)
@@ -406,13 +429,16 @@ class RunRepairPromotion:
                 )
             )
             or live.get("integrated_parents") != expected_parents
+            or not publication_boundary_valid
             or (
                 published_as_merge_resolution
                 and (
-                    self.owner.git.commit_parents(str(published_candidate))
-                    != [published_base, published_default]
-                    or self.owner.git.commit_parents(str(published_publication))
-                    != [published_base, published_default]
+                    not self.owner.git.is_ancestor(
+                        str(published_default), str(published_candidate)
+                    )
+                    or not self.owner.git.is_ancestor(
+                        str(published_default), publication_sha
+                    )
                     or not self.owner.git.is_ancestor(str(published_default), integrated)
                 )
             )

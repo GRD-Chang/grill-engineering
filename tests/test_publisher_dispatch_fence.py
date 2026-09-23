@@ -108,13 +108,17 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
 
 @pytest.mark.parametrize("revoke_after_write", [False, True])
 def test_git_dispatch_rechecks_ownership_but_inflight_readback_is_allowed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revoke_after_write: bool
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, revoke_after_write: bool
 ) -> None:
-    publisher, control, task, identity, states, _state = _publisher(tmp_path)
+    publisher, control, task, identity, states, _state = _publisher(git_repo)
     writes = []
     reads = []
-    head = "a" * 40
-    previous = "b" * 40
+    previous = GitRepository(git_repo).resolve("HEAD")
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "publication"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    head = GitRepository(git_repo).resolve("HEAD")
 
     def revoke():
         control.claim_control_action(task, kind="stop", payload={}, run_id="run-156", state_dir=states.root)
@@ -194,6 +198,7 @@ def test_pr_creation_allows_explicit_get_readback_after_stop(
 ) -> None:
     publisher, control, task, _identity, states, _state = _publisher(tmp_path)
     commands = []
+    created = False
     head, base = "a" * 40, "b" * 40
     pull = {
         "number": 5,
@@ -202,13 +207,15 @@ def test_pr_creation_allows_explicit_get_readback_after_stop(
     }
 
     def dispatch(command, **kwargs):
+        nonlocal created
         commands.append(command)
         if command[1:3] == ["pr", "create"]:
             control.claim_control_action(task, kind="stop", payload={}, run_id="run-156", state_dir=states.root)
+            created = True
             result = ""
         else:
             assert command[1] == "api" and command[command.index("--method") + 1] == "GET"
-            result = json.dumps([] if len(commands) == 1 else [pull])
+            result = json.dumps([pull] if created else [])
         return subprocess.CompletedProcess(command, 0, result, "")
 
     def unexpected_retry(*args, **kwargs):
@@ -220,4 +227,4 @@ def test_pr_creation_allows_explicit_get_readback_after_stop(
         branch="topic", base_branch="main", title="change", body="description",
         expected_head_sha=head, expected_base_sha=base,
     ) == 5
-    assert len(commands) == 3
+    assert len(commands) == 4

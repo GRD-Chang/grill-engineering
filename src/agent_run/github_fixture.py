@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
+from agent_run.branch_publication import (
+    BranchPublicationResult,
+    RemoteBranchChanged,
+    RemoteBranchObservation,
+)
 from agent_run.github import (
     GitHubReadError,
     MergeOutcomeUnknownError,
@@ -273,7 +278,9 @@ class FixtureGitHubPublisher:
                 raise ValueError("fixture Ticket ref is missing after publication")
             published[branch] = expected_base_sha
         elif current not in {expected_remote_sha, recovery_remote_sha}:
-            raise ValueError("fixture Ticket ref has a foreign identity")
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, current)
+            )
         self._save()
         self._crash_once("ensure_ticket_branch")
 
@@ -318,7 +325,9 @@ class FixtureGitHubPublisher:
                 raise ValueError("fixture Change ref is missing after publication")
             published[branch] = expected_base_sha
         elif current not in {expected_remote_sha, recovery_remote_sha}:
-            raise ValueError("fixture Change ref has a foreign identity")
+            raise RemoteBranchChanged(
+                RemoteBranchObservation(branch, expected_remote_sha, current)
+            )
         self._save()
         self._crash_once("ensure_change_branch")
         self._crash_once("ensure_ticket_branch")
@@ -727,12 +736,17 @@ class FixtureGitHubPublisher:
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None:
+    ) -> BranchPublicationResult:
         published = _mutable_mapping(self._delivery(), "published_branches")
-        if published.get(branch) == head_sha:
-            return
-        if published.get(branch) != expected_remote_sha:
-            raise ValueError("fixture remote ticket branch drifted")
+        observation = RemoteBranchObservation(
+            branch, expected_remote_sha, published.get(branch)
+        )
+        if not self.git.is_ancestor(expected_remote_sha, head_sha):
+            raise GitError("publication head does not descend from the observed source head")
+        if observation.observed_sha == head_sha:
+            return BranchPublicationResult(observation, head_sha, "already_published")
+        if not observation.matches_expected:
+            raise RemoteBranchChanged(observation)
         published[branch] = head_sha
         for pull in _mutable_list(self._delivery(), "pull_requests"):
             if (
@@ -744,6 +758,7 @@ class FixtureGitHubPublisher:
         self._save()
         self._inject_revision_drift("publish_branch")
         self._crash_once("publish_branch")
+        return BranchPublicationResult(observation, head_sha, "published")
 
     def verify_ticket_pr_before_publish(
         self,
@@ -764,6 +779,16 @@ class FixtureGitHubPublisher:
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Ticket PRs")
+        if not matching and any(
+            isinstance(pull, dict)
+            and pull.get("branch") == branch
+            and pull.get("state") != "OPEN"
+            for pull in _mutable_list(self._delivery(), "pull_requests")
+        ):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if matching:
             pull = matching[0]
             if (
@@ -810,6 +835,16 @@ class FixtureGitHubPublisher:
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Change PRs")
+        if not matching and any(
+            isinstance(pull, dict)
+            and pull.get("branch") == branch
+            and pull.get("state") != "OPEN"
+            for pull in pulls
+        ):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if matching:
             pull = matching[0]
             if (
@@ -865,6 +900,16 @@ class FixtureGitHubPublisher:
         ]
         if len(matching) > 1:
             raise ValueError("fixture contains duplicate Ticket PRs")
+        if not matching and any(
+            isinstance(pr, dict)
+            and pr.get("branch") == branch
+            and pr.get("state") != "OPEN"
+            for pr in pulls
+        ):
+            raise GitHubReadError(
+                "change_pr_closed_unmerged",
+                "Existing Change PR is no longer open; refusing to create a replacement",
+            )
         if matching:
             pull = matching[0]
             if (

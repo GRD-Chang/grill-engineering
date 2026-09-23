@@ -2019,7 +2019,7 @@ def test_parent_only_cli_rejects_same_named_foreign_ref_before_development(
     )
 
     assert failed.returncode == 2
-    assert stdout_json(failed)["status"] == "execution_failed"
+    assert stdout_json(failed)["status"] == "blocked"
     delivery = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]
     assert delivery.get("pull_requests", []) == []
 

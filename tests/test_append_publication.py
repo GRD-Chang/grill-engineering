@@ -1,0 +1,187 @@
+"""A later publication keeps the source history used by the existing PR."""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from agent_run import github_publish
+from agent_run.branch_publication import RemoteBranchChanged
+from agent_run.git import GitError, GitRepository
+from agent_run.github_publish import GhGitHubPublisher
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _candidate(root: Path, name: str, contents: str) -> str:
+    (root / name).write_text(contents, encoding="utf-8")
+    _git(root, "add", name)
+    _git(root, "commit", "-m", name)
+    return _git(root, "rev-parse", "HEAD")
+
+
+def test_later_publication_is_fast_forward_and_failed_rewrite_preserves_remote(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
+    _git(git_repo, "remote", "add", "origin", str(remote))
+    base = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "push", "origin", f"{base}:refs/heads/ticket")
+    git = GitRepository(git_repo)
+    publisher = GhGitHubPublisher("example/project", git)
+
+    first_candidate = _candidate(git_repo, "first.txt", "first\n")
+    first = git.create_publication_commit(
+        git_repo, candidate_sha=first_candidate, base_sha=base, message="first"
+    )
+    assert publisher.publish_branch(
+        "ticket", first, expected_remote_sha=base
+    ).disposition == "published"
+
+    second_candidate = _candidate(git_repo, "second.txt", "second\n")
+    second = git.create_publication_commit(
+        git_repo, candidate_sha=second_candidate, base_sha=base,
+        published_sha=first, message="second",
+    )
+    assert git.commit_parents(second) == [first]
+    result = publisher.publish_branch("ticket", second, expected_remote_sha=first)
+    assert result.observation.observed_sha == first
+    assert result.disposition == "published"
+    assert publisher.publish_branch(
+        "ticket", second, expected_remote_sha=first
+    ).disposition == "already_published"
+
+    _git(git_repo, "reset", "--hard", base)
+    rewritten = _candidate(git_repo, "rewrite.txt", "rewrite\n")
+    with pytest.raises(GitError, match="does not descend"):
+        publisher.publish_branch("ticket", rewritten, expected_remote_sha=second)
+    assert _git(git_repo, "ls-remote", "origin", "refs/heads/ticket").split()[0] == second
+
+
+def test_unexpected_remote_rewrite_returns_observed_head_without_overwrite(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
+    _git(git_repo, "remote", "add", "origin", str(remote))
+    base = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "push", "origin", f"{base}:refs/heads/ticket")
+    git = GitRepository(git_repo)
+    publisher = GhGitHubPublisher("example/project", git)
+    first_candidate = _candidate(git_repo, "first.txt", "first\n")
+    first = git.create_publication_commit(
+        git_repo, candidate_sha=first_candidate, base_sha=base, message="first"
+    )
+    publisher.publish_branch("ticket", first, expected_remote_sha=base)
+    second_candidate = _candidate(git_repo, "second.txt", "second\n")
+    second = git.create_publication_commit(
+        git_repo, candidate_sha=second_candidate, base_sha=base,
+        published_sha=first, message="second",
+    )
+
+    collaborator = tmp_path / "collaborator"
+    _git(tmp_path, "clone", str(remote), str(collaborator))
+    _git(collaborator, "push", "--force", "origin", f"{base}:refs/heads/ticket")
+    with pytest.raises(RemoteBranchChanged) as raised:
+        publisher.publish_branch("ticket", second, expected_remote_sha=first)
+    assert raised.value.observation.observed_sha == base
+    assert _git(git_repo, "ls-remote", "origin", "refs/heads/ticket").split()[0] == base
+
+
+@pytest.mark.parametrize("remote_change", ["rewind", "delete", "advance"])
+def test_remote_change_between_read_and_push_preserves_collaborator_ref(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote_change: str
+) -> None:
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "clone", "--bare", str(git_repo), str(remote))
+    _git(git_repo, "remote", "add", "origin", str(remote))
+    base = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "push", "origin", f"{base}:refs/heads/ticket")
+    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    first = _candidate(git_repo, "first.txt", "first\n")
+    publisher.publish_branch("ticket", first, expected_remote_sha=base)
+    next_head = _candidate(git_repo, "next.txt", "next\n")
+
+    collaborator = tmp_path / "collaborator"
+    _git(tmp_path, "clone", str(remote), str(collaborator))
+    if remote_change == "advance":
+        _git(collaborator, "config", "user.name", "Collaborator")
+        _git(collaborator, "config", "user.email", "collaborator@example.invalid")
+        _git(collaborator, "checkout", "--detach", first)
+        collaborator_head = _candidate(collaborator, "collaborator.txt", "kept\n")
+    else:
+        collaborator_head = base if remote_change == "rewind" else None
+
+    actual_write = github_publish.run_write_command
+    pushes = 0
+
+    def change_before_push(arguments: list[str], **kwargs: object):
+        nonlocal pushes
+        pushes += 1
+        assert pushes == 1
+        if remote_change == "delete":
+            _git(collaborator, "push", "origin", ":refs/heads/ticket")
+        else:
+            force = ("--force",) if remote_change == "rewind" else ()
+            _git(collaborator, "push", *force, "origin", f"{collaborator_head}:refs/heads/ticket")
+        return actual_write(arguments, **kwargs)
+
+    monkeypatch.setattr(github_publish, "run_write_command", change_before_push)
+    with pytest.raises(RemoteBranchChanged) as raised:
+        publisher.publish_branch("ticket", next_head, expected_remote_sha=first)
+    assert pushes == 1
+    assert raised.value.observation.observed_sha == collaborator_head
+    remote_ref = _git(git_repo, "ls-remote", "origin", "refs/heads/ticket")
+    assert (remote_ref.split()[0] if remote_ref else None) == collaborator_head
+
+
+def test_merge_resolution_publication_keeps_prior_source_and_default_ancestors(
+    git_repo: Path
+) -> None:
+    git = GitRepository(git_repo)
+    base = _git(git_repo, "rev-parse", "HEAD")
+    default = _candidate(git_repo, "default.txt", "default\n")
+    tree = _git(git_repo, "rev-parse", f"{default}^{{tree}}")
+    first_candidate = _git(
+        git_repo, "commit-tree", tree, "-p", base, "-p", default, "-m", "resolve"
+    )
+    first = git.create_merge_resolution_publication_commit(
+        git_repo, candidate_sha=first_candidate, run_head_sha=base,
+        default_head_sha=default, message="first",
+    )
+    (git_repo / "repair.txt").write_text("repair\n", encoding="utf-8")
+    _git(git_repo, "add", "repair.txt")
+    repaired_tree = _git(git_repo, "write-tree")
+    second_candidate = _git(
+        git_repo, "commit-tree", repaired_tree, "-p", base, "-p", default,
+        "-m", "resolve again",
+    )
+    second = git.create_merge_resolution_publication_commit(
+        git_repo, candidate_sha=second_candidate, run_head_sha=base,
+        default_head_sha=default, published_sha=first, message="second",
+    )
+    assert git.commit_parents(second) == [first, default]
+    assert git.is_ancestor(first, second)
+    assert git.is_ancestor(default, second)
+    assert git.resolve(f"{second}^{{tree}}") == git.resolve(
+        f"{second_candidate}^{{tree}}"
+    )
+    (git_repo / "followup.txt").write_text("followup\n", encoding="utf-8")
+    third_candidate = git.commit_merge_resolution_candidate(
+        git_repo, run_head_sha=base, default_head_sha=default,
+        published_sha=second, attempt=3,
+    )
+    assert isinstance(third_candidate, str)
+    third = git.create_merge_resolution_publication_commit(
+        git_repo, candidate_sha=third_candidate, run_head_sha=base,
+        default_head_sha=default, published_sha=second, message="third",
+    )
+    assert git.commit_parents(third) == [second, default]
+    assert git.is_ancestor(first, third)

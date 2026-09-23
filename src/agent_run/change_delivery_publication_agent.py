@@ -159,9 +159,11 @@ def publication(
         "pr_title": publication.pr_title,
         "pr_body_markdown": publication.pr_body_markdown,
     }
+    publication_parent = str(job.get("published_sha", job["base_sha"]))
     sha = stage.publisher.create_publication_commit(
         checkout, job, publication.commit_message
     )
+    actual_parent = stage.git.commit_parents(sha)[0]
     close_semantic_attempt(
         job,
         semantic_attempt,
@@ -173,6 +175,8 @@ def publication(
         {
             "publication": publication_result,
             "publication_sha": sha,
+            "publication_parent_sha": actual_parent,
+            "publication_prior_published_sha": publication_parent,
             "phase": "publishing",
         }
     )

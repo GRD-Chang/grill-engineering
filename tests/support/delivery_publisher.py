@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from agent_run.git import GitRepository
+from agent_run.branch_publication import BranchPublicationResult, RemoteBranchObservation
 
 
 class ScriptedPublisher:
@@ -69,12 +70,16 @@ class ScriptedPublisher:
         head_sha: str,
         *,
         expected_remote_sha: str,
-    ) -> None:
+    ) -> BranchPublicationResult:
+        observation = RemoteBranchObservation(
+            branch, expected_remote_sha, self.live_head or expected_remote_sha
+        )
         if self.live_head == head_sha:
-            return
+            return BranchPublicationResult(observation, head_sha, "already_published")
         if self.live_head not in {None, expected_remote_sha}:
             raise ValueError("scripted remote ticket branch drifted")
         self.live_head = head_sha
+        return BranchPublicationResult(observation, head_sha, "published")
 
     def verify_ticket_pr_before_publish(
         self,
@@ -325,4 +330,3 @@ def _tree(repository: Path, sha: str) -> str:
         capture_output=True,
         check=True,
     ).stdout.strip()
-

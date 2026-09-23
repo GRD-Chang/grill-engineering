@@ -197,9 +197,11 @@ class CandidateRunAcceptance:
     ) -> None:
         if not uses_merge_resolution(job):
             return
-        expected = [str(job["base_sha"]), str(job["default_base_sha"])]
-        if self.git.commit_parents(candidate_sha) != expected:
-            raise GitError("Merge-resolution Candidate parents do not match its boundary")
+        if not (
+            self.git.is_ancestor(str(job["base_sha"]), candidate_sha)
+            and self.git.is_ancestor(str(job["default_base_sha"]), candidate_sha)
+        ):
+            raise GitError("Merge-resolution Candidate lacks a required boundary ancestor")
 
     def _default_head(self, state: dict[str, Any]) -> str:
         return self.default_head_sha or str(_mapping(state, "base")["sha"])

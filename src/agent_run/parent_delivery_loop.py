@@ -259,6 +259,7 @@ class ParentDeliveryPublisher(ChangeDeliveryPublisher):
             checkout,
             candidate_sha=str(job["candidate_sha"]),
             base_sha=str(job["base_sha"]),
+            published_sha=job.get("published_sha"),
             message=message,
         )
 

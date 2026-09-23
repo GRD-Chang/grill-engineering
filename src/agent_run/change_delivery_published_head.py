@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
+from dataclasses import asdict
 from typing import Any, Callable, Protocol
 
 from agent_run.change_delivery_branches import ensure_linked_branch_display
+from agent_run.branch_publication import RemoteBranchChanged
 from agent_run.change_delivery_contracts import (
     ChangeDeliveryAdapter,
     ChangeDeliveryPublisher,
@@ -246,18 +248,30 @@ def publish_and_merge(
         job["ticket_write_intent"] = publish_intent
         stage.save(state)
     if not observed_published:
-        exhausted, _ = _publication_operation(
-            stage,
-            state,
-            job,
-            lambda: stage.github.publish_branch(
-                branch,
-                str(job["publication_sha"]),
-                expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
-            ),
-        )
+        try:
+            exhausted, publish_result = _publication_operation(
+                stage,
+                state,
+                job,
+                lambda: stage.github.publish_branch(
+                    branch,
+                    str(job["publication_sha"]),
+                    expected_remote_sha=str(job.get("published_sha", job["base_sha"])),
+                ),
+            )
+        except RemoteBranchChanged as error:
+            job["branch_publication_observation"] = asdict(error.observation)
+            return stage._block(
+                state, job, "remote_source_changed",
+                "Remote source branch changed after publication preparation; local Candidate preserved",
+            )
         if exhausted:
             return True
+        job["branch_publication_observation"] = {
+            **asdict(publish_result.observation),
+            "head_sha": publish_result.head_sha,
+            "disposition": publish_result.disposition,
+        }
     job.pop("ticket_write_intent", None)
     job["published_sha"] = str(job["publication_sha"])
     stage.save(state)

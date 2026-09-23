@@ -53,7 +53,7 @@ def test_publication_read_outage_preserves_work_through_bounded_pause(
                 raise GitHubReadError("github_timeout", "GitHub command timed out")
             return super().verify_ticket_pr_before_publish(**kwargs)
 
-        def publish_branch(self, *args: Any, **kwargs: Any) -> None:
+        def publish_branch(self, *args: Any, **kwargs: Any) -> Any:
             if failure_point == "publish" and self.offline:
                 raise GitHubReadError("github_timeout", "GitHub command timed out")
             return super().publish_branch(*args, **kwargs)
@@ -178,7 +178,24 @@ def test_publication_result_survives_read_timeout_before_local_commit(
 def test_push_response_loss_uses_remote_facts_before_retrying(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, readback: str,
 ) -> None:
-    reads = ["old", readback]
+    old_sha = GitRepository(git_repo).resolve("HEAD")
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "publication"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    new_sha = GitRepository(git_repo).resolve("HEAD")
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "foreign"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    foreign_sha = GitRepository(git_repo).resolve("HEAD")
+    reads = [old_sha, {
+        "old": old_sha,
+        "new": new_sha,
+        "foreign": foreign_sha,
+        "absent": "absent",
+        "unavailable": "unavailable",
+    }[readback]]
     writes: list[list[str]] = []
 
     def read(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -197,18 +214,19 @@ def test_push_response_loss_uses_remote_facts_before_retrying(
     monkeypatch.setattr("agent_run.github_publish.run_write_command", write)
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
     if readback == "new":
-        publisher.publish_branch("ticket", "new", expected_remote_sha="old")
+        result = publisher.publish_branch("ticket", new_sha, expected_remote_sha=old_sha)
+        assert result.disposition == "already_published"
     elif readback in {"foreign", "absent"}:
-        with pytest.raises(GitError, match="drifted"):
-            publisher.publish_branch("ticket", "new", expected_remote_sha="old")
+        with pytest.raises(GitError, match="changed"):
+            publisher.publish_branch("ticket", new_sha, expected_remote_sha=old_sha)
     else:
         with pytest.raises(GitHubReadError) as caught:
-            publisher.publish_branch("ticket", "new", expected_remote_sha="old")
+            publisher.publish_branch("ticket", new_sha, expected_remote_sha=old_sha)
         assert caught.value.code == (
             "github_write_failed" if readback == "old" else "github_read_failed"
         )
     assert len(writes) == 1
-    assert "--force-with-lease=refs/heads/ticket:old" in writes[0]
+    assert f"--force-with-lease=refs/heads/ticket:{old_sha}" in writes[0]
 
 
 @pytest.mark.parametrize("subject", ["change", "run"])
