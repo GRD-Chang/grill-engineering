@@ -43,7 +43,7 @@ jobs:
             code:
               - '**'
               - '!*.md'
-              - '!docs/**/*.{md,png,jpg,jpeg,svg,gif,webp}'
+              - '!docs/**/*.{md,html,png,jpg,jpeg,svg,gif,webp}'
 
       - name: Report lightweight validation
         if: steps.changes.outcome == 'success' && steps.changes.outputs.code == 'false'
