@@ -204,13 +204,23 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     ) == "inner_exhausted"
     run.update({
         "phase": "ready_for_human", "blocked_reason": "ci_inner_budget_exhausted",
-        "ci_failed_evidence": {"checks": [{"bucket": "fail"}]},
     })
+    failed_observation = {
+        "pr_number": 1, "head_sha": failed_head, "result": "fail",
+        "checks": [{
+            "bucket": "fail", "workflow": "fixture-ci",
+            "name": "fixture-required-check", "link": "https://example.invalid/checks/fixture",
+        }],
+    }
     run["repair_job"] = {
         "phase": "blocked",
         "blocked_reason": "ci_inner_budget_exhausted",
         "escalation_code": "ci_inner_budget_exhausted",
         "repair_mode": "squash",
+        "repair_source": "acceptance",
+        "pr_number": 1,
+        "publication_sha": failed_head,
+        "required_checks_origin": failed_observation,
         "policy_snapshot": deepcopy(run["policy_snapshot"]),
         "review_budget": deepcopy(run["review_budget"]),
         "review_budget_history": deepcopy(run["review_budget_history"]),
@@ -237,14 +247,17 @@ def test_run_ci_resume_renews_only_the_exhausted_inner_window(git_repo: Path) ->
     assert resumed_run["review_budget"] == review_before
     assert resumed_run["integration_resync"] == resync_before
     assert resumed_run["phase"] == "repairing"
-    assert resumed_run["repair_request"]["repair_source"] == "required_checks"
+    assert "repair_request" not in resumed_run
     assert resumed["run_publication"]["phase"] == "stale"
     assert _public_ci_recovery(resumed) == {
         "outer_window": 1, "rounds_used": 1, "rounds_limit": 3,
         "inner_window": 2, "repairs_used": 0, "repairs_limit": 3,
         "review_required": True, "checkpoint_reason": None,
         "failure_head": resumed_run["ci_recovery"]["failure_head"],
-        "failed_checks": [],
+        "failed_checks": [{
+            "workflow": "fixture-ci", "name": "fixture-required-check",
+            "link": "https://example.invalid/checks/fixture",
+        }],
     }
     persisted = states.load_current_run(str(state["run_id"]))
     assert persisted is not None

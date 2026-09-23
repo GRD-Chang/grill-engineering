@@ -604,6 +604,12 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         job, state_snapshot=state.get("policy_snapshot")
     )
     candidate_validation_status = _candidate_validation_status(job)
+    ordinary_budget = job.get("review_budget")
+    ordinary_modifications = (
+        ordinary_budget.get("development_attempts", 0)
+        if isinstance(ordinary_budget, dict)
+        else 0
+    )
     return {
         # Keep ``generation`` and ``phase`` as compatibility aliases while
         # exposing each lifecycle dimension under an unambiguous public name.
@@ -616,7 +622,7 @@ def _run_repair_status(state: dict[str, object]) -> dict[str, object] | None:
         "candidate_validation_phase": candidate_validation_status,
         "candidate_validation_status": candidate_validation_status,
         "cycle_status": cycle.get("status"),
-        "code_modification_attempts": cycle.get("code_modification_attempts", 0),
+        "code_modification_attempts": ordinary_modifications,
         "code_modification_limit": policy.development_limit,
         "validation_attempts": cycle.get("validation_attempts", 0),
         "candidate_sha": job.get("candidate_sha"),

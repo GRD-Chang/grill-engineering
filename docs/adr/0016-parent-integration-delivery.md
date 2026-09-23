@@ -14,6 +14,8 @@ Publisher 保留已发布源分支的祖先关系，以准确远端 head 为 lea
 
 可修复的 Required Checks 失败由每个交付对象独立的 CI 恢复额度处理：默认外层三轮、每轮最多三次开发修复。Ticket 首轮只允许一次修复；本轮使用准确旧发布授权、失败检查证据和新 Candidate 绑定的窄发布收据，不伪造 Reviewer 通过。Ticket 后续轮次与两种 Parent 的 CI 修复均需 Reviewer。CI 额度耗尽只暂停并续期对应层，不改需求开发、Parent 集成或 resync 额度。运行状态分别展示各窗口用量。
 
+多 Ticket Parent 的逻辑 CI 交付对象是 Run：最终 Run PR、内部 Repair PR 与后继提交共用 Run Acceptance 持久化的 `ci_recovery`。活动 Repair Job 持有相同预算快照，完成后由 Run 继续持有；更换内部 PR 或显式恢复不创建另一份额度。CI 修复的次数只记入 CI 内层，普通修复用量从独立 `review_budget` 展示。CI 内层或外层耗尽时，Repair Cycle 一同标记暂停；显式续期只恢复对应 CI 窗口及活动 Cycle，不重置外层累计轮数。
+
 ## 理由与边界
 
 Ticket 集成已有精确远端读取、机械合并和独立 resync 额度；Parent 共用这些底层事实，但各自保留 Review-first 与 Dev-first 的入口语义。Run Acceptance 原来的临时合并预览不能证明远端 Run Branch 已被接纳，Parent-only 原来的 base 漂移阻断也不能处理协作者追加。共用集成边界使审核对象与后续发布的 tree 一致，并让预算、暂停和恢复有单一事实来源。服务端最终 base 与 merge 之间的瞬时竞态仍由现有准确 head 检查承担，本决定不增加分布式锁或 merge queue。

@@ -247,7 +247,11 @@ def escalate_repair(
     state: dict[str, Any], run: dict[str, Any], job: dict[str, Any], code: str
 ) -> None:
     job["blocked_reason"] = code
-    if code == "modification_budget_exhausted":
+    if code in {
+        "modification_budget_exhausted",
+        "ci_inner_budget_exhausted",
+        "ci_outer_budget_exhausted",
+    }:
         cycle = run.get("repair_cycle")
         if isinstance(cycle, dict):
             cycle.update({"status": "budget_exhausted", "ended_reason": code})

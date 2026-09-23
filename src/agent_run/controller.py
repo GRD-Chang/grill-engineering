@@ -66,6 +66,7 @@ from agent_run.requeue_supervision import (
     refresh_requeue_transition_facts,
     wait_for_recoverable_github_read,
 )
+from agent_run.required_checks_observation import require_required_checks_observation
 from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_audit
 from agent_run.resume_intent import resume_pause_state
 from agent_run.scope_changes import reconcile_structure
@@ -1828,6 +1829,27 @@ def _resume_ci_recovery_window(state: dict[str, Any]) -> bool:
     if repair_job is not None:
         if not isinstance(repair_job, dict) or repair_job.get("ci_recovery") != job.get("ci_recovery"):
             raise ValueError("Run and Run Repair CI recovery state differ")
+        evidence = repair_job.get("ci_evidence")
+        origin = repair_job.get("required_checks_origin")
+        budget = job["ci_recovery"]
+        publication = state.get("run_publication")
+        expected_pr = repair_job.get("pr_number")
+        if type(expected_pr) is not int and isinstance(publication, dict):
+            expected_pr = publication.get("pr_number")
+        origin = require_required_checks_observation(
+            origin,
+            location="run_acceptance.repair_job.required_checks_origin",
+            expected_pr_number=expected_pr if type(expected_pr) is int else None,
+            expected_head_sha=budget["failure_head"],
+            allowed_results=frozenset({"fail"}),
+        )
+        if isinstance(evidence, dict) and (
+            evidence.get("pr_number") != origin["pr_number"]
+            or ("head_sha" in evidence and evidence["head_sha"] != budget["failure_head"])
+        ):
+            raise ValueError("Run Repair CI evidence differs from its failed PR/head")
+    elif kind == "run_acceptance" and not isinstance(job.get("ci_failed_evidence"), dict):
+        raise ValueError("Run CI recovery requires its failed check evidence")
     reset_exhausted_ci_budget(
         job, outer_limit=outer_limit, inner_limit=inner_limit,
         is_ticket=kind == "ticket",
@@ -1842,12 +1864,16 @@ def _resume_ci_recovery_window(state: dict[str, Any]) -> bool:
             repair_job.pop("escalation_code", None)
             repair_job["phase"] = "repairing"
             repair_job["next_attempt_kind"] = "ci_repair"
-        evidence = job.get("ci_failed_evidence")
-        if not isinstance(evidence, dict):
-            raise ValueError("Run CI recovery requires its failed check evidence")
-        job["repair_request"] = {
-            "repair_source": "required_checks", "ci_evidence": evidence
-        }
+            cycle = job.get("repair_cycle")
+            if isinstance(cycle, dict) and cycle.get("ended_reason") in {
+                "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
+            }:
+                cycle["status"] = "active"
+                cycle.pop("ended_reason", None)
+        if repair_job is None:
+            job["repair_request"] = {
+                "repair_source": "required_checks", "ci_evidence": job["ci_failed_evidence"]
+            }
         publication = state.get("run_publication")
         if isinstance(publication, dict):
             publication["phase"] = "stale"

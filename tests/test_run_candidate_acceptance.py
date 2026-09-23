@@ -187,10 +187,12 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
     run_branch = str(state["run_branch"])
     base_sha = git.resolve(run_branch)
     artifact = _repair_artifact()
+    ordinary_budget = _canonical_run_budget()
+    ordinary_budget["development_attempts"] = 3
     run = {
         "phase": "repairing",
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
+        "review_budget": dict(ordinary_budget),
         "review_budget_history": [],
         "acceptance_generation": 4,
         "repair_generation": 2,
@@ -211,7 +213,7 @@ def test_run_repair_budget_exhaustion_ends_the_repair_cycle(
         "run_id": state["run_id"],
         "phase": "escalating",
         "policy_snapshot": dict(state["policy_snapshot"]),
-        "review_budget": _canonical_run_budget(),
+        "review_budget": dict(ordinary_budget),
         "review_budget_history": [],
         "repair_attempt": 1,
         "repair_generation": 2,
