@@ -4,14 +4,21 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.controller import Controller
+from agent_run.delivery import TicketDeliveryEngine
 from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git import GitRepository
-from agent_run.github_fixture import FixtureGitHubReader
+from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.graph import state_from_graph
 from agent_run.revisions import ticket_graph_revision
 from agent_run.run_currentness import refresh_run_currentness
+from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.state import StateStore
+from agent_run.state_contract import require_current_run_state
+from support.cli_payloads import passing_acceptance, publication
 from support.seeding import write_fixture
 
 
@@ -24,6 +31,86 @@ def _ticket(number: int) -> dict[str, Any]:
         "labels": ["ready-for-agent"],
         "blocked_by": [],
     }
+
+
+@pytest.mark.parametrize(
+    ("paused_ticket", "changed_ticket"),
+    [(True, 2), (False, 2), (False, 3)],
+    ids=["human-blocked-A", "waiting-CI-A", "queued-B"],
+)
+def test_noncurrent_ticket_revision_stops_run_before_independent_delivery(
+    git_repo: Path, paused_ticket: bool, changed_ticket: int,
+) -> None:
+    fixture = write_fixture(
+        git_repo / "github.json",
+        issues={"2": _ticket(2), "3": _ticket(3)},
+        delivery={"required_checks": ["pending", "pass"]},
+    )
+    agent_fixture = git_repo / "agents.json"
+    blocked_review = {
+        "thread_id": "reviewer-2",
+        "checks": {
+            "e2e": {
+                "status": "blocked",
+                "evidence": "发生：需求待确认；尝试：核对 Issue；人必须：确认需求。",
+                "findings": [],
+            },
+            "standards": passing_acceptance("unused", "pass")["checks"]["standards"],
+            "spec": passing_acceptance("unused", "pass")["checks"]["spec"],
+        },
+    }
+    agent_fixture.write_text(json.dumps({
+        "developments": [
+            {"thread_id": f"developer-{number}", "summary": f"Ticket {number}",
+             "write_files": {f"ticket-{number}.txt": "done\n"}}
+            for number in (2, 3)
+        ],
+        "reviews": [
+            blocked_review if paused_ticket else passing_acceptance("reviewer-2", "passed"),
+            passing_acceptance("reviewer-3", "passed"),
+        ],
+        "publications": [publication(), publication()],
+    }), encoding="utf-8")
+    states = StateStore(git_repo / ".agent-run")
+    git = GitRepository(git_repo)
+    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    started, _ = controller.start(1)
+    engine = DeliveryRunEngine(
+        controller=controller,
+        tickets=TicketDeliveryEngine(
+            git=git, states=states, github=FixtureGitHubPublisher(fixture, git),
+            agents=FixtureAgentBackend(agent_fixture),
+        ),
+    )
+    waiting = engine.deliver(started["run_id"])
+    assert waiting["ticket_jobs"]["2"]["phase"] == (
+        "blocked" if paused_ticket else "waiting_checks"
+    )
+    assert waiting["ticket_jobs"]["3"]["phase"] == (
+        "waiting_checks" if paused_ticket else "ready_for_integration"
+    )
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    before_delivery = data["delivery"]
+    data["issues"][str(changed_ticket)]["body"] += "\nChanged authoritative requirement."
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+
+    refreshed, _ = controller.resume(started["run_id"])
+    assert refreshed["status"] == "requeue_required"
+    assert refreshed["requeue_required"]["work_subject"] == f"ticket:{changed_ticket}"
+    assert refreshed["active_ticket_job"]["ticket_number"] == changed_ticket
+    require_current_run_state(refreshed)
+    repeated, _ = controller.resume(started["run_id"])
+    assert repeated["status"] == "requeue_required"
+    assert repeated["active_ticket_job"]["ticket_number"] == changed_ticket
+    require_current_run_state(repeated)
+    stopped = engine.deliver(started["run_id"])
+    assert stopped["status"] == "requeue_required"
+    assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"] == before_delivery
+    if changed_ticket == 3:
+        requeued, retired = controller.requeue(started["run_id"])
+        assert retired["work_subject"] == "ticket:3"
+        assert requeued["ticket_jobs"]["2"]["phase"] == "waiting_checks"
+        assert requeued["ticket_integration_holder"] == 2
 
 
 def test_refresh_drops_supervision_window_when_frontier_ticket_changes(
@@ -105,7 +192,9 @@ def test_ticket_graph_revision_ignores_parent_execution_order(
     )
     reader = FixtureGitHubReader(fixture)
     original = reader.delivery_graph(1)
-    original_state = state_from_graph({}, original)
+    original_state = state_from_graph(
+        {"ticket_integration_holder": None, "ticket_integration_queue": []}, original
+    )
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["parent"]["sub_issues"] = [3, 2]

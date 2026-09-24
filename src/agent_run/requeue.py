@@ -58,7 +58,9 @@ def requeue_change_job(state: dict[str, Any]) -> dict[str, Any]:
         container["phase"] = "pending"
         next_status = "run_acceptance_pending"
 
-    state["active_agent_invocation"] = None
+    invocation = state.get("active_agent_invocation")
+    if not isinstance(invocation, dict) or invocation.get("work_subject") == subject:
+        state["active_agent_invocation"] = None
     state.pop("requeue_required", None)
     state.update(
         {

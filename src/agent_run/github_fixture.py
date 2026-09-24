@@ -1433,6 +1433,16 @@ class FixtureGitHubPublisher:
     ) -> None:
         published = _mutable_mapping(self._delivery(), "published_branches")
         published[run_branch] = integrated_sha
+        # An open PR tracks its base branch as that branch advances. Keep the
+        # fixture's stored identity aligned with the live Git ref after a
+        # different Ticket wins the shared integration seat.
+        for pull in _mutable_list(self._delivery(), "pull_requests"):
+            if (
+                isinstance(pull, dict)
+                and pull.get("state") == "OPEN"
+                and pull.get("base_branch") == run_branch
+            ):
+                pull["base_sha"] = integrated_sha
         if self.git.resolve(run_branch) == integrated_sha:
             self._save()
             self._crash_once("sync_run_branch")

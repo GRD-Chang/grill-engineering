@@ -49,6 +49,7 @@ class TicketPhase(StrEnum):
     CANDIDATE = "candidate"
     REVIEWING = "reviewing"
     ACCEPTED = "accepted"
+    READY_FOR_INTEGRATION = "ready_for_integration"
     PUBLICATION_PENDING = "publication_pending"
     PUBLISHING = "publishing"
     WAITING_CHECKS = "waiting_checks"

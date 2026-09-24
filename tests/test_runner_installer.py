@@ -1620,30 +1620,49 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
                 env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
             )
             assert configured.returncode == 0, configured.stdout + configured.stderr
-            for body, role, context in (
+            requests = (
                 ("development", "development", {}),
                 ("repair", "development", {
                     "repair_source": "acceptance", "acceptance_artifact": {"verdict": "reject"},
                 }),
                 ("acceptance", "review", {}),
                 ("publishing", "publication", {"acceptance_artifact": {"verdict": "accept"}}),
+            )
+            # Keep all eight installed-resource previews, but load the real
+            # installed interpreter once per language instead of four times.
+            preview_batch = subprocess.run(
+                [
+                    str(_active_snapshot(home) / "bin" / "python"), "-c",
+                    "import contextlib, io, json, pathlib, sys\n"
+                    "from agent_run.cli import main\n"
+                    "request = pathlib.Path(sys.argv[1])\n"
+                    "results = []\n"
+                    "for body, role, context in json.loads(sys.argv[2]):\n"
+                    "    request.write_text(json.dumps({'acceptance_scope': 'parent_only', **context}))\n"
+                    "    out, err = io.StringIO(), io.StringIO()\n"
+                    "    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):\n"
+                    "        code = main(['prompts', 'preview', '--role', role, '--request', str(request)])\n"
+                    "    results.append((body, code, out.getvalue(), err.getvalue()))\n"
+                    "print(json.dumps(results))\n",
+                    str(request_path), json.dumps(requests),
+                ],
+                env=isolated_environment, cwd=tmp_path, capture_output=True,
+                text=True, timeout=60,
+            )
+            assert preview_batch.returncode == 0, preview_batch.stdout + preview_batch.stderr
+            previews = json.loads(preview_batch.stdout)
+            assert len(previews) == len(requests)
+            for (body, _role, _context), (returned_body, code, output, error) in zip(
+                requests, previews, strict=True
             ):
-                request_path.write_text(json.dumps({
-                    "acceptance_scope": "parent_only", **context,
-                }), encoding="utf-8")
-                preview = subprocess.run(
-                    [str(stable_entry), "prompts", "preview", "--role", role,
-                     "--request", str(request_path)],
-                    env=isolated_environment, cwd=tmp_path, capture_output=True,
-                    text=True, timeout=15,
-                )
-                assert preview.returncode == 0, preview.stdout + preview.stderr
+                assert returned_body == body
+                assert code == 0, output + error
                 builtin = (package / f"resources/{language}/methods/{body}.md").read_text(
                     encoding="utf-8",
                 ).strip()
-                assert builtin and builtin in preview.stdout
+                assert builtin and builtin in output
                 language_instruction = "Use English" if language == "en" else "中文"
-                assert language_instruction in preview.stdout
+                assert language_instruction in output
     finally:
         hidden_resources.rename(source_resources)
 
@@ -1770,10 +1789,24 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert profile.count("# <<< agent-run managed PATH <<<") == 1
     assert len(list((_data_root(home) / "snapshots").iterdir())) == 1
 
-    # Reuse this isolated real build boundary for archive update, failed build
-    # preservation and rollback. Other lifecycle combinations stay lightweight.
+    # The real offline build above verifies the installed wheel and resources.
+    # The archive update, failed build and rollback exercise the same installer
+    # transaction with the fast build seam used by the lifecycle tests.
     first_snapshot = _active_snapshot(home)
     shutil.rmtree(source / ".git")
+    shutil.copy2(
+        PROJECT_ROOT / "tests/support/fast_runner_installer.py",
+        source / "fast_runner_installer.py",
+    )
+    (source / "install.sh").write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\n'
+        'exec python3 "$SOURCE_DIR/fast_runner_installer.py" "$@" '
+        '--source "$SOURCE_DIR"\n',
+        encoding="utf-8",
+    )
+    (source / "install.sh").chmod(0o755)
     version_file = source / "src/agent_run/__init__.py"
     version_file.write_text(version_file.read_text() + "\n# archive update\n")
     updated = _run(source, home, fake_bin, cwd=tmp_path,
@@ -1783,9 +1816,8 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert second_snapshot != first_snapshot
     assert _manifest(second_snapshot)["source_provenance"] == {"kind": "source-directory"}
     assert (_data_root(home) / "active/previous").resolve() == first_snapshot
-    build_config = source / "pyproject.toml"
-    original_config = build_config.read_text()
-    build_config.write_text(original_config.replace("setuptools.build_meta", "missing_backend"))
+    failure_marker = source / ".agent-run-test-build-failure"
+    failure_marker.touch()
     failed = _run(source, home, fake_bin, cwd=tmp_path,
                   path=isolated_path, environment=isolated_environment)
     assert failed.returncode == 1, failed.stdout + failed.stderr
@@ -1795,7 +1827,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     still_usable = subprocess.run([str(stable_entry), "--help"], cwd=tmp_path,
                                  env=isolated_environment, capture_output=True, timeout=15)
     assert still_usable.returncode == 0
-    build_config.write_text(original_config)
+    failure_marker.unlink()
     rolled_back = _run(source, home, fake_bin, "--rollback", cwd=tmp_path,
                       path=isolated_path, environment=isolated_environment)
     assert rolled_back.returncode == 0, rolled_back.stderr

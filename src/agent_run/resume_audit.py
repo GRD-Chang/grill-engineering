@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.external_supervision import is_github_refresh_wait
-from agent_run.operator_gate import has_non_invocation_execution_failure
+from agent_run.operator_gate import has_non_invocation_execution_failure, operator_gate_subjects
 from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.resume_audit_contract import (
     RESUME_AUDIT_KINDS,
@@ -26,6 +26,7 @@ def append_explicit_resume_audit(
     *,
     new_thread: bool,
     human_response_supplied: bool,
+    ticket_number: int | None = None,
 ) -> dict[str, Any]:
     """Record one public ``resume`` without creating a Resume budget."""
 
@@ -55,16 +56,35 @@ def append_explicit_resume_audit(
         invocation
         if isinstance(invocation, dict)
         and invocation_attempt_is_pending(state, invocation)
+        and (
+            ticket_number is None
+            or invocation.get("work_subject") == f"ticket:{ticket_number}"
+        )
         else None
     )
     bound = active.get("semantic_attempt") if active is not None else None
     attempt = bound if isinstance(bound, dict) else None
+    human_owner: tuple[str, dict[str, Any]] | None = None
+    if human_response_supplied and (
+        ticket_number is not None or human_blocker_subject_count(state) == 1
+    ):
+        human_owner = next(
+            (
+                (location, subject)
+                for location, subject in operator_gate_subjects(state)
+                if ticket_number is None or location == f"ticket:{ticket_number}"
+                if subject.get("blocked_reason") in {
+                    "agent_requires_human", "reviewer_requires_human"
+                }
+            ),
+            None,
+        )
     requested_at = datetime.now(UTC).isoformat()
     sequence = total + 1
     event: dict[str, Any] = {
         "sequence": sequence,
         "requested_at": requested_at,
-        "kind": _resume_kind(state, active),
+        "kind": _resume_kind(state, active, ticket_number=ticket_number),
         "source_status": str(state.get("status", "unknown")),
         "failure_code": _failure_code(state),
         "work_subject": active.get("work_subject") if active is not None else None,
@@ -88,6 +108,21 @@ def append_explicit_resume_audit(
         "human_response_supplied": human_response_supplied,
         "successor_invocation_started_at": None,
     }
+    if human_owner is not None:
+        location, subject = human_owner
+        event["work_subject"] = location if location.startswith("ticket:") else (
+            f"parent-only:{state['run_id']}" if location == "parent" else f"{location.replace('_', '-')}:{state['run_id']}"
+        )
+        event["generation"] = subject.get(
+            "ticket_branch_generation",
+            subject.get("repair_generation", subject.get("acceptance_generation", 1)),
+        )
+    elif ticket_number is not None:
+        jobs = state.get("ticket_jobs")
+        ticket_job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
+        if isinstance(ticket_job, dict):
+            event["work_subject"] = f"ticket:{ticket_number}"
+            event["generation"] = ticket_job.get("ticket_branch_generation")
     event["resume_id"] = resume_identity(str(state["run_id"]), event)
     event["event_digest"] = resume_event_digest(event)
     response_audit: dict[str, Any] | None = None
@@ -196,12 +231,34 @@ def bind_resume_to_successor(
 
 
 def _resume_kind(
-    state: dict[str, Any], invocation: dict[str, Any] | None
+    state: dict[str, Any], invocation: dict[str, Any] | None,
+    *, ticket_number: int | None = None,
 ) -> str:
+    if ticket_number is not None:
+        jobs = state.get("ticket_jobs")
+        job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
+        if not isinstance(job, dict):
+            raise ValueError("resume Ticket Job is missing")
+        reason = job.get("blocked_reason")
+        if reason in {"agent_requires_human", "reviewer_requires_human"}:
+            return "human_blocker"
+        if reason in {"modification_budget_exhausted", "review_budget_exhausted", "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"}:
+            return "budget_checkpoint"
+        if reason == "integration_resync_exhausted":
+            return "integration_resync"
+        if job.get("phase") == "publication_pending":
+            return "publication_operation_retry"
+        raise ValueError("resume Ticket has no supported local recovery boundary")
     if state.get("status") == "operator_stopped":
         return "operator_stopped"
     if state.get("status") == "supervision_timeout":
         return "supervision_timeout"
+    ticket_jobs = state.get("ticket_jobs")
+    if isinstance(ticket_jobs, dict) and sum(
+        isinstance(job, dict) and job.get("phase") == "publication_pending"
+        for job in ticket_jobs.values()
+    ) == 1:
+        return "publication_operation_retry"
     if is_github_refresh_wait(state):
         return "github_refresh_retry"
     if len(budget_checkpoint_subjects(state)) == 1:

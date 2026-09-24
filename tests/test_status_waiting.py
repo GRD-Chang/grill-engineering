@@ -174,6 +174,37 @@ def test_waiting_status_shows_current_checks_without_restart_command(
     assert _file_snapshot(Path.home().parent) == before_user_state
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_multi_ticket_status_details_are_localized_and_read_only(
+    waiting_run: tuple[Path, dict[str, Any]], language: str,
+) -> None:
+    repo, state = waiting_run
+    state["language"] = language
+    state["multi_ticket_protocol"] = 1
+    StateStore(managed_state(repo)).save_run(state["run_id"], state)
+    before = _workspace_snapshot(repo)
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    audit = json.loads(output.getvalue())
+    assert audit["progress"]["ticket_progress"] == {"completed": 1, "total": 1}
+
+    label = "子任务明细" if language == "zh" else "Ticket details"
+    for plain in (True, False):
+        human = status_text(state["run_id"], plain=plain)
+        if plain:
+            assert ("等待合并前检查" if language == "zh" else "Waiting for pre-merge checks") in human
+        else:
+            assert label in human
+            assert "Ticket #3" in human
+
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["status", state["run_id"], "--json"]) == 0
+    assert json.loads(output.getvalue()) == audit
+    assert _workspace_snapshot(repo) == before
+
+
 @pytest.mark.parametrize("host", ["not_running", "unknown"])
 def test_waiting_status_does_not_promise_an_exited_or_unknown_runner_will_continue(
     waiting_run: tuple[Path, dict[str, Any]], host: str,

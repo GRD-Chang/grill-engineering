@@ -5068,7 +5068,7 @@ def test_ticket_fallback_completes_without_human_escalation(
     assert result["active_ticket_job"]["publication_authority"] == "fallback"
 
 
-def test_resume_preserves_frontier_while_an_operator_gate_is_current(
+def test_resume_preserves_local_gate_while_selecting_independent_frontier(
     git_repo: Path,
 ) -> None:
     fixture = write_fixture(
@@ -5234,7 +5234,7 @@ def test_resume_preserves_frontier_while_an_operator_gate_is_current(
         FixtureGitHubReader(fixture), GitRepository(git_repo), states
     ).resume(state["run_id"])
 
-    assert resumed["active_ticket_job"]["ticket_number"] == 3
+    assert resumed["active_ticket_job"]["ticket_number"] == 5
     assert resumed["ticket_jobs"]["3"] == old_job
     assert resumed["ticket_jobs"]["3"]["blocked_reason"] == ("reviewer_requires_human")
     assert resumed["ticket_jobs"]["3"]["development_thread_id"] == ("developer-3")

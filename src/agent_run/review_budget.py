@@ -336,12 +336,12 @@ def budget_checkpoint_subjects(
 
     subjects: list[tuple[str, dict[str, Any]]] = []
     active = state.get("active_ticket_job")
-    if isinstance(active, dict) and _is_budget_checkpoint(active):
-        subjects.append(("ticket", active))
-    elif isinstance(state.get("ticket_jobs"), dict):
+    if isinstance(state.get("ticket_jobs"), dict):
         for value in state["ticket_jobs"].values():
             if isinstance(value, dict) and _is_budget_checkpoint(value):
                 subjects.append(("ticket", value))
+    elif isinstance(active, dict) and _is_budget_checkpoint(active):
+        subjects.append(("ticket", active))
     parent = state.get("parent_job")
     if isinstance(parent, dict) and _is_budget_checkpoint(parent):
         subjects.append(("parent", parent))

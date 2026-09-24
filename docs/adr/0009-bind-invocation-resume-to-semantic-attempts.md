@@ -10,7 +10,7 @@ Development、Reviewer 与 Publication 统一以 Semantic Agent Attempt 表达�
 
 Development 在 Attempt 分配时占用一次 Development Budget，因为 Worker 可能已修改 Managed Development Checkout；Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget；Publication 在分配时计入一次 Publication Attempt。三种角色的 Invocation Resume 都不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须继续该 pending Attempt，不得将它拒绝为预算耗尽。只有不存在 pending Attempt 且真正进入 `modification_budget_exhausted` 或 `review_budget_exhausted` 时，维护者显式 Resume 才开启新的编号 Budget Window，并在该窗口中分配新 Attempt。显式 Resume 没有第二套硬上限；每次人工授权、失败原因与 successor Invocation 都进入 `status`/`history` 审计。本决策不增加自动进程重试：零退出但输出不符合 contract 时仍只在当前 Invocation 内最多执行两次 Output Repair，其他进程、timeout、signal、sandbox、凭据、缺少最终输出或 Thread mismatch 失败仍停在 `execution_failed` 等待显式 Resume。
 
-Publication 的 Agent 语义生成与外部操作恢复分开计数。Publication Attempt 只跟踪 Publication Codex 对准确发布边界的一轮语义工作；GitHub 读取收敛、带精确绑定的写入与结果对账使用独立、有界的 Publication Operation Retry，不增加 Publication Attempt，也不被 Resume 清零或绕过。
+Publication 的 Agent 语义生成与外部操作恢复分开计数。Publication Attempt 只跟踪 Publication Codex 对准确发布边界的一轮语义工作；GitHub 读取收敛、带精确绑定的写入与结果对账使用独立、有界的 Publication Operation Retry，不增加 Publication Attempt，也不被 Invocation Resume 清零或绕过。耗尽后的定向人工 Resume 按 ADR 0017 建立新的操作重试窗口，并保留已耗尽窗口的历史。
 
 Managed Development Checkout 是尚未形成 Candidate 时的交付成果边界。维护者中断前台调用只表示可恢复暂停，不授权删除工作区；这一决策有意替代现有运行手册、实现与测试中“操作者显式取消即终态清理”的旧边界。普通 `run`、`resume` 和自动 cleanup 发现 tracked modifications 或 untracked files 时必须 fail closed，保留路径、原因与恢复动作。普通 `abandon` 必须在任何外部 mutation 前扫描全部 Managed Development Checkout 并在发现 dirty checkout 时拒绝；只有额外显式的 `--discard-worktree` 才授权不可恢复删除。Validation Checkout 等一次性验证工作区不属于这一交付成果边界。
 

@@ -218,6 +218,20 @@ def test_requeue_ticket_archives_the_old_generation_and_releases_a_fresh_job() -
     assert state["diagnostics"] == []
 
 
+def test_requeue_one_ticket_keeps_another_tickets_invocation() -> None:
+    state = _ticket_state()
+    other = {"ticket_number": 8, "phase": "developing"}
+    invocation = {"work_subject": "ticket:8", "status": "failed"}
+    state["ticket_jobs"]["8"] = other
+    state["active_agent_invocation"] = invocation
+
+    retired = requeue_change_job(state)
+
+    assert retired["work_subject"] == "ticket:7"
+    assert state["ticket_jobs"] == {"8": other}
+    assert state["active_agent_invocation"] is invocation
+
+
 @pytest.mark.parametrize("status", ["active", "execution_failed", "completed"])
 def test_requeue_rejects_any_state_except_requeue_required(status: str) -> None:
     state = _ticket_state()

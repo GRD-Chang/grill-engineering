@@ -13,6 +13,7 @@ from typing import Any
 from agent_run.guidance_actions import action_command, next_action_fact, render_next_action
 from agent_run.messages import text
 from agent_run.operator_gate import (
+    has_run_operator_gate,
     operator_gate_evidence,
     operator_gate_subjects,
 )
@@ -34,7 +35,7 @@ def operator_action_view(
     language: str = "zh",
     human: bool = False,
 ) -> dict[str, Any] | None:
-    """Project one canonical Run-wide gate for public CLI consumers."""
+    """Project the current operator action for public CLI consumers."""
 
     subjects = operator_gate_subjects(state)
     if not subjects:
@@ -74,6 +75,7 @@ def operator_action_view(
     )
     return {
         "type": _operator_action_label(action_kind),
+        "run_paused": has_run_operator_gate(state),
         "object": delivery_object_label(
             state,
             location,
@@ -86,12 +88,17 @@ def operator_action_view(
             _triggering_invocation(state, location) if is_human_blocker else None
         ),
         "preserved": _preserved_results(subject, current_identity),
-        "next_action": _operator_next_action(
-            state,
-            action_kind,
-            reason,
-            fallback_next_action=fallback_next_action,
-            language=language, human=human,
+        "next_action": (
+            _multiple_ticket_resume_action(state)
+            if len(subjects) > 1 and all(
+                location.startswith("ticket:") for location, _subject in subjects
+            ) else _operator_next_action(
+                state,
+                action_kind,
+                reason,
+                fallback_next_action=fallback_next_action,
+                language=language, human=human,
+            )
         ),
     }
 
@@ -114,7 +121,8 @@ def print_operator_action(
     print(
         display_text('presentation.status.preserved_work_v1', v1=terminal_safe(human_preserved_results(action['preserved'])))
     )
-    print(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue'))
+    if action.get("run_paused", True):
+        print(display_text('presentation.status.the_entire_run_is_paused_other_tickets_will_not_continue'))
     if action["type"] == "Review Budget Checkpoint":
         print(display_text('presentation.status.resuming_grants_the_configured_development_and_review_allowance_t'))
     print(
@@ -352,6 +360,15 @@ def _operator_next_action(
                 run=f"agent-run run {parent_number} --repo {repository}",
             )
     return fallback_next_action
+
+
+def _multiple_ticket_resume_action(state: dict[str, Any]) -> str:
+    parent = state.get("parent")
+    number = parent.get("number") if isinstance(parent, dict) else None
+    repository = state.get("repository")
+    if type(number) is int and isinstance(repository, str):
+        return f"agent-run resume {number} --repo {repository} --ticket <ticket-number>"
+    return "agent-run resume <run-id> --ticket <ticket-number>"
 
 
 def human_next_action_for_state(state: Mapping[str, Any], *, language: str | None = None) -> object:

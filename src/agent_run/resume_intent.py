@@ -29,11 +29,26 @@ def resume_pause_state(state: Mapping[str, Any]) -> dict[str, Any]:
     return current
 
 
-def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
+def bind_resume_intent(
+    state: Mapping[str, Any], *, ticket_number: int | None = None
+) -> dict[str, Any]:
     """Bind pause facts, excluding observation timestamps and refresh metadata."""
     state = current = resume_pause_state(state)
     checkpoints = budget_checkpoint_subjects(current)
     gates = operator_gate_subjects(current)
+    if ticket_number is not None:
+        if type(ticket_number) is not int or ticket_number < 1:
+            raise ResumeIntentError("resume Ticket 编号必须为正整数")
+        gates = [
+            (location, subject) for location, subject in gates
+            if location == f"ticket:{ticket_number}"
+        ]
+        checkpoints = [
+            (location, subject) for location, subject in checkpoints
+            if location == "ticket" and subject.get("ticket_number") == ticket_number
+        ]
+        if not gates and not checkpoints:
+            raise ResumeIntentError("指定 Ticket 没有可恢复的局部门禁")
     resync = [
         (location, subject)
         for location, subject in gates
@@ -52,10 +67,21 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
         if subject.get("blocked_reason")
         in {"agent_requires_human", "reviewer_requires_human"}
     ]
+    publication_retry = [
+        (location, subject) for location, subject in gates
+        if location.startswith("ticket:")
+        and subject.get("phase") == "publication_pending"
+    ]
+    if ticket_number is not None and not any(
+        (checkpoints, human, resync, ci_recovery, publication_retry)
+    ):
+        raise ResumeIntentError("指定 Ticket 没有受支持的局部恢复边界")
     if (
         len(checkpoints) > 1 or len(human) > 1 or len(resync) > 1
-        or len(ci_recovery) > 1
-        or sum(bool(group) for group in (checkpoints, human, resync, ci_recovery)) > 1
+        or len(ci_recovery) > 1 or len(publication_retry) > 1
+        or sum(bool(group) for group in (
+            checkpoints, human, resync, ci_recovery, publication_retry
+        )) > 1
     ):
         raise ResumeIntentError("resume 暂停对象不唯一；拒绝推断恢复授权")
     if checkpoints:
@@ -70,6 +96,9 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
     elif ci_recovery:
         reason, authorization = "ci_recovery", "renew_ci_recovery"
         subjects = ci_recovery
+    elif publication_retry:
+        reason, authorization = "publication_operation_retry", "renew_publication_operation_retry"
+        subjects = publication_retry
     else:
         reason = str(state.get("status"))
         parent_job = state.get("parent_job")
@@ -88,6 +117,11 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
         subjects = []
     invocation = state.get("active_agent_invocation")
     invocation = invocation if isinstance(invocation, Mapping) else {}
+    if (
+        ticket_number is not None
+        and invocation.get("work_subject") != f"ticket:{ticket_number}"
+    ):
+        invocation = {}
     target = {
         "run_id": state.get("run_id"),
         "invocation": {
@@ -107,7 +141,7 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
                         "ticket_number", "generation", "acceptance_generation",
                         "candidate_sha", "phase", "blocked_reason", "human_blockers",
                         "pending_semantic_attempt", "review_budget", "integration_resync",
-                        "ci_recovery",
+                        "ci_recovery", "publication_operation_retry",
                     )
                 },
             }
@@ -119,18 +153,24 @@ def bind_resume_intent(state: Mapping[str, Any]) -> dict[str, Any]:
         "supervision_wait": state.get("supervision_wait")
         if reason == "supervision_timeout" else None,
     }
-    return {
+    intent: dict[str, Any] = {
         "pause_reason": reason,
         "authorization": authorization,
         "target_digest": canonical_fingerprint(target),
     }
+    if ticket_number is not None:
+        intent["ticket_number"] = ticket_number
+    return intent
 
 
 def validate_resume_intent(
     state: Mapping[str, Any], intent: object,
 ) -> None:
     """Never turn an accepted continuation into a different business grant."""
-    if not isinstance(intent, Mapping) or dict(intent) != bind_resume_intent(state):
+    ticket_number = intent.get("ticket_number") if isinstance(intent, Mapping) else None
+    if not isinstance(intent, Mapping) or dict(intent) != bind_resume_intent(
+        state, ticket_number=ticket_number
+    ):
         raise ResumeIntentError("resume 暂停对象或授权已变化；原 Action 不能重新解释，请检查状态后重新提交")
 
 

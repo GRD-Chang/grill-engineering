@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_run.semantic_attempt import invocation_is_explicitly_resumable
 from agent_run.scope_changes import unsupported_scope_change_identity_is_consistent
+from agent_run.ticket_queue import next_ticket
 
 
 _OPERATOR_GATE_STATUSES = frozenset(
@@ -184,6 +185,21 @@ def _local_gate_matches_top_status(
     status = state.get("status")
     location, subject = local
     phase = subject.get("phase")
+    active = state.get("active_ticket_job")
+    if (
+        location.startswith("ticket:")
+        and isinstance(active, dict)
+        and location != f"ticket:{active.get('ticket_number')}"
+        and status in {"active", "ticket_delivery_pending", "ticket_completed", "waiting_checks"}
+    ):
+        return True
+    if (
+        location.startswith("ticket:")
+        and active is None
+        and status == "progress_exhausted"
+        and state.get("terminal_kind") == "waiting_human"
+    ):
+        return True
     if status == "operator_stopped":
         return True
     if status in {"waiting_external", "supervision_timeout", "abandonment_pending"}:
@@ -212,9 +228,28 @@ def _local_gate_matches_top_status(
 def has_run_operator_gate(state: dict[str, Any]) -> bool:
     """Whether automatic selection of another top-level work subject must stop."""
 
-    if has_local_operator_gate(state):
+    if has_local_operator_gate(state) and not _has_independent_ticket_work(state):
         return True
+    if _has_independent_ticket_work(state) and state.get("status") in {
+        "blocked", "ready_for_human", "publication_pending", "progress_exhausted"
+    }:
+        return False
     return _status_requires_operator_gate(state)
+
+
+def _has_independent_ticket_work(state: dict[str, Any]) -> bool:
+    frontier = state.get("frontier")
+    jobs = state.get("ticket_jobs")
+    if not isinstance(frontier, list) or not isinstance(jobs, dict):
+        return False
+    if not isinstance(state.get("ticket_integration_queue"), list) or (
+        "ticket_integration_holder" not in state
+    ):
+        return False
+    selected = next_ticket(state, frontier)
+    return selected is not None and jobs.get(str(selected), {}).get("phase") not in {
+        "blocked", "completed", "publication_pending",
+    }
 
 
 def has_local_operator_gate(state: dict[str, Any]) -> bool:
@@ -234,37 +269,12 @@ def has_non_invocation_execution_failure(state: dict[str, Any]) -> bool:
 def active_ticket_gate_mirror_is_consistent(state: dict[str, Any]) -> bool:
     """Whether every gate agrees with the current active Ticket identity."""
 
-    subjects = operator_gate_subjects(state)
     active = state.get("active_ticket_job")
     if not isinstance(active, dict):
-        return not any(
-            location.startswith("ticket:") for location, _subject in subjects
-        )
+        return True
     ticket_number = active.get("ticket_number")
     if not isinstance(ticket_number, int):
         return True
-    if not subjects:
-        return True
-    terminal = active.get("phase") in {"merged", "completed", "abandoned"}
-    ticket_subjects = [
-        location for location, _subject in subjects if location.startswith("ticket:")
-    ]
-    if terminal and not ticket_subjects:
-        return True
-    evidence = operator_gate_evidence(state)
-    if (
-        active.get("phase") in {"completed", "abandoned"}
-        and evidence is not None
-        and evidence["work_subject"].startswith("ticket:")
-    ):
-        # A completed Ticket cannot become the current Change Job again merely
-        # because a later top-level diagnostic names it.  The merged phase is
-        # intentionally excluded: response-loss recovery may still own the
-        # exact, mirrored Ticket while its closeout operation is uncertain.
-        return False
-    expected_location = f"ticket:{ticket_number}"
-    if any(location != expected_location for location, _subject in subjects):
-        return False
     jobs = state.get("ticket_jobs")
     mirror = (
         jobs.get(str(ticket_number))
@@ -277,7 +287,7 @@ def active_ticket_gate_mirror_is_consistent(state: dict[str, Any]) -> bool:
 def has_unresolved_subject_gate(state: dict[str, Any]) -> bool:
     """Whether Controller refresh could bypass an unresolved local decision."""
 
-    return any(
+    return not _has_independent_ticket_work(state) and any(
         subject.get("phase") in {"blocked", "ready_for_human"}
         for _location, subject in _iter_operator_gate_subjects(state)
     )

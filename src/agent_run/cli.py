@@ -54,6 +54,7 @@ from agent_run.operator_gate import (
     has_local_operator_gate,
     has_non_invocation_execution_failure,
     has_run_operator_gate,
+    operator_gate_subjects,
 )
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -111,6 +112,7 @@ from agent_run.resume_intent import (
     bind_resume_intent,
     validate_resume_intent,
 )
+from agent_run.review_budget import budget_checkpoint_subjects
 from agent_run.run_selection import (
     load_exact_run, load_selected_state, read_state_directory, selector_records,
     selector_error, validate_repository_name, selected_local_run_id,
@@ -198,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(resume)
     _add_policy_options(resume, allow_thread_policy=False)
     resume.add_argument("--json", action="store_true", dest="as_json")
+    resume.add_argument("--ticket", type=_positive_integer, help="选择要恢复的局部 Ticket 门禁")
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--new-thread",
@@ -713,6 +716,7 @@ def _main_with_parser_resources(
                     not resume_attachable
                     and not final_receipt_pending
                     and not cli_surface._resume_is_ready(current)
+                    and not _targeted_resume_is_ready(current, parsed.ticket)
                 ):
                     _reject_if_task_action_pending(parsed, states, git)
                     if resume_feedback is not None:
@@ -724,7 +728,17 @@ def _main_with_parser_resources(
                 if (
                     not resume_attachable
                     and parsed.message is not None
-                    and human_blocker_subject_count(current) != 1
+                    and (
+                        human_blocker_subject_count(current) != 1
+                        if parsed.ticket is None
+                        else not any(
+                            location == f"ticket:{parsed.ticket}"
+                            and subject.get("blocked_reason") in {
+                                "agent_requires_human", "reviewer_requires_human"
+                            }
+                            for location, subject in operator_gate_subjects(current)
+                        )
+                    )
                 ):
                     if resume_feedback is not None:
                         resume_feedback.failure("")
@@ -1528,12 +1542,28 @@ def _run_action_payload(
     }
 
 
+def _targeted_resume_is_ready(
+    current: Mapping[str, Any], ticket_number: int | None
+) -> bool:
+    if ticket_number is None:
+        return False
+    try:
+        bind_resume_intent(current, ticket_number=ticket_number)
+    except ResumeIntentError:
+        return False
+    return True
+
+
 def _resume_action_payload(
     parsed: argparse.Namespace,
     current: Mapping[str, Any],
 ) -> dict[str, Any]:
     budget_checkpoint_resume = (
-        cli_surface._review_budget_checkpoint_count(dict(current)) == 1
+        sum(
+            1 for kind, subject in budget_checkpoint_subjects(dict(current))
+            if parsed.ticket is None
+            or (kind == "ticket" and subject.get("ticket_number") == parsed.ticket)
+        ) == 1
     )
     explicit_policy = _policy_overrides(parsed)
     if explicit_policy and not budget_checkpoint_resume:
@@ -1550,8 +1580,9 @@ def _resume_action_payload(
         "run_id": parsed.run_id,
         "new_thread": bool(parsed.new_thread),
         "message": parsed.message,
+        "ticket_number": parsed.ticket,
         "resume_budget_checkpoint": budget_checkpoint_resume,
-        "resume_intent": bind_resume_intent(current),
+        "resume_intent": bind_resume_intent(current, ticket_number=parsed.ticket),
         "policy": policy.snapshot(),
     }
 
@@ -1566,6 +1597,7 @@ def _resume_payload_for_existing_action(
         "run_id": parsed.run_id,
         "new_thread": bool(parsed.new_thread),
         "message": parsed.message,
+        "ticket_number": parsed.ticket,
     }
     semantic_match = all(
         existing_payload.get(key) == value for key, value in semantic_fields.items()
@@ -2230,6 +2262,10 @@ def _run_lifecycle(
                     validate_resume_state=lambda state: validate_resume_intent(
                         state, retry_intent
                     ),
+                    ticket_number=(
+                        payload.get("ticket_number")
+                        if type(payload.get("ticket_number")) is int else None
+                    ),
                 )
 
             resume_retry = retry_resume_refresh
@@ -2343,6 +2379,10 @@ def _run_lifecycle(
                 budget_policy=parse_policy_snapshot(policy_snapshot),
                 validate_resume_state=lambda state: validate_resume_intent(
                     state, bound_intent
+                ),
+                ticket_number=(
+                    action_payload.get("ticket_number")
+                    if type(action_payload.get("ticket_number")) is int else None
                 ),
                 prepare_state=lambda state: prepare_action_application_receipt(
                     state, action
@@ -3726,6 +3766,12 @@ def _add_policy_options(
         help=cli_message('cli.ticket_rounds_help'),
     )
     parser.add_argument(
+        "--ticket-development-workers",
+        dest=f"{dest_prefix}ticket_development_workers",
+        type=_positive_integer,
+        help=cli_message('cli.ticket_development_workers_help'),
+    )
+    parser.add_argument(
         "--integration-resync-limit",
         dest=f"{dest_prefix}integration_resync_limit",
         type=_nonnegative_integer,
@@ -3764,6 +3810,7 @@ def _policy_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         "parent_only_paired_rounds",
         "run_repair_rounds",
         "ticket_review_rounds",
+        "ticket_development_workers",
         "integration_resync_limit",
         "ci_recovery_rounds",
         "ci_repairs_per_round",

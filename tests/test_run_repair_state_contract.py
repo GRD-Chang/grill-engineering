@@ -381,19 +381,23 @@ def test_fallback_receipt_observation_without_job_observation_is_incompatible(
     valid_run_state: dict[str, Any],
 ) -> None:
     state = valid_run_state
-    state["active_ticket_job"] = {
-        "phase": "candidate",
-        "fallback_publication_receipt": {
-            "pr_number": 17,
-            "publication_sha": "candidate-head",
-            "required_checks_evidence": {
+    job = state["ticket_jobs"]["2"]
+    job.update(
+        {
+            "phase": "candidate",
+            "fallback_publication_receipt": {
                 "pr_number": 17,
-                "head_sha": "candidate-head",
-                "result": "fail",
-                "checks": [],
+                "publication_sha": "candidate-head",
+                "required_checks_evidence": {
+                    "pr_number": 17,
+                    "head_sha": "candidate-head",
+                    "result": "fail",
+                    "checks": [],
+                },
             },
         },
-    }
+    )
+    state["active_ticket_job"] = deepcopy(job)
 
     with pytest.raises(IncompatibleRunStateError, match="without the Job Observation"):
         _require_repair_state(state)

@@ -29,6 +29,7 @@ from agent_run.external_supervision import (
 from agent_run.human_responses import current_human_response_history
 from agent_run.state import StateStore
 from agent_run.ticket_phase import TicketPhase, sync_active_ticket_job
+from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
 from agent_run.review_budget import previous_review_context
 from agent_run.delivery_policy import ticket_budget_policy_for_job
 from agent_run.delivery_evidence import clear_stale_delivery_evidence
@@ -648,6 +649,9 @@ class TicketDeliveryLoop:
         )
 
     def _save(self, state: dict[str, Any]) -> dict[str, Any]:
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict):
+            reconcile_ticket_slot(state, active)
         sync_active_ticket_job(state)
         self.states.save_run(str(state["run_id"]), state)
         return state

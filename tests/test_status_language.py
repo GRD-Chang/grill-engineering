@@ -101,6 +101,80 @@ def test_delivery_progress_preserves_audit(
     assert _file_snapshot(root) == before
 
 
+def test_multi_ticket_status_reports_local_work_and_integration_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agent_run.delivery_facts import multi_ticket_progress, ticket_progress
+    from agent_run.delivery_status import _multi_ticket_lines, status_progress_view
+
+    state = {
+        "multi_ticket_protocol": 1,
+        "policy_snapshot": {
+            "ticket_development_workers": 2,
+            "ticket_review_rounds": 3,
+            "ci_recovery_rounds": 3,
+            "ci_repairs_per_round": 3,
+            "integration_resync_limit": 3,
+        },
+        "ticket_graph": {"tickets": {
+            "2": {"blocked_by": []},
+            "3": {"blocked_by": [{"number": 2, "state": "OPEN"}]},
+            "4": {"blocked_by": []},
+        }},
+        "ticket_jobs": {
+            "2": {"phase": "merged", "review_budget": {
+                "development_attempts": 2, "reviewer_invocations": 1,
+            }},
+            "4": {"phase": "ready_for_integration", "review_budget": {
+                "development_attempts": 1, "reviewer_invocations": 1,
+            }},
+        },
+        "ticket_integration_queue": [
+            {"ticket_number": 4, "ready_at": "2026-09-24T00:01:00+00:00"},
+        ],
+        "ticket_integration_holder": 2,
+    }
+    state.update({"run_id": "r", "repository": "example/project", "parent": {"number": 1}, "status": "active"})
+    before = json.dumps(state, sort_keys=True)
+    assert ticket_progress(state) == {"completed": 0, "total": 3}
+    progress = multi_ticket_progress(state)
+    assert progress is not None
+    assert progress["development_worker_limit"] == 2
+    assert progress["integration_holder"] == 2
+    assert progress["integration_queue"] == state["ticket_integration_queue"]
+    assert progress["tickets"][0]["holds_integration"] is True
+    assert progress["tickets"][0]["usage"]["development_limit"] == 4
+    assert progress["tickets"][0]["usage"]["review_limit"] == 3
+    assert progress["tickets"][1]["blocked_by"] == [2]
+    assert progress["tickets"][1]["blocked_reason"] == "waiting_for_dependencies"
+    assert progress["tickets"][2]["queue_position"] == 1
+    status_view = status_progress_view(state, {"status": "active", "phase": "ready_for_integration"})
+    assert status_view["multi_ticket"] == progress
+    assert "队列第 1 位" in "\n".join(_multi_ticket_lines({"multi_ticket": progress}))
+    assert "开发 2/4" in "\n".join(_multi_ticket_lines({"multi_ticket": progress}))
+    assert json.dumps(state, sort_keys=True) == before
+    assert capsys.readouterr().out == ""
+
+
+def test_multi_ticket_status_does_not_offer_unsupported_resume() -> None:
+    from agent_run.delivery_facts import multi_ticket_progress
+
+    state = {
+        "multi_ticket_protocol": 1,
+        "repository": "example/project", "parent": {"number": 1},
+        "ticket_graph": {"tickets": {"2": {"blocked_by": []}}},
+        "ticket_jobs": {"2": {
+            "ticket_number": 2, "phase": "blocked",
+            "blocked_reason": "integration_history_rewritten",
+        }},
+        "ticket_integration_queue": [], "ticket_integration_holder": None,
+    }
+
+    progress = multi_ticket_progress(state)
+    assert progress is not None
+    assert progress["tickets"][0]["recovery_action"] is None
+
+
 @pytest.mark.parametrize("plain", [True, False])
 def test_completed_status_requires_cleanup_when_closeout_crashed_before_scheduling(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, plain: bool,

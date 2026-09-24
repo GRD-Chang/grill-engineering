@@ -17,6 +17,7 @@ from agent_run.change_currentness import (
     unknown_pr_mutation,
 )
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
+from agent_run.delivery_loop import _record_superseded_integration
 from agent_run.delivery_policy import (
     DELIVERY_POLICY_PROTOCOL,
     DeliveryPolicy,
@@ -69,6 +70,7 @@ from agent_run.requeue_supervision import (
 from agent_run.required_checks_observation import require_required_checks_observation
 from agent_run.resume_audit import append_explicit_resume_audit, latest_resume_audit
 from agent_run.resume_intent import resume_pause_state
+from agent_run.publication_operation_retry import require_publication_operation_retry
 from agent_run.scope_changes import reconcile_structure
 from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
@@ -83,6 +85,7 @@ from agent_run.state_contract import (
 from agent_run.task_control import TASK_CONTROL_PROTOCOL
 from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
 from agent_run.ticket_phase import sync_active_ticket_job
+from agent_run.ticket_queue import acquire as acquire_ticket_slot, reconcile_all as reconcile_ticket_slots
 from agent_run.integration_resync_budget import renew_resync_budget
 from agent_run.ci_recovery_budget import ci_limits_for_job, reset_exhausted_ci_budget
 
@@ -264,6 +267,7 @@ class Controller:
         prepare_state: Callable[[dict[str, Any]], None] | None = None,
         budget_policy: DeliveryPolicy | None = None,
         validate_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        ticket_number: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
         if message is not None:
             if human_response is not None:
@@ -311,14 +315,14 @@ class Controller:
         try:
             existing = self._load_bound_run(run_id, state=existing)
             if explicit_resume or resume_human_blocker or resume_budget_checkpoint:
-                self._require_ticket_labels(existing)
+                self._require_ticket_labels(existing, ticket_number=ticket_number)
         except GitHubReadError as error:
             if not is_github_convergence_error(error.code):
                 raise
             response_replayed = False
             if human_response is not None:
                 response_binding = _bind_current_human_response(
-                    existing, human_response
+                    existing, human_response, ticket_number=ticket_number
                 )
                 if not resume_human_blocker or response_binding is None:
                     raise ValueError("--message requires a current Human Blocker")
@@ -335,6 +339,7 @@ class Controller:
                     existing,
                     new_thread=new_thread,
                     human_response_supplied=human_response is not None,
+                    ticket_number=ticket_number,
                 )
             wait_for_github_refresh(
                 existing,
@@ -355,7 +360,7 @@ class Controller:
         response_replayed = False
         if human_response is not None:
             response_binding = _bind_current_human_response(
-                existing, human_response
+                existing, human_response, ticket_number=ticket_number
             )
             if not resume_human_blocker or response_binding is None:
                 raise ValueError("--message requires a current Human Blocker")
@@ -364,6 +369,10 @@ class Controller:
             not explicit_resume
             and not resume_human_blocker
             and not resume_budget_checkpoint
+            and not (
+                isinstance(existing.get("active_ticket_job"), dict)
+                and existing["active_ticket_job"].get("phase") == "completed"
+            )
             and (
                 has_unresolved_subject_gate(existing)
                 or has_non_invocation_execution_failure(existing)
@@ -381,6 +390,7 @@ class Controller:
                 existing,
                 new_thread=new_thread,
                 human_response_supplied=human_response is not None,
+                ticket_number=ticket_number,
             )
         if resuming_operator_stop:
             if new_thread or human_response is not None:
@@ -489,14 +499,25 @@ class Controller:
             _resume_review_budget_window(
                 state,
                 effective_budget_policy,
+                ticket_number=ticket_number,
             )
             if resume_budget_checkpoint
             else False
         )
         if explicit_resume and not budget_resumed:
-            budget_resumed = _resume_ci_recovery_window(state)
+            budget_resumed = _resume_ci_recovery_window(state, ticket_number=ticket_number)
+        if explicit_resume and not budget_resumed:
+            budget_resumed = _resume_ticket_publication_retry(
+                state, ticket_number=ticket_number
+            )
         if explicit_resume and not budget_resumed:
             active_ticket = state.get("active_ticket_job")
+            if (
+                ticket_number is not None
+                and isinstance(active_ticket, dict)
+                and active_ticket.get("ticket_number") != ticket_number
+            ):
+                active_ticket = None
             if not isinstance(active_ticket, dict):
                 ticket_jobs = state.get("ticket_jobs")
                 matches = [
@@ -505,6 +526,11 @@ class Controller:
                     and value.get("phase") == "blocked"
                     and value.get("blocked_reason") == "integration_resync_exhausted"
                 ] if isinstance(ticket_jobs, dict) else []
+                if ticket_number is not None:
+                    matches = [
+                        value for value in matches
+                        if value.get("ticket_number") == ticket_number
+                    ]
                 active_ticket = matches[0] if len(matches) == 1 else None
             if (
                 isinstance(active_ticket, dict)
@@ -521,6 +547,8 @@ class Controller:
                     else "accepted"
                 )
                 active_ticket.pop("blocked_reason", None)
+                if active_ticket["phase"] == "accepted":
+                    acquire_ticket_slot(state, active_ticket)
                 state["active_ticket_job"] = active_ticket
                 state.update({"status": "ticket_delivery_pending", "terminal_kind": None, "diagnostics": []})
                 sync_active_ticket_job(state)
@@ -554,12 +582,15 @@ class Controller:
                     budget_resumed = True
                     break
         if budget_resumed and human_response is not None:
-            raise ValueError("Review Budget resume does not accept a Human Blocker response")
+            raise ValueError("Checkpoint resume does not accept a Human Blocker response")
+        resumed_subject = False
         if budget_resumed:
             resumed_subject = True
         elif resume_human_blocker:
             resuming_run_acceptance = _run_acceptance_human_blocker(state)
-            resumed_subject = _resume_agent_human_blocker(state)
+            resumed_subject = _resume_agent_human_blocker(
+                state, ticket_number=ticket_number
+            )
             if human_response is not None and not resumed_subject:
                 raise ValueError("--message requires a current Human Blocker")
         elif human_response is not None:
@@ -578,6 +609,8 @@ class Controller:
                 state, allow_completed=resume_completed_invocation
             )
         _mark_failed_invocation_resuming(state)
+        if resumed_subject:
+            _reactivate_resumed_ticket(state)
         self._ensure_delivery_branch(state, base_sha)
         self.states.save_run(run_id, state)
         self._initialize_direct_profile(state)
@@ -984,8 +1017,17 @@ class Controller:
         require_current_run_state(state)
         return state
 
-    def _require_ticket_labels(self, state: dict[str, Any]) -> None:
-        subject, job, _ = current_change_job(state)
+    def _require_ticket_labels(
+        self, state: dict[str, Any], *, ticket_number: int | None = None
+    ) -> None:
+        if ticket_number is None:
+            subject, job, _ = current_change_job(state)
+        else:
+            jobs = state.get("ticket_jobs")
+            job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
+            subject = f"ticket:{ticket_number}"
+            if not isinstance(job, dict):
+                raise ValueError(f"Ticket #{ticket_number} has no current Job")
         if job is None or not subject.startswith("ticket:"):
             return
         number = int(job["ticket_number"])
@@ -1025,6 +1067,9 @@ class Controller:
             previous_boundary = waiting_boundary(state)
             projected = state_from_graph(state, graph)
             refreshed = reconcile_structure(state, projected)
+            _select_ticket_currentness_subject(
+                refreshed, previous=state, git=self.publisher.git
+            )
             supervision_window = state.get("supervision_window")
             credential_availability = state.get("credential_availability")
             if isinstance(credential_availability, dict):
@@ -1066,9 +1111,9 @@ class Controller:
                     self._mark_stale_change_job(
                         refreshed, check_requeue_currentness=True
                     )
-                if refreshed.get("status") not in {
-                    "active",
-                    "requeue_required",
+                if refreshed.get("status") in {
+                    "unsupported_scope_change", "deterministic_contradiction",
+                    "abandoned", "completed",
                 }:
                     return refreshed
                 # Graph reconciliation projects normal lifecycle phases from
@@ -1092,6 +1137,7 @@ class Controller:
                     refreshed, check_requeue_currentness=check_requeue_currentness
                 )
             self._invalidate_stale_final_run(refreshed, default_head)
+            reconcile_ticket_slots(refreshed)
             refreshed.pop("github_refresh_pending", None)
             return refreshed
         except GitHubReadError as error:
@@ -1140,11 +1186,7 @@ class Controller:
         if state.get("status") == "requeue_required" and not check_requeue_currentness:
             return
         subject, job, _ = current_change_job(state)
-        if job is None or job.get("phase") in {
-            "completed",
-            "merged",
-            "merging",
-        }:
+        if job is None or job.get("phase") in {"completed", "merging"}:
             return
         if not any(
             type(job.get(key)) is int
@@ -1163,6 +1205,16 @@ class Controller:
             # currentness boundary. They remain eligible for their normal
             # invocation-recovery checks, but cannot be mechanically labelled
             # stale solely because a required fact is absent.
+            return
+        if job.get("phase") == "merged":
+            reason = stale_change_job_reason(state, subject, job, self.publisher.git)
+            if reason is None:
+                return
+            integrated = job.get("integrated_sha")
+            if not isinstance(integrated, str) or not integrated:
+                raise ValueError("merged Ticket Job is missing integrated SHA")
+            _record_superseded_integration(job, integrated)
+            _mark_requeue_required(state, subject, job, reason)
             return
         external = (
             None
@@ -1214,10 +1266,14 @@ class Controller:
             )
             return
         reason = stale_change_job_reason(state, subject, job, self.publisher.git)
+        if reason is None and subject.startswith("ticket:") and job.get(
+            "blocked_reason"
+        ) in {"effective_revision_mismatch", "merged_revision_mismatch"}:
+            reason = "ticket_requirements_changed"
         if reason is None:
             return
-        job.pop("approval_grant", None)
         if subject.startswith("run-repair:"):
+            job.pop("approval_grant", None)
             checkout = (
                 self.states.root
                 / "worktrees"
@@ -1248,23 +1304,7 @@ class Controller:
                     pass
             invalidate_stale_run_repair(state)
             return
-        state.update(
-            {
-                "status": "requeue_required",
-                "terminal_kind": "requeue_required",
-                "diagnostics": [
-                    {
-                        "code": reason,
-                        "message": "Change Job Generation is stale; run requeue",
-                    }
-                ],
-                "requeue_required": {
-                    "work_subject": subject,
-                    "generation": _subject_generation(job),
-                    "reason": reason,
-                },
-            }
-        )
+        _mark_requeue_required(state, subject, job, reason)
 
     def _invalidate_stale_final_run(
         self, state: dict[str, Any], default_head: str
@@ -1332,6 +1372,7 @@ class Controller:
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
+            "multi_ticket_protocol": 1,
             "semantic_attempt_protocol": 1,
             "human_response_audit_protocol": 1,
             "lifecycle_action_protocol": TASK_CONTROL_PROTOCOL,
@@ -1348,6 +1389,8 @@ class Controller:
             "frontier": [],
             "active_ticket_job": None,
             "ticket_jobs": {},
+            "ticket_integration_queue": [],
+            "ticket_integration_holder": None,
             "retired_ticket_generations": {},
             "pending_ticket_retirements": {},
             "accepted_ticket_graph_revision": None,
@@ -1582,7 +1625,8 @@ def _now() -> str:
 
 
 def _resume_agent_human_blocker(
-    state: dict[str, Any], human_response: str | None = None
+    state: dict[str, Any], human_response: str | None = None,
+    *, ticket_number: int | None = None,
 ) -> bool:
     """Re-enter exactly one top-level Agent phase after an explicit resume.
 
@@ -1590,11 +1634,11 @@ def _resume_agent_human_blocker(
     the maintainer chose to resume.  The controller neither interprets the
     condition nor declares it fixed.
     """
-    if human_blocker_subject_count(state) > 1:
+    if ticket_number is None and human_blocker_subject_count(state) > 1:
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
-    target = _current_human_blocker_target(state)
+    target = _current_human_blocker_target(state, ticket_number=ticket_number)
     if target is None:
         return False
     location, subject, _generation = target
@@ -1661,15 +1705,15 @@ def _resume_agent_human_blocker(
 
 
 def _bind_current_human_response(
-    state: dict[str, Any], response: str
+    state: dict[str, Any], response: str, *, ticket_number: int | None = None
 ) -> Literal["appended", "replayed"] | None:
     """Bind response to one current Generation without releasing its gate."""
 
-    if human_blocker_subject_count(state) > 1:
+    if ticket_number is None and human_blocker_subject_count(state) > 1:
         raise ValueError(
             "multiple current Human Blockers require an unambiguous resume target"
         )
-    target = _current_human_blocker_target(state)
+    target = _current_human_blocker_target(state, ticket_number=ticket_number)
     if target is None:
         return None
     _location, subject, generation = target
@@ -1754,8 +1798,11 @@ def _resume_audit_matches_replay(
 
 def _current_human_blocker_target(
     state: dict[str, Any],
+    *, ticket_number: int | None = None,
 ) -> tuple[str, dict[str, Any], int] | None:
     for location, subject in operator_gate_subjects(state):
+        if ticket_number is not None and location != f"ticket:{ticket_number}":
+            continue
         if location.startswith("ticket:"):
             ticket_jobs = state.get("ticket_jobs")
             key = location.removeprefix("ticket:")
@@ -1796,19 +1843,59 @@ def _is_ready_human_blocker(value: object) -> bool:
     )
 
 
-def _resume_ci_recovery_window(state: dict[str, Any]) -> bool:
+def _resume_ticket_publication_retry(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    """Open one explicitly authorized external-operation retry window."""
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return False
+    paused = [
+        job for job in jobs.values()
+        if isinstance(job, dict)
+        and job.get("phase") == "publication_pending"
+        and (ticket_number is None or job.get("ticket_number") == ticket_number)
+    ]
+    if not paused:
+        return False
+    if len(paused) != 1:
+        raise ValueError("multiple Ticket publication pauses require an unambiguous resume target")
+    job = paused[0]
+    retry = require_publication_operation_retry(job.get("publication_operation_retry"))
+    if retry["attempts"] != retry["limit"]:
+        raise ValueError("Ticket publication pause has not exhausted its operation retry window")
+    if not isinstance(job.get("publication_sha"), str):
+        raise ValueError("Ticket publication pause is missing its current publication")
+    history = job.setdefault("publication_operation_retry_history", [])
+    if not isinstance(history, list):
+        raise ValueError("Ticket publication retry history must be a list")
+    history.append(deepcopy(retry))
+    job.pop("publication_operation_retry", None)
+    job.pop("last_publication_error", None)
+    job["integration_resume_phase"] = "publishing"
+    job["phase"] = "publishing"
+    acquire_ticket_slot(state, job)
+    state["active_ticket_job"] = job
+    state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+    sync_active_ticket_job(state)
+    return True
+
+
+def _resume_ci_recovery_window(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
     """Renew only one exhausted CI layer and preserve all other budgets."""
 
     candidates: list[tuple[str, dict[str, Any]]] = []
-    active = state.get("active_ticket_job")
-    if isinstance(active, dict):
-        candidates.append(("ticket", active))
+    jobs = state.get("ticket_jobs")
+    if isinstance(jobs, dict):
+        candidates.extend(
+            ("ticket", job) for job in jobs.values() if isinstance(job, dict)
+        )
     else:
-        jobs = state.get("ticket_jobs")
-        if isinstance(jobs, dict):
-            candidates.extend(
-                ("ticket", job) for job in jobs.values() if isinstance(job, dict)
-            )
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict):
+            candidates.append(("ticket", active))
     for key in ("parent_job", "run_acceptance"):
         job = state.get(key)
         if isinstance(job, dict):
@@ -1818,6 +1905,10 @@ def _resume_ci_recovery_window(state: dict[str, Any]) -> bool:
         if job.get("blocked_reason") in {
             "ci_inner_budget_exhausted", "ci_outer_budget_exhausted"
         }
+        and (
+            ticket_number is None
+            or (kind == "ticket" and job.get("ticket_number") == ticket_number)
+        )
     ]
     if not exhausted:
         return False
@@ -1894,12 +1985,18 @@ def _resume_ci_recovery_window(state: dict[str, Any]) -> bool:
 
 
 def _resume_review_budget_window(
-    state: dict[str, Any], delivery_policy: DeliveryPolicy | None = None
+    state: dict[str, Any], delivery_policy: DeliveryPolicy | None = None,
+    *, ticket_number: int | None = None,
 ) -> bool:
     """Open exactly one new bounded window after an explicit budget pause."""
 
     policy = delivery_policy or default_delivery_policy()
     subjects = budget_checkpoint_subjects(state)
+    if ticket_number is not None:
+        subjects = [
+            (kind, subject) for kind, subject in subjects
+            if kind == "ticket" and subject.get("ticket_number") == ticket_number
+        ]
     if not subjects:
         return False
     if len(subjects) > 1:
@@ -2404,6 +2501,33 @@ def _resume_change_job(
     return True
 
 
+def _reactivate_resumed_ticket(state: dict[str, Any]) -> None:
+    """Restore a resumed Ticket to the graph frontier saved before its release."""
+    active = state.get("active_ticket_job")
+    if not isinstance(active, dict) or active.get("phase") == "blocked":
+        return
+    number = active.get("ticket_number")
+    graph = state.get("ticket_graph")
+    tickets = graph.get("tickets") if isinstance(graph, dict) else None
+    ticket = tickets.get(str(number)) if isinstance(tickets, dict) else None
+    eligibility = ticket.get("eligibility") if isinstance(ticket, dict) else None
+    if not isinstance(eligibility, dict) or eligibility.get("eligible") is not True:
+        return
+    frontier = state.get("frontier")
+    order = graph.get("ordered_ticket_numbers") if isinstance(graph, dict) else None
+    if not isinstance(frontier, list) or not isinstance(order, list):
+        return
+    if number not in frontier:
+        frontier.append(number)
+        frontier.sort(key=lambda item: order.index(item))
+    if active.get("phase") == "accepted" or (
+        active.get("phase") == "candidate"
+        and active.get("attempt_kind") == "ci_repair"
+    ):
+        acquire_ticket_slot(state, active)
+    state["terminal_kind"] = None
+
+
 def _resume_change_job_owner(
     value: dict[str, Any], *, human_response: str | None
 ) -> None:
@@ -2512,6 +2636,75 @@ def _subject_generation(subject: dict[str, Any]) -> int:
         if isinstance(value, int):
             return value
     return 1
+
+
+def _select_ticket_currentness_subject(
+    state: dict[str, Any], *, previous: dict[str, Any], git: GitRepository
+) -> None:
+    """Check retained Ticket requirements before selecting independent work."""
+    if state.get("status") in {
+        "unsupported_scope_change", "abandoned", "completed",
+    }:
+        return
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return
+    prior_requeue = previous.get("requeue_required")
+    if previous.get("status") == "requeue_required" and isinstance(prior_requeue, dict):
+        subject = prior_requeue.get("work_subject")
+        if isinstance(subject, str) and subject.startswith("ticket:"):
+            job = jobs.get(subject.removeprefix("ticket:"))
+            if isinstance(job, dict):
+                state["active_ticket_job"] = job
+        return
+    graph = state.get("ticket_graph")
+    order = graph.get("ordered_ticket_numbers") if isinstance(graph, dict) else None
+    if not isinstance(order, list):
+        return
+    for number in order:
+        if type(number) is not int:
+            continue
+        job = jobs.get(str(number))
+        subject = f"ticket:{number}"
+        if (
+            not isinstance(job, dict)
+            or job.get("phase") == "completed"
+            or type(job.get("ticket_branch_generation")) is not int
+            or not has_currentness_facts(subject, job)
+        ):
+            continue
+        if stale_change_job_reason(state, subject, job, git) is None and job.get(
+            "blocked_reason"
+        ) not in {"effective_revision_mismatch", "merged_revision_mismatch"}:
+            continue
+        state["active_ticket_job"] = job
+        if job.get("phase") == "merging":
+            # Reconcile an in-flight merge before replacing its Generation.
+            state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+        return
+
+
+def _mark_requeue_required(
+    state: dict[str, Any], subject: str, job: dict[str, Any], reason: str
+) -> None:
+    job.pop("approval_grant", None)
+    state.update(
+        {
+            "status": "requeue_required",
+            "terminal_kind": "requeue_required",
+            "diagnostics": [
+                {
+                    "code": reason,
+                    "message": "Change Job Generation is stale; run requeue",
+                }
+            ],
+            "requeue_required": {
+                "work_subject": subject,
+                "generation": _subject_generation(job),
+                "reason": reason,
+            },
+        }
+    )
 
 
 def _publication_generation(state: dict[str, Any]) -> int:

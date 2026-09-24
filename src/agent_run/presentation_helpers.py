@@ -55,6 +55,7 @@ _STATUS_TERMS = {
     'publication_pending',
     'publishing',
     'queued',
+    'ready_for_integration',
     'ready_for_approval',
     'ready_for_human',
     'repairing',

@@ -12,6 +12,7 @@ from agent_run.revisions import (
 )
 from agent_run.ticket_phase import BLOCKED_MESSAGES, TicketPhase
 from agent_run.ticket_eligibility import label_blocker
+from agent_run.ticket_queue import next_ticket
 
 
 def state_from_graph(
@@ -58,6 +59,21 @@ def state_from_graph(
 
     ticket_jobs = _retained_ticket_jobs(previous, order)
     _preserve_completed_ticket_snapshots(previous, tickets, ticket_jobs)
+    # A closed dependency Issue is not proof of this Run's Ticket Completion.
+    # Dependent work may start only after the Publisher's closeout was saved.
+    for number in order:
+        unresolved = [
+            blocker.number
+            for blocker in graph.issues[number].blocked_by
+            if blocker.number in order
+            and ticket_jobs.get(str(blocker.number), {}).get("phase")
+            != TicketPhase.COMPLETED.value
+        ]
+        if unresolved:
+            tickets[str(number)]["eligibility"] = {
+                "eligible": False,
+                "reason": "blocked_by_incomplete_tickets",
+            }
     parent_revision = fingerprint(
         {"title": graph.parent.title, "body": graph.parent.body}
     )
@@ -65,6 +81,7 @@ def state_from_graph(
     frontier = [
         number
         for number in order
+        if tickets[str(number)]["eligibility"]["reason"] != "blocked_by_incomplete_tickets"
         if (
             tickets[str(number)]["eligibility"]["eligible"]
             or (
@@ -87,10 +104,12 @@ def state_from_graph(
             if isinstance(previous_active, dict) and previous_active.get("phase")
             else None
         )
-        selected = continuing if continuing in frontier else frontier[0]
+        selected = next_ticket({**previous, "ticket_jobs": ticket_jobs}, frontier)
+        if selected is None:
+            selected = continuing if continuing in frontier else frontier[0]
         active = ticket_jobs.get(str(selected), {"ticket_number": selected})
         active["selection_reason"] = (
-            "first eligible ticket by parent sub-issue order, then issue number"
+            "integration queue, development worker limit, then eligible ticket order"
         )
         previous_graph = previous.get("ticket_graph")
         if str(selected) in ticket_jobs and isinstance(previous_graph, dict):
@@ -116,6 +135,9 @@ def state_from_graph(
                     subject_key="ticket_number", subject=active["ticket_number"]
                 )
             ]
+        elif active.get("phase") == TicketPhase.WAITING_CHECKS.value:
+            status = "waiting_checks"
+            diagnostics = []
         elif (
             active.get("phase") == TicketPhase.BLOCKED.value
             and active.get("blocked_reason") != "no_code_changes"

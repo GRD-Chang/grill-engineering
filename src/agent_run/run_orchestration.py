@@ -7,6 +7,7 @@ from agent_run.operator_gate import (
     is_mechanical_revision_restart,
 )
 from agent_run.revisions import TicketGraphDriftError
+from agent_run.ticket_queue import next_ticket
 
 
 class RunController(Protocol):
@@ -33,21 +34,48 @@ class DeliveryRunEngine:
     def deliver_from_state(
         self, run_id: str, state: dict[str, Any]
     ) -> dict[str, Any]:
+        idle_tickets: set[int] = set()
         while state.get("active_ticket_job") is not None:
+            active_before = state["active_ticket_job"]
+            number = active_before.get("ticket_number")
+            if isinstance(number, int) and number in idle_tickets:
+                return state
             try:
                 result = self.tickets.deliver(run_id)
             except TicketGraphDriftError:
                 state, _ = self.controller.resume(run_id)
                 return state
-            if has_run_operator_gate(result):
+            if result.get("status") in {"requeue_required", "waiting_external"}:
                 return result
-            if result.get("status") in {
-                "waiting_checks",
-                "waiting_external",
-                "publication_pending",
-                "requeue_required",
-            }:
+            if (
+                result.get("status") == "waiting_checks"
+                and isinstance(number, int)
+                and next_ticket(result, result.get("frontier", [])) == number
+            ):
+                # Preserve the external wait and its supervision window when
+                # no other Ticket can advance. A refresh may otherwise
+                # project the selected Job back to an ordinary active state.
                 return result
+            current_result_job = result.get("active_ticket_job")
+            if (
+                has_run_operator_gate(result)
+                and not (
+                    isinstance(current_result_job, dict)
+                    and current_result_job.get("phase") == "completed"
+                )
+            ):
+                return result
+            job_after = result.get("active_ticket_job")
+            if (
+                isinstance(number, int)
+                and isinstance(job_after, dict)
+                and job_after.get("ticket_number") == number
+                and job_after.get("phase") in {
+                    "waiting_checks", "ready_for_integration", "blocked",
+                    "publication_pending",
+                }
+            ):
+                idle_tickets.add(number)
             state, _ = self.controller.resume(run_id)
             if state.get("status") == "requeue_required":
                 # A Requeue command may launch one replacement Generation, but
@@ -57,9 +85,8 @@ class DeliveryRunEngine:
             active = state.get("active_ticket_job")
             if not isinstance(active, dict):
                 return state
-            if active.get("phase") != "blocked":
-                continue
-            if is_mechanical_revision_restart(active.get("blocked_reason")):
-                continue
-            return state
+            if active.get("phase") == "blocked" and not is_mechanical_revision_restart(
+                active.get("blocked_reason")
+            ):
+                return state
         return state

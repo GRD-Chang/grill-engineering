@@ -26,6 +26,7 @@ from agent_run.ticket_phase import (
     parse_ticket_phase,
     sync_active_ticket_job,
 )
+from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
 
 
 class TicketDeliveryEngine:
@@ -357,6 +358,9 @@ class TicketDeliveryEngine:
                 pass
 
     def _save(self, state: dict[str, Any]) -> None:
+        active = state.get("active_ticket_job")
+        if isinstance(active, dict):
+            reconcile_ticket_slot(state, active)
         sync_active_ticket_job(state)
         self.states.save_run(str(state["run_id"]), state)
 

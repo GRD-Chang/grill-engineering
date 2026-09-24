@@ -96,6 +96,23 @@ def test_ci_recovery_limits_are_independent_and_frozen() -> None:
     assert parse_policy_snapshot(policy.snapshot()) == policy
 
 
+def test_ticket_development_worker_limit_is_positive_and_frozen() -> None:
+    policy = resolve_delivery_policy(
+        user_defaults={"ticket_development_workers": 5},
+        command_overrides={"ticket_development_workers": 1},
+    )
+    assert DeliveryPolicy().ticket_development_workers == 3
+    assert policy.ticket_development_workers == 1
+    assert parse_policy_snapshot(policy.snapshot()) == policy
+
+    from agent_run.cli import _policy_overrides, build_parser
+
+    parsed = build_parser().parse_args([
+        "settings", "configure", "--ticket-development-workers", "2",
+    ])
+    assert _policy_overrides(parsed) == {"ticket_development_workers": 2}
+
+
 def test_cli_accepts_both_ci_recovery_policy_overrides() -> None:
     from agent_run.cli import _policy_overrides, build_parser
 
@@ -137,6 +154,8 @@ def test_invocation_deadlines_are_read_from_the_frozen_snapshot() -> None:
         {"integration_resync_limit": True},
         {"ci_recovery_rounds": 0},
         {"ci_repairs_per_round": True},
+        {"ticket_development_workers": 0},
+        {"ticket_development_workers": True},
         {"invocation_deadlines": {"review": "0s"}},
         {"invocation_deadlines": {"review": "not-a-duration"}},
         {"invocation_deadlines": {"review": 10**400}},
@@ -157,6 +176,10 @@ def test_policy_snapshot_is_complete_and_does_not_reapply_defaults() -> None:
     missing_resync.pop("integration_resync_limit")
     with pytest.raises(DeliveryPolicyError):
         parse_policy_snapshot(missing_resync)
+    missing_workers = dict(snapshot)
+    missing_workers.pop("ticket_development_workers")
+    with pytest.raises(DeliveryPolicyError):
+        parse_policy_snapshot(missing_workers)
     with pytest.raises(DeliveryPolicyError):
         parse_policy_snapshot({"ticket_review_rounds": 4})
 

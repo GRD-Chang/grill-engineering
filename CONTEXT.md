@@ -512,8 +512,16 @@ _Avoid_: Ticket 自动修复、Run 暂停、默认分支回滚
 _Avoid_: Ticket、Attempt、Codex Thread
 
 **Active Ticket Job（活跃 Ticket 任务）**:
-Delivery Run 当前唯一获准进入开发、发布或验收循环的 Ticket Job。Controller 任意时刻最多激活一个，其他 Ticket 即使依赖已解除也仍保持等待。
-_Avoid_: 所有 ready Ticket、并行 frontier、后台 worker 池
+Controller 当前交给共享 Engine 推进的 Ticket Job 指针。一个 Run 可保存多个独立 Ticket Job，并在有效依赖解除后推进最多达到 Run Policy Snapshot 中 `ticket_development_workers` 上限的开发及原有审核工作；内置默认值为 3，配置为 1 时顺序推进。目前 Agent Invocation 仍串行执行。排队等待、CI 观测与集成席位不占开发 Worker。`active_ticket_job` 只表示当前执行指针，不代表其他 Ticket 不可恢复或未在开发集合中。
+_Avoid_: 把当前指针当成唯一 Ticket Job、让等待 CI 占开发 Worker、由 Agent 决定调度
+
+**Ticket Integration Queue（Ticket 集成队列）**:
+Ticket 满足开发及原有审核条件后进入的 Run 级持久队列。规范记录为 `ticket_integration_queue` 中的 Ticket number 与 `ready_at`；先按进入待集成时间、同时时按编号排序。代码修复或异常暂停使 Ticket 释放席位并离队，修复后以新的 `ready_at` 重新排队。队列中和审核通过都不是 Ticket Completion。
+_Avoid_: 沿用修复前队列位置、以 Ticket 编号替代真实就绪时间、把排队视为完成
+
+**Ticket Integration Holder（Ticket 集成席位持有者）**:
+Run Branch 同一时刻唯一获准执行 Ticket 集成及后续交付的 Ticket number，保存在 `ticket_integration_holder`。正常集成、适用审核、发布、等待 CI、合入及确认期间保留；代码修复与异常暂停释放。其他 Ticket 可继续开发和排队，但不能从持有者尚未合入的候选建立 Run Branch 基线。失联恢复先核验既有持有者和外部结果，再决定继续或释放。
+_Avoid_: 第二个 Ticket 同时提交 Run Branch、等待 CI 时释放、把席位当开发 Worker
 
 **Ticket Selection Order（Ticket 选择顺序）**:
 多个 Ticket 同时具备执行资格时使用的确定性顺序：优先采用 Parent Spec 的 GitHub 原生 `subIssues` 顺序，缺少稳定顺序时按 Issue number 升序。Codex Worker 不决定该优先级。
@@ -592,7 +600,7 @@ _Avoid_: Acceptance Record、模糊审查摘要、Controller 生成的修复方�
 _Avoid_: 新的独立 Schema、Ticket Acceptance Artifact、Run PR 评论
 
 **Human Blocker（人工阻塞）**:
-顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 以一个或多个 `blocked` lane 的 evidence 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；维护者可不附加响应直接授权 Agent 重新核验，也可提供仅绑定当前 Job Generation 的不可变 Human Response，后者按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。任何当前顶层 Work Subject（包括 Ticket/Parent-only Change Job、Run Acceptance 与 Run Publication）产生 Human Blocker 都建立 Run-wide Operator Gate；恢复成功后当前 blocker 告警和全局门禁会清除，原始 blocker/response 尝试按顺序保留。
+顶层 Codex 判断必须由人提供产品决策、外部权限、敏感凭据或不可替代外部操作才能继续时的最小结构化请求。Fresh/Run Acceptance 以一个或多个 `blocked` lane 的 evidence 表达；Development 使用 `result_kind: "human_blocker"`、`summary: null` 和非空 `human_blockers`，Publication 使用对应五字段 flat wire contract。Controller 只保存、展示与在 resume 时原样传回 blocker；维护者可不附加响应直接授权 Agent 重新核验，也可提供仅绑定当前 Job Generation 的不可变 Human Response，后者按顺序进入后续 Development 与 Fresh Acceptance，不修改 Issue、不触发 Requeue，也不与 Run Feedback Revision 混用。每个 response 最多 8 KiB；同一 Generation 的序列不按容量截断，替换 Generation 会从空序列开始，绝不向新 Generation 注入旧响应。Ticket Job 的 Human Blocker 是局部门禁，只阻塞自身及依赖任务；独立 Ticket 继续推进。Parent-only、Run Acceptance 与 Run Publication 的 Human Blocker 仍建立 Run-wide Operator Gate。恢复成功后对应 blocker 告警清除，原始 blocker/response 尝试按顺序保留。
 _Avoid_: Controller 诊断、subagent 事件、自动重试策略、笼统失败摘要
 
 **Human Response（人工响应）**:
@@ -638,7 +646,7 @@ _Avoid_: Publication Metadata、PR 语义正文、永久适用于整张 PR 的�
 
 **Delivery Progress View（交付进度视图）**:
 面向用户的当前工作摘要与关键工作历程；Agent 角色统一称为“开发 Agent／验收 Agent／发布 Agent”，工作动作使用“整体修复／整体验收／发布”等可理解名称。已确认的新版展示合同发布于 相关设计记录。展示要求：status 完整显示当前相关问题，通过后移除旧问题；history 按语义轮次归组并保留问题原文，`--details` 展开证据和续接过程；创建 PR 属于发布阶段，PR 检查、合并及收尾保留独立记录。这些规则优先于下文旧版展示细节；设计合同不代表实现已完成。
-`status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；Run-wide Operator Gate 生效时，显示准确 Ticket/Parent Issue 或 Run 对象、角色与阶段，并说明整个 Delivery Run 已暂停、其他独立 Ticket 尚未继续。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
+`status` 与 `history` 默认提供的面向操作者 CLI 文本视图，采用分段摘要组织，而非前端面板、原始字段表或内部状态转储。`status` 只读返回一次当前视图，不创建、恢复、停止、持续观察或修复 Run。`status` 依次回答运行对象与状态、整体及当前轮次进度、总时长、当前 Agent 的模型与推理强度、当前 Findings、系统下一步与用户是否需要操作；显示当前门禁时，说明准确 Ticket/Parent Issue 或 Run 对象、角色与阶段；Ticket 局部门禁需区分其他独立 Ticket 的进度，Run-wide Operator Gate 才说明整个 Delivery Run 已暂停。Task Control Record 不可读取或无法与 Host 对账时，`status` 与 `history` 仍展示 Delivery Run 中可独立验证的进度和历史，但明确说明当前 Agent 是否运行暂时无法确认，且生命周期动作会在提交前先执行 Task Control Reconciliation；它们不得猜测执行状态或把故障控制事实写回。触发 blocker 的 Invocation 已结束，因此阻塞项显示“触发阻塞的 Agent”及其角色、模型、推理强度与本轮时长，不将其误写为当前仍在运行的 Agent。当前 blocker 原文完整展示。`history` 按设备本地时间叙述 Development、Review、Required Checks、集成、Human Blocker、Human Response、恢复与完成等关键里程碑，并在结尾汇总轮次和总时长；较长的历史 blocker 与 response 只做简单、明确标记的确定性截断，完整原文留在 Machine Audit View，不引入摘要 Agent 或新的语义处理。内部身份和完整审计事实不属于该视图。
 _Avoid_: 前端面板、调试转储、机器审计接口、完整内部状态、仅对齐字段的运维表格
 
 **Notification Facts（通知事实）**:
@@ -651,12 +659,12 @@ _Avoid_: 反向解析翻译文案、通知独立状态机、按发送时个人�
 _Avoid_: 仅成功时通知、隐藏人工待办
 
 **Operator Action View（操作者动作视图）**:
-Delivery Progress View 在 Run 需要维护者介入时采用的统一区块，固定说明准确类型、所在 Ticket/Parent Issue 或 Run 对象与阶段、原因、已保留成果、整个 Run 已暂停，以及唯一允许的下一步；Human Blocker 额外显示触发阻塞的 Agent 角色、模型、推理强度与本轮时长。Human Blocker、Review Budget Checkpoint、Execution Failure、Supervision Timeout Pause、Requeue Required 与最终批准继续保留各自真实语义，不因共享版式而被统称为 Human Blocker。
-_Avoid_: 把所有暂停叫作 Human Blocker、只显示内部状态码、缺少恢复动作、声称其他 Ticket 仍在推进
+Delivery Progress View 在 Run 需要维护者介入时采用的统一区块，固定说明准确类型、所在 Ticket/Parent Issue 或 Run 对象与阶段、原因、已保留成果、影响范围，以及唯一允许的下一步；Human Blocker 额外显示触发阻塞的 Agent 角色、模型、推理强度与本轮时长。Human Blocker、Review Budget Checkpoint、Execution Failure、Supervision Timeout Pause、Requeue Required 与最终批准继续保留各自真实语义，不因共享版式而被统称为 Human Blocker。
+_Avoid_: 把所有暂停叫作 Human Blocker、只显示内部状态码、缺少恢复动作、把局部门禁说成整项 Run 暂停
 
 **Run-wide Operator Gate（运行级人工门禁）**:
-当前顶层 Work Subject（包括 Ticket/Parent-only Change Job、Run Acceptance 与 Run Publication）到达任何必须由维护者明确处理的状态时建立的 Delivery Run 全局暂停；它在 Controller 选择另一个 Ticket 或进入下一顶层阶段前生效，保留准确阻塞对象和现有成果，并只允许该门禁对应的恢复或终止动作。Human Blocker、Review Budget Checkpoint、Execution Failure、确定性外部矛盾及其他 Operator Action View 状态都建立该门禁；普通 Ticket DAG 依赖、triage 不可领取状态和仍在监督预算内的异步等待不是人工门禁，Controller 仍可选择其他符合条件的 Ticket。新规范 Run 不积累多个 Ticket 人工门禁；当前门禁解除且原 Work Subject 恢复或收口后，Controller 才选择下一个 Ticket 或顶层阶段。
-_Avoid_: Ticket 局部人工门禁、门禁期间切换 frontier、把普通依赖等待当作人工门禁、积累多个待选 blocker
+Parent-only Change Job、Run Acceptance、Run Publication 的人工门禁，以及需求或图谱合同变化、明确全局停止和确定性全局矛盾，会暂停整个 Delivery Run。Ticket Job 的 Human Blocker、预算检查点及其他局部门禁仅阻塞该 Ticket 和依赖任务；独立 Ticket 可继续开发或交付。Run-wide 门禁保留准确阻塞对象与成果，只允许对应恢复或终止动作。普通 Ticket DAG 依赖、triage 不可领取及仍在监督预算内的异步等待也不构成 Run-wide 人工门禁。
+_Avoid_: 将 Ticket 局部门禁误投影为 Run-wide、在全局门禁期间切换 frontier、把普通依赖等待当作人工门禁
 
 **Human Run Selector（人类运行选择器）**:
 操作者为只读 `status`、`history` 与 Run 发现命令选择 Delivery Run 的面向用户身份。当前仓库仅有一个进行中 Run 时可省略选择参数；当前仓库内可用 `--parent <issue-number>` 选择 Parent，任意目录可用 `--repo <owner/name> --parent <issue-number>` 组成跨项目选择器，`runs` 可按当前仓库或显式 `--repo` 列出候选。若同一仓库与 Parent 仍匹配多个 Run 或多个本地 clone，Controller 不根据最近时间猜测，而是显示仓库工作目录、Parent、状态与开始时间并要求进一步消歧。完整不透明 Run ID 与显式 `--state-dir` 继续用于自动化、精确排障和歧义恢复，但不是普通用户需要记忆或默认展示的身份。
@@ -775,7 +783,7 @@ _Avoid_: 把 CI 修复计入普通需求开发次数、隐式额外 Reviewer
 _Avoid_: 同一失败 head 重复计轮、把 CI 修复记作需求修复、无证据跳过 Reviewer
 
 **Ticket Resume Command（Ticket 恢复命令）**:
-维护者通过 `agent-run resume <parent-issue>` 恢复当前 failed 或 Human Blocker Invocation；在
+维护者通过 `agent-run resume <parent-issue>` 恢复当前 failed 或 Human Blocker Invocation；多个 Ticket 各自等待人工处理时，通过 `--ticket <number>` 指定其中一个 Ticket，恢复只解除该 Ticket 的局部门禁，其他 Ticket 的阻塞与预算保持原状。在
 `modification_budget_exhausted` 边界，该显式命令会同时新建有编号的 Ticket Review Budget Window 与 Ticket Development Budget Window，；CI 恢复额度保持独立。Ticket 用尽有效 Run Policy Snapshot 的 `N` 次 Reviewer Invocation 本身不产生 `review_budget_exhausted`；最后 Findings 已由后续 Development 处理出新 Candidate 时自动进入 Deterministic Ticket Fallback，没有普通 Development 名额处理 Findings 时则产生 `modification_budget_exhausted`。
 若该边界保存了 Reviewer Finding、Git Integrity 或 Required Checks 失败证据，新窗口先启动普通 Development Attempt，并将准确原始证据交给按 Development Thread Policy 选择的开发会话；只有产出新 Candidate 后才由新窗口 Reviewer 1 建立基线。准确新 head 的可修复 CI 失败进入独立 CI 恢复轮次，不审查未修改的失败 Candidate。
 若 preflight
@@ -786,8 +794,8 @@ Thread；它不重置既有窗口的消耗记录。
 _Avoid_: 隐式 Requeue、无内容变化重试、Run Feedback Revision
 
 **Progress Exhaustion（推进耗尽）**:
-Delivery Run 在没有 Run-wide Operator Gate 的前提下，已不存在可激活的 Ticket Job，但 Ticket Set 尚未全部完成的状态。它只汇总普通 DAG dependency、triage 不可领取或其他不要求维护者立即处理却使 frontier 为空的事实；任何 Ticket 已进入 Human Blocker、Review Budget Checkpoint、Execution Failure 或其他 Operator Action View 状态时，Controller 必须立即建立 Run-wide Operator Gate，不能先继续独立 Ticket，也不能把该门禁延迟到 Progress Exhaustion。
-_Avoid_: Run-wide Operator Gate、单 Ticket 人工门禁、最终整体验收
+Delivery Run 已不存在可自动推进的 Ticket Job，但 Ticket Set 尚未全部完成的状态。它汇总 DAG dependency、triage、局部 Human Blocker 和其他已持久化的 Ticket 停顿；独立 Ticket 会先继续推进。需求或图谱合同变化、明确全局停止及 Run 级门禁仍即时阻止整个 Run。局部人工门禁保留准确 Ticket 身份、原始证据与恢复动作，不能借 Progress Exhaustion 使其自动恢复。
+_Avoid_: 把局部门禁升级为全局停止、把待集成或 CI pass 当完成、最终整体验收
 
 **Ticket Content Revision（Ticket 内容版本）**:
 一张 Ticket 当前标题和正文的稳定版本指纹。Agent Artifact 必须绑定该指纹；指纹变化会使基于旧内容产生的 Plan、代码候选和验收结论失效，但不会改变 Ticket Job 身份。若 Ticket Graph Revision 未变化，Controller 停在 `requeue_required`，只有维护者显式 `requeue` 才会从最新权威事实创建新的 Job Generation；Issue 评论可由 Codex 阅读，但不属于权威需求且不触发 Revision。

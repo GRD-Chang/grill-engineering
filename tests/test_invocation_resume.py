@@ -259,6 +259,7 @@ def _prepared_resume(
         active_ticket = state.get("active_ticket_job")
         if isinstance(active_ticket, dict):
             active_ticket.update(job)
+        state["ticket_integration_holder"] = 3
         role = "publication"
         work_subject = "ticket:3"
         attempt_owner = job

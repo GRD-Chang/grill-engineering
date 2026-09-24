@@ -12,7 +12,7 @@ from agent_run.acceptance_facts import (
     acceptance_subject,
     has_prior_acceptance_failure,
 )
-from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, role_family
+from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, multi_ticket_progress, role_family
 from agent_run.execution_timing import invocation_execution_seconds, invocation_activity, parse_optional_timestamp
 
 from agent_run.messages import display_text, display_language
@@ -105,7 +105,7 @@ def status_progress_view(
     timing = status_timing(state, invocation)
     if current_agent is not None and "round_seconds" in timing:
         current_agent["duration_seconds"] = timing["round_seconds"]
-    return {
+    result = {
         "repository": state.get("repository"),
         "parent": {
             "number": parent_view.get("number"),
@@ -130,6 +130,10 @@ def status_progress_view(
         ),
         "next_action": audit.get("next_action"),
     }
+    multi_ticket = multi_ticket_progress(state)
+    if multi_ticket is not None:
+        result["multi_ticket"] = multi_ticket
+    return result
 
 
 def invocation_recovery_details(invocation: dict[str, Any]) -> list[str]:
@@ -201,6 +205,8 @@ def print_status_progress(
         print(display_text('presentation.status.total_agent_execution_time_v1', v1=_duration(timing['total_seconds'])))
     print(display_text('presentation.status.nprogress'))
     print(f"  {_ticket_progress_text(state, view)}")
+    for line in _multi_ticket_lines(view):
+        print(f"  {_terminal_safe(line)}")
     rounds = view["round_progress"]
     if rounds is not None and state.get("status") != "completed":
         print(display_text('presentation.status.nexecution_allowance'))
@@ -426,6 +432,9 @@ def print_rich_status_progress(
     if view.get("elapsed_seconds") is not None:
         progress_text += display_text('presentation.status.task_elapsed_time_v1_48', v1=_duration(view['elapsed_seconds']))
     add_identity(display_text('presentation.status.overall_progress'), progress_text)
+    ticket_lines = _multi_ticket_lines(view)
+    if ticket_lines:
+        add_identity(display_text('presentation.status.ticket_details'), "\n".join(ticket_lines))
 
     automatic_work = controller_work(state, audit)
     wait_view = waiting_presentation(state, audit)
@@ -782,6 +791,56 @@ def _ticket_progress_text(state: dict[str, Any], view: dict[str, Any]) -> str:
     if acceptance_phase in {None, "pending"}:
         return text + display_text('presentation.status.acceptance_and_publication_still_required')
     return text
+
+
+def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
+    multi = view.get("multi_ticket")
+    if not isinstance(multi, dict):
+        return []
+    zh = display_language() == "zh"
+    holder = multi.get("integration_holder")
+    limit = multi.get("development_worker_limit")
+    lines = [
+        f"开发 Worker 上限：{limit}；集成席位：{f'Ticket #{holder}' if holder is not None else '空闲'}"
+        if zh else
+        f"Development Worker limit: {limit}; integration holder: {f'Ticket #{holder}' if holder is not None else 'free'}"
+    ]
+    for item in multi.get("tickets", []):
+        if not isinstance(item, dict):
+            continue
+        phase = item.get("phase")
+        phase_label = str(human_status_term(phase))
+        parts = [f"Ticket #{item.get('ticket_number')}: {phase_label}"]
+        position = item.get("queue_position")
+        if type(position) is int:
+            parts.append(f"队列第 {position} 位" if zh else f"queue #{position}")
+        if item.get("holds_integration"):
+            parts.append("持有集成席位" if zh else "holds integration")
+        usage = item.get("usage")
+        if isinstance(usage, dict) and usage.get("development_attempts") is not None:
+            labels = (
+                ("开发", "development", "development_attempts", "development_limit"),
+                ("验收", "review", "reviewer_invocations", "review_limit"),
+                ("CI 轮次", "CI rounds", "ci_rounds_used", "ci_rounds_limit"),
+                ("CI 修复", "CI repairs", "ci_repairs_used", "ci_repairs_limit"),
+                ("同步", "resync", "integration_resync_used", "integration_resync_limit"),
+            )
+            parts.append(" / ".join(
+                f"{cn if zh else en} {usage[used]}/{usage[limit]}"
+                for cn, en, used, limit in labels
+                if usage.get(used) is not None and usage.get(limit) is not None
+            ))
+        blockers = item.get("blocked_by")
+        if blockers:
+            parts.append(("依赖未完成：" if zh else "dependencies incomplete: ") + ", ".join(f"#{number}" for number in blockers))
+        reason = item.get("blocked_reason")
+        if reason and reason != "waiting_for_dependencies":
+            parts.append(("阻塞：" if zh else "blocked: ") + str(human_pause_reason(reason)))
+        action = item.get("recovery_action")
+        if action:
+            parts.append(("可恢复动作：" if zh else "recovery action: ") + str(action))
+        lines.append(" · ".join(parts))
+    return lines
 
 
 def _round_progress(

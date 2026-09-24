@@ -106,6 +106,11 @@ from agent_run.ticket_integration import (
     integration_record_is_valid,
     prepare_ticket_integration,
 )
+from agent_run.ticket_queue import (
+    acquire as acquire_ticket_slot,
+    has_other_ticket_work,
+    reconcile as reconcile_ticket_slot,
+)
 from agent_run.parent_integration import (
     parent_integration_record_is_valid,
 )
@@ -141,6 +146,10 @@ class ChangeDeliveryEngine:
         self._current_job: dict[str, Any] | None = None
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
+        if self.contract.label.startswith("ticket-") and self._current_job is not None:
+            if self._current_job.get("phase") == "accepted":
+                acquire_ticket_slot(state, self._current_job)
+            reconcile_ticket_slot(state, self._current_job)
         return self.state_store.save(state)
 
     def commit_required_checks_observation(
@@ -166,6 +175,11 @@ class ChangeDeliveryEngine:
                 phase = str(job["phase"])
                 if phase in {"completed", "blocked"}:
                     return state
+                if phase == "ready_for_integration":
+                    if not acquire_ticket_slot(state, job):
+                        return state
+                    self.save(state)
+                    continue
                 if phase == "publication_pending":
                     # Operation Retry exhaustion is an independent hard
                     # boundary. Resume must not reset it or regenerate the
@@ -197,6 +211,10 @@ class ChangeDeliveryEngine:
                         self.contract.label.startswith("ticket-")
                         and job.get("attempt_kind") == "ci_repair"
                     ):
+                        if not acquire_ticket_slot(state, job):
+                            self.save(state)
+                            return state
+                        self.save(state)
                         if not prepare_ticket_integration(self, state, job, checkout):
                             continue
                         self._bind_ticket_ci_integration(state, job)
@@ -261,6 +279,10 @@ class ChangeDeliveryEngine:
                         self.save(state)
                         continue
                     if self.contract.label.startswith("ticket-"):
+                        if not acquire_ticket_slot(state, job):
+                            self.save(state)
+                            return state
+                        self.save(state)
                         if not prepare_ticket_integration(self, state, job, checkout):
                             continue
                         if job.get("attempt_kind") == "ci_repair":
@@ -308,6 +330,13 @@ class ChangeDeliveryEngine:
                     terminal = self._publish_and_merge(state, job, checkout)
                     if terminal:
                         return state
+                    if (
+                        self.contract.label.startswith("ticket-")
+                        and job.get("phase") == "repairing"
+                        and state.get("ticket_integration_holder") != job.get("ticket_number")
+                        and has_other_ticket_work(state, int(job["ticket_number"]))
+                    ):
+                        return state
                     continue
                 if job["phase"] == "publication_pending":
                     return state
@@ -315,6 +344,8 @@ class ChangeDeliveryEngine:
                     return state
                 if job["phase"] in {"developing", "repairing"}:
                     continue
+                if job["phase"] == "ready_for_integration":
+                    return state
                 if job["phase"] in {"completed", "blocked"}:
                     return state
                 raise ValueError(f"unknown Ticket phase: {job['phase']}")

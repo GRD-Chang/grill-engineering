@@ -162,7 +162,7 @@ def events(state: dict[str, Any]) -> list[dict[str, Any]]:
     result.extend(key_events)
     progress = ticket_progress(state)
     for number, job in (state.get("ticket_jobs") or {}).items():
-        if isinstance(job, dict) and job.get("phase") in {"completed", "merged"}:
+        if isinstance(job, dict) and job.get("phase") == "completed":
             result.append(event_envelope(state, "ticket_completed", [number, job.get("generation")],
                                 event_copy(state, "ticket_completed", title=event_subject(state, f"ticket:{number}").get("task_title") or "#" + str(number)), "green",
                                 **event_subject(state, f"ticket:{number}"),

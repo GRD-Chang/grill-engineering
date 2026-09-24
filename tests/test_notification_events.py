@@ -220,6 +220,22 @@ def test_modes_ticket_identity_and_logical_e2e_counts() -> None:
     assert len({event['id'] for event in detailed + events(state)}) == 14
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_ticket_completion_waits_for_completed_phase(language: str) -> None:
+    state = state_with_round()
+    state["language"] = language
+    state["ticket_graph"] = {"tickets": {"2": {"title": "Ticket 2"}}}
+    state["ticket_jobs"] = {"2": {"phase": "merged", "generation": 1}}
+    state["notifications"] = {"mode": "concise"}
+
+    assert not any(event["kind"] == "ticket_completed" for event in events(state))
+
+    state["ticket_jobs"]["2"]["phase"] = "completed"
+    completion = next(event for event in events(state) if event["kind"] == "ticket_completed")
+    assert completion["title"] == ("子任务完成：Ticket 2" if language == "zh" else "Ticket completed: Ticket 2")
+    assert completion["summary"] == ("子任务已完成 1/1" if language == "zh" else "Tickets completed: 1/1")
+
+
 def test_round_resume_timing_and_missing_data_are_not_fabricated() -> None:
     state = state_with_round()
     invocation = state['agent_invocation_history'][0]

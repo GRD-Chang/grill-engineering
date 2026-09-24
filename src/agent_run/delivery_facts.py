@@ -26,12 +26,129 @@ def ticket_progress(state: dict[str, Any]) -> dict[str, int]:
             for number, job in jobs.items()
             if (not graph_numbers or str(number) in graph_numbers)
             if isinstance(job, dict)
-            and job.get("phase") in {"completed", "merged"}
+            and job.get("phase") == "completed"
         )
         if isinstance(jobs, dict)
         else 0
     )
     return {"completed": completed, "total": total}
+
+
+def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Project the persisted Ticket queue and local Job facts for status only."""
+
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 1:
+        return None
+    if state.get("delivery_type") == "parent_only":
+        return None
+    graph = state.get("ticket_graph")
+    tickets = graph.get("tickets") if isinstance(graph, dict) else None
+    jobs = state.get("ticket_jobs")
+    queue = state.get("ticket_integration_queue")
+    ticket_map = tickets if isinstance(tickets, dict) else {}
+    job_map = jobs if isinstance(jobs, dict) else {}
+    queue_items = queue if isinstance(queue, list) else []
+    queued = {
+        item.get("ticket_number"): index + 1
+        for index, item in enumerate(queue_items)
+        if isinstance(item, dict) and type(item.get("ticket_number")) is int
+    }
+    holder = state.get("ticket_integration_holder")
+    details = []
+    for key in sorted(ticket_map, key=lambda value: int(value)):
+        ticket = ticket_map[key]
+        job = job_map.get(key)
+        ticket_data = ticket if isinstance(ticket, dict) else {}
+        job_data = job if isinstance(job, dict) else {}
+        blockers = ticket_data.get("blocked_by")
+        unresolved = [
+            item.get("number") for item in blockers
+            if isinstance(item, dict)
+            and type(item.get("number")) is int
+            and (
+                (
+                    isinstance(job_map.get(str(item["number"])), dict)
+                    and job_map[str(item["number"])].get("phase") != "completed"
+                )
+                or (
+                    str(item["number"]) not in ticket_map
+                    and item.get("state") != "CLOSED"
+                )
+                or (
+                    str(item["number"]) in ticket_map
+                    and str(item["number"]) not in job_map
+                )
+            )
+        ] if isinstance(blockers, list) else []
+        number = int(key)
+        phase = job_data.get("phase") or "pending"
+        reason = job_data.get("blocked_reason")
+        if not reason and unresolved:
+            reason = "waiting_for_dependencies"
+        review = job_data.get("review_budget")
+        ci = job_data.get("ci_recovery")
+        resync = job_data.get("integration_resync")
+        job_policy = job_data.get("policy_snapshot")
+        policy = job_policy if isinstance(job_policy, dict) else state.get("policy_snapshot")
+        policy_data = policy if isinstance(policy, dict) else {}
+        review_rounds = policy_data.get("ticket_review_rounds")
+        usage = {
+            "development_attempts": review.get("development_attempts") if isinstance(review, dict) else None,
+            "development_limit": review_rounds + 1 if type(review_rounds) is int else None,
+            "reviewer_invocations": review.get("reviewer_invocations") if isinstance(review, dict) else None,
+            "review_limit": review_rounds,
+            "ci_rounds_used": ci.get("rounds_used") if isinstance(ci, dict) else None,
+            "ci_rounds_limit": policy_data.get("ci_recovery_rounds"),
+            "ci_repairs_used": ci.get("repairs_used") if isinstance(ci, dict) else None,
+            "ci_repairs_limit": (
+                policy_data.get("ci_repairs_per_round")
+                if isinstance(ci, dict) and ci.get("review_required") is True else 1
+            ),
+            "integration_resync_used": resync.get("used") if isinstance(resync, dict) else None,
+            "integration_resync_limit": resync.get("limit") if isinstance(resync, dict) else policy_data.get("integration_resync_limit"),
+        }
+        action = None
+        if phase == "publication_pending":
+            action = "resume"
+        elif phase == "blocked":
+            if reason in {
+                "effective_revision_mismatch", "merged_revision_mismatch"
+            }:
+                action = "requeue"
+            elif reason in {
+                "agent_requires_human", "reviewer_requires_human",
+                "modification_budget_exhausted", "review_budget_exhausted",
+                "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
+                "integration_resync_exhausted",
+            }:
+                action = "resume"
+        parent = state.get("parent")
+        parent_number = parent.get("number") if isinstance(parent, dict) else None
+        repository = state.get("repository")
+        if action is not None and type(parent_number) is int and isinstance(repository, str):
+            action = (
+                f"agent-run {action} {parent_number} --repo {repository} "
+                f"--ticket {number}"
+                if action == "resume"
+                else f"agent-run requeue {parent_number} --repo {repository}"
+            )
+        details.append({
+            "ticket_number": number,
+            "phase": phase,
+            "queue_position": queued.get(number),
+            "holds_integration": number == holder,
+            "blocked_reason": reason,
+            "blocked_by": unresolved,
+            "usage": usage,
+            "recovery_action": action,
+        })
+    snapshot = state.get("policy_snapshot")
+    return {
+        "development_worker_limit": snapshot.get("ticket_development_workers") if isinstance(snapshot, dict) else None,
+        "integration_queue": [dict(item) for item in queue_items if isinstance(item, dict)],
+        "integration_holder": holder,
+        "tickets": details,
+    }
 
 
 
@@ -180,6 +297,3 @@ def current_delivery_identity(state: dict[str, object]) -> dict[str, object]:
             "pr_number": publication.get("pr_number"),
         }
     return {"candidate_sha": None, "pr_number": None}
-
-
-

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from agent_run.prompt_resources import validate_resources
@@ -24,7 +25,6 @@ from agent_run.integration_resync_budget import require_resync_budget
 from agent_run.operator_gate import (
     active_ticket_gate_mirror_is_consistent,
     operator_gate_identity_is_consistent,
-    operator_gate_subject_count,
     operator_gate_subjects,
 )
 from agent_run.required_checks_observation import (
@@ -35,6 +35,7 @@ from agent_run.state_errors import (
     IncompatibleRunStateError as IncompatibleRunStateError,
 )
 from agent_run.ticket_phase import TicketPhase
+from agent_run.ticket_queue import INTEGRATION_HOLDER_PHASES
 from agent_run.ticket_publication_contract import (
     require_active_ticket_publication_authorization as require_active_ticket_publication_authorization,
 )
@@ -162,6 +163,10 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Semantic Agent Attempt protocol"
         )
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 1:
+        raise IncompatibleRunStateError(
+            "legacy state has an incompatible Multi Ticket protocol"
+        )
     for key, expected in (
         ("run_id", str),
         ("repository", str),
@@ -185,10 +190,8 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_parent(state["parent"])
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
-    if operator_gate_subject_count(state) > 1:
-        raise IncompatibleRunStateError(
-            "legacy state has multiple current Run-wide Operator Gates"
-        )
+    _require_ticket_integration_queue(state)
+    _require_run_gate_exclusivity(state)
     if (
         not operator_gate_identity_is_consistent(state)
         and not _operator_gate_identity_waits_for_subject_validation(state)
@@ -927,6 +930,135 @@ def _require_base(base: dict[str, Any]) -> None:
             raise IncompatibleRunStateError(f"legacy state has an invalid base.{key}")
 
 
+def _require_run_gate_exclusivity(state: dict[str, Any]) -> None:
+    global_gates = [
+        location
+        for location, subject in operator_gate_subjects(state)
+        if location in {"parent", "run_acceptance", "run_repair", "run_publication"}
+        and subject.get("phase")
+        in {"blocked", "ready_for_human", "publication_pending", "ready_for_approval"}
+    ]
+    if len(global_gates) > 1:
+        raise IncompatibleRunStateError(
+            "legacy state has multiple current Run-wide Operator Gates"
+        )
+    active = state.get("active_ticket_job")
+    if global_gates and isinstance(active, dict) and active.get("phase") not in {
+        "completed", "abandoned"
+    }:
+        raise IncompatibleRunStateError(
+            "legacy state has a Run-wide Operator Gate with an active Ticket Job"
+        )
+
+
+def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
+    """Bind the single integration seat and ordered waiters to Ticket Jobs."""
+
+    queue = state.get("ticket_integration_queue")
+    holder = state.get("ticket_integration_holder")
+    jobs = state["ticket_jobs"]
+    if not isinstance(queue, list) or "ticket_integration_holder" not in state:
+        raise IncompatibleRunStateError(
+            "legacy state is missing the Ticket integration queue"
+        )
+    if holder is not None and (type(holder) is not int or holder < 1):
+        raise IncompatibleRunStateError(
+            "legacy state has an invalid Ticket integration holder"
+        )
+
+    queued: set[int] = set()
+    previous: tuple[datetime, int] | None = None
+    for entry in queue:
+        if not isinstance(entry, dict) or set(entry) != {"ticket_number", "ready_at"}:
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration queue entry"
+            )
+        number = entry["ticket_number"]
+        ready_at = entry["ready_at"]
+        if type(number) is not int or number < 1 or not isinstance(ready_at, str):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration queue entry"
+            )
+        try:
+            instant = datetime.fromisoformat(ready_at)
+            if instant.tzinfo is None or instant.utcoffset() is None:
+                raise ValueError("ready_at must include a UTC offset")
+            order = (instant.astimezone(UTC), number)
+        except (ValueError, OverflowError) as error:
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration ready_at"
+            ) from error
+        if number in queued or (previous is not None and order <= previous):
+            raise IncompatibleRunStateError(
+                "legacy state has an unordered or duplicate Ticket integration queue"
+            )
+        job = jobs.get(str(number))
+        if (
+            not isinstance(job, dict)
+            or type(job.get("ticket_number")) is not int
+            or job["ticket_number"] != number
+            or job.get("phase") != "ready_for_integration"
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has a Ticket integration queue/Job mismatch"
+            )
+        queued.add(number)
+        previous = order
+
+    if holder in queued:
+        raise IncompatibleRunStateError(
+            "legacy state has a Ticket in both integration seat and queue"
+        )
+    if holder is not None:
+        job = jobs.get(str(holder))
+        if (
+            not isinstance(job, dict)
+            or type(job.get("ticket_number")) is not int
+            or job["ticket_number"] != holder
+            or job.get("phase") not in INTEGRATION_HOLDER_PHASES
+            or (
+                job.get("phase") in {"candidate", "reviewing"}
+                and job.get("attempt_kind") != "ci_repair"
+            )
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has a Ticket integration holder/Job mismatch"
+            )
+
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        phase = job.get("phase")
+        number = job.get("ticket_number")
+        resume_phase = job.get("integration_resume_phase")
+        if resume_phase is not None and (
+            resume_phase != "publishing"
+            or phase != "ready_for_integration"
+            or not job.get("publication_operation_retry_history")
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket integration resume phase"
+            )
+        if phase == "ready_for_integration" and (
+            type(number) is not int or number not in queued
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an unqueued ready Ticket Job"
+            )
+        if phase in INTEGRATION_HOLDER_PHASES - {"candidate", "reviewing"} and number != holder:
+            raise IncompatibleRunStateError(
+                "legacy state has a Ticket Job outside its integration seat"
+            )
+
+    active = state.get("active_ticket_job")
+    if active is not None:
+        number = active.get("ticket_number") if isinstance(active, dict) else None
+        if type(number) is not int or number < 1 or jobs.get(str(number)) != active:
+            raise IncompatibleRunStateError(
+                "legacy state has an inconsistent active Ticket gate mirror"
+            )
+
+
 def _require_ticket_graph(graph: dict[str, Any]) -> None:
     if graph.get("revision") is not None and not isinstance(graph.get("revision"), str):
         raise IncompatibleRunStateError("legacy state has an invalid ticket_graph.revision")
@@ -1611,6 +1743,22 @@ def _require_semantic_attempt_owners(state: dict[str, Any]) -> None:
 def _require_owner_publication_operation_retry(
     owner: dict[str, Any], *, location: str, publication_capable: bool
 ) -> None:
+    history = owner.get("publication_operation_retry_history", [])
+    if not isinstance(history, list):
+        raise IncompatibleRunStateError(
+            f"legacy state has invalid {location}.publication_operation_retry_history"
+        )
+    for index, entry in enumerate(history):
+        try:
+            prior = require_publication_operation_retry(
+                entry, location=f"{location}.publication_operation_retry_history[{index}]"
+            )
+        except ValueError as error:
+            raise IncompatibleRunStateError(f"legacy state has invalid {error}") from error
+        if prior["attempts"] != prior["limit"]:
+            raise IncompatibleRunStateError(
+                f"legacy state has non-exhausted {location}.publication_operation_retry_history"
+            )
     value = owner.get("publication_operation_retry")
     if value is None:
         if owner.get("phase") == "publication_pending":
