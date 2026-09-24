@@ -346,6 +346,7 @@ def record_session_interruption(
         )
         state["active_agent_invocation"] = failed
         _sync_invocation_history(state, failed)
+    _interrupt_ticket_invocations(state, "session_interrupted")
     diagnostic: dict[str, Any] = {
         "code": "session_interrupted",
         "message": "Executor Session 已退出；保留现场并等待显式 Resume",
@@ -411,6 +412,7 @@ def record_operator_stop(
         )
         state["active_agent_invocation"] = failed
         _sync_invocation_history(state, failed)
+    _interrupt_ticket_invocations(state, "operator_stopped")
     state.update(
         {
             "status": "operator_stopped",
@@ -424,6 +426,23 @@ def record_operator_stop(
         }
     )
     save(state)
+
+
+def _interrupt_ticket_invocations(state: dict[str, Any], reason: str) -> None:
+    invocations = state.get("ticket_agent_invocations")
+    if not isinstance(invocations, dict):
+        return
+    for number, active in list(invocations.items()):
+        if not isinstance(active, dict) or active.get("status") not in {"running", "resuming"}:
+            continue
+        failed = dict(active)
+        failed.update({
+            "status": "failed",
+            "interruption_observed_at": datetime.now(UTC).isoformat(),
+            "error": reason,
+        })
+        invocations[number] = failed
+        _sync_invocation_history(state, failed)
 
 
 def restore_operator_stop(state: dict[str, Any]) -> None:

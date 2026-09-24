@@ -101,6 +101,7 @@ def _seed_run(
     policy_overrides: dict[str, Any] = {}
     for option, key in (
         ("--ticket-review-rounds", "ticket_review_rounds"),
+        ("--ticket-development-workers", "ticket_development_workers"),
         ("--parent-only-paired-rounds", "parent_only_paired_rounds"),
         ("--run-repair-rounds", "run_repair_rounds"),
     ):

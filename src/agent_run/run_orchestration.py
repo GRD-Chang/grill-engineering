@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agent_run.operator_gate import (
     has_run_operator_gate,
@@ -8,6 +8,7 @@ from agent_run.operator_gate import (
 )
 from agent_run.revisions import TicketGraphDriftError
 from agent_run.ticket_queue import next_ticket
+from agent_run.ticket_development_state import parallel_delivery_state_lock
 
 
 class RunController(Protocol):
@@ -16,6 +17,11 @@ class RunController(Protocol):
 
 class TicketEngine(Protocol):
     def deliver(self, run_id: str) -> dict[str, Any]: ...
+
+    def develop_frontier(
+        self, run_id: str, state: dict[str, Any],
+        *, after_lane: Callable[[frozenset[int]], None] | None = None,
+    ) -> bool: ...
 
 
 class DeliveryRunEngine:
@@ -36,9 +42,29 @@ class DeliveryRunEngine:
     ) -> dict[str, Any]:
         idle_tickets: set[int] = set()
         while state.get("active_ticket_job") is not None:
+            parallel = getattr(self.tickets, "develop_frontier", None)
+            if callable(parallel) and parallel(
+                run_id, state,
+                after_lane=lambda lanes: self._integrate_ready_ticket(run_id, lanes),
+            ):
+                state, _ = self.controller.resume(run_id)
+                if state.get("status") in {
+                    "requeue_required", "operator_stopped", "execution_failed",
+                    "unsupported_scope_change", "deterministic_contradiction",
+                }:
+                    return state
+                if state.get("active_ticket_job") is None:
+                    return state
             active_before = state["active_ticket_job"]
             number = active_before.get("ticket_number")
-            if isinstance(number, int) and number in idle_tickets:
+            ready_for_freed_seat = (
+                active_before.get("phase") == "ready_for_integration"
+                and state.get("ticket_integration_holder") is None
+                and isinstance(state.get("ticket_integration_queue"), list)
+                and bool(state["ticket_integration_queue"])
+                and state["ticket_integration_queue"][0].get("ticket_number") == number
+            )
+            if isinstance(number, int) and number in idle_tickets and not ready_for_freed_seat:
                 return state
             try:
                 result = self.tickets.deliver(run_id)
@@ -90,3 +116,21 @@ class DeliveryRunEngine:
             ):
                 return state
         return state
+
+    def _integrate_ready_ticket(
+        self, run_id: str, lanes: frozenset[int]
+    ) -> None:
+        """Use a freed integration seat while other development lanes run."""
+        with parallel_delivery_state_lock:
+            state, _ = self.controller.resume(run_id)
+            job = state.get("active_ticket_job")
+        if (
+            isinstance(job, dict)
+            and job.get("phase") == "ready_for_integration"
+            and state.get("ticket_integration_holder") is None
+        ):
+            deliver_parallel = getattr(self.tickets, "deliver_with_parallel_lanes", None)
+            if callable(deliver_parallel):
+                deliver_parallel(run_id, lanes)
+            else:
+                self.tickets.deliver(run_id)

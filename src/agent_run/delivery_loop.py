@@ -405,11 +405,13 @@ class TicketDeliveryLoop:
         states: StateStore,
         github: GitHubPublisher,
         agents: AgentBackend,
+        development_only: bool = False,
     ) -> None:
         self.git = git
         self.states = states
         self.github = github
         self.agents = agents
+        self.development_only = development_only
         self.adapter = TicketDeliveryAdapter(git, github)
         self.publisher = TicketDeliveryPublisher(self)
 
@@ -436,6 +438,7 @@ class TicketDeliveryLoop:
             adapter=self.adapter,
             publisher=self.publisher,
             state_store=ChangeDeliveryStateStore(self.states, str(state["run_id"])),
+            development_only=self.development_only,
         )
 
     def _invalidate_stale(

@@ -135,6 +135,7 @@ class ChangeDeliveryEngine:
         adapter: ChangeDeliveryAdapter,
         publisher: ChangeDeliveryPublisher,
         state_store: ChangeDeliveryStateStore,
+        development_only: bool = False,
     ) -> None:
         self.git = git
         self.github = github
@@ -143,12 +144,46 @@ class ChangeDeliveryEngine:
         self.adapter = adapter
         self.publisher = publisher
         self.state_store = state_store
+        self.development_only = development_only
         self._current_job: dict[str, Any] | None = None
+
+    def _pause_ticket_if_requested(
+        self, state: dict[str, Any], job: dict[str, Any]
+    ) -> bool:
+        if not self.contract.label.startswith("ticket-") or job.get("phase") in {
+            "completed", "merged", "blocked", "escalating", "committing_candidate",
+            "publishing", "waiting_merge", "merging",
+        }:
+            return False
+        latest = self.state_store.states.load_current_run(str(state["run_id"]))
+        if latest is None:
+            raise ValueError("Delivery Run disappeared at Ticket pause boundary")
+        requests = latest.get("ticket_pause_requests")
+        number = str(job["ticket_number"])
+        if not isinstance(requests, dict) or number not in requests:
+            return False
+        state["ticket_pause_requests"] = dict(requests)
+        state["ticket_pause_requests"].pop(number, None)
+        job["pause_resume_phase"] = job["phase"]
+        job["phase"] = "blocked"
+        job["blocked_reason"] = "ticket_paused"
+        state.update({"status": "blocked", "terminal_kind": None, "diagnostics": [{
+            "code": "ticket_paused",
+            "message": "Ticket paused at a delivery boundary",
+            "ticket_number": job["ticket_number"],
+        }]})
+        self.save(state)
+        return True
 
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         if self.contract.label.startswith("ticket-") and self._current_job is not None:
             if self._current_job.get("phase") == "accepted":
-                acquire_ticket_slot(state, self._current_job)
+                if self.development_only:
+                    from agent_run.ticket_queue import enqueue
+
+                    enqueue(state, self._current_job)
+                else:
+                    acquire_ticket_slot(state, self._current_job)
             reconcile_ticket_slot(state, self._current_job)
         return self.state_store.save(state)
 
@@ -171,11 +206,15 @@ class ChangeDeliveryEngine:
         try:
             ensure_budget(job, self.review_budget_policy())
             while True:
+                if self._pause_ticket_if_requested(state, job):
+                    return state
                 self._require_ticket_publication_authorization(job)
                 phase = str(job["phase"])
                 if phase in {"completed", "blocked"}:
                     return state
                 if phase == "ready_for_integration":
+                    if self.development_only:
+                        return state
                     if not acquire_ticket_slot(state, job):
                         return state
                     self.save(state)
@@ -195,6 +234,8 @@ class ChangeDeliveryEngine:
                     return self.save(state)
                 if phase in {"developing", "repairing"}:
                     self._develop(state, job, checkout)
+                    if self._pause_ticket_if_requested(state, job):
+                        return state
                     if job["phase"] in {"blocked", "escalating"}:
                         continue
                 if job["phase"] == "committing_candidate":
@@ -205,6 +246,8 @@ class ChangeDeliveryEngine:
                         "Candidate was not created after requirements changed",
                     )
                     if not self._commit_candidate(state, job, checkout):
+                        return state
+                    if self._pause_ticket_if_requested(state, job):
                         return state
                 if job["phase"] == "candidate":
                     if (
@@ -258,6 +301,8 @@ class ChangeDeliveryEngine:
                         )
                         continue
                     self._review(state, job, checkout)
+                    if self._pause_ticket_if_requested(state, job):
+                        return state
                     if job["phase"] == "escalating":
                         # Budget exhaustion is a durable terminal boundary;
                         # process it before the Run Repair adapter asks the
@@ -274,6 +319,8 @@ class ChangeDeliveryEngine:
                         self.save(state)
                     continue
                 if job["phase"] == "accepted":
+                    if self.development_only:
+                        return state
                     if self._can_resume_integrated_publication(job):
                         job["phase"] = "merged"
                         self.save(state)

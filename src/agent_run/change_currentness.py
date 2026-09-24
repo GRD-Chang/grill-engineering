@@ -170,7 +170,12 @@ def candidate_or_acceptance_is_inconsistent(job: dict[str, Any]) -> bool:
             "committing_candidate",
             "candidate",
             "reviewing",
+            "ready_for_integration",
         }
+        or (
+            job.get("phase") == "ready_for_integration"
+            and job.get("attempt_kind") != "ci_repair"
+        )
         or reviewed_candidate != job.get("last_review_candidate_sha")
     ):
         return True

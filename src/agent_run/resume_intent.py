@@ -72,15 +72,29 @@ def bind_resume_intent(
         if location.startswith("ticket:")
         and subject.get("phase") == "publication_pending"
     ]
+    ticket_failure = [
+        (location, subject) for location, subject in gates
+        if location.startswith("ticket:")
+        and subject.get("blocked_reason") == "ticket_execution_failed"
+    ]
+    ticket_pause = [
+        (location, subject) for location, subject in gates
+        if location.startswith("ticket:")
+        and subject.get("blocked_reason") == "ticket_paused"
+    ]
     if ticket_number is not None and not any(
-        (checkpoints, human, resync, ci_recovery, publication_retry)
+        (checkpoints, human, resync, ci_recovery, publication_retry,
+         ticket_failure, ticket_pause)
     ):
         raise ResumeIntentError("指定 Ticket 没有受支持的局部恢复边界")
     if (
         len(checkpoints) > 1 or len(human) > 1 or len(resync) > 1
         or len(ci_recovery) > 1 or len(publication_retry) > 1
+        or len(ticket_failure) > 1
+        or len(ticket_pause) > 1
         or sum(bool(group) for group in (
-            checkpoints, human, resync, ci_recovery, publication_retry
+            checkpoints, human, resync, ci_recovery, publication_retry,
+            ticket_failure, ticket_pause,
         )) > 1
     ):
         raise ResumeIntentError("resume 暂停对象不唯一；拒绝推断恢复授权")
@@ -99,6 +113,12 @@ def bind_resume_intent(
     elif publication_retry:
         reason, authorization = "publication_operation_retry", "renew_publication_operation_retry"
         subjects = publication_retry
+    elif ticket_failure:
+        reason, authorization = "ticket_execution_failed", "continue_ticket"
+        subjects = ticket_failure
+    elif ticket_pause:
+        reason, authorization = "ticket_paused", "continue_ticket"
+        subjects = ticket_pause
     else:
         reason = str(state.get("status"))
         parent_job = state.get("parent_job")

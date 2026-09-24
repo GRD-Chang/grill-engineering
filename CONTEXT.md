@@ -512,7 +512,7 @@ _Avoid_: Ticket 自动修复、Run 暂停、默认分支回滚
 _Avoid_: Ticket、Attempt、Codex Thread
 
 **Active Ticket Job（活跃 Ticket 任务）**:
-Controller 当前交给共享 Engine 推进的 Ticket Job 指针。一个 Run 可保存多个独立 Ticket Job，并在有效依赖解除后推进最多达到 Run Policy Snapshot 中 `ticket_development_workers` 上限的开发及原有审核工作；内置默认值为 3，配置为 1 时顺序推进。目前 Agent Invocation 仍串行执行。排队等待、CI 观测与集成席位不占开发 Worker。`active_ticket_job` 只表示当前执行指针，不代表其他 Ticket 不可恢复或未在开发集合中。
+Controller 当前交给共享 Engine 推进的 Ticket Job 指针。一个 Run 可保存多个独立 Ticket Job，并在有效依赖解除后并行推进最多达到 Run Policy Snapshot 中 `ticket_development_workers` 上限的开发及原有审核工作；内置默认值为 3，配置为 1 时顺序推进。该上限计 Ticket 开发/审核 lane，不计所有子进程。排队等待、CI 观测与集成席位不占开发 Worker。`ticket_jobs` 与 `ticket_agent_invocations` 保存按 Ticket 隔离的事实，`active_ticket_job` 与 `active_agent_invocation` 是当前选中 Ticket 的兼容投影；StateStore 在单一提交边界归并独立 Ticket，集成仍持单席位。
 _Avoid_: 把当前指针当成唯一 Ticket Job、让等待 CI 占开发 Worker、由 Agent 决定调度
 
 **Ticket Integration Queue（Ticket 集成队列）**:

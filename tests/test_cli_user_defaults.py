@@ -519,7 +519,20 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
     configured = capsys.readouterr().out
     assert ("个人运行默认配置" if language == "zh" else "Personal Run defaults") in configured
     assert ("语言: " if language == "zh" else "Language: ") + language in configured
-    for arguments in (["--help"], ["run", "--help"], ["settings", "configure", "--help"]):
+    ticket_help = {
+        "resume": {
+            "zh": "选择要恢复的局部 Ticket 门禁",
+            "en": "Ticket gate to resume",
+        },
+        "stop": {
+            "zh": "只暂停指定 Ticket",
+            "en": "Pause only the selected Ticket",
+        },
+    }
+    for arguments in (
+        ["--help"], ["run", "--help"], ["resume", "--help"],
+        ["stop", "--help"], ["settings", "configure", "--help"],
+    ):
         with pytest.raises(SystemExit) as exit_info:
             cli.main(arguments)
         assert exit_info.value.code == 0
@@ -528,6 +541,9 @@ def test_cli_help_settings_errors_and_method_receipt_follow_personal_language(
         assert ("显示此帮助并退出" if language == "zh" else "show this help message and exit") in output
         if language == "en":
             assert not re.search(r"[\u4e00-\u9fff]", output)
+        if arguments[0] in {"resume", "stop"}:
+            assert "--ticket" in output
+            assert ticket_help[arguments[0]][language] in output
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["run", "0"])
     assert exit_info.value.code == 2

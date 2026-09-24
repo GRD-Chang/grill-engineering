@@ -10,6 +10,7 @@ import pytest
 
 from agent_run.run_locator import MAX_LOCATOR_ENTRIES, RunLocatorIndex
 from agent_run.state import (
+    ConcurrentRunStateError,
     MAX_DIAGNOSTIC_BYTES,
     MAX_DIAGNOSTIC_ENTRIES,
     MAX_RUN_STATE_BYTES,
@@ -36,6 +37,32 @@ def test_run_state_reads_pretty_json_and_saves_the_same_data_compactly(
     assert store.load_run("run-1") == state
     assert loaded == state
     assert len(path.read_bytes()) < len(original.encode("utf-8"))
+
+
+def test_parallel_lane_context_only_affects_its_run(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save_run("other", {"version": 1})
+
+    with store.preserve_parallel_ticket_lanes("parallel", frozenset({2})):
+        store.save_run("other", {"version": 2})
+
+    assert store.load_run("other") == {"version": 2}
+
+
+def test_controller_refresh_rejects_a_concurrent_run_write(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state")
+    store.save_run("run-1", {"version": 1})
+    baseline = store.load_run("run-1")
+    assert baseline is not None
+
+    with store.require_unchanged_run("run-1", baseline):
+        store.save_run("run-1", {"version": 2})
+        store.save_run("run-1", {"version": 3})
+        StateStore(store.root).save_run("run-1", {"version": 4})
+        with pytest.raises(ConcurrentRunStateError, match="changed"):
+            store.save_run("run-1", {"version": 5})
+
+    assert store.load_run("run-1") == {"version": 4}
 
 
 def test_run_state_persistence_rejects_oversized_write_and_read(

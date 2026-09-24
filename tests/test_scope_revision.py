@@ -9,6 +9,7 @@ import pytest
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.controller import Controller
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.external_supervision import ensure_supervision_window
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
@@ -73,7 +74,10 @@ def test_noncurrent_ticket_revision_stops_run_before_independent_delivery(
     }), encoding="utf-8")
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), git, states,
+        delivery_policy=DeliveryPolicy(ticket_development_workers=1),
+    )
     started, _ = controller.start(1)
     engine = DeliveryRunEngine(
         controller=controller,

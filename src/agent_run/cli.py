@@ -200,7 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(resume)
     _add_policy_options(resume, allow_thread_policy=False)
     resume.add_argument("--json", action="store_true", dest="as_json")
-    resume.add_argument("--ticket", type=_positive_integer, help="选择要恢复的局部 Ticket 门禁")
+    resume.add_argument("--ticket", type=_positive_integer, help=cli_message('cli.resume_ticket_help'))
     resume.add_argument("--agent-fixture", help=argparse.SUPPRESS)
     resume.add_argument(
         "--new-thread",
@@ -252,6 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=cli_message('cli.selector_help'),
     )
     _add_common_options(stop)
+    stop.add_argument("--ticket", type=_positive_integer, help=cli_message('cli.stop_ticket_help'))
     stop.add_argument("--json", action="store_true", dest="as_json")
     abandon = subcommands.add_parser("abandon", help=cli_message('cli.abandon_help'))
     abandon.add_argument(
@@ -514,6 +515,26 @@ def _main_with_parser_resources(
             parsed.parent = selected_parent_number
         if parsed.command in {"configure", "config", "profile"}:
             return _configure_profile(parsed)
+        if parsed.command == "stop" and parsed.ticket is not None:
+            from agent_run.ticket_pause import request_ticket_pause
+
+            paused = request_ticket_pause(states, parsed.run_id, parsed.ticket)
+            result = {
+                "run_id": paused["run_id"],
+                "status": paused["status"],
+                "ticket_number": parsed.ticket,
+                "pause_requested": str(parsed.ticket) in paused["ticket_pause_requests"],
+                "ticket_phase": paused["ticket_jobs"][str(parsed.ticket)]["phase"],
+            }
+            if parsed.as_json:
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            else:
+                print(text(
+                    "cli.ticket_pause_requested" if result["pause_requested"]
+                    else "cli.ticket_paused",
+                    language=selected_language(paused), ticket_number=parsed.ticket,
+                ))
+            return 0
         executor_binding = _executor_binding_from_environment()
         if resume_feedback is not None and executor_binding is not None:
             resume_feedback.identity = executor_binding[0]
@@ -2718,6 +2739,7 @@ def _reconcile_resume_exit(
         and (
             executor.get("status") in {"running", "starting"}
             or isinstance(executor.get("worker"), Mapping)
+            or isinstance(executor.get("workers"), list)
             or (
                 # A previous reconciliation can commit the Host exit before
                 # the Run interruption save fails. Recheck its concrete process

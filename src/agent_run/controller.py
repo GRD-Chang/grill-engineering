@@ -76,13 +76,13 @@ from agent_run.semantic_attempt import (
     invocation_attempt_is_pending,
     invocation_is_explicitly_resumable,
 )
-from agent_run.state import StateStore
+from agent_run.state import ConcurrentRunStateError, StateStore
 from agent_run.state_contract import (
     IncompatibleRunStateError,
     human_blocker_subject_count,
     require_current_run_state,
 )
-from agent_run.task_control import TASK_CONTROL_PROTOCOL
+from agent_run.task_control import TASK_CONTROL_PROTOCOL, TaskControlBusyError
 from agent_run.ticket_eligibility import TicketEligibilityError, label_blocker
 from agent_run.ticket_phase import sync_active_ticket_job
 from agent_run.ticket_queue import acquire as acquire_ticket_slot, reconcile_all as reconcile_ticket_slots
@@ -254,6 +254,74 @@ class Controller:
         )
 
     def resume(
+        self,
+        run_id: str,
+        *,
+        resume_human_blocker: bool = False,
+        new_thread: bool = False,
+        human_response: str | None = None,
+        message: str | None = None,
+        explicit_resume: bool = False,
+        record_explicit_resume_audit: bool = True,
+        resume_budget_checkpoint: bool = False,
+        prepare_state: Callable[[dict[str, Any]], None] | None = None,
+        budget_policy: DeliveryPolicy | None = None,
+        validate_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        ticket_number: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        automatic_refresh = not any((
+            resume_human_blocker, explicit_resume, resume_budget_checkpoint,
+            new_thread, ticket_number is not None,
+            human_response is not None, message is not None,
+            prepare_state is not None, validate_resume_state is not None,
+        ))
+        attempts = 3 if automatic_refresh else 1
+        for attempt in range(attempts):
+            baseline = self._load_run(run_id)
+            try:
+                with self.states.require_unchanged_run(run_id, baseline):
+                    result = self._resume_once(
+                        run_id,
+                        resume_human_blocker=resume_human_blocker,
+                        new_thread=new_thread,
+                        human_response=human_response,
+                        message=message,
+                        explicit_resume=explicit_resume,
+                        record_explicit_resume_audit=record_explicit_resume_audit,
+                        resume_budget_checkpoint=resume_budget_checkpoint,
+                        prepare_state=prepare_state,
+                        budget_policy=budget_policy,
+                        validate_resume_state=validate_resume_state,
+                        ticket_number=ticket_number,
+                    )
+                    latest = self.states.load_unchanged_run(run_id)
+                    if latest is not None and any(
+                        result[0].get(key) != latest.get(key)
+                        for key in (
+                            "status", "terminal_kind", "operator_stop", "diagnostics",
+                            "ticket_jobs", "ticket_pause_requests",
+                            "ticket_integration_queue", "ticket_integration_holder",
+                            "active_ticket_job",
+                        )
+                    ):
+                        raise ConcurrentRunStateError(
+                            "Run changed before Controller returned its refresh"
+                        )
+                    return result
+            except ConcurrentRunStateError as error:
+                latest = self.states.load_current_run(run_id)
+                if automatic_refresh and latest is not None and latest.get("status") in {
+                    "operator_stopped", "abandoned", "abandonment_pending",
+                    "completed", "supervision_timeout",
+                }:
+                    return latest, True
+                if attempt + 1 == attempts:
+                    raise TaskControlBusyError(
+                        "Run changed during Controller refresh; retry the operation"
+                    ) from error
+        raise AssertionError("Controller refresh retry limit was not enforced")
+
+    def _resume_once(
         self,
         run_id: str,
         *,
@@ -511,6 +579,14 @@ class Controller:
                 state, ticket_number=ticket_number
             )
         if explicit_resume and not budget_resumed:
+            budget_resumed = _resume_ticket_execution_failure(
+                state, ticket_number=ticket_number
+            )
+        if explicit_resume and not budget_resumed:
+            budget_resumed = _resume_ticket_pause(
+                state, ticket_number=ticket_number
+            )
+        if explicit_resume and not budget_resumed:
             active_ticket = state.get("active_ticket_job")
             if (
                 ticket_number is not None
@@ -608,6 +684,8 @@ class Controller:
             _restore_current_invocation_thread(
                 state, allow_completed=resume_completed_invocation
             )
+        if explicit_resume and ticket_number is None:
+            _restore_parallel_ticket_invocations(state)
         _mark_failed_invocation_resuming(state)
         if resumed_subject:
             _reactivate_resumed_ticket(state)
@@ -1372,7 +1450,9 @@ class Controller:
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
             "delivery_policy_protocol": DELIVERY_POLICY_PROTOCOL,
-            "multi_ticket_protocol": 1,
+            "multi_ticket_protocol": 2,
+            "ticket_agent_invocations": {},
+            "ticket_pause_requests": {},
             "semantic_attempt_protocol": 1,
             "human_response_audit_protocol": 1,
             "lifecycle_action_protocol": TASK_CONTROL_PROTOCOL,
@@ -1843,6 +1923,82 @@ def _is_ready_human_blocker(value: object) -> bool:
     )
 
 
+def _resume_ticket_pause(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return False
+    paused = [
+        job for job in jobs.values()
+        if isinstance(job, dict)
+        and job.get("phase") == "blocked"
+        and job.get("blocked_reason") == "ticket_paused"
+        and (ticket_number is None or job.get("ticket_number") == ticket_number)
+    ]
+    if not paused:
+        return False
+    if len(paused) != 1:
+        raise ValueError("multiple Ticket pauses require --ticket")
+    job = paused[0]
+    phase = job.pop("pause_resume_phase", None)
+    if phase not in {
+        "developing", "repairing", "candidate", "reviewing", "accepted",
+        "ready_for_integration", "waiting_checks", "publication_pending",
+    }:
+        raise ValueError("Ticket pause has no recoverable phase")
+    job["phase"] = phase
+    job.pop("blocked_reason", None)
+    state["ticket_pause_requests"].pop(str(job["ticket_number"]), None)
+    state["active_ticket_job"] = job
+    if phase in {"accepted", "waiting_checks"}:
+        job["integration_resume_phase"] = phase
+        phase = "ready_for_integration"
+        job["phase"] = phase
+    if phase == "ready_for_integration":
+        from agent_run.ticket_queue import enqueue
+
+        enqueue(state, job)
+    state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+    sync_active_ticket_job(state)
+    return True
+
+
+def _resume_ticket_execution_failure(
+    state: dict[str, Any], *, ticket_number: int | None = None
+) -> bool:
+    jobs = state.get("ticket_jobs")
+    if not isinstance(jobs, dict):
+        return False
+    paused = [
+        job for job in jobs.values()
+        if isinstance(job, dict)
+        and job.get("phase") == "blocked"
+        and job.get("blocked_reason") == "ticket_execution_failed"
+        and (ticket_number is None or job.get("ticket_number") == ticket_number)
+    ]
+    if not paused:
+        return False
+    if len(paused) != 1:
+        raise ValueError("multiple Ticket execution failures require --ticket")
+    job = paused[0]
+    phase = job.pop("execution_resume_phase", None)
+    if phase not in {
+        "developing", "repairing", "committing_candidate", "candidate", "reviewing",
+    }:
+        raise ValueError("Ticket execution failure has no recoverable phase")
+    job["phase"] = phase
+    job.pop("blocked_reason", None)
+    job.pop("execution_failure", None)
+    state["active_ticket_job"] = job
+    invocations = state.get("ticket_agent_invocations")
+    if isinstance(invocations, dict):
+        state["active_agent_invocation"] = invocations.get(str(job["ticket_number"]))
+    state.update({"status": "active", "terminal_kind": None, "diagnostics": []})
+    sync_active_ticket_job(state)
+    return True
+
+
 def _resume_ticket_publication_retry(
     state: dict[str, Any], *, ticket_number: int | None = None
 ) -> bool:
@@ -2307,6 +2463,36 @@ def _mark_failed_invocation_resuming(state: dict[str, Any]) -> None:
     invocation = state.get("active_agent_invocation")
     if isinstance(invocation, dict) and invocation.get("status") == "failed":
         invocation["status"] = "resuming"
+    invocations = state.get("ticket_agent_invocations")
+    if isinstance(invocations, dict):
+        for ticket_invocation in invocations.values():
+            if (
+                isinstance(ticket_invocation, dict)
+                and ticket_invocation.get("status") == "failed"
+                and ticket_invocation.get("error") in {
+                    "operator_stopped", "session_interrupted"
+                }
+            ):
+                ticket_invocation["status"] = "resuming"
+
+
+def _restore_parallel_ticket_invocations(state: dict[str, Any]) -> None:
+    invocations = state.get("ticket_agent_invocations")
+    if not isinstance(invocations, dict):
+        return
+    selected = state.get("active_agent_invocation")
+    for invocation in invocations.values():
+        if (
+            isinstance(invocation, dict)
+            and invocation.get("status") == "failed"
+            and invocation.get("error") in {
+                "operator_stopped", "session_interrupted"
+            }
+            and invocation is not selected
+        ):
+            state["active_agent_invocation"] = invocation
+            _restore_current_invocation_thread(state)
+    state["active_agent_invocation"] = selected
 
 
 def _run_acceptance_for_invocation(

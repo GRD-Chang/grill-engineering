@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from typing import Any, Callable
 
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery import ensure_change_branch_authority
@@ -27,6 +29,13 @@ from agent_run.ticket_phase import (
     sync_active_ticket_job,
 )
 from agent_run.ticket_queue import reconcile as reconcile_ticket_slot
+from agent_run.ticket_development_state import TicketDevelopmentState
+from agent_run.task_control import TaskControlBusyError
+from agent_run.revisions import TicketGraphDriftError
+from agent_run.state_contract import IncompatibleRunStateError
+
+
+_ticket_checkout_preparation = Lock()
 
 
 class TicketDeliveryEngine:
@@ -37,16 +46,100 @@ class TicketDeliveryEngine:
         states: StateStore,
         github: GitHubPublisher,
         agents: AgentBackend,
+        development_only: bool = False,
     ) -> None:
         self.git = git
         self.states = states
         self.github = github
         self.agents = agents
+        self.development_only = development_only
+
+    def develop_frontier(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        after_lane: Callable[[frozenset[int]], None] | None = None,
+    ) -> bool:
+        """Run one bounded batch of independent demand Dev/Review lanes."""
+        policy = state.get("policy_snapshot")
+        limit = policy.get("ticket_development_workers", 3) if isinstance(policy, dict) else 3
+        if type(limit) is not int or limit <= 1:
+            return False
+        jobs = state.get("ticket_jobs", {})
+        if not isinstance(jobs, dict):
+            return False
+        candidates = [
+            number for number in state.get("frontier", [])
+            if type(number) is int
+            and (
+                not isinstance(jobs.get(str(number)), dict)
+                or jobs[str(number)].get("phase") is None
+                or jobs[str(number)].get("phase") in {
+                    "developing", "repairing", "committing_candidate",
+                    "candidate", "reviewing",
+                }
+            )
+            and not (
+                isinstance(jobs.get(str(number)), dict)
+                and jobs[str(number)].get("attempt_kind") == "ci_repair"
+            )
+        ][:limit]
+        if len(candidates) < 2:
+            return False
+
+        def advance(number: int) -> None:
+            scoped = TicketDevelopmentState(self.states, run_id, number)
+            try:
+                TicketDeliveryEngine(
+                    git=self.git,
+                    states=scoped,  # type: ignore[arg-type]
+                    github=self.github,
+                    agents=self.agents,
+                    development_only=True,
+                ).deliver(run_id)
+            except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError):
+                raise
+            except Exception as error:
+                scoped.block_execution_failure(error)
+
+        with ThreadPoolExecutor(max_workers=len(candidates), thread_name_prefix="ticket-dev") as pool:
+            futures = {pool.submit(advance, number): number for number in candidates}
+            for future in as_completed(futures):
+                future.result()
+                if after_lane is not None:
+                    after_lane(frozenset(
+                        number for pending, number in futures.items()
+                        if not pending.done()
+                    ))
+        return True
+
+    def deliver_with_parallel_lanes(
+        self, run_id: str, lanes: frozenset[int]
+    ) -> dict[str, Any]:
+        """Also preserve lanes that may not have a durable Job yet."""
+        with self.states.preserve_parallel_ticket_lanes(run_id, lanes):
+            return self.deliver(run_id)
 
     def deliver(self, run_id: str) -> dict[str, Any]:
         state = self.states.load_current_run(run_id)
         if state is None:
             raise ValueError(f"unknown Delivery Run: {run_id}")
+        if self.development_only:
+            return self._deliver_loaded(run_id, state)
+        active = state.get("active_ticket_job")
+        active_number = active.get("ticket_number") if isinstance(active, dict) else None
+        jobs = state.get("ticket_jobs", {})
+        other_numbers = frozenset(
+            job["ticket_number"] for job in jobs.values()
+            if isinstance(job, dict)
+            and type(job.get("ticket_number")) is int
+            and job["ticket_number"] != active_number
+        )
+        with self.states.preserve_parallel_ticket_lanes(run_id, other_numbers):
+            return self._deliver_loaded(run_id, state)
+
+    def _deliver_loaded(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
         job = self._job(state)
         # Restore the in-memory mirror before shared stages save a recovered
         # Job; merge recovery intentionally performs no branch-intent write.
@@ -86,18 +179,30 @@ class TicketDeliveryEngine:
             checkout, str(job["ticket_branch"])
         )
         try:
-            self._ensure_ticket_branch(state, job)
-            self.git.prepare_ticket_checkout(
-                branch=str(job["ticket_branch"]),
-                base_sha=str(job["base_sha"]),
-                checkout=checkout,
-            )
+            if self.development_only:
+                # Git worktree metadata and the initial remote branch fixture
+                # are shared even though each Ticket checkout is separate.
+                with _ticket_checkout_preparation:
+                    self._ensure_ticket_branch(state, job)
+                    self.git.prepare_ticket_checkout(
+                        branch=str(job["ticket_branch"]),
+                        base_sha=str(job["base_sha"]),
+                        checkout=checkout,
+                    )
+            else:
+                self._ensure_ticket_branch(state, job)
+                self.git.prepare_ticket_checkout(
+                    branch=str(job["ticket_branch"]),
+                    base_sha=str(job["base_sha"]),
+                    checkout=checkout,
+                )
             checkout_prepared = True
             result = TicketDeliveryLoop(
                 git=self.git,
                 states=self.states,
                 github=self.github,
                 agents=self.agents,
+                development_only=self.development_only,
             ).run(state, job, checkout)
             if job.get("phase") == TicketPhase.COMPLETED.value:
                 result = DeliveryCleanupEngine(

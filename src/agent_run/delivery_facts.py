@@ -37,16 +37,18 @@ def ticket_progress(state: dict[str, Any]) -> dict[str, int]:
 def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
     """Project the persisted Ticket queue and local Job facts for status only."""
 
-    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 1:
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 2:
         return None
     if state.get("delivery_type") == "parent_only":
         return None
     graph = state.get("ticket_graph")
     tickets = graph.get("tickets") if isinstance(graph, dict) else None
     jobs = state.get("ticket_jobs")
+    invocations = state.get("ticket_agent_invocations")
     queue = state.get("ticket_integration_queue")
     ticket_map = tickets if isinstance(tickets, dict) else {}
     job_map = jobs if isinstance(jobs, dict) else {}
+    invocation_map = invocations if isinstance(invocations, dict) else {}
     queue_items = queue if isinstance(queue, list) else []
     queued = {
         item.get("ticket_number"): index + 1
@@ -120,6 +122,8 @@ def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
                 "modification_budget_exhausted", "review_budget_exhausted",
                 "ci_inner_budget_exhausted", "ci_outer_budget_exhausted",
                 "integration_resync_exhausted",
+                "ticket_execution_failed",
+                "ticket_paused",
             }:
                 action = "resume"
         parent = state.get("parent")
@@ -138,13 +142,28 @@ def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
             "queue_position": queued.get(number),
             "holds_integration": number == holder,
             "blocked_reason": reason,
+            "pause_requested": number in {
+                int(item) for item in state.get("ticket_pause_requests", {})
+                if isinstance(item, str) and item.isdecimal()
+            },
             "blocked_by": unresolved,
             "usage": usage,
             "recovery_action": action,
+            "invocation": {
+                "role": invocation_map[key].get("role"),
+                "status": invocation_map[key].get("status"),
+                "started_at": invocation_map[key].get("started_at"),
+            } if isinstance(invocation_map.get(key), dict) else None,
         })
     snapshot = state.get("policy_snapshot")
     return {
         "development_worker_limit": snapshot.get("ticket_development_workers") if isinstance(snapshot, dict) else None,
+        "development_workers_active": sum(
+            isinstance(invocation, dict)
+            and invocation.get("status") in {"running", "resuming"}
+            and invocation.get("role") in {"development", "fresh_acceptance"}
+            for invocation in invocation_map.values()
+        ),
         "integration_queue": [dict(item) for item in queue_items if isinstance(item, dict)],
         "integration_holder": holder,
         "tickets": details,

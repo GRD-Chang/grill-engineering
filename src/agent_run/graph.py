@@ -228,7 +228,7 @@ def state_from_graph(
                 else "completed" if status == "completed"
                 else "publication_pending" if status == "publication_pending"
                 else (
-                    _exhaustion_kind(diagnostics[0]["remaining_tickets"])
+                    _exhaustion_kind(diagnostics[0]["remaining_tickets"], ticket_jobs)
                     if status == "progress_exhausted"
                     else None
                 )
@@ -236,6 +236,12 @@ def state_from_graph(
             "updated_at": _now(),
         }
     )
+    if active is not None and type(active.get("ticket_number")) is int:
+        invocations = state.get("ticket_agent_invocations")
+        state["active_agent_invocation"] = (
+            invocations.get(str(active["ticket_number"]))
+            if isinstance(invocations, dict) else None
+        )
     return state
 
 
@@ -404,7 +410,15 @@ def _remaining_ticket_reasons(
     return remaining
 
 
-def _exhaustion_kind(remaining: list[dict[str, Any]]) -> str:
+def _exhaustion_kind(
+    remaining: list[dict[str, Any]], ticket_jobs: dict[str, dict[str, Any]]
+) -> str:
+    if any(
+        ticket_jobs.get(str(item["ticket_number"]), {}).get("phase")
+        == TicketPhase.BLOCKED.value
+        for item in remaining
+    ):
+        return "waiting_human"
     human_reasons = {
         "agent_requires_human",
         "reviewer_requires_human",

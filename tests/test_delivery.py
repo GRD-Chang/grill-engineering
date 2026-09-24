@@ -85,6 +85,7 @@ def test_change_delivery_seams_keep_facts_and_semantics_separate() -> None:
         "adapter",
         "publisher",
         "state_store",
+        "development_only",
     }
     for concrete in (
         TicketDeliveryAdapter,

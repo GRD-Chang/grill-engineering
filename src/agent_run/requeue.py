@@ -47,6 +47,9 @@ def requeue_change_job(state: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(jobs, dict):
             raise RequeueError("ticket_jobs must be an object")
         jobs.pop(ticket, None)
+        invocations = state.get("ticket_agent_invocations")
+        if isinstance(invocations, dict):
+            invocations.pop(ticket, None)
         state["active_ticket_job"] = None
         next_status = "active"
     elif subject.startswith("parent-only:"):

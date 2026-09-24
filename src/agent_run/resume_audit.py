@@ -246,6 +246,10 @@ def _resume_kind(
             return "budget_checkpoint"
         if reason == "integration_resync_exhausted":
             return "integration_resync"
+        if reason == "ticket_execution_failed":
+            return "execution_failure"
+        if reason == "ticket_paused":
+            return "operator_stopped"
         if job.get("phase") == "publication_pending":
             return "publication_operation_retry"
         raise ValueError("resume Ticket has no supported local recovery boundary")

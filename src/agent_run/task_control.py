@@ -460,6 +460,7 @@ class TaskControlStore:
                     and (
                         executor.get("status") in _ACTIVE_EXECUTOR_STATUSES
                         or isinstance(executor.get("worker"), Mapping)
+                        or isinstance(executor.get("workers"), list)
                     )
                     else None
                 )
@@ -625,19 +626,19 @@ class TaskControlStore:
                     raise ActionReconciliationError(
                         "Control Action Receipt target Run/generation 不匹配"
                     )
-                worker = target_executor.get("worker")
-                target_process = worker if isinstance(worker, Mapping) else target_executor
-                token = target_process.get("process_start_token")
-                if (
-                    type(target_process.get("pid")) is not int
-                    or not isinstance(token, str)
-                    or not token
-                    or token == "[REDACTED]"
-                ):
-                    raise ActionReconciliationError(
-                        "Control Action Receipt target 进程 identity 缺失；"
-                        "不会猜测目标已退出"
-                    )
+                workers = _executor_workers(target_executor)
+                for target_process in workers or [target_executor]:
+                    token = target_process.get("process_start_token")
+                    if (
+                        type(target_process.get("pid")) is not int
+                        or not isinstance(token, str)
+                        or not token
+                        or token == "[REDACTED]"
+                    ):
+                        raise ActionReconciliationError(
+                            "Control Action Receipt target 进程 identity 缺失；"
+                            "不会猜测目标已退出"
+                        )
         action = {
             "action_id": receipt["action_id"],
             "kind": receipt["kind"],
@@ -1106,7 +1107,7 @@ class TaskControlStore:
         pid: int,
         process_start_token: str,
     ) -> dict[str, Any]:
-        """Bind one active Worker process group to the exact Executor."""
+        """Bind a Worker process group to the exact Executor."""
 
         if type(pid) is not int or pid <= 0:
             raise TaskControlError("Worker PID must be positive")
@@ -1117,19 +1118,24 @@ class TaskControlStore:
             executor = _require_executor(record, action_id, generation)
             if executor.get("status") not in _ACTIVE_EXECUTOR_STATUSES:
                 raise ActionReconciliationError("Executor is not active")
-            worker = executor.get("worker")
-            if isinstance(worker, dict) and (
-                worker.get("pid") != pid
-                or worker.get("process_start_token") != process_start_token
-            ):
-                raise ActionReconciliationError("Executor already owns another Worker")
-            if isinstance(worker, dict):
-                return deepcopy(record)
-            executor["worker"] = {
+            workers = _executor_workers(executor)
+            for worker in workers:
+                if worker["pid"] == pid:
+                    if worker["process_start_token"] != process_start_token:
+                        raise ActionReconciliationError("Worker PID has another start token")
+                    return deepcopy(record)
+            binding = {
                 "pid": pid,
                 "process_start_token": process_start_token,
                 "started_at": _now(),
             }
+            if "workers" in executor:
+                executor["workers"].append(binding)
+            elif workers:
+                executor["workers"] = [workers[0], binding]
+                executor.pop("worker", None)
+            else:
+                executor["worker"] = binding
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)
@@ -1148,15 +1154,20 @@ class TaskControlStore:
         with self._locked(task):
             record = self._require_unlocked(task)
             executor = _require_executor(record, action_id, generation)
-            worker = executor.get("worker")
-            if worker is None:
+            workers = _executor_workers(executor)
+            if not workers:
                 return deepcopy(record)
-            if not isinstance(worker, dict) or (
-                worker.get("pid") != pid
-                or worker.get("process_start_token") != process_start_token
-            ):
+            matching = [worker for worker in workers if worker["pid"] == pid]
+            if len(matching) != 1 or matching[0]["process_start_token"] != process_start_token:
                 raise ActionReconciliationError("Worker completion binding does not match")
-            executor.pop("worker", None)
+            if "workers" in executor:
+                remaining = [worker for worker in workers if worker["pid"] != pid]
+                if remaining:
+                    executor["workers"] = remaining
+                else:
+                    executor.pop("workers")
+            else:
+                executor.pop("worker", None)
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)
@@ -1739,9 +1750,7 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
                 raise TaskControlError(
                     "Task Control Record receipt-only Executor lacks Runner binding"
                 )
-        worker = executor.get("worker")
-        if worker is not None:
-            _validate_worker_snapshot(worker)
+        _executor_workers(executor)
         if isinstance(action, dict):
             if executor.get("action_id") != action.get("action_id"):
                 raise TaskControlError(
@@ -1772,9 +1781,32 @@ def _validate_executor_snapshot(executor: Mapping[str, Any]) -> None:
     pid = executor.get("pid")
     if pid is not None and (type(pid) is not int or pid <= 0):
         raise TaskControlError("Control Action target Executor PID is invalid")
+    _executor_workers(executor)
+
+
+def _executor_workers(executor: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Read the legacy singleton or the bounded multi-Worker snapshot."""
+
     worker = executor.get("worker")
-    if worker is not None:
-        _validate_worker_snapshot(worker)
+    workers = executor.get("workers")
+    if worker is not None and workers is not None:
+        raise TaskControlError("Executor has conflicting Worker bindings")
+    if workers is not None:
+        if not isinstance(workers, list) or not workers:
+            raise TaskControlError("Executor Worker bindings are invalid")
+        bindings = workers
+    elif worker is not None:
+        bindings = [worker]
+    else:
+        return []
+    seen: set[int] = set()
+    for binding in bindings:
+        _validate_worker_snapshot(binding)
+        pid = binding["pid"]
+        if pid in seen:
+            raise TaskControlError("Executor Worker PID is duplicated")
+        seen.add(pid)
+    return bindings
 
 
 def _validate_worker_snapshot(worker: object) -> None:

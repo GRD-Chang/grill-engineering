@@ -155,6 +155,12 @@ def prepare_action_application_receipt(
                     for key in ("pid", "process_start_token")
                     if key in worker
                 }
+            workers = target.get("workers")
+            if isinstance(workers, list):
+                target_receipt["workers"] = [
+                    {key: worker[key] for key in ("pid", "process_start_token") if key in worker}
+                    for worker in workers if isinstance(worker, Mapping)
+                ]
         state["action_application_receipt"]["target_executor"] = target_receipt
 
 

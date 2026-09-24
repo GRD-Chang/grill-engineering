@@ -14,6 +14,7 @@ from agent_run.controller import Controller
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
 from agent_run.cli_presentation import _operator_action_view
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.delivery_facts import multi_ticket_progress
 from agent_run.delivery_loop import TicketDeliveryLoop
 from agent_run.state_contract import (
@@ -1423,7 +1424,7 @@ def test_deliver_advances_the_complete_dag_and_enters_run_acceptance(
         ),
         encoding="utf-8",
     )
-    started = seed_run(git_repo, fixture, "1")
+    started = seed_run(git_repo, fixture, "1", "--ticket-development-workers", "1")
     run_id = stdout_json(started)["run_id"]
 
     delivered = run_internal_stage(
@@ -1674,7 +1675,10 @@ def test_human_blocked_ticket_allows_independent_work_until_resume(
         ),
         encoding="utf-8",
     )
-    started = seed_run(git_repo, fixture, "1", idle_control=True)
+    started = seed_run(
+        git_repo, fixture, "1", "--ticket-development-workers", "1",
+        idle_control=True,
+    )
     run_id = stdout_json(started)["run_id"]
 
     result = run_cli(
@@ -1851,7 +1855,10 @@ def test_resume_selects_one_of_two_local_ticket_blockers(git_repo: Path) -> None
         ],
         "reviews": [_human_acceptance("reviewer-2"), _human_acceptance("reviewer-3")],
     }), encoding="utf-8")
-    started = seed_run(git_repo, fixture, "1", idle_control=True)
+    started = seed_run(
+        git_repo, fixture, "1", "--ticket-development-workers", "1",
+        idle_control=True,
+    )
     run_id = stdout_json(started)["run_id"]
     first = run_cli(git_repo, fixture, "run", "1", "--agent-fixture", str(initial_agents))
     assert first.returncode == 2
@@ -1977,7 +1984,10 @@ def test_waiting_ci_holds_slot_while_independent_ticket_queues(git_repo: Path) -
     )
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), git, states,
+        delivery_policy=DeliveryPolicy(ticket_development_workers=1),
+    )
     state, _ = controller.start(1)
     engine = DeliveryRunEngine(
         controller=controller,
@@ -2023,7 +2033,10 @@ def test_local_review_blocker_does_not_stop_other_tickets_ci(git_repo: Path) -> 
     }), encoding="utf-8")
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), git, states,
+        delivery_policy=DeliveryPolicy(ticket_development_workers=1),
+    )
     state, _ = controller.start(1)
     engine = DeliveryRunEngine(
         controller=controller,
@@ -2067,7 +2080,10 @@ def test_exhausted_ticket_publication_releases_slot_for_queued_ticket(
     }), encoding="utf-8")
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), git, states,
+        delivery_policy=DeliveryPolicy(ticket_development_workers=1),
+    )
     state, _ = controller.start(1)
     engine = DeliveryRunEngine(
         controller=controller,
@@ -2147,7 +2163,10 @@ def test_failed_ci_releases_slot_before_ticket_repair(git_repo: Path) -> None:
     }), encoding="utf-8")
     states = StateStore(git_repo / ".agent-run")
     git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), git, states,
+        delivery_policy=DeliveryPolicy(ticket_development_workers=1),
+    )
     state, _ = controller.start(1)
     engine = DeliveryRunEngine(
         controller=controller,
@@ -2196,7 +2215,10 @@ def test_run_recovers_after_process_failure_between_tickets(
         encoding="utf-8",
     )
     run_id = stdout_json(
-        seed_run(git_repo, fixture, "1", idle_control=True)
+        seed_run(
+            git_repo, fixture, "1", "--ticket-development-workers", "1",
+            idle_control=True,
+        )
     )["run_id"]
 
     interrupted = run_internal_stage(

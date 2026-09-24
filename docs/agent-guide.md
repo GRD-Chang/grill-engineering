@@ -63,7 +63,7 @@
 | `requeue_required` | 核对变化后的需求，再执行 `requeue` |
 | 最终 PR 待批准 | 展示 PR、验收和检查结果；已有针对该最终交付的明确批准时才执行 `approve` |
 | 整体修改意见 | 在允许的状态用 `revise --message` 传递原始反馈 |
-| 暂停 | 使用 `stop`；Ctrl-C 或关闭终端只离开观察，后台任务仍运行 |
+| 暂停 | 整个 Run 用 `stop`，单张 Ticket 用 `stop --ticket N` 并在需要时以 `resume --ticket N` 继续；Ctrl-C 或关闭终端只离开观察，后台任务仍运行 |
 | 放弃 | 按 `abandon` 边界处理；默认保留未提交工作，强制丢弃须有明确授权 |
 
 预算耗尽、范围变化或状态不兼容时，报告当前所需决策；使用公开 CLI 恢复，

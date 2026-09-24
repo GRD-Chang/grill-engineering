@@ -163,7 +163,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Semantic Agent Attempt protocol"
         )
-    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 1:
+    if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 2:
         raise IncompatibleRunStateError(
             "legacy state has an incompatible Multi Ticket protocol"
         )
@@ -174,6 +174,8 @@ def require_current_run_state(state: dict[str, Any]) -> None:
         ("base", dict),
         ("ticket_graph", dict),
         ("ticket_jobs", dict),
+        ("ticket_agent_invocations", dict),
+        ("ticket_pause_requests", dict),
         ("retired_ticket_generations", dict),
         ("pending_ticket_retirements", dict),
         ("frontier", list),
@@ -191,6 +193,7 @@ def require_current_run_state(state: dict[str, Any]) -> None:
     _require_base(state["base"])
     _require_ticket_graph(state["ticket_graph"])
     _require_ticket_integration_queue(state)
+    _require_ticket_agent_invocations(state)
     _require_run_gate_exclusivity(state)
     if (
         not operator_gate_identity_is_consistent(state)
@@ -951,6 +954,37 @@ def _require_run_gate_exclusivity(state: dict[str, Any]) -> None:
         )
 
 
+def _require_ticket_agent_invocations(state: dict[str, Any]) -> None:
+    for key, requested_at in state["ticket_pause_requests"].items():
+        if (
+            not isinstance(key, str)
+            or not key.isdecimal()
+            or key not in state["ticket_graph"]["tickets"]
+            or not isinstance(requested_at, str)
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket pause request"
+            )
+    invocations = state["ticket_agent_invocations"]
+    jobs = state["ticket_jobs"]
+    for key, invocation in invocations.items():
+        if (
+            not isinstance(key, str)
+            or not key.isdecimal()
+            or key not in jobs
+            or not isinstance(invocation, dict)
+            or invocation.get("work_subject") != f"ticket:{key}"
+        ):
+            raise IncompatibleRunStateError(
+                "legacy state has an invalid Ticket Agent Invocation owner"
+            )
+        _require_invocation(
+            invocation, f"ticket_agent_invocations[{key}]", str(state["run_id"])
+        )
+        if invocation["status"] != "completed":
+            _require_active_invocation_identity(state, invocation)
+
+
 def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
     """Bind the single integration seat and ordered waiters to Ticket Jobs."""
 
@@ -1032,9 +1066,12 @@ def _require_ticket_integration_queue(state: dict[str, Any]) -> None:
         number = job.get("ticket_number")
         resume_phase = job.get("integration_resume_phase")
         if resume_phase is not None and (
-            resume_phase != "publishing"
-            or phase != "ready_for_integration"
-            or not job.get("publication_operation_retry_history")
+            phase != "ready_for_integration"
+            or resume_phase not in {"accepted", "waiting_checks", "publishing"}
+            or (
+                resume_phase == "publishing"
+                and not job.get("publication_operation_retry_history")
+            )
         ):
             raise IncompatibleRunStateError(
                 "legacy state has an invalid Ticket integration resume phase"
@@ -1983,9 +2020,24 @@ def _change_owner_phase_is_current(
     role = invocation["role"]
     phase = invocation["phase"]
     if role == "development":
-        return isinstance(phase, str) and job.get("phase") == phase
+        return isinstance(phase, str) and (
+            job.get("phase") == phase
+            or (
+                job.get("blocked_reason") == "ticket_execution_failed"
+                and job.get("execution_resume_phase") == phase
+            )
+        )
     if role == "fresh_acceptance":
-        return job.get("phase") == "reviewing"
+        return (
+            job.get("phase") == "reviewing"
+            or (
+                job.get("phase") == "candidate"
+                and invocation.get("status") in {"failed", "resuming"}
+            )
+        ) or (
+            job.get("blocked_reason") == "ticket_execution_failed"
+            and job.get("execution_resume_phase") == "reviewing"
+        )
     if role == "publication":
         # Publication generation begins while the accepted Candidate is still
         # intact.  ``publishing`` is written only after the Agent returned a

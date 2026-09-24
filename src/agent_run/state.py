@@ -35,6 +35,68 @@ _STATE_COMMIT_RETRY_INTERVAL_SECONDS = 0.001
 _T = TypeVar("_T")
 
 
+class ConcurrentRunStateError(RuntimeError):
+    """A Run changed after a Controller read its refresh baseline."""
+
+
+def _preserve_parallel_ticket_lanes(
+    state: dict[str, Any], latest: dict[str, Any], numbers: frozenset[int]
+) -> None:
+    """Rebase a Ticket save onto concurrent changes to other Ticket Jobs."""
+    if latest.get("status") in {
+        "operator_stopped", "abandoned", "requeue_required",
+        "unsupported_scope_change", "deterministic_contradiction",
+    } and state.get("status") != latest.get("status"):
+        raise TaskControlBusyError("Integration lost Run authorization")
+
+    from agent_run.ticket_development_state import (
+        _merge_invocation_history,
+        _merge_resume_successors,
+    )
+
+    jobs = state["ticket_jobs"]
+    invocations = state["ticket_agent_invocations"]
+    latest_jobs = latest["ticket_jobs"]
+    latest_invocations = latest["ticket_agent_invocations"]
+    requests = state["ticket_pause_requests"]
+    latest_requests = latest["ticket_pause_requests"]
+    active = state.get("active_ticket_job")
+    active_number = active.get("ticket_number") if isinstance(active, dict) else None
+    if type(active_number) is int:
+        numbers = numbers - {active_number}
+    keys = {str(number) for number in numbers}
+    for number in numbers:
+        key = str(number)
+        if key in latest_jobs:
+            jobs[key] = deepcopy(latest_jobs[key])
+        else:
+            jobs.pop(key, None)
+        if key in latest_invocations:
+            invocations[key] = deepcopy(latest_invocations[key])
+        else:
+            invocations.pop(key, None)
+        if key in latest_requests:
+            requests[key] = latest_requests[key]
+        else:
+            requests.pop(key, None)
+        _merge_invocation_history(state, latest, number)
+    _merge_resume_successors(state, latest)
+
+    queue = [
+        entry for entry in state["ticket_integration_queue"]
+        if str(entry["ticket_number"]) not in keys
+    ]
+    queue.extend(
+        deepcopy(entry) for entry in latest["ticket_integration_queue"]
+        if str(entry["ticket_number"]) in keys
+    )
+    queue.sort(key=lambda entry: (
+        datetime.fromisoformat(entry["ready_at"]).astimezone(UTC),
+        entry["ticket_number"],
+    ))
+    state["ticket_integration_queue"] = queue
+
+
 def _load_bounded_json(path: Path) -> object:
     with path.open("rb") as source:
         encoded = source.read(MAX_RUN_STATE_BYTES + 1)
@@ -58,6 +120,48 @@ class StateStore:
         self._write_guard: Callable[[], None] | None = None
         self.run_saved_observer: Callable[[dict[str, Any]], None] | None = None
         self._write_transaction: Callable[[], Any] | None = None
+        self._parallel_ticket_lanes = threading.local()
+        self._expected_run_state = threading.local()
+
+    @contextmanager
+    def require_unchanged_run(
+        self, run_id: str, expected: dict[str, Any]
+    ) -> Iterator[None]:
+        """Reject stale Controller saves while leaving GitHub reads unlocked."""
+        previous: dict[str, dict[str, Any]] = getattr(
+            self._expected_run_state, "by_run", {}
+        )
+        current = dict(previous)
+        current[run_id] = deepcopy(expected)
+        self._expected_run_state.by_run = current
+        try:
+            yield
+        finally:
+            self._expected_run_state.by_run = previous
+
+    def load_unchanged_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read the result of this Controller refresh only if no writer superseded it."""
+        expected = getattr(self._expected_run_state, "by_run", {}).get(run_id)
+        latest = self.load_run(run_id)
+        if expected is None or latest != expected:
+            raise ConcurrentRunStateError("Run changed before Controller returned its refresh")
+        return latest
+
+    @contextmanager
+    def preserve_parallel_ticket_lanes(
+        self, run_id: str, numbers: frozenset[int]
+    ) -> Iterator[None]:
+        """Keep other Ticket Jobs authoritative during Ticket delivery I/O."""
+        previous: dict[str, frozenset[int]] = getattr(
+            self._parallel_ticket_lanes, "by_run", {}
+        )
+        current = dict(previous)
+        current[run_id] = current.get(run_id, frozenset()) | numbers
+        self._parallel_ticket_lanes.by_run = current
+        try:
+            yield
+        finally:
+            self._parallel_ticket_lanes.by_run = previous
 
     def _set_write_guard(
         self,
@@ -219,6 +323,39 @@ class StateStore:
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         destination = self.runs_directory / f"{run_id}.json"
         previous = self.load_run(run_id)
+        expected_by_run: dict[str, dict[str, Any]] = getattr(
+            self._expected_run_state, "by_run", {}
+        )
+        expected = expected_by_run.get(run_id)
+        if expected is not None and previous != expected:
+            raise ConcurrentRunStateError("Run changed during Controller refresh")
+        protected: frozenset[int] = getattr(
+            self._parallel_ticket_lanes, "by_run", {}
+        ).get(run_id, frozenset())
+        if isinstance(previous, dict) and protected:
+            _preserve_parallel_ticket_lanes(state, previous, protected)
+        if isinstance(previous, dict) and isinstance(previous.get("ticket_pause_requests"), dict):
+            requests = state.get("ticket_pause_requests")
+            jobs = state.get("ticket_jobs")
+            if isinstance(requests, dict):
+                for number, requested_at in previous["ticket_pause_requests"].items():
+                    job = jobs.get(number) if isinstance(jobs, dict) else None
+                    if isinstance(job, dict) and job.get("phase") == "blocked":
+                        requests.pop(number, None)
+                    else:
+                        requests.setdefault(number, requested_at)
+        invocations = state.get("ticket_agent_invocations")
+        active_job = state.get("active_ticket_job")
+        active_invocation = state.get("active_agent_invocation")
+        if (
+            isinstance(invocations, dict)
+            and isinstance(active_job, dict)
+            and type(active_job.get("ticket_number")) is int
+            and isinstance(active_invocation, dict)
+            and active_invocation.get("work_subject")
+            == f"ticket:{active_job['ticket_number']}"
+        ):
+            invocations[str(active_job["ticket_number"])] = deepcopy(active_invocation)
         durable_state = _sanitize_durable_errors(state)
         if "run_id" in durable_state:
             _append_timeline_event(durable_state, previous)
@@ -255,6 +392,8 @@ class StateStore:
                 os.fsync(temporary_file.fileno())
             os.replace(temporary_path, destination)
             self._sync_directory(self.runs_directory)
+            if expected is not None:
+                expected_by_run[run_id] = json.loads(serialized)
         except BaseException:
             temporary_path.unlink(missing_ok=True)
             raise

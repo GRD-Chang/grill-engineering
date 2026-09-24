@@ -1,8 +1,10 @@
 ---
-status: accepted
+status: superseded by 0018-ticket-parallel-development.md
 ---
 
 # 多 Ticket 开发推进与单一集成席位
+
+并行执行与状态权威由 [ADR 0018](0018-ticket-parallel-development.md) 取代；本页保留前序集成队列决定的历史背景。
 
 ## 决定
 
