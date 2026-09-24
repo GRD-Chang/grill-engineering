@@ -14,7 +14,7 @@ from agent_run import cli
 
 def invoke_cli_inprocess(
     repo: Path,
-    fixture: Path,
+    fixture: Path | None,
     *arguments: str,
     extra_env: dict[str, str] | None = None,
 ) -> CompletedProcess[str]:
@@ -26,7 +26,9 @@ def invoke_cli_inprocess(
 
     environment = os.environ.copy()
     environment.update(extra_env or {})
-    command_arguments = [*arguments, "--github-fixture", str(fixture)]
+    command_arguments = [*arguments]
+    if fixture is not None:
+        command_arguments.extend(("--github-fixture", str(fixture)))
     stdout, stderr = StringIO(), StringIO()
     with (
         pytest.MonkeyPatch.context() as scoped,

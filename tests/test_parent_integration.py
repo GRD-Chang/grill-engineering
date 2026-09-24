@@ -15,6 +15,7 @@ from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.parent_integration import (
+    ParentHistoryRewritten,
     finish_parent_snapshot_conflict,
     prepare_parent_snapshot,
 )
@@ -101,6 +102,57 @@ def test_parent_snapshot_preserves_local_and_both_remote_heads(
     )
     assert readback.record == result.record
     assert subject["integration_resync"]["used"] == 0
+
+
+@pytest.mark.parametrize("remote_change", ["rollback", "fork", "append"])
+def test_published_parent_source_requires_append_history(
+    git_repo: Path, tmp_path: Path, remote_change: str
+) -> None:
+    collaborator, git, github, base = _setup(git_repo, tmp_path)
+    _git(git_repo, "checkout", "-b", "parent")
+    candidate = _commit(git_repo, "agent.txt", "agent\n")
+    policy = DeliveryPolicy().snapshot()
+    subject: dict = {"base_sha": base, "policy_snapshot": policy}
+    first = prepare_parent_snapshot(
+        git=git, github=github, subject=subject, checkout=git_repo,
+        source_branch="parent", target_branch="main", candidate_sha=candidate,
+        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
+    )
+    assert first.record is not None
+    published = str(first.record["head_sha"])
+    _git(git_repo, "push", "origin", f"{published}:refs/heads/parent")
+    subject["published_sha"] = published
+    _git(collaborator, "checkout", "parent")
+    if remote_change == "append":
+        _git(collaborator, "fetch", "origin", "parent")
+        _git(collaborator, "reset", "--hard", published)
+        observed = _commit(collaborator, "human.txt", "human\n")
+        _git(collaborator, "push", "origin", "parent")
+    elif remote_change == "fork":
+        observed = _commit(collaborator, "human.txt", "fork\n")
+        _git(collaborator, "push", "--force", "origin", "parent")
+    else:
+        observed = base
+        _git(collaborator, "push", "--force", "origin", f"{base}:refs/heads/parent")
+
+    prepare = lambda: prepare_parent_snapshot(
+        git=git, github=github, subject=subject, checkout=git_repo,
+        source_branch="parent", target_branch="main", candidate_sha=published,
+        policy_snapshot=policy, record_key="parent_integration", save=lambda: None,
+        own_source_write=published,
+    )
+    if remote_change == "append":
+        result = prepare()
+        assert result.record is not None
+        assert result.record["source_sha"] == observed
+        assert git.is_ancestor(published, result.record["head_sha"])
+        assert git.is_ancestor(observed, result.record["head_sha"])
+    else:
+        with pytest.raises(ParentHistoryRewritten) as error:
+            prepare()
+        assert error.value.previous == published
+        assert error.value.observed == observed
+        assert github.live_branch_heads("parent", "main")[0] == observed
 
 
 def test_parent_conflict_resolution_keeps_both_histories(

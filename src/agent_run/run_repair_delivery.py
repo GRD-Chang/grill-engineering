@@ -18,6 +18,7 @@ from agent_run.run_candidate_acceptance import CandidateRunAcceptance
 from agent_run.run_currentness import RunCurrentnessReader, refresh_run_currentness
 from agent_run.run_repair_cycle import uses_merge_resolution
 from agent_run.run_repair_currentness import RunRepairCurrentness
+from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.run_repair_requests import RunRepairRequests
 from agent_run.run_thread_identity import prior_thread_identities
 
@@ -77,7 +78,7 @@ class RunRepairAdapter(ChangeDeliveryAdapter):
         )
 
     def base_is_current(self, current_base: str, job: dict[str, Any]) -> bool:
-        return current_base in {job.get("base_sha"), job.get("integrated_sha")}
+        return repair_run_branch_is_current(self.git, job, current_base)
 
     def development_request(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
@@ -253,20 +254,27 @@ class RunRepairPublisher(ChangeDeliveryPublisher):
     def create_publication_commit(
         self, checkout: Path, job: dict[str, Any], message: str
     ) -> str:
+        integration = job.get("run_repair_integration")
+        published_sha = (
+            str(integration["source_sha"])
+            if isinstance(integration, dict)
+            else job.get("published_sha")
+        )
         if uses_merge_resolution(job):
             return self.owner.git.create_merge_resolution_publication_commit(
                 checkout,
                 candidate_sha=str(job["candidate_sha"]),
                 run_head_sha=str(job["base_sha"]),
                 default_head_sha=str(job["default_base_sha"]),
-                published_sha=job.get("published_sha"),
+                published_sha=published_sha,
+                integration=integration if isinstance(integration, dict) else None,
                 message=message,
             )
         return self.owner.git.create_publication_commit(
             checkout,
             candidate_sha=str(job["candidate_sha"]),
             base_sha=str(job["base_sha"]),
-            published_sha=job.get("published_sha"),
+            published_sha=published_sha,
             message=message,
         )
 

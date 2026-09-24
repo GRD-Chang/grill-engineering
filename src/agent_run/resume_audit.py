@@ -117,6 +117,20 @@ def append_explicit_resume_audit(
             "ticket_branch_generation",
             subject.get("repair_generation", subject.get("acceptance_generation", 1)),
         )
+    elif event["kind"] in {"integration_resync", "execution_failure"}:
+        acceptance = state.get("run_acceptance")
+        repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+        if (
+            isinstance(repair, dict)
+            and repair.get("phase") == "blocked"
+            and repair.get("blocked_reason") == (
+                "integration_resync_exhausted"
+                if event["kind"] == "integration_resync"
+                else "integration_failed"
+            )
+        ):
+            event["work_subject"] = f"run-repair:{state['run_id']}"
+            event["generation"] = repair.get("repair_generation")
     elif ticket_number is not None:
         jobs = state.get("ticket_jobs")
         ticket_job = jobs.get(str(ticket_number)) if isinstance(jobs, dict) else None
@@ -281,6 +295,13 @@ def _resume_kind(
             and subject.get("blocked_reason") == "integration_resync_exhausted"
         ):
             return "integration_resync"
+    acceptance = state.get("run_acceptance")
+    repair = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if isinstance(repair, dict) and repair.get("phase") == "blocked":
+        if repair.get("blocked_reason") == "integration_resync_exhausted":
+            return "integration_resync"
+        if repair.get("blocked_reason") == "integration_failed":
+            return "execution_failure"
     if human_blocker_subject_count(state) == 1:
         return "human_blocker"
     if has_non_invocation_execution_failure(state):

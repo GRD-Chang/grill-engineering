@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from agent_run.commit_messages import commit_messages_match
 from agent_run.delivery_cleanup import DeliveryCleanupEngine
 from agent_run.integration_resync_budget import complete_integration_window
+from agent_run.parent_integration import parent_integration_record_is_valid
 from agent_run.required_checks_observation import (
     bind_new_publication_head,
     clear_required_checks_observation,
@@ -113,6 +114,11 @@ class RunRepairPromotion:
         ):
             job["unresolved_acceptance_artifact"] = deepcopy(acceptance_artifact)
         job["default_base_sha"] = default_head
+        # The prior exact source/target record describes a Candidate built
+        # against the old default merge scene. Reprepare owns the new scene;
+        # retaining that record would replay its old Candidate during the
+        # next integration and can resurrect a resolved conflict.
+        job.pop("run_repair_integration", None)
         if integrated_merge_resolution:
             # The controlled two-parent result is now the actual Run head.  A
             # later default-only drift validates that Run head as an ordinary
@@ -411,6 +417,24 @@ class RunRepairPromotion:
             else None
         )
         publication_parents = self.owner.git.commit_parents(publication_sha)
+        integration = job.get("run_repair_integration")
+        if not published_as_merge_resolution or isinstance(revalidation_merge, dict):
+            candidate_boundary_valid = True
+        elif isinstance(integration, dict):
+            candidate_boundary_valid = (
+                parent_integration_record_is_valid(
+                    self.owner.git, {**job, "parent_integration": integration}
+                )
+                and bool(publication_parents)
+                and integration["source_sha"] == publication_parents[0]
+                and self.owner.git.is_ancestor(
+                    str(published_default), str(published_candidate)
+                )
+            )
+        else:
+            candidate_boundary_valid = self.owner.git.commit_parents(
+                str(published_candidate)
+            ) == [published_base, published_default]
         publication_boundary_valid = (
             self.owner.git.is_ancestor(str(published_base), publication_sha)
             and self.owner.git.is_ancestor(
@@ -419,6 +443,18 @@ class RunRepairPromotion:
             )
             and self.owner.git.resolve(f"{publication_sha}^{{tree}}")
             == self.owner.git.resolve(f"{published_candidate}^{{tree}}")
+            and candidate_boundary_valid
+            and (
+                not published_as_merge_resolution
+                or (
+                    len(publication_parents) == 2
+                    and publication_parents[1] == published_default
+                    and (
+                        publication_parent is None
+                        or publication_parents[0] == publication_parent
+                    )
+                )
+            )
             and (
                 publication_parent is None
                 or (

@@ -12,6 +12,7 @@ from agent_run.artifacts import AcceptanceArtifact
 from agent_run.git import GitError, GitRepository
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_cycle import uses_merge_resolution
+from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state_contract import require_candidate_acceptance_history
 
 
@@ -124,8 +125,9 @@ class CandidateRunAcceptance:
             and acceptance.get("reviewed_candidate_tree") == candidate_tree
             and acceptance.get("expected_merge_tree") == expected_merge_tree
             and self._default_head(state) == default_base
-            and self.git.resolve(str(state["run_branch"]))
-            in {job.get("base_sha"), job.get("integrated_sha")}
+            and repair_run_branch_is_current(
+                self.git, job, self.git.resolve(str(state["run_branch"]))
+            )
         )
 
     def promotion_record(

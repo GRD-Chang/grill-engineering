@@ -44,6 +44,7 @@ from agent_run.parent_integration import (
     parent_integration_record_is_valid,
 )
 from agent_run.parent_only_integration import reconcile_parent_integration
+from agent_run.run_repair_integration import reconcile_repair_integration
 
 
 class PublishedHeadStage(ChangeDeliveryStage, Protocol):
@@ -103,6 +104,21 @@ def _publication_operation(
             return True, None
         raise
 
+
+def _reconcile_delivery_snapshot(
+    stage: PublishedHeadStage, state: dict[str, Any], job: dict[str, Any]
+) -> bool:
+    label = stage.contract.label
+    if label.startswith("ticket-"):
+        return reconcile_ticket_integration(stage, state, job)
+    if label == "parent-only":
+        return reconcile_parent_integration(stage, state, job)
+    if label.startswith("run-repair-"):
+        if isinstance(job.get("integrated_sha"), str):
+            return True
+        return reconcile_repair_integration(stage, state, job)
+    return True
+
 def publish_and_merge(
     stage: PublishedHeadStage,
     state: dict[str, Any],
@@ -111,10 +127,15 @@ def publish_and_merge(
 ) -> bool:
     ticket = stage.contract.label.startswith("ticket-")
     parent_only = stage.contract.label == "parent-only"
+    run_repair = stage.contract.label.startswith("run-repair-")
     parent_record = job.get("parent_integration") if parent_only else None
+    repair_record = job.get("run_repair_integration") if run_repair else None
     publication_base = delivery_base_sha(job) if ticket else (
         str(parent_record["target_sha"])
-        if isinstance(parent_record, dict) else str(job["base_sha"])
+        if isinstance(parent_record, dict) else (
+            str(repair_record["target_sha"])
+            if isinstance(repair_record, dict) else str(job["base_sha"])
+        )
     )
     publication_candidate = delivery_candidate_sha(job) if ticket else str(job["candidate_sha"])
     publication_source = (
@@ -123,7 +144,11 @@ def publish_and_merge(
         else (
             str(parent_record["source_sha"])
             if isinstance(parent_record, dict)
-            else str(job.get("published_sha", job["base_sha"]))
+            else (
+                str(repair_record["source_sha"])
+                if isinstance(repair_record, dict)
+                else str(job.get("published_sha", job["base_sha"]))
+            )
         )
     )
     if (
@@ -245,9 +270,7 @@ def publish_and_merge(
             state["status"] = "waiting_merge"
             stage.save(state)
             return True
-        if ticket and not reconcile_ticket_integration(stage, state, job):
-            return False
-        if parent_only and not reconcile_parent_integration(stage, state, job):
+        if not _reconcile_delivery_snapshot(stage, state, job):
             return False
         observed_published = (
             existing_live.get("head_sha") == job["publication_sha"]
@@ -271,11 +294,9 @@ def publish_and_merge(
         state, job, checkout, "Published-Head Gate rejected stale requirements"
     )
     if not isinstance(existing_pr, int):
-        if ticket and not reconcile_ticket_integration(stage, state, job):
+        if not _reconcile_delivery_snapshot(stage, state, job):
             return False
-        if parent_only and not reconcile_parent_integration(stage, state, job):
-            return False
-    if (ticket or parent_only) and not isinstance(existing_pr, int):
+    if (ticket or parent_only or run_repair) and not isinstance(existing_pr, int):
         # A PR creation response may be lost after the source commit was
         # published. Its durable publication SHA and exact live ref prove
         # whether a second push is needed before recovering the original PR.
@@ -285,10 +306,7 @@ def publish_and_merge(
         if live_target != publication_base or live_source not in {
             publication_source, str(job["publication_sha"]),
         }:
-            current = (
-                reconcile_ticket_integration(stage, state, job)
-                if ticket else reconcile_parent_integration(stage, state, job)
-            )
+            current = _reconcile_delivery_snapshot(stage, state, job)
             if not current:
                 return False
         observed_published = (
@@ -314,9 +332,7 @@ def publish_and_merge(
             ),
         )
     except GitHubReadError:
-        if ticket and not reconcile_ticket_integration(stage, state, job):
-            return False
-        if parent_only and not reconcile_parent_integration(stage, state, job):
+        if not _reconcile_delivery_snapshot(stage, state, job):
             return False
         raise
     if exhausted:
@@ -338,9 +354,7 @@ def publish_and_merge(
             )
         except RemoteBranchChanged as error:
             job["branch_publication_observation"] = asdict(error.observation)
-            if ticket and not reconcile_ticket_integration(stage, state, job):
-                return False
-            if parent_only and not reconcile_parent_integration(stage, state, job):
+            if not _reconcile_delivery_snapshot(stage, state, job):
                 return False
             return stage._block(
                 state, job, "remote_source_changed",
@@ -494,7 +508,7 @@ def publish_and_merge(
             candidate_current = False
             reviewed_base_sha = publication_base
         else:
-            reviewed_base_sha = publication_base if (ticket or parent_only) else str(acceptance.get("reviewed_base_sha"))
+            reviewed_base_sha = publication_base if (ticket or parent_only or run_repair) else str(acceptance.get("reviewed_base_sha"))
             candidate_current = (
                 acceptance.get("reviewed_candidate_sha") == job["candidate_sha"]
                 and acceptance.get("reviewed_candidate_tree") == candidate_tree
@@ -511,6 +525,15 @@ def publish_and_merge(
         candidate_current = (
             candidate_current
             and parent_integration_record_is_valid(stage.git, job)
+            and stage.git.resolve(f"{publication_candidate}^{{tree}}")
+            == stage.git.resolve(f"{job['publication_sha']}^{{tree}}")
+        )
+    if isinstance(repair_record, dict):
+        candidate_current = (
+            candidate_current
+            and parent_integration_record_is_valid(stage.git, {
+                **job, "parent_integration": repair_record,
+            })
             and stage.git.resolve(f"{publication_candidate}^{{tree}}")
             == stage.git.resolve(f"{job['publication_sha']}^{{tree}}")
         )
@@ -533,9 +556,7 @@ def publish_and_merge(
             "published_head_mismatch",
             "Published-Head Gate rejected live PR state",
         )
-    if ticket and not reconcile_ticket_integration(stage, state, job):
-        return False
-    if parent_only and not reconcile_parent_integration(stage, state, job):
+    if not _reconcile_delivery_snapshot(stage, state, job):
         return False
     required_checks_evidence = deepcopy(required_checks_evidence)
     required_checks_evidence.update({"pr_number": pr_number})

@@ -849,8 +849,9 @@ def test_publication_prompt_does_not_turn_nonblocking_evidence_into_delivery(
     assert "延期范围和可选建议不是本次交付成果" in prompt
 
 
+@pytest.mark.parametrize("case_group", range(4))
 def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
-    tmp_path: Path, monkeypatch: Any
+    tmp_path: Path, monkeypatch: Any, case_group: int
 ) -> None:
     checkout = tmp_path / "PRIVATE_CHECKOUT_SENTINEL"
     checkout.mkdir()
@@ -1168,7 +1169,11 @@ def test_dynamic_context_matrix_reaches_codex_stdin_without_private_facts(
     )
     prior_blockers = ["  PRIOR_BLOCKER_SENTINEL must remain verbatim.  "]
 
-    for name, method, role_request, required in cases:
+    # Keep every prompt/continuation pair, but let xdist schedule the matrix
+    # across workers instead of serializing all 44 calls in one test item.
+    for index, (name, method, role_request, required) in enumerate(cases):
+        if index % 4 != case_group:
+            continue
         for with_human_context in (False, True):
             active_case = f"{name}_{'new_thread_blocker' if with_human_context else 'normal'}"
             active_method = method

@@ -98,7 +98,7 @@ class GhGitHubReader:
         repository = self.repository()
         data = self._gh_json(
             "pr", "view", str(pr_number), "--repo", repository.name_with_owner,
-            "--json", "state,headRefOid,baseRefName,baseRefOid,mergeCommit",
+            "--json", "state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,mergeCommit",
         )
         merge_commit = data.get("mergeCommit")
         integrated_sha = (
@@ -108,9 +108,12 @@ class GhGitHubReader:
         )
         result: dict[str, Any] = {
             "state": _string(data, "state"),
+            "head_branch": _string(data, "headRefName"),
             "head_sha": _string(data, "headRefOid"),
+            "head_repository": _string(_mapping(data, "headRepository"), "nameWithOwner"),
             "base_branch": _string(data, "baseRefName"),
             "base_sha": _string(data, "baseRefOid"),
+            "base_repository": repository.name_with_owner,
             "integrated_sha": integrated_sha,
         }
         head_sha = result["head_sha"]

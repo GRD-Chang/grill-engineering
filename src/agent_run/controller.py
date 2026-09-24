@@ -59,6 +59,7 @@ from agent_run.run_currentness import (
     ticket_completion_records_fingerprint,
 )
 from agent_run.run_locator import RunLocatorError, RunLocatorIndex
+from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.review_budget import (
     budget_checkpoint_subjects,
     reset_budget,
@@ -586,6 +587,8 @@ class Controller:
             budget_resumed = _resume_ticket_pause(
                 state, ticket_number=ticket_number
             )
+        if explicit_resume and not budget_resumed and ticket_number is None:
+            budget_resumed = _resume_run_repair_integration(state)
         if explicit_resume and not budget_resumed:
             active_ticket = state.get("active_ticket_job")
             if (
@@ -1301,6 +1304,19 @@ class Controller:
                 state, subject, job, self.github, self.publisher.git
             )
         )
+        if (
+            external in {
+                "change_pr_head_changed_externally",
+                "change_pr_base_changed_externally",
+            }
+            and subject.startswith("run-repair:")
+            # A failed remote read cannot prove a rewrite. Delivery will
+            # re-read the exact snapshot before reviewing or publishing.
+            and _run_repair_pr_is_append_only(
+                state, job, self.github, self.publisher.git
+            ) is not False
+        ):
+            external = None
         if external is not None:
             job.pop("approval_grant", None)
             state.update(
@@ -2137,6 +2153,80 @@ def _resume_ci_recovery_window(
             "status": "active" if kind == "ticket" else "parent_delivery_pending",
             "terminal_kind": None, "diagnostics": [],
         })
+    return True
+
+
+def _run_repair_pr_is_append_only(
+    state: dict[str, Any], job: dict[str, Any],
+    github: GitHubReader, git: GitRepository,
+) -> bool | None:
+    pr_number = job.get("pr_number")
+    published = job.get("published_sha")
+    branch = job.get("repair_branch")
+    base_branch = state.get("run_branch")
+    if (
+        type(pr_number) is not int or not isinstance(published, str)
+        or not isinstance(branch, str) or not isinstance(base_branch, str)
+    ):
+        return False
+    live = github.live_pull_request(pr_number)
+    source = live.get("head_sha")
+    target = live.get("base_sha")
+    if (
+        live.get("state") != "OPEN"
+        or live.get("head_branch") != branch
+        or live.get("head_repository") != state.get("repository")
+        or live.get("base_repository") != state.get("repository")
+        or live.get("base_branch") != base_branch
+        or not isinstance(source, str)
+        or not isinstance(target, str)
+    ):
+        return False
+    try:
+        if not repair_run_branch_is_current(git, job, git.resolve(base_branch)):
+            return False
+    except GitError:
+        return False
+    try:
+        git.fetch_remote_commit(branch, source)
+        git.fetch_remote_commit(base_branch, target)
+        return (
+            git.is_ancestor(published, source)
+            and git.is_ancestor(str(job["base_sha"]), target)
+        )
+    except GitError:
+        # Git transport/read failures do not establish a changed history.
+        # The delivery stage repeats this read before it can mutate the PR.
+        return None
+
+
+def _resume_run_repair_integration(state: dict[str, Any]) -> bool:
+    acceptance = state.get("run_acceptance")
+    job = acceptance.get("repair_job") if isinstance(acceptance, dict) else None
+    if not isinstance(job, dict) or job.get("phase") != "blocked":
+        return False
+    reason = job.get("blocked_reason")
+    if reason not in {"integration_resync_exhausted", "integration_failed"}:
+        return False
+    if reason == "integration_resync_exhausted":
+        renew_resync_budget(
+            job,
+            policy_snapshot=job.get("policy_snapshot") or state["policy_snapshot"],
+        )
+    # The integration attempt can start before or after Candidate Acceptance.
+    # Re-enter that same stage so live refs are read again and any changed
+    # combination receives a fresh review through the normal delivery path.
+    job["phase"] = (
+        "accepted" if isinstance(job.get("acceptance_record"), dict) else "candidate"
+    )
+    job.pop("blocked_reason", None)
+    assert isinstance(acceptance, dict)
+    acceptance["phase"] = "repairing"
+    state.update({
+        "status": "run_acceptance_pending",
+        "terminal_kind": "run_repair_pending",
+        "diagnostics": [],
+    })
     return True
 
 

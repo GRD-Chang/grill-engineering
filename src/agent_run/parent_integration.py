@@ -42,6 +42,7 @@ def prepare_parent_snapshot(
     record_key: str,
     save: Callable[[], object],
     own_source_write: bool | str = False,
+    confirmed_source_sha: str | None = None,
 ) -> ParentSnapshotResult:
     """Integrate one exact live snapshot and record its provenance.
 
@@ -75,6 +76,13 @@ def prepare_parent_snapshot(
         if isinstance(prior, dict)
         else str(subject["base_sha"])
     )
+    # The integration record remembers the head observed *before* publication.
+    # Once its result has been published, that newer head is also an authority:
+    # resetting the remote back to the old source must not be accepted as a
+    # fresh snapshot and pushed again.
+    published_source = confirmed_source_sha or subject.get("published_sha")
+    if isinstance(published_source, str) and not git.is_ancestor(published_source, source):
+        raise ParentHistoryRewritten("source", published_source, source)
     if not git.is_ancestor(previous_source, source):
         raise ParentHistoryRewritten("source", previous_source, source)
     if not git.is_ancestor(previous_target, target):

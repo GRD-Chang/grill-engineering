@@ -115,6 +115,10 @@ from agent_run.parent_integration import (
     parent_integration_record_is_valid,
 )
 from agent_run.parent_only_integration import prepare_parent_integration
+from agent_run.run_repair_integration import (
+    needs_repair_integration,
+    prepare_repair_integration,
+)
 
 
 class ChangeDeliveryEngine:
@@ -272,6 +276,13 @@ class ChangeDeliveryEngine:
                     ):
                         continue
                     if (
+                        self.contract.label.startswith("run-repair-")
+                        and not isinstance(job.get("integrated_sha"), str)
+                        and needs_repair_integration(self, job)
+                        and not prepare_repair_integration(self, state, job, checkout)
+                    ):
+                        continue
+                    if (
                         job.get("attempt_kind") == "ci_repair"
                         and job.get("repair_source") == "required_checks"
                         and not ci_review_required(
@@ -355,6 +366,13 @@ class ChangeDeliveryEngine:
                                 continue
                     elif self.contract.label == "parent-only":
                         if not prepare_parent_integration(self, state, job, checkout):
+                            continue
+                    elif self.contract.label.startswith("run-repair-"):
+                        if (
+                            not isinstance(job.get("integrated_sha"), str)
+                            and needs_repair_integration(self, job)
+                            and not prepare_repair_integration(self, state, job, checkout)
+                        ):
                             continue
                     self._publication(state, job, checkout)
                     # Publication can discover a moving base and let the

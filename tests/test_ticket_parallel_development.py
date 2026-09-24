@@ -31,6 +31,7 @@ from support.cli_payloads import (
 )
 from support.seeding import seed_run, write_fixture
 from support.cli import run_cli, stdout_json
+from support.inprocess_cli import invoke_cli_inprocess
 from support.workspace import managed_repo, managed_state
 
 
@@ -126,6 +127,58 @@ def _engine(
         agents=agents,
         development_only=development_only,
     )
+
+
+def test_fixture_revision_read_does_not_erase_parallel_ticket_branch(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, _, git, fixture = _run(git_repo, (2, 3))
+    publisher = FixtureGitHubPublisher(fixture, git)
+    read_complete, release_read = Event(), Event()
+    original = FixtureGitHubReader.delivery_graph
+
+    def delayed_graph(reader: FixtureGitHubReader, parent_number: int) -> Any:
+        graph = original(reader, parent_number)
+        read_complete.set()
+        assert release_read.wait(10)
+        return graph
+
+    monkeypatch.setattr(FixtureGitHubReader, "delivery_graph", delayed_graph)
+    errors: list[BaseException] = []
+
+    def read_revision() -> None:
+        try:
+            publisher.current_effective_revision(
+                parent_number=1, ticket_number=2, expected_revision="",
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=read_revision)
+    thread.start()
+    try:
+        assert read_complete.wait(10)
+        base_sha = git.resolve(state["run_branch"])
+        for number in (2, 3):
+            if number == 3:
+                release_read.set()
+                thread.join(timeout=10)
+                assert not thread.is_alive()
+                assert not errors, errors
+            publisher.ensure_ticket_branch(
+                ticket_number=number,
+                branch=f"agent-run/test/ticket-{number}",
+                base_branch=state["run_branch"],
+                expected_base_sha=base_sha,
+                expected_remote_sha=base_sha,
+                recovery_remote_sha=base_sha,
+            )
+    finally:
+        release_read.set()
+        thread.join(timeout=10)
+    heads = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["published_branches"]
+    assert heads["agent-run/test/ticket-2"] == base_sha
+    assert heads["agent-run/test/ticket-3"] == base_sha
 
 
 def test_independent_ticket_development_overlaps_and_merges_state(git_repo: Path) -> None:
@@ -263,7 +316,7 @@ def test_ticket_pause_receipts_use_frozen_run_language(
     state = states.load_current_run(stdout_json(seeded)["run_id"])
     assert state is not None
     UserDefaultsStore().configure(language="en" if run_language == "zh" else "zh")
-    help_result = run_cli(git_repo, None, "stop", "--help", machine_output=False)
+    help_result = invoke_cli_inprocess(git_repo, None, "stop", "--help")
     assert help_result.returncode == 0, help_result.stdout + help_result.stderr
     assert (
         "Pause only the selected Ticket" if run_language == "zh"
@@ -283,7 +336,7 @@ def test_ticket_pause_receipts_use_frozen_run_language(
     assert waiting is not None
     assert waiting["ticket_jobs"][str(held_number)]["phase"] == "waiting_checks"
 
-    requested_json = run_cli(
+    requested_json = invoke_cli_inprocess(
         git_repo, fixture, "stop", "1", "--ticket", str(held_number), "--json",
     )
     assert requested_json.returncode == 0, requested_json.stdout + requested_json.stderr
@@ -293,16 +346,16 @@ def test_ticket_pause_receipts_use_frozen_run_language(
     }
     assert receipt["pause_requested"] is True
     assert receipt["ticket_phase"] == "waiting_checks"
-    requested_plain = run_cli(
-        git_repo, fixture, "stop", "1", "--ticket", str(held_number), machine_output=False,
+    requested_plain = invoke_cli_inprocess(
+        git_repo, fixture, "stop", "1", "--ticket", str(held_number),
     )
     assert requested_plain.returncode == 0, requested_plain.stdout + requested_plain.stderr
     assert requested_plain.stdout.strip() == (
         f"Ticket #{held_number}：已请求暂停" if run_language == "zh"
         else f"Ticket #{held_number}: pause requested"
     )
-    paused_plain = run_cli(
-        git_repo, fixture, "stop", "1", "--ticket", str(queued_number), machine_output=False,
+    paused_plain = invoke_cli_inprocess(
+        git_repo, fixture, "stop", "1", "--ticket", str(queued_number),
     )
     assert paused_plain.returncode == 0, paused_plain.stdout + paused_plain.stderr
     assert paused_plain.stdout.strip() == (
@@ -633,6 +686,8 @@ def test_queued_ticket_pause_survives_another_ticket_publication_and_restart(
     assert ready is not None
     queued = [entry["ticket_number"] for entry in ready["ticket_integration_queue"]]
     assert set(queued) == {2, 3}
+    branch_heads = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["published_branches"]
+    assert {ready["ticket_jobs"][str(number)]["ticket_branch"] for number in (2, 3)} <= set(branch_heads)
     held_number, paused_number = queued
     orchestrator = DeliveryRunEngine(
         controller=Controller(FixtureGitHubReader(fixture), git, states),
@@ -703,6 +758,8 @@ def test_controller_refresh_keeps_queued_ticket_pause_from_graph_read(
     assert ready is not None
     queued = [entry["ticket_number"] for entry in ready["ticket_integration_queue"]]
     assert set(queued) == {2, 3}
+    branch_heads = json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["published_branches"]
+    assert {ready["ticket_jobs"][str(number)]["ticket_branch"] for number in (2, 3)} <= set(branch_heads)
     paused_number = queued[pause_queue_index]
     graph_entered = Event()
     release_graph = Event()

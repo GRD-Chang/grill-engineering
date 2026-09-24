@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from agent_run.git import GitError, GitRepository
+
+
+def test_git_dispatch_honors_path_changes_after_cached_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.git_output import run_git
+
+    original_path = os.environ.get("PATH", "")
+    for marker in ("first", "second"):
+        directory = tmp_path / marker
+        directory.mkdir()
+        executable = directory / "git"
+        executable.write_text(f"#!/bin/sh\nprintf '{marker}\\n'\n", encoding="utf-8")
+        executable.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{directory}:{original_path}")
+        result = run_git(["git", "--version"], cwd=tmp_path)
+        assert result.returncode == 0
+        assert result.stdout.strip() == marker
 
 
 @pytest.mark.parametrize("megabytes", [2, 4])

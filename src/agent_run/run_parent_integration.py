@@ -67,6 +67,7 @@ def prepare_run_parent_integration(
                 record_key="run_integration",
                 save=lambda: owner._save(state),
                 own_source_write=candidate if _own_run_ref_write(state, candidate) else False,
+                confirmed_source_sha=_published_run_head(state),
             )
             while result.status == "conflict":
                 keep_checkout = True
@@ -177,6 +178,13 @@ def run_integration_remote_is_current(
     source, target = owner.github.live_branch_heads(
         str(state["run_branch"]), str(state["base"]["branch"])
     )
+    published = _published_run_head(state)
+    if published is not None:
+        if source is None:
+            return False
+        owner.git.fetch_remote_commit(str(state["run_branch"]), source)
+        if not owner.git.is_ancestor(published, source):
+            return False
     return (
         target == record["target_sha"]
         and (
@@ -201,6 +209,12 @@ def _own_run_ref_write(state: dict[str, Any], candidate: str) -> bool:
     )
 
 
+def _published_run_head(state: dict[str, Any]) -> str | None:
+    publication = state.get("run_publication")
+    head = publication.get("published_head_sha") if isinstance(publication, dict) else None
+    return head if isinstance(head, str) else None
+
+
 def observe_run_repair_snapshot(
     owner: RunAcceptanceEngine, state: dict[str, Any], run: dict[str, Any]
 ) -> bool:
@@ -221,6 +235,9 @@ def observe_run_repair_snapshot(
             str(record["source_sha"]) if isinstance(record, dict)
             else str(state["base"]["sha"])
         )
+        published = _published_run_head(state)
+        if published is not None and not owner.git.is_ancestor(published, source):
+            raise ParentHistoryRewritten("source", published, source)
         previous_target = (
             str(record["target_sha"]) if isinstance(record, dict)
             else str(state["base"]["sha"])

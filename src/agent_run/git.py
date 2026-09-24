@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Literal
 
 from agent_run.commit_messages import commit_messages_match
@@ -25,6 +26,9 @@ from agent_run.git_retirement import (
     ManagedBranchRetirementGit,
     is_managed_delivery_branch as is_managed_delivery_branch,
 )
+
+
+_worktree_registry_lock = RLock()
 
 
 
@@ -49,6 +53,11 @@ class GitRepository:
         self._retirement = ManagedBranchRetirementGit(self)
         self._integration_scene = IntegrationRepairSceneGit(self)
         self._integration_commit = IntegrationRepairCommitGit(self)
+        # A proven relationship between immutable commit IDs stays true after
+        # later fetches. Keep this small: long-running Controllers see many Runs.
+        self._proven_ancestors: set[tuple[str, str]] = set()
+        self._immutable_resolutions: dict[str, str] = {}
+        self._known_commits: set[str] = set()
 
     def _set_write_guard(self, guard: Callable[[], None]) -> None:
         """Bind the owning Executor check to each Git dispatch."""
@@ -142,9 +151,19 @@ class GitRepository:
             raise GitError(result.stderr.strip() or f"could not create branch {branch}")
 
     def resolve(self, reference: str) -> str:
+        immutable = re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:\^\{tree\})?", reference
+        ) is not None
+        if immutable and reference in self._immutable_resolutions:
+            self._check_write_guard()
+            return self._immutable_resolutions[reference]
         resolved = self._resolve(reference)
         if resolved is None:
             raise GitError(f"Git reference {reference!r} does not exist")
+        if immutable:
+            if len(self._immutable_resolutions) >= 256:
+                self._immutable_resolutions.clear()
+            self._immutable_resolutions[reference] = resolved
         return resolved
 
     def checkout_head(self, checkout: Path) -> str:
@@ -681,6 +700,7 @@ class GitRepository:
         run_head_sha: str,
         default_head_sha: str,
         published_sha: str | None = None,
+        integration: dict[str, object] | None = None,
         message: str,
     ) -> str:
         return self._integration_commit.create_merge_resolution_publication_commit(
@@ -689,6 +709,7 @@ class GitRepository:
             run_head_sha=run_head_sha,
             default_head_sha=default_head_sha,
             published_sha=published_sha,
+            integration=integration,
             message=message,
         )
 
@@ -794,9 +815,20 @@ class GitRepository:
         return result.stdout.strip().split()
 
     def is_ancestor(self, ancestor_sha: str, descendant_sha: str) -> bool:
-        return self._run(
+        pair = (ancestor_sha, descendant_sha)
+        cacheable = all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) for sha in pair)
+        if cacheable and pair in self._proven_ancestors:
+            self._check_write_guard()
+            return True
+        proven = self._run(
             "merge-base", "--is-ancestor", ancestor_sha, descendant_sha
         ).returncode == 0
+        # Failed checks may become true when a missing object is fetched.
+        if proven and cacheable:
+            if len(self._proven_ancestors) >= 256:
+                self._proven_ancestors.clear()
+            self._proven_ancestors.add(pair)
+        return proven
 
     def fetch_remote_commit(self, branch: str, expected_sha: str) -> str:
         """Fetch the observed object, never a later value of a moving branch.
@@ -1072,9 +1104,18 @@ class GitRepository:
             )
 
     def _commit_exists(self, sha: str) -> bool:
-        return (
-            self._run("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
-        )
+        immutable = re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) is not None
+        if immutable and sha in self._known_commits:
+            self._check_write_guard()
+            return True
+        exists = self._run("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
+        # An absent object may arrive through a later fetch. Only retain
+        # successful checks for immutable full commit IDs.
+        if exists and immutable:
+            if len(self._known_commits) >= 256:
+                self._known_commits.clear()
+            self._known_commits.add(sha)
+        return exists
 
     def _resolve(self, reference: str) -> str | None:
         result = self._run("rev-parse", "--verify", reference)
@@ -1109,6 +1150,16 @@ class GitRepository:
     ) -> subprocess.CompletedProcess[str]:
         # Recheck each dispatch, including later commands inside one public call.
         self._check_write_guard()
+        if arguments and arguments[0] == "worktree":
+            # Git does not keep a new worktree's registry entry complete for
+            # the entire add command. A concurrent prune can delete it before
+            # add returns, including when callers use distinct GitRepository
+            # objects for the same Run.
+            with _worktree_registry_lock:
+                # Stop or a new Executor generation may revoke authority
+                # while this dispatch waits for another worktree command.
+                self._check_write_guard()
+                return run_git(["git", *arguments], cwd=directory, input=input)
         return run_git(["git", *arguments], cwd=directory, input=input)
 
 

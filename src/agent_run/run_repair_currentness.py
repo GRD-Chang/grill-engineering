@@ -15,6 +15,7 @@ from agent_run.external_supervision import (
 from agent_run.git import GitRepository
 from agent_run.github import GitHubReadError
 from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_repair_integration import repair_run_branch_is_current
 from agent_run.state import StateStore
 
 
@@ -67,15 +68,11 @@ class RunRepairCurrentness:
         default_head_sha: str,
     ) -> bool:
         run_head = self.git.resolve(str(state["run_branch"]))
-        expected_run_heads = {job.get("base_sha")}
-        integrated = job.get("integrated_sha")
-        if isinstance(integrated, str):
-            expected_run_heads.add(integrated)
         return (
             not self.trigger_is_current(
                 state, job, default_head_sha=default_head_sha
             )
-            or run_head not in expected_run_heads
+            or not repair_run_branch_is_current(self.git, job, run_head)
             or _mapping(state, "parent").get("revision")
             != job.get("parent_revision")
             or _mapping(state, "ticket_graph").get("revision")

@@ -506,6 +506,9 @@ class RunPublicationFlow(RunPublicationShared):
             return self._invalidate_for_fresh_acceptance(state)
         run = self._mapping(state, "run_acceptance")
         run_head = self.git.resolve(str(state["run_branch"]))
+        source_change = self._published_source_change(state, run, publication, run_head)
+        if source_change is not None:
+            return source_change
         integration = run.get("run_integration")
         observed_source = (
             str(integration["source_sha"])
@@ -734,6 +737,38 @@ class RunPublicationFlow(RunPublicationShared):
             state["terminal_kind"] = "waiting_human"
             state["diagnostics"] = []
         return self._save(state)
+
+    def _published_source_change(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        publication: dict[str, Any],
+        run_head: str,
+    ) -> dict[str, Any] | None:
+        """Fence an already published Run head before PR reuse or another push."""
+
+        published = publication.get("published_head_sha")
+        if not isinstance(published, str):
+            return None
+        branch = str(state["run_branch"])
+        source, _ = self.github.live_branch_heads(branch, self.default_branch)
+        if source is not None:
+            self.git.fetch_remote_commit(branch, source)
+        if source is None or not self.git.is_ancestor(published, source):
+            run.update({"phase": "ready_for_human", "blocked_reason": "integration_history_rewritten"})
+            publication["phase"] = "ready_for_human"
+            state.update({
+                "status": "ready_for_human",
+                "terminal_kind": "waiting_human",
+                "diagnostics": [{
+                    "code": "integration_history_rewritten",
+                    "message": f"Run source history changed after published head {published}: {source}",
+                }],
+            })
+            return self._save(state)
+        if source not in {published, run_head}:
+            return self._invalidate_for_fresh_acceptance(state)
+        return None
 
     def _publication_is_current(self, state: dict[str, Any]) -> bool:
         if not self._refresh_currentness(state):

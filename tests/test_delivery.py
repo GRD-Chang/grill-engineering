@@ -2405,8 +2405,12 @@ class ValidatingCiStateStore(StateStore):
             assert self.load_current_run(run_id) is not None
 
 
-@pytest.mark.parametrize("append_to", ["source", "target"])
-@pytest.mark.parametrize("ci_round", [1, 2])
+@pytest.mark.parametrize(
+    ("ci_round", "append_to"),
+    # The checkpoint recovery cases exercise the complementary pairs:
+    # first-round target and second-round source.
+    [(1, "source"), (2, "target")],
+)
 def test_ticket_ci_repair_integrates_before_applicable_review(
     git_repo: Path, tmp_path: Path, append_to: str, ci_round: int,
 ) -> None:
@@ -2526,8 +2530,12 @@ def _replace_external_file(repo: Path, tmp_path: Path, head: str) -> str:
         )
 
 
-@pytest.mark.parametrize("legacy_resume_phase", [False, True])
-@pytest.mark.parametrize("ci_round", [1, 2])
+@pytest.mark.parametrize(
+    ("ci_round", "legacy_resume_phase"),
+    # Normal conflict recovery covers both review policies; the legacy phase
+    # is checked after the second round, where review authority is required.
+    [(1, False), (2, False), (2, True)],
+)
 def test_ticket_ci_conflict_human_resume_returns_to_candidate(
     git_repo: Path, tmp_path: Path, ci_round: int, legacy_resume_phase: bool,
 ) -> None:
@@ -2612,14 +2620,21 @@ def test_ticket_ci_conflict_human_resume_returns_to_candidate(
 
 @pytest.mark.parametrize(
     ("ci_round", "append_to", "checkpoint"),
-    [(round_number, None, "invalidation") for round_number in (1, 2)]
-    + [
-        (round_number, branch, checkpoint)
-        for round_number in (1, 2)
-        for branch in ("source", "target")
-        for checkpoint in ("snapshot", "integration", "binding")
-    ]
-    + [(2, None, "review_result"), (2, "source", "review_result")],
+    [
+        (1, None, "invalidation"),
+        (2, None, "invalidation"),
+        # Each persisted checkpoint is recovered after both CI rounds and
+        # after both kinds of external append. Other tests cover the full
+        # source/target by first/second-round integration behavior.
+        (1, "source", "snapshot"),
+        (2, "target", "snapshot"),
+        (1, "target", "integration"),
+        (2, "source", "integration"),
+        (1, "source", "binding"),
+        (2, "target", "binding"),
+        (2, None, "review_result"),
+        (2, "source", "review_result"),
+    ],
 )
 def test_ticket_ci_integration_checkpoints_resume_with_current_authority(
     git_repo: Path, tmp_path: Path, ci_round: int,

@@ -100,7 +100,9 @@ class FixtureGitHubReader:
         return self._delivery_graph_once(parent_number)
 
     def live_pull_request(self, pr_number: int) -> dict[str, Any]:
-        delivery = _mapping(self._load(), "delivery")
+        current = self._load()
+        delivery = _mapping(current, "delivery")
+        repository = _string(current, "repository")
         pulls = delivery.get("pull_requests")
         if not isinstance(pulls, list):
             raise GitHubReadError("invalid_fixture", "delivery.pull_requests must be an array")
@@ -117,8 +119,11 @@ class FixtureGitHubReader:
                     base_sha = self.repository().default_head_sha
                 result: dict[str, Any] = {
                     "state": pull.get("state"), "head_sha": head,
+                    "head_branch": pull.get("head_ref", branch),
+                    "head_repository": pull.get("head_repository", repository),
                     "base_branch": base_branch,
                     "base_sha": base_sha,
+                    "base_repository": pull.get("base_repository", repository),
                     "integrated_sha": pull.get("integrated_sha"),
                 }
                 integrated = pull.get("integrated_sha")
@@ -348,7 +353,9 @@ class FixtureGitHubPublisher:
         recovery_remote_sha: str,
     ) -> None:
         if is_managed_delivery_branch(base_branch):
-            self._ensure_managed_base_ref(base_branch, expected_base_sha)
+            self._ensure_managed_base_ref(
+                base_branch, expected_base_sha, allow_append=True
+            )
         published = _mutable_mapping(self._delivery(), "published_branches")
         current = published.get(branch)
         if current is None:
@@ -1246,13 +1253,14 @@ class FixtureGitHubPublisher:
             raise ValueError(f"{failure_key} failure type is invalid")
         published = _mutable_mapping(self._delivery(), "published_branches")
         live_head = published.get(str(pull["branch"])) or pull.get("head_sha")
+        live_base = published.get(str(pull["base_branch"]))
         override = self._delivery().get("live_head_override")
         result = {
             "head_branch": pull.get("head_ref", pull["branch"]),
             "head_sha": override if isinstance(override, str) else live_head,
             "head_repository": pull.get("head_repository", self.data["repository"]),
             "base_branch": pull["base_branch"],
-            "base_sha": self.git.resolve(str(pull["base_branch"])),
+            "base_sha": live_base if isinstance(live_base, str) else self.git.resolve(str(pull["base_branch"])),
             "base_repository": pull.get("base_repository", self.data["repository"]),
             "mergeable": bool(self._delivery().get("mergeable", True)),
             "state": reported_state,
@@ -1389,7 +1397,10 @@ class FixtureGitHubPublisher:
             if outcome == "unknown":
                 raise MergeOutcomeUnknownError("fixture squash merge response is unknown")
         tree = self.git.resolve(f"{expected_head_sha}^{{tree}}")
-        parent = self.git.resolve(run_branch)
+        local_before = self.git.resolve(run_branch)
+        parent = str(live["base_sha"])
+        if not self.git.is_ancestor(local_before, parent):
+            raise ValueError("fixture Run ref diverged from the PR base")
         result = subprocess.run(
             [
                 "git",
@@ -1416,7 +1427,7 @@ class FixtureGitHubPublisher:
                 "update-ref",
                 f"refs/heads/{run_branch}",
                 integrated,
-                parent,
+                local_before,
             ],
             cwd=self.git.root,
             check=True,
@@ -1768,7 +1779,6 @@ class FixtureGitHubPublisher:
     ) -> str:
         reader = FixtureGitHubReader(self.path)
         graph = reader.delivery_graph(parent_number)
-        self.data = reader.data
         return effective_revision_from_graph(graph, ticket_number)
 
     def _delivery(self) -> dict[str, Any]:

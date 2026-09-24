@@ -14,9 +14,17 @@ import pytest
 from support.workspace import prepare_workspace
 
 from agent_run.agents import DevelopmentResult, ReviewResult
+from agent_run.controller import Controller
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.delivery_history import history_records
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
+from agent_run.git import GitError
+from agent_run.integration_resync_budget import (
+    complete_integration_window,
+    observe_integration_snapshot,
+)
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run import run_repair_integration
 from agent_run.run_currentness import invalidate_stale_run_repair
 from agent_run.run_publication import RunPublicationEngine
 from agent_run.semantic_attempt import allocate_semantic_attempt, close_semantic_attempt
@@ -229,6 +237,286 @@ def test_run_repair_non_repairable_required_checks_wait_without_new_candidate(
     assert len(agents.development_requests) == 1
     assert run.get("completed_repair_jobs", []) == []
     assert result["supervision_window"]["kind"] == "github_convergence"
+
+
+@pytest.mark.parametrize("reason", ["integration_resync_exhausted", "integration_failed"])
+def test_nested_run_repair_integration_resume_preserves_pr_and_delivery(
+    git_repo: Path, reason: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, states, git = _completed_run(
+        git_repo,
+        delivery_policy=DeliveryPolicy(
+            integration_resync_limit=1 if reason == "integration_resync_exhausted" else 3
+        ),
+    )
+    run_id = str(state["run_id"])
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["unknown"]
+    publisher._save()
+    agents = ScriptedRunAgents()
+    paused = RunAcceptanceEngine(
+        git=git, states=states, agents=agents, github=publisher,
+    ).accept(run_id)
+    assert paused["status"] == "waiting_external"
+    run = paused["run_acceptance"]
+    job = run["repair_job"]
+    original_pr = job["pr_number"]
+    original_candidate = job["candidate_sha"]
+    original_review = deepcopy(job["review_budget"])
+    original_run_review = deepcopy(run["review_budget"])
+    original_run_resync = deepcopy(run["integration_resync"])
+    states.save_run(run_id, paused)
+    collaborator = git_repo.parent / "repair-collaborator"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(collaborator), job["published_sha"]],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    try:
+        (collaborator / "external-repair.txt").write_text("external\n", encoding="utf-8")
+        subprocess.run(["git", "add", "external-repair.txt"], cwd=collaborator, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Collaborator", "-c", "user.email=c@example.invalid",
+             "commit", "-m", "append Repair source"],
+            cwd=collaborator, check=True, capture_output=True,
+        )
+        first_append = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=collaborator, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        (collaborator / "external-repair.txt").write_text("external again\n", encoding="utf-8")
+        subprocess.run(["git", "add", "external-repair.txt"], cwd=collaborator, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Collaborator", "-c", "user.email=c@example.invalid",
+             "commit", "-m", "append Repair source again"],
+            cwd=collaborator, check=True, capture_output=True,
+        )
+        appended = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=collaborator, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        target_append = None
+        if reason == "integration_resync_exhausted":
+            subprocess.run(
+                ["git", "checkout", "--detach", str(job["base_sha"])],
+                cwd=collaborator, check=True, capture_output=True,
+            )
+            (collaborator / "external-target.txt").write_text(
+                "target contribution\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "external-target.txt"], cwd=collaborator, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Collaborator", "-c", "user.email=c@example.invalid",
+                 "commit", "-m", "append Run target"],
+                cwd=collaborator, check=True, capture_output=True,
+            )
+            target_append = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=collaborator, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(collaborator)],
+            cwd=git_repo, check=True, capture_output=True,
+        )
+    if reason == "integration_resync_exhausted":
+        for source in (job["published_sha"], first_append):
+            observe_integration_snapshot(
+                job, source_sha=source, target_sha=job["base_sha"],
+                policy_snapshot=job["policy_snapshot"],
+            )
+            complete_integration_window(job)
+        original_job_resync = deepcopy(job["integration_resync"])
+        states.save_run(run_id, paused)
+    else:
+        original_job_resync = job.get("integration_resync")
+    publisher.data["delivery"]["published_branches"][job["repair_branch"]] = appended
+    repair_pr = next(
+        pr for pr in publisher.data["delivery"]["pull_requests"]
+        if pr["number"] == original_pr
+    )
+    repair_pr["head_sha"] = appended
+    if target_append is not None:
+        publisher.data["delivery"]["published_branches"][str(state["run_branch"])] = target_append
+        repair_pr["base_sha"] = target_append
+    publisher._save()
+    if reason == "integration_failed":
+        original_prepare = run_repair_integration.prepare_parent_snapshot
+
+        def temporary_failure(**_kwargs: Any) -> Any:
+            raise GitError("temporary local Git read failure")
+
+        monkeypatch.setattr(run_repair_integration, "prepare_parent_snapshot", temporary_failure)
+    blocked = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(run_id)
+    if reason == "integration_failed":
+        monkeypatch.setattr(run_repair_integration, "prepare_parent_snapshot", original_prepare)
+    assert blocked["status"] == "ready_for_human"
+    assert blocked["run_acceptance"]["repair_job"]["blocked_reason"] == reason
+    blocked_review = deepcopy(blocked["run_acceptance"]["repair_job"]["review_budget"])
+    blocked_run_review = deepcopy(blocked["run_acceptance"]["review_budget"])
+    blocked_run_resync = deepcopy(blocked["run_acceptance"]["integration_resync"])
+    if reason == "integration_failed":
+        assert blocked_review == original_review
+        assert blocked_run_review == original_run_review
+        assert blocked_run_resync == original_run_resync
+    assert states.load_current_run(run_id) == blocked
+
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True,
+    )
+    resumed_run = resumed["run_acceptance"]
+    resumed_job = resumed_run["repair_job"]
+    assert resumed["status"] == "run_acceptance_pending", (
+        resumed["status"], resumed.get("diagnostics"), resumed_run["phase"],
+        resumed_job["phase"], resumed_job.get("blocked_reason"),
+    )
+    assert resumed_run["phase"] == "repairing"
+    assert resumed_job["phase"] == "accepted"
+    assert resumed_job["pr_number"] == original_pr
+    assert resumed_job["candidate_sha"] == original_candidate
+    assert resumed_job["review_budget"] == blocked_review
+    assert resumed_run["review_budget"] == blocked_run_review
+    assert resumed_run["integration_resync"] == blocked_run_resync
+    if reason == "integration_resync_exhausted":
+        assert resumed_job["integration_resync"]["generation"] == 2
+        assert resumed_job["integration_resync"]["used"] == 0
+        assert resumed_job["integration_resync"]["history"][:-1] == original_job_resync["history"]
+    else:
+        assert resumed_job.get("integration_resync") == original_job_resync
+    event = resumed["resume_audit"]["history"][-1]
+    assert event["kind"] == (
+        "integration_resync" if reason == "integration_resync_exhausted"
+        else "execution_failure"
+    )
+    assert event["work_subject"] == f"run-repair:{run_id}"
+    assert event["generation"] == resumed_job["repair_generation"]
+    assert states.load_current_run(run_id) == resumed
+
+    publisher.data["delivery"]["required_checks"] = ["pass"]
+    publisher._save()
+    agents._reviews = [_passing_artifact()]
+    delivered = RunAcceptanceEngine(
+        git=git, states=states, agents=agents,
+        github=FixtureGitHubPublisher(fixture, git),
+    ).accept(run_id)
+    assert delivered["status"] == "run_publication_pending", (
+        delivered["status"], delivered.get("diagnostics"),
+        delivered["run_acceptance"]["phase"],
+        delivered["run_acceptance"].get("repair_job", {}).get("phase"),
+    )
+    assert delivered["run_acceptance"]["repair_pr_number"] == original_pr
+    if target_append is not None:
+        assert subprocess.run(
+            ["git", "show", f"{delivered['run_branch']}:external-target.txt"],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        ).stdout.strip() == "target contribution"
+
+
+def test_nested_run_repair_history_rewrite_is_not_resumable(git_repo: Path) -> None:
+    state, states, git = _completed_run(git_repo)
+    run_id = str(state["run_id"])
+    fixture = git_repo / "github.json"
+    agents = ScriptedRunAgents()
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["unknown"]
+    publisher._save()
+    paused = RunAcceptanceEngine(
+        git=git, states=states, agents=agents, github=publisher,
+    ).accept(run_id)
+    job = paused["run_acceptance"]["repair_job"]
+    job.update({"phase": "blocked", "blocked_reason": "integration_history_rewritten"})
+    paused["run_acceptance"]["phase"] = "ready_for_human"
+    paused.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
+    states.save_run(run_id, paused)
+
+    with pytest.raises(ValueError, match="no canonical recovery boundary"):
+        Controller(FixtureGitHubReader(fixture), git, states).resume(
+            run_id, explicit_resume=True,
+        )
+    assert states.load_current_run(run_id) == paused
+
+
+@pytest.mark.parametrize("rewritten_branch", ["source", "target"])
+def test_rewritten_repair_pr_cannot_consume_nested_resync_resume(
+    git_repo: Path, rewritten_branch: str,
+) -> None:
+    state, states, git = _completed_run(
+        git_repo, delivery_policy=DeliveryPolicy(integration_resync_limit=0)
+    )
+    run_id = str(state["run_id"])
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["unknown"]
+    publisher._save()
+    paused = RunAcceptanceEngine(
+        git=git, states=states, agents=ScriptedRunAgents(), github=publisher,
+    ).accept(run_id)
+    run = paused["run_acceptance"]
+    job = run["repair_job"]
+    observe_integration_snapshot(
+        job, source_sha=job["published_sha"], target_sha=job["base_sha"],
+        policy_snapshot=job["policy_snapshot"],
+    )
+    complete_integration_window(job)
+    budget_before = deepcopy(job["integration_resync"])
+    job.update({"phase": "blocked", "blocked_reason": "integration_resync_exhausted"})
+    run["phase"] = "ready_for_human"
+    paused.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
+    states.save_run(run_id, paused)
+
+    if rewritten_branch == "source":
+        publisher.data["delivery"]["published_branches"][job["repair_branch"]] = job["base_sha"]
+    else:
+        rewritten = git.resolve("main")
+        publisher.data["delivery"]["published_branches"][state["run_branch"]] = rewritten
+        publisher.data["delivery"]["pull_requests"][0]["base_sha"] = rewritten
+    publisher._save()
+    blocked, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True,
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["diagnostics"][0]["code"] == (
+        "change_pr_head_changed_externally"
+        if rewritten_branch == "source" else "change_pr_base_changed_externally"
+    )
+    assert blocked["run_acceptance"]["repair_job"]["integration_resync"] == budget_before
+    assert blocked["run_acceptance"]["repair_job"]["phase"] == "blocked"
+
+
+def test_nested_integration_resume_reenters_candidate_without_review_record(
+    git_repo: Path,
+) -> None:
+    state, states, git = _completed_run(git_repo)
+    run_id = str(state["run_id"])
+    fixture = git_repo / "github.json"
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["unknown"]
+    publisher._save()
+    paused = RunAcceptanceEngine(
+        git=git, states=states, agents=ScriptedRunAgents(), github=publisher,
+    ).accept(run_id)
+    run = paused["run_acceptance"]
+    job = run["repair_job"]
+    original_pr = job["pr_number"]
+    review_budget = deepcopy(job["review_budget"])
+    job.pop("acceptance_record")
+    job.pop("acceptance_artifact")
+    job.update({"phase": "blocked", "blocked_reason": "integration_failed"})
+    run["phase"] = "ready_for_human"
+    paused.update({"status": "ready_for_human", "terminal_kind": "waiting_human"})
+    states.save_run(run_id, paused)
+
+    resumed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+        run_id, explicit_resume=True,
+    )
+    resumed_job = resumed["run_acceptance"]["repair_job"]
+    assert resumed_job["phase"] == "candidate"
+    assert resumed_job["pr_number"] == original_pr
+    assert resumed_job["review_budget"] == review_budget
+    assert resumed["status"] == "run_acceptance_pending"
 
 def test_run_repair_default_branch_drift_revalidates_candidate_in_same_cycle(
     git_repo: Path,

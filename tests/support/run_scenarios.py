@@ -11,6 +11,7 @@ from agent_run.controller import Controller
 from agent_run.ci_recovery_budget import (
     new_ci_recovery_budget, observe_repairable_ci_failure,
 )
+from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
 from agent_run.github_fixture import FixtureGitHubReader, FixtureGitHubPublisher
 from agent_run.run_acceptance import RunAcceptanceEngine
@@ -62,6 +63,7 @@ def save_run_with_ci_fixture(
 
 def _completed_run(
     git_repo: Path, *, ticket_number: int = 2, state_root: Path | None = None,
+    delivery_policy: DeliveryPolicy | None = None,
 ) -> tuple[dict[str, Any], StateStore, GitRepository]:
     """构造历史 completed Ticket 及其 accepted Integration，保存真实 Run。
 
@@ -83,7 +85,10 @@ def _completed_run(
     )
     states = StateStore(state_root if state_root is not None else git_repo / ".agent-run")
     git = GitRepository(git_repo)
-    controller = Controller(FixtureGitHubReader(fixture), git, states)
+    controller = Controller(
+        FixtureGitHubReader(fixture), git, states,
+        delivery_policy=delivery_policy,
+    )
     state, _ = controller.start(1)
     tree = git.resolve(f"{state['run_branch']}^{{tree}}")
     integrated = subprocess.run(

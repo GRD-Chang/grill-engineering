@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import pytest
 
@@ -473,13 +473,85 @@ def _managed_state_snapshot(
     }
 
 
-def _install_a_and_b(source: Path, home: Path, fake_bin: Path) -> None:
-    for version in ("a", "b"):
-        (source / "src" / "agent_run" / "__init__.py").write_text(
-            f"__version__ = '{version}'\n", encoding="utf-8"
+@pytest.fixture(scope="session")
+def installed_a_and_b(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Callable[[Path, Path, Path], None]]:
+    """Copy a settled two-generation install into each independent test home."""
+    # Every xdist worker sees the same parent of its private basetemp. Build
+    # the immutable template once, then copy it into each worker's test home.
+    shared = "PYTEST_XDIST_WORKER" in os.environ
+    template_root = (
+        tmp_path_factory.getbasetemp().parent / "installer-a-b-shared"
+        if shared else tmp_path_factory.mktemp("installer-a-b")
+    )
+    template_home = template_root / "home"
+
+    def prepare_template() -> None:
+        template_root.mkdir(exist_ok=True)
+        template_source = _source_tree(template_root)
+        template_bin, template_count, _ = _fake_codex(template_root)
+        template_home.mkdir()
+        for version in ("a", "b"):
+            (template_source / "src" / "agent_run" / "__init__.py").write_text(
+                f"__version__ = '{version}'\n", encoding="utf-8"
+            )
+            result = _run(template_source, template_home, template_bin)
+            assert result.returncode == 0, result.stderr
+        assert template_count.read_text(encoding="utf-8") == "2"
+        shutil.rmtree(template_source)
+        (template_root / "ready").touch()
+
+    if shared:
+        with template_root.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not (template_root / "ready").exists():
+                if template_root.exists():
+                    shutil.rmtree(template_root)
+                try:
+                    prepare_template()
+                except BaseException:
+                    shutil.rmtree(template_root, ignore_errors=True)
+                    raise
+    else:
+        prepare_template()
+
+    def install(source: Path, home: Path, fake_bin: Path) -> None:
+        assert source.parent == home.parent == fake_bin.parent
+        assert not any(home.iterdir())
+        shutil.copytree(
+            template_home, home, dirs_exist_ok=True, symlinks=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
-        result = _run(source, home, fake_bin)
-        assert result.returncode == 0, result.stderr
+        old_root = str(template_root).encode()
+        new_root = str(home.parent).encode()
+        for path in home.rglob("*"):
+            if path.is_symlink():
+                target = os.readlink(path)
+                if target.startswith(str(template_root)):
+                    path.unlink()
+                    path.symlink_to(str(home.parent) + target[len(str(template_root)):])
+            elif path.is_file() and path.name in {
+                "pyvenv.cfg", "agent-run", "activate", "activate.csh", "activate.fish",
+            }:
+                contents = path.read_bytes()
+                if old_root in contents:
+                    path.write_bytes(contents.replace(old_root, new_root))
+        assert _active_snapshot(home).is_dir()
+        assert (_data_root(home) / "active" / "previous").resolve().is_dir()
+        assert (home / ".local" / "bin" / "agent-run").resolve() == (
+            _active_snapshot(home) / "bin" / "agent-run"
+        )
+        (source / "src" / "agent_run" / "__init__.py").write_text(
+            "__version__ = 'b'\n", encoding="utf-8"
+        )
+        (fake_bin.parent / "codex-count").write_text("2", encoding="utf-8")
+
+    try:
+        yield install
+    finally:
+        if not shared:
+            shutil.rmtree(template_root)
 
 
 def _write_public_state_fixtures(tmp_path: Path, home: Path) -> tuple[Path, Path, Path]:
@@ -1015,13 +1087,13 @@ def test_install_rejects_managed_paths_inside_source_without_writing_source(
     ],
 )
 def test_public_install_failures_preserve_existing_state(
-    tmp_path: Path, failure: str
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None], failure: str
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1103,13 +1175,14 @@ def _write_activation_fault_sitecustomize(
 
 @pytest.mark.parametrize("fault", ["rename", "sync"])
 def test_public_activation_faults_preserve_existing_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    installed_a_and_b: Callable[[Path, Path, Path], None], fault: str,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1134,13 +1207,14 @@ def test_public_activation_faults_preserve_existing_state(
 
 @pytest.mark.parametrize("termination_signal", [signal.SIGINT, signal.SIGTERM])
 def test_public_signal_cleans_candidate_probe_process_and_state(
-    tmp_path: Path, termination_signal: signal.Signals
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None],
+    termination_signal: signal.Signals,
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1150,7 +1224,7 @@ def test_public_signal_cleans_candidate_probe_process_and_state(
     )
     (tmp_path / "codex-behavior").write_text("sleep", encoding="utf-8")
     pid_file = tmp_path / "codex-pid"
-    pid_file.unlink()
+    pid_file.unlink(missing_ok=True)
     environment = os.environ.copy()
     environment.update(
         {
@@ -1186,13 +1260,13 @@ def test_public_signal_cleans_candidate_probe_process_and_state(
 
 
 def test_public_signal_during_post_activation_cleanup_keeps_new_generation_complete(
-    tmp_path: Path,
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None],
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, _count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1244,13 +1318,13 @@ def test_public_signal_during_post_activation_cleanup_keeps_new_generation_compl
 
 
 def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
-    tmp_path: Path,
+    tmp_path: Path, installed_a_and_b: Callable[[Path, Path, Path], None],
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    _install_a_and_b(source, home, fake_bin)
+    installed_a_and_b(source, home, fake_bin)
     config, locator, delivery = _write_public_state_fixtures(tmp_path, home)
     before = _managed_state_snapshot(
         home, config=config, locator=locator, delivery=delivery
@@ -1531,7 +1605,7 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
 
 def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    offline_install_environment: dict[str, str],
+    offline_install_environment: dict[str, str], capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = _source_tree(tmp_path, real_install=True)
     source = source.rename(tmp_path / "源码 archive with spaces")
@@ -1556,7 +1630,7 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     monkeypatch.setenv("TMPDIR", str(probe_tmp))
     shell = tool_directory / "bash"
     git = str(tool_directory / "git")
-    # The two real builds also cover source cleanliness and exact provenance;
+    # The real build covers source cleanliness and exact provenance;
     # a separate initial installation would repeat the same expensive boundary.
     for arguments in (
         ["init", "-q", "-b", "main"],
@@ -1771,14 +1845,16 @@ def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
     assert list((managed_root / "state" / "runs").glob("*.json"))
 
     count_before_repeat = int(count.read_text(encoding="utf-8"))
-    repeated = _run(
-        source,
-        home,
-        fake_bin,
-        path=isolated_path,
-        environment=isolated_environment,
-    )
-    assert repeated.returncode == 0, repeated.stderr
+    # The public setup above already built and installed the real wheel.
+    # Rebuild only the identical package tree to exercise idempotent activation.
+    with monkeypatch.context() as repeat_environment:
+        for name, value in isolated_environment.items():
+            repeat_environment.setenv(name, value)
+        repeat_environment.setattr(
+            runner_installer, "_build_candidate", fast_build_candidate
+        )
+        assert runner_installer.main(["--source", str(source)]) == 0
+    assert json.loads(capsys.readouterr().out)["idempotent"] is True
     _assert_process_gone(tmp_path / "codex-descendant-pid")
     assert int(count.read_text(encoding="utf-8")) == count_before_repeat
     assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from agent_run.agents import DevelopmentResult, ReviewResult
@@ -92,6 +93,101 @@ def test_parent_only_ci_repair_reviews_final_candidate_and_keeps_pr(git_repo: Pa
     assert len(agents.review_requests) == 2
     assert agents.review_requests[-1]["candidate_sha"] == job["candidate_sha"]
     assert len(publisher.data["delivery"]["pull_requests"]) == 1
+
+
+def test_parent_only_published_source_rollback_pauses_without_repush(git_repo: Path) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
+    run_id = str(state["run_id"])
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["pending"]
+    publisher._save()
+    agents = ParentCIAgents(states.root / "worktrees" / run_id / "parent")
+    engine = ParentDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
+
+    waiting = engine.deliver(run_id)
+    job = waiting["parent_job"]
+    assert job["phase"] == "waiting_checks"
+    published = job["published_sha"]
+    previous = job["parent_integration"]["source_sha"]
+    assert previous != published
+    branch = str(job["parent_branch"])
+    publisher.data["delivery"]["published_branches"][branch] = previous
+    publisher.data["delivery"]["pull_requests"][0]["head_sha"] = previous
+    publisher._save()
+    reviews_before = len(agents.review_requests)
+
+    paused = engine.deliver(run_id)
+    assert paused["status"] == "blocked", (
+        paused["parent_job"]["phase"], paused["diagnostics"]
+    )
+    assert paused["terminal_kind"] == "waiting_human"
+    assert paused["parent_job"]["blocked_reason"] == "integration_history_rewritten"
+    assert paused["parent_job"]["published_sha"] == published
+    assert publisher.live_branch_heads(branch, "main")[0] == previous
+    assert len(agents.review_requests) == reviews_before
+
+
+def test_parent_only_published_source_append_reuses_pr(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    git = GitRepository(git_repo)
+    states = StateStore(git_repo / ".agent-run")
+    state, _ = Controller(FixtureGitHubReader(fixture), git, states).start(1)
+    run_id = str(state["run_id"])
+    publisher = FixtureGitHubPublisher(fixture, git)
+    publisher.data["delivery"]["required_checks"] = ["pending"]
+    publisher._save()
+    agents = ParentCIAgents(states.root / "worktrees" / run_id / "parent")
+    engine = ParentDeliveryEngine(git=git, states=states, github=publisher, agents=agents)
+    waiting = engine.deliver(run_id)
+    job = waiting["parent_job"]
+    assert job["phase"] == "waiting_checks"
+    original_pr = job["pr_number"]
+    published = job["published_sha"]
+
+    collaborator = tmp_path / "collaborator"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(collaborator), published],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    try:
+        (collaborator / "human.txt").write_text("human contribution\n", encoding="utf-8")
+        subprocess.run(["git", "add", "human.txt"], cwd=collaborator, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Collaborator", "-c", "user.email=c@example.invalid",
+             "commit", "-m", "append Parent contribution"],
+            cwd=collaborator, check=True, capture_output=True,
+        )
+        appended = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=collaborator, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(collaborator)],
+            cwd=git_repo, check=True, capture_output=True,
+        )
+    branch = str(job["parent_branch"])
+    publisher.data["delivery"]["published_branches"][branch] = appended
+    publisher.data["delivery"]["pull_requests"][0]["head_sha"] = appended
+    publisher.data["delivery"]["required_checks"] = ["pass"]
+    publisher.data["delivery"]["check_position"] = 0
+    publisher._save()
+
+    delivered = engine.deliver(run_id)
+    final = delivered["parent_job"]
+    assert delivered["status"] == "parent_approval_pending", (
+        final["phase"], final.get("blocked_reason")
+    )
+    assert final["pr_number"] == original_pr
+    assert git.is_ancestor(published, final["published_sha"])
+    assert git.is_ancestor(appended, final["published_sha"])
+    assert len(agents.review_requests) == 2
+    assert agents.review_requests[-1]["candidate_sha"] == final["candidate_sha"]
 
 
 def test_run_final_ci_repair_shares_budget_with_internal_pr(git_repo: Path) -> None:

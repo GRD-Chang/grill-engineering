@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from agent_run.git import GitError, GitRepository
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records
+from agent_run.run_repair_integration import repair_run_branch_is_current
 
 
 class PullRequestReader(Protocol):
@@ -49,7 +50,7 @@ def stale_change_job_reason(
         return "run_repair_ticket_completion_changed"
     run_branch = state.get("run_branch")
     if isinstance(run_branch, str):
-        if job.get("base_sha") != git.resolve(run_branch):
+        if not repair_run_branch_is_current(git, job, git.resolve(run_branch)):
             return "run_repair_base_changed"
     return None
 
@@ -142,8 +143,20 @@ def unknown_pr_mutation(
         return "change_pr_base_unknown"
     if live.get("base_branch") != expected_base_branch:
         return "change_pr_base_changed_externally"
-    if not subject.startswith("ticket:") and live.get("base_sha") != git.resolve(expected_base_branch):
-        return "change_pr_base_changed_externally"
+    if not subject.startswith("ticket:"):
+        local_base = git.resolve(expected_base_branch)
+        if subject.startswith("run-repair:") and repair_run_branch_is_current(
+            git, job, local_base
+        ):
+            # The published PR can already target an integrated remote Run
+            # snapshot while the managed local ref remains at its anchor.
+            # A newer live target still needs the append-only check in the
+            # Controller, followed by fresh integration and review.
+            expected_base = job.get("base_sha")
+        else:
+            expected_base = local_base
+        if live.get("base_sha") != expected_base:
+            return "change_pr_base_changed_externally"
     return None
 
 

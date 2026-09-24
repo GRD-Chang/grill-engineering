@@ -31,6 +31,7 @@ from agent_run.run_repair_delivery import (
     RunRepairJobRotationRequired,
     RunRepairPublisher,
 )
+from agent_run.run_repair_integration import observe_repair_source
 from agent_run.run_thread_identity import prior_thread_identities
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
@@ -73,7 +74,11 @@ class RunRepairLifecycle:
                 self._complete_pending_repair_job_rotation(state, job, checkout)
                 branch = str(job["repair_branch"])
                 repair_is_integrated = isinstance(job.get("integrated_sha"), str)
-                if not repair_is_integrated:
+                existing_append = (
+                    observe_repair_source(self.owner, state, job)
+                    if not repair_is_integrated else False
+                )
+                if not repair_is_integrated and not existing_append:
                     ensure_change_branch_authority(
                         github=self.owner.github,
                         state=state,

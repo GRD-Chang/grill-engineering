@@ -124,7 +124,9 @@ def test_github_reader_live_pull_request_returns_integrated_sha(
             }
         return {
             "state": "MERGED",
+            "headRefName": "agent-run-repair/run-1",
             "headRefOid": "head-sha",
+            "headRepository": {"nameWithOwner": "example/project"},
             "baseRefName": "agent-run/run-1",
             "baseRefOid": "integrated-sha",
             "mergeCommit": {"oid": "integrated-sha"},
@@ -135,6 +137,8 @@ def test_github_reader_live_pull_request_returns_integrated_sha(
     live = reader.live_pull_request(12)
 
     assert live["integrated_sha"] == "integrated-sha"
+    assert live["head_branch"] == "agent-run-repair/run-1"
+    assert live["head_repository"] == live["base_repository"] == "example/project"
     assert live["head_tree"] == "head-sha-tree"
     assert live["integrated_tree"] == "integrated-sha-tree"
     assert live["integrated_parents"] == ["parent-a", "parent-b"]

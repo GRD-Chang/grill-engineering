@@ -1194,7 +1194,7 @@ def test_run_advances_multiple_tickets_without_final_merge(git_repo: Path) -> No
     fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
     pulls = fixture_data["delivery"]["pull_requests"]
     assert len(pulls) == 3
-    assert fixture_data["delivery"]["closed_issues"] == [2, 3]
+    assert sorted(fixture_data["delivery"]["closed_issues"]) == [2, 3]
 
 
 def test_status_and_history_show_started_development_attempt(

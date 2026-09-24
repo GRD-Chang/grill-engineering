@@ -110,6 +110,115 @@ def test_own_final_ref_readback_does_not_open_new_run_integration(
     assert run.get("blocked_reason") != "run_integration_moving"
 
 
+def test_published_run_ref_rollback_pauses_before_reintegration(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["fail"]
+    publisher._save()
+    failed = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    ).publish(str(state["run_id"]))
+    run = failed["run_acceptance"]
+    record = dict(run["run_integration"])
+    published = failed["run_publication"]["published_head_sha"]
+    assert published == record["head_sha"]
+    old_source = git.resolve("main")
+    assert old_source != published
+    # The last integration observed this source before publishing its result.
+    record["source_sha"] = old_source
+    run["run_integration"] = record
+    publisher.data["delivery"]["published_branches"][str(state["run_branch"])] = old_source
+    publisher._save()
+    run["phase"] = "pending"
+    owner = RunAcceptanceEngine(
+        git=git, states=states, agents=ScriptedRunAgents(), github=publisher,
+    )
+
+    assert not prepare_run_parent_integration(owner, failed, run)
+    assert run["blocked_reason"] == "integration_history_rewritten"
+    assert failed["status"] == "ready_for_human"
+    assert run["run_integration"] == record
+    assert publisher.live_branch_heads(str(state["run_branch"]), "main")[0] == old_source
+
+
+def test_final_publication_rejects_rollback_before_repush(git_repo: Path) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["pending"]
+    publisher._save()
+    publication = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    waiting = publication.publish(str(state["run_id"]))
+    assert waiting["status"] == "waiting_checks"
+    published = waiting["run_publication"]["published_head_sha"]
+    old_source = git.resolve("main")
+    assert published != old_source
+    branch = str(state["run_branch"])
+    publisher.data["delivery"]["published_branches"][branch] = old_source
+    publisher.data["delivery"]["pull_requests"][0]["head_sha"] = old_source
+    publisher._save()
+
+    paused = publication.publish(str(state["run_id"]))
+    assert paused["status"] == "ready_for_human"
+    assert paused["run_acceptance"]["blocked_reason"] == "integration_history_rewritten"
+    assert publisher.live_branch_heads(branch, "main")[0] == old_source
+    assert paused["run_publication"]["published_head_sha"] == published
+
+
+def test_final_publication_append_requires_new_acceptance_and_reuses_pr(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    state, states, git, publisher = _accepted_run(git_repo)
+    publisher.data["delivery"]["required_checks"] = ["pending"]
+    publisher._save()
+    publication = RunPublicationEngine(
+        git=git, states=states, agents=RunPublicationAgents(),
+        github=publisher, default_branch="main", default_head_sha=git.resolve("main"),
+    )
+    waiting = publication.publish(str(state["run_id"]))
+    assert waiting["status"] == "waiting_checks"
+    original_pr = waiting["run_publication"]["pr_number"]
+    published = waiting["run_publication"]["published_head_sha"]
+    branch = str(state["run_branch"])
+    collaborator = tmp_path / "collaborator"
+    _git(git_repo, "worktree", "add", "--detach", str(collaborator), published)
+    try:
+        (collaborator / "human.txt").write_text("human\n", encoding="utf-8")
+        _git(collaborator, "add", "human.txt")
+        _git(collaborator, "-c", "user.name=Collaborator", "-c", "user.email=c@example.invalid",
+             "commit", "-m", "append final Run contribution")
+        appended = _git(collaborator, "rev-parse", "HEAD")
+    finally:
+        _git(git_repo, "worktree", "remove", "--force", str(collaborator))
+    publisher.data["delivery"]["published_branches"][branch] = appended
+    publisher.data["delivery"]["pull_requests"][0]["head_sha"] = appended
+    publisher._save()
+
+    refreshed = publication.publish(str(state["run_id"]))
+    assert refreshed["status"] == "run_acceptance_pending"
+    assert refreshed["run_publication"]["pr_number"] == original_pr
+    agents = ScriptedRunAgents()
+    agents._reviews = [_passing_artifact()]
+    accepted = RunAcceptanceEngine(
+        git=git, states=states, agents=agents, github=publisher,
+    ).accept(str(state["run_id"]))
+    assert accepted["status"] == "run_publication_pending"
+    record = accepted["run_acceptance"]["run_integration"]
+    assert record["source_sha"] == appended
+    assert git.is_ancestor(published, record["head_sha"])
+    assert git.is_ancestor(appended, record["head_sha"])
+    assert agents.review_requests[0]["run_integration_record"] == record
+    assert accepted["run_publication"]["pr_number"] == original_pr
+    publisher.data["delivery"]["required_checks"] = ["pass"]
+    publisher.data["delivery"]["check_position"] = 0
+    publisher._save()
+    republished = publication.publish(str(state["run_id"]))
+    assert republished["status"] == "run_approval_pending"
+    assert republished["run_publication"]["pr_number"] == original_pr
+    assert git.is_ancestor(appended, republished["run_publication"]["published_head_sha"])
+
+
 def test_run_resync_resume_renews_only_exhausted_allowance(git_repo: Path) -> None:
     state, states, git = _completed_run(git_repo)
     fixture = git_repo / "github.json"

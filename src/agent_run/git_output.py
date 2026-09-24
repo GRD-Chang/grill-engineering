@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import selectors
+import shutil
 import signal
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 from agent_run.git_errors import GitError
@@ -13,6 +15,16 @@ MAX_GIT_OUTPUT_BYTES = 1024 * 1024
 MAX_GIT_ERROR_BYTES = 64 * 1024
 _READ_BYTES = 16 * 1024
 _TRUNCATED = "[Git output truncated]\n"
+
+
+@lru_cache(maxsize=16)
+def _git_executable(search_path: str) -> str:
+    # A delivery performs many short Git commands. Resolve an absolute PATH
+    # once so each child does not repeat the shell-style directory search.
+    # Relative entries depend on cwd, so never cache their result.
+    if any(not os.path.isabs(entry) for entry in search_path.split(os.pathsep)):
+        return "git"
+    return shutil.which("git", path=search_path) or "git"
 
 
 def git_environment() -> dict[str, str]:
@@ -39,10 +51,13 @@ def run_git(
     data = input.encode() if input is not None else b""
     if len(data) > MAX_GIT_OUTPUT_BYTES:
         raise GitError("Git input exceeds the 1 MiB transfer limit")
+    environment = git_environment()
+    executable = _git_executable(environment.get("PATH", os.defpath))
     process = subprocess.Popen(
-        arguments, cwd=cwd, stdin=subprocess.PIPE if input is not None else None,
+        [executable, *arguments[1:]], cwd=cwd,
+        stdin=subprocess.PIPE if input is not None else None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-        env=git_environment(),
+        env=environment,
     )
     stdout, stderr = bytearray(), bytearray()
     overflow = {"stdout": False, "stderr": False}

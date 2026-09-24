@@ -10,6 +10,17 @@ import pytest
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # Work stealing initially gives each worker a contiguous part of the
+    # collection. Start the real offline installer smoke early so its long
+    # build does not become the final worker's tail.
+    smoke = "tests/test_runner_installer.py::test_public_quickstart_smoke_uses_login_shell_and_cleans_resources"
+    for index, item in enumerate(items):
+        if item.nodeid == smoke:
+            items.insert(0, items.pop(index))
+            break
+
+
 @pytest.fixture(autouse=True)
 def isolated_user_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Helpers and CLI children share one private user environment per case."""

@@ -43,6 +43,21 @@ def reconcile_parent_integration(stage: Any, state: dict[str, Any], job: dict[st
     source, target = stage.github.live_branch_heads(
         stage.contract.branch, stage.contract.base_branch
     )
+    published = job.get("published_sha")
+    if source is None:
+        _pause(stage, state, job, "remote_source_missing", "Parent source ref is missing")
+        return False
+    if isinstance(published, str) and source != published:
+        try:
+            stage.git.fetch_remote_commit(stage.contract.branch, source)
+            if not stage.git.is_ancestor(published, source):
+                raise ParentHistoryRewritten("source", published, source)
+        except ParentHistoryRewritten as error:
+            _pause(stage, state, job, "integration_history_rewritten", str(error))
+            return False
+        except GitError as error:
+            _pause(stage, state, job, "integration_failed", str(error))
+            return False
     intent = job.get("ticket_write_intent")
     own_source = source == job.get("publication_sha") and (
         source == job.get("published_sha")
@@ -112,7 +127,7 @@ def prepare_parent_integration(
             _pause(stage, state, job, "integration_failed", str(error))
             return False
         if result.status == "conflict":
-            if not _resolve_parent_conflict(stage, state, job, checkout):
+            if not resolve_parent_conflict(stage, state, job, checkout, record_key="parent_integration"):
                 return False
             try:
                 result = finish_parent_snapshot_conflict(
@@ -164,10 +179,11 @@ def _pause(stage: Any, state: dict[str, Any], job: dict[str, Any], code: str, me
     stage.save(state)
 
 
-def _resolve_parent_conflict(
-    stage: Any, state: dict[str, Any], job: dict[str, Any], checkout: Path
+def resolve_parent_conflict(
+    stage: Any, state: dict[str, Any], job: dict[str, Any], checkout: Path,
+    *, record_key: str,
 ) -> bool:
-    conflict = job["parent_integration_conflict"]
+    conflict = job[f"{record_key}_conflict"]
     attempt = pending_semantic_attempt(job, role="development")
     if conflict.get("attempts", 0) >= 1 and attempt is None and "development_summary" not in conflict:
         _pause(stage, state, job, "integration_conflict_unresolved", "Parent conflict repair already attempted")
@@ -184,9 +200,10 @@ def _resolve_parent_conflict(
     })
     work_subject, generation = stage.adapter.invocation_identity(state, job)
     if attempt is None:
-        job["parent_integration_conflict_ordinal"] = max(
+        ordinal_key = f"{record_key}_conflict_ordinal"
+        job[ordinal_key] = max(
             int(job.get("modification_attempts", 0)),
-            int(job.get("parent_integration_conflict_ordinal", 0)),
+            int(job.get(ordinal_key, 0)),
         ) + 1
     attempt = allocate_semantic_attempt(
         job,
@@ -194,7 +211,7 @@ def _resolve_parent_conflict(
         work_subject=work_subject,
         generation=generation,
         currentness_boundary=stage._invocation_boundary(job),
-        ordinal=int(job["parent_integration_conflict_ordinal"]),
+        ordinal=int(job[f"{record_key}_conflict_ordinal"]),
         budget_window=int(job["review_budget"]["window"]),
     )
     request["_invocation_event"] = stage._invocation_events(

@@ -49,13 +49,15 @@ class GhGitHubPublisher:
         expected_remote_sha: str,
         recovery_remote_sha: str,
     ) -> None:
+        # Run Repair may follow a confirmed append to its managed Run target.
+        # The helper verifies ancestry before reusing that target ref.
         self._ensure_change_branch(
             branch=branch,
             base_branch=base_branch,
             expected_base_sha=expected_base_sha,
             expected_remote_sha=expected_remote_sha,
             recovery_remote_sha=recovery_remote_sha,
-            allow_managed_base_append=False,
+            allow_managed_base_append=True,
         )
 
     def _ensure_change_branch(
