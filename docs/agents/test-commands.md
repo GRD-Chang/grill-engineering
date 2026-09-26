@@ -37,6 +37,8 @@ CLI、安装器等未单列的模块直接选择其测试文件。公共接口�
 提交前优先使用 CI 相同的 CPython 3.11.16 与锁定开发依赖；通过环境报告比较 Git、系统能力及依赖版本。Python 版本号本身不能证明构建支持 memfd/pidfd，部分便携构建缺少这些接口。先激活所选 venv，并确认 `python` 与 `python3` 都来自该环境；仅指定 Make 的 `PYTHON` 不会改变所有外部工具的解释器选择。Git 测试只使用公开支持的命令构造状态，例如通过本地 fetch 生成 `FETCH_HEAD`，不直接将伪引用交给 `update-ref`。不同版本本地通过不代表 CI 已通过，不应固定旧版 Git 来规避兼容性缺陷。
 六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`；CI 显式使用这个双 worker 命令，runner 规格和 job 数量不变。
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
+`make test-full` 未收到显式 `TMPDIR` 时，在标准且可写的 `/run/user/<uid>` tmpfs 中放置测试临时文件；其他环境沿用 `/tmp`。
+该路径对受控 Worker 子进程可见，避免 `/dev/shm` 在 bubblewrap 的 `/dev` 挂载下不可见；需要对照磁盘临时目录时可显式设置 `TMPDIR=/tmp`。
 调试顺序问题用 `make test-full TEST_WORKERS=0`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。
 

@@ -172,8 +172,12 @@ def test_waiting_status_and_history_expose_a_sanitized_supervision_snapshot(
     process, state = _run_until_pending_window(git_repo, fixture, agents)
     try:
         run_id = str(state["run_id"])
-        status = stdout_json(run_cli(git_repo, fixture, "status", run_id, "--json"))
-        history = stdout_json(run_cli(git_repo, fixture, "history", run_id, "--json"))
+        status_result = run_cli(git_repo, fixture, "status", run_id, "--json")
+        history_result = run_cli(git_repo, fixture, "history", run_id, "--json")
+        assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+        assert history_result.returncode == 0, history_result.stdout + history_result.stderr
+        status = stdout_json(status_result)
+        history = stdout_json(history_result)
 
         for output in (status, history):
             wait = output["supervision"]

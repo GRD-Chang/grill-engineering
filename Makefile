@@ -40,7 +40,14 @@ test:
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:
 	$(PYTHON) -c 'import os, pip, sys; all(hasattr(os, name) for name in ("memfd_create", "pidfd_open")) or sys.exit("完整测试需要支持 os.memfd_create 和 os.pidfd_open 的 Linux Python；请切换解释器，不得以跳过关键进程测试代替完整验收"); os.close(os.memfd_create("agent-run-tests", os.MFD_CLOEXEC)); os.close(os.pidfd_open(os.getpid()))'
-	AGENT_RUN_TEST_WHEELHOUSE="$(abspath $(TEST_WHEELHOUSE))" $(PYTHON) -m pytest -n $(TEST_WORKERS) --dist worksteal $(PYTEST_ARGS)
+	@test_tmpdir="$${TMPDIR:-/tmp}"; runtime_dir="/run/user/$$(id -u)"; \
+	if [ -z "$${TMPDIR:-}" ] && [ -d "$$runtime_dir" ] && [ ! -L "$$runtime_dir" ] \
+		&& [ -w "$$runtime_dir" ] && [ "$$(stat -f -c %T "$$runtime_dir")" = tmpfs ]; then \
+		test_tmpdir="$$runtime_dir"; \
+	fi; \
+	printf '完整测试临时目录：%s\n' "$$test_tmpdir"; \
+	TMPDIR="$$test_tmpdir" AGENT_RUN_TEST_WHEELHOUSE="$(abspath $(TEST_WHEELHOUSE))" \
+		$(PYTHON) -m pytest -n $(TEST_WORKERS) --dist worksteal $(PYTEST_ARGS)
 
 # Preserve diagnostics on failure; pipefail retains the test command's failure.
 test-report: SHELL := /bin/bash

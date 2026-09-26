@@ -138,7 +138,9 @@ def _run_until_pending_window(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    timeout = time.monotonic() + (8 if wait_for_retry_message else 3)
+    # The process may still be preparing its Git and Runner state under CPU
+    # contention; the poll exits immediately once the durable wait exists.
+    timeout = time.monotonic() + (20 if wait_for_retry_message else 15)
     try:
         while time.monotonic() < timeout:
             try:
