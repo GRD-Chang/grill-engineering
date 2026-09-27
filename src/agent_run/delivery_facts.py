@@ -14,6 +14,34 @@ _CURRENT_PUBLICATION_GATE_PHASES = {
 }
 
 
+def _ticket_execution_activity(invocation: object, executor_activity: str) -> str:
+    if not isinstance(invocation, dict) or invocation.get("status") not in {
+        "running", "resuming",
+    }:
+        return "not_running"
+    return "interrupted" if executor_activity == "not_running" else executor_activity
+
+
+def ticket_phase_execution_activity(
+    state: dict[str, Any], audit: dict[str, Any], activity: str,
+) -> str:
+    """Describe an interrupted Ticket preparation before an Invocation exists."""
+    if activity != "not_running" or state.get("status") != "active":
+        return activity
+    current = current_work_subject(state)
+    if (
+        current is None
+        or not current[0].startswith("ticket:")
+        or current[1].get("phase") not in {"developing", "repairing"}
+    ):
+        return activity
+    control = audit.get("executor_control")
+    observed = control.get("activity") if isinstance(control, dict) else "unknown"
+    if observed == "not_running":
+        return "interrupted"
+    return "unknown" if observed == "unknown" else activity
+
+
 def ticket_progress(state: dict[str, Any]) -> dict[str, int]:
     graph = state.get("ticket_graph")
     tickets = graph.get("tickets") if isinstance(graph, dict) else None
@@ -34,7 +62,9 @@ def ticket_progress(state: dict[str, Any]) -> dict[str, int]:
     return {"completed": completed, "total": total}
 
 
-def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
+def multi_ticket_progress(
+    state: dict[str, Any], *, executor_activity: str = "unknown"
+) -> dict[str, Any] | None:
     """Project the persisted Ticket queue and local Job facts for status only."""
 
     if type(state.get("multi_ticket_protocol")) is not int or state["multi_ticket_protocol"] != 2:
@@ -149,6 +179,9 @@ def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
             "blocked_by": unresolved,
             "usage": usage,
             "recovery_action": action,
+            "execution_activity": _ticket_execution_activity(
+                invocation_map.get(key), executor_activity
+            ),
             "invocation": {
                 "role": invocation_map[key].get("role"),
                 "status": invocation_map[key].get("status"),
@@ -157,13 +190,14 @@ def multi_ticket_progress(state: dict[str, Any]) -> dict[str, Any] | None:
         })
     snapshot = state.get("policy_snapshot")
     return {
+        "executor_activity": executor_activity,
         "development_worker_limit": snapshot.get("ticket_development_workers") if isinstance(snapshot, dict) else None,
         "development_workers_active": sum(
             isinstance(invocation, dict)
             and invocation.get("status") in {"running", "resuming"}
             and invocation.get("role") in {"development", "fresh_acceptance"}
             for invocation in invocation_map.values()
-        ),
+        ) if executor_activity == "running" else 0 if executor_activity == "not_running" else None,
         "integration_queue": [dict(item) for item in queue_items if isinstance(item, dict)],
         "integration_holder": holder,
         "tickets": details,

@@ -1037,5 +1037,11 @@
   "workspace.error.connect": "无法连接远端主机",
   "workspace.error.disk_full": "数据目录磁盘空间不足",
   "workspace.error.command_failed": "Runner 独立仓库操作失败（退出码 {returncode}）：{reason}",
-  "prompts.legacy_notice": "旧格式个人文件已保留，但不再生效：{mapping}。请自行对照旧修改与新完整正文，将需要的内容手动写入新文件；程序不会自动合并。实际生效来源见 sources（来源）；预览若提供快照，则使用该快照。"
+  "prompts.legacy_notice": "旧格式个人文件已保留，但不再生效：{mapping}。请自行对照旧修改与新完整正文，将需要的内容手动写入新文件；程序不会自动合并。实际生效来源见 sources（来源）；预览若提供快照，则使用该快照。",
+  "presentation.final_approval.status_comment_failed": "最终批准在 PR 状态评论写入阶段失败：{reason}",
+  "presentation.final_approval.action_failed": "最终批准动作失败：{reason}",
+  "presentation.status.executor_activity": "执行器：{activity}",
+  "presentation.status.executor_activity_running": "正在运行",
+  "presentation.status.executor_activity_exited": "已退出",
+  "presentation.status.executor_activity_unknown": "无法确认"
 }

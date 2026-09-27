@@ -12,7 +12,7 @@ from agent_run.acceptance_facts import (
     acceptance_subject,
     has_prior_acceptance_failure,
 )
-from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, multi_ticket_progress, role_family
+from agent_run.delivery_facts import current_work_subject, delivery_object_label, ticket_progress, multi_ticket_progress, role_family, ticket_phase_execution_activity
 from agent_run.execution_timing import invocation_execution_seconds, invocation_activity, parse_optional_timestamp
 
 from agent_run.messages import display_text, display_language
@@ -22,7 +22,10 @@ if TYPE_CHECKING:
 
 from agent_run.status_actions import approval_lines, controller_work, delivery_result_lines, status_heading, status_timing
 from agent_run.waiting_presentation import cleanup_instruction, waiting_presentation
-from agent_run.final_approval_operation import final_approval_cleanup_pending
+from agent_run.final_approval_operation import (
+    approval_failure_text,
+    final_approval_cleanup_pending,
+)
 from agent_run.operator_action_presentation import (
     human_action_type,
     human_preserved_results,
@@ -90,6 +93,7 @@ def status_progress_view(
         and current[1].get("phase") in {"committing_candidate", "creating_pr"}
         and (not isinstance(control, dict) or control.get("activity") == "unknown")):
         activity = "unknown"
+    activity = ticket_phase_execution_activity(state, audit, activity)
     findings = current_findings(state)
     if current_agent is not None:
         current_agent["activity"] = activity
@@ -130,7 +134,12 @@ def status_progress_view(
         ),
         "next_action": audit.get("next_action"),
     }
-    multi_ticket = multi_ticket_progress(state)
+    multi_ticket = multi_ticket_progress(
+        state,
+        executor_activity=(
+            control.get("activity", "unknown") if isinstance(control, dict) else "unknown"
+        ),
+    )
     if multi_ticket is not None:
         result["multi_ticket"] = multi_ticket
     return result
@@ -200,6 +209,10 @@ def print_status_progress(
 
     for detail in approval_lines(state):
         print(f"  {detail}")
+    control = audit.get("executor_control")
+    failure = control.get("approval_failure") if isinstance(control, dict) else None
+    if isinstance(failure, dict):
+        print(f"  {_terminal_safe(approval_failure_text(failure))}")
     timing = status_timing(state)
     if "total_seconds" in timing:
         print(display_text('presentation.status.total_agent_execution_time_v1', v1=_duration(timing['total_seconds'])))
@@ -399,6 +412,13 @@ def print_rich_status_progress(
         add_identity(display_text('presentation.status.delivery_result'), result)
     for detail in approval_lines(state):
         add_identity(display_text('presentation.status.approve_merge'), detail)
+    control = audit.get("executor_control")
+    failure = control.get("approval_failure") if isinstance(control, dict) else None
+    if isinstance(failure, dict):
+        add_identity(
+            display_text('presentation.status.approve_merge'),
+            approval_failure_text(failure),
+        )
     timing = status_timing(state)
     if "total_seconds" in timing:
         add_identity(display_text('presentation.status.total_agent_execution_time'), _duration(timing["total_seconds"]))
@@ -805,6 +825,15 @@ def _multi_ticket_lines(view: dict[str, Any]) -> list[str]:
         if zh else
         f"Development Worker limit: {limit}; integration holder: {f'Ticket #{holder}' if holder is not None else 'free'}"
     ]
+    executor_activity = multi.get("executor_activity")
+    activity_key = {
+        "running": "executor_activity_running",
+        "not_running": "executor_activity_exited",
+    }.get(str(executor_activity), "executor_activity_unknown")
+    lines.append(display_text(
+        'presentation.status.executor_activity',
+        activity=display_text(f'presentation.status.{activity_key}'),
+    ))
     for item in multi.get("tickets", []):
         if not isinstance(item, dict):
             continue

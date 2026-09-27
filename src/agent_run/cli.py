@@ -92,6 +92,7 @@ from agent_run.run_driver import (
     RunOutcomeKind,
 )
 from agent_run.final_approval_operation import (
+    approval_failures,
     final_approval_busy_message,
     final_approval_cleanup_pending,
     final_approval_failure,
@@ -3459,6 +3460,14 @@ def _with_executor_control(
                     reason = "executor_host_unknown"
         else:
             reason = "executor_binding_invalid"
+    final_failures = approval_failures(record, str(state["run_id"]))
+    current_approval_failure = (
+        final_failures[-1]
+        if final_failures and isinstance(action, Mapping)
+        and action.get("status") == "failed"
+        and final_failures[-1]["action_id"] == action.get("action_id")
+        else None
+    )
     projected["_executor_control"] = {
         "activity": activity,
         "action": (
@@ -3472,6 +3481,9 @@ def _with_executor_control(
                     "run_id",
                     "executor_generation",
                     "application_observed",
+                    "completed_at",
+                    "result_status",
+                    "failure",
                 )
             }
             if isinstance(action, Mapping)
@@ -3487,11 +3499,14 @@ def _with_executor_control(
                     "generation",
                     "pid",
                     "handshake_at",
+                    "failure",
                 )
             }
             if isinstance(executor, Mapping)
             else None
         ),
+        "approval_failure": current_approval_failure,
+        "approval_failures": final_failures,
     }
     if reason is not None:
         projected["_executor_control"]["reason"] = reason

@@ -59,7 +59,10 @@ def test_publication_reset_removes_evidence_and_retains_job_authority(kind: str)
     git = ResetGit()
     loop_type = TicketDeliveryLoop if kind == "ticket" else ParentDeliveryLoop
     loop = loop_type(git=git, states=None, github=None, agents=None)  # type: ignore[arg-type]
-    state = {"run_branch": "run", "base": {"branch": "main"}, "diagnostics": ["old"]}
+    state = {
+        "run_branch": "run", "base": {"branch": "main", "sha": "fixed-base"},
+        "diagnostics": ["old"],
+    }
     preserved = {
         "pr_number": 12,
         "published_sha": "old-remote-head",
@@ -76,12 +79,16 @@ def test_publication_reset_removes_evidence_and_retains_job_authority(kind: str)
 
     loop.publisher.invalidate_stale(state, job, Path("checkout"))
 
-    assert job == {**preserved, "base_sha": "new-base", "phase": "developing", "validation_attempts": 0}
+    expected_base = "new-base" if kind == "ticket" else "fixed-base"
+    assert job == {
+        **preserved, "base_sha": expected_base, "phase": "developing",
+        "validation_attempts": 0,
+    }
     assert state["diagnostics"] == []
     assert state["status"] == ("active" if kind == "ticket" else "parent_delivery_pending")
     assert git.calls == (
         [("reset", "run"), ("resolve", "run")]
-        if kind == "ticket" else [("resolve", "main"), ("reset", "main")]
+        if kind == "ticket" else [("reset", "fixed-base")]
     )
 
 
@@ -90,10 +97,14 @@ def test_reset_failure_does_not_discard_evidence_or_parent_approval(kind: str) -
     git = ResetGit(fail=True)
     loop_type = TicketDeliveryLoop if kind == "ticket" else ParentDeliveryLoop
     loop = loop_type(git=git, states=None, github=None, agents=None)  # type: ignore[arg-type]
-    state = {"run_branch": "run", "base": {"branch": "main"}, "status": "publishing"}
+    state = {
+        "run_branch": "run", "base": {"branch": "main", "sha": "fixed-base"},
+        "status": "publishing",
+    }
     job = {**stale_job(), "approval_grant": {"head_sha": "old-publication"}}
     before = deepcopy(job)
     with pytest.raises(OSError, match="reset failed"):
         loop.publisher.invalidate_stale(state, job, Path("checkout"))
     assert job == before
     assert state["status"] == "publishing"
+    assert git.calls == [("reset", "run" if kind == "ticket" else "fixed-base")]

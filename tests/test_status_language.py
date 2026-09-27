@@ -106,6 +106,7 @@ def test_multi_ticket_status_reports_local_work_and_integration_order(
 ) -> None:
     from agent_run.delivery_facts import multi_ticket_progress, ticket_progress
     from agent_run.delivery_status import _multi_ticket_lines, status_progress_view
+    from agent_run.messages import presentation_language
 
     state = {
         "multi_ticket_protocol": 2,
@@ -152,6 +153,8 @@ def test_multi_ticket_status_reports_local_work_and_integration_order(
     assert status_view["multi_ticket"] == progress
     assert "队列第 1 位" in "\n".join(_multi_ticket_lines({"multi_ticket": progress}))
     assert "开发 2/4" in "\n".join(_multi_ticket_lines({"multi_ticket": progress}))
+    with presentation_language("en"):
+        assert "Executor: unknown" in _multi_ticket_lines({"multi_ticket": progress})
     assert json.dumps(state, sort_keys=True) == before
     assert capsys.readouterr().out == ""
 

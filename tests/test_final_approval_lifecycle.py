@@ -30,7 +30,7 @@ def test_final_approval_holds_admission_until_delivery_finishes(
         for command in ("stop", "abandon"):
             with pytest.raises(ActionBusyError, match="最终批准"):
                 lifecycle.submit_control(LifecycleRequest(
-                    task=task, kind=command, payload={"parent": 156},
+                    task=task, kind=command, payload={"parent": 156, "run_id": "run-1"},
                 ))
         states.value["status"] = "completed"
         return dict(states.value)
@@ -47,7 +47,7 @@ def test_final_approval_holds_admission_until_delivery_finishes(
         execute=execute,
     )
     state, _, receipt = lifecycle.submit(LifecycleRequest(
-        task=task, kind=kind, payload={"parent": 156},
+        task=task, kind=kind, payload={"parent": 156, "run_id": "run-1"},
     ))
     assert state["status"] == "completed"
     assert receipt.status == "completed"
@@ -66,7 +66,9 @@ def test_resume_closes_an_exited_unfinished_approval_as_failed_before_continuing
         "run_publication": {"approval_grant": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
-    claim = control.claim_action(task, kind="approve", payload={"parent": 156})
+    claim = control.claim_action(
+        task, kind="approve", payload={"parent": 156, "run_id": "run-1"}
+    )
     assert claim.action_id is not None and claim.action is not None
     control.bind_run(task, claim.action_id, "run-1")
     reservation = control.begin_executor(task, action_id=claim.action_id, run_id="run-1")
@@ -93,7 +95,8 @@ def test_resume_closes_an_exited_unfinished_approval_as_failed_before_continuing
         ), execute=execute,
     )
     state, _, receipt = lifecycle.submit(LifecycleRequest(
-        task=task, kind="resume", payload={"parent": 156}, allow_terminal_successor=True,
+        task=task, kind="resume", payload={"parent": 156, "run_id": "run-1"},
+        allow_terminal_successor=True,
     ))
     assert state["status"] == "completed"
     assert receipt.kind == "resume"
@@ -124,7 +127,7 @@ def test_resume_stops_when_refresh_invalidates_the_original_approval(tmp_path: P
         execute=lambda _run_id: pytest.fail("old approval must not authorize new development"),
     )
     final, _, receipt = lifecycle.submit(LifecycleRequest(
-        task=task, kind="resume", payload={"parent": 156},
+        task=task, kind="resume", payload={"parent": 156, "run_id": "run-1"},
     ))
     assert final["status"] == "run_acceptance_pending"
     assert receipt.status == "failed"
@@ -140,7 +143,9 @@ def test_failed_approval_cannot_resume_while_its_executor_is_still_alive(tmp_pat
         "run_publication": {"approval_grant": {"granted_at": "approved"}},
     })
     control = TaskControlStore(tmp_path / "control")
-    claim = control.claim_action(task, kind="approve", payload={"parent": 156})
+    claim = control.claim_action(
+        task, kind="approve", payload={"parent": 156, "run_id": "run-1"}
+    )
     assert claim.action_id is not None and claim.action is not None
     control.bind_run(task, claim.action_id, "run-1")
     prepare_action_application_receipt(states.value, claim.action)
@@ -161,7 +166,7 @@ def test_failed_approval_cannot_resume_while_its_executor_is_still_alive(tmp_pat
     )
     before = control.path_for(task).read_bytes()
     with pytest.raises(ActionBusyError):
-        lifecycle.submit(LifecycleRequest(task, "resume", {"parent": 156}))
+        lifecycle.submit(LifecycleRequest(task, "resume", {"parent": 156, "run_id": "run-1"}))
     assert control.path_for(task).read_bytes() == before
     assert host.start_count == 1
 

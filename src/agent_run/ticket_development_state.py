@@ -11,12 +11,34 @@ from agent_run.agent_invocation import _sync_invocation_history
 from agent_run.state import StateStore
 from agent_run.error_safety import bounded_error
 from agent_run.task_control import TaskControlBusyError
+from agent_run.ticket_eligibility import DISQUALIFYING_LABELS
 from agent_run.ticket_queue import enqueue, reconcile
 
 
 # Serialize controller selection with lane commits. Integration I/O runs outside
 # this lock; StateStore rebases each integration save onto concurrent lane commits.
 parallel_delivery_state_lock = RLock()
+_SCHEDULER_JOB_FIELDS = frozenset({"selection_reason", "source_revision_changed"})
+
+
+def _execution_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
+    if job is None:
+        return None
+    return {key: value for key, value in job.items() if key not in _SCHEDULER_JOB_FIELDS}
+
+
+def _demand_identity(state: dict[str, Any], number: str) -> tuple[Any, Any, Any, Any]:
+    ticket = state["ticket_graph"]["tickets"].get(number)
+    if not isinstance(ticket, dict):
+        return (state["parent"]["revision"], state["ticket_graph"]["revision"], ticket, ())
+    # Ordinary labels do not change the Ticket contract or work-entry gate.
+    labels = set(ticket["labels"])
+    return (
+        state["parent"]["revision"],
+        state["ticket_graph"]["revision"],
+        {key: value for key, value in ticket.items() if key != "labels"},
+        tuple(sorted(labels & (DISQUALIFYING_LABELS | {"ready-for-agent"}))),
+    )
 
 
 class TicketDevelopmentState:
@@ -32,6 +54,8 @@ class TicketDevelopmentState:
         self.ticket_number = ticket_number
         self.root = states.root
         self._last_job: dict[str, Any] | None = None
+        self._last_invocation: dict[str, Any] | None = None
+        self._last_demand: tuple[Any, Any, Any, Any] | None = None
 
     def load_current_run(self, run_id: str) -> dict[str, Any] | None:
         if run_id != self.run_id:
@@ -40,6 +64,7 @@ class TicketDevelopmentState:
         if state is None:
             return None
         number = str(self.ticket_number)
+        self._last_demand = deepcopy(_demand_identity(state, number))
         job = state["ticket_jobs"].get(number)
         self._last_job = deepcopy(job) if isinstance(job, dict) else None
         if not isinstance(job, dict):
@@ -47,6 +72,7 @@ class TicketDevelopmentState:
             state["ticket_jobs"][number] = job
         state["active_ticket_job"] = job
         invocation = state["ticket_agent_invocations"].get(number)
+        self._last_invocation = deepcopy(invocation) if isinstance(invocation, dict) else None
         state["active_agent_invocation"] = deepcopy(invocation)
         if state["status"] not in {
             "operator_stopped", "abandoned", "requeue_required",
@@ -74,15 +100,26 @@ class TicketDevelopmentState:
             }:
                 raise TaskControlBusyError("Ticket development lost Run authorization")
             current = latest["ticket_jobs"].get(number)
-            if current != self._last_job:
+            if _execution_job(current) != _execution_job(self._last_job):
                 raise TaskControlBusyError("Ticket Job changed while its development lane ran")
+            if latest["ticket_agent_invocations"].get(number) != self._last_invocation:
+                raise TaskControlBusyError("Ticket Invocation changed while its development lane ran")
+            if _demand_identity(latest, number) != _demand_identity(state, number):
+                raise TaskControlBusyError("Ticket demand changed while its development lane ran")
             if (
                 isinstance(current, dict)
                 and current.get("ticket_branch_generation") is not None
                 and current.get("ticket_branch_generation") != job.get("ticket_branch_generation")
             ):
                 raise TaskControlBusyError("Ticket Job generation changed")
-            latest["ticket_jobs"][number] = deepcopy(job)
+            saved_job = deepcopy(job)
+            if isinstance(current, dict):
+                for field in _SCHEDULER_JOB_FIELDS:
+                    if field in current:
+                        saved_job[field] = deepcopy(current[field])
+                    else:
+                        saved_job.pop(field, None)
+            latest["ticket_jobs"][number] = saved_job
             invocation = state.get("active_agent_invocation")
             if isinstance(invocation, dict):
                 latest["ticket_agent_invocations"][number] = deepcopy(invocation)
@@ -107,6 +144,7 @@ class TicketDevelopmentState:
                     latest[key] = deepcopy(state.get(key))
             self.states._save_run_and_notify_unlocked(run_id, latest)
             self._last_job = deepcopy(latest["ticket_jobs"][number])
+            self._last_invocation = deepcopy(invocation) if isinstance(invocation, dict) else None
 
         with parallel_delivery_state_lock:
             self.states._commit_run(commit)
@@ -125,8 +163,12 @@ class TicketDevelopmentState:
                 raise TaskControlBusyError("Ticket development lost Run authorization")
             number = str(self.ticket_number)
             job = latest["ticket_jobs"].get(number)
-            if not isinstance(job, dict) or job != self._last_job:
+            if not isinstance(job, dict) or _execution_job(job) != _execution_job(self._last_job):
                 raise TaskControlBusyError("Ticket Job changed while its development lane ran")
+            if latest["ticket_agent_invocations"].get(number) != self._last_invocation:
+                raise TaskControlBusyError("Ticket Invocation changed while its development lane ran")
+            if _demand_identity(latest, number) != self._last_demand:
+                raise TaskControlBusyError("Ticket demand changed while its development lane ran")
             if job.get("phase") == "blocked":
                 return
             job["execution_resume_phase"] = job.get("phase") or "developing"

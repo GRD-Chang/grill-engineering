@@ -17,7 +17,12 @@ from support.cli import PROJECT_ROOT, load_only_run_state, run_cli, stdout_json
 from support.cli_payloads import ticket
 
 
-@pytest.mark.parametrize("case", ["exited", "unknown_executor", "foreign_receipt"])
+@pytest.mark.parametrize(
+    "case", [
+        "exited", "bound_exited", "bound_wrong_payload", "bound_foreign_run",
+        "bound_unknown_executor", "unknown_executor", "foreign_receipt",
+    ],
+)
 def test_rejected_action_requires_exact_unapplied_exit_evidence(
     tmp_path: Path, case: str,
 ) -> None:
@@ -30,10 +35,21 @@ def test_rejected_action_requires_exact_unapplied_exit_evidence(
     state: dict[str, Any] = {"run_id": "run-1", "status": "execution_failed"}
     prepare_action_application_receipt(state, first.action or {})
     control.finish_executor(task, action_id=first.action_id, generation=1)
-    successor = control.claim_action(task, kind="resume", payload={"parent": 1})
+    successor_payload = {"parent": 1}
+    if case.startswith("bound_"):
+        successor_payload["run_id"] = (
+            "run-other" if case == "bound_wrong_payload" else "run-1"
+        )
+    successor = control.claim_action(task, kind="resume", payload=successor_payload)
     assert successor.action_id is not None
     control.begin_executor(task, action_id=successor.action_id, run_id=None)
-    if case == "unknown_executor":
+    if case.startswith("bound_"):
+        control.bind_run(
+            task, successor.action_id,
+            "run-other" if case == "bound_foreign_run" else "run-1",
+            generation=2,
+        )
+    if case in {"unknown_executor", "bound_unknown_executor"}:
         control.fail_action(task, action_id=successor.action_id, failure="rejected")
     else:
         control.finish_executor(
@@ -43,7 +59,7 @@ def test_rejected_action_requires_exact_unapplied_exit_evidence(
         state["action_application_receipt"]["executor_generation"] = 99
     before = control.path_for(task).read_bytes()
 
-    if case == "exited":
+    if case in {"exited", "bound_exited"}:
         result = control.reconcile_from_run(task, state)
         assert result is not None
         assert result["action"]["status"] == "failed"

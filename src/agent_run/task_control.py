@@ -658,6 +658,19 @@ class TaskControlStore:
             action["receipt_only_reconciliation"] = True
         else:
             action["payload"] = normalized_payload
+        approval_subject = (
+            run_state.get(
+                "parent_job" if run_state.get("delivery_type") == "parent_only"
+                else "run_publication"
+            )
+            if isinstance(run_state, Mapping) else None
+        )
+        if receipt["kind"] == "approve" or (
+            receipt["kind"] == "resume"
+            and isinstance(approval_subject, Mapping)
+            and isinstance(approval_subject.get("approval_grant"), Mapping)
+        ):
+            action["final_approval_operation"] = True
         record["run_id"] = receipt["run_id"]
         record["action"] = action
         record["executor"] = {
@@ -742,6 +755,28 @@ class TaskControlStore:
                         "Executor is already bound to another Delivery Run"
                     )
                 executor["run_id"] = run_id
+            record["updated_at"] = _now()
+            self._write_unlocked(task, record)
+            return deepcopy(record)
+
+    def mark_final_approval_operation(
+        self, task: TaskKey, *, action_id: str, generation: int
+    ) -> dict[str, Any]:
+        """Keep the exact final-approval role with the durable Action history."""
+
+        with self._locked(task):
+            record = self._require_unlocked(task)
+            action = _require_active_action(record, action_id)
+            if (
+                action.get("kind") not in {"approve", "resume"}
+                or action.get("executor_generation") != generation
+            ):
+                raise ActionReconciliationError(
+                    "Final Approval Action identity/generation 不匹配"
+                )
+            if action.get("final_approval_operation") is True:
+                return deepcopy(record)
+            action["final_approval_operation"] = True
             record["updated_at"] = _now()
             self._write_unlocked(task, record)
             return deepcopy(record)
@@ -1635,6 +1670,11 @@ def _validate_record(record: Mapping[str, Any], task: TaskKey) -> None:
             raise TaskControlError("Task Control Record Action status is invalid")
         if not isinstance(action.get("kind"), str) or not action["kind"]:
             raise TaskControlError("Task Control Record Action kind is invalid")
+        if "final_approval_operation" in action and (
+            action["final_approval_operation"] is not True
+            or action["kind"] not in {"approve", "resume"}
+        ):
+            raise TaskControlError("Task Control Final Approval marker is invalid")
         if (
             not isinstance(action.get("payload_digest"), str)
             or not action["payload_digest"]
@@ -1879,7 +1919,7 @@ def _verify_record_matches_run(
         action.get(key) != receipt[key]
         for key in ("action_id", "kind", "payload_digest")
     ):
-        if not _is_unbound_successor_of_receipt(record, action, receipt):
+        if not _is_unapplied_successor_of_receipt(record, action, receipt):
             raise ActionReconciliationError(
                 "Task Control Record 与 Run Application Receipt 不一致"
             )
@@ -1933,28 +1973,45 @@ def _action_receipt(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return {key: raw[key] for key in raw}
 
 
-def _is_unbound_successor_of_receipt(
+def _is_unapplied_successor_of_receipt(
     record: Mapping[str, Any],
     action: Mapping[str, Any],
     receipt: Mapping[str, Any],
 ) -> bool:
     executor = record.get("executor")
-    # Rejected entry preconditions leave the previous Run receipt untouched;
-    # a proven exited, unapplied successor is not evidence of a conflicting Run.
+    # Rejected entry preconditions leave the previous Run receipt untouched.
+    # A lifecycle successor may already be bound to that Run before selecting
+    # it; binding alone does not mean its application receipt was persisted.
+    bound_run_id = action.get("run_id")
+    if bound_run_id is not None:
+        payload = action.get("payload")
+        if (
+            bound_run_id != receipt["run_id"]
+            or record.get("run_id") != receipt["run_id"]
+            or action.get("kind") not in {"resume", "approve", "revise", "requeue"}
+            or not isinstance(payload, Mapping)
+            or payload.get("run_id") != receipt["run_id"]
+        ):
+            return False
+    if isinstance(executor, Mapping) and (
+        executor.get("action_id") != action.get("action_id")
+        or executor.get("generation") != action.get("executor_generation")
+        or executor.get("run_id") != bound_run_id
+    ):
+        return False
+    # A failed successor needs an exact, proven exit before the previous
+    # receipt can be treated as its unapplied predecessor.
     rejected_before_application = (
         action.get("status") == "failed"
         and isinstance(executor, Mapping)
         and executor.get("status") in {"exited", "absent"}
-        and executor.get("action_id") == action.get("action_id")
-        and executor.get("generation") == action.get("executor_generation")
-        and executor.get("run_id") is None
+        and executor.get("reconciliation_required") is not True
     )
     if (
         (
             action.get("status") not in _ACTIVE_ACTION_STATUSES
             and not rejected_before_application
         )
-        or action.get("run_id") is not None
         or action.get("application_observed") is not False
     ):
         return False

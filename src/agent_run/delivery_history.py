@@ -12,6 +12,7 @@ from agent_run.delivery_status import (
     execution_guidance,
     invocation_recovery_details,
 )
+from agent_run.final_approval_operation import approval_failure_text
 from agent_run.messages import display_language, text
 from agent_run.operator_action_presentation import human_action_type, human_preserved_results
 from agent_run.presentation_helpers import (
@@ -33,7 +34,7 @@ from agent_run.attempt_evidence import (
     invocation_attempt_view,
 )
 from agent_run.acceptance_facts import acceptance_lanes, artifact_findings as _artifact_findings
-from agent_run.delivery_facts import role_family as _role_family
+from agent_run.delivery_facts import role_family as _role_family, ticket_phase_execution_activity
 from agent_run.execution_timing import (
     invocation_activity, invocation_execution_seconds,
     run_elapsed_seconds,
@@ -48,13 +49,22 @@ def _copy(key: str, **values: object) -> str:
 HISTORY_DETAIL_LIMIT = 240
 
 
+def _approval_failures(audit: dict[str, Any]) -> list[dict[str, Any]]:
+    control = audit.get("executor_control")
+    failures = control.get("approval_failures") if isinstance(control, dict) else None
+    return [item for item in failures if isinstance(item, dict)] if isinstance(failures, list) else []
+
+
 def history_progress_view(
     state: dict[str, Any], audit: dict[str, Any]
 ) -> dict[str, Any]:
     events = _history_events(state, audit)
+    execution_activity = ticket_phase_execution_activity(
+        state, audit, invocation_activity(state.get("active_agent_invocation"), audit)
+    )
     return {
         "events": events,
-        "execution_activity": invocation_activity(state.get("active_agent_invocation"), audit),
+        "execution_activity": execution_activity,
         "summary": {
             "rounds": _round_summary(audit.get("semantic_agent_attempts")),
             "elapsed_seconds": _elapsed_seconds(state, events),
@@ -98,6 +108,8 @@ def print_history_progress(
                 print(line)
     else:
         print(_copy('presentation.history.no_confirmed_agent_work_records_yet'))
+    for failure in _approval_failures(audit):
+        print(f"  {_safe_text(approval_failure_text(failure))}")
     cleanup_lines = _cleanup_history_lines(state, details=details)
     if cleanup_lines:
         print(_copy('presentation.history.delivery_cleanup'))
@@ -195,6 +207,8 @@ def print_rich_history_progress(
         body.append(Text(""))
     if not records:
         body.append(Text(_copy('presentation.history.no_confirmed_agent_work_records_yet')))
+    for failure in _approval_failures(audit):
+        body.append(Text(f"  {_safe_text(approval_failure_text(failure))}"))
     cleanup_lines = _cleanup_history_lines(state, details=details)
     if cleanup_lines:
         body.extend([Text(""), Text(_copy('presentation.history.delivery_cleanup_22'), style="bold")])

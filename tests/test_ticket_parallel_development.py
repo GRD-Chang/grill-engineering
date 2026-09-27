@@ -12,12 +12,18 @@ import pytest
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_operator_stop
 from agent_run.controller import Controller
+from agent_run import cli
 from agent_run.delivery import TicketDeliveryEngine
+from agent_run.delivery_status import _multi_ticket_lines, status_progress_view
+from agent_run.delivery_history import history_progress_view
 from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitRepository
+from agent_run.guidance_actions import next_action_fact
+from agent_run.executor_host import HostObservation
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.state import StateStore
 from agent_run.state_contract import require_current_run_state
+from agent_run.task_control import TaskControlBusyError
 from agent_run.resume_intent import bind_resume_intent
 from agent_run.run_orchestration import DeliveryRunEngine
 from agent_run.ticket_development_state import TicketDevelopmentState
@@ -225,6 +231,330 @@ def test_one_ticket_worker_failure_pauses_only_that_ticket(git_repo: Path) -> No
     )
     assert resumed["ticket_jobs"]["2"]["phase"] == "developing"
     assert resumed["ticket_jobs"]["3"]["phase"] == "ready_for_integration"
+
+
+@pytest.mark.parametrize("second_fails", [False, True])
+def test_branch_failure_refresh_preserves_running_lane(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, second_fails: bool,
+) -> None:
+    state, states, git, fixture = _run(
+        git_repo, (2, 3, 4), blocked_by={4: [2, 3]},
+    )
+    entered = Event()
+    release = Event()
+    refreshes: list[dict[str, Any]] = []
+    preparation_states: list[dict[str, Any]] = []
+    original_branch = FixtureGitHubPublisher.ensure_ticket_branch
+
+    def prepare_branch(publisher: FixtureGitHubPublisher, **kwargs: Any) -> None:
+        if kwargs["ticket_number"] == 2:
+            current = states.load_current_run(str(state["run_id"]))
+            assert current is not None
+            preparation_states.append(current)
+            raise RuntimeError("Ticket 2 branch preparation failed")
+        original_branch(publisher, **kwargs)
+
+    monkeypatch.setattr(FixtureGitHubPublisher, "ensure_ticket_branch", prepare_branch)
+
+    def develop(number: int) -> None:
+        if number == 3:
+            entered.set()
+            assert release.wait(timeout=10)
+            if second_fails:
+                raise RuntimeError("Ticket 3 Worker exited")
+
+    def after_lane(lanes: frozenset[int]) -> None:
+        if 3 not in lanes:
+            return
+        assert entered.wait(timeout=10)
+        refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(
+            str(state["run_id"])
+        )
+        refreshes.append(refreshed)
+        release.set()
+
+    try:
+        assert _engine(
+            git, states, fixture, _TicketAgents(git_repo, (2, 3, 4), develop)
+        ).develop_frontier(str(state["run_id"]), state, after_lane=after_lane)
+    finally:
+        release.set()
+    assert refreshes, "Controller did not refresh after the failed lane"
+    assert preparation_states
+    preparing = preparation_states[0]
+    assert preparing["ticket_jobs"]["2"]["phase"] == "developing"
+    assert "2" not in preparing["ticket_agent_invocations"]
+    preparing_view = status_progress_view(preparing, {
+        "status": preparing["status"],
+        "executor_control": {"activity": "not_running"},
+    })
+    preparing_progress = preparing_view["multi_ticket"]
+    assert preparing_progress["tickets"][0]["phase"] == "developing"
+    assert preparing_progress["executor_activity"] == "not_running"
+    assert preparing_view["execution_activity"] == "interrupted"
+    assert status_progress_view(preparing, {
+        "status": preparing["status"],
+        "executor_control": {"activity": "unknown"},
+    })["execution_activity"] == "unknown"
+    assert next_action_fact({
+        **preparing, "_executor_control": {"activity": "not_running"},
+    }).command == "resume"
+    assert history_progress_view(preparing, {
+        "executor_control": {"activity": "not_running"},
+    })["execution_activity"] == "interrupted"
+    assert history_progress_view(preparing, {
+        "executor_control": {"activity": "unknown"},
+    })["execution_activity"] == "unknown"
+    for activity in ("running", "unknown"):
+        assert next_action_fact({
+            **preparing, "_executor_control": {"activity": activity},
+        }).command == "run"
+    saved = states.load_current_run(str(state["run_id"]))
+    assert saved is not None
+    assert saved["ticket_jobs"]["2"]["blocked_reason"] == "ticket_execution_failed"
+    assert saved["ticket_jobs"]["3"]["phase"] == (
+        "blocked" if second_fails else "ready_for_integration"
+    )
+    assert saved["ticket_jobs"].get("4", {}).get("phase") is None
+    assert 4 not in saved["frontier"]
+    assert saved["status"] not in {"execution_failed", "operator_stopped"}
+    require_current_run_state(saved)
+    before_query = json.dumps(saved, sort_keys=True)
+    for executor_activity, expected in (
+        ("not_running", "执行器：已退出"),
+        ("running", "执行器：正在运行"),
+        ("unknown", "执行器：无法确认"),
+    ):
+        audit = {
+            "status": saved["status"],
+            "executor_control": {"activity": executor_activity},
+        }
+        progress = status_progress_view(saved, audit)
+        multi = progress["multi_ticket"]
+        first = next(item for item in multi["tickets"] if item["ticket_number"] == 2)
+        assert first["phase"] == "blocked"
+        assert first["invocation"] is None
+        assert any(expected in line for line in _multi_ticket_lines(progress))
+        if executor_activity == "not_running":
+            assert multi["development_workers_active"] == 0
+        if executor_activity == "unknown":
+            assert multi["development_workers_active"] is None
+    assert json.dumps(saved, sort_keys=True) == before_query
+
+
+def test_branch_preparation_status_queries_observe_real_control_without_invocation(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = write_fixture(git_repo / "github.json", issues={
+        "2": {
+            "number": 2, "title": "Ticket 2", "body": "Deliver Ticket 2.",
+            "state": "OPEN", "labels": ["ready-for-agent"], "blocked_by": [],
+        },
+    })
+    seeded = seed_run(git_repo, fixture, "1", idle_control=True)
+    assert seeded.returncode == 0, seeded.stderr
+    run_id = stdout_json(seeded)["run_id"]
+    states = StateStore(managed_state(git_repo))
+    control_path = next((states.root / "task-control").glob("*.json"))
+    run_path = states.runs_directory / f"{run_id}.json"
+    evidence_path = git_repo / "branch-preparation-observed.json"
+    observed: list[str] = []
+
+    def inspect_preparation(_publisher: FixtureGitHubPublisher, **_kwargs: Any) -> None:
+        preparing = states.load_current_run(run_id)
+        assert preparing is not None
+        assert preparing["ticket_jobs"]["2"]["phase"] == "developing"
+        assert "2" not in preparing["ticket_agent_invocations"]
+        original_control = control_path.read_bytes()
+        original_run = run_path.read_bytes()
+        try:
+            for activity in ("not_running", "running", "unknown"):
+                if activity == "unknown":
+                    control_path.unlink()
+                else:
+                    control = json.loads(original_control)
+                    control["executor"].update(
+                        status="exited" if activity == "not_running" else "running",
+                        pid=123 if activity == "running" else control["executor"].get("pid"),
+                        handshake_at="2026-09-27T00:00:00+00:00",
+                    )
+                    control_path.write_text(json.dumps(control), encoding="utf-8")
+                with monkeypatch.context() as host_patch:
+                    if activity == "running":
+                        host_patch.setattr(
+                            cli, "observe_systemd_executor",
+                            lambda spec, *args, **kwargs: HostObservation(
+                                "running", spec.generation, 123, True
+                            ),
+                        )
+                    before_control = (
+                        control_path.read_bytes() if control_path.exists() else None
+                    )
+                    for command in ("status", "history"):
+                        result = invoke_cli_inprocess(
+                            git_repo, fixture, command, run_id, "--json"
+                        )
+                        assert result.returncode == 0, result.stderr
+                        view = stdout_json(result)
+                        assert view["executor_control"]["activity"] == activity
+                        if command == "status":
+                            assert view["progress"]["multi_ticket"]["tickets"][0]["invocation"] is None
+                            assert view["progress"]["execution_activity"] == {
+                                "not_running": "interrupted",
+                                "running": "not_running",
+                                "unknown": "unknown",
+                            }[activity]
+                            if activity == "not_running":
+                                assert view["next_action"].startswith("agent-run resume ")
+                        else:
+                            assert view["execution_activity"] == {
+                                "not_running": "interrupted",
+                                "running": "not_running",
+                                "unknown": "unknown",
+                            }[activity]
+                    assert run_path.read_bytes() == original_run
+                    assert (control_path.read_bytes() if control_path.exists() else None) == before_control
+                    observed.append(activity)
+        finally:
+            control_path.write_bytes(original_control)
+        evidence_path.write_text(json.dumps(observed), encoding="utf-8")
+        raise RuntimeError("branch preparation probe complete")
+
+    monkeypatch.setattr(
+        FixtureGitHubPublisher, "ensure_ticket_branch", inspect_preparation
+    )
+    agents = git_repo / "branch-preparation-agents.json"
+    agents.write_text(json.dumps({"developments": [], "reviews": [], "publications": []}), encoding="utf-8")
+    started = invoke_cli_inprocess(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents), "--json"
+    )
+    assert started.returncode == 2
+    assert json.loads(evidence_path.read_text(encoding="utf-8")) == [
+        "not_running", "running", "unknown",
+    ], started.stdout + started.stderr
+
+
+@pytest.mark.parametrize("changed", ["job", "invocation", "demand", "global_stop"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_lane_rejects_real_concurrent_changes(
+    git_repo: Path, changed: str, failure: bool,
+) -> None:
+    state, states, git, fixture = _run(git_repo, (2, 3))
+    if changed == "invocation":
+        agents = _TicketAgents(git_repo, (2, 3), lambda _number: None)
+        assert _engine(git, states, fixture, agents).develop_frontier(
+            str(state["run_id"]), state
+        )
+    run_id = str(state["run_id"])
+    lane = TicketDevelopmentState(states, run_id, 2)
+    snapshot = lane.load_current_run(run_id)
+    assert snapshot is not None
+    latest = states.load_current_run(run_id)
+    assert latest is not None
+    if changed == "job":
+        latest["ticket_jobs"]["2"]["base_sha"] = "concurrent-head"
+        latest["active_ticket_job"] = latest["ticket_jobs"]["2"]
+    elif changed == "invocation":
+        latest["ticket_agent_invocations"]["2"]["concurrent_marker"] = "changed"
+        if latest["active_ticket_job"]["ticket_number"] == 2:
+            latest["active_agent_invocation"] = latest["ticket_agent_invocations"]["2"]
+    elif changed == "demand":
+        latest["ticket_graph"]["tickets"]["2"]["content_revision"] = "changed"
+    else:
+        latest["status"] = "operator_stopped"
+    states.save_run(run_id, latest)
+    with pytest.raises(TaskControlBusyError):
+        if failure:
+            lane.block_execution_failure(RuntimeError("Worker exited"))
+        else:
+            lane.save_run(run_id, snapshot)
+    saved = states.load_current_run(run_id)
+    assert saved is not None
+    assert saved["status"] == latest["status"]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_lane_preserves_documentation_label_refresh(
+    git_repo: Path, failure: bool,
+) -> None:
+    state, states, git, fixture = _run(git_repo, (2, 3))
+    run_id = str(state["run_id"])
+    started, other_finished, release = Event(), Event(), Event()
+
+    def develop(number: int) -> None:
+        if number == 2:
+            started.set()
+            assert release.wait(timeout=10)
+            if failure:
+                raise RuntimeError("Worker exited")
+
+    agents = _TicketAgents(git_repo, (2, 3), develop)
+    errors: list[BaseException] = []
+
+    def advance() -> None:
+        try:
+            assert _engine(git, states, fixture, agents).develop_frontier(
+                run_id, state,
+                after_lane=lambda lanes: other_finished.set()
+                if lanes == frozenset({2}) else None,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=advance)
+    thread.start()
+    try:
+        assert started.wait(timeout=10)
+        assert other_finished.wait(timeout=10)
+        fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+        fixture_data["issues"]["2"]["labels"].append("documentation")
+        fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+        refreshed, _ = Controller(FixtureGitHubReader(fixture), git, states).resume(run_id)
+        assert refreshed["ticket_graph"]["tickets"]["2"]["labels"] == [
+            "documentation", "ready-for-agent",
+        ]
+        assert refreshed["ticket_graph"]["tickets"]["2"]["eligibility"]["eligible"]
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert not errors, errors
+
+    saved = states.load_current_run(run_id)
+    assert saved is not None
+    assert saved["ticket_graph"]["tickets"]["2"]["labels"] == [
+        "documentation", "ready-for-agent",
+    ]
+    assert saved["ticket_jobs"]["2"]["phase"] == (
+        "blocked" if failure else "ready_for_integration"
+    )
+    if failure:
+        assert saved["ticket_jobs"]["2"]["blocked_reason"] == "ticket_execution_failed"
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("labels", [["documentation"], ["ready-for-agent", "needs-info"]])
+def test_lane_rejects_label_qualification_change_after_refresh(
+    git_repo: Path, failure: bool, labels: list[str],
+) -> None:
+    state, states, _, fixture = _run(git_repo, (2, 3))
+    run_id = str(state["run_id"])
+    lane = TicketDevelopmentState(states, run_id, 2)
+    snapshot = lane.load_current_run(run_id)
+    assert snapshot is not None
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    fixture_data["issues"]["2"]["labels"] = labels
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+    refreshed, _ = Controller(
+        FixtureGitHubReader(fixture), GitRepository(git_repo), states,
+    ).resume(run_id)
+    assert not refreshed["ticket_graph"]["tickets"]["2"]["eligibility"]["eligible"]
+    with pytest.raises(TaskControlBusyError):
+        if failure:
+            lane.block_execution_failure(RuntimeError("Worker exited"))
+        else:
+            lane.save_run(run_id, snapshot)
 
 
 def test_local_failure_remains_resumable_after_other_ticket_completes(

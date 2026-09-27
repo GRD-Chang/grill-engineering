@@ -8,6 +8,57 @@ from typing import Any
 
 from agent_run.task_control import TaskControlStore, TaskKey, action_receipt_matches
 from agent_run.managed_workspace import workspace_state_root
+from agent_run.messages import display_text
+
+
+_STATUS_COMMENT_FAILURE = "Final Run PR status comment write failed: "
+
+
+def approval_failures(
+    record: Mapping[str, Any], run_id: str
+) -> list[dict[str, Any]]:
+    """Project bounded, exact Action failures for read-only status/history."""
+
+    entries = record.get("action_history")
+    actions = list(entries) if isinstance(entries, list) else []
+    actions.append(record)
+    failures: list[dict[str, Any]] = []
+    for entry in actions:
+        if not isinstance(entry, Mapping):
+            continue
+        action = entry.get("action")
+        if not isinstance(action, Mapping) or action.get("run_id") != run_id:
+            continue
+        kind = action.get("kind")
+        if action.get("status") != "failed" or not (
+            kind == "approve"
+            or (kind == "resume" and action.get("final_approval_operation") is True)
+        ):
+            continue
+        failure = action.get("failure")
+        if not isinstance(failure, str) or not failure:
+            continue
+        failures.append({
+            "action_id": action.get("action_id"),
+            "kind": kind,
+            "stage": (
+                "final_run_status_comment"
+                if failure.startswith(_STATUS_COMMENT_FAILURE)
+                else "final_approval"
+            ),
+            "failure": failure,
+            "completed_at": action.get("completed_at"),
+        })
+    return failures
+
+
+def approval_failure_text(failure: Mapping[str, Any]) -> str:
+    key = (
+        "presentation.final_approval.status_comment_failed"
+        if failure.get("stage") == "final_run_status_comment"
+        else "presentation.final_approval.action_failed"
+    )
+    return display_text(key, reason=failure.get("failure"))
 
 
 def has_final_approval(state: Mapping[str, Any]) -> bool:

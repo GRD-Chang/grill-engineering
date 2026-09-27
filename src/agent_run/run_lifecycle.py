@@ -932,6 +932,10 @@ class RunLifecycle:
             action_run_id = None
 
         final_approval = is_final_approval_action(action, current or {})
+        if final_approval:
+            self.control.mark_final_approval_operation(
+                self.task, action_id=action_id, generation=generation
+            )
 
         def apply(generation: int) -> Mapping[str, Any]:
             self._set_executor_state_fence(
@@ -945,8 +949,45 @@ class RunLifecycle:
                 action_id=action_id,
                 generation=generation,
             )
+            payload = action.get("payload")
+            existing_run_id = (
+                payload.get("run_id") if isinstance(payload, Mapping) else None
+            )
+            if action.get("kind") in {"resume", "approve", "revise", "requeue"}:
+                if not isinstance(existing_run_id, str) or not existing_run_id:
+                    raise ActionReconciliationError(
+                        "Lifecycle Action 缺少已有 Delivery Run binding"
+                    )
+                if not isinstance(current, Mapping) or (
+                    current.get("run_id") != existing_run_id
+                ):
+                    raise ActionReconciliationError(
+                        "Lifecycle Action payload 与当前 Delivery Run 不匹配"
+                    )
+                # These actions already name their Run. Bind the control and
+                # Executor before selection can persist an application receipt
+                # or perform external work. A failure during selection then
+                # leaves an exact, reconcilable ownership record.
+                self.control.bind_run(
+                    self.task,
+                    action_id,
+                    existing_run_id,
+                    generation=generation,
+                    state_dir=getattr(self.states, "root", None),
+                )
+                execute_action.bind_run(existing_run_id)
+                self._set_executor_state_fence(
+                    self.states,
+                    action_id=action_id,
+                    generation=generation,
+                    run_id=existing_run_id,
+                )
             state, resumed = self.select_run(action)
             run_id = _string_field(state, "run_id")
+            if isinstance(existing_run_id, str) and run_id != existing_run_id:
+                raise ActionReconciliationError(
+                    "Lifecycle Action 选择了不同的 Delivery Run"
+                )
             # External Executors start with an unbound Action, so its Run (and
             # predecessor receipt) may only become known during selection.
             receipt_predecessor = replace_receipt_action_id
@@ -1014,6 +1055,16 @@ class RunLifecycle:
         latest_action = latest.get("action")
         if not isinstance(latest_action, Mapping):
             raise ActionReconciliationError("Action 在继续前无效")
+        if (
+            latest_action.get("status") in {"accepted", "applying"}
+            and is_final_approval_action(latest_action, current or {})
+        ):
+            latest = self.control.mark_final_approval_operation(
+                self.task,
+                action_id=action_id,
+                generation=_positive_integer(latest_action.get("executor_generation")),
+            )
+            latest_action = latest["action"]
         if (
             latest_action.get("run_id") is None
             and current is not None

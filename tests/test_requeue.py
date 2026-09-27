@@ -4,6 +4,7 @@ from support.workspace import managed_repo, managed_state, prepare_workspace
 
 from copy import deepcopy
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -1042,3 +1043,53 @@ def test_run_repair_completion_drift_requires_a_new_generation(
     assert stale_change_job_reason(state, "run-repair:run-1", job, git) == (
         "run_repair_ticket_completion_changed"
     )
+
+
+def test_parent_only_currentness_rejects_invalid_fixed_base_and_pr_target(
+    git_repo: Path,
+) -> None:
+    git = GitRepository(git_repo)
+    fixed = git.resolve("main")
+    tree = git.resolve(f"{fixed}^{{tree}}")
+
+    def descendant(message: str) -> str:
+        return subprocess.run(
+            ["git", "commit-tree", tree, "-p", fixed, "-m", message],
+            cwd=git_repo, text=True, capture_output=True, check=True,
+        ).stdout.strip()
+
+    target = descendant("accepted remote target")
+    unrelated_target = descendant("rewritten remote target")
+    state = {
+        "parent": {"revision": "current-revision"},
+        "ticket_graph": {"revision": "graph", "tickets": {}},
+        "base": {"branch": "main", "sha": fixed},
+    }
+    job = {
+        "effective_revision": "current-revision", "base_sha": fixed,
+        "phase": "developing", "pr_number": 1, "publication_sha": fixed,
+    }
+    assert stale_change_job_reason(state, "parent-only:run-1", job, git) is None
+    job["base_sha"] = target
+    assert stale_change_job_reason(state, "parent-only:run-1", job, git) == (
+        "parent_base_changed"
+    )
+    job["base_sha"] = fixed
+
+    class Reader:
+        def __init__(self, base_sha: str) -> None:
+            self.base_sha = base_sha
+
+        def live_pull_request(self, _pr_number: int) -> dict[str, Any]:
+            return {
+                "state": "OPEN", "head_sha": fixed, "base_branch": "main",
+                "base_sha": self.base_sha,
+            }
+
+    assert unknown_pr_mutation(
+        state, "parent-only:run-1", job, Reader(target), git
+    ) is None
+    job["base_sha"] = target
+    assert unknown_pr_mutation(
+        state, "parent-only:run-1", job, Reader(unrelated_target), git
+    ) == "change_pr_base_changed_externally"

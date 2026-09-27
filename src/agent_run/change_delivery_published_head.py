@@ -237,17 +237,18 @@ def publish_and_merge(
             live_head = existing_live.get("head_sha")
             if isinstance(live_head, str):
                 job["integrated_publication_sha"] = live_head
-            exhausted, _ = _publication_operation(
-                stage,
-                state,
-                job,
-                lambda: stage.github.sync_run_branch(
-                    run_branch=stage.contract.base_branch,
-                    integrated_sha=integrated_sha,
-                ),
-            )
-            if exhausted:
-                return True
+            if stage.contract.label != "parent-only":
+                exhausted, _ = _publication_operation(
+                    stage,
+                    state,
+                    job,
+                    lambda: stage.github.sync_run_branch(
+                        run_branch=stage.contract.base_branch,
+                        integrated_sha=integrated_sha,
+                    ),
+                )
+                if exhausted:
+                    return True
             exhausted, after_merge = _publication_operation(
                 stage,
                 state,
@@ -697,16 +698,17 @@ def publish_and_merge(
     job["integrated_sha"] = integrated
     job["integrated_publication_sha"] = str(job["publication_sha"])
     stage.save(state)
-    exhausted, _ = _publication_operation(
-        stage,
-        state,
-        job,
-        lambda: stage.github.sync_run_branch(
-            run_branch=stage.contract.base_branch, integrated_sha=integrated
-        ),
-    )
-    if exhausted:
-        return True
+    if stage.contract.label != "parent-only":
+        exhausted, _ = _publication_operation(
+            stage,
+            state,
+            job,
+            lambda: stage.github.sync_run_branch(
+                run_branch=stage.contract.base_branch, integrated_sha=integrated
+            ),
+        )
+        if exhausted:
+            return True
     exhausted, live_after_merge = _publication_operation(
         stage,
         state,

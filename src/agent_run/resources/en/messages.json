@@ -1037,5 +1037,11 @@
   "workspace.error.connect": "Cannot connect to the remote host",
   "workspace.error.disk_full": "The data directory has insufficient disk space",
   "workspace.error.command_failed": "Runner independent repository operation failed (exit code {returncode}): {reason}",
-  "prompts.legacy_notice": "Legacy personal files are preserved but inactive: {mapping}. Compare your old edits with the new complete bodies and manually transfer the desired changes; no automatic merge is performed. See sources for effective bodies; a preview supplied with a snapshot uses that snapshot."
+  "prompts.legacy_notice": "Legacy personal files are preserved but inactive: {mapping}. Compare your old edits with the new complete bodies and manually transfer the desired changes; no automatic merge is performed. See sources for effective bodies; a preview supplied with a snapshot uses that snapshot.",
+  "presentation.final_approval.status_comment_failed": "Final approval failed while writing the PR status comment: {reason}",
+  "presentation.final_approval.action_failed": "Final approval action failed: {reason}",
+  "presentation.status.executor_activity": "Executor: {activity}",
+  "presentation.status.executor_activity_running": "running",
+  "presentation.status.executor_activity_exited": "exited",
+  "presentation.status.executor_activity_unknown": "unknown"
 }

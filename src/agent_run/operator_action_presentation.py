@@ -11,6 +11,7 @@ from itertools import chain
 from typing import Any
 
 from agent_run.guidance_actions import action_command, next_action_fact, render_next_action
+from agent_run.final_approval_operation import has_final_approval
 from agent_run.messages import text
 from agent_run.operator_gate import (
     has_run_operator_gate,
@@ -338,7 +339,8 @@ def _operator_next_action(
         and isinstance(repository, str)
         and isinstance(parent_number, int)
     ):
-        return f"agent-run approve {parent_number} --repo {repository}"
+        command = "resume" if has_final_approval(state) else "approve"
+        return f"agent-run {command} {parent_number} --repo {repository}"
     if action_kind == "deterministic_contradiction":
         run_id = state.get("run_id")
         if state.get("status") == "unsupported_scope_change":

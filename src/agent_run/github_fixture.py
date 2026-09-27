@@ -652,7 +652,9 @@ class FixtureGitHubPublisher:
             )
         if not live["mergeable"]:
             raise ValueError("fixture final merge does not match expected open head")
-        base = self.git.resolve(str(pull["base_branch"]))
+        base_branch = str(pull["base_branch"])
+        published_branches = _mutable_mapping(self._delivery(), "published_branches")
+        base = str(live["base_sha"])
         result = subprocess.run(
             ["git", "merge-tree", "--write-tree", base, expected_head_sha],
             cwd=self.git.root,
@@ -676,11 +678,13 @@ class FixtureGitHubPublisher:
         if merged.returncode != 0:
             raise ValueError(merged.stderr.strip() or "fixture final merge failed")
         integrated = merged.stdout.strip()
-        subprocess.run(
-            ["git", "update-ref", f"refs/heads/{pull['base_branch']}", integrated, base],
-            cwd=self.git.root,
-            check=True,
-        )
+        if self.git.managed_branch_head(base_branch) == base:
+            subprocess.run(
+                ["git", "update-ref", f"refs/heads/{base_branch}", integrated, base],
+                cwd=self.git.root,
+                check=True,
+            )
+        published_branches[base_branch] = integrated
         pull.update({"state": "MERGED", "integrated_sha": integrated})
         readback_identity_error = self._delivery().get(
             "normal_merge_readback_identity_error"

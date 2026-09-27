@@ -8,6 +8,7 @@ from agent_run.git import GitError, GitRepository
 from agent_run.revisions import effective_revision
 from agent_run.run_currentness import ticket_completion_records
 from agent_run.run_repair_integration import repair_run_branch_is_current
+from agent_run.parent_integration import parent_integration_record_is_valid
 
 
 class PullRequestReader(Protocol):
@@ -38,8 +39,16 @@ def stale_change_job_reason(
         if job.get("effective_revision") != parent.get("revision"):
             return "parent_requirements_changed"
         base = _mapping(state, "base")
-        branch = base.get("branch")
-        if not isinstance(branch, str) or job.get("base_sha") != git.resolve(branch):
+        fixed_base = base.get("sha")
+        job_base = job.get("base_sha")
+        if not isinstance(fixed_base, str) or not isinstance(job_base, str):
+            return "parent_base_changed"
+        try:
+            if not git.is_ancestor(fixed_base, job_base):
+                return "parent_base_changed"
+        except (GitError, ValueError):
+            return "parent_base_changed"
+        if job_base != fixed_base and not parent_integration_record_is_valid(git, job):
             return "parent_base_changed"
         return None
     if job.get("parent_revision") != parent.get("revision"):
@@ -143,7 +152,20 @@ def unknown_pr_mutation(
         return "change_pr_base_unknown"
     if live.get("base_branch") != expected_base_branch:
         return "change_pr_base_changed_externally"
-    if not subject.startswith("ticket:"):
+    if subject.startswith("parent-only:"):
+        expected_base = job.get("base_sha")
+        observed_base = live.get("base_sha")
+        try:
+            target_is_append_only = (
+                isinstance(expected_base, str)
+                and isinstance(observed_base, str)
+                and git.is_ancestor(expected_base, observed_base)
+            )
+        except (GitError, ValueError):
+            target_is_append_only = False
+        if not target_is_append_only:
+            return "change_pr_base_changed_externally"
+    elif not subject.startswith("ticket:"):
         local_base = git.resolve(expected_base_branch)
         if subject.startswith("run-repair:") and repair_run_branch_is_current(
             git, job, local_base

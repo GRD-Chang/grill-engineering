@@ -28,7 +28,7 @@ from agent_run.state import StateStore
 from agent_run.task_control import TaskControlStore, TaskKey
 from support.seeding import seed_run, write_fixture
 from support.inprocess_cli import invoke_cli_inprocess
-from support.workspace import managed_repo, managed_state
+from support.workspace import managed_repo, managed_state, prepare_workspace
 from support.published_run import prepare_accepted_run, prepare_published_run
 from support.cli import (
     load_only_run_state,
@@ -3056,6 +3056,111 @@ def test_parent_only_approve_requires_explicit_requeue_for_stale_parent_revision
     assert state["parent_job"]["phase"] == "ready_for_approval"
     assert state["requeue_required"]["work_subject"].startswith("parent-only:")
     assert json.loads(fixture.read_text(encoding="utf-8"))["delivery"]["pull_requests"][0]["state"] == "OPEN"
+
+
+@pytest.mark.parametrize(
+    ("default_branch", "local_relation"),
+    [("main", "behind"), ("main", "ahead"), ("trunk", "diverged")],
+)
+def test_parent_only_fixed_remote_base_ignores_managed_local_default_ref(
+    git_repo: Path, default_branch: str, local_relation: str
+) -> None:
+    if default_branch != "main":
+        subprocess.run(
+            ["git", "checkout", "-b", default_branch], cwd=git_repo, check=True,
+            capture_output=True,
+        )
+    prepare_workspace(git_repo)
+    if local_relation in {"behind", "diverged"}:
+        (git_repo / "remote-only.txt").write_text("remote\n", encoding="utf-8")
+        subprocess.run(["git", "add", "remote-only.txt"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "remote default head"], cwd=git_repo,
+            check=True, capture_output=True,
+        )
+    fixture = write_fixture(
+        git_repo / "github.json", issues={}, default_branch=default_branch
+    )
+    managed = managed_repo(git_repo)
+    if local_relation in {"ahead", "diverged"}:
+        (managed / "local-only.txt").write_text("local\n", encoding="utf-8")
+        subprocess.run(["git", "add", "local-only.txt"], cwd=managed, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "preserve managed local head"], cwd=managed,
+            check=True, capture_output=True,
+        )
+    local_default_head = GitRepository(managed).resolve(default_branch)
+    agents = git_repo / "parent-fixed-base-agents.json"
+    agents.write_text(
+        json.dumps({
+            "developments": [{
+                "expected_thread_id": None,
+                "thread_id": "parent-developer",
+                "summary": "Implemented the Parent request.",
+                "write_files": {"parent-feature.txt": "done\n"},
+            }],
+            "publications": [{"invalid": "publication"}],
+            "reviews": [passing_acceptance("parent-reviewer", "Candidate passed.")],
+        }),
+        encoding="utf-8",
+    )
+    run_id = stdout_json(seed_run(git_repo, fixture, "1", idle_control=True))["run_id"]
+    seeded = json.loads(fixture.read_text(encoding="utf-8"))
+    initial_state = load_only_run_state(git_repo)
+    seeded.setdefault("delivery", {}).setdefault("published_branches", {})[
+        initial_state["parent_branch"]
+    ] = initial_state["base"]["sha"]
+    seeded["delivery"]["published_branches"][default_branch] = (
+        initial_state["base"]["sha"]
+    )
+    fixture.write_text(json.dumps(seeded), encoding="utf-8")
+
+    interrupted = run_cli(
+        git_repo, fixture, "run", "1", "--agent-fixture", str(agents)
+    )
+    assert interrupted.returncode == 2, interrupted.stderr
+    paused = load_only_run_state(git_repo)["parent_job"]
+    assert paused["phase"] == "accepted"
+    assert paused["modification_attempts"] == 1
+    agents.write_text(json.dumps({
+        "developments": [],
+        "publications": [parent_publication()],
+        "reviews": [],
+    }), encoding="utf-8")
+    resumed = run_cli(
+        git_repo, fixture, "resume", run_id, "--agent-fixture", str(agents)
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    before = load_only_run_state(git_repo)["parent_job"]
+    assert before["phase"] == "ready_for_approval"
+    assert before["development_thread_id"] == paused["development_thread_id"]
+    assert before["modification_attempts"] == paused["modification_attempts"]
+    assert before["base_sha"] == json.loads(fixture.read_text())["default_head_sha"]
+    assert GitRepository(managed).resolve(default_branch) == local_default_head
+    assert (managed / "local-only.txt").exists() == (local_relation != "behind")
+    assert "local-only.txt" not in {
+        change["path"] for change in GitRepository(managed).diff_name_status(
+            str(before["base_sha"]), str(before["candidate_sha"])
+        )
+    }
+
+    approved = run_cli(git_repo, fixture, "approve", run_id)
+
+    assert approved.returncode == 0, approved.stderr
+    assert stdout_json(approved)["status"] == "completed"
+    after = load_only_run_state(git_repo)["parent_job"]
+    assert after["development_thread_id"] == before["development_thread_id"]
+    assert after["modification_attempts"] == before["modification_attempts"]
+    assert GitRepository(managed).resolve(default_branch) == local_default_head
+    delivered_files = set(subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", str(after["integrated_sha"])],
+        cwd=managed, text=True, capture_output=True, check=True,
+    ).stdout.splitlines())
+    assert "parent-feature.txt" in delivered_files
+    assert "local-only.txt" not in delivered_files
+    assert ("remote-only.txt" in delivered_files) == (
+        local_relation in {"behind", "diverged"}
+    )
 
 
 def test_parent_only_requeue_replaces_the_branch_and_closes_old_pr(

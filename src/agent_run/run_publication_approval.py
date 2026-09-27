@@ -173,7 +173,15 @@ class RunPublicationApproval(RunPublicationShared):
         if observation is None:
             return state
         checks = str(observation["result"])
-        self._record_agent_run_status(pr_number, run, run_head, checks)
+        try:
+            self._record_agent_run_status(pr_number, run, run_head, checks)
+        except Exception as error:
+            # The grant and Action receipt are already durable here. Retain
+            # the failing external step in the Action failure history so a
+            # later status query does not reduce it to a Host exit message.
+            raise RuntimeError(
+                f"Final Run PR status comment write failed: {error}"
+            ) from error
         if checks == "fail":
             self._save(state)
             evidence = self._required_check_evidence(

@@ -407,9 +407,8 @@ class ParentDeliveryLoop:
     def _invalidate_stale(
         self, state: dict[str, Any], job: dict[str, Any], checkout: Path
     ) -> None:
-        base_branch = str(_mapping(state, "base")["branch"])
-        base_sha = self.git.resolve(base_branch)
-        self.git.reset_checkout_to_base(checkout, base_branch)
+        base_sha = str(_mapping(state, "base")["sha"])
+        self.git.reset_checkout_to_base(checkout, base_sha)
         clear_stale_delivery_evidence(job)
         job.pop("approval_grant", None)
         job.update(
