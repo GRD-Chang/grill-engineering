@@ -26,6 +26,16 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。它不持有 GitHub 写凭证，也不具备外部交付状态的变更权限。
 _Avoid_: GitHub Bot、Publisher、Mutation Authority
 
+**Worker GitHub Identity（Worker GitHub 身份）**:
+目标设计术语，尚未实现；当前凭据边界仍按 Codex Worker 与 Worker GitHub Read Broker 的定义执行。
+操作者选择供 Worker 访问 GitHub 的身份，确定该身份在 GitHub 上获授的能力。该授权与 Worker 的角色职责、Runner 的交付授权分别定义，不因拥有 GitHub 写权限就取得 Runner 的发布或完成权威。
+_Avoid_: Publisher、Mutation Authority
+
+**Runner GitHub Identity（程序端 GitHub 身份）**:
+目标设计术语，尚未实现独立来源选择。
+Controller 与 Publisher 执行程序端 GitHub 读取、正式发布及远端 Git 操作所使用的身份。它与 Worker GitHub Identity 分别选择，可以共享凭据来源，但不因 Worker 的只读限制而自动改变程序端授权，也不替代交付批准。
+_Avoid_: Publication Agent、独立 Publisher 账号、Mutation Authority
+
 **Worker GitHub Read Broker（Worker GitHub 只读代理）**:
 Codex Worker 通过普通命令形态的受控只读 `gh` 入口提交绑定当前 Repository identity 的固定 GitHub 读取请求；Worker 不需要知道入口背后的凭据代理机制。Controller 默认使用宿主已登录的 `gh` 凭据执行；写请求、认证请求和其他仓库请求在宿主执行前拒绝。需要独立最小权限身份的操作者可以通过一次性 CLI 配置改用专用只读 GitHub App。App profile 一旦存在就明确选择 App provider；配置损坏、私钥不可读、签名或权限校验失败时有界失败，不得静默回退到宿主 `gh`。该持久配置只记录 App ID、Installation ID 与仓库外私钥文件的路径，私钥内容不复制，短期 installation token 不落盘；App 模式保留 token 到期前续签、短暂失败有界重试和过期读取重试。无论凭据来源如何，Worker 都不获得 token、App 私钥或 Publisher 写凭据，Controller 对每次读取设置有界超时并在 Worker 结束时清理仍在执行的读取进程。
 _Avoid_: 要求 Worker 理解 adapter、socket、PATH 或挂载细节、强制配置 GitHub App、每次导出环境变量、持久化 installation token、复制 App 私钥、向 Worker 暴露宿主凭据、允许任意 GitHub 请求、无限重试
