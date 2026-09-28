@@ -120,6 +120,7 @@ class Controller:
         self.delivery_policy_provider = delivery_policy_provider
         self.creation_language: str | None = None
         self.creation_github_identity: dict[str, Any] | None = None
+        self.creation_runner_github_identity: dict[str, Any] | None = None
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -207,6 +208,11 @@ class Controller:
                 return existing, True
         resumed = existing is not None
         if existing is None:
+            runner_identity = self.creation_runner_github_identity or self.publisher.git.runner_identity
+            if runner_identity and runner_identity.get("source") == "pat":
+                # A successful /user probe does not prove repository access.
+                # Do not invent a recoverable Run for failed PAT initialization.
+                raise error
             provisional = Repository(
                 name_with_owner=repository_hint,
                 default_branch="HEAD",
@@ -910,7 +916,9 @@ class Controller:
             )
         )
 
-    def record_execution_failure(self, run_id: str, message: str) -> bool:
+    def record_execution_failure(
+        self, run_id: str, message: str, *, runner_credential_failure: bool = False,
+    ) -> bool:
         state = self.states.load_run(run_id)
         if state is None:
             return False
@@ -936,6 +944,9 @@ class Controller:
         if (
             has_run_operator_gate(state)
             and state.get("status") != "execution_failed"
+            and not (runner_credential_failure and state.get("status") in {
+                "parent_approval_pending", "run_approval_pending",
+            })
         ):
             return False
         hint_reader = getattr(self.github, "repository_hint", None)
@@ -972,7 +983,9 @@ class Controller:
                 role=str(active["role"]),
                 save=lambda _state: None,
             )
-        if message.startswith("controller_no_progress:"):
+        if runner_credential_failure:
+            code = "runner_credential_failed"
+        elif message.startswith("controller_no_progress:"):
             code = "controller_no_progress"
             message = message.partition(":")[2].strip()
         else:
@@ -1470,6 +1483,10 @@ class Controller:
             "run_id": run_id,
             "language": language,
             "github_identity": github_identity,
+            "runner_github_identity": validate_identity_snapshot(
+                self.creation_runner_github_identity
+                or self.publisher.git.runner_identity or {"source": "host"}
+            ),
             "prompt_resources": resolve_resources(language),
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,
@@ -1569,7 +1586,15 @@ class Controller:
                 identity_sha,
                 delivery_policy=self._policy_for_new_run(),
             )
-            state["base_resolution_pending"] = True
+            runner_identity = state["runner_github_identity"]
+            if runner_identity["source"] == "pat":
+                # PAT initialization must succeed before publishing a Run.
+                state["base"]["sha"] = self.publisher.resolve_base(
+                    repository.default_branch, repository.default_head_sha,
+                )
+            else:
+                state["base_resolution_pending"] = True
+            # Host mode preserves its existing durable fetch recovery boundary.
             # Persist identity before a remote fetch.  A timeout can then be
             # resumed against the same durable Run rather than creating a new
             # branch or Worker identity on the next foreground invocation.

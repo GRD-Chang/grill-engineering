@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
+from agent_run.runner_transport import runner_options
 from agent_run.git import GitError, GitRepository, is_managed_delivery_branch
 from agent_run.branch_publication import (
     BranchPublicationResult,
@@ -736,6 +737,7 @@ class GhGitHubPublisher:
         remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
             cwd=self.git.root,
+            **runner_options(self.git.runner_identity),
         )
         if remote.returncode != 0:
             raise GitHubReadError(
@@ -760,6 +762,7 @@ class GhGitHubPublisher:
         remote = run_read_command(
             ["git", "ls-remote", "--heads", "origin", *refs],
             cwd=self.git.root,
+            **runner_options(self.git.runner_identity),
         )
         if remote.returncode != 0:
             raise GitHubReadError(
@@ -2131,7 +2134,9 @@ class GhGitHubPublisher:
         ticket_number: int,
         expected_revision: str,
     ) -> str:
-        graph = GhGitHubReader(self.repository).delivery_graph(parent_number)
+        graph = GhGitHubReader(
+            self.repository, runner_identity=self.git.runner_identity,
+        ).delivery_graph(parent_number)
         return effective_revision_from_graph(graph, ticket_number)
 
     def _commit_metadata(self, sha: str) -> dict[str, Any]:
@@ -2203,20 +2208,26 @@ class GhGitHubPublisher:
     ) -> subprocess.CompletedProcess[str]:
         command = ["gh", *arguments]
         if retry if retry is not None else _is_read_command(arguments):
-            return run_read_command(command, cwd=self.git.root)
+            return run_read_command(
+                command, cwd=self.git.root, **runner_options(self.git.runner_identity),
+            )
         if (
             arguments[:1] == ("api",)
             and "--method" in arguments
             and arguments[arguments.index("--method") + 1 :][:1] == ("GET",)
         ):
             # Explicit GET keeps its existing single-dispatch readback behavior.
-            return run_write_command(command, cwd=self.git.root)
+            return run_write_command(
+                command, cwd=self.git.root, **runner_options(self.git.runner_identity),
+            )
         return self._write_command(command)
 
     def _write_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         if self._write_guard is not None:
             self._write_guard()
-        return run_write_command(command, cwd=self.git.root)
+        return run_write_command(
+            command, cwd=self.git.root, **runner_options(self.git.runner_identity),
+        )
 
 
 def _mapping(value: object) -> dict[str, Any]:

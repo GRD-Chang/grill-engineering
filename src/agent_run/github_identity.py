@@ -25,12 +25,14 @@ def _error(key: str, **values: object) -> GitHubIdentityError:
 def normalize_github_config(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise _error("object")
-    allowed = {"worker_source", "pat", "app", "app_read_only", "app_current_repository_only"}
+    allowed = {"worker_source", "runner_source", "pat", "app", "app_read_only", "app_current_repository_only"}
     if set(raw) - allowed:
         raise _error("unknown", fields=", ".join(sorted(set(raw) - allowed)))
     result = dict(raw)
     if "worker_source" in result and result["worker_source"] not in ("host", "pat", "app"):
         raise _error("source")
+    if "runner_source" in result and result["runner_source"] not in ("host", "pat"):
+        raise _error("runner_source")
     if "pat" in result:
         reference = result["pat"]
         if not isinstance(reference, Mapping) or set(reference) not in ({"env"}, {"file"}):
@@ -92,6 +94,21 @@ def resolve_worker_identity(
     return {"source": "app", "app_profile": config["app"],
             "app_read_only": config.get("app_read_only", False),
             "app_current_repository_only": config.get("app_current_repository_only", False)}
+
+
+def resolve_runner_identity(
+    defaults: Mapping[str, Any] | None = None,
+    overrides: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze the independent Runner selection using the shared PAT reference."""
+    config = normalize_github_config({**normalize_github_config(defaults or {}),
+                                      **normalize_github_config(overrides or {})})
+    source = config.get("runner_source", "host")
+    if source == "host":
+        return {"source": "host"}
+    if "pat" not in config:
+        raise _error("reference")
+    return {"source": "pat", "pat": config["pat"]}
 
 
 def validate_identity_snapshot(raw: object) -> dict[str, Any]:
@@ -185,6 +202,8 @@ def validate_worker_auth(
 def add_identity_options(parser: argparse.ArgumentParser, language: str) -> None:
     parser.add_argument("--worker-github-source", choices=("host", "pat", "app"),
                         help=text("identity.source_help", language=language))
+    parser.add_argument("--runner-github-source", choices=("host", "pat"),
+                        help=text("identity.runner_source_help", language=language))
     for option in ("app-id", "installation-id", "private-key-path"):
         parser.add_argument(f"--github-{option}", help=text("identity.app_help", language=language))
     for option in ("read-only", "current-repository-only"):
@@ -199,6 +218,8 @@ def identity_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if getattr(parsed, "worker_github_source", None) is not None:
         result["worker_source"] = parsed.worker_github_source
+    if getattr(parsed, "runner_github_source", None) is not None:
+        result["runner_source"] = parsed.runner_github_source
     for key in ("env", "file"):
         value = getattr(parsed, f"github_pat_{key}", None)
         if value is not None:
@@ -214,7 +235,10 @@ def identity_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
     return normalize_github_config(result)
 
 
-def describe_identity(identity: Mapping[str, Any], language: str) -> dict[str, Any]:
-    return {"worker": dict(identity), "runner": {"source": "host"},
+def describe_identity(
+    identity: Mapping[str, Any], language: str,
+    runner_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {"worker": dict(identity), "runner": dict(runner_identity) if runner_identity is not None else None,
             "capabilities": text("identity.app_scope" if identity["source"] == "app"
                                  else "identity.native_scope", language=language)}

@@ -95,7 +95,8 @@ def execute(
         result = {
             "result": "settings", "scope": "run", "run_id": parsed.run_id,
             "language": language,
-            "github": (describe_identity(state["github_identity"], language)
+            "github": (describe_identity(state["github_identity"], language,
+                                          state.get("runner_github_identity"))
                        if state.get("github_identity") else None),
             "policy": policy_snapshot_for_state(state),
             "notifications": state.get("notifications", {"enabled": False}),

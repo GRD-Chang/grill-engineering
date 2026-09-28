@@ -86,6 +86,7 @@ def test_cli_requires_exact_ownership_before_lifecycle_admission(
                     "policy": policy_snapshot_for_state(state),
                     "profile": {"preset": None, "overrides": {}},
                     "github_identity": state["github_identity"],
+                    "runner_github_identity": state["runner_github_identity"],
                 }
             )
         if command in {"resume", "approve", "revise", "requeue"}:

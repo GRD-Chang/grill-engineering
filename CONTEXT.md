@@ -32,8 +32,8 @@ _Avoid_: GitHub Bot、Publisher、Mutation Authority
 _Avoid_: Publisher、Mutation Authority
 
 **Runner GitHub Identity（程序端 GitHub 身份）**:
-当前固定使用 host；PAT/App 的程序端来源选择尚未实现。
-Controller 与 Publisher 执行程序端 GitHub 读取、正式发布及远端 Git 操作所使用的身份。它与 Worker GitHub Identity 的职责分开；Worker 的选择不改变程序端 host 身份，也不替代交付批准。选择 Worker host 时双方可能使用同一宿主身份。
+支持 host/PAT，默认 host；与 Worker 独立选择，共享 PAT 引用定义。程序端 App 尚未实现。
+Controller 与 Publisher 执行程序端 GitHub 读取、正式发布及远端 Git 操作所使用的身份。它与 Worker GitHub Identity 的职责分开；Worker 的选择不改变程序端身份，也不替代交付批准。选择 Worker host 时双方可能使用同一宿主身份。
 _Avoid_: Publication Agent、独立 Publisher 账号、Mutation Authority
 
 **Worker Credential Delivery（Worker 凭据传递）**:

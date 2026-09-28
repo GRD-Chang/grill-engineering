@@ -22,7 +22,7 @@ from agent_run.delivery_policy import (
     resolve_delivery_policy,
 )
 from agent_run.github_identity import (
-    GitHubIdentityError, describe_identity, normalize_github_config, resolve_worker_identity,
+    GitHubIdentityError, describe_identity, normalize_github_config, resolve_worker_identity, resolve_runner_identity,
 )
 from agent_run.github_auth_profile import GitHubAppProfileStore
 from agent_run.paths import app_config_root
@@ -176,10 +176,13 @@ class UserDefaultsStore:
         config = document.get("github", {})
         legacy = self.path.with_name("github-app.json")
         if "worker_source" not in config and legacy.exists():
-            return {"worker": {"source": "app"}, "runner": {"source": "host"},
+            return {"worker": {"source": "app"}, "runner": resolve_runner_identity(config),
                     "migration": "required", "legacy_path": str(legacy),
                     "notice": text("identity.migration_required", language=self.language(document))}
-        result = describe_identity(resolve_worker_identity(config, app_profile_path=legacy), self.language(document))
+        result = describe_identity(
+            resolve_worker_identity(config, app_profile_path=legacy), self.language(document),
+            resolve_runner_identity(config),
+        )
         result["migration"] = "legacy-ignored" if legacy.exists() else "not-needed"
         return result
 
@@ -291,6 +294,7 @@ class UserDefaultsStore:
                     merged["github"] = {**merged.get("github", {}), **supplied["github"]}
                 if "github" in merged:
                     resolve_worker_identity(merged["github"], app_profile_path=self.path.with_name("github-app.json"))
+                    resolve_runner_identity(merged["github"])
                 merged = _document(merged)
                 result = self._describe(merged, "user-defaults")
                 self._write(merged)

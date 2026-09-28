@@ -4,7 +4,7 @@ status: accepted
 
 # Codex 使用 YOLO，外层只保护 Git 权威和 Publisher 凭据
 
-所有 Development、Repair、Fresh/Run Acceptance 与 Publication Codex 都在信任 Agent 的前提下以 YOLO 运行，可以访问宿主文件系统、联网并使用真实 Git CLI。host/PAT/App Worker 使用原生 `gh`，不挂载替换可执行文件、不经过命令代理或本地 allowlist；GitHub 能力由操作者选择的凭据决定，需要较小权限时由操作者在 GitHub 设置凭据权限。Runner 程序端目前继续使用 host，不主动向 Worker 注入独立程序端秘密；用户选择 host 时两端身份可能相同。
+所有 Development、Repair、Fresh/Run Acceptance 与 Publication Codex 都在信任 Agent 的前提下以 YOLO 运行，可以访问宿主文件系统、联网并使用真实 Git CLI。host/PAT/App Worker 使用原生 `gh`，不挂载替换可执行文件、不经过命令代理或本地 allowlist；GitHub 能力由操作者选择的凭据决定，需要较小权限时由操作者在 GitHub 设置凭据权限。Runner 程序端可独立选择 host/PAT，默认 host，不主动向 Worker 注入独立程序端秘密；用户选择 host 时两端身份可能相同。
 
 Execution Guard 继续保护权威 Git metadata 与 Runner 控制状态，并在 Worker 启动前以固定脱敏错误拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，不改写 config。YOLO 和凭据写能力都不扩大角色职责：Development/Repair 只整理当前 checkout，不自行提交或发布；Fresh/Run Acceptance 只产生和清理验证产物，不修复交付内容；Publication 只生成文案。验收、Currentness、正式批准与完成判断属于 Controller，正式发布由 Publisher 程序执行。
 

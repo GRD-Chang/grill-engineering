@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any, Mapping
 
 from agent_run.messages import error_message
 from agent_run.git import GitError, GitRepository
@@ -36,6 +37,7 @@ def open_workspace(
     fixture: str | None,
     *,
     create: bool,
+    runner_identity: Mapping[str, Any] | None = None,
 ) -> GitRepository:
     workspace = selected_workspace(repository, fixture)
     if create:
@@ -46,7 +48,7 @@ def open_workspace(
             source = GitRepository.discover(Path.cwd())
             remote = str(source.root)
         identity = read_git_identity(Path.cwd()) if not workspace.root.exists() else None
-        return workspace.ensure(remote_url=remote, identity=identity)
+        return workspace.ensure(remote_url=remote, identity=identity, runner_identity=None if fixture else runner_identity)
     if not workspace.root.exists():
         raise RunLocatorError(
             "run_selector_not_found", error_message("cli.error.workspace_missing")

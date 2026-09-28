@@ -5,15 +5,15 @@ import subprocess
 import pytest
 
 from agent_run.github_identity import (
-    GitHubIdentityError, native_github_environment, normalize_github_config,
-    resolve_worker_identity, validate_identity_snapshot, validate_worker_auth,
+    GitHubIdentityError, describe_identity, native_github_environment, normalize_github_config,
+    resolve_worker_identity, resolve_runner_identity, validate_identity_snapshot, validate_worker_auth,
 )
 from agent_run.user_defaults import UserDefaultsStore
 from support.user_defaults import settings
 
 
 @pytest.mark.parametrize('config', [
-    {'worker_source': 'invalid'}, {'pat': {}}, {'pat': {'env': 'X', 'file': '/x'}},
+    {'worker_source': 'invalid'}, {'runner_source': 'app'}, {'runner_source': None}, {'pat': {}}, {'pat': {'env': 'X', 'file': '/x'}},
     {'pat': {'env': 'not-valid'}}, {'pat': {'file': 'relative'}},
     {'worker_source': 'host', 'read_only': True}, {'pat': {'token': 'secret'}},
     {'app_read_only': 'true'}, {'app_current_repository_only': 1},
@@ -108,6 +108,55 @@ def test_pat_file_read_is_bounded_and_rejects_nonregular(tmp_path: Path) -> None
         native_github_environment(identity, {})
 
 
+def test_runner_defaults_shared_reference_and_independent_override(tmp_path: Path) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    configured = store.configure(github={"worker_source": "host", "runner_source": "pat",
+                                         "pat": {"env": "RUNNER_PAT"}})
+    saved = store.path.read_bytes()
+    runner = configured["github"]["runner"]
+    assert runner == {"source": "pat", "pat": {"env": "RUNNER_PAT"}}
+    assert configured["github"]["worker"] == {"source": "host"}
+    assert resolve_runner_identity() == {"source": "host"}
+    defaults = store.load()["github"]
+    assert resolve_runner_identity(defaults, {"runner_source": "host"}) == {"source": "host"}
+    assert resolve_worker_identity(defaults, {"worker_source": "pat"}) == runner
+    assert store.path.read_bytes() == saved
+    with pytest.raises(GitHubIdentityError):
+        resolve_runner_identity({"runner_source": "pat"})
+    with pytest.raises(GitHubIdentityError):
+        native_github_environment(runner, {"GH_TOKEN": "host-secret"})
+    assert native_github_environment(runner, {"RUNNER_PAT": "new-secret"})["GH_TOKEN"] == "new-secret"
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_public_settings_runner_selection(language: str, tmp_path: Path) -> None:
+    code, configured = settings("configure", "--language", language,
+                                "--worker-github-source", "host", "--runner-github-source", "pat",
+                                "--github-pat-env", "UNSET_RUNNER_PAT")
+    assert code == 0
+    assert configured["github"]["runner"] == {"source": "pat", "pat": {"env": "UNSET_RUNNER_PAT"}}
+    assert configured["github"]["worker"] == {"source": "host"}
+    code, updated = settings("configure", "--github-pat-file", str(tmp_path / "missing"))
+    assert code == 0
+    assert updated["github"]["runner"]["pat"] == {"file": str(tmp_path / "missing")}
+    code, shown = settings("show")
+    assert code == 0
+    assert shown["github"] == updated["github"]
+    code, changed = settings("configure", "--runner-github-source", "host")
+    assert code == 0
+    assert changed["github"]["runner"] == {"source": "host"}
+    assert changed["github"]["worker"] == {"source": "host"}
+
+
+def test_identity_description_never_guesses_missing_runner_binding() -> None:
+    worker = {"source": "host"}
+    assert describe_identity(worker, "zh")["runner"] is None
+    runner = {"source": "pat", "pat": {"env": "SAVED_PAT"}}
+    assert describe_identity(worker, "en", runner)["runner"] == runner
+
+
+
+
 def app_config(tmp_path: Path) -> dict:
     return {'worker_source': 'app', 'app': {
         'app_id': '123', 'installation_id': '456', 'private_key_path': str(tmp_path / 'key.pem')}}
@@ -160,10 +209,15 @@ def test_legacy_app_migration_is_atomic_preserves_materials_and_explicit_setting
     legacy.write_text(json.dumps({**app_config(tmp_path)['app'], 'private_key_path': str(key)}))
     legacy.chmod(0o600)
     store = UserDefaultsStore(directory / 'user-defaults.json')
-    store.path.write_text(json.dumps({'language': 'en', 'profile': {'preset': 'economy'}}))
+    runner = {'source': 'pat', 'pat': {'env': 'RUNNER_PAT'}}
+    store.path.write_text(json.dumps({
+        'language': 'en', 'profile': {'preset': 'economy'},
+        'github': {'runner_source': 'pat', 'pat': runner['pat']},
+    }))
     original = store.path.read_bytes()
     material = legacy.read_bytes()
     assert store.describe()['github']['migration'] == 'required'
+    assert store.describe()['github']['runner'] == runner
     assert store.path.read_bytes() == original
     with pytest.raises(GitHubIdentityError, match='migrate-github-app'):
         resolve_worker_identity({}, app_profile_path=legacy)
@@ -178,6 +232,8 @@ def test_legacy_app_migration_is_atomic_preserves_materials_and_explicit_setting
     assert result['github']['worker'] == {'source': 'app', 'app_profile': {
         **app_config(tmp_path)['app'], 'private_key_path': str(key)},
         'app_read_only': False, 'app_current_repository_only': False}
+    assert result['github']['runner'] == runner
+    assert resolve_runner_identity(store.load()['github']) == runner
     assert store.load()['language'] == 'en'
     assert store.load()['profile'] == {'preset': 'economy'}
     assert legacy.read_bytes() == material

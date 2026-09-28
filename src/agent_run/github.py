@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
+from agent_run.runner_transport import runner_options
 from agent_run.github_retry import run_read_command
 from agent_run.git_output import git_environment
 from agent_run.models import Blocker, DeliveryGraph, Issue, ParentIssue, Repository
@@ -54,7 +56,9 @@ class GhGitHubReader:
         repository_override: str | None = None,
         *,
         working_directory: Path | None = None,
+        runner_identity: Mapping[str, Any] | None = None,
     ) -> None:
+        self.runner_identity = runner_identity
         self.repository_override = repository_override
         self.working_directory = working_directory
         self._repository: Repository | None = None
@@ -276,9 +280,10 @@ class GhGitHubReader:
             arguments.extend(["-F", f"cursor={cursor}"])
         return self._gh_json(*arguments)
 
-    @staticmethod
-    def _gh_json(*arguments: str) -> dict[str, Any]:
-        result = run_read_command(["gh", *arguments])
+    def _gh_json(self, *arguments: str) -> dict[str, Any]:
+        result = run_read_command(
+            ["gh", *arguments], **runner_options(self.runner_identity),
+        )
         if result.returncode != 0:
             raise GitHubReadError(
                 "github_read_failed",

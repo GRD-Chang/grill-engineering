@@ -928,7 +928,9 @@ def _sanitize_error_value(
     key_kinds: dict[str, tuple[bool, bool, bool]],
     diagnostic: bool = False, path: tuple[str, ...] = ()
 ) -> object:
-    if path in {("github_identity",), ("creation_configuration", "github_identity")}:
+    if path in {(name,) for name in ("github_identity", "runner_github_identity")} | {
+        ("creation_configuration", name) for name in ("github_identity", "runner_github_identity")
+    }:
         # Only validated source and references belong here, never credential values.
         from agent_run.github_identity import validate_identity_snapshot
 

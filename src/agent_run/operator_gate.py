@@ -204,6 +204,13 @@ def _local_gate_matches_top_status(
         return True
     if status in {"waiting_external", "supervision_timeout", "abandonment_pending"}:
         return True
+    if status == "execution_failed" and phase == "ready_for_approval":
+        # Authentication may fail before approval is consumed. Keep the exact
+        # approval subject; Resume refreshes it and still requires approval.
+        evidence = operator_gate_evidence(state)
+        resolved = _work_subject(state, evidence["work_subject"]) if evidence else None
+        return bool(evidence and evidence["reason"] == "runner_credential_failed"
+                    and resolved is not None and resolved[0] == location)
     if status == "ready_for_human":
         return phase in {"blocked", "ready_for_human"}
     if status == "blocked":

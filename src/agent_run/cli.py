@@ -19,10 +19,11 @@ from agent_run.cli_messages import cli_message, personal_language, error_message
 from agent_run.messages import selected_language, text
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
+from agent_run.runner_identity import bind_runner_identity, frozen_runner_identity
 from agent_run.github_identity import (
     GitHubIdentityError,
     add_identity_options, identity_overrides, resolve_worker_identity, validate_worker_auth,
-    validate_identity_snapshot,
+    validate_identity_snapshot, resolve_runner_identity,
 )
 from agent_run import settings_cli, prompt_cli
 from agent_run.agent_fixture import FixtureAgentBackend
@@ -435,8 +436,18 @@ def _main_with_parser_resources(
                 bootstrap_host.check_readiness()
             except SystemdExecutionReadinessError as error:
                 raise ExecutionReadinessError(str(error)) from error
+        # A new clone has no Run to bind yet. Resolve credentials before any
+        # remote initialization; existing workspaces are opened locally first.
+        initial_runner_identity = None
+        if parsed.command == "run" and target_root is not None and not target_root.exists():
+            initial_runner_identity = resolve_runner_identity(
+                UserDefaultsStore().load().get("github"), identity_overrides(parsed),
+            )
+            if initial_runner_identity["source"] == "pat":
+                validate_worker_auth(initial_runner_identity)
         git = open_workspace(
-            parsed.repo, parsed.github_fixture, create=parsed.command == "run"
+            parsed.repo, parsed.github_fixture, create=parsed.command == "run",
+            runner_identity=initial_runner_identity,
         )
         state_root = workspace_state_root(git.root)
         if parsed.state_dir and Path(parsed.state_dir).resolve() != state_root.resolve():
@@ -476,6 +487,8 @@ def _main_with_parser_resources(
             "profile",
         }:
             _resolve_mutation_selection(parsed, git, states)
+        bind_runner_identity(parsed, states, git, github, initial_runner_identity)
+        controller.creation_runner_github_identity = dict(git.runner_identity) if git.runner_identity else None
         if parsed.command == "resume":
             selected_resume = cli_surface._load_local_run(states, parsed.run_id)
             resume_notifications = selected_resume.get("notifications")
@@ -2107,6 +2120,12 @@ def _run_lifecycle(
                     preset=preset, overrides=overrides, document=document,
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
+                payload["runner_github_identity"] = dict(git.runner_identity or {"source": "host"})
+                if payload["runner_github_identity"]["source"] == "pat":
+                    validate_worker_auth(payload["runner_github_identity"])
+                    # Authentication alone does not grant target-repository access.
+                    # Report startup access errors before admitting an Executor.
+                    github.repository()
                 payload["github_identity"] = resolve_worker_identity(
                     document.get("github"), identity_overrides(parsed),
                 )
@@ -2126,6 +2145,7 @@ def _run_lifecycle(
                     policy = parse_policy_snapshot(policy_snapshot_for_state(current))
                     payload = _run_action_payload(parsed, policy, creation_profile)
                     payload["github_identity"] = frozen_worker_identity(current)
+                    payload["runner_github_identity"] = frozen_runner_identity(current)
         else:
             if current is None:  # pragma: no cover - guarded above
                 raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
@@ -2352,6 +2372,22 @@ def _run_lifecycle(
     )
 
     def select_run(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        if git.runner_identity and git.runner_identity["source"] == "pat":
+            try:
+                validate_worker_auth(git.runner_identity)
+            except GitHubIdentityError as error:
+                if current is None:
+                    raise
+                failed_run_id = str(current["run_id"])
+                controller.record_execution_failure(
+                    failed_run_id, str(error), runner_credential_failure=True,
+                )
+                failed = states.load_current_run(failed_run_id)
+                if failed is None:
+                    raise
+                prepare_action_application_receipt(failed, action)
+                states.save_run(failed_run_id, failed)
+                return failed, True
         if action_kind == "resume":
             action_payload = action.get("payload")
             if not isinstance(action_payload, Mapping):
@@ -2502,6 +2538,7 @@ def _run_lifecycle(
         controller.delivery_policy_provider = lambda: frozen_policy
         controller.creation_language = str(run_payload.get("language", "zh"))
         controller.creation_github_identity = validate_identity_snapshot(run_payload["github_identity"])
+        controller.creation_runner_github_identity = validate_identity_snapshot(run_payload["runner_github_identity"])
         def prepare_creation(state: dict[str, Any]) -> None:
             # Keep the initial configuration beside the creation receipt so a
             # lost Task Control can be reconciled without reading user defaults.
@@ -2677,6 +2714,16 @@ def _run_payload_for_existing_action(
             if selected != identity:
                 raise TaskControlError(error_message("identity.run_fixed"))
         notification_payload["github_identity"] = dict(identity)
+    runner_identity = existing_payload.get("runner_github_identity")
+    if isinstance(runner_identity, dict):
+        selected_runner = resolve_runner_identity(
+            {"runner_source": runner_identity["source"],
+             **({"pat": runner_identity["pat"]} if "pat" in runner_identity else {})},
+            identity_overrides(parsed),
+        )
+        if selected_runner != runner_identity:
+            raise TaskControlError(error_message("identity.run_fixed"))
+        notification_payload["runner_github_identity"] = dict(runner_identity)
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")
     if isinstance(stored_policy, Mapping):
@@ -2993,6 +3040,7 @@ def _run_driver(
         on_worker_started=on_worker_started,
         on_worker_finished=on_worker_finished,
         worker_identity=worker_identity,
+        runner_identity=dict(git.runner_identity) if git.runner_identity else None,
     )
     return RunDriver(
         operations=DirectRunOperations(
@@ -3024,6 +3072,7 @@ def _agent_backend(
     on_worker_started: Callable[[int], None] | None = None,
     on_worker_finished: Callable[[int], None] | None = None,
     worker_identity: dict[str, Any] | None = None,
+    runner_identity: dict[str, Any] | None = None,
 ) -> ProfiledAgentBackend:
     fixture = getattr(parsed, "agent_fixture", None)
     backend = (
@@ -3031,6 +3080,7 @@ def _agent_backend(
         if fixture
         else CodexCliBackend(
             worker_identity=worker_identity,
+            runner_identity=runner_identity,
             on_worker_started=on_worker_started,
             on_worker_finished=on_worker_finished,
         )

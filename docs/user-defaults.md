@@ -1,6 +1,6 @@
 # 个人运行默认配置
 
-`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度、开发会话策略及 Worker GitHub 身份。无需自定义时无需创建文件，直接使用内置默认。
+`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度、开发会话策略及 Worker / Runner GitHub 身份。无需自定义时无需创建文件，直接使用内置默认。
 
 运行参数文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
@@ -19,30 +19,33 @@ agent-run settings show --run <完整Run-ID> --json
 
 ## GitHub 身份
 
-`github` 与其他偏好共用同一文件。Worker 支持 host/PAT/App 原生 `gh`；Runner 程序端继续使用 host。无配置默认 host；已有独立 App 元数据需要显式迁移，不能静默切换个人身份。显式统一配置优先。
+`github` 与其他偏好共用同一文件。Worker 与 Runner 独立选择来源，共享同一个 `pat` 引用定义。Worker 支持 host/PAT/App 原生 `gh`；无配置默认 host，已有独立 App 元数据需要显式迁移，不能静默切换个人身份。显式统一配置优先。Runner 程序端支持 host/PAT，默认 host，统一覆盖首次读取与克隆、Controller、Publisher 读写及远端 Git fetch/push/分支清理，不单独配置 Controller 或 Publisher。
 
 ```json
 {
   "github": {
-    "worker_source": "pat",
-    "pat": {"env": "WORKER_GITHUB_PAT"}
+    "worker_source": "host",
+    "runner_source": "pat",
+    "pat": {"env": "DELIVERY_GITHUB_PAT"}
   }
 }
 ```
 
-也可将 `pat` 改为 `{"file":"/secure/worker-pat"}`。环境变量名和文件路径二选一，不填写 token 本身；缺失、空值、不可读、两种引用同时出现均明确失败，不回退 host。引用可在选择 host 时保留，只有选择 PAT 时消费。host/PAT 不适用 App 收窄选项，不会被程序伪装成只读；实际 GitHub 能力由凭据授权决定。
+也可将 `pat` 改为 `{"file":"/secure/delivery-pat"}`。环境变量名和文件路径二选一，不填写 token 本身；缺失、空值、不可读、两种引用同时出现均明确失败，不回退 host。引用可在选择 host 时保留，只有选择 PAT 时消费。Worker host/PAT 不适用 App 收窄选项，不会被程序伪装成只读；实际 GitHub 能力由凭据授权决定。
 
 ```bash
-agent-run settings configure --worker-github-source pat --github-pat-env WORKER_GITHUB_PAT
-agent-run settings configure --worker-github-source pat --github-pat-file /secure/worker-pat
+agent-run settings configure --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PAT
+agent-run settings configure --worker-github-source pat --github-pat-file /secure/delivery-pat
 agent-run settings configure --worker-github-source host
+agent-run settings configure --runner-github-source pat --github-pat-env DELIVERY_GITHUB_PAT
 agent-run settings show --json
-agent-run run 330 --worker-github-source pat --github-pat-env WORKER_GITHUB_PAT
+agent-run run 330 --runner-github-source pat
+agent-run run 330 --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PAT
 ```
 
 `run` 覆盖只作用于新 Run，不改个人默认。使用环境引用时，启动及恢复命令的环境须包含该变量，后台执行器继承所需环境。Run 固定非秘密来源和引用，秘密值不进入快照或普通输出；修改个人默认不改变已有 Run。文件引用适合在相同路径更换 token；环境引用则在恢复前重新导出同名变量。已有 Run 因凭据不可用暂停时，保留进度与诊断，修复原引用后公开 `resume`，不切换来源、不重置正式批准边界。
 
-`settings show` 的 `github.worker` 展示有效来源及引用，`github.runner.source` 当前为 `host`，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看该 Run 固定配置。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
+`settings show` 的 `github.worker` 与 `github.runner` 分别展示两端有效来源及引用，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看该 Run 固定配置；旧 Run 未保存程序端身份时该项显示未设置，不从当前默认推测。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
 
 ### App 配置与迁移
 
@@ -68,13 +71,13 @@ agent-run run 330 --worker-github-source app --no-github-app-read-only --no-gith
 agent-run settings configure --migrate-github-app
 ```
 
-App 参数三项一起设置；只保存私钥文件引用，不保存私钥内容。默认省略签发请求中的权限与仓库限制，使用安装已授权的范围。`app_read_only` 将安装已授权限收窄到可用只读权限，`app_current_repository_only` 只选当前目标仓库；两者独立，不能扩大安装授权，不再要求固定七项 read。收窄只作用于 Worker，不改变程序端身份或权限。选择 host/PAT 时不能启用 App 收窄选项。
+App 参数三项一起设置；只保存私钥文件引用，不保存私钥内容。默认省略签发请求中的权限与仓库限制，使用安装已授权的范围。`app_read_only` 将安装已授权限收窄到可用只读权限，`app_current_repository_only` 只选当前目标仓库；两者独立，不能扩大安装授权，不再要求固定七项 read。收窄只作用于 Worker，不改变程序端身份或权限。Worker 选择 host/PAT 时不能启用 App 收窄选项。
 
 旧独立 App 元数据用 `settings configure --migrate-github-app` 显式迁移：保留 App 来源，采用新默认权限与仓库范围，显式新配置优先，不覆盖其他设置。写入原子化，失败保留有效数据；`settings show` 只报告迁移状态，不写文件、不签发 token。成功后统一配置是新运行的唯一来源。旧文件和私钥保留，避免删除活动执行器引用的材料。旧 `auth app` 命令已移除，统一使用 settings。
 
 每次 Invocation 的 App 短期 token 写入隔离的 `GH_CONFIG_DIR/hosts.yml`，续签原子替换文件。同一 Agent 正常继承环境的后续原生 gh 子进程读取更新值，不通过命令代理、不依靠启动时一次性 token 环境注入。临时失败有界重试，有效旧 token 可继续使用；不可恢复失效进入 Execution Failure，保留进度，修复同一身份与引用后公开 `resume`。停止、失败和取消回收续签线程、签名子进程与临时凭据目录。
 
-个人配置迁移不修改旧活动 Run 的授权。缺少新身份或范围绑定、无法安全恢复的 Run 明确报告不兼容并保留数据；不能根据新默认补齐。程序端 PAT/App 选择由后续任务完成。工具替身测试仅验证上述传递与生命周期逻辑，不代表真实 gh 兼容性已验证。
+个人配置迁移不修改旧活动 Run 的授权。缺少新身份或范围绑定、无法安全恢复的 Run 明确报告不兼容并保留数据；不能根据新默认补齐。程序端 App 选择尚未实现。工具替身测试仅验证上述传递与生命周期逻辑，不代表真实 gh 兼容性已验证。
 
 ## 轮数
 
@@ -207,7 +210,7 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 策略和模型中的未知字段、null、非法值及文件损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
 
-账号凭据由 `auth` 管理，项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录；这些内容均不合并到个人默认文件。
+GitHub 身份在个人默认文件中仅保存非秘密配置和凭据引用，秘密值保留在引用的环境变量或文件中；Codex 账号凭据由 `auth` 管理。项目 CI 由仓库管理，Run 状态与 Profile 保留在各自状态目录。
 
 发送、恢复与本地记录的边界见[飞书进度通知](notifications.md)。
 

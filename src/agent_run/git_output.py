@@ -6,6 +6,8 @@ import shutil
 import signal
 import subprocess
 from functools import lru_cache
+from collections.abc import Mapping
+from typing import Any
 from pathlib import Path
 
 from agent_run.git_errors import GitError
@@ -43,7 +45,8 @@ def git_environment() -> dict[str, str]:
 
 
 def run_git(
-    arguments: list[str], *, cwd: Path, input: str | None = None
+    arguments: list[str], *, cwd: Path, input: str | None = None,
+    runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drain both pipes; never return a truncated patch or other Git result."""
     if input is not None and len(input) > MAX_GIT_OUTPUT_BYTES:
@@ -51,7 +54,10 @@ def run_git(
     data = input.encode() if input is not None else b""
     if len(data) > MAX_GIT_OUTPUT_BYTES:
         raise GitError("Git input exceeds the 1 MiB transfer limit")
-    environment = git_environment()
+    from agent_run.runner_transport import runner_git_environment, redact_transport_output
+
+    remote = bool(arguments[1:2] and arguments[1] in {"clone", "fetch", "push", "pull", "ls-remote"})
+    environment = runner_git_environment(runner_identity, cwd=cwd) if remote else git_environment()
     executable = _git_executable(environment.get("PATH", os.defpath))
     process = subprocess.Popen(
         [executable, *arguments[1:]], cwd=cwd,
@@ -108,6 +114,8 @@ def run_git(
             if opened_stream is not None:
                 opened_stream.close()
     error = stderr.decode("utf-8", errors="replace")
+    if remote:
+        error = redact_transport_output(error, environment)
     # Replacement decoding may expand invalid bytes; the diagnostic is byte bounded too.
     encoded = error.encode()
     if overflow["stderr"] or len(encoded) > MAX_GIT_ERROR_BYTES:
@@ -121,6 +129,8 @@ def run_git(
         )
     try:
         output = stdout.decode("utf-8")
+        if remote:
+            output = redact_transport_output(output, environment)
     except UnicodeDecodeError as invalid_output:
         raise GitError("Git stdout is not valid UTF-8; complete result unavailable") from invalid_output
     return subprocess.CompletedProcess(arguments, returncode, output, error)

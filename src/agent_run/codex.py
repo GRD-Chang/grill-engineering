@@ -119,12 +119,14 @@ class CodexCliBackend:
         credential_provider: CredentialProvider | None = None,
         *,
         worker_identity: dict[str, Any] | None = None,
+        runner_identity: dict[str, Any] | None = None,
         on_worker_started: Callable[[int], None] | None = None,
         on_worker_finished: Callable[[int], None] | None = None,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
         self.worker_identity = worker_identity
+        self.runner_identity = runner_identity
         self.on_worker_started = on_worker_started
         self.on_worker_finished = on_worker_finished
 
@@ -640,6 +642,13 @@ class CodexCliBackend:
                         native_github_environment(identity), temporary / "gh",
                         host=identity["source"] == "host",
                     )
+                # Native GH_TOKEN has already been resolved for the Worker.
+                # Do not also inject the Runner's custom PAT reference value.
+                runner_env = (self.runner_identity or {}).get("pat", {}).get("env")
+                if runner_env and runner_env not in {
+                    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                }:
+                    environment.pop(runner_env, None)
                 hidden_paths = _worker_hidden_paths(
                     profile, checkout=checkout, hide_host_credentials=app_access
                 )

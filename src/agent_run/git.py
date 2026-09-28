@@ -5,12 +5,13 @@ import re
 import shutil
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import Any, Literal
 
+from agent_run.runner_transport import runner_options
 from agent_run.commit_messages import commit_messages_match
 from agent_run.git_errors import GitError as GitError
 from agent_run.git_errors import (
@@ -47,8 +48,11 @@ class GitIntegrationResult:
 
 
 class GitRepository:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, *, runner_identity: Mapping[str, Any] | None = None,
+    ) -> None:
         self.root = root
+        self.runner_identity = runner_identity
         self._write_guard: Callable[[], None] | None = None
         self._retirement = ManagedBranchRetirementGit(self)
         self._integration_scene = IntegrationRepairSceneGit(self)
@@ -845,6 +849,7 @@ class GitRepository:
             ["git", "fetch", "--no-tags", "origin", expected_sha],
             cwd=self.root,
             before_attempt=self._check_write_guard,
+            **runner_options(self.runner_identity),
         )
         if fetched.returncode != 0 or not self._commit_exists(expected_sha):
             raise GitError(
@@ -1097,6 +1102,7 @@ class GitRepository:
             ["git", "fetch", "--no-tags", "origin", default_branch],
             cwd=self.root,
             before_attempt=self._check_write_guard,
+            **runner_options(self.runner_identity),
         )
         if result.returncode != 0:
             raise GitError(
@@ -1159,8 +1165,14 @@ class GitRepository:
                 # Stop or a new Executor generation may revoke authority
                 # while this dispatch waits for another worktree command.
                 self._check_write_guard()
-                return run_git(["git", *arguments], cwd=directory, input=input)
-        return run_git(["git", *arguments], cwd=directory, input=input)
+                return run_git(
+                    ["git", *arguments], cwd=directory, input=input,
+                    **runner_options(self.runner_identity),
+                )
+        return run_git(
+            ["git", *arguments], cwd=directory, input=input,
+            **runner_options(self.runner_identity),
+        )
 
 
 class Publisher:

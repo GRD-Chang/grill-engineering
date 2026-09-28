@@ -144,7 +144,8 @@ def test_app_native_worker_receives_scope_without_private_key_or_gh_mount(
     tool.chmod(0o700)
     worker = tmp_path / "agent"
     worker.write_text(f"#!{sys.executable}\n" +
-        "import json, pathlib, subprocess, sys\n"
+        "import json, os, pathlib, subprocess, sys\n"
+        "assert 'TASK_RUNNER_PAT' not in os.environ\n"
         "try:\n"
         f"    private = pathlib.Path({str(key)!r}).read_text()\n"
         "except OSError:\n    private = ''\n"
@@ -157,7 +158,11 @@ def test_app_native_worker_receives_scope_without_private_key_or_gh_mount(
         "print(json.dumps({'type':'thread.started','thread_id':'app-native'}))\n")
     worker.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
-    result = CodexCliBackend(executable=str(worker), worker_identity=identity).develop(
+    monkeypatch.setenv("TASK_RUNNER_PAT", "runner-only-secret")
+    result = CodexCliBackend(
+        executable=str(worker), worker_identity=identity,
+        runner_identity={"source": "pat", "pat": {"env": "TASK_RUNNER_PAT"}},
+    ).develop(
         {"checkout": str(git_repo), "repository": "example/project", "ticket": {"number": 3}})
     assert result.thread_id == "app-native"
     assert seen == [(True, "example/project")]

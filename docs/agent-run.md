@@ -109,7 +109,9 @@ agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 
 ### GitHub 身份
 
-Worker 的 host/PAT/App 选择、凭据引用与 App 收窄选项通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；所有来源使用原生 `gh`，访问能力由所选凭据决定，不通过本地命令白名单限制。Runner 程序端继续使用 host。
+Worker 的 host/PAT/App 选择、凭据引用与 App 收窄选项通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；所有来源使用原生 `gh`，访问能力由所选凭据决定，不通过本地命令白名单限制。Runner 程序端独立选择 host/PAT，默认 host，复用同一 PAT 引用定义。
+
+程序端 PAT 在首次克隆前校验；克隆、Controller 查询、Publisher 写入和读回、Git fetch/push 与远端分支清理均使用该选择。远端 Git 使用任务级 HTTPS 凭据，不修改全局登录或 Git 配置。`--runner-github-source` 仅覆盖新 Run；已有 Run 固定来源与引用，修复原引用后通过 `resume` 恢复。建立 Run 前失败只报告启动错误；已有 Run 保留进度与执行失败诊断。结果未知的写入继续按已有意图、准确 head 和发布者身份读回核验，不因凭据恢复而绕过批准或盲目重放写入。
 
 App 元数据与其他个人设置共同保存在 `user-defaults.json`；私钥只引用文件，由程序端签发短期 token，不主动下发私钥。App 默认采用安装已授权的权限和仓库范围，只读和当前仓库是独立选项。示例：
 
@@ -523,7 +525,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥、Run locator、Runner 独立仓库和运行数据。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
 的同名入口会被保留并报告清理未完成。
 
-Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app` 命令已移除，迁移不删除用户私钥；App 故障不回退 host。程序端仍使用宿主身份。
+Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app` 命令已移除，迁移不删除用户私钥；App 故障不回退 host。程序端可独立选择 host/PAT，默认 host。
 
 首版范围为 Linux、用户级 `~/.profile` 和单用户安装；尚未完成发行版、版本与架构组合的完整真实宿主验证。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、
