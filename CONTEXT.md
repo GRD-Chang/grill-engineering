@@ -284,6 +284,7 @@ _Avoid_: 通用 watch 命令、终端所有权、Worker PTY 代理、以 Ctrl-C 
 
 **Lifecycle Action（生命周期动作）**:
 维护者通过公开生命周期命令向准确 Delivery Run 提交的一次性、可验证意图。Action 在当前 Run 状态允许时被接受，并由唯一 Run Executor Session 至多消费一次；`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 共用这一入口和后续 Driver，不各自形成独立控制流程。活动 Executor 且没有未完成 Action 时再次收到普通 `run`，只返回现有执行状态而不创建新 Action；`resume`、`approve`、`revise` 与 `requeue` 只在准确对应边界接受，否则立即拒绝；`stop` 与 `abandon` 可在没有未完成 Action 的活动执行中请求收口；最终批准操作执行期间不可取消，恢复该操作时同样适用。不被当前状态允许的 Action 不等待未来状态、不进入通用队列。完全匹配当前 unresolved Action 的 task、kind 与用户显式输入的重复原命令可以在新 Action 准入前附着并对账原 Action；它继续确认第一次接受时已解析并保存的语义 payload，即使其后用户级默认配置发生变化，也不重新解释第一次操作。原 Action 未收口时不产生第二个 Action 或历史，只有确认原 Action 已失败并持久收口后，同一次用户命令才可顺序提交 successor Action。恢复原最终批准操作的 `resume` 是有限例外：可在新动作准入前对账原最终批准操作的未完成 Action（approve 或恢复该操作的 resume），但仍须确认旧执行已结束并形成原 Action 的确定结果，才能继续未完成部分。其他相同或不同命令仍立即拒绝。
+已有 Run 的 `resume`、`approve`、`revise`、`requeue` 在执行准备时可用已接受 Action 的冻结 payload Run ID 从受管状态定位准确对象；请求目标不代表执行权。核验规范状态、Repository/Parent 归属、当前 Action/Executor generation 与非空绑定一致性后，才正式绑定并通过命令原有业务检查应用意图。绑定尚未产生 Application Receipt 时重入仍须应用命令；准确 Receipt 已保存时只对账并继续后续工作，不重复意图。该定位不用于只读查询、通用回执或 `run`、`stop`、`abandon` 的专用流程。
 _Avoid_: 终端控制文件、重复消费、通用消息队列、过期授权、命令各自直接驱动 Engine、隐式授权、重复命令创建第二个 Action
 
 **Action Admission Gate（动作准入门）**:
@@ -846,5 +847,7 @@ _Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue
 多 Ticket Parent 在所有 Ticket Completion 后，先读取远端 Run Branch 与默认分支的准确 head，保留本地、远端源分支和目标分支的成果，再启动首次完整 Run Acceptance。Reviewer 看到 Parent、Ticket 完成与 fallback、Ticket/Run 集成记录及准确合并结果；这一次审核属于当前集成窗口的首次审核。Parent-only 先在固定开发基线完成最多 D10/R10 的需求开发与独立验收，不使用 Ticket fallback；交付前读取远端 Parent Branch 与默认分支。若集成后的 head、tree、base 和验收边界仍与已通过记录一致，可复用验收；否则在独立集成窗口重新审核新组合。两者共用准确远端快照、机械集成、冲突记录与 resync 额度，普通 Parent 集成窗口的默认问题修复上限为 3 次，首次审核另计。纯冲突解决不消耗需求开发或集成问题修复额度。
 
 首次集成免费；完成后的真实外部源/目标新增提交才消耗一次自动 resync 机会并开启新窗口。自身发布、回读、Reviewer 退回及 CI 失败不开户；默认最多三次自动 resync。额度耗尽时保留工作区、PR、有效验收及未耗尽预算，显式 resume 只续期该耗尽额度。集成记录绑定准确源、目标、候选、结果 head/tree 与冲突路径；非追加历史明确暂停。已发布源分支只追加提交，保持原 PR；当前结果的 Reviewer、Required Checks 与最终人工批准才可授权合入。状态协议不兼容时在外部写入前拒绝旧 Run，不做隐式迁移。
+
+Ticket、Parent-only 和 Run Repair 的纯冲突调用保留 `development / integration_conflict`，Job 保留其合法业务阶段。活动调用必须同时匹配当前 Job 归属、Generation、pending Semantic Agent Attempt、预算窗口和准确候选的冲突上下文；失败及恢复不放宽这些约束。completed 事件落盘后与业务收尾后的历史都可读取，已收尾历史不再要求活动 pending Attempt 或冲突现场。公开 resume 续接同一 Attempt 和适用线程，保留候选、有效验收、工作区成果及预算历史，不把冲突处理计为新一轮开发。Run 最终集成仍使用独立的 `run_integration_conflict` 语义。
 
 CI 恢复额度独立于上述需求与集成预算。每个对象默认最多三轮，每轮默认最多三次有实际代码工作的修复；同一失败 head 的回读不计轮。Ticket 首轮最多一次修复，允许以绑定旧已发布授权和准确失败证据的窄收据更新 PR；从第二轮开始须经 Reviewer。Parent-only 与多 Ticket Parent 的 CI 修复每轮均须 Reviewer。内层或外层耗尽均安全暂停，显式 resume 只续期耗尽层并保留其他预算与有效成果。

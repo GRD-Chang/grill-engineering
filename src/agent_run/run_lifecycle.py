@@ -793,14 +793,49 @@ class RunLifecycle:
             or executor.get("status") not in {"starting", "running"}
         ):
             raise ActionReconciliationError("Executor generation binding 不匹配")
-        run_id = _record_run_id(record)
-        current = self._load_action_run(run_id, {}, record=record)
+        self.control.assert_executor_current(
+            self.task, action_id=action_id, generation=generation
+        )
+        if action.get("kind") in {"resume", "approve", "revise", "requeue"}:
+            current = self._load_existing_action_target(record, action)
+        else:
+            current = self._load_action_run(_record_run_id(record), {}, record=record)
         return self._continue_action(
             action,
             current,
             replace_receipt_action_id=_receipt_owner_action_id(record, current),
             executor_generation=generation,
         )
+
+    def _load_existing_action_target(
+        self, record: Mapping[str, Any], action: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Locate an accepted request without granting it Run ownership."""
+
+        payload = action.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ActionReconciliationError("Lifecycle Action payload 缺失")
+        run_id = _string_field(payload, "run_id")
+        if Path(run_id).name != run_id or run_id in {".", ".."}:
+            raise ActionReconciliationError("Lifecycle Action payload Run ID 无效")
+        executor = record.get("executor")
+        for owner in (record, action, executor):
+            if isinstance(owner, Mapping) and owner.get("run_id") not in {None, run_id}:
+                raise ActionReconciliationError("Lifecycle Action 的 Delivery Run binding 冲突")
+        state = self._state_store_for_record(record).load_current_run(run_id)
+        if state is None:
+            raise ActionReconciliationError(f"Lifecycle Action 目标 Delivery Run 不存在: {run_id}")
+        if state.get("run_id") != run_id:
+            raise ActionReconciliationError("Lifecycle Action 目标 Delivery Run ID 不匹配")
+        parent = state.get("parent")
+        repository = state.get("repository")
+        if (
+            not same_repository(repository, self.task.repository)
+            or not isinstance(parent, Mapping)
+            or parent.get("number") != self.task.parent_number
+        ):
+            raise ActionReconciliationError("Lifecycle Action 目标 Repository/Parent 与 Delivery Task 归属不符")
+        return state
 
     def _claim(self, request: LifecycleRequest) -> ActionClaim:
         return self.control.claim_action(
@@ -1097,6 +1132,18 @@ class RunLifecycle:
             )
         action = latest_action
         run_id = action.get("run_id")
+        if (
+            isinstance(run_id, str) and run_id
+            and action.get("kind") in {"resume", "approve", "revise", "requeue"}
+            and current is not None
+            and not action_receipt_matches(current, action)
+        ):
+            # Binding precedes command intent. A crash in between must still
+            # pass through selection and the command's current business gates.
+            return self._start_action(
+                action, current, attached=attached,
+                replace_receipt_action_id=replace_receipt_action_id,
+            )
         if isinstance(run_id, str) and run_id:
             state_store = self._state_store_for_record(latest)
             state = state_store.load_current_run(run_id)

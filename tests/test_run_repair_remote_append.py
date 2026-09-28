@@ -15,6 +15,7 @@ from agent_run.delivery_policy import DeliveryPolicy
 from agent_run.git import GitError
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.run_acceptance import RunAcceptanceEngine
+from agent_run.state import StateStore
 from agent_run.run_publication import RunPublicationEngine
 from support.run_agents import ScriptedRunAgents
 from support.run_artifacts import _candidate_finding_artifact, _passing_artifact
@@ -52,10 +53,16 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
                         "second repair\n", encoding="utf-8"
                     )
                 return result
+            event = request["_invocation_event"]
+            event("started", requested_thread_id="run-repair-developer", attempt_count=1)
+            event("thread_started", reported_thread_id="run-repair-developer")
+            assert StateStore(states.root).load_current_run(state["run_id"]) is not None
             self.development_requests.append(request)
             (Path(str(request["checkout"])) / "run-repair.txt").write_text(
                 "repaired with human change\n", encoding="utf-8"
             )
+            event("completed")
+            assert StateStore(states.root).load_current_run(state["run_id"]) is not None
             return DevelopmentResult(
                 thread_id="run-repair-developer",
                 summary="Resolved both repair changes.",
@@ -235,6 +242,11 @@ def test_run_repair_accepts_a_second_clone_append_on_its_existing_pr(
         result.get("terminal_kind"), result["run_acceptance"].get("phase"),
         result["run_acceptance"].get("discarded_repair_thread_ids"),
     )
+    if conflict:
+        loaded = StateStore(states.root).load_current_run(state["run_id"])
+        assert loaded is not None
+        assert any(item["phase"] == "integration_conflict" and item["status"] == "completed"
+                   for item in loaded["agent_invocation_history"])
     completed = result["run_acceptance"]["completed_repair_jobs"][0]
     assert result["run_acceptance"]["repair_pr_number"] == original_pr
     assert git.is_ancestor(human_sha, completed["publication_sha"])

@@ -4949,6 +4949,10 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
 
         def develop(self, request: dict[str, Any]) -> DevelopmentResult:
             if request.get("repair_source") == "merge_conflict":
+                event = request["_invocation_event"]
+                event("started", requested_thread_id="development-thread-1", attempt_count=1)
+                event("thread_started", reported_thread_id="development-thread-1")
+                assert StateStore(states.root).load_current_run(state["run_id"]) is not None
                 assert isinstance(request["merge_conflict_evidence"], str)
                 assert '"source_sha"' in request["merge_conflict_evidence"]
                 (checkout / "delivered.txt").write_text(
@@ -4962,6 +4966,8 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
                 ).stdout.strip()
                 publisher.live_head = self.appended
                 self.development_requests.append(request)
+                event("completed")
+                assert StateStore(states.root).load_current_run(state["run_id"]) is not None
                 return DevelopmentResult(
                     thread_id="development-thread-1", summary="Resolved and tested the merge conflict."
                 )
@@ -4985,6 +4991,11 @@ def test_ticket_conflict_resolution_keeps_review_budget_and_both_contributions(
     integrated = subprocess.run(["git", "show", f"{job['integrated_sha']}:delivered.txt"],
                                 cwd=git_repo, text=True, capture_output=True, check=True)
     assert integrated.stdout == "first attempt\nremote contribution\n"
+
+    loaded = StateStore(states.root).load_current_run(state["run_id"])
+    assert loaded is not None
+    assert any(item["phase"] == "integration_conflict" and item["status"] == "completed"
+               for item in loaded["agent_invocation_history"])
 
 
 def test_ticket_resolves_source_and_target_conflicts_in_one_integration(
