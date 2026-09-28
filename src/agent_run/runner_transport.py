@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypedDict
 
-from agent_run.github_identity import native_github_environment
+from agent_run.runner_credentials import runner_credential_environment
 from agent_run.git_errors import GitError
 
 
@@ -22,7 +22,7 @@ def runner_options(identity: Mapping[str, Any] | None) -> RunnerOptions:
 def runner_environment(identity: Mapping[str, Any] | None) -> dict[str, str]:
     from agent_run.git_output import git_environment
 
-    return native_github_environment(identity or {"source": "host"}, git_environment())
+    return runner_credential_environment(identity or {"source": "host"}, git_environment())
 
 
 def runner_git_environment(
@@ -55,7 +55,7 @@ def runner_git_environment(
             # Git uses URL userinfo before consulting a credential helper.
             # Refuse it before remote dispatch, including push URLs/rewrite keys.
             if re.search(r"https?://[^/\s]*@", key + " " + value, re.IGNORECASE):
-                raise GitError("Runner PAT refuses Git remote URLs containing credentials")
+                raise GitError("Runner identity refuses Git remote URLs containing credentials")
         else:
             settings.append((key, ""))
     settings.extend([

@@ -109,14 +109,17 @@ agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 
 ### GitHub 身份
 
-Worker 的 host/PAT/App 选择、凭据引用与 App 收窄选项通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；所有来源使用原生 `gh`，访问能力由所选凭据决定，不通过本地命令白名单限制。Runner 程序端独立选择 host/PAT，默认 host，复用同一 PAT 引用定义。
+Worker 的 host/PAT/App 选择、凭据引用与 App 收窄选项通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；所有来源使用原生 `gh`，访问能力由所选凭据决定，不通过本地命令白名单限制。Runner 程序端独立选择 host/PAT/App，默认 host，复用同一 PAT 引用和 App 定义。
 
-程序端 PAT 在首次克隆前校验；克隆、Controller 查询、Publisher 写入和读回、Git fetch/push 与远端分支清理均使用该选择。远端 Git 使用任务级 HTTPS 凭据，不修改全局登录或 Git 配置。`--runner-github-source` 仅覆盖新 Run；已有 Run 固定来源与引用，修复原引用后通过 `resume` 恢复。建立 Run 前失败只报告启动错误；已有 Run 保留进度与执行失败诊断。结果未知的写入继续按已有意图、准确 head 和发布者身份读回核验，不因凭据恢复而绕过批准或盲目重放写入。
+程序端 PAT/App 在首次克隆前校验；克隆、Controller 查询、Publisher 写入和读回、Git fetch/push 与远端分支清理均使用该选择。远端 Git 使用任务级 HTTPS 凭据，不修改全局登录或 Git 配置。`--runner-github-source` 仅覆盖新 Run；已有 Run 固定来源与引用，修复原引用后通过 `resume` 恢复。建立 Run 前失败只报告启动错误；已有 Run 保留进度与执行失败诊断。结果未知的写入继续按已有意图、准确 head 和发布者身份读回核验，不因凭据恢复而绕过批准或盲目重放写入。App 使用其 bot 操作身份核验评论、事件及发布结果，不要求 installation token 通过个人用户身份接口，也不删除作者校验；外部操作不能仅因内容相似被认领为本次正式发布。
 
-App 元数据与其他个人设置共同保存在 `user-defaults.json`；私钥只引用文件，由程序端签发短期 token，不主动下发私钥。App 默认采用安装已授权的权限和仓库范围，只读和当前仓库是独立选项。示例：
+Parent-only 与 Final Run 收尾前保存绑定 Run、PR、合并 SHA 和发布者的关闭意图及派发状态。评论与关闭请求分别在发送前保存派发状态；评论结果未知且暂不可见时只等待读回，不重复发送。恢复时同时核对完成评论与意图之后的关闭事件；只有本地已记录关闭派发且匹配发布者的关闭事件可完成收尾，同一 App 的其他调用方关闭也不能替代本地派发证据。其他作者关闭或后续重新打开属于冲突；事件尚不可见时保持待对账，不重发已派发的关闭操作。缺少可核验关闭意图的旧完成评论不能单独证明本次发布已关闭 Parent。
+
+App 元数据与其他个人设置共同保存在 `user-defaults.json`；私钥只引用文件，由程序端签发短期 token，不主动下发私钥。App 默认采用安装已授权的权限和仓库范围；只读和当前仓库是仅作用于 Worker 的独立选项。Runner 使用完整安装授权，同一 App 定义下的两端 token 按调用上下文和范围隔离。示例：
 
 ```bash
 agent-run settings configure --worker-github-source app --github-app-id 123 --github-installation-id 456 --github-private-key-path /secure/agent-run-app.pem
+agent-run settings configure --runner-github-source app
 agent-run settings configure --github-app-read-only
 agent-run settings configure --migrate-github-app
 agent-run settings show
@@ -402,7 +405,7 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 
 Worker host/PAT/App 使用原生 `gh`，不挂载替换入口、不经过命令代理或本地 allowlist。host 复用宿主认证；PAT 使用所选引用的当前值。它们的 GitHub 能力由用户凭据决定，需要较小权限时由用户在 GitHub 收窄权限。Worker 得到选定身份需要的凭据，程序不会主动向其注入独立 Runner 秘密；host 身份可能与程序端相同。凭据秘密值不进入 Run 快照、普通输出和诊断。
 
-App 在程序端签发并自动续签，短期 token 通过每次 Invocation 隔离的 `GH_CONFIG_DIR/hosts.yml` 原子更新；同一 Agent 正常继承环境的后续 gh 子进程读取新 token，无需重建会话。不同权限和仓库范围的凭据实例隔离；不再替换 gh、解析命令或运行 socket 代理。临时续签失败有界重试，有效旧 token 可继续使用；失效后进入 Execution Failure。App 私钥不主动提供给 Worker，程序端 App 接入由后续任务完成。
+App 在程序端签发并自动续签，短期 token 通过每次 Invocation 隔离的 `GH_CONFIG_DIR/hosts.yml` 原子更新；同一 Agent 正常继承环境的后续 gh 子进程读取新 token，无需重建会话。不同权限和仓库范围的凭据实例隔离；不再替换 gh、解析命令或运行 socket 代理。临时续签失败有界重试，有效旧 token 可继续使用；失效后进入 Execution Failure。App 私钥不主动提供给 Worker。Runner 选择 App 时复用签发及续签实现，使用独立凭据实例；后续 GitHub API 与远端 Git 调用消费当前有效 token。程序端使用安装授权的完整范围，不继承 Worker 的只读或当前仓库收窄；权限不足明确失败，不自动扩大授权。
 
 Codex 使用 YOLO，可读写宿主文件系统、联网及使用真实 Git CLI。外层 bubblewrap 继续只读保护权威 Git metadata 和 Runner 控制状态；启动前拒绝 local Git config 中含 userinfo 的 HTTP(S) remote URL，并返回固定脱敏错误，不改写 config。这不是通用安全沙箱，不承诺防御恶意进程、主动搜索宿主凭据、宿主污染或数据外泄。
 
@@ -525,7 +528,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥、Run locator、Runner 独立仓库和运行数据。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
 的同名入口会被保留并报告清理未完成。
 
-Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app` 命令已移除，迁移不删除用户私钥；App 故障不回退 host。程序端可独立选择 host/PAT，默认 host。
+Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app` 命令已移除，迁移不删除用户私钥；App 故障不回退 host。程序端可独立选择 host/PAT/App，默认 host。
 
 首版范围为 Linux、用户级 `~/.profile` 和单用户安装；尚未完成发行版、版本与架构组合的完整真实宿主验证。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、

@@ -128,7 +128,7 @@ class ManagedWorkspace:
             staging = Path(tempfile.mkdtemp(prefix=f".{self.root.name}-", dir=self.root.parent))
             try:
                 checkout = staging / "repository"
-                if remote_url is None and runner_identity and runner_identity.get("source") == "pat":
+                if remote_url is None and runner_identity and runner_identity.get("source") in {"pat", "app"}:
                     remote_url = f"https://github.com/{self.repository}.git"
                 command = (
                     ["git", "clone", "--no-local", "--quiet", "--", remote_url, str(checkout)]

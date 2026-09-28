@@ -15,7 +15,7 @@ from agent_run.task_control import TaskControlError, TaskControlStore
 from agent_run.user_defaults import UserDefaultsStore
 
 
-@pytest.mark.parametrize("source", ["host", "pat"])
+@pytest.mark.parametrize("source", ["host", "pat", "app"])
 @pytest.mark.parametrize("kind,binding", [("run", "action"), ("approve", "action"),
                                           ("resume", "payload")])
 def test_pending_action_uses_bound_run_identity_not_current_defaults(
@@ -24,6 +24,10 @@ def test_pending_action_uses_bound_run_identity_not_current_defaults(
     identity = {"source": source}
     if source == "pat":
         identity["pat"] = {"env": "FROZEN_PAT_REFERENCE"}
+    if source == "app":
+        identity.update(app_profile={"app_id": "123", "installation_id": "456",
+                                     "private_key_path": str(tmp_path / "key")},
+                        app_read_only=False, app_current_repository_only=False)
     # No token resolution is needed to observe the existing Executor.
     UserDefaultsStore().configure(github={"runner_source": "pat",
                                           "pat": {"env": "DIFFERENT_DEFAULT_REFERENCE"}})

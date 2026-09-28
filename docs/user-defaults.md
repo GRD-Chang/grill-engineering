@@ -19,7 +19,7 @@ agent-run settings show --run <完整Run-ID> --json
 
 ## GitHub 身份
 
-`github` 与其他偏好共用同一文件。Worker 与 Runner 独立选择来源，共享同一个 `pat` 引用定义。Worker 支持 host/PAT/App 原生 `gh`；无配置默认 host，已有独立 App 元数据需要显式迁移，不能静默切换个人身份。显式统一配置优先。Runner 程序端支持 host/PAT，默认 host，统一覆盖首次读取与克隆、Controller、Publisher 读写及远端 Git fetch/push/分支清理，不单独配置 Controller 或 Publisher。
+`github` 与其他偏好共用同一文件。Worker 与 Runner 独立选择来源，共享同一个 `pat` 引用及 `app` 元数据定义。Worker 支持 host/PAT/App 原生 `gh`；无配置默认 host，已有独立 App 元数据需要显式迁移，不能静默切换个人身份。显式统一配置优先。Runner 程序端支持 host/PAT/App，默认 host，统一覆盖首次读取与克隆、Controller、Publisher 读写及远端 Git fetch/push/分支清理，不单独配置 Controller 或 Publisher。
 
 ```json
 {
@@ -53,6 +53,7 @@ agent-run run 330 --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PA
 {
   "github": {
     "worker_source": "app",
+    "runner_source": "app",
     "app": {
       "app_id": "123",
       "installation_id": "456",
@@ -66,18 +67,24 @@ agent-run run 330 --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PA
 
 ```bash
 agent-run settings configure --worker-github-source app --github-app-id 123 --github-installation-id 456 --github-private-key-path /secure/agent-run-app.pem
+agent-run settings configure --runner-github-source app
 agent-run settings configure --github-app-read-only --github-app-current-repository-only
+agent-run run 330 --runner-github-source app
 agent-run run 330 --worker-github-source app --no-github-app-read-only --no-github-app-current-repository-only
 agent-run settings configure --migrate-github-app
 ```
 
-App 参数三项一起设置；只保存私钥文件引用，不保存私钥内容。默认省略签发请求中的权限与仓库限制，使用安装已授权的范围。`app_read_only` 将安装已授权限收窄到可用只读权限，`app_current_repository_only` 只选当前目标仓库；两者独立，不能扩大安装授权，不再要求固定七项 read。收窄只作用于 Worker，不改变程序端身份或权限。Worker 选择 host/PAT 时不能启用 App 收窄选项。
+App 参数三项一起设置；只保存私钥文件引用，不保存私钥内容。默认省略签发请求中的权限与仓库限制，使用安装已授权的范围。`app_read_only` 将安装已授权限收窄到可用只读权限，`app_current_repository_only` 只选当前目标仓库；两者独立，不能扩大安装授权，不再要求固定七项 read。收窄只作用于 Worker，不改变程序端身份或权限。Worker 选择 host/PAT 时不能启用 App 收窄选项。两端选择同一 App 无需重复填写参数；Runner 始终使用安装已授权的完整权限和仓库范围，与 Worker 的收窄 token 分别获取及续签，不串用凭据。权限不足时明确失败，不自动修改安装授权。
 
 旧独立 App 元数据用 `settings configure --migrate-github-app` 显式迁移：保留 App 来源，采用新默认权限与仓库范围，显式新配置优先，不覆盖其他设置。写入原子化，失败保留有效数据；`settings show` 只报告迁移状态，不写文件、不签发 token。成功后统一配置是新运行的唯一来源。旧文件和私钥保留，避免删除活动执行器引用的材料。旧 `auth app` 命令已移除，统一使用 settings。
 
 每次 Invocation 的 App 短期 token 写入隔离的 `GH_CONFIG_DIR/hosts.yml`，续签原子替换文件。同一 Agent 正常继承环境的后续原生 gh 子进程读取更新值，不通过命令代理、不依靠启动时一次性 token 环境注入。临时失败有界重试，有效旧 token 可继续使用；不可恢复失效进入 Execution Failure，保留进度，修复同一身份与引用后公开 `resume`。停止、失败和取消回收续签线程、签名子进程与临时凭据目录。
 
-个人配置迁移不修改旧活动 Run 的授权。缺少新身份或范围绑定、无法安全恢复的 Run 明确报告不兼容并保留数据；不能根据新默认补齐。程序端 App 选择尚未实现。工具替身测试仅验证上述传递与生命周期逻辑，不代表真实 gh 兼容性已验证。
+Runner App 复用相同的签发与续签实现，后续 Controller、Publisher GitHub 请求及远端 Git 调用取得当前有效 token。程序端 PAT/App 使用任务级 HTTPS 认证，不回退宿主 SSH、token 或 Git credential helper，不修改全局登录或 Git 配置。尚未建立 Run 时失败返回启动诊断；已有 Run 的不可恢复凭据故障保留进度与 Execution Failure，修复固定引用后显式 `resume`。
+
+发布者核验区分个人用户与 App bot 操作身份；App 通过签名请求读取自身元数据、核对 App ID，再使用其 `<slug>[bot]` 作者身份。评论、事件和写入意图仍绑定发布者，恢复时核对固定身份与远端事实；更换私钥或续签 token 不授权更换 App 来源。写入结果未知时先对账，不盲目重放，不认领外部操作，也不取消准确 head、验收与正式批准门禁。
+
+个人配置迁移不修改旧活动 Run 的授权。缺少新身份或范围绑定、无法安全恢复的 Run 明确报告不兼容并保留数据；不能根据新默认补齐。工具替身测试仅验证上述传递与生命周期逻辑，不代表真实 gh 兼容性已验证。
 
 ## 轮数
 

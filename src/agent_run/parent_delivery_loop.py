@@ -465,12 +465,19 @@ class ParentDeliveryLoop:
             }]
             self._save(state)
             return False
+
+        def record_close_intent(intent: dict[str, Any]) -> None:
+            job["parent_close_intent"] = intent
+            self._save(state)
+
         self.github.close_parent_issue(
             parent_number=int(_mapping(state, "parent")["number"]),
             run_id=str(state["run_id"]),
             pr_number=int(job["pr_number"]),
             integrated_sha=integrated,
             delivery_type="Parent-only",
+            close_intent=job.get("parent_close_intent"),
+            record_intent=record_close_intent,
         )
         job["phase"] = "completed"
         state["status"] = "completed"

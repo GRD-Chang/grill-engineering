@@ -19,6 +19,7 @@ from agent_run.cli_messages import cli_message, personal_language, error_message
 from agent_run.messages import selected_language, text
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
+from agent_run.runner_credentials import validate_runner_auth
 from agent_run.runner_identity import bind_runner_identity, frozen_runner_identity
 from agent_run.github_identity import (
     GitHubIdentityError,
@@ -348,6 +349,8 @@ def _main_with_parser(
     parser: argparse.ArgumentParser, arguments: Sequence[str] | None = None
 ) -> int:
     with ExitStack() as resources:
+        from agent_run.runner_credentials import runner_credential_scope
+        resources.enter_context(runner_credential_scope())
         return _main_with_parser_resources(parser, arguments, resources)
 
 
@@ -443,8 +446,8 @@ def _main_with_parser_resources(
             initial_runner_identity = resolve_runner_identity(
                 UserDefaultsStore().load().get("github"), identity_overrides(parsed),
             )
-            if initial_runner_identity["source"] == "pat":
-                validate_worker_auth(initial_runner_identity)
+            if initial_runner_identity["source"] in {"pat", "app"}:
+                validate_runner_auth(initial_runner_identity)
         git = open_workspace(
             parsed.repo, parsed.github_fixture, create=parsed.command == "run",
             runner_identity=initial_runner_identity,
@@ -2121,8 +2124,8 @@ def _run_lifecycle(
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
                 payload["runner_github_identity"] = dict(git.runner_identity or {"source": "host"})
-                if payload["runner_github_identity"]["source"] == "pat":
-                    validate_worker_auth(payload["runner_github_identity"])
+                if payload["runner_github_identity"]["source"] in {"pat", "app"}:
+                    validate_runner_auth(payload["runner_github_identity"])
                     # Authentication alone does not grant target-repository access.
                     # Report startup access errors before admitting an Executor.
                     github.repository()
@@ -2372,22 +2375,29 @@ def _run_lifecycle(
     )
 
     def select_run(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
-        if git.runner_identity and git.runner_identity["source"] == "pat":
-            try:
-                validate_worker_auth(git.runner_identity)
-            except GitHubIdentityError as error:
-                if current is None:
-                    raise
-                failed_run_id = str(current["run_id"])
-                controller.record_execution_failure(
-                    failed_run_id, str(error), runner_credential_failure=True,
-                )
-                failed = states.load_current_run(failed_run_id)
-                if failed is None:
-                    raise
-                prepare_action_application_receipt(failed, action)
-                states.save_run(failed_run_id, failed)
-                return failed, True
+        try:
+            return select_run_with_credentials(action)
+        except GitHubIdentityError as error:
+            # Applying approve/resume can dispatch remote operations before
+            # DeliveryExecutor.execute owns failure recording. A renewal that
+            # expires here must preserve the same Run and mutation intent.
+            if current is None:
+                raise
+            failed_run_id = str(current["run_id"])
+            if not controller.record_execution_failure(
+                failed_run_id, str(error), runner_credential_failure=True,
+            ):
+                raise
+            failed = states.load_current_run(failed_run_id)
+            if failed is None:
+                raise
+            prepare_action_application_receipt(failed, action)
+            states.save_run(failed_run_id, failed)
+            return failed, True
+
+    def select_run_with_credentials(action: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        if git.runner_identity and git.runner_identity["source"] in {"pat", "app"}:
+            validate_runner_auth(git.runner_identity)
         if action_kind == "resume":
             action_payload = action.get("payload")
             if not isinstance(action_payload, Mapping):
@@ -2718,7 +2728,8 @@ def _run_payload_for_existing_action(
     if isinstance(runner_identity, dict):
         selected_runner = resolve_runner_identity(
             {"runner_source": runner_identity["source"],
-             **({"pat": runner_identity["pat"]} if "pat" in runner_identity else {})},
+             **({"pat": runner_identity["pat"]} if "pat" in runner_identity else {}),
+             **({"app": runner_identity["app_profile"]} if "app_profile" in runner_identity else {})},
             identity_overrides(parsed),
         )
         if selected_runner != runner_identity:

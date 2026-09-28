@@ -238,3 +238,149 @@ def test_runner_initial_fetch_failure_does_not_create_run(
         controller.start_or_resume_unfinished(1)
     assert received == [identity]
     assert not list((states.root / "runs").glob("*.json"))
+
+
+@pytest.mark.parametrize("failure_mode", ["initial", "renewal"])
+def test_public_runner_app_failure_repaired_reference_and_resume(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str,
+) -> None:
+    """Real CLI restarts protect frozen App binding and durable approval recovery."""
+    import subprocess
+
+    monkeypatch.chdir(git_repo)
+    key = tmp_path / "app-key"
+    key.write_text("first")
+    capture = tmp_path / "app-calls.jsonl"
+    driver = tmp_path / "app-cli.py"
+    driver.write_text('''import json, os, sys, time, threading
+from pathlib import Path
+from types import SimpleNamespace
+from agent_run import cli, github_auth, runner_credentials
+from agent_run.credential_lifecycle import ReadCredential
+from agent_run.github_fixture import FixtureGitHubPublisher
+from agent_run.runner_transport import runner_environment
+renewal_failed = threading.Event()
+expired = threading.Event()
+class Provider:
+    def __init__(self, profile, *, read_only=False, repository=None):
+        self.profile, self.read_only, self.repository = profile, read_only, repository
+    def __call__(self):
+        try:
+            token = self.profile.private_key_path.read_text().strip()
+        except OSError:
+            renewal_failed.set()
+            raise github_auth.GitHubCredentialError("key unavailable", retryable=False) from None
+        if token not in ("first", "repaired"):
+            raise github_auth.GitHubCredentialError("invalid key")
+        with Path(os.environ["APP_CAPTURE"]).open("a") as stream:
+            stream.write(json.dumps({"token": token, "read_only": self.read_only,
+                                     "repository": self.repository}) + "\\n")
+        return ReadCredential("test-app-" + token, time.time() + 3600)
+    def cancel(self):
+        expired.set()
+github_auth._GitHubAppCredentialProvider = Provider
+runner_credentials._GitHubAppCredentialProvider = Provider
+original_merge = FixtureGitHubPublisher.normal_merge
+def merge(self, **arguments):
+    if os.environ.get("APP_EXPIRE_DURING_MERGE"):
+        # Exercise the real credential consumer at the remote-write boundary.
+        # The existing fixture retains all remote facts and merge behavior.
+        assert runner_environment(self.git.runner_identity)["GH_TOKEN"].startswith("test-app-")
+        credentials = runner_credentials._scope.get()
+        assert credentials and len(credentials) == 1
+        credential = next(iter(credentials.values()))
+        current = credential.lifecycle._credential
+        assert current is not None
+        now = [current.expires_at - 200]
+        credential.lifecycle._clock = lambda: now[0]
+        runner_credentials.time = SimpleNamespace(time=lambda: now[0])
+        Path(self.git.runner_identity["app_profile"]["private_key_path"]).unlink()
+        expired.clear()
+        credential.lifecycle.wake()
+        assert renewal_failed.wait(2), "renewal did not attempt the failed reference"
+        now[0] = current.expires_at + 1
+        credential.lifecycle.wake()
+        assert expired.wait(2), "expired credential was not cancelled"
+        Path(os.environ["APP_EXPIRY_PROOF"]).write_text("renewal failed and expired")
+        runner_environment(self.git.runner_identity)
+        raise AssertionError("expired Runner credential unexpectedly remained usable")
+    return original_merge(self, **arguments)
+FixtureGitHubPublisher.normal_merge = merge
+raise SystemExit(cli.main(sys.argv[1:]))
+''')
+    fixture = write_fixture(git_repo / "github.json", issues={})
+    agents = _parent_only_agents(git_repo / "agents.json")
+    assert settings("configure", "--runner-github-source", "app", "--worker-github-source", "app",
+                    "--github-app-id", "123", "--github-installation-id", "456",
+                    "--github-private-key-path", str(key), "--github-app-read-only",
+                    "--github-app-current-repository-only")[0] == 0
+    environment = dict(os.environ, APP_CAPTURE=str(capture), GH_TOKEN="host-must-not-be-used",
+                       PYTHONPATH=str(Path(__file__).parents[1] / "src"))
+
+    def call(*arguments: str):
+        result = subprocess.run([sys.executable, str(driver), *arguments,
+                                 "--github-fixture", str(fixture), "--json"], cwd=git_repo,
+                                env=environment, capture_output=True, text=True, timeout=30)
+        assert "host-must-not-be-used" not in result.stdout + result.stderr
+        assert "test-app-" not in result.stdout + result.stderr
+        return result
+
+    started = call("run", "1", "--agent-fixture", str(agents))
+    assert started.returncode == 0, started.stdout + started.stderr
+    original = load_only_run_state(git_repo)
+    assert original["status"] == "parent_approval_pending"
+    run_id = original["run_id"]
+    identity = original["runner_github_identity"]
+    assert identity["source"] == "app"
+    assert identity["app_read_only"] is False
+    assert identity["app_current_repository_only"] is False
+    assert original["github_identity"]["app_read_only"] is True
+    assert original["github_identity"]["app_current_repository_only"] is True
+    assert original["github_identity"]["app_profile"] == identity["app_profile"]
+    assert settings("show", "--run", run_id)[1]["github"]["runner"] == identity
+    # Changed personal defaults must not switch the active Run to host.
+    assert settings("configure", "--runner-github-source", "host")[0] == 0
+    if failure_mode == "initial":
+        key.unlink()
+    else:
+        environment["APP_EXPIRE_DURING_MERGE"] = "1"
+        environment["APP_EXPIRY_PROOF"] = str(tmp_path / "expired-proof")
+    failed = call("approve", run_id)
+    environment.pop("APP_EXPIRE_DURING_MERGE", None)
+    if failure_mode == "renewal":
+        assert (tmp_path / "expired-proof").read_text() == "renewal failed and expired"
+    assert failed.returncode == 2, failed.stdout + failed.stderr
+    state = load_only_run_state(git_repo)
+    assert state["status"] == "execution_failed", failed.stdout + failed.stderr
+    failed_grant = state["parent_job"].get("approval_grant")
+    if failure_mode == "renewal":
+        assert failed_grant and failed_grant["head_sha"] == original["parent_job"]["publication_sha"]
+        assert "runner_credential_renewal_failed" in state["diagnostics"][0]["message"]
+        assert json.loads(fixture.read_text())["delivery"]["pull_requests"][0]["state"] == "OPEN"
+    assert state["runner_github_identity"] == identity
+    assert state["parent_job"]["candidate_sha"] == original["parent_job"]["candidate_sha"]
+    assert stdout_json(call("status", run_id))["status"] == "execution_failed"
+    key.write_text("repaired")
+    resumed = call("resume", run_id)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    state = load_only_run_state(git_repo)
+    assert state["runner_github_identity"] == identity
+    assert state["parent_job"]["review_budget"] == original["parent_job"]["review_budget"]
+    assert state["parent_job"]["candidate_sha"] == original["parent_job"]["candidate_sha"]
+    if failure_mode == "initial":
+        assert state["status"] == "parent_approval_pending"
+        approved = call("approve", run_id)
+        assert approved.returncode == 0, approved.stdout + approved.stderr
+        assert stdout_json(approved)["status"] == "completed"
+    else:
+        # Approval committed before expiry; resume reuses that exact grant.
+        assert state["status"] == "completed", resumed.stdout + resumed.stderr
+        assert state["parent_job"]["approval_grant"] == failed_grant
+    delivery = json.loads(fixture.read_text())["delivery"]
+    assert len(delivery["pull_requests"]) == 1
+    assert delivery["pull_requests"][0]["state"] == "MERGED"
+    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert {entry["token"] for entry in calls} == {"first", "repaired"}
+    assert {(entry["read_only"], entry["repository"]) for entry in calls} == {
+        (False, None), (True, original["repository"]),
+    }

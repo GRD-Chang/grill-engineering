@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Any, Callable
 
+from agent_run.runner_credentials import runner_credential_scope
+
 from agent_run.agents import AgentBackend
 from agent_run.change_delivery import ensure_change_branch_authority
 from agent_run.ci_recovery_budget import new_ci_recovery_budget
@@ -91,13 +93,14 @@ class TicketDeliveryEngine:
         def advance(number: int) -> None:
             scoped = TicketDevelopmentState(self.states, run_id, number)
             try:
-                TicketDeliveryEngine(
-                    git=self.git,
-                    states=scoped,  # type: ignore[arg-type]
-                    github=self.github,
-                    agents=self.agents,
-                    development_only=True,
-                ).deliver(run_id)
+                with runner_credential_scope():
+                    TicketDeliveryEngine(
+                        git=self.git,
+                        states=scoped,  # type: ignore[arg-type]
+                        github=self.github,
+                        agents=self.agents,
+                        development_only=True,
+                    ).deliver(run_id)
             except (TaskControlBusyError, TicketGraphDriftError, IncompatibleRunStateError):
                 raise
             except Exception as error:

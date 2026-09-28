@@ -15,13 +15,28 @@ from agent_run.github_retry import run_read_command, run_write_command
 from agent_run.runner_transport import runner_git_environment
 
 
-def test_pat_delivery_transports_and_lost_delete_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("source", ["pat", "app"])
+def test_selected_delivery_transports_and_lost_delete_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
 ) -> None:
     """Real subprocess boundaries cover API reads/writes and Git cleanup recovery."""
     token_file = tmp_path / "pat"
     token_file.write_text("selected-pat")
     identity = {"source": "pat", "pat": {"file": str(token_file)}}
+    if source == "app":
+        from agent_run.credential_lifecycle import ReadCredential
+        from agent_run.github_identity import resolve_runner_identity
+        import time
+        class Provider:
+            def __init__(self, profile):
+                self.profile = profile
+            def __call__(self):
+                return ReadCredential(token_file.read_text(), time.time() + 3600)
+            def cancel(self):
+                pass
+        monkeypatch.setattr("agent_run.runner_credentials._GitHubAppCredentialProvider", Provider)
+        identity = resolve_runner_identity({"runner_source": "app", "app": {
+            "app_id": "123", "installation_id": "456", "private_key_path": str(token_file)}})
     log = tmp_path / "calls.jsonl"
     state = tmp_path / "remote-head"
     state.write_text("a" * 40)
@@ -137,8 +152,9 @@ def test_transport_redacts_failed_and_timed_out_output(
     assert "[REDACTED]" in result.stdout
 
 
-def test_pat_initial_clone_uses_https_without_host_login(
-    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("source", ["pat", "app"])
+def test_selected_initial_clone_uses_https_without_host_login(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
 ) -> None:
     import shutil
 
@@ -163,7 +179,13 @@ subprocess.run([{real_git!r}, "config", "remote.origin.url", sys.argv[-2]], cwd=
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("RUNNER_PAT", "clone-pat")
     workspace = ManagedWorkspace.for_repository("example/project")
-    git = workspace.ensure(runner_identity={"source": "pat", "pat": {"env": "RUNNER_PAT"}})
+    identity = {"source": "pat", "pat": {"env": "RUNNER_PAT"}}
+    if source == "app":
+        from agent_run.github_identity import resolve_runner_identity
+        identity = resolve_runner_identity({"runner_source": "app", "app": {
+            "app_id": "123", "installation_id": "456", "private_key_path": str(tmp_path / "key")}})
+        monkeypatch.setattr("agent_run.runner_credentials.runner_app_token", lambda _identity: "clone-pat")
+    git = workspace.ensure(runner_identity=identity)
     assert git.root == workspace.repository_root
     call = json.loads(calls.read_text())
     assert call["args"][-2] == "https://github.com/example/project.git"

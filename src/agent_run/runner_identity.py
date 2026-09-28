@@ -21,7 +21,7 @@ def frozen_runner_identity(state: Mapping[str, Any]) -> dict[str, Any]:
     if "runner_github_identity" not in state:
         raise IncompatibleRunStateError(error_message("identity.run_missing"))
     identity = validate_identity_snapshot(state["runner_github_identity"])
-    if identity["source"] not in {"host", "pat"}:
+    if identity["source"] == "app" and (identity["app_read_only"] or identity["app_current_repository_only"]):
         raise IncompatibleRunStateError(error_message("identity.run_missing"))
     return identity
 
@@ -78,7 +78,8 @@ def bind_runner_identity(
     if parsed.command == "run" and (current is not None or pending is not None):
         selected = resolve_runner_identity(
             {"runner_source": identity["source"],
-             **({"pat": identity["pat"]} if "pat" in identity else {})},
+             **({"pat": identity["pat"]} if "pat" in identity else {}),
+             **({"app": identity["app_profile"]} if "app_profile" in identity else {})},
             identity_overrides(parsed),
         )
         if selected != identity:

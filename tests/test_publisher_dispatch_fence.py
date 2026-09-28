@@ -57,6 +57,12 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
     remote = {"state": "OPEN", "comments": []}
 
     def read(command, **kwargs):
+        if command[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps({"login": "publisher"}), "")
+        if command[:2] == ["gh", "api"] and command[2].endswith("events"):
+            events = ([{"id": 1, "event": "closed", "actor": {"login": "publisher"},
+                        "created_at": "2026-09-28T10:00:01Z"}] if remote["state"] == "CLOSED" else [])
+            return subprocess.CompletedProcess(command, 0, json.dumps([events]), "")
         assert command[:3] == ["gh", "issue", "view"]
         return subprocess.CompletedProcess(command, 0, json.dumps(remote), "")
 
@@ -66,7 +72,8 @@ def test_parent_comment_in_flight_cannot_dispatch_close_after_revocation(
         if operation == "comment":
             entered.set()
             assert release.wait(5), "test did not release the in-flight comment"
-            remote["comments"].append({"body": command[command.index("--body") + 1]})
+            remote["comments"].append({"body": command[command.index("--body") + 1],
+                                       "author": {"login": "publisher"}, "createdAt": "2026-09-28T10:00:00Z"})
         else:
             assert operation == "close"
             remote["state"] = "CLOSED"

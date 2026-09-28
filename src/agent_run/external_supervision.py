@@ -28,6 +28,7 @@ _PROVEN_GITHUB_STATE_CONTRADICTIONS = frozenset(
         "github_invalid_response",
         "change_pr_identity_mismatch",
         "change_pr_head_drift",
+        "parent_close_external_conflict",
     }
 )
 

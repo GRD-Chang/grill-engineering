@@ -613,12 +613,19 @@ class RunPublicationApproval(RunPublicationShared):
         integrated_sha = publication.get("integrated_sha")
         if not isinstance(integrated_sha, str) or not integrated_sha:
             raise ValueError("merged final Run is missing its integrated SHA")
+
+        def record_close_intent(intent: dict[str, Any]) -> None:
+            publication["parent_close_intent"] = intent
+            self._save(state)
+
         self.github.close_parent_issue(
             parent_number=int(self._mapping(state, "parent")["number"]),
             run_id=str(state["run_id"]),
             pr_number=self._integer(publication, "pr_number"),
             integrated_sha=integrated_sha,
             delivery_type="Final Run",
+            close_intent=publication.get("parent_close_intent"),
+            record_intent=record_close_intent,
         )
         publication["parent_closed"] = True
         state.update({"status": "completed", "terminal_kind": "merged", "diagnostics": []})

@@ -102,6 +102,8 @@ class GitHubPublisher(Protocol):
         pr_number: int,
         integrated_sha: str,
         delivery_type: str,
+        close_intent: dict[str, Any] | None = None,
+        record_intent: Callable[[dict[str, Any]], None] | None = None,
     ) -> None: ...
 
     def abandon_run_pr(self, pr_number: int) -> None: ...

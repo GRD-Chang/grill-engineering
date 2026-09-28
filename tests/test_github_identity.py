@@ -13,7 +13,7 @@ from support.user_defaults import settings
 
 
 @pytest.mark.parametrize('config', [
-    {'worker_source': 'invalid'}, {'runner_source': 'app'}, {'runner_source': None}, {'pat': {}}, {'pat': {'env': 'X', 'file': '/x'}},
+    {'worker_source': 'invalid'}, {'runner_source': 'invalid'}, {'runner_source': None}, {'pat': {}}, {'pat': {'env': 'X', 'file': '/x'}},
     {'pat': {'env': 'not-valid'}}, {'pat': {'file': 'relative'}},
     {'worker_source': 'host', 'read_only': True}, {'pat': {'token': 'secret'}},
     {'app_read_only': 'true'}, {'app_current_repository_only': 1},

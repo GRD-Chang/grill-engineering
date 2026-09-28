@@ -209,9 +209,9 @@ class Controller:
         resumed = existing is not None
         if existing is None:
             runner_identity = self.creation_runner_github_identity or self.publisher.git.runner_identity
-            if runner_identity and runner_identity.get("source") == "pat":
-                # A successful /user probe does not prove repository access.
-                # Do not invent a recoverable Run for failed PAT initialization.
+            if runner_identity and runner_identity.get("source") in {"pat", "app"}:
+                # Credential authentication does not prove repository access.
+                # Do not invent a recoverable Run for failed PAT/App initialization.
                 raise error
             provisional = Repository(
                 name_with_owner=repository_hint,
@@ -562,7 +562,8 @@ class Controller:
             return state, True
         if validate_resume_state is not None:
             validation_state = state
-            if resuming_operator_stop or resuming_supervision_timeout:
+            if (resuming_operator_stop or resuming_supervision_timeout
+                    or resume_pause["status"] == "execution_failed"):
                 # These pauses were consumed above by this authorized action.
                 # Recheck refreshed work identities against the original pause,
                 # without mistaking our own consumption for external drift.
@@ -1587,8 +1588,8 @@ class Controller:
                 delivery_policy=self._policy_for_new_run(),
             )
             runner_identity = state["runner_github_identity"]
-            if runner_identity["source"] == "pat":
-                # PAT initialization must succeed before publishing a Run.
+            if runner_identity["source"] in {"pat", "app"}:
+                # Explicit identity initialization must succeed before publishing a Run.
                 state["base"]["sha"] = self.publisher.resolve_base(
                     repository.default_branch, repository.default_head_sha,
                 )

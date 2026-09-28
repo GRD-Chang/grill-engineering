@@ -183,15 +183,10 @@ class _GitHubAppCredentialProvider:
             )
 
 
-def mint_installation_credential(
-    profile: GitHubAppProfile,
-    *,
-    read_only: bool = False,
-    repository: str | None = None,
-    process_registry: _SigningProcessRegistry | None = None,
-) -> ReadCredential:
+def _app_headers(
+    profile: GitHubAppProfile, process_registry: _SigningProcessRegistry | None,
+) -> dict[str, str]:
     app_id = profile.app_id
-    installation_id = profile.installation_id
     try:
         validated = GitHubAppProfileStore._validate_values(
             profile.app_id, profile.installation_id, str(profile.private_key_path),
@@ -218,13 +213,24 @@ def mint_installation_credential(
         )
     if process_registry is not None and process_registry.is_cancelled():
         raise GitHubCredentialError("GitHub App credential provider is closed")
-    headers = {
+    return {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {app_jwt}",
         "Content-Type": "application/json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "agent-run",
     }
+
+
+def mint_installation_credential(
+    profile: GitHubAppProfile,
+    *,
+    read_only: bool = False,
+    repository: str | None = None,
+    process_registry: _SigningProcessRegistry | None = None,
+) -> ReadCredential:
+    installation_id = profile.installation_id
+    headers = _app_headers(profile, process_registry)
     endpoint = f"https://api.github.com/app/installations/{installation_id}"
     payload: dict[str, object] = {}
     requested_permissions: dict[str, str] | None = None
@@ -281,6 +287,28 @@ def mint_installation_credential(
     if expiry <= time.time():
         raise GitHubCredentialError("GitHub token response has an expired token")
     return ReadCredential(token=token, expires_at=expiry)
+
+
+def resolve_app_login(profile: GitHubAppProfile) -> str:
+    """Resolve the authenticated App bot without using the personal /user API.
+
+    GET /app requires the App JWT. The returned ID must match the fixed
+    definition; an installation ID is not a bot user ID.
+    """
+    registry = _SigningProcessRegistry()
+    try:
+        app = _request_json(urllib.request.Request(
+            "https://api.github.com/app", headers=_app_headers(profile, registry),
+        ), registry)
+        slug = app.get("slug")
+        if (type(app.get("id")) is not int or app["id"] != int(profile.app_id)
+                or not isinstance(slug, str) or not slug
+                or any(not (character.isascii() and (character.isalnum() or character == "-"))
+                       for character in slug)):
+            raise GitHubCredentialError("Authenticated GitHub App identity is invalid")
+        return f"{slug}[bot]"
+    finally:
+        registry.cancel()
 
 
 def _request_json(request: urllib.request.Request, registry: _SigningProcessRegistry | None) -> dict[str, Any]:

@@ -711,6 +711,8 @@ class FixtureGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
         delivery_type: str,
+        close_intent: dict[str, Any] | None = None,
+        record_intent: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         parent = _mutable_mapping(self.data, "parent")
         if _integer(parent, "number") != parent_number:

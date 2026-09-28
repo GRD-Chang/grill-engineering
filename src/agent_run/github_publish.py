@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -410,91 +411,27 @@ class GhGitHubPublisher:
         )
 
     def close_parent_issue(
-        self,
-        *,
-        parent_number: int,
-        run_id: str,
-        pr_number: int,
-        integrated_sha: str,
-        delivery_type: str,
+        self, *, parent_number: int, run_id: str, pr_number: int,
+        integrated_sha: str, delivery_type: str,
+        close_intent: dict[str, Any] | None = None,
+        record_intent: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(parent_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
+        from agent_run.parent_close import close_parent
+
+        def write(operation: str, body: str | None) -> None:
+            arguments = ["issue", operation, str(parent_number), "--repo", self.repository]
+            if body is not None:
+                arguments.extend(["--body", body])
+            self._require(*arguments)
+
+        close_parent(
+            parent_number=parent_number, run_id=run_id, pr_number=pr_number,
+            integrated_sha=integrated_sha, delivery_type=delivery_type,
+            actor=self._publisher_login(),
+            read_issue=lambda: self._issue_with_comments(parent_number),
+            read_events=lambda: self._ticket_transitions(parent_number), write=write,
+            close_intent=close_intent, record_intent=record_intent,
         )
-        marker = f"<!-- agent-run:{run_id}:parent-completed -->"
-        body = (
-            f"{marker}\nDelivery Run `{run_id}` completed this Parent Issue "
-            f"in {delivery_type} PR #{pr_number}; merge commit `{integrated_sha}` "
-            "is verified on the default branch."
-        )
-        comments = issue.get("comments")
-        marker_comments = (
-            [
-                _mapping(comment)
-                for comment in comments
-                if marker in str(_mapping(comment).get("body", ""))
-            ]
-            if isinstance(comments, list)
-            else []
-        )
-        if marker_comments and not any(
-            comment.get("body") == body for comment in marker_comments
-        ):
-            raise GitHubReadError(
-                "github_write_outcome_unknown",
-                "Parent Issue completion marker body does not match the intent",
-            )
-        already_recorded = bool(marker_comments)
-        if not already_recorded:
-            self._require(
-                "issue",
-                "comment",
-                str(parent_number),
-                "--repo",
-                self.repository,
-                "--body",
-                body,
-            )
-        if issue.get("state") != "CLOSED":
-            self._require(
-                "issue",
-                "close",
-                str(parent_number),
-                "--repo",
-                self.repository,
-            )
-        observed = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(parent_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
-        observed_comments = observed.get("comments")
-        if (
-            observed.get("state") != "CLOSED"
-            or not isinstance(observed_comments, list)
-            or not any(
-                _mapping(comment).get("body") == body
-                for comment in observed_comments
-            )
-        ):
-            raise GitHubReadError(
-                "github_write_outcome_unknown",
-                "Parent Issue close remote readback did not match the intent",
-            )
 
     def abandon_run_pr(self, pr_number: int) -> None:
         live = self.live_pull_request(pr_number)
@@ -1251,7 +1188,10 @@ class GhGitHubPublisher:
     ) -> None:
         """Apply one marker-owned comment and prove its exact remote body."""
 
+        publisher_login = self._publisher_login()
         comments = self._marker_comments(pr_number)
+        comments = [comment for comment in comments
+                    if _mapping(comment.get("user", {})).get("login") == publisher_login]
         existing = next(
             (comment for comment in comments if marker in str(comment.get("body", ""))),
             None,
@@ -1275,7 +1215,9 @@ class GhGitHubPublisher:
                 f"body={body}",
             )
         if not any(
-            comment.get("body") == body for comment in self._marker_comments(pr_number)
+            comment.get("body") == body
+            and _mapping(comment.get("user", {})).get("login") == publisher_login
+            for comment in self._marker_comments(pr_number)
         ):
             raise GitHubReadError(
                 "github_write_outcome_unknown",
@@ -1315,10 +1257,7 @@ class GhGitHubPublisher:
             "--slurp",
         )
         events = _flatten_pages(events, "events")
-        viewer = self._json("api", "user")
-        viewer_login = _mapping(viewer).get("login")
-        if not isinstance(viewer_login, str) or not viewer_login:
-            return False
+        viewer_login = self._publisher_login()
         if not self.has_supersession_close_intent(pr_number, generation, close_nonce):
             return False
         lifecycle_events = [
@@ -1347,10 +1286,7 @@ class GhGitHubPublisher:
             "--paginate",
             "--slurp",
         )
-        viewer = self._json("api", "user")
-        viewer_login = _mapping(viewer).get("login")
-        if not isinstance(viewer_login, str):
-            return False
+        viewer_login = self._publisher_login()
         comments = _flatten_pages(comments, "comments")
         return any(
             _supersession_status_matches(
@@ -1371,10 +1307,7 @@ class GhGitHubPublisher:
             "--paginate",
             "--slurp",
         )
-        viewer = self._json("api", "user")
-        viewer_login = _mapping(viewer).get("login")
-        if not isinstance(viewer_login, str):
-            return False
+        viewer_login = self._publisher_login()
         comments = _flatten_pages(comments, "comments")
         record = (
             f"{_AGENT_RUN_STATUS_MARKER}\n"
@@ -1451,17 +1384,7 @@ class GhGitHubPublisher:
         pr_number: int,
         integrated_sha: str,
     ) -> dict[str, Any] | None:
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:completed -->"
         intent_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         close_intent = (
@@ -1519,17 +1442,7 @@ class GhGitHubPublisher:
                 body,
             )
         if issue.get("state") != "CLOSED":
-            intent_issue = _mapping(
-                self._json(
-                    "issue",
-                    "view",
-                    str(ticket_number),
-                    "--repo",
-                    self.repository,
-                    "--json",
-                    "state,comments,updatedAt",
-                )
-            )
+            intent_issue = self._issue_with_comments(ticket_number)
             intent = self._publisher_close_intent(
                 intent_issue,
                 close_intent,
@@ -1587,6 +1500,12 @@ class GhGitHubPublisher:
         )
         if prepared is None:
             return prepared
+        if ((self.git.runner_identity or {}).get("source") == "app"
+                and prepared.get("actor") != self._publisher_login()):
+            raise GitHubReadError(
+                "ticket_close_external_conflict",
+                "prepared Ticket close belongs to a different Publisher identity",
+            )
         expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         if prepared.get("intent_binding") != expected_binding:
             raise GitHubReadError(
@@ -1605,17 +1524,7 @@ class GhGitHubPublisher:
                     "recorded Ticket close is no longer current",
                 )
             return ownership
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         if issue.get("state") == "CLOSED":
             ownership = self._ticket_close_ownership(
                 ticket_number=ticket_number,
@@ -1698,17 +1607,7 @@ class GhGitHubPublisher:
         recorded_ownership: dict[str, Any] | None,
         require_recovery_currentness: bool = False,
     ) -> dict[str, Any] | None:
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         transitions = self._ticket_transitions(ticket_number)
         if not transitions:
             if (
@@ -1976,7 +1875,37 @@ class GhGitHubPublisher:
             "intent_binding": intent_binding,
         }
 
+    def _issue_with_comments(self, number: int) -> dict[str, Any]:
+        app = (self.git.runner_identity or {}).get("source") == "app"
+        issue = _mapping(self._json(
+            "issue", "view", str(number), "--repo", self.repository, "--json",
+            "state,updatedAt" if app else "state,comments,updatedAt",
+        ))
+        if app:
+            # GraphQL Bot.login is a bare slug and can collide with a User login.
+            # REST comments expose the unambiguous slug[bot] author also used by
+            # REST transition events. Never normalize an arbitrary bare login.
+            issue["comments"] = [
+                {"body": comment.get("body"), "author": comment.get("user"),
+                 "createdAt": comment.get("created_at")}
+                for comment in self._marker_comments(number)
+            ]
+        return issue
+
     def _publisher_login(self) -> str:
+        selected = self.git.runner_identity or {"source": "host"}
+        if selected.get("source") == "app":
+            from agent_run.github_auth import GitHubCredentialError, resolve_app_login
+            from agent_run.github_auth_profile import GitHubAppProfile
+
+            profile = selected["app_profile"]
+            try:
+                return resolve_app_login(GitHubAppProfile(
+                    profile["app_id"], profile["installation_id"],
+                    Path(profile["private_key_path"]),
+                ))
+            except GitHubCredentialError as error:
+                raise GitHubReadError("github_auth_failed", str(error)) from None
         identity = _mapping(self._json("api", "user"))
         login = identity.get("login")
         if not isinstance(login, str) or not login:
@@ -1994,23 +1923,19 @@ class GhGitHubPublisher:
         integrated_sha: str,
         expected_ownership: dict[str, Any],
     ) -> bool:
+        if ((self.git.runner_identity or {}).get("source") == "app"
+                and expected_ownership.get("actor") != self._publisher_login()):
+            raise GitHubReadError(
+                "ticket_close_external_conflict",
+                "prepared Ticket close belongs to a different Publisher identity",
+            )
         expected_binding = f"pr-{pr_number}:sha-{integrated_sha}"
         if expected_ownership.get("intent_binding") != expected_binding:
             raise GitHubReadError(
                 "ticket_close_reconciliation_pending",
                 "recorded Ticket close belongs to a different PR generation",
             )
-        issue = _mapping(
-            self._json(
-                "issue",
-                "view",
-                str(ticket_number),
-                "--repo",
-                self.repository,
-                "--json",
-                "state,comments,updatedAt",
-            )
-        )
+        issue = self._issue_with_comments(ticket_number)
         marker = f"<!-- agent-run:{run_id}:ticket-{ticket_number}:abandoned -->"
         comments = issue.get("comments")
         publisher_login = expected_ownership.get("actor")

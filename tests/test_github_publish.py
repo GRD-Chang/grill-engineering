@@ -238,6 +238,7 @@ def test_supersession_status_scan_flattens_comment_pages(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     calls: list[tuple[str, ...]] = []
     recorded: dict[str, object] | None = None
 
@@ -253,7 +254,7 @@ def test_supersession_status_scan_flattens_comment_pages(
                     comments.append(recorded)
                 return [comments, []]
             body_argument = next(value for value in arguments if value.startswith("body="))
-            recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
+            recorded = {"id": 10, "body": body_argument.removeprefix("body="), "user": {"login": "agent-run-bot"}}
             return recorded
         return {"id": 10}
 
@@ -276,6 +277,7 @@ def test_marker_comment_requires_exact_remote_readback(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     reads = 0
 
     def fake_json(*arguments: str, **_kwargs: object) -> object:
@@ -298,6 +300,7 @@ def test_marker_comment_lost_response_is_reconciled_without_second_write(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     recorded: dict[str, object] | None = None
     writes = 0
 
@@ -307,7 +310,7 @@ def test_marker_comment_lost_response_is_reconciled_without_second_write(
             return [[recorded] if recorded is not None else []]
         writes += 1
         body_argument = next(value for value in arguments if value.startswith("body="))
-        recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
+        recorded = {"id": 10, "body": body_argument.removeprefix("body="), "user": {"login": "agent-run-bot"}}
         raise OSError("lost response after comment write")
 
     monkeypatch.setattr(publisher, "_json", fake_json)
@@ -329,8 +332,9 @@ def test_agent_run_status_lost_response_is_reconciled_without_second_write(
     existing_body: str | None,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     recorded: dict[str, object] | None = (
-        {"id": 10, "body": existing_body} if existing_body is not None else None
+        {"id": 10, "body": existing_body, "user": {"login": "agent-run-bot"}} if existing_body is not None else None
     )
     writes = 0
     mutations: list[tuple[str, ...]] = []
@@ -342,7 +346,7 @@ def test_agent_run_status_lost_response_is_reconciled_without_second_write(
         writes += 1
         mutations.append(arguments)
         body_argument = next(value for value in arguments if value.startswith("body="))
-        recorded = {"id": 10, "body": body_argument.removeprefix("body=")}
+        recorded = {"id": 10, "body": body_argument.removeprefix("body="), "user": {"login": "agent-run-bot"}}
         raise OSError("lost response after status write")
 
     monkeypatch.setattr(publisher, "_json", fake_json)
@@ -445,14 +449,18 @@ def test_close_parent_issue_passes_repository_to_gh(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     calls: list[tuple[str, ...]] = []
     closed = False
     comment_body: str | None = None
 
     def fake_json(*_arguments: str) -> object:
+        if _arguments[0] == "api":
+            return [[{"id": 1, "event": "closed", "actor": {"login": "agent-run-bot"},
+                      "created_at": "2026-09-28T10:00:01Z"}]] if closed else [[]]
         return {
             "state": "CLOSED" if closed else "OPEN",
-            "comments": ([{"body": comment_body}] if comment_body is not None else []),
+            "comments": ([{"body": comment_body, "createdAt": "2026-09-28T10:00:00Z", "author": {"login": "agent-run-bot"}}] if comment_body is not None else []),
         }
 
     def fake_require(*arguments: str) -> None:
@@ -481,6 +489,7 @@ def test_close_parent_issue_rejects_a_drifted_completion_marker(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     monkeypatch.setattr(
         publisher,
         "_json",
@@ -488,6 +497,7 @@ def test_close_parent_issue_rejects_a_drifted_completion_marker(
             "state": "CLOSED",
             "comments": [
                 {
+                    "author": {"login": "agent-run-bot"},
                     "body": (
                         "<!-- agent-run:run-1:parent-completed -->\n"
                         "completion for a different merge"
@@ -2334,6 +2344,7 @@ def test_agent_run_status_comment_is_updated_in_place(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
+    monkeypatch.setattr(publisher, "_publisher_login", lambda: "agent-run-bot")
     comments: list[dict[str, object]] = []
 
     def fake_json(*arguments: str) -> object:
@@ -2347,7 +2358,7 @@ def test_agent_run_status_comment_is_updated_in_place(
         if "PATCH" in arguments:
             comments[0]["body"] = body
         else:
-            comments.append({"id": 9, "body": body})
+            comments.append({"id": 9, "body": body, "user": {"login": "agent-run-bot"}})
         return {"id": 9}
 
     monkeypatch.setattr(publisher, "_json", fake_json)

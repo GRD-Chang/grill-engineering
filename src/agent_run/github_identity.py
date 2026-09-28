@@ -31,7 +31,7 @@ def normalize_github_config(raw: object) -> dict[str, Any]:
     result = dict(raw)
     if "worker_source" in result and result["worker_source"] not in ("host", "pat", "app"):
         raise _error("source")
-    if "runner_source" in result and result["runner_source"] not in ("host", "pat"):
+    if "runner_source" in result and result["runner_source"] not in ("host", "pat", "app"):
         raise _error("runner_source")
     if "pat" in result:
         reference = result["pat"]
@@ -100,12 +100,17 @@ def resolve_runner_identity(
     defaults: Mapping[str, Any] | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Freeze the independent Runner selection using the shared PAT reference."""
+    """Freeze Runner selection; Worker restrictions do not narrow Runner access."""
     config = normalize_github_config({**normalize_github_config(defaults or {}),
                                       **normalize_github_config(overrides or {})})
     source = config.get("runner_source", "host")
     if source == "host":
         return {"source": "host"}
+    if source == "app":
+        if "app" not in config:
+            raise _error("app_missing")
+        return {"source": "app", "app_profile": config["app"],
+                "app_read_only": False, "app_current_repository_only": False}
     if "pat" not in config:
         raise _error("reference")
     return {"source": "pat", "pat": config["pat"]}
@@ -202,7 +207,7 @@ def validate_worker_auth(
 def add_identity_options(parser: argparse.ArgumentParser, language: str) -> None:
     parser.add_argument("--worker-github-source", choices=("host", "pat", "app"),
                         help=text("identity.source_help", language=language))
-    parser.add_argument("--runner-github-source", choices=("host", "pat"),
+    parser.add_argument("--runner-github-source", choices=("host", "pat", "app"),
                         help=text("identity.runner_source_help", language=language))
     for option in ("app-id", "installation-id", "private-key-path"):
         parser.add_argument(f"--github-{option}", help=text("identity.app_help", language=language))
