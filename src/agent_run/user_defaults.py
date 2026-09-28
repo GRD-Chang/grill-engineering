@@ -21,6 +21,9 @@ from agent_run.delivery_policy import (
     normalize_policy_overrides,
     resolve_delivery_policy,
 )
+from agent_run.github_identity import (
+    GitHubIdentityError, describe_identity, normalize_github_config, resolve_worker_identity,
+)
 from agent_run.paths import app_config_root
 from agent_run.messages import DEFAULT_LANGUAGE, ErrorMessage, error_message, text, validate_language
 
@@ -97,7 +100,7 @@ def _notifications(raw: object) -> dict[str, Any]:
 def _document(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise UserDefaultsError(error_message("defaults.document_object"))
-    unknown = set(raw) - {"policy", "profile", "notifications", "language"}
+    unknown = set(raw) - {"policy", "profile", "notifications", "language", "github"}
     if unknown:
         raise UserDefaultsError(error_message("defaults.document_unknown", keys=sorted(unknown)))
     result: dict[str, Any] = {}
@@ -115,6 +118,11 @@ def _document(raw: object) -> dict[str, Any]:
             raise UserDefaultsError(error_message("defaults.policy_error", reason=reason)) from error
     if "profile" in raw:
         result["profile"] = _profile(raw["profile"])
+    if "github" in raw:
+        try:
+            result["github"] = normalize_github_config(raw["github"])
+        except GitHubIdentityError as error:
+            raise UserDefaultsError(error.args[0]) from error
     if "notifications" in raw:
         result["notifications"] = raw["notifications"]
     return result
@@ -195,6 +203,7 @@ class UserDefaultsStore:
             "defaults": document,
             "policy": policy, "policy_sources": policy_sources,
             "profile": resolved, "profile_sources": sources,
+            "github": describe_identity(resolve_worker_identity(document.get("github")), self.language(document)),
             "notifications": notification_snapshot(document.get("notifications")),
             "language": self.language(document),
             "language_source": source if "language" in document else "builtin",
@@ -210,9 +219,12 @@ class UserDefaultsStore:
     def configure(self, *, policy: Mapping[str, Any] | None = None,
                   profile: Mapping[str, Any] | None = None,
                   notifications: Mapping[str, Any] | None = None,
+                  github: Mapping[str, Any] | None = None,
                   language: str | None = None) -> dict[str, Any]:
         supplied = _document({**({"policy": policy} if policy is not None else {}),
                               **({"profile": profile} if profile is not None else {})})
+        if github:
+            supplied["github"] = normalize_github_config(github)
         if language is not None:
             try:
                 supplied["language"] = validate_language(language)
@@ -247,9 +259,12 @@ class UserDefaultsStore:
                     if not isinstance(prior_notifications, Mapping):
                         prior_notifications = {}
                     merged["notifications"] = _notifications({**prior_notifications, **supplied["notifications"]})
+                if "github" in supplied:
+                    merged["github"] = {**current.get("github", {}), **supplied["github"]}
+                    resolve_worker_identity(merged["github"])
                 merged = _document(merged)
-                self._write(merged)
                 result = self._describe(merged, "user-defaults")
+                self._write(merged)
                 result["result"] = "configured"
                 result["changed"] = supplied
                 return result

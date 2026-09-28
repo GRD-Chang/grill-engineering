@@ -37,4 +37,6 @@ v0.1 的公开安装入口是取得 Git 仓库源码，并在用户选择的 tag
 
 用户首次安装与后续重建都需要一份源码目录，并对自己选择的 Git revision 或本地修改负责。执行所选源码的安装器与 build backend 等同于授予该源码当前用户级代码执行权限；“只修改受管位置”的承诺只约束符合本项目合同的源码，不构成对不受信 fork 的 sandbox。项目只维护一个源码树和一套 Runner 版本；README 必须把 release tag 安装作为稳定使用路径，把 branch/fork 安装明确为开发者选择。安装器只管理自己的 XDG 安装目录、Active Runner 入口和唯一边界标记的 PATH 受管配置；同名非受管入口不覆盖、不备份，卸载时发现入口已被替换则保留用户内容并报告 operational error。宿主依赖缺失时返回准确错误，由用户自行安装，可选 `agent-run doctor` 只提供诊断。管理动作不协调已经运行的生命周期进程，因此清理或卸载旧 Snapshot 后不保证旧进程继续可用。
 
-本 ADR 明确修订 ADR 0001 的 Worker GitHub 凭据来源子决策：临时 adapter、绑定当前 Repository identity 的固定只读请求、凭据不进入 Worker 与 Publisher 唯一 Mutation Authority 的边界保持不变；写请求、认证请求和其他仓库请求必须在宿主执行前拒绝。默认 provider 改为宿主已登录的 `gh`，只有操作者显式配置时才使用专用只读 GitHub App。App profile 存在但损坏、私钥不可读、签名或权限校验失败时必须有界失败，不得静默回退；App 模式继续使用短期 installation token 的有界续签与过期读取重试。GitHub 读取身份与源码安装互不耦合。
+当前 Worker 身份支持 host/PAT 原生 `gh`，统一由个人 `user-defaults.json` 和 `settings show/configure` 选择；无配置默认 host，显式选择优先于既有 App 默认。PAT 只保存环境变量名或文件路径引用，二选一，缺失、空值或不可读明确失败，不回退宿主身份。新 Run 固定非秘密来源与引用，单次覆盖不改变个人默认；恢复从同一引用取得更新值，个人默认变化不改变已有 Run。查询不签发 token、不显示秘密值。Runner 程序端本阶段继续使用 host。
+
+尚未迁移的 App 保持原来源、独立 App 元数据配置、当前仓库固定只读 adapter 和短期 installation token 续签；profile 损坏、私钥不可读或签发校验失败仍有界失败，不静默回退。此路径仅为后续迁移前的过渡，不是长期可选代理模式，也不删除活动执行器所需材料。host/PAT 不采用 App 的收窄规则，不通过本地 allowlist 伪装成只读；不适用的收窄配置明确诊断。GitHub 凭据授权不替代角色职责、权威 Git 保护、Controller 正式批准与 Publisher 发布权威。GitHub 身份与源码安装互不耦合。

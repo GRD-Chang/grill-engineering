@@ -23,22 +23,22 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 ## Language
 
 **Codex Worker（Codex 工作器）**:
-在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。它不持有 GitHub 写凭证，也不具备外部交付状态的变更权限。
+在隔离工作区内进行规划、代码编辑、验证或审查，并返回结构化 Artifact 的智能执行者。其 GitHub 能力由所选凭据决定；拥有写能力不授予正式发布、自我批准或完成交付的职责。
 _Avoid_: GitHub Bot、Publisher、Mutation Authority
 
 **Worker GitHub Identity（Worker GitHub 身份）**:
-目标设计术语，尚未实现；当前凭据边界仍按 Codex Worker 与 Worker GitHub Read Broker 的定义执行。
+当前支持 host/PAT 原生 `gh`；无配置默认 host，显式选择优先，既有 App 保留过渡代理与续签。新 Run 固定非秘密来源与 PAT 引用，恢复从同一引用读取新值，不随个人默认改变。
 操作者选择供 Worker 访问 GitHub 的身份，确定该身份在 GitHub 上获授的能力。该授权与 Worker 的角色职责、Runner 的交付授权分别定义，不因拥有 GitHub 写权限就取得 Runner 的发布或完成权威。
 _Avoid_: Publisher、Mutation Authority
 
 **Runner GitHub Identity（程序端 GitHub 身份）**:
-目标设计术语，尚未实现独立来源选择。
-Controller 与 Publisher 执行程序端 GitHub 读取、正式发布及远端 Git 操作所使用的身份。它与 Worker GitHub Identity 分别选择，可以共享凭据来源，但不因 Worker 的只读限制而自动改变程序端授权，也不替代交付批准。
+当前固定使用 host；PAT/App 的程序端来源选择尚未实现。
+Controller 与 Publisher 执行程序端 GitHub 读取、正式发布及远端 Git 操作所使用的身份。它与 Worker GitHub Identity 的职责分开；Worker 的选择不改变程序端 host 身份，也不替代交付批准。选择 Worker host 时双方可能使用同一宿主身份。
 _Avoid_: Publication Agent、独立 Publisher 账号、Mutation Authority
 
 **Worker GitHub Read Broker（Worker GitHub 只读代理）**:
-Codex Worker 通过普通命令形态的受控只读 `gh` 入口提交绑定当前 Repository identity 的固定 GitHub 读取请求；Worker 不需要知道入口背后的凭据代理机制。Controller 默认使用宿主已登录的 `gh` 凭据执行；写请求、认证请求和其他仓库请求在宿主执行前拒绝。需要独立最小权限身份的操作者可以通过一次性 CLI 配置改用专用只读 GitHub App。App profile 一旦存在就明确选择 App provider；配置损坏、私钥不可读、签名或权限校验失败时有界失败，不得静默回退到宿主 `gh`。该持久配置只记录 App ID、Installation ID 与仓库外私钥文件的路径，私钥内容不复制，短期 installation token 不落盘；App 模式保留 token 到期前续签、短暂失败有界重试和过期读取重试。无论凭据来源如何，Worker 都不获得 token、App 私钥或 Publisher 写凭据，Controller 对每次读取设置有界超时并在 Worker 结束时清理仍在执行的读取进程。
-_Avoid_: 要求 Worker 理解 adapter、socket、PATH 或挂载细节、强制配置 GitHub App、每次导出环境变量、持久化 installation token、复制 App 私钥、向 Worker 暴露宿主凭据、允许任意 GitHub 请求、无限重试
+仅供尚未迁移的 GitHub App 来源使用的过渡机制：临时 `gh` adapter 将当前仓库固定只读请求交给 Controller，App 私钥及 installation token 不进入 Worker。现有签发、续签、有界重试与进程清理继续有效；配置或认证故障不回退 host。host/PAT 不使用此代理、不挂载替换 `gh`、不经过本地命令 allowlist。它不是长期可选代理模式。
+_Avoid_: 将 App 过渡约束描述为全部 Worker 的能力、静默切换来源、向 Worker 注入 App 私钥、无限重试
 
 **Agent Artifact（Agent 产物）**:
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
@@ -177,7 +177,7 @@ mutation 则是 Human Blocker。
 _Avoid_: Agent 判断是否 stale、Thread 连续性、自动 rebase
 
 **Execution Guard（执行约束）**:
-Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用真实 Git CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。Worker 的 `gh` 是临时 adapter：只把固定的只读 GitHub 请求交给 Controller，token 不进入 Worker；这是一条凭据边界，不是对 Worker 其他命令或网络的 allowlist。Execution Guard 还通过只读权威 Git metadata 和不向 Worker 注入 Publisher 写凭据保留 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回不含 URL 或凭据的固定错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
+Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用真实 Git CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。host/PAT Worker 使用原生 `gh`，GitHub 能力由凭据决定；App 暂保留只读代理与续签。Execution Guard 通过只读权威 Git metadata、Runner 控制状态保护和不主动注入独立程序端秘密保留正式 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回固定脱敏错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:
@@ -727,7 +727,7 @@ Controller 或 Publisher 在一次 Publication Attempt 内对 GitHub 读取收�
 _Avoid_: Publication Attempt、Output Repair、无界 GitHub 重试
 
 **Agent Run User Defaults（个人运行默认配置）**:
-用户创建新 Delivery Run 时采用的统一运行偏好，包括开发与审查轮数、角色调用时限、模型与推理强度、Publication 配置引用，统一保存在个人 `user-defaults.json`，由 `settings show/configure` 读写；Development Thread Policy 同样由该入口配置。修改这些默认值不改变已有 Run 或其未来预算窗口。它不同于显式调整某次 Run 的实际配置，也不拥有账号凭据、项目质量规则、运行状态或内部轮询与重试机制。
+用户创建新 Delivery Run 时采用的统一运行偏好，包括开发与审查轮数、角色调用时限、模型与推理强度、Publication 配置引用，以及 Worker GitHub 来源和非秘密 PAT 引用，统一保存在个人 `user-defaults.json`，由 `settings show/configure` 读写；Development Thread Policy 同样由该入口配置。修改这些默认值不改变已有 Run 或其未来预算窗口。它不同于显式调整某次 Run 的实际配置，也不保存凭据秘密值、项目质量规则、运行状态或内部轮询与重试机制。
 _Avoid_: Codex 用户全局配置、活动 Run 快照、项目共享默认、认证配置合并文件
 
 **Agent Execution Profile（Agent 执行配置）**:

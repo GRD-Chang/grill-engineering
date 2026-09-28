@@ -1105,10 +1105,12 @@ def test_public_operator_docs_describe_the_v01_quickstart() -> None:
         for required in (
             "./setup.sh", "./install.sh", "agent-run doctor --json",
             "--rollback", "--uninstall", "Linux", "gh auth login",
-            "agent-run auth status", "codex login status",
+            "gh auth status", "agent-run settings show", "settings show/configure",
+            "host", "PAT", "codex login status",
         ):
             assert required in install
-        assert "](agent-run.md#github-只读身份)" in install
+        assert "](agent-run.md#github-身份)" in install
+        assert "](user-defaults.md)" in install
         assert "](agent-run.md#权限边界)" in install
 
 

@@ -17,7 +17,6 @@ from agent_run.github_auth_profile import (
 )
 import agent_run.worker_credentials as worker_credentials
 from agent_run.worker_credentials import (
-    HostGitHubReadChannel,
     ReadCredential,
     WorkerCredentialChannel,
     WorkerCredentialError,
@@ -650,7 +649,7 @@ def test_worker_environment_rejects_external_host_and_hides_authorized_override(
     assert "GH_HOST" not in environment
 
 
-def test_host_gh_channel_runs_one_allowlisted_read_without_token_retry(
+def test_app_gh_channel_runs_one_allowlisted_read(
     tmp_path: Path,
 ) -> None:
     calls = tmp_path / "calls"
@@ -663,7 +662,9 @@ def test_host_gh_channel_runs_one_allowlisted_read_without_token_retry(
         encoding="utf-8",
     )
     executable.chmod(0o700)
-    channel = HostGitHubReadChannel(gh_executable=str(executable))
+    channel = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", 9999999999), gh_executable=str(executable)
+    )
     try:
         result = channel._request(  # noqa: SLF001 - broker request seam
             {"kind": "run", "arguments": ["issue", "view", "3"]}
@@ -675,33 +676,13 @@ def test_host_gh_channel_runs_one_allowlisted_read_without_token_retry(
     assert calls.read_text(encoding="utf-8") == "issue view 3"
 
 
-def test_host_gh_channel_bounds_and_redacts_command_failures(tmp_path: Path) -> None:
-    executable = tmp_path / "gh"
-    executable.write_text(
-        "#!/bin/sh\n"
-        "echo 'not logged in token=ghp_1234567890abcdef' >&2\n"
-        "exit 4\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o700)
-    channel = HostGitHubReadChannel(gh_executable=str(executable))
-    try:
-        result = channel._request(  # noqa: SLF001 - broker request seam
-            {"kind": "run", "arguments": ["repo", "view"]}
-        )
-    finally:
-        channel.close()
-
-    assert result["returncode"] == 4
-    assert "not logged in" in result["stderr"]
-    assert "ghp_1234567890abcdef" not in result["stderr"]
-
-
-def test_host_gh_channel_rejects_mutation_before_starting_gh(tmp_path: Path) -> None:
+def test_app_gh_channel_rejects_mutation_before_starting_gh(tmp_path: Path) -> None:
     executable = tmp_path / "gh"
     executable.write_text("#!/bin/sh\ntouch invoked\n", encoding="utf-8")
     executable.chmod(0o700)
-    channel = HostGitHubReadChannel(gh_executable=str(executable))
+    channel = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", 9999999999), gh_executable=str(executable)
+    )
     try:
         with pytest.raises(WorkerCredentialError, match="only permits read commands"):
             channel._request(  # noqa: SLF001 - broker request seam
@@ -712,7 +693,7 @@ def test_host_gh_channel_rejects_mutation_before_starting_gh(tmp_path: Path) -> 
     assert not (tmp_path / "invoked").exists()
 
 
-def test_host_gh_channel_rejects_other_repository_before_starting_gh(
+def test_app_gh_channel_rejects_other_repository_before_starting_gh(
     tmp_path: Path,
 ) -> None:
     invoked = tmp_path / "invoked"
@@ -723,7 +704,8 @@ def test_host_gh_channel_rejects_other_repository_before_starting_gh(
         encoding="utf-8",
     )
     executable.chmod(0o700)
-    channel = HostGitHubReadChannel(
+    channel = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", 9999999999),
         gh_executable=str(executable), repository="owner/repository"
     )
     try:
@@ -738,32 +720,6 @@ def test_host_gh_channel_rejects_other_repository_before_starting_gh(
                         "other-owner/other-repository",
                     ],
                 }
-            )
-    finally:
-        channel.close()
-    assert not invoked.exists()
-
-
-def test_host_gh_channel_rejects_external_host_before_starting_gh(
-    tmp_path: Path,
-) -> None:
-    invoked = tmp_path / "invoked"
-    executable = tmp_path / "gh"
-    executable.write_text(
-        "#!/bin/sh\n"
-        f"touch {invoked}\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o700)
-    channel = HostGitHubReadChannel(
-        gh_executable=str(executable),
-        gh_environment={"GH_HOST": "outside.example"},
-        repository="owner/repository",
-    )
-    try:
-        with pytest.raises(WorkerCredentialError, match="host is not authorized"):
-            channel._request(  # noqa: SLF001 - broker request seam
-                {"kind": "run", "arguments": ["issue", "view", "3"]}
             )
     finally:
         channel.close()
@@ -805,7 +761,7 @@ def test_app_gh_channel_rejects_external_host_before_minting_or_starting_gh(
     assert not invoked.exists()
 
 
-def test_host_gh_channel_keeps_serving_after_oversize_response(
+def test_app_gh_channel_keeps_serving_after_oversize_response(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(worker_credentials, "MAX_CHANNEL_MESSAGE_BYTES", 1024)
@@ -825,7 +781,9 @@ def test_host_gh_channel_keeps_serving_after_oversize_response(
     )
     executable.chmod(0o700)
     socket_path = tmp_path / "channel.sock"
-    channel = HostGitHubReadChannel(gh_executable=str(executable))
+    channel = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", 9999999999), gh_executable=str(executable)
+    )
     channel.start(socket_path)
 
     def request() -> dict[str, object]:

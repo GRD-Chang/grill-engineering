@@ -225,6 +225,10 @@ def test_settings_human_output_and_complete_example(tmp_path: Path, monkeypatch:
             from agent_run.development_prompts import development_prompt
             assert payload["task_issue_url"] in development_prompt(payload)
             continue
+        if "github" in payload:
+            described = UserDefaultsStore().describe(payload)
+            assert described["github"]["worker"]["source"] == payload["github"]["worker_source"]
+            continue
         independent = UserDefaultsStore().describe({"profile": payload})
         assert independent["profile"]["profiles"]["publication"]["reference"] is None
 

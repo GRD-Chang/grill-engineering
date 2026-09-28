@@ -85,13 +85,14 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 
 ### GitHub 认证：默认无需配置 App
 
-默认使用本机已登录的 `gh`。发布操作需要该账号能推送代码、创建和合并 PR、更新 Issue；
-Worker 的 GitHub 请求由程序限制为只读，不向 Worker 提供发布凭据。
-已有有效登录直接复用，缺失时用 `gh auth login` 登录，再核对目标仓库权限。
+程序端目前使用本机已登录的 `gh` 读取、克隆和发布，该身份须有交付所需权限。Worker 无配置时默认 host，可在 `settings show/configure` 选择 host 或 PAT 引用；显式选择优先于已有 App 配置。
 
-只有需要为 Worker 单独配置只读身份时，才配置 GitHub App；App 不替代发布操作所需的宿主 gh 登录。
-先用 `agent-run auth status` 查看当前身份来源。已有 App 配置时会使用 App，配置损坏不会自动回退到 gh。
-App 所需只读权限和配置命令见[GitHub App 配置](agent-run.md#github-只读身份)及[权限边界](agent-run.md#权限边界)。
+宿主尚未登录时，由操作者执行 `gh auth login`，再用 `gh auth status` 核对登录状态。为 Worker 选择 PAT 不替代程序端所需的宿主认证。
+
+host/PAT Worker 使用原生 `gh`，不经过本地命令白名单，GitHub 能力由凭据决定。角色仍不得自行正式发布或自我批准，Controller 批准和 Publisher 职责保持不变。PAT 只引用一个环境变量名或文件路径，秘密值不进入 Run 快照。Run 固定来源与引用，修改默认值不影响已有 Run；凭据故障后修复同一引用，再显式 resume，不回退 host。
+
+既有 App 在过渡期保留当前只读代理与续签。本阶段尚未实现 App 原生接入及程序端 PAT/App 选择。配置见 [GitHub 身份](agent-run.md#github-身份)和[个人运行配置](user-defaults.md)；查询不签发凭据、不显示秘密值。
+凭据能力与交付职责的区别见[权限边界](agent-run.md#权限边界)。
 
 执行 `agent-run doctor --json` 和 `agent-run settings show`，核对环境及所选模型、推理强度和运行额度。
 配置调整见[个人运行配置](user-defaults.md)；模型实际可调用性由执行验证。

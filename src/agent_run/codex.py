@@ -8,6 +8,7 @@ import re
 import threading
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,9 +38,13 @@ from agent_run.publication_prompts import (
     publication_prompt,
 )
 from agent_run.reviewer_prompts import review_continuation_prompt, review_prompt
+from agent_run.github_identity import (
+    GitHubIdentityError, native_github_environment, validate_worker_auth,
+)
 from agent_run.github_auth import _GitHubAppCredentialProvider
 from agent_run.github import _repository_hint_from_origin
 from agent_run.github_auth_profile import (
+    GitHubAppProfile,
     GitHubAppProfileStore,
     load_github_app_profile,
 )
@@ -55,10 +60,10 @@ from agent_run.worker_sandbox import (
     run_worker_process,
     _worker_gh_targets,
     worker_credential_environment,
+    native_worker_environment,
 )
 from agent_run.worker_credentials import (
     CredentialProvider,
-    HostGitHubReadChannel,
     InitialCredentialUnavailable,
     WorkerCredentialChannel,
     WorkerCredentialError,
@@ -106,7 +111,7 @@ _MAX_FINAL_OUTPUT_BYTES = 1024 * 1024
 
 
 class CodexCliBackend:
-    """Runs untrusted role-scoped agents without Publisher GitHub credentials."""
+    """Run role-scoped agents with their selected Worker GitHub identity."""
 
     emits_execution_binding = True
 
@@ -115,11 +120,13 @@ class CodexCliBackend:
         executable: str = "codex",
         credential_provider: CredentialProvider | None = None,
         *,
+        worker_identity: dict[str, Any] | None = None,
         on_worker_started: Callable[[int], None] | None = None,
         on_worker_finished: Callable[[int], None] | None = None,
     ) -> None:
         self.executable = executable
         self.credential_provider = credential_provider
+        self.worker_identity = worker_identity
         self.on_worker_started = on_worker_started
         self.on_worker_finished = on_worker_finished
 
@@ -612,30 +619,49 @@ class CodexCliBackend:
             )
             try:
                 adapter_directory = temporary / "gh-adapter"
-                environment = worker_credential_environment(
-                    temporary / "gh", adapter_directory
-                )
-                gh_targets = _worker_gh_targets(environment, cwd=checkout)
-                real_gh_path = _controller_gh_target(
-                    gh_targets, checkout=checkout, temporary=temporary
-                )
-                if real_gh_path is None:
-                    raise WorkerSandboxError("gh is required for Worker GitHub reads")
-                real_gh = str(real_gh_path)
                 profile = (
                     load_github_app_profile()
-                    if self.credential_provider is None
+                    if self.credential_provider is None and self.worker_identity is None
                     else None
                 )
-                if self.credential_provider is None:
-                    repository = repository or _repository_hint_from_origin(checkout)
-                else:
-                    repository = None
-                if self.credential_provider is None and repository is None:
-                    raise WorkerSandboxError(
-                        "当前 GitHub repository identity 不可确定，已拒绝 Worker GitHub read"
+                if self.worker_identity is not None and self.worker_identity["source"] == "app":
+                    app = self.worker_identity["app_profile"]
+                    profile = GitHubAppProfile(
+                        app_id=app["app_id"], installation_id=app["installation_id"],
+                        private_key_path=Path(app["private_key_path"]),
                     )
-                hidden_paths = _worker_hidden_paths(profile, checkout=checkout)
+                app_access = self.credential_provider is not None or profile is not None
+                if app_access:
+                    environment = worker_credential_environment(
+                        temporary / "gh", adapter_directory
+                    )
+                    gh_targets = _worker_gh_targets(environment, cwd=checkout)
+                    real_gh_path = _controller_gh_target(
+                        gh_targets, checkout=checkout, temporary=temporary
+                    )
+                    if real_gh_path is None:
+                        raise WorkerSandboxError("gh is required for Worker GitHub reads")
+                    real_gh = str(real_gh_path)
+                    if self.credential_provider is None:
+                        repository = repository or _repository_hint_from_origin(checkout)
+                        if repository is None:
+                            raise WorkerSandboxError(
+                                "当前 GitHub repository identity 不可确定，已拒绝 Worker GitHub read"
+                            )
+                    else:
+                        repository = None
+                else:
+                    identity = self.worker_identity or {"source": "host"}
+                    if self.worker_identity is not None:
+                        validate_worker_auth(identity)
+                    environment = native_worker_environment(
+                        native_github_environment(identity), temporary / "gh",
+                        host=identity["source"] == "host",
+                    )
+                    gh_targets = ()
+                hidden_paths = _worker_hidden_paths(
+                    profile, checkout=checkout, hide_host_credentials=app_access
+                )
                 if repository is not None:
                     environment["GH_REPO"] = repository
                 credential_exhausted = threading.Event()
@@ -645,20 +671,14 @@ class CodexCliBackend:
                     credential_exhausted.set()
 
                 if self.credential_provider is not None:
-                    channel: HostGitHubReadChannel | WorkerCredentialChannel = WorkerCredentialChannel(
+                    channel: WorkerCredentialChannel | None = WorkerCredentialChannel(
                         self.credential_provider,
                         gh_executable=real_gh,
                         gh_environment=environment,
                         repository=repository,
                         on_exhausted=report_credential_exhausted,
                     )
-                elif profile is None:
-                    channel = HostGitHubReadChannel(
-                        gh_executable=real_gh,
-                        gh_environment=dict(os.environ),
-                        repository=repository,
-                    )
-                else:
+                elif profile is not None:
                     channel = WorkerCredentialChannel(
                         _GitHubAppCredentialProvider(profile),
                         gh_executable=real_gh,
@@ -666,9 +686,12 @@ class CodexCliBackend:
                         repository=repository,
                         on_exhausted=report_credential_exhausted,
                     )
-                with channel as credentials:
+                else:
+                    channel = None
+                with channel if channel is not None else nullcontext() as credentials:
                     try:
-                        credentials.start(temporary / "credential.sock")
+                        if credentials is not None:
+                            credentials.start(temporary / "credential.sock")
                     except WorkerCredentialError as error:
                         if _is_retryable_initial_credential_error(error):
                             raise InitialCredentialUnavailable(
@@ -676,9 +699,10 @@ class CodexCliBackend:
                                 http_status=error.http_status,
                             ) from error
                         raise
-                    create_gh_access_adapter(
-                        adapter_directory, temporary / "credential.sock", environment
-                    )
+                    if app_access:
+                        create_gh_access_adapter(
+                            adapter_directory, temporary / "credential.sock", environment
+                        )
                     arguments = bubblewrap_command(
                         codex_arguments,
                         checkout=checkout,
@@ -688,6 +712,7 @@ class CodexCliBackend:
                         hidden_paths=hidden_paths,
                         gh_adapter=adapter_directory / "gh",
                         gh_targets=gh_targets,
+                        inherit_host_auth=not app_access and identity["source"] == "host",
                     )
                     worker_timeout = timeout
                     if deadline_at_monotonic is not None:
@@ -733,9 +758,21 @@ class CodexCliBackend:
                         worker_options["on_process_started"] = worker_started
                     try:
                         result = run_worker_process(arguments, **worker_options)
+                        if not app_access and self.worker_identity is not None:
+                            # Validate the credential consumed by this invocation, not a
+                            # replacement that appeared at the reference while it ran.
+                            consumed_identity = (
+                                {"source": "pat", "pat": {"env": "GH_TOKEN"}}
+                                if identity["source"] == "pat" else identity
+                            )
+                            validate_worker_auth(consumed_identity, environment=environment)
                     finally:
                         if worker_pid is not None and self.on_worker_finished is not None:
                             self.on_worker_finished(worker_pid)
+            except GitHubIdentityError as error:
+                raise CodexProcessError(
+                    str(error), machine_error="credential_unavailable"
+                ) from error
             except InitialCredentialUnavailable:
                 raise
             except WorkerDeadlineExceeded as error:
@@ -1088,10 +1125,10 @@ def _human_blocker_output(value: str, name: str) -> tuple[str, ...] | None:
 
 
 def _worker_hidden_paths(
-    profile: object, *, checkout: Path | None = None
+    profile: object, *, checkout: Path | None = None, hide_host_credentials: bool = True
 ) -> tuple[Path, ...]:
     paths: list[Path] = []
-    for variable in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
+    for variable in (("GH_CONFIG_DIR", "XDG_CONFIG_HOME") if hide_host_credentials else ()):
         value = os.environ.get(variable)
         if value:
             paths.append(Path(value))

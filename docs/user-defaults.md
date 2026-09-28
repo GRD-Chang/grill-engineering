@@ -1,6 +1,6 @@
 # 个人运行默认配置
 
-`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度及开发会话策略。无需自定义时无需创建文件，直接使用内置默认。
+`agent-run settings` 统一查看和编辑语言、轮数、调用时限、模型、推理强度、开发会话策略及 Worker GitHub 身份。无需自定义时无需创建文件，直接使用内置默认。
 
 运行参数文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`，未设置 XDG 时为
 `~/.config/agent-run/user-defaults.json`。文件是 JSON，可只填写需要覆盖的字段；直接编辑后下一次查询或创建 Run 即生效，无需导入或同步。
@@ -16,6 +16,35 @@ agent-run settings show --run <完整Run-ID> --json
 
 查询个人默认返回文件位置、实际来源、稀疏设置、完整解析值及逐字段来源。Run 查询返回保存的策略、有效 Profile Revision 和不可变 Thread bindings，不读取个人默认，不写文件，不查询凭据。支持既有 `--repo` / `--state-dir` 定位规则。
 保存结果包含 `changed`、保存后的解析值及 `notice`：**仅影响之后创建的新 Run，已有 Run 保持原设置**。`--json` 成功输出为单个 JSON 对象；失败沿用 CLI 的结构化诊断或参数错误。
+
+## GitHub 身份
+
+`github` 与其他偏好共用同一文件。当前 Worker 支持 host/PAT 原生 `gh`；Runner 程序端继续使用 host。无显式来源且没有旧 App 配置时默认 host；显式选择优先，既有 App 保留原代理和续签过渡行为。
+
+```json
+{
+  "github": {
+    "worker_source": "pat",
+    "pat": {"env": "WORKER_GITHUB_PAT"}
+  }
+}
+```
+
+也可将 `pat` 改为 `{"file":"/secure/worker-pat"}`。环境变量名和文件路径二选一，不填写 token 本身；缺失、空值、不可读、两种引用同时出现均明确失败，不回退 host。引用可在选择 host 时保留，只有选择 PAT 时消费。host/PAT 不适用 App 收窄选项，不会被程序伪装成只读；实际 GitHub 能力由凭据授权决定。
+
+```bash
+agent-run settings configure --worker-github-source pat --github-pat-env WORKER_GITHUB_PAT
+agent-run settings configure --worker-github-source pat --github-pat-file /secure/worker-pat
+agent-run settings configure --worker-github-source host
+agent-run settings show --json
+agent-run run 330 --worker-github-source pat --github-pat-env WORKER_GITHUB_PAT
+```
+
+`run` 覆盖只作用于新 Run，不改个人默认。使用环境引用时，启动及恢复命令的环境须包含该变量，后台执行器继承所需环境。Run 固定非秘密来源和引用，秘密值不进入快照或普通输出；修改个人默认不改变已有 Run。文件引用适合在相同路径更换 token；环境引用则在恢复前重新导出同名变量。已有 Run 因凭据不可用暂停时，保留进度与诊断，修复原引用后公开 `resume`，不切换来源、不重置正式批准边界。
+
+`settings show` 的 `github.worker` 展示有效来源及引用，`github.runner.source` 当前为 `host`，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看该 Run 固定配置。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
+
+旧 `auth app` 配置在本阶段仍独立保留，尚未迁移到统一 App 定义；其代理、固定只读权限及续签只用于 App 过渡路径。原生 App 接入和程序端 PAT/App 选择不属于当前已实现能力。
 
 ## 轮数
 

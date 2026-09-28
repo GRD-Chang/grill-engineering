@@ -119,6 +119,7 @@ class Controller:
         self.delivery_policy = delivery_policy or default_delivery_policy()
         self.delivery_policy_provider = delivery_policy_provider
         self.creation_language: str | None = None
+        self.creation_github_identity: dict[str, Any] | None = None
 
     def start(
         self, parent_number: int, *, reuse_existing: bool = True
@@ -1459,9 +1460,16 @@ class Controller:
         now = _now()
         policy = delivery_policy or self.delivery_policy
         language = selected_language(self.creation_language)
+        from agent_run.github_identity import resolve_worker_identity, validate_identity_snapshot
+        from agent_run.user_defaults import UserDefaultsStore
+
+        github_identity = (validate_identity_snapshot(self.creation_github_identity)
+                           if self.creation_github_identity is not None else
+                           resolve_worker_identity(UserDefaultsStore().load().get("github")))
         state: dict[str, Any] = {
             "run_id": run_id,
             "language": language,
+            "github_identity": github_identity,
             "prompt_resources": resolve_resources(language),
             "branch_authority_protocol": 2,
             "review_budget_protocol": 1,

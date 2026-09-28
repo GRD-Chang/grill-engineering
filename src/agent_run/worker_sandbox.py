@@ -143,6 +143,29 @@ class _BoundedJsonlStream:
             self._pinned["error"] = line
 
 
+def native_worker_environment(
+    environment: dict[str, str], gh_config: Path, *, host: bool
+) -> dict[str, str]:
+    """Pass the selected native identity, without Runner control secrets."""
+    result = {
+        key: value for key, value in environment.items()
+        if not key.startswith(("AGENT_RUN_EXECUTOR_", "AGENT_RUN_INTERNAL_"))
+        and key not in {
+            "AGENT_RUN_GITHUB_APP_ID", "AGENT_RUN_GITHUB_APP_INSTALLATION_ID",
+            "AGENT_RUN_GITHUB_APP_PRIVATE_KEY", "AGENT_RUN_GITHUB_READ_PERMISSIONS",
+            "AGENT_RUN_GITHUB_READ_TOKEN", "DBUS_SESSION_BUS_ADDRESS",
+        }
+    }
+    result["PATH"] = _without_inherited_gh_adapters(result.get("PATH", os.defpath))
+    if not host:
+        for key in ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "SSH_ASKPASS"):
+            result.pop(key, None)
+        gh_config.mkdir(parents=True, exist_ok=True)
+        result["GH_CONFIG_DIR"] = str(gh_config)
+        result["GH_PROMPT_DISABLED"] = "1"
+    return result
+
+
 def worker_environment(
     gh_config: Path, github_read_token: str
 ) -> dict[str, str]:
@@ -344,6 +367,7 @@ def bubblewrap_command(
     hidden_paths: Sequence[Path] = (),
     gh_adapter: Path | None = None,
     gh_targets: Sequence[Path] = (),
+    inherit_host_auth: bool = False,
 ) -> list[str]:
     _reject_credentialed_http_remotes(checkout, environment)
     executable = shutil.which("bwrap")
@@ -382,10 +406,10 @@ def bubblewrap_command(
         arguments.extend(["--bind", str(codex_home), str(codex_home)])
     home = Path.home()
     for secret_directory in (home / ".config" / "gh", home / ".ssh"):
-        if secret_directory.exists():
+        if not inherit_host_auth and secret_directory.exists():
             arguments.extend(["--tmpfs", str(secret_directory)])
     git_credentials = home / ".git-credentials"
-    if git_credentials.exists():
+    if not inherit_host_auth and git_credentials.exists():
         arguments.extend(["--ro-bind", "/dev/null", str(git_credentials)])
     hidden = _mask_worker_paths(
         arguments,

@@ -107,10 +107,13 @@ agent-run stop <parent-issue> --ticket <ticket-number> --repo OWNER/REPO
 agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 ```
 
-### GitHub 只读身份
+### GitHub 身份
 
-没有 App profile 时，Worker GitHub Read Broker 默认使用宿主已经登录的 `gh`，不会启动登录、刷新或
-读取 `gh auth token`。需要独立最小权限身份时，一次性保存 App 元数据和仓库外私钥路径：
+Worker 的 host/PAT 选择与引用通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；显式选择优先于旧 App 配置。host/PAT 使用原生 `gh`，访问能力由凭据决定，不通过本地命令白名单限制为只读。Runner 程序端继续使用 host。
+
+#### 既有 App 过渡配置
+
+尚未迁移的 App 保留原有只读代理与续签，不静默切回 host。这只是后续迁移前的过渡，不是长期可选代理模式。现有配置入口保存 App 元数据和仓库外私钥路径：
 
 ```bash
 agent-run auth status
@@ -401,43 +404,15 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 
 ## 权限边界
 
-没有 App profile 时，Controller 在现有 allowlist 校验后直接使用宿主 `gh` 执行固定只读请求；它不调用
-`gh auth login`、`gh auth refresh` 或 `gh auth token`。存在有效 App profile 时，Controller 使用专属
-GitHub App 的 ID、installation ID 与私钥，按 worker 启动次数创建短期 installation token。创建请求只申请
-`actions: read`、`checks: read`、
-`contents: read`、`issues: read`、`metadata: read`、`pull_requests: read` 和
-`statuses: read`，且只接受 GitHub 在同一响应中返回完全一致 permissions 的 token。这些只读
-权限使独立验收可以通过 `gh pr checks` 读取 GitHub Actions 产生的远端 Checks 与 commit
-statuses，确认 Hosted CI 结果。
-不要复用 Publisher 的写 token。Controller 启动 Codex worker 时会移除 App 私钥、
-Publisher GitHub token、SSH agent 和交互式凭据入口，并要求系统安装 `bubblewrap`。每个受 Run 保存的角色调用时限约束的 Worker 通过仅在本次 invocation 存活的
-普通 `gh` 命令入口按读取请求获取宿主身份或短期 token；Worker 不需要知道该入口背后的 adapter、socket、PATH 或挂载机制。Execution Guard
-只检查 Worker PATH 与 Codex command-tool 的有效前置目录（`CODEX_INSTALL_DIR`，未设置时为 `~/.local/bin`），将其中当前存在且可执行的 `gh` 解析为去重的 canonical target，并由 bubblewrap
-在 Worker mount namespace 内把同一个 invocation-local adapter 只读绑定到这些 target。新 adapter 不再 prepend 到 PATH，只清理继承环境中失效的旧 adapter 项；
-bubblewrap 的原子挂载就是启动保障，不增加 sandbox launcher、`samefile`、私有 probe 或持久状态。它不扫描 PATH 外文件，也不拦截 shell alias/function
-或 Agent 主动取得的替代客户端；任一绑定失败都在 Codex 启动前以 `worker_gh_binding_failed` 执行失败结束。Controller 位于该 namespace 外，
-继续使用原始真实 `gh` 或专用 GitHub App；宿主 token、App 私钥和 Publisher 凭据都不进入 Worker 环境、持久 Run state、诊断或日志。adapter 只接受固定的 GitHub 读取
-请求，拒绝外部 hostname、写入参数和携带请求体的 API 调用；单次 Controller 读取有界超时，
-Worker 结束或凭据续签耗尽时会清理尚未结束的读取进程。adapter 在到期认证读取失败时仅
-续签并重试该读取一次；续签使用十分钟有界退避，耗尽后以
-`worker_credential_renewal_failed` 的可恢复诊断保留 checkout 与 Thread，供 `resume` 创建
-新 Worker。Codex 使用 YOLO 模式，可以读写宿主文件系统、联网以及
-使用真实 Git CLI 与上述受限的临时 `gh` adapter。Controller 只向 Brief 提供适用的 Parent/Ticket URL 和
-不可重建的原始失败证据；Revision、SHA、Run/Thread/Attempt 等身份只留在确定性账本中。
-Development、Publication 与 Fresh Validation Codex 使用 Git/`gh` 自行读取 diff、
-历史、Issue 和 PR 事实。
+Worker host/PAT 使用原生 `gh`，不挂载替换入口、不经过命令代理或本地 allowlist。host 复用宿主认证；PAT 使用所选引用的当前值。两者的 GitHub 能力由用户凭据决定，需要较小权限时由用户在 GitHub 收窄权限。Worker 得到选定身份需要的凭据，程序不会主动向其注入独立 Runner 秘密；host 身份可能与程序端相同。凭据秘密值不进入 Run 快照、普通输出和诊断。
 
-外层 bubblewrap 不是通用安全沙箱。它保留宿主和 checkout 的正常读写，只把权威
-literal `.git`、resolved gitdir 与 common-dir 挂载为只读，并隐藏 Publisher GitHub
-凭证、SSH agent 与交互式凭据入口。启动 Worker 前还会检查 local Git config 的全部
-remote URL 和 push URL；带 userinfo 的 HTTP(S) URL 会以固定脱敏错误拒绝，普通 HTTPS、
-SSH、scp-like 与本地 remote 保持可用，权威 config 不会被改写。这个边界用于防止可信
-Worker 误写权威历史，不承诺抵抗恶意进程、主动搜索其他宿主凭据、宿主污染或数据外泄。
-Codex 可以返回 Development Summary、Publication Artifact 或 Acceptance Artifact，
-但发布动作只能由 Publisher 执行。
+既有 App 暂保留固定只读权限、当前仓库请求代理、签发与自动续签，App 私钥及 token 不进入 Worker。该过渡路径的 adapter 绑定、到期读取重试、有界退避和清理逻辑继续有效；host/PAT 不受其命令规则限制。App 原生接入、授权默认迁移以及程序端 PAT/App 来源选择尚未在此阶段实现。
 
-普通测试使用 fake broker、fake `gh` 和本地 bubblewrap，不调用真实 Codex。真实 Codex command-tool
-compatibility acceptance 只允许显式 opt-in，不进入普通 pytest、每轮 Development 或常规 CI。
+Codex 使用 YOLO，可读写宿主文件系统、联网及使用真实 Git CLI。外层 bubblewrap 继续只读保护权威 Git metadata 和 Runner 控制状态；启动前拒绝 local Git config 中含 userinfo 的 HTTP(S) remote URL，并返回固定脱敏错误，不改写 config。这不是通用安全沙箱，不承诺防御恶意进程、主动搜索宿主凭据、宿主污染或数据外泄。
+
+GitHub 写能力不替代角色职责：开发只整理文件，审查不改交付内容，Publication Agent 只生成文案；不得自行提交、正式发布、自我批准或关闭任务。Controller 保留验收、Currentness、正式批准和完成判断，正式发布由 Publisher 程序执行。Controller 向 Agent 提供适用的需求 URL 与原始失败证据，Agent 使用 Git/gh 自行读取事实。
+
+已有 Run 的凭据故障保留进度和诊断，修复同一 PAT 引用后显式 `resume`，不隐式换来源、不归为代码 Finding。停止、失败和正常退出释放本轮临时资源。普通测试通过 gh、Codex 和服务替身验证配置、凭据传递与恢复；替身通过不代表真实外部工具兼容性已经验证。
 
 Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证；当前角色 Prompt 的
 风险相称验证、预检与只修改工作树边界优先于该通用 skill 的完整测试、Review 或 commit 建议。Development
@@ -554,11 +529,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥、Run locator、Runner 独立仓库和运行数据。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
 的同名入口会被保留并报告清理未完成。
 
-没有 App profile 时 Worker read provider 默认是 host `gh`；`agent-run auth status`、
-`agent-run auth app configure --app-id <id> --installation-id <id> --private-key /secure/app.pem` 和
-`agent-run auth app remove` 是可选的公开配置路径。status 不显示 token 或私钥，remove 不删除用户的
-私钥文件；App profile 损坏时 fail closed，不回退到 host `gh`。Worker 读取继续受固定 allowlist 与
-凭据隔离约束，Publisher 仍使用宿主写身份。
+Worker host/PAT 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app configure/remove` 入口仍维护过渡 App 配置，不删除用户私钥；App 故障不回退 host。程序端仍使用宿主身份。
 
 首版范围为 Linux、用户级 `~/.profile` 和单用户安装；尚未完成发行版、版本与架构组合的完整真实宿主验证。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、

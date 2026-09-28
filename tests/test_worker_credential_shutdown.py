@@ -9,7 +9,6 @@ import pytest
 
 import agent_run.worker_credentials as worker_credentials
 from agent_run.worker_credentials import (
-    HostGitHubReadChannel,
     ReadCredential,
     WorkerCredentialChannel,
 )
@@ -67,11 +66,9 @@ def test_close_during_retry_joins_renewal_without_another_backoff(
             renewal_thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("provider", ["host", "app"])
 def test_close_reclaims_connection_waiting_for_an_incomplete_frame(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    provider: str,
 ) -> None:
     receiving = threading.Event()
     original_receive = worker_credentials._receive_message
@@ -81,11 +78,7 @@ def test_close_reclaims_connection_waiting_for_an_incomplete_frame(
         return original_receive(connection)
 
     monkeypatch.setattr(worker_credentials, "_receive_message", receive)
-    channel = (
-        HostGitHubReadChannel()
-        if provider == "host"
-        else WorkerCredentialChannel(lambda: "reader")
-    )
+    channel = WorkerCredentialChannel(lambda: "reader")
     socket_path = tmp_path / "read.sock"
     try:
         channel.start(socket_path)

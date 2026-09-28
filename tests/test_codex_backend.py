@@ -57,7 +57,6 @@ from agent_run.worker_sandbox import (
     _BoundedJsonlStream,
 )
 from agent_run.worker_credentials import (
-    HostGitHubReadChannel,
     InitialCredentialUnavailable,
     ReadCredential,
     WorkerCredentialChannel,
@@ -3168,112 +3167,119 @@ print('{"type":"thread.started","thread_id":"credential-e2e-thread"}')
     ]
 
 
-def test_default_backend_uses_host_gh_read_broker_without_exposing_host_config(
-    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source", ["host", "pat"])
+def test_backend_native_gh_receives_identity_and_unrestricted_arguments(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
     calls = tmp_path / "gh-calls"
-    cache_marker = tmp_path / "gh-cache-marker"
-    browser_calls = tmp_path / "browser-calls"
-    browser = tmp_path / "browser"
-    browser.write_text(
-        "#!/usr/bin/env python3\n"
-        f"from pathlib import Path\nPath({str(browser_calls)!r}).write_text('invoked')\n",
-        encoding="utf-8",
-    )
-    browser.chmod(0o700)
+    host_config = tmp_path / "host-gh-config"
+    host_config.mkdir()
+    (host_config / "hosts.yml").write_text("host login")
     host_gh = tmp_path / "gh"
     host_gh.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, pathlib, subprocess, sys\n"
-        f"with pathlib.Path({str(calls)!r}).open('a', encoding='utf-8') as stream:\n"
-        "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
-        "if any(argument == '--cache' or argument.startswith('--cache=') for argument in sys.argv[1:]):\n"
-        f"    pathlib.Path({str(cache_marker)!r}).write_text('cached')\n"
-        "if '--web' in sys.argv[1:] or '-w' in sys.argv[1:]:\n"
-        "    subprocess.run([os.environ['BROWSER']], check=True)\n"
-        "if sys.argv[1:2] == ['auth']:\n"
-        "    raise SystemExit(3)\n"
-        "print('host-read')\n",
-        encoding="utf-8",
+        "import json, os, pathlib, sys\n"
+        f"with pathlib.Path({str(calls)!r}).open('a') as stream:\n"
+        "    stream.write(json.dumps({'args': sys.argv[1:], 'token': os.environ.get('GH_TOKEN'), "
+        "'config': os.environ.get('GH_CONFIG_DIR'), 'alternate': os.environ.get('GITHUB_TOKEN')}) + '\\n')\n"
     )
     host_gh.chmod(0o700)
-    host_config = tmp_path / "host-gh-config"
-    host_config.mkdir()
-    xdg_config = tmp_path / "config"
-    xdg_config.mkdir()
     worker = tmp_path / "codex-worker"
+    native_arguments = ["api", "repos/other/project/issues", "--method", "POST", "-f", "title=native"]
     worker.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, subprocess, sys\n"
-        "if 'GH_TOKEN' in os.environ or 'GH_ENTERPRISE_TOKEN' in os.environ:\n"
-        "    raise RuntimeError('Worker received a host token')\n"
-        f"if os.environ.get('GH_CONFIG_DIR') in {{{str(host_config)!r}, {str(xdg_config)!r}}}:\n"
-        "    raise RuntimeError('Worker received the host GH_CONFIG_DIR')\n"
-        "subprocess.run(['gh', 'issue', 'view', '3'], check=True)\n"
-        "subprocess.run(['gh', 'api', 'repos/example/project/issues/3'], check=True)\n"
-        f"for allowed_args in {_SEARCH_BROKER_VALID_ARGUMENTS!r}:\n"
-        "    subprocess.run(['gh', *allowed_args], check=True)\n"
-        "for rejected_args in (\n"
-        "    ['repo', 'view', '--json', 'name', 'other-owner/other-repository'],\n"
-        "    ['api', '--template', 'repos/example/project',\n"
-        "     'repos/other-owner/other-repository/issues'],\n"
-        "    ['issue', 'list', '--repo=other-owner/other-repository'],\n"
-        "    ['issue', 'list', '-R', 'other-owner/other-repository'],\n"
-        "    ['issue', 'list', '--repo', 'HOST/OWNER/REPO'],\n"
-        "    ['api', '--hostname', 'outside.example',\n"
-        "     'repos/example/project/issues'],\n"
-        "    ['api', 'repos/example/project/../../other-owner/other-repository/issues'],\n"
-        "    ['api', 'repos/example/project/%2e%2e/other-owner/other-repository/issues'],\n"
-        "    ['api', 'repos/{owner}/{repo}/../../other-owner/other-repository/issues'],\n"
-        "    ['auth', 'status'],\n"
-        "):\n"
-        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
-        "    if rejected.returncode == 0:\n"
-        "        raise RuntimeError(f'rejected request unexpectedly succeeded: {rejected_args!r}')\n"
-        f"for rejected_args in {_SEARCH_BROKER_REJECT_ARGUMENTS!r}:\n"
-        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
-        "    if rejected.returncode == 0:\n"
-        "        raise RuntimeError(f'search request unexpectedly succeeded: {rejected_args!r}')\n"
-        f"for rejected_args in {_UNSAFE_GH_READ_ARGUMENTS!r}:\n"
-        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
-        "    if rejected.returncode == 0:\n"
-        "        raise RuntimeError(f'unsafe request unexpectedly succeeded: {rejected_args!r}')\n"
-        f"for rejected_args in {_API_CACHE_ARGUMENTS!r}:\n"
-        "    rejected = subprocess.run(['gh', *rejected_args], check=False)\n"
-        "    if rejected.returncode == 0:\n"
-        "        raise RuntimeError(f'cache request unexpectedly succeeded: {rejected_args!r}')\n"
+        f"subprocess.run(['gh', *{native_arguments!r}], check=True)\n"
+        "assert not any(k.startswith('AGENT_RUN_INTERNAL_') for k in os.environ)\n"
+        f"assert ('SSH_AUTH_SOCK' in os.environ) == {source == 'host'!r}\n"
+        "assert subprocess.run(['git', 'config', '--local', 'test.worker-write', 'blocked'], capture_output=True).returncode != 0\n"
         "output = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
-        "with open(output, 'w', encoding='utf-8') as result:\n"
+        "with open(output, 'w') as result:\n"
         "    json.dump({'result_kind': 'development', 'summary': 'ok', 'human_blockers': None}, result)\n"
-        "print('{\"type\":\"thread.started\",\"thread_id\":\"host-broker-thread\"}')\n",
-        encoding="utf-8",
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'native-thread'}))\n"
     )
     worker.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
-    monkeypatch.setenv("BROWSER", str(browser))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
     monkeypatch.setenv("GH_CONFIG_DIR", str(host_config))
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.delenv("GH_ENTERPRISE_TOKEN", raising=False)
-
-    output, thread_id = CodexCliBackend(executable=str(worker))._invoke(
-        prompt="controlled host broker",
-        checkout=git_repo,
-        thread_id=None,
-        repository="example/project",
-    )
-
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "host-agent.sock"))
+    monkeypatch.setenv("GH_TOKEN", "host-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "alternate-host-token")
+    monkeypatch.setenv("WORKER_TEST_PAT", "selected-pat")
+    monkeypatch.setenv("AGENT_RUN_INTERNAL_TEST", "control-secret")
+    identity = {"source": source}
+    if source == "pat":
+        identity["pat"] = {"env": "WORKER_TEST_PAT"}
+    output, thread_id = CodexCliBackend(
+        executable=str(worker), worker_identity=identity
+    )._invoke(prompt="native identity", checkout=git_repo, thread_id=None, repository="example/project")
     assert json.loads(output)["result_kind"] == "development"
-    assert thread_id == "host-broker-thread"
-    assert calls.read_text(encoding="utf-8") == (
-        "issue view 3\napi repos/example/project/issues/3\n"
-        + "".join(
-            " ".join(arguments) + "\n"
-            for arguments in _SEARCH_BROKER_VALID_ARGUMENTS
-        )
+    assert thread_id == "native-thread"
+    call = next(
+        row for row in map(json.loads, calls.read_text().splitlines())
+        if row["args"] == native_arguments
     )
-    assert not cache_marker.exists()
-    assert not browser_calls.exists()
+    assert call["args"] == native_arguments
+    assert call["token"] == ("host-token" if source == "host" else "selected-pat")
+    if source == "host":
+        assert call["config"] == str(host_config)
+    else:
+        assert call["alternate"] is None
+        assert call["config"] != str(host_config)
+        assert not Path(call["config"]).exists(), "invocation temporary credentials must be cleaned"
+
+
+def test_native_pat_unavailable_is_execution_failure_and_reloads_same_reference(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = tmp_path / "worker-token"
+    backend = CodexCliBackend(worker_identity={"source": "pat", "pat": {"file": str(reference)}})
+    monkeypatch.setattr(codex_module, "validate_worker_auth", lambda identity, **kwargs: None)
+    received: list[str] = []
+    def run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        received.append(options["environment"]["GH_TOKEN"])
+        assert "gh-adapter" not in options["environment"]["PATH"]
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text("ok")
+        return subprocess.CompletedProcess(arguments, 0, '{"type":"thread.started","thread_id":"fixed-thread"}', "")
+    monkeypatch.setattr(codex_module, "run_worker_process", run)
+    with pytest.raises(CodexProcessError) as failure:
+        backend._invoke(prompt="test", checkout=git_repo, thread_id=None)
+    assert failure.value.machine_error == "credential_unavailable"
+    assert failure.value.recoverable
+    assert not received
+    reference.write_text("first-token")
+    backend._invoke(prompt="test", checkout=git_repo, thread_id=None)
+    reference.write_text("replacement-token")
+    backend._invoke(prompt="test", checkout=git_repo, thread_id="fixed-thread")
+    assert received == ["first-token", "replacement-token"]
+
+
+def test_native_auth_failure_after_worker_result_is_execution_failure(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = tmp_path / "worker-token"
+    reference.write_text("invocation-token")
+    identity = {"source": "pat", "pat": {"file": str(reference)}}
+    backend = CodexCliBackend(worker_identity=identity)
+    validated: list[str] = []
+    def validate(selected: dict[str, Any], environment: dict[str, str] | None = None) -> None:
+        if environment is None:
+            return
+        validated.append(codex_module.native_github_environment(selected, environment)["GH_TOKEN"])
+        raise codex_module.GitHubIdentityError("PAT authentication failed; repair the same reference and resume")
+    def run(arguments: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        # Changing the reference must not hide failure of the credential the Worker used.
+        reference.write_text("replacement-token")
+        output = Path(arguments[arguments.index("--output-last-message") + 1])
+        output.write_text('{"decision":"changes_requested","findings":["authentication failed"]}')
+        return subprocess.CompletedProcess(arguments, 0, '{"type":"thread.started","thread_id":"review-thread"}', "")
+    monkeypatch.setattr(codex_module, "validate_worker_auth", validate)
+    monkeypatch.setattr(codex_module, "run_worker_process", run)
+    with pytest.raises(CodexProcessError) as failure:
+        backend._invoke(prompt="review", checkout=git_repo, thread_id=None)
+    assert failure.value.machine_error == "credential_unavailable"
+    assert failure.value.recoverable
+    assert validated == ["invocation-token"]
 
 
 def test_public_app_auth_starts_production_broker_with_read_and_reject_paths(
@@ -3508,9 +3514,8 @@ def test_worker_credential_channel_keeps_serving_after_a_bad_framed_request(
     assert result == {"returncode": 0, "stdout": "", "stderr": ""}
 
 
-@pytest.mark.parametrize("provider", ["host", "app"])
 def test_closing_credential_channel_terminates_active_gh_read(
-    tmp_path: Path, provider: str,
+    tmp_path: Path,
 ) -> None:
     executable = tmp_path / "hanging-gh"
     process_id_path = tmp_path / "gh.pid"
@@ -3525,15 +3530,9 @@ def test_closing_credential_channel_terminates_active_gh_read(
     )
     executable.chmod(0o700)
     environment = {"GH_TEST_PID_PATH": str(process_id_path), "PATH": os.environ["PATH"]}
-    credentials = (
-        HostGitHubReadChannel(
-            gh_executable=str(executable), gh_environment=environment,
-        )
-        if provider == "host"
-        else WorkerCredentialChannel(
-            lambda: ReadCredential("reader", time.time() + 3600),
-            gh_executable=str(executable), gh_environment=environment,
-        )
+    credentials = WorkerCredentialChannel(
+        lambda: ReadCredential("reader", time.time() + 3600),
+        gh_executable=str(executable), gh_environment=environment,
     )
     worker = threading.Thread(
         target=lambda: credentials._request(  # noqa: SLF001 - lifecycle seam

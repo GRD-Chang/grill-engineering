@@ -621,3 +621,24 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
 
     store.save_run("run-1", state)
     assert store.load_run("run-1") == persisted
+
+
+@pytest.mark.parametrize("identity", [
+    {"source": "host"},
+    {"source": "pat", "pat": {"env": "CUSTOM_WORKER_PAT"}},
+    {"source": "pat", "pat": {"file": "/secure/credential"}},
+    {"source": "app", "app_profile": {"app_id": "1", "installation_id": "2",
+                                           "private_key_path": "/secure/app.pem"}},
+])
+def test_identity_reference_survives_state_redaction(tmp_path: Path, identity: dict) -> None:
+    store = StateStore(tmp_path)
+    store.save_run("identity", {"github_identity": identity,
+                               "creation_configuration": {"github_identity": identity},
+                               "extension": {"env": {"CUSTOM_WORKER_PAT": "secret"}}})
+    persisted = store.load_run("identity")
+    assert persisted["github_identity"] == identity
+    assert persisted["creation_configuration"]["github_identity"] == identity
+    assert persisted["extension"] == {}
+    with pytest.raises(ValueError):
+        store.save_run("identity", {"github_identity": {**identity, "token": "secret"}})
+    assert store.load_run("identity") == persisted

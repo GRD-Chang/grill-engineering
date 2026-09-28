@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_run.agent_profiles import AgentProfileStore, ProfileOverrides
 from agent_run.delivery_policy import policy_snapshot_for_state
+from agent_run.github_identity import add_identity_options, identity_overrides, describe_identity
 from agent_run.user_defaults import UserDefaultsStore, UserDefaultsError
 from agent_run.messages import DEFAULT_LANGUAGE, text
 
@@ -35,6 +36,7 @@ def add_parser(
     show.add_argument("--json", action="store_true", dest="as_json")
     configure = actions.add_parser("configure", help=message("configure_help"))
     configure.add_argument("--language", metavar="{zh,en}", help=message("language_help"))
+    add_identity_options(configure, language)
     policy_options(configure)
     profile_options(configure)
     notification_toggle = configure.add_mutually_exclusive_group()
@@ -69,6 +71,7 @@ def execute(
         if preset is not None:
             profile["preset"] = preset
         result = UserDefaultsStore().configure(
+            github=identity_overrides(parsed),
             policy=policy_overrides(parsed), profile=profile, language=parsed.language,
             notifications={key: value for key, value in {
                 "enabled": True if parsed.notification_mode else parsed.notifications_enabled,
@@ -90,6 +93,8 @@ def execute(
         result = {
             "result": "settings", "scope": "run", "run_id": parsed.run_id,
             "language": language,
+            "github": (describe_identity(state["github_identity"], language)
+                       if state.get("github_identity") else None),
             "policy": policy_snapshot_for_state(state),
             "notifications": state.get("notifications", {"enabled": False}),
             "profile": (

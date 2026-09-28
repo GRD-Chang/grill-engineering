@@ -753,51 +753,6 @@ class WorkerCredentialChannel(_GitHubReadChannel):
             self._on_exhausted(self._renewal_pause_message())
 
 
-class HostGitHubReadChannel(_GitHubReadChannel):
-    """Relay allowlisted reads to the host ``gh`` without exporting a token."""
-
-    _thread_name = "agent-run-worker-host-gh-channel"
-    _read_label = "host GitHub read"
-
-    def __init__(
-        self,
-        *,
-        gh_executable: str = "gh",
-        gh_environment: dict[str, str] | None = None,
-        repository: str | None = None,
-    ) -> None:
-        super().__init__(
-            gh_executable=gh_executable,
-            gh_environment=gh_environment or dict(os.environ),
-            repository=repository,
-        )
-
-    def __enter__(self) -> HostGitHubReadChannel:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-    def _run_gh(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        _validate_github_host(self._gh_environment)
-        environment = dict(self._gh_environment)
-        environment.setdefault("GH_PROMPT_DISABLED", "1")
-        if self._repository is not None:
-            environment["GH_REPO"] = self._repository
-        result = self._run_gh_once(arguments, environment)
-        if result.returncode == 0:
-            return result
-        stderr = bounded_error(result.stderr.strip())
-        if not stderr:
-            stderr = f"host GitHub read failed with exit status {result.returncode}"
-        return subprocess.CompletedProcess(
-            result.args,
-            result.returncode,
-            "",
-            stderr,
-        )
-
-
 def _coerce_credential(value: ReadCredential | str, now: float) -> ReadCredential:
     if isinstance(value, ReadCredential):
         if not value.token.strip() or value.expires_at <= now:

@@ -19,6 +19,10 @@ from agent_run.cli_messages import cli_message, personal_language, error_message
 from agent_run.messages import selected_language, text
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
+from agent_run.github_identity import (
+    add_identity_options, identity_overrides, resolve_worker_identity, validate_worker_auth,
+    validate_identity_snapshot,
+)
 from agent_run import settings_cli, prompt_cli
 from agent_run.agent_fixture import FixtureAgentBackend
 from agent_run.agent_invocation import record_session_interruption
@@ -186,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(run)
     _add_profile_options(run)
     _add_policy_options(run)
+    add_identity_options(run, language=personal_language())
     run.add_argument("--json", action="store_true", dest="as_json")
     notification_options = run.add_mutually_exclusive_group()
     notification_options.add_argument("--notification-mode", choices=("concise", "detailed"), help=cli_message('cli.notifications_help'))
@@ -2126,6 +2131,11 @@ def _run_lifecycle(
                     preset=preset, overrides=overrides, document=document,
                 )
                 payload = _run_action_payload(parsed, policy, resolved_creation)
+                payload["github_identity"] = resolve_worker_identity(
+                    document.get("github"), identity_overrides(parsed),
+                )
+                if parsed.github_fixture is None or payload["github_identity"]["source"] == "pat":
+                    validate_worker_auth(payload["github_identity"])
                 payload["language"] = defaults.language(document)
                 payload["notifications"] = notification_snapshot(
                     document.get("notifications"), disabled=parsed.no_notifications, mode=parsed.notification_mode,
@@ -2139,6 +2149,7 @@ def _run_lifecycle(
                 else:
                     policy = parse_policy_snapshot(policy_snapshot_for_state(current))
                     payload = _run_action_payload(parsed, policy, creation_profile)
+                    payload["github_identity"] = frozen_worker_identity(current)
         else:
             if current is None:  # pragma: no cover - guarded above
                 raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
@@ -2340,6 +2351,8 @@ def _run_lifecycle(
             use_current_state_once=action_kind == "resume",
             on_worker_started=worker_started,
             on_worker_finished=worker_finished,
+            worker_identity=(frozen_worker_identity(current) if current is not None
+                             else dict(payload["github_identity"])),
         )
         if resume_feedback is not None:
             driver.on_outcome = resume_feedback.progressed
@@ -2512,6 +2525,7 @@ def _run_lifecycle(
         frozen_policy = parse_policy_snapshot(run_payload.get("policy"))
         controller.delivery_policy_provider = lambda: frozen_policy
         controller.creation_language = str(run_payload.get("language", "zh"))
+        controller.creation_github_identity = validate_identity_snapshot(run_payload["github_identity"])
         def prepare_creation(state: dict[str, Any]) -> None:
             # Keep the initial configuration beside the creation receipt so a
             # lost Task Control can be reconciled without reading user defaults.
@@ -2645,6 +2659,15 @@ def _control_state_root(control_record: Mapping[str, Any] | None) -> Path | None
     return state_root.resolve() if state_root.is_absolute() else None
 
 
+def frozen_worker_identity(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the frozen binding without consulting current personal defaults."""
+    if "github_identity" not in state:
+        raise IncompatibleRunStateError(
+            error_message("identity.run_missing")
+        )
+    return validate_identity_snapshot(state["github_identity"])
+
+
 def _run_payload_for_existing_action(
     parsed: argparse.Namespace,
     existing_payload: dict[str, Any],
@@ -2662,6 +2685,17 @@ def _run_payload_for_existing_action(
     notification_payload = {"notifications": dict(notifications)} if isinstance(notifications, Mapping) else {}
     if "language" in existing_payload:
         notification_payload["language"] = existing_payload["language"]
+    identity = existing_payload.get("github_identity")
+    if isinstance(identity, dict):
+        github_options = identity_overrides(parsed)
+        if github_options:
+            selected = resolve_worker_identity(
+                {"worker_source": identity["source"], **({"pat": identity["pat"]} if "pat" in identity else {})},
+                github_options,
+            )
+            if selected != identity:
+                raise TaskControlError(error_message("identity.run_fixed"))
+        notification_payload["github_identity"] = dict(identity)
     explicit_policy = _policy_overrides(parsed)
     stored_policy = existing_payload.get("policy")
     if isinstance(stored_policy, Mapping):
@@ -2970,12 +3004,14 @@ def _run_driver(
     on_worker_started: Callable[[int], None] | None = None,
     on_worker_finished: Callable[[int], None] | None = None,
     executor_host: ExecutorHost | None = None,
+    worker_identity: dict[str, Any] | None = None,
 ) -> RunDriver:
     agents = _agent_backend(
         parsed,
         profiles,
         on_worker_started=on_worker_started,
         on_worker_finished=on_worker_finished,
+        worker_identity=worker_identity,
     )
     return RunDriver(
         operations=DirectRunOperations(
@@ -3006,12 +3042,14 @@ def _agent_backend(
     *,
     on_worker_started: Callable[[int], None] | None = None,
     on_worker_finished: Callable[[int], None] | None = None,
+    worker_identity: dict[str, Any] | None = None,
 ) -> ProfiledAgentBackend:
     fixture = getattr(parsed, "agent_fixture", None)
     backend = (
         FixtureAgentBackend(Path(fixture))
         if fixture
         else CodexCliBackend(
+            worker_identity=worker_identity,
             on_worker_started=on_worker_started,
             on_worker_finished=on_worker_finished,
         )

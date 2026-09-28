@@ -928,6 +928,11 @@ def _sanitize_error_value(
     key_kinds: dict[str, tuple[bool, bool, bool]],
     diagnostic: bool = False, path: tuple[str, ...] = ()
 ) -> object:
+    if path in {("github_identity",), ("creation_configuration", "github_identity")}:
+        # Only validated source and references belong here, never credential values.
+        from agent_run.github_identity import validate_identity_snapshot
+
+        return validate_identity_snapshot(value)
     if isinstance(value, list):
         return [
             _sanitize_error_value(

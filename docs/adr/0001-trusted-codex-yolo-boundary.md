@@ -4,9 +4,13 @@ status: accepted
 
 # Codex 使用 YOLO，外层只保护 Git 权威和 Publisher 凭据
 
-所有 Development、Repair、Fresh/Run Acceptance 与 Publication Codex 都在信任 Agent 的前提下以 YOLO 运行，可以访问宿主文件系统、联网并使用真实 Git CLI。系统不建设通用 sandbox、任务目录写入边界或 Worker 其他命令的 allowlist；唯独 Worker 的 `gh` 是临时 Controller-owned adapter，只接受固定的 GitHub 读取请求，并由 Controller 使用 ADR 0008 定义的活动凭据来源在有界时间内执行。这条窄规则保护凭据不进入 Worker，不把 YOLO 变成通用隔离。Execution Guard 还把权威 Git metadata 设为只读，确保 Publisher 写凭据不进入 Worker，并在 Worker 启动前以固定脱敏错误拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，而不改写 config。YOLO 是宿主能力边界，不扩大角色合同：Development/Repair 可编辑当前 checkout，Fresh/Run Acceptance 只可产生和清理验证产物，Publication 保持只读。我们接受它不能抵抗恶意 Agent、prompt injection 主动寻找其他宿主凭据、宿主文件污染或数据外泄，以换取真实开发和 E2E 工具不受限制，以及更小的实现和维护成本。
+所有 Development、Repair、Fresh/Run Acceptance 与 Publication Codex 都在信任 Agent 的前提下以 YOLO 运行，可以访问宿主文件系统、联网并使用真实 Git CLI。host/PAT Worker 使用原生 `gh`，不挂载替换可执行文件、不经过命令代理或本地 allowlist；GitHub 能力由操作者选择的凭据决定，需要较小权限时由操作者在 GitHub 设置凭据权限。Runner 程序端目前继续使用 host，不主动向 Worker 注入独立程序端秘密；用户选择 host 时两端身份可能相同。
 
-Worker 只感知普通命令形态的受控只读 `gh`，不承担 adapter、socket、PATH 或挂载机制的知识。PATH 不构成该入口的权威绑定：Execution Guard 只检查 Worker PATH 与 Codex command-tool 的有效前置目录（`CODEX_INSTALL_DIR`，未设置时为 `~/.local/bin`），在其中收集当前存在且可执行的 `gh`，解析并去重 canonical regular-file target，再由 bubblewrap 把同一个 invocation-local adapter 只读绑定到这些 target；任一挂载失败都发生在 Codex payload 启动前。新 adapter 不再 prepend 到 PATH，只清理继承环境中失效的旧 adapter 项；bubblewrap 的原子挂载就是启动保障，不增加 sandbox launcher、`samefile` 或私有 probe，也不增加持久状态。Controller 位于该 mount namespace 外，继续使用原始真实 `gh` 或专用 GitHub App 执行 broker 已允许的读取。该机制不扫描 PATH 外文件、不建设通用 executable replacement、不处理 shell alias/function，也不防御可信 Agent 主动复制或下载替代客户端。普通测试使用 fake/local 边界；真实 Codex command-tool compatibility acceptance 只能显式 opt-in，不进入普通 pytest 或常规 CI。
+Execution Guard 继续保护权威 Git metadata 与 Runner 控制状态，并在 Worker 启动前以固定脱敏错误拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，不改写 config。YOLO 和凭据写能力都不扩大角色职责：Development/Repair 只整理当前 checkout，不自行提交或发布；Fresh/Run Acceptance 只产生和清理验证产物，不修复交付内容；Publication 只生成文案。验收、Currentness、正式批准与完成判断属于 Controller，正式发布由 Publisher 程序执行。
+
+尚未迁移的 App 来源暂时保留 invocation-local adapter、当前仓库固定只读请求、Controller 签发与自动续签，以及 App 私钥和 installation token 不进入 Worker 的旧行为；具体凭据选择见 ADR 0008。其 `gh` 绑定及有界重试只适用于此过渡路径，不是长期可选代理模式，不能据此为 host/PAT 恢复命令限制。
+
+该设计不建设通用 sandbox，不承诺防御恶意 Agent、主动搜索宿主秘密、宿主文件污染或数据外泄。普通测试使用工具和服务替身；真实外部工具兼容性验证仍需另行执行，替身通过不代表真实工具兼容性已验证。
 
 Reviewer 的交付工作区继续保持只读。优先将运行产物放在外部目录，必要时允许使用仓库外的临时运行副本；
 副本必须对应当前实际验收内容，不获得修复源码、测试、配置或依赖声明的权限，使用后关闭进程并清理。
