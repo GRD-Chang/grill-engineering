@@ -14,7 +14,7 @@ from agent_run.artifacts import (
     parse_publication_wire_result,
 )
 from agent_run.worker_sandbox import WorkerSandboxError
-from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.credential_lifecycle import InitialCredentialUnavailable
 
 
 class FixtureAgentBackend:

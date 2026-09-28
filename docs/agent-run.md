@@ -109,24 +109,18 @@ agent-run abandon <parent-issue> [--discard-worktree] --repo OWNER/REPO
 
 ### GitHub 身份
 
-Worker 的 host/PAT 选择与引用通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；显式选择优先于旧 App 配置。host/PAT 使用原生 `gh`，访问能力由凭据决定，不通过本地命令白名单限制为只读。Runner 程序端继续使用 host。
+Worker 的 host/PAT/App 选择、凭据引用与 App 收窄选项通过 [个人运行配置](user-defaults.md) 管理。无配置默认使用宿主已登录的 `gh`；所有来源使用原生 `gh`，访问能力由所选凭据决定，不通过本地命令白名单限制。Runner 程序端继续使用 host。
 
-#### 既有 App 过渡配置
-
-尚未迁移的 App 保留原有只读代理与续签，不静默切回 host。这只是后续迁移前的过渡，不是长期可选代理模式。现有配置入口保存 App 元数据和仓库外私钥路径：
+App 元数据与其他个人设置共同保存在 `user-defaults.json`；私钥只引用文件，由程序端签发短期 token，不主动下发私钥。App 默认采用安装已授权的权限和仓库范围，只读和当前仓库是独立选项。示例：
 
 ```bash
-agent-run auth status
-agent-run auth app configure \
-  --app-id <app-id> \
-  --installation-id <installation-id> \
-  --private-key /secure/agent-run-app.pem
-agent-run auth app remove
+agent-run settings configure --worker-github-source app --github-app-id 123 --github-installation-id 456 --github-private-key-path /secure/agent-run-app.pem
+agent-run settings configure --github-app-read-only
+agent-run settings configure --migrate-github-app
+agent-run settings show
 ```
 
-配置文件位于 XDG 用户配置目录，只保存 App ID、Installation ID 和解析后的私钥绝对路径；私钥内容与
-短期 installation token 不会复制或落盘。App profile 存在但损坏或私钥不可用时会 fail closed，不会回退
-到宿主 `gh`。`auth` 命令可以从任意目录执行，不经过 Git discovery 或生命周期门禁。
+旧独立 App 配置需要显式迁入统一配置，保持 App 来源并采用新默认范围；查询不隐式迁移。迁移保留其他设置，显式新配置优先，失败保留有效数据，不删除活动执行器引用的旧材料。缺少新身份与范围绑定的旧 Run 明确拒绝恢复并保留数据，不从个人默认猜测补齐。配置或认证失败不回退宿主身份。
 
 ### 顶层 Codex 执行配置
 
@@ -404,15 +398,15 @@ mutation。MVP 不提供 `confirm-structure`；操作者只能恢复 GitHub 原�
 
 ## 权限边界
 
-Worker host/PAT 使用原生 `gh`，不挂载替换入口、不经过命令代理或本地 allowlist。host 复用宿主认证；PAT 使用所选引用的当前值。两者的 GitHub 能力由用户凭据决定，需要较小权限时由用户在 GitHub 收窄权限。Worker 得到选定身份需要的凭据，程序不会主动向其注入独立 Runner 秘密；host 身份可能与程序端相同。凭据秘密值不进入 Run 快照、普通输出和诊断。
+Worker host/PAT/App 使用原生 `gh`，不挂载替换入口、不经过命令代理或本地 allowlist。host 复用宿主认证；PAT 使用所选引用的当前值。它们的 GitHub 能力由用户凭据决定，需要较小权限时由用户在 GitHub 收窄权限。Worker 得到选定身份需要的凭据，程序不会主动向其注入独立 Runner 秘密；host 身份可能与程序端相同。凭据秘密值不进入 Run 快照、普通输出和诊断。
 
-既有 App 暂保留固定只读权限、当前仓库请求代理、签发与自动续签，App 私钥及 token 不进入 Worker。该过渡路径的 adapter 绑定、到期读取重试、有界退避和清理逻辑继续有效；host/PAT 不受其命令规则限制。App 原生接入、授权默认迁移以及程序端 PAT/App 来源选择尚未在此阶段实现。
+App 在程序端签发并自动续签，短期 token 通过每次 Invocation 隔离的 `GH_CONFIG_DIR/hosts.yml` 原子更新；同一 Agent 正常继承环境的后续 gh 子进程读取新 token，无需重建会话。不同权限和仓库范围的凭据实例隔离；不再替换 gh、解析命令或运行 socket 代理。临时续签失败有界重试，有效旧 token 可继续使用；失效后进入 Execution Failure。App 私钥不主动提供给 Worker，程序端 App 接入由后续任务完成。
 
 Codex 使用 YOLO，可读写宿主文件系统、联网及使用真实 Git CLI。外层 bubblewrap 继续只读保护权威 Git metadata 和 Runner 控制状态；启动前拒绝 local Git config 中含 userinfo 的 HTTP(S) remote URL，并返回固定脱敏错误，不改写 config。这不是通用安全沙箱，不承诺防御恶意进程、主动搜索宿主凭据、宿主污染或数据外泄。
 
 GitHub 写能力不替代角色职责：开发只整理文件，审查不改交付内容，Publication Agent 只生成文案；不得自行提交、正式发布、自我批准或关闭任务。Controller 保留验收、Currentness、正式批准和完成判断，正式发布由 Publisher 程序执行。Controller 向 Agent 提供适用的需求 URL 与原始失败证据，Agent 使用 Git/gh 自行读取事实。
 
-已有 Run 的凭据故障保留进度和诊断，修复同一 PAT 引用后显式 `resume`，不隐式换来源、不归为代码 Finding。停止、失败和正常退出释放本轮临时资源。普通测试通过 gh、Codex 和服务替身验证配置、凭据传递与恢复；替身通过不代表真实外部工具兼容性已经验证。
+已有 Run 的凭据故障保留进度和诊断，修复同一凭据引用后显式 `resume`，不隐式换来源、不归为代码 Finding。停止、失败和正常退出释放本轮临时资源。普通测试通过 gh、Codex 和服务替身验证配置、凭据传递与恢复；替身通过不代表真实外部工具兼容性已经验证。
 
 Development Codex 使用 `skill:implement` 完成实现、自测和真实核心路径验证；当前角色 Prompt 的
 风险相称验证、预检与只修改工作树边界优先于该通用 skill 的完整测试、Review 或 commit 建议。Development
@@ -517,7 +511,7 @@ agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
 `agent-run doctor` 是可选、只读的诊断入口，不要求当前目录是 Git 仓库。它报告 Python 版本、Git、Codex、
-宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker read provider；JSON
+宿主 `gh` 登录、OpenSSL、Linux `bubblewrap`、Active Runner、PATH 和 Worker GitHub 身份；JSON
 输出只包含 Python 版本、路径、状态、provider 和布尔值等非敏感信息。缺少依赖只报告问题，不安装软件、不
 修复 PATH、不触发生命周期，也不修改 shell、auth profile、Run locator、Delivery Run、Thread、PR、
 branch 或运行数据。
@@ -529,7 +523,7 @@ C/B；相同内容重复安装不会重新 probe 或增加 Snapshot，候选失�
 私钥、Run locator、Runner 独立仓库和运行数据。PATH 变化需要重新打开登录 shell；重复卸载安全，用户替换
 的同名入口会被保留并报告清理未完成。
 
-Worker host/PAT 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app configure/remove` 入口仍维护过渡 App 配置，不删除用户私钥；App 故障不回退 host。程序端仍使用宿主身份。
+Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[个人运行配置](user-defaults.md)。旧 `auth app` 命令已移除，迁移不删除用户私钥；App 故障不回退 host。程序端仍使用宿主身份。
 
 首版范围为 Linux、用户级 `~/.profile` 和单用户安装；尚未完成发行版、版本与架构组合的完整真实宿主验证。底层安装器要求 CPython 3.11+、`venv`、
 `pip`、Git、Codex、OpenSSL、已登录的 `gh`、Linux `bubblewrap` 与目标仓库所需权限；Windows、macOS、

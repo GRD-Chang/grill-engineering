@@ -4,11 +4,11 @@ status: accepted
 
 # Codex 使用 YOLO，外层只保护 Git 权威和 Publisher 凭据
 
-所有 Development、Repair、Fresh/Run Acceptance 与 Publication Codex 都在信任 Agent 的前提下以 YOLO 运行，可以访问宿主文件系统、联网并使用真实 Git CLI。host/PAT Worker 使用原生 `gh`，不挂载替换可执行文件、不经过命令代理或本地 allowlist；GitHub 能力由操作者选择的凭据决定，需要较小权限时由操作者在 GitHub 设置凭据权限。Runner 程序端目前继续使用 host，不主动向 Worker 注入独立程序端秘密；用户选择 host 时两端身份可能相同。
+所有 Development、Repair、Fresh/Run Acceptance 与 Publication Codex 都在信任 Agent 的前提下以 YOLO 运行，可以访问宿主文件系统、联网并使用真实 Git CLI。host/PAT/App Worker 使用原生 `gh`，不挂载替换可执行文件、不经过命令代理或本地 allowlist；GitHub 能力由操作者选择的凭据决定，需要较小权限时由操作者在 GitHub 设置凭据权限。Runner 程序端目前继续使用 host，不主动向 Worker 注入独立程序端秘密；用户选择 host 时两端身份可能相同。
 
 Execution Guard 继续保护权威 Git metadata 与 Runner 控制状态，并在 Worker 启动前以固定脱敏错误拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，不改写 config。YOLO 和凭据写能力都不扩大角色职责：Development/Repair 只整理当前 checkout，不自行提交或发布；Fresh/Run Acceptance 只产生和清理验证产物，不修复交付内容；Publication 只生成文案。验收、Currentness、正式批准与完成判断属于 Controller，正式发布由 Publisher 程序执行。
 
-尚未迁移的 App 来源暂时保留 invocation-local adapter、当前仓库固定只读请求、Controller 签发与自动续签，以及 App 私钥和 installation token 不进入 Worker 的旧行为；具体凭据选择见 ADR 0008。其 `gh` 绑定及有界重试只适用于此过渡路径，不是长期可选代理模式，不能据此为 host/PAT 恢复命令限制。
+App 私钥仅以文件路径引用，签发留在程序端；Worker 获得所选范围的短期 installation token。每次 Invocation 独立的 `GH_CONFIG_DIR/hosts.yml` 通过原子更新传递续签结果，同一 Agent 正常继承环境的后续 `gh` 子进程使用新 token。没有 gh 可执行文件替换、socket 请求协议或代理兼容入口。默认授权范围、收窄与迁移规则见 ADR 0008。临时失败有界重试；失效后保留进度进入 Execution Failure，修复同一引用后公开 resume，不自动换身份。
 
 该设计不建设通用 sandbox，不承诺防御恶意 Agent、主动搜索宿主秘密、宿主文件污染或数据外泄。普通测试使用工具和服务替身；真实外部工具兼容性验证仍需另行执行，替身通过不代表真实工具兼容性已验证。
 

@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import ssl
+import stat
 import subprocess
 import threading
 import time
@@ -14,7 +15,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from agent_run.worker_credentials import (
+from agent_run.credential_lifecycle import (
     ReadCredential,
     WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS,
     safe_http_status,
@@ -22,16 +23,24 @@ from agent_run.worker_credentials import (
 from agent_run.process_cleanup import (
     terminate_process_group,
 )
-from agent_run.github_auth_profile import GitHubAppProfile
+from agent_run.github_auth_profile import (
+    GitHubAppProfile, GitHubAppProfileStore, GitHubAuthProfileError,
+)
 
 
 _DEFAULT_URL_OPEN = urllib.request.urlopen
 
+# These installation-token permissions have no read level. Omit them from an
+# explicit read-only request rather than inventing a level or retaining write.
+# https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+_WRITE_ONLY_INSTALLATION_PERMISSIONS = frozenset({"workflows", "profile"})
+
 
 class GitHubCredentialError(RuntimeError):
-    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+    def __init__(self, message: str, *, http_status: int | None = None, retryable: bool | None = None) -> None:
         super().__init__(message)
         self.http_status = safe_http_status(http_status)
+        self.retryable = (self.http_status is not None and (self.http_status >= 500 or self.http_status in {408, 429})) if retryable is None else retryable
 
 
 class _SigningProcessRegistry:
@@ -137,8 +146,10 @@ class _SigningProcessRegistry:
 class _GitHubAppCredentialProvider:
     """Mint App credentials with a channel-owned, cancellable signer."""
 
-    def __init__(self, profile: GitHubAppProfile) -> None:
+    def __init__(self, profile: GitHubAppProfile, *, read_only: bool = False, repository: str | None = None) -> None:
         self._profile = profile
+        self._read_only = read_only
+        self._repository = repository
         self._signing_processes = _SigningProcessRegistry()
         self._call_condition = threading.Condition()
         self._call_active = False
@@ -150,8 +161,10 @@ class _GitHubAppCredentialProvider:
                 raise GitHubCredentialError("GitHub App credential provider is closed")
             self._call_active = True
         try:
-            return mint_read_only_installation_credential(
+            return mint_installation_credential(
                 self._profile,
+                read_only=self._read_only,
+                repository=self._repository,
                 process_registry=self._signing_processes,
             )
         finally:
@@ -170,32 +183,31 @@ class _GitHubAppCredentialProvider:
             )
 
 
-_REQUIRED_READ_PERMISSIONS = {
-    "actions": "read",
-    "checks": "read",
-    "contents": "read",
-    "issues": "read",
-    "metadata": "read",
-    "pull_requests": "read",
-    "statuses": "read",
-}
-
-
-def mint_read_only_installation_token(profile: GitHubAppProfile) -> str:
-    return mint_read_only_installation_credential(profile).token
-
-
-def mint_read_only_installation_credential(
+def mint_installation_credential(
     profile: GitHubAppProfile,
     *,
+    read_only: bool = False,
+    repository: str | None = None,
     process_registry: _SigningProcessRegistry | None = None,
 ) -> ReadCredential:
     app_id = profile.app_id
     installation_id = profile.installation_id
     try:
-        private_key = profile.private_key_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise GitHubCredentialError("GitHub App private key is unavailable") from error
+        validated = GitHubAppProfileStore._validate_values(
+            profile.app_id, profile.installation_id, str(profile.private_key_path),
+        )
+        descriptor = os.open(validated.private_key_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as key_file:
+            metadata = os.fstat(key_file.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077
+                    or metadata.st_size > 64 * 1024):
+                raise GitHubCredentialError("GitHub App private key must be a private, bounded regular file")
+            key_bytes = key_file.read(64 * 1024 + 1)
+            if len(key_bytes) > 64 * 1024:
+                raise GitHubCredentialError("GitHub App private key is too large")
+            private_key = key_bytes.decode("utf-8")
+    except (GitHubAuthProfileError, OSError, UnicodeDecodeError) as error:
+        raise GitHubCredentialError("GitHub App private key is unavailable or unsafe") from None
     if process_registry is None:
         app_jwt = _create_app_jwt(app_id, private_key)
     else:
@@ -206,40 +218,43 @@ def mint_read_only_installation_credential(
         )
     if process_registry is not None and process_registry.is_cancelled():
         raise GitHubCredentialError("GitHub App credential provider is closed")
-    request = urllib.request.Request(
-        (
-            "https://api.github.com/app/installations/"
-            f"{installation_id}/access_tokens"
-        ),
-        data=json.dumps(
-            {"permissions": _REQUIRED_READ_PERMISSIONS}
-        ).encode(),
-        method="POST",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {app_jwt}",
-            "Content-Type": "application/json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "agent-run",
-        },
-    )
-    try:
-        with _open_installation_token_request(request, process_registry) as response:
-            loaded: object = json.load(response)
-    except urllib.error.HTTPError as error:
-        raise GitHubCredentialError(
-            "could not create a GitHub App installation token",
-            http_status=error.code,
-        ) from error
-    except (OSError, json.JSONDecodeError) as error:
-        raise GitHubCredentialError(
-            "could not create a GitHub App installation token"
-        ) from error
-    finally:
-        if process_registry is not None:
-            process_registry.clear_connection()
-    if not isinstance(loaded, dict):
-        raise GitHubCredentialError("GitHub token response is invalid")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {app_jwt}",
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "agent-run",
+    }
+    endpoint = f"https://api.github.com/app/installations/{installation_id}"
+    payload: dict[str, object] = {}
+    requested_permissions: dict[str, str] | None = None
+    if read_only or repository is not None:
+        installation = _request_json(
+            urllib.request.Request(endpoint, headers=headers), process_registry,
+        )
+        if read_only:
+            granted = installation.get("permissions")
+            if not isinstance(granted, dict) or any(
+                not isinstance(key, str) or level not in ("read", "write", "admin")
+                for key, level in granted.items()
+            ):
+                raise GitHubCredentialError("GitHub installation permissions are invalid")
+            requested_permissions = {
+                key: "read" for key in granted
+                if key not in _WRITE_ONLY_INSTALLATION_PERMISSIONS
+            }
+            payload["permissions"] = requested_permissions
+        if repository is not None:
+            owner, separator, name = repository.partition("/")
+            account = installation.get("account")
+            if (not separator or not name or "/" in name or not isinstance(account, dict)
+                    or str(account.get("login", "")).casefold() != owner.casefold()):
+                raise GitHubCredentialError("Target repository does not belong to the selected installation")
+            payload["repositories"] = [name]
+    loaded = _request_json(urllib.request.Request(
+        endpoint + "/access_tokens", data=json.dumps(payload).encode(),
+        method="POST", headers=headers,
+    ), process_registry)
     token = loaded.get("token")
     expires_at = loaded.get("expires_at")
     permissions = loaded.get("permissions")
@@ -247,10 +262,18 @@ def mint_read_only_installation_credential(
         raise GitHubCredentialError("GitHub token response has no token")
     if not isinstance(expires_at, str):
         raise GitHubCredentialError("GitHub token response has no expiry")
-    if permissions != _REQUIRED_READ_PERMISSIONS:
-        raise GitHubCredentialError(
-            "GitHub did not grant the exact worker read permissions"
-        )
+    if read_only and (
+        not isinstance(permissions, dict)
+        or any(level != "read" or key not in (requested_permissions or {})
+               for key, level in permissions.items())
+    ):
+        raise GitHubCredentialError("GitHub did not honor the read-only credential scope")
+    if repository is not None:
+        repositories = loaded.get("repositories")
+        if (not isinstance(repositories, list) or len(repositories) != 1
+                or not isinstance(repositories[0], dict)
+                or str(repositories[0].get("full_name", "")).casefold() != repository.casefold()):
+            raise GitHubCredentialError("GitHub did not honor the repository credential scope")
     try:
         expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
     except ValueError as error:
@@ -258,6 +281,24 @@ def mint_read_only_installation_credential(
     if expiry <= time.time():
         raise GitHubCredentialError("GitHub token response has an expired token")
     return ReadCredential(token=token, expires_at=expiry)
+
+
+def _request_json(request: urllib.request.Request, registry: _SigningProcessRegistry | None) -> dict[str, Any]:
+    try:
+        with _open_installation_token_request(request, registry) as response:
+            loaded: object = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise GitHubCredentialError("GitHub App credential request failed", http_status=error.code, retryable=error.code >= 500 or error.code in {408, 429}) from None
+    except OSError:
+        raise GitHubCredentialError("GitHub App credential request failed", retryable=True) from None
+    except ValueError:
+        raise GitHubCredentialError("GitHub App response is invalid") from None
+    finally:
+        if registry is not None:
+            registry.clear_connection()
+    if not isinstance(loaded, dict):
+        raise GitHubCredentialError("GitHub App response is invalid")
+    return loaded
 
 
 class _CancellableHTTPSHandler(urllib.request.HTTPSHandler):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_run.external_supervision import wait_for_github_convergence
-from agent_run.worker_credentials import safe_http_status
+from agent_run.credential_lifecycle import safe_http_status
 
 
 def wait_for_initial_credential(

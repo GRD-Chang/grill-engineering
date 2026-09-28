@@ -20,6 +20,7 @@ from agent_run.messages import selected_language, text
 from agent_run.models import same_repository
 from agent_run.user_defaults import UserDefaultsStore, notification_snapshot
 from agent_run.github_identity import (
+    GitHubIdentityError,
     add_identity_options, identity_overrides, resolve_worker_identity, validate_worker_auth,
     validate_identity_snapshot,
 )
@@ -47,10 +48,6 @@ from agent_run.managed_workspace import workspace_state_root, validate_data_root
 from agent_run.workspace_cli import open_workspace, selected_repository_root
 from agent_run.git import DirtyManagedCheckoutError, GitError, GitRepository
 from agent_run.github import GhGitHubReader, GitHubReadError
-from agent_run.github_auth_profile import (
-    GitHubAuthProfileError,
-    GitHubAppProfileStore,
-)
 from agent_run.github_fixture import FixtureGitHubPublisher, FixtureGitHubReader
 from agent_run.github_publish import GhGitHubPublisher
 from agent_run.github_retry import MAX_READ_ATTEMPTS
@@ -180,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar=(
             "{run,resume,requeue,approve,revise,stop,abandon,status,history,"
-            "runs,configure,settings,prompts,policy,auth,doctor}"
+            "runs,configure,settings,prompts,policy,doctor}"
         ),
     )
     run = subcommands.add_parser(
@@ -334,26 +331,6 @@ def build_parser() -> argparse.ArgumentParser:
         subcommands, _add_common_options, _add_policy_options, _add_profile_options
     )
     prompt_cli.add_parser(subcommands)
-    auth = subcommands.add_parser("auth", help=cli_message('cli.auth_help'))
-    auth_commands = auth.add_subparsers(
-        dest="auth_command", required=True, metavar="{status,app}"
-    )
-    auth_commands.add_parser("status", help=cli_message('cli.auth_status_help'))
-    auth_app = auth_commands.add_parser("app", help=cli_message('cli.auth_app_help'))
-    auth_app_commands = auth_app.add_subparsers(
-        dest="auth_app_command", required=True, metavar="{configure,remove}"
-    )
-    configure_app = auth_app_commands.add_parser(
-        "configure", help=cli_message('cli.auth_configure_help')
-    )
-    configure_app.add_argument("--app-id", required=True, help="GitHub App ID")
-    configure_app.add_argument(
-        "--installation-id", required=True, help="GitHub App Installation ID"
-    )
-    configure_app.add_argument(
-        "--private-key", required=True, help=cli_message('cli.private_key_help')
-    )
-    auth_app_commands.add_parser("remove", help=cli_message('cli.auth_remove_help'))
     doctor_command = subcommands.add_parser(
         "doctor", help=cli_message('cli.doctor_help')
     )
@@ -406,8 +383,6 @@ def _main_with_parser_resources(
             if parsed.command == "run"
             else None
         )
-        if parsed.command == "auth":
-            return _auth_command(parsed)
         if parsed.command == "doctor":
             return doctor.run(as_json=parsed.as_json)
         if parsed.command == "prompts":
@@ -1963,6 +1938,7 @@ def _run_lifecycle(
     if action_kind != "run" and current is None:
         raise TaskControlError(error_message('cli.error.action_run_missing' ,value0=action_kind))
     if current is not None:
+        frozen_worker_identity(current)
         controller._require_current_checkout(current)
     try:
         existing_control = control.load(task)
@@ -2134,8 +2110,8 @@ def _run_lifecycle(
                 payload["github_identity"] = resolve_worker_identity(
                     document.get("github"), identity_overrides(parsed),
                 )
-                if parsed.github_fixture is None or payload["github_identity"]["source"] == "pat":
-                    validate_worker_auth(payload["github_identity"])
+                if parsed.github_fixture is None or payload["github_identity"]["source"] in {"pat", "app"}:
+                    validate_worker_auth(payload["github_identity"], repository=task.repository)
                 payload["language"] = defaults.language(document)
                 payload["notifications"] = notification_snapshot(
                     document.get("notifications"), disabled=parsed.no_notifications, mode=parsed.notification_mode,
@@ -2665,7 +2641,10 @@ def frozen_worker_identity(state: Mapping[str, Any]) -> dict[str, Any]:
         raise IncompatibleRunStateError(
             error_message("identity.run_missing")
         )
-    return validate_identity_snapshot(state["github_identity"])
+    try:
+        return validate_identity_snapshot(state["github_identity"])
+    except GitHubIdentityError as error:
+        raise IncompatibleRunStateError(error_message("identity.run_incompatible")) from error
 
 
 def _run_payload_for_existing_action(
@@ -2690,7 +2669,9 @@ def _run_payload_for_existing_action(
         github_options = identity_overrides(parsed)
         if github_options:
             selected = resolve_worker_identity(
-                {"worker_source": identity["source"], **({"pat": identity["pat"]} if "pat" in identity else {})},
+                {"worker_source": identity["source"], **({"pat": identity["pat"]} if "pat" in identity else {}),
+                 **({"app": identity["app_profile"], "app_read_only": identity["app_read_only"],
+                     "app_current_repository_only": identity["app_current_repository_only"]} if identity["source"] == "app" else {})},
                 github_options,
             )
             if selected != identity:
@@ -4007,67 +3988,6 @@ def _configure_profile(parsed: argparse.Namespace) -> int:
         print(cli_message("cli.profile_saved", language=str(state.get("language", "zh")), revision=document["profile_revision"]))
         print(cli_message("cli.profile_no_execution", language=str(state.get("language", "zh"))))
     return 0
-
-
-def _auth_command(parsed: argparse.Namespace) -> int:
-    try:
-        store = GitHubAppProfileStore()
-        if parsed.auth_command == "status":
-            configured = store.load() is not None
-            print(
-                json.dumps(
-                    {
-                        "app_profile": "configured"
-                        if configured
-                        else "not_configured",
-                        "provider": "app" if configured else "host",
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            return 0
-        if parsed.auth_app_command == "configure":
-            store.configure(
-                app_id=parsed.app_id,
-                installation_id=parsed.installation_id,
-                private_key_path=parsed.private_key,
-            )
-            print(json.dumps({"provider": "app", "result": "configured"}, sort_keys=True))
-            return 0
-        if parsed.auth_app_command == "remove":
-            store.remove()
-            print(
-                json.dumps(
-                    {
-                        "app_profile": "not_configured",
-                        "provider": "host",
-                        "result": "removed",
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            return 0
-        raise ValueError(error_message('cli.error.unknown_auth'))
-    except GitHubAuthProfileError as error:
-        print(
-            json.dumps(
-                {
-                    "result": "error",
-                    "status": "invalid_auth_profile",
-                    "diagnostics": [
-                        {
-                            "code": "github_auth_profile_invalid",
-                            "message": bounded_error(str(error)),
-                        }
-                    ],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
-        return 2
 
 
 def _profile_state_root(parsed: argparse.Namespace) -> Path:

@@ -53,7 +53,7 @@ CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown
 | --- | --- |
 | 命令入口、暂停与恢复 | `test_cli_mvp.py`、`test_cli_run_supervision.py`、`test_cli_run_repair_supervision.py` 中的真实 run/resume/approve 与进程重新启动 |
 | 持久化、授权与版本漂移 | StateStore、Locator、`test_ticket_191_*.py`、`test_git_dispatch_fence.py` 的真实文件、锁、Git 与前后状态断言 |
-| Worker 隔离、取消与凭据回收 | `test_codex_backend.py` 的真实子进程、bubblewrap、信号、socket 和清理验证 |
+| Worker 隔离、取消与凭据回收 | `test_codex_backend.py` 的真实子进程、bubblewrap、信号验证，以及 App 凭据测试中的文件更新和清理验证 |
 | 安装与离线构建 | 安装器真实构建、激活、回滚及中断恢复；依赖在测试前准备 |
 
 同一流程中的辅助结果查询可以调用进程内公开 CLI；CLI 启动、环境继承、跨目录选择与信号测试仍需真实子进程。

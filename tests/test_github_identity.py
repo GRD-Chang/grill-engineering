@@ -16,6 +16,7 @@ from support.user_defaults import settings
     {'worker_source': 'invalid'}, {'pat': {}}, {'pat': {'env': 'X', 'file': '/x'}},
     {'pat': {'env': 'not-valid'}}, {'pat': {'file': 'relative'}},
     {'worker_source': 'host', 'read_only': True}, {'pat': {'token': 'secret'}},
+    {'app_read_only': 'true'}, {'app_current_repository_only': 1},
 ])
 def test_invalid_configuration_is_explicit(config: dict) -> None:
     with pytest.raises(GitHubIdentityError):
@@ -105,3 +106,95 @@ def test_pat_file_read_is_bounded_and_rejects_nonregular(tmp_path: Path) -> None
     path.write_text("x" * 65537)
     with pytest.raises(GitHubIdentityError):
         native_github_environment(identity, {})
+
+
+def app_config(tmp_path: Path) -> dict:
+    return {'worker_source': 'app', 'app': {
+        'app_id': '123', 'installation_id': '456', 'private_key_path': str(tmp_path / 'key.pem')}}
+
+
+@pytest.mark.parametrize('read_only,current_only', [(False, False), (True, False), (False, True), (True, True)])
+def test_app_scope_and_snapshot_are_independent(tmp_path: Path, read_only: bool, current_only: bool) -> None:
+    config = app_config(tmp_path)
+    frozen = resolve_worker_identity(config, {'app_read_only': read_only, 'app_current_repository_only': current_only})
+    assert frozen == {'source': 'app', 'app_profile': config['app'],
+                      'app_read_only': read_only, 'app_current_repository_only': current_only}
+    assert validate_identity_snapshot(frozen) == frozen
+    assert 'app_read_only' not in config
+    with pytest.raises(GitHubIdentityError):
+        validate_identity_snapshot({'source': 'app', 'app_profile': config['app']})
+    with pytest.raises(GitHubIdentityError):
+        resolve_worker_identity(config, {'worker_source': 'host', 'app_read_only': True})
+
+
+def test_public_settings_app_metadata_scope_and_read_only_query(tmp_path: Path) -> None:
+    code, configured = settings('configure', '--worker-github-source', 'app',
+        '--github-app-id', '123', '--github-installation-id', '456',
+        '--github-private-key-path', str(tmp_path / 'unread-key'), '--github-app-read-only')
+    assert code == 0
+    worker = configured['github']['worker']
+    assert worker['app_read_only'] is True
+    assert worker['app_current_repository_only'] is False
+    before = UserDefaultsStore().path.read_bytes()
+    assert settings('show')[1]['github']['worker'] == worker
+    assert UserDefaultsStore().path.read_bytes() == before
+    selected = resolve_worker_identity(UserDefaultsStore().load()['github'], {'app_current_repository_only': True})
+    assert selected['app_current_repository_only'] is True
+    assert UserDefaultsStore().path.read_bytes() == before
+    code, configured = settings('configure', '--no-github-app-read-only', '--github-app-current-repository-only')
+    assert code == 0
+    assert configured['github']['worker']['app_read_only'] is False
+    assert configured['github']['worker']['app_current_repository_only'] is True
+
+
+def test_legacy_app_migration_is_atomic_preserves_materials_and_explicit_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = tmp_path / 'private-key'
+    key.write_text('private material is never shown')
+    key.chmod(0o600)
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    directory = tmp_path / 'config' / 'agent-run'
+    directory.mkdir(mode=0o700, parents=True)
+    legacy = directory / 'github-app.json'
+    legacy.write_text(json.dumps({**app_config(tmp_path)['app'], 'private_key_path': str(key)}))
+    legacy.chmod(0o600)
+    store = UserDefaultsStore(directory / 'user-defaults.json')
+    store.path.write_text(json.dumps({'language': 'en', 'profile': {'preset': 'economy'}}))
+    original = store.path.read_bytes()
+    material = legacy.read_bytes()
+    assert store.describe()['github']['migration'] == 'required'
+    assert store.path.read_bytes() == original
+    with pytest.raises(GitHubIdentityError, match='migrate-github-app'):
+        resolve_worker_identity({}, app_profile_path=legacy)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, '_sync_directory', lambda: (_ for _ in ()).throw(OSError('disk failure')))
+        with pytest.raises(OSError):
+            store.configure(migrate_github_app=True)
+    assert store.path.read_bytes() == original
+    assert legacy.read_bytes() == material
+    code, result = settings('configure', '--migrate-github-app')
+    assert code == 0
+    assert result['github']['worker'] == {'source': 'app', 'app_profile': {
+        **app_config(tmp_path)['app'], 'private_key_path': str(key)},
+        'app_read_only': False, 'app_current_repository_only': False}
+    assert store.load()['language'] == 'en'
+    assert store.load()['profile'] == {'preset': 'economy'}
+    assert legacy.read_bytes() == material
+    assert key.exists()
+    legacy.write_text('corrupted after migration')
+    assert store.describe()['github']['worker'] == result['github']['worker']
+    explicit = app_config(tmp_path)
+    explicit.update(worker_source='host', app_read_only=False)
+    store.configure(github=explicit)
+    assert store.configure(migrate_github_app=True)['github']['worker'] == {'source': 'host'}
+    assert not list(directory.glob('*.tmp'))
+
+
+def test_migration_explicit_host_does_not_consume_broken_legacy(tmp_path: Path) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    store.path.write_text(json.dumps({"github": {"worker_source": "host"}, "language": "en"}))
+    legacy = tmp_path / "github-app.json"
+    legacy.write_text("broken old metadata")
+    assert store.configure(migrate_github_app=True)["github"]["worker"] == {"source": "host"}
+    assert legacy.read_text() == "broken old metadata"

@@ -16,8 +16,8 @@ from support.user_defaults import settings
 from support.workspace import managed_state
 
 
-@pytest.mark.parametrize("reference", ["env", "file"])
-def test_public_native_pat_failure_and_same_reference_resume(
+@pytest.mark.parametrize("reference", ["env", "file", "app"])
+def test_public_native_identity_failure_and_same_reference_resume(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference: str,
 ) -> None:
     """Real CLI/fork/restart/state; gh and Codex alone are external doubles."""
@@ -29,6 +29,9 @@ def test_public_native_pat_failure_and_same_reference_resume(
     gh.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 from pathlib import Path
 value = os.environ.get("GH_TOKEN")
+if value is None:
+    config = Path(os.environ["GH_CONFIG_DIR"]) / "hosts.yml"
+    value = json.loads(config.read_text())["github.com"]["oauth_token"]
 if sys.argv[1:] == ["api", "--hostname", "github.com", "user"]:
     raise SystemExit(0 if value in ("pat-first", "pat-repaired") else 1)
 assert sys.argv[1:] == ["api", "--method", "POST", "repos/other/project/dispatches"]
@@ -39,7 +42,28 @@ with Path(os.environ["IDENTITY_CAPTURE"]).open("a") as out:
     driver = tmp_path / "candidate-cli.py"
     driver.write_text('''import json, subprocess, sys
 from pathlib import Path
-from agent_run import cli, codex
+from agent_run import cli, codex, github_auth
+from agent_run.credential_lifecycle import ReadCredential
+import time
+
+class ControlledAppProvider:
+    def __init__(self, profile, *, read_only=False, repository=None):
+        self.profile = profile
+        assert read_only is True
+        assert repository is None
+    def __call__(self):
+        try:
+            token = self.profile.private_key_path.read_text().strip()
+        except OSError:
+            raise github_auth.GitHubCredentialError("key unavailable") from None
+        if token not in ("pat-first", "pat-repaired"):
+            raise github_auth.GitHubCredentialError("key invalid")
+        return ReadCredential(token, time.time() + 3600)
+    def cancel(self):
+        pass
+
+github_auth._GitHubAppCredentialProvider = ControlledAppProvider
+codex._GitHubAppCredentialProvider = ControlledAppProvider
 
 def worker(arguments, **options):
     assert not any("gh-adapter" in item for item in arguments)
@@ -62,6 +86,9 @@ raise SystemExit(cli.main(sys.argv[1:]))
                        IDENTITY_CAPTURE=str(capture), TASK_WORKER_PAT="pat-first",
                        GH_TOKEN="independent-runner-secret")
     ref_args = ["--github-pat-env", "TASK_WORKER_PAT"] if reference == "env" else ["--github-pat-file", str(token_file)]
+    if reference == "app":
+        ref_args = ["--github-app-id", "123", "--github-installation-id", "456",
+                    "--github-private-key-path", str(token_file), "--github-app-read-only"]
     assert settings("configure", "--worker-github-source", "host")[0] == 0
     defaults = UserDefaultsStore().path.read_bytes()
 
@@ -76,11 +103,21 @@ raise SystemExit(cli.main(sys.argv[1:]))
         assert "pat-repaired" not in result.stdout + result.stderr
         return result
 
-    started = call("run", "1", "--worker-github-source", "pat", *ref_args)
+    if reference == "app":
+        token_file.unlink()
+        failed_start = call("run", "1", "--worker-github-source", "app", *ref_args)
+        assert not list((managed_state(git_repo) / "runs").glob("*.json"))
+        assert "app" in failed_start.stdout
+        token_file.write_text("pat-first\n")
+    started = call("run", "1", "--worker-github-source", "app" if reference == "app" else "pat", *ref_args)
     assert list((managed_state(git_repo) / "runs").glob("*.json")), started.stdout + started.stderr
     first = load_only_run_state(git_repo)
     assert first["status"] == "ready_for_human"
     expected = {"source": "pat", "pat": {reference: "TASK_WORKER_PAT" if reference == "env" else str(token_file)}}
+    if reference == "app":
+        expected = {"source": "app", "app_profile": {"app_id": "123", "installation_id": "456",
+                    "private_key_path": str(token_file)}, "app_read_only": True,
+                    "app_current_repository_only": False}
     assert first["github_identity"] == expected
     assert first["creation_configuration"]["github_identity"] == expected
     assert UserDefaultsStore().path.read_bytes() == defaults
@@ -114,6 +151,15 @@ raise SystemExit(cli.main(sys.argv[1:]))
     assert [json.loads(line)["token"] for line in capture.read_text().splitlines()] == ["pat-first", "pat-repaired"]
     for path in managed_state(git_repo).rglob("*.json"):
         assert all(secret not in path.read_text() for secret in ("pat-first", "pat-repaired", "independent-runner-secret"))
+    if reference == "app":
+        state_path = next((managed_state(git_repo) / "runs").glob("*.json"))
+        legacy_state = json.loads(state_path.read_text())
+        legacy_state["github_identity"].pop("app_read_only")
+        state_path.write_text(json.dumps(legacy_state))
+        before = state_path.read_bytes()
+        incompatible = call("resume", first["run_id"], "--message", "旧授权不能猜测")
+        assert "incompatible_run_state" in incompatible.stdout
+        assert state_path.read_bytes() == before
 
 
 def test_new_run_rejects_missing_pat_before_creating_state(

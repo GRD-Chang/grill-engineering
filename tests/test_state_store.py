@@ -627,8 +627,10 @@ def test_unsupported_scope_change_uses_bounded_deduplicated_history(
     {"source": "host"},
     {"source": "pat", "pat": {"env": "CUSTOM_WORKER_PAT"}},
     {"source": "pat", "pat": {"file": "/secure/credential"}},
-    {"source": "app", "app_profile": {"app_id": "1", "installation_id": "2",
-                                           "private_key_path": "/secure/app.pem"}},
+    *({"source": "app", "app_profile": {"app_id": "1", "installation_id": "2",
+                                         "private_key_path": "/secure/app.pem"},
+       "app_read_only": read_only, "app_current_repository_only": current_repository_only}
+      for read_only in (False, True) for current_repository_only in (False, True)),
 ])
 def test_identity_reference_survives_state_redaction(tmp_path: Path, identity: dict) -> None:
     store = StateStore(tmp_path)
@@ -642,3 +644,10 @@ def test_identity_reference_survives_state_redaction(tmp_path: Path, identity: d
     with pytest.raises(ValueError):
         store.save_run("identity", {"github_identity": {**identity, "token": "secret"}})
     assert store.load_run("identity") == persisted
+
+    if identity["source"] == "app":
+        for field in ("app_read_only", "app_current_repository_only"):
+            legacy = {key: value for key, value in identity.items() if key != field}
+            with pytest.raises(ValueError):
+                store.save_run("identity", {"github_identity": legacy})
+            assert store.load_run("identity") == persisted

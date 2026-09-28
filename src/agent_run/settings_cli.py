@@ -37,6 +37,8 @@ def add_parser(
     configure = actions.add_parser("configure", help=message("configure_help"))
     configure.add_argument("--language", metavar="{zh,en}", help=message("language_help"))
     add_identity_options(configure, language)
+    configure.add_argument("--migrate-github-app", action="store_true",
+                           help=text("identity.migrate_help", language=language))
     policy_options(configure)
     profile_options(configure)
     notification_toggle = configure.add_mutually_exclusive_group()
@@ -71,7 +73,7 @@ def execute(
         if preset is not None:
             profile["preset"] = preset
         result = UserDefaultsStore().configure(
-            github=identity_overrides(parsed),
+            github=identity_overrides(parsed), migrate_github_app=parsed.migrate_github_app,
             policy=policy_overrides(parsed), profile=profile, language=parsed.language,
             notifications={key: value for key, value in {
                 "enabled": True if parsed.notification_mode else parsed.notifications_enabled,

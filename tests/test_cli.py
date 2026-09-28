@@ -1086,7 +1086,7 @@ def test_invalid_policy_is_rejected_before_run_state_creation(
 def test_public_operator_docs_describe_the_v01_quickstart() -> None:
     reference = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(encoding="utf-8")
     for required in (
-        "./install.sh", "release tag", "agent-run doctor", "auth app configure",
+        "./install.sh", "release tag", "agent-run doctor", "--migrate-github-app",
         "--rollback", "--uninstall", "Linux", "./setup.sh", "独立克隆",
     ):
         assert required in reference
@@ -1233,7 +1233,7 @@ def test_doctor_classifies_bounded_openssl_probe_states(
     assert output["checks"]["openssl"]["status"] == expected_status
 
 
-def test_doctor_does_not_fallback_when_app_profile_is_invalid(
+def test_doctor_reports_legacy_app_migration_without_reading_or_writing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = tmp_path / "config" / "agent-run"
@@ -1251,11 +1251,33 @@ def test_doctor_does_not_fallback_when_app_profile_is_invalid(
 
     output_text = capsys.readouterr().out
     output = json.loads(output_text)
-    assert output["checks"]["worker_read_provider"] == {
-        "provider": "app",
-        "status": "invalid",
-    }
+    check = output["checks"]["worker_read_provider"]
+    assert check["provider"] == "app"
+    assert check["status"] == "migration_required"
+    assert "--migrate-github-app" in check["reason"]
+    assert profile.read_text() == "{not-json}\n"
+    assert not (config / "user-defaults.json").exists()
     assert "not-json" not in output_text
+
+
+@pytest.mark.parametrize("source", ["host", "pat"])
+def test_doctor_uses_unified_identity_and_ignores_old_app_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    config = tmp_path / "config" / "agent-run"
+    config.mkdir(parents=True)
+    legacy = config / "github-app.json"
+    legacy.write_text("invalid legacy configuration")
+    settings = config / "user-defaults.json"
+    settings.write_text(json.dumps({"github": {
+        "worker_source": source, "pat": {"env": "TEST_MISSING_PAT"},
+    }}))
+    original = settings.read_bytes()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
+    monkeypatch.delenv("TEST_MISSING_PAT", raising=False)
+    assert doctor._provider_check() == {"provider": source, "status": "ok"}
+    assert settings.read_bytes() == original
+    assert legacy.read_text() == "invalid legacy configuration"
 
 
 @pytest.mark.parametrize(
@@ -1283,8 +1305,8 @@ def test_doctor_reports_invalid_app_identifiers_without_unbounded_conversion(
         "private_key_path": str(tmp_path / "secret-key.pem"),
     }
     profile[field] = value
-    profile_path = config / "github-app.json"
-    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    profile_path = config / "user-defaults.json"
+    profile_path.write_text(json.dumps({"github": {"worker_source": "app", "app": profile}}), encoding="utf-8")
     profile_path.chmod(0o600)
     home = tmp_path / "home"
     home.mkdir()
@@ -1310,7 +1332,7 @@ def test_doctor_reports_invalid_app_identifiers_without_unbounded_conversion(
         "path",
     } <= output["checks"].keys()
     assert output["checks"]["worker_read_provider"] == {
-        "provider": "app",
+        "provider": "unknown",
         "status": "invalid",
     }
     assert "command_failed" not in output_text
@@ -1420,17 +1442,17 @@ def test_doctor_reports_a_corrupt_app_key_as_invalid_provider(
     key.chmod(0o600)
     config = tmp_path / "config" / "agent-run"
     config.mkdir(parents=True)
-    (config / "github-app.json").write_text(
+    (config / "user-defaults.json").write_text(
         json.dumps(
-            {
+            {"github": {"worker_source": "app", "app": {
                 "app_id": "123",
                 "installation_id": "456",
                 "private_key_path": str(key),
-            }
+            }}}
         ),
         encoding="utf-8",
     )
-    (config / "github-app.json").chmod(0o600)
+    (config / "user-defaults.json").chmod(0o600)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
@@ -1461,14 +1483,14 @@ def test_doctor_rejects_a_zero_exit_openssl_probe_without_a_signature(
     config = tmp_path / "config" / "agent-run"
     config.mkdir(parents=True)
     config.chmod(0o700)
-    profile = config / "github-app.json"
+    profile = config / "user-defaults.json"
     profile.write_text(
         json.dumps(
-            {
+            {"github": {"worker_source": "app", "app": {
                 "app_id": "123",
                 "installation_id": "456",
                 "private_key_path": str(key),
-            }
+            }}}
         ),
         encoding="utf-8",
     )
@@ -1531,14 +1553,14 @@ def test_doctor_accepts_a_real_private_key_signature(
     config = tmp_path / "config" / "agent-run"
     config.mkdir(parents=True)
     config.chmod(0o700)
-    profile = config / "github-app.json"
+    profile = config / "user-defaults.json"
     profile.write_text(
         json.dumps(
-            {
+            {"github": {"worker_source": "app", "app": {
                 "app_id": "123",
                 "installation_id": "456",
                 "private_key_path": str(key),
-            }
+            }}}
         ),
         encoding="utf-8",
     )

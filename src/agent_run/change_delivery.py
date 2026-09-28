@@ -34,7 +34,7 @@ from agent_run.external_supervision import (
 )
 from agent_run.publication_operation_retry import record_publication_operation_failure
 from agent_run.publication_pending import publication_pending_diagnostic
-from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.semantic_attempt import (
     close_semantic_attempt,
     detach_active_invocation,

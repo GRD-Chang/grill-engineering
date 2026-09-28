@@ -14,10 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from agent_run.github_auth_profile import (
-    GitHubAppProfileStore,
-    GitHubAuthProfileError,
-)
+from agent_run.user_defaults import UserDefaultsStore
+from agent_run.github_auth_profile import GitHubAppProfileStore
 from agent_run.runner_installer import (
     InstallPaths,
     InstallerError,
@@ -309,15 +307,21 @@ def _is_managed_entry(paths: InstallPaths) -> bool:
 
 
 def _provider_check() -> dict[str, object]:
+    provider = "unknown"
     try:
-        profile = GitHubAppProfileStore().load()
-        if profile is None:
-            return {"provider": "host", "status": "ok"}
-        if not _private_key_is_usable(profile.private_key_path):
-            return {"provider": "app", "status": "invalid"}
-    except (GitHubAuthProfileError, OSError, RuntimeError):
-        return {"provider": "app", "status": "invalid"}
-    return {"provider": "app", "status": "ok"}
+        github = UserDefaultsStore().describe()["github"]
+        identity = github["worker"]
+        provider = identity["source"]
+        if github["migration"] == "required":
+            return {"provider": provider, "status": "migration_required",
+                    "reason": github["notice"]}
+        if provider == "app":
+            profile = GitHubAppProfileStore._validate_values(**identity["app_profile"])
+            if not _private_key_is_usable(profile.private_key_path):
+                return {"provider": provider, "status": "invalid"}
+    except (ValueError, OSError, RuntimeError):
+        return {"provider": provider, "status": "invalid"}
+    return {"provider": provider, "status": "ok"}
 
 
 def _private_key_is_usable(path: Path) -> bool:
@@ -418,7 +422,7 @@ def _print_human(report: dict[str, object]) -> None:
         ("github", "宿主 gh 登录"),
         ("active_runner", "Active Runner"),
         ("path", "PATH"),
-        ("worker_read_provider", "Worker read provider"),
+        ("worker_read_provider", "Worker GitHub identity"),
     )
     print("agent-run doctor（只读诊断）")
     for key, label in labels:

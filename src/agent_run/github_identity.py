@@ -5,7 +5,6 @@ import argparse
 import os
 import re
 import stat
-import stat
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -26,8 +25,9 @@ def _error(key: str, **values: object) -> GitHubIdentityError:
 def normalize_github_config(raw: object) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise _error("object")
-    if set(raw) - {"worker_source", "pat"}:
-        raise _error("unknown", fields=", ".join(sorted(set(raw) - {"worker_source", "pat"})))
+    allowed = {"worker_source", "pat", "app", "app_read_only", "app_current_repository_only"}
+    if set(raw) - allowed:
+        raise _error("unknown", fields=", ".join(sorted(set(raw) - allowed)))
     result = dict(raw)
     if "worker_source" in result and result["worker_source"] not in ("host", "pat", "app"):
         raise _error("source")
@@ -47,6 +47,24 @@ def normalize_github_config(raw: object) -> dict[str, Any]:
                 raise _error("absolute")
             value = str(path)
         result["pat"] = {key: value}
+    if "app" in result:
+        profile = result["app"]
+        if not isinstance(profile, Mapping) or set(profile) != {"app_id", "installation_id", "private_key_path"}:
+            raise _error("app_missing")
+        if any(not isinstance(value, str) or not value.strip() for value in profile.values()):
+            raise _error("app_missing")
+        profile = {key: value.strip() for key, value in profile.items()}
+        for key in ("app_id", "installation_id"):
+            value = profile[key]
+            if not value.isascii() or not value.isdigit() or len(value) > 64 or not value.strip("0"):
+                raise _error("app_missing")
+        path = Path(profile["private_key_path"]).expanduser()
+        if not path.is_absolute():
+            raise _error("absolute")
+        result["app"] = {**profile, "private_key_path": str(path)}
+    for key in ("app_read_only", "app_current_repository_only"):
+        if key in result and type(result[key]) is not bool:
+            raise _error("scope_bool")
     return result
 
 
@@ -58,22 +76,22 @@ def resolve_worker_identity(
     """Freeze selection/references, without reading PATs or issuing credentials."""
     config = normalize_github_config({**normalize_github_config(defaults or {}),
                                       **normalize_github_config(overrides or {})})
-    source = config.get("worker_source")
+    source = config.get("worker_source", "host")
+    if source != "app" and any(config.get(key) for key in ("app_read_only", "app_current_repository_only")):
+        raise _error("scope_source")
+    if "worker_source" not in config and GitHubAppProfileStore(app_profile_path).path.exists():
+        raise _error("migration_required")
     if source == "host":
         return {"source": "host"}
     if source == "pat":
         if "pat" not in config:
             raise _error("reference")
         return {"source": "pat", "pat": config["pat"]}
-    profile = GitHubAppProfileStore(app_profile_path).load()
-    if profile is None:
-        if source == "app":
-            raise _error("app_missing")
-        return {"source": "host"}
-    return {"source": "app", "app_profile": {
-        "app_id": profile.app_id, "installation_id": profile.installation_id,
-        "private_key_path": str(profile.private_key_path),
-    }}
+    if "app" not in config:
+        raise _error("app_missing")
+    return {"source": "app", "app_profile": config["app"],
+            "app_read_only": config.get("app_read_only", False),
+            "app_current_repository_only": config.get("app_current_repository_only", False)}
 
 
 def validate_identity_snapshot(raw: object) -> dict[str, Any]:
@@ -82,20 +100,15 @@ def validate_identity_snapshot(raw: object) -> dict[str, Any]:
         raise _error("object")
     source = raw.get("source")
     keys = {"host": {"source"}, "pat": {"source", "pat"},
-            "app": {"source", "app_profile"}}
+            "app": {"source", "app_profile", "app_read_only", "app_current_repository_only"}}
     if not isinstance(source, str) or source not in keys or set(raw) != keys[source]:
         raise _error("source")
     if source == "pat":
         return {"source": source, "pat": normalize_github_config({"pat": raw["pat"]})["pat"]}
     if source == "app":
-        profile = raw["app_profile"]
-        if not isinstance(profile, Mapping) or set(profile) != {
-            "app_id", "installation_id", "private_key_path",
-        } or any(not isinstance(value, str) or not value.strip() for value in profile.values()):
-            raise _error("app_missing")
-        if not Path(profile["private_key_path"]).is_absolute():
-            raise _error("app_missing")
-        return {"source": source, "app_profile": dict(profile)}
+        return resolve_worker_identity({"worker_source": "app", "app": raw["app_profile"],
+                                        "app_read_only": raw["app_read_only"],
+                                        "app_current_repository_only": raw["app_current_repository_only"]})
     return {"source": source}
 
 
@@ -136,11 +149,28 @@ def native_github_environment(
 
 def validate_worker_auth(
     identity: Mapping[str, Any], environment: Mapping[str, str] | None = None,
+    *, repository: str | None = None,
 ) -> None:
     """Bounded native gh authentication probe; tool output may contain secrets."""
     identity = validate_identity_snapshot(identity)
     if identity.get("source") == "app":
-        return  # Existing App provider owns validation and renewal during transition.
+        from agent_run.github_auth import _GitHubAppCredentialProvider
+        from agent_run.github_auth_profile import GitHubAppProfile
+        if identity["app_current_repository_only"] and repository is None:
+            raise _error("app_repository")
+        profile = identity["app_profile"]
+        provider = _GitHubAppCredentialProvider(
+            GitHubAppProfile(profile["app_id"], profile["installation_id"], Path(profile["private_key_path"])),
+            read_only=identity["app_read_only"],
+            repository=repository if identity["app_current_repository_only"] else None,
+        )
+        try:
+            provider()
+        except Exception:
+            raise _error("auth_failed", source="app") from None
+        finally:
+            provider.cancel()
+        return
     selected = native_github_environment(identity, environment)
     try:
         result = subprocess.run(["gh", "api", "--hostname", "github.com", "user"],
@@ -155,6 +185,11 @@ def validate_worker_auth(
 def add_identity_options(parser: argparse.ArgumentParser, language: str) -> None:
     parser.add_argument("--worker-github-source", choices=("host", "pat", "app"),
                         help=text("identity.source_help", language=language))
+    for option in ("app-id", "installation-id", "private-key-path"):
+        parser.add_argument(f"--github-{option}", help=text("identity.app_help", language=language))
+    for option in ("read-only", "current-repository-only"):
+        parser.add_argument(f"--github-app-{option}", action=argparse.BooleanOptionalAction,
+                            default=None, help=text("identity.scope_help", language=language))
     references = parser.add_mutually_exclusive_group()
     references.add_argument("--github-pat-env", help=text("identity.env_help", language=language))
     references.add_argument("--github-pat-file", help=text("identity.file_help", language=language))
@@ -168,6 +203,14 @@ def identity_overrides(parsed: argparse.Namespace) -> dict[str, Any]:
         value = getattr(parsed, f"github_pat_{key}", None)
         if value is not None:
             result["pat"] = {key: value}
+    app = {key: getattr(parsed, f"github_{key}", None)
+           for key in ("app_id", "installation_id", "private_key_path")}
+    if any(value is not None for value in app.values()):
+        result["app"] = app
+    for key in ("app_read_only", "app_current_repository_only"):
+        value = getattr(parsed, f"github_{key}", None)
+        if value is not None:
+            result[key] = value
     return normalize_github_config(result)
 
 

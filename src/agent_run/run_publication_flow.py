@@ -41,7 +41,7 @@ from agent_run.publication_pending import publication_pending_diagnostic
 from agent_run.publication_operation_retry import begin_publication_operation_attempt
 from agent_run.run_publication_shared import RunPublicationShared
 from agent_run.run_currentness import run_currentness_boundary
-from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.semantic_attempt import (
     allocate_semantic_attempt,
     close_semantic_attempt,

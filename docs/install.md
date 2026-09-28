@@ -89,9 +89,9 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 
 宿主尚未登录时，由操作者执行 `gh auth login`，再用 `gh auth status` 核对登录状态。为 Worker 选择 PAT 不替代程序端所需的宿主认证。
 
-host/PAT Worker 使用原生 `gh`，不经过本地命令白名单，GitHub 能力由凭据决定。角色仍不得自行正式发布或自我批准，Controller 批准和 Publisher 职责保持不变。PAT 只引用一个环境变量名或文件路径，秘密值不进入 Run 快照。Run 固定来源与引用，修改默认值不影响已有 Run；凭据故障后修复同一引用，再显式 resume，不回退 host。
+host/PAT/App Worker 使用原生 `gh`，不经过本地命令白名单，GitHub 能力由凭据决定。角色仍不得自行正式发布或自我批准，Controller 批准和 Publisher 职责保持不变。PAT 只引用一个环境变量名或文件路径，秘密值不进入 Run 快照。Run 固定来源与引用，修改默认值不影响已有 Run；凭据故障后修复同一引用，再显式 resume，不回退 host。
 
-既有 App 在过渡期保留当前只读代理与续签。本阶段尚未实现 App 原生接入及程序端 PAT/App 选择。配置见 [GitHub 身份](agent-run.md#github-身份)和[个人运行配置](user-defaults.md)；查询不签发凭据、不显示秘密值。
+App 元数据统一由 settings 管理，默认采用安装授权范围，可独立收窄为只读和当前仓库；程序端签发、续签并更新 Worker 临时凭据文件。本阶段程序端仍使用 host。配置见 [GitHub 身份](agent-run.md#github-身份)和[个人运行配置](user-defaults.md)；查询不签发凭据、不显示秘密值。
 凭据能力与交付职责的区别见[权限边界](agent-run.md#权限边界)。
 
 执行 `agent-run doctor --json` 和 `agent-run settings show`，核对环境及所选模型、推理强度和运行额度。

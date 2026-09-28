@@ -27,7 +27,7 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 _Avoid_: GitHub Bot、Publisher、Mutation Authority
 
 **Worker GitHub Identity（Worker GitHub 身份）**:
-当前支持 host/PAT 原生 `gh`；无配置默认 host，显式选择优先，既有 App 保留过渡代理与续签。新 Run 固定非秘密来源与 PAT 引用，恢复从同一引用读取新值，不随个人默认改变。
+支持 host/PAT/App 原生 `gh`；无配置默认 host，已有 App 元数据须显式迁入统一配置，保留 App 来源。App 默认采用安装授权的权限和仓库范围，可独立收窄为只读或当前仓库。新 Run 固定非秘密来源、凭据引用与范围，恢复不随个人默认改变。
 操作者选择供 Worker 访问 GitHub 的身份，确定该身份在 GitHub 上获授的能力。该授权与 Worker 的角色职责、Runner 的交付授权分别定义，不因拥有 GitHub 写权限就取得 Runner 的发布或完成权威。
 _Avoid_: Publisher、Mutation Authority
 
@@ -36,9 +36,10 @@ _Avoid_: Publisher、Mutation Authority
 Controller 与 Publisher 执行程序端 GitHub 读取、正式发布及远端 Git 操作所使用的身份。它与 Worker GitHub Identity 的职责分开；Worker 的选择不改变程序端 host 身份，也不替代交付批准。选择 Worker host 时双方可能使用同一宿主身份。
 _Avoid_: Publication Agent、独立 Publisher 账号、Mutation Authority
 
-**Worker GitHub Read Broker（Worker GitHub 只读代理）**:
-仅供尚未迁移的 GitHub App 来源使用的过渡机制：临时 `gh` adapter 将当前仓库固定只读请求交给 Controller，App 私钥及 installation token 不进入 Worker。现有签发、续签、有界重试与进程清理继续有效；配置或认证故障不回退 host。host/PAT 不使用此代理、不挂载替换 `gh`、不经过本地命令 allowlist。它不是长期可选代理模式。
-_Avoid_: 将 App 过渡约束描述为全部 Worker 的能力、静默切换来源、向 Worker 注入 App 私钥、无限重试
+**Worker Credential Delivery（Worker 凭据传递）**:
+程序端签发 App 短期 token，以每次 Invocation 独立的 `GH_CONFIG_DIR/hosts.yml` 原子更新交付给原生 `gh`；同一 Agent 正常继承环境的后续子进程读取更新值，无需重建 Agent。私钥只保留文件引用，不主动提供给 Worker。不同权限和仓库范围的凭据实例隔离；传递不解析 gh 命令，不承担 GitHub 授权。
+临时续签失败有界重试，有效旧 token 可继续使用；不可恢复失效进入 Execution Failure，保留进度，修复同一身份引用后公开 resume。停止、失败和取消回收续签线程、签名进程及临时凭据目录。
+_Avoid_: gh 请求代理、命令白名单、向 Worker 注入 App 私钥、静默切换来源、无限重试
 
 **Agent Artifact（Agent 产物）**:
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
@@ -177,7 +178,7 @@ mutation 则是 Human Blocker。
 _Avoid_: Agent 判断是否 stale、Thread 连续性、自动 rebase
 
 **Execution Guard（执行约束）**:
-Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用真实 Git CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。host/PAT Worker 使用原生 `gh`，GitHub 能力由凭据决定；App 暂保留只读代理与续签。Execution Guard 通过只读权威 Git metadata、Runner 控制状态保护和不主动注入独立程序端秘密保留正式 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回固定脱敏错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
+Codex 以 YOLO 运行，并可自由读写宿主文件系统、联网及使用真实 Git CLI；Execution Guard 不提供通用 filesystem、network、审批或命令隔离。所有 Worker 使用原生 `gh`，GitHub 能力由所选凭据决定；App 在程序端签发和续签短期 token。Execution Guard 通过只读权威 Git metadata、Runner 控制状态保护和不主动注入独立程序端秘密保留正式 Mutation Authority；Worker 启动前会拒绝 local Git config 中带 userinfo 的 HTTP(S) remote URL，并只返回固定脱敏错误，不改写权威 config。该边界不承诺抵抗恶意进程、主动凭据搜索、宿主污染或数据外泄。
 _Avoid_: hardened security sandbox、恶意代码隔离、全局 Git 配置、Publisher 权限
 
 **Trusted Subagent Contract（受信任 Subagent 契约）**:

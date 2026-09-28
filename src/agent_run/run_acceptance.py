@@ -52,7 +52,7 @@ from agent_run.state import StateStore
 from agent_run.integration_record_contract import (
     require_completed_ticket_integration_records,
 )
-from agent_run.worker_credentials import InitialCredentialUnavailable
+from agent_run.credential_lifecycle import InitialCredentialUnavailable
 from agent_run.review_budget import (
     ReviewBudgetPolicy,
     ensure_budget,

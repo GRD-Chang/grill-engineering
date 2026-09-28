@@ -88,12 +88,12 @@ def _capture_public_prompt(
         )
 
     # 这里的 Worker 已是 stdin/schema 捕获函数，不会发起 GitHub 请求。
-    # 无消费者的 socket/续签线程由 backend 专项真实边界测试负责，避免每个文案变体等待关闭。
+    # 无消费者的凭据续签线程由 backend 专项真实边界测试负责，避免每个文案变体等待关闭。
     with monkeypatch.context() as scoped:
         scoped.setattr("agent_run.codex.run_worker_process", fake_run)
         scoped.setattr(
-            "agent_run.codex.WorkerCredentialChannel",
-            lambda *args, **kwargs: nullcontext(SimpleNamespace(start=lambda path: None)),
+            "agent_run.codex.NativeCredentialDelivery",
+            lambda *args, **kwargs: nullcontext(SimpleNamespace(start=lambda: None)),
         )
         backend = CodexCliBackend(credential_provider=lambda: "reader-secret")
         getattr(backend, method)({**request, "checkout": str(checkout)})
